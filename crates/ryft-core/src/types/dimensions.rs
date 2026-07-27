@@ -285,9 +285,24 @@ impl DimensionType {
         self.variable.bounds()
     }
 
-    /// Extends a complete-signature [`TypeIdentityRenaming`] with one declared/actual dimension-type pair. The `actual`
+    /// Extends a complete-signature [`TypeIdentityRenaming`] with one declared/actual dimension-type pair. This is
+    /// the per-pair fold step behind [`Type::derive_identity_renaming`] for dimension types: signature-level drivers
+    /// (including the dimension arms of [`ArrayProgramType`](crate::types::ArrayProgramType)) call it once per member
+    /// so that a repeated declared [`DimensionVariable`] renames consistently across the whole signature. The `actual`
     /// [`DimensionType`]'s bounds must be contained in the `declared` [`DimensionType`]'s bounds, and the declared
     /// [`DimensionVariable`] must not already be renamed to a different target by another member of the same signature.
+    ///
+    /// # Example
+    ///
+    /// Given the variables `n: [0, 8)`, `m: [0, 8)`, and `k: [0, 4)`, folding over a declared signature behaves as
+    /// follows:
+    ///
+    ///   - `(dimension<n>, dimension<n>)` instantiated by `(dimension<m>, dimension<m>)`: Records the renaming
+    ///     `n -> m` and accepts its consistent repetition.
+    ///   - `(dimension<n>, dimension<n>)` instantiated by `(dimension<m>, dimension<k>)`: Fails because `n` would be
+    ///     renamed to both `m` and `k`.
+    ///   - `(dimension<k>)` instantiated by `(dimension<n>)`: Fails because the declared bounds `[0, 4)` do not
+    ///     contain the actual bounds `[0, 8)`.
     pub(crate) fn extend_identity_renaming(
         declared: &Self,
         actual: &Self,

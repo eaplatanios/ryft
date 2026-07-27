@@ -725,33 +725,27 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// Type stored at array-program boundaries whose graph may contain arrays and first-class runtime dimensions.
-///
-/// This sum is a storage boundary rather than the semantic contract of ordinary primitives. Array-only operations use
-/// [`ArrayType`], dimension-only operations use [`DimensionType`](crate::DimensionType), and genuinely mixed
-/// operations use this type directly. Standard [`From`] and [`TryFrom`] conversions provide the checked bridge between
-/// those contracts.
+/// [`Type`] used in [`Program`](crate::Program)s that may contain both [`ArrayType`]-valued and
+/// [`DimensionType`]-valued values. This enum is a storage boundary rather than the semantic contract of ordinary
+/// primitives. Array-only [`Operation`](crate::Operation)s use [`ArrayType`], dimension-only operations use
+/// [`DimensionType`], and genuinely mixed operations use this type directly. Standard [`From`] and [`TryFrom`]
+/// conversions provide a checked bridge between those contracts.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayProgramType {
-    /// An ordinary array type.
     Array(ArrayType),
-
-    /// A first-class runtime dimension type.
     Dimension(DimensionType),
 }
 
-// TODO(eaplatanios): Review this.
 impl Display for ArrayProgramType {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Array(r#type) => Display::fmt(r#type, formatter),
-            Self::Dimension(r#type) => Display::fmt(r#type, formatter),
+            Self::Array(r#type) => r#type.fmt(formatter),
+            Self::Dimension(r#type) => r#type.fmt(formatter),
         }
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl From<ArrayType> for ArrayProgramType {
     #[inline]
     fn from(r#type: ArrayType) -> Self {
@@ -759,7 +753,6 @@ impl From<ArrayType> for ArrayProgramType {
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl From<DimensionType> for ArrayProgramType {
     #[inline]
     fn from(r#type: DimensionType) -> Self {
@@ -767,12 +760,11 @@ impl From<DimensionType> for ArrayProgramType {
     }
 }
 
-// TODO(eaplatanios): Review this.
-impl<'a> TryFrom<&'a ArrayProgramType> for &'a ArrayType {
+impl<'t> TryFrom<&'t ArrayProgramType> for &'t ArrayType {
     type Error = TypeError;
 
     #[inline]
-    fn try_from(r#type: &'a ArrayProgramType) -> Result<Self, Self::Error> {
+    fn try_from(r#type: &'t ArrayProgramType) -> Result<Self, Self::Error> {
         match r#type {
             ArrayProgramType::Array(r#type) => Ok(r#type),
             ArrayProgramType::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
@@ -780,12 +772,11 @@ impl<'a> TryFrom<&'a ArrayProgramType> for &'a ArrayType {
     }
 }
 
-// TODO(eaplatanios): Review this.
-impl<'a> TryFrom<&'a ArrayProgramType> for &'a DimensionType {
+impl<'t> TryFrom<&'t ArrayProgramType> for &'t DimensionType {
     type Error = TypeError;
 
     #[inline]
-    fn try_from(r#type: &'a ArrayProgramType) -> Result<Self, Self::Error> {
+    fn try_from(r#type: &'t ArrayProgramType) -> Result<Self, Self::Error> {
         match r#type {
             ArrayProgramType::Array(_) => Err(TypeError::invalid("expected dimension type but got array type")),
             ArrayProgramType::Dimension(r#type) => Ok(r#type),
@@ -798,6 +789,7 @@ impl Type for ArrayProgramType {
     type Identity = DimensionVariable;
     type Refinements = ArrayProgramTypeRefinements;
 
+    #[inline]
     fn visit_identities(&self, visitor: &mut impl FnMut(TypeIdentityPosition, &Self::Identity)) {
         match self {
             Self::Array(r#type) => r#type.visit_identities(visitor),
