@@ -478,11 +478,11 @@ ledger disagrees with Git.
 
 ## P3a: production array-program dispatcher
 
-- Status: ready for owner review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p3a-array-program-dispatcher`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending
+- Source commit: `ac66c0bd2`
+- Integration commit: `d44f9be37c1cc55b272cd6995d177cd7ca22a1ec`
+- Remainder reconciliation commit: `526a597337763b0a3cd4e4c1da6a9e927ca5e417`
 - Immutable archive unchanged: yes
 - Scope: add the production two-family `ArrayProgramOperation<A>` dispatcher, standard homogeneous-family lifts, and
   complete array-program operation-contract projection without adding any genuinely mixed operation
@@ -498,5 +498,34 @@ ledger disagrees with Git.
 - Lint audit: the repository's inherited Clippy backlog remains, but no diagnostic names either P3a-owned backend file
 - Residual search: exactly two outer family variants; no mixed variant, per-primitive production projection match,
   semantic context state, ambient dimension/source-array field, replay hook, or new context/value wrapper
+- Review method: line by line
+- Owner corrections: inlined the one-use `project_types`, `lift_types`, and `lift_region_input_types` helpers into the
+  owning operation-dispatch paths before merging
+- Next action: none
+
+## P3b: canonical first-class dimension size
+
+- Status: ready for owner review
+- Branch: `u/eaplatanios/increment/p3b-dimension-size`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending
+- Immutable archive unchanged: yes
+- Scope: introduce the sole `array -> dimension` `DimensionSizeOperation`, add it as one genuinely mixed outer-family
+  variant, and support explicit staging plus constant-time reference-backend eager extent extraction
+- Deferred: dimension-to-data conversion remains P3c; data gateways remain P3d/P3e; comparison remains P3f;
+  composite batching, differentiation/transposition, and backend lowering remain P5, P6, and P7
+- Plan: `.tasks/plan_p3b_dimension_size.md`
+- Audit correction: the archived operation's result-only validation rejects a valid dynamic-declared/static-actual
+  eager refinement; the production payload retains the selected declared axis dimension and validates refinement
+  directionally
+- Implementation: added the sole mixed `array -> dimension` operation, dynamic identity forwarding, exact static
+  results, one constant-time reference-backend extent provider, outer-family eager dispatch, projected-array staging,
+  ordinary partial evaluation, and composite trace/import coverage
+- Verification: focused operation and dispatcher tests, allocation integration tests, core check/lib/doc suites, XLA
+  check/lib suite, formatting, diff check, changed-file Clippy attribution, and architectural residual searches pass
+- Residual search: no homogeneous array contract, rank-zero integer result, runtime-dimension data type, array-family
+  variant, carrier-specific wrapper tower, or implicit witness/source-array/replay mechanism; P3c/P5/P6/P7 retain their
+  named data-conversion, transform, and lowering work
 - Review method: line by line
 - Next action: commit and push the increment branch, then stage its no-commit merge for owner review

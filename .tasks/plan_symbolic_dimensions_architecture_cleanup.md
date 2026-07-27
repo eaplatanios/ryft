@@ -1065,7 +1065,7 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 
 ### Phase 3: establish canonical mixed operation signatures
 
-- [ ] Make `DimensionSizeOperation` exclusively `array -> dimension`.
+- [x] Make `DimensionSizeOperation` exclusively `array -> dimension`.
 - [ ] Keep `DimensionToScalarOperation` as the only `dimension -> scalar-array` conversion.
 - [ ] Migrate reshape and broadcast first as the canonical mixed vertical slice.
 - [ ] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
