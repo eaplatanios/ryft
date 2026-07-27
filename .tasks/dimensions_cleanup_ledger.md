@@ -418,7 +418,7 @@ ledger disagrees with Git.
 - Branch: `u/eaplatanios/increment/p2c-generic-storage-projection`
 - Source commit: `064ed670259e3660506e46fcc26a9f1487ccecde`
 - Integration commit: `e5aeef0c4557dda3eefcc80e32005a1c028417e7`
-- Remainder reconciliation commit: pending
+- Remainder reconciliation commit: `0057c4636`
 - Immutable archive unchanged: yes
 - Scope: introduce the array/dimension storage type and value sums plus generic borrowed and consuming projection
   contracts, preserving concrete eager payload ownership and symbolic SSA identity without introducing projected
