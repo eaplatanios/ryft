@@ -444,11 +444,11 @@ ledger disagrees with Git.
 
 ## P2d: zero-state projected binding
 
-- Status: ready for owner review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p2d-projected-context`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending
+- Source commit: `768ba6fc1`
+- Integration commit: `85e75a9fe35a7f40dbf5585348bfcc0443366299` (including owner review follow-ups)
+- Remainder reconciliation commit: `29e3ea7ad8a863c9d64538cfe52c342c14ad17f3`
 - Immutable archive unchanged: yes
 - Scope: add one generic zero-state context that binds homogeneous member operations directly through a composite
   parent operation family, plus the operation-family projection contract and the third-member extensibility gate
@@ -473,5 +473,30 @@ ledger disagrees with Git.
   `Value for ProjectedValue` remain; no array/dimension-specific context view, replay hook, source-array field,
   ambient-dimension field, or production mixed operation family was introduced; the remaining `with_dimensions`
   matches are the unrelated reshape-permutation builder and its tests
+- Review method: line by line
+- Next action: none
+
+## P3a: production array-program dispatcher
+
+- Status: ready for owner review
+- Branch: `u/eaplatanios/increment/p3a-array-program-dispatcher`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending
+- Immutable archive unchanged: yes
+- Scope: add the production two-family `ArrayProgramOperation<A>` dispatcher, standard homogeneous-family lifts, and
+  complete array-program operation-contract projection without adding any genuinely mixed operation
+- Deferred: `dimension_size`, data gateways, dimension comparison, mixed shape operations, region-carrying execution,
+  transform policies, and backend lowering remain in their named P3b+ and P4+ increments
+- Implemented: adds exactly one array-family and one dimension-family variant, standard `From` lifts and
+  `OperationProjection` associations, one shared type/region-interface projection path, complete operation-contract
+  forwarding, and generic region-free eager delegation; `ArrayProgramValue<A>` keeps its constant-only dispatch domain
+  while using the new family for rich execution
+- Verification: 7 focused dispatcher tests, both allocation integration tests, 967 core library tests, 53 executable
+  core doctests, 396 XLA library tests, and `cargo check -p ryft-core -p ryft-xla` passed; formatting and diff hygiene
+  passed
+- Lint audit: the repository's inherited Clippy backlog remains, but no diagnostic names either P3a-owned backend file
+- Residual search: exactly two outer family variants; no mixed variant, per-primitive production projection match,
+  semantic context state, ambient dimension/source-array field, replay hook, or new context/value wrapper
 - Review method: line by line
 - Next action: commit and push the increment branch, then stage its no-commit merge for owner review

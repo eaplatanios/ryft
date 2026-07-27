@@ -7,7 +7,7 @@ pub mod arrays;
 pub mod dimensions;
 pub mod scalars;
 
-pub use array_programs::ArrayProgramValue;
+pub use array_programs::{ArrayProgramOperation, ArrayProgramValue};
 pub use arrays::{Array, ArrayOperation, ArrayTracingContext};
 pub use dimensions::{DimensionOperation, DimensionTracingContext, DimensionValue};
 pub use scalars::{Scalar, ScalarOperation, ScalarTracingContext};
