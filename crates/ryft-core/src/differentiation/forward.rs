@@ -21,8 +21,8 @@ use crate::programs::programs::Program;
 use crate::programs::regions::{
     BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
 };
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::{ProjectedValue, Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Represents a differentiation _dual_ value which is a _primal_ value paired with a _tangent_ value. In the
@@ -704,6 +704,33 @@ impl<C: Context> Value for DifferentiationTracer<C> {
     #[inline]
     fn execution_domain(&self) -> DifferentiationContext<C> {
         self.context().clone()
+    }
+}
+
+impl<C: Context, T: Type + 'static> ValueProjection<T> for DifferentiationTracer<C>
+where
+    for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
+{
+    type Projected = ProjectedValue<T, Self>;
+    type ProjectedRef<'v>
+        = ProjectedValue<T, &'v Self>
+    where
+        Self: 'v;
+
+    #[inline]
+    fn from_projected(value: Self::Projected) -> Self {
+        value.into_value()
+    }
+
+    #[inline]
+    fn projected(&self) -> Result<Self::ProjectedRef<'_>, TypeError> {
+        Ok(ProjectedValue::new(self, <&T>::try_from(self.r#type().as_ref())?.clone()))
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        let r#type = <&T>::try_from(self.r#type().as_ref())?.clone();
+        Ok(ProjectedValue::new(self, r#type))
     }
 }
 
