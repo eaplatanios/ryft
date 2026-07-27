@@ -284,6 +284,22 @@ impl DimensionType {
     pub fn bounds(&self) -> DimensionBounds {
         self.variable.bounds()
     }
+
+    /// Extends a complete-signature [`TypeIdentityRenaming`] with one declared/actual dimension-type pair. The `actual`
+    /// [`DimensionType`]'s bounds must be contained in the `declared` [`DimensionType`]'s bounds, and the declared
+    /// [`DimensionVariable`] must not already be renamed to a different target by another member of the same signature.
+    pub(crate) fn extend_identity_renaming(
+        declared: &Self,
+        actual: &Self,
+        renaming: &mut TypeIdentityRenaming<DimensionVariable>,
+    ) -> Result<(), TypeError> {
+        if !declared.bounds().contains_bounds(actual.bounds()) {
+            return Err(TypeError::invalid(format!(
+                "dimension type {actual} cannot instantiate declared type {declared}",
+            )));
+        }
+        renaming.insert(declared.variable.clone(), actual.variable.clone())
+    }
 }
 
 impl Display for DimensionType {
@@ -313,18 +329,12 @@ impl Type for DimensionType {
                 actual.len(),
             )));
         }
+        let mut renaming = TypeIdentityRenaming::new();
         declared
             .iter()
             .zip(actual)
-            .try_fold(TypeIdentityRenaming::new(), |mut renaming, (declared, actual)| {
-                if !declared.bounds().contains_bounds(actual.bounds()) {
-                    return Err(TypeError::invalid(format!(
-                        "dimension type {actual} cannot instantiate declared type {declared}",
-                    )));
-                }
-                renaming.insert(declared.variable.clone(), actual.variable.clone())?;
-                Ok(renaming)
-            })
+            .try_for_each(|(declared, actual)| Self::extend_identity_renaming(declared, actual, &mut renaming))?;
+        Ok(renaming)
     }
 
     #[inline]
@@ -843,11 +853,23 @@ mod tests {
         let wider = DimensionType::new(DimensionVariable::new("wider", DimensionBounds::new(0, Some(129)).unwrap()));
         assert!(!declared.is_refined_by(&wider));
         assert_eq!(
-            DimensionType::derive_identity_renaming(&[declared], &[wider]),
+            DimensionType::derive_identity_renaming(&[declared.clone()], &[wider]),
             Err(TypeError::invalid(
                 "dimension type dimension<wider: [0, 129)> cannot instantiate declared type \
                  dimension<declared: [1, 65)>",
             )),
+        );
+
+        // A repeated declared variable must rename consistently across the complete signature.
+        let other = DimensionType::new(DimensionVariable::new("other", DimensionBounds::new(1, Some(65)).unwrap()));
+        assert_eq!(
+            DimensionType::derive_identity_renaming(&[declared.clone(), declared], &[actual.clone(), other.clone()],),
+            Err(TypeError::invalid(format!(
+                "identity {} is renamed to both {} and {}",
+                "declared",
+                actual.variable(),
+                other.variable(),
+            ))),
         );
     }
 
