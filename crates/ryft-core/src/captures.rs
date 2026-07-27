@@ -30,7 +30,7 @@ use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::RegionArena;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{ProjectedValueRef, Value, ValueProjection};
 use crate::tracing::{NestedTracingContext, TracingContext};
 use crate::types::ArrayType;
 
@@ -108,6 +108,33 @@ impl<T: Type> Value for CaptureReference<T> {
     #[inline]
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
         Ok(Self::new(self.index, self.r#type.rename_identities(renaming)?))
+    }
+}
+
+impl<T: Type + From<P>, P: Type + 'static> ValueProjection<P> for CaptureReference<T>
+where
+    for<'a> &'a P: TryFrom<&'a T, Error = TypeError>,
+{
+    type Projected = CaptureReference<P>;
+    type ProjectedRef<'v>
+        = ProjectedValueRef<'v, P, Self>
+    where
+        Self: 'v;
+
+    #[inline]
+    fn from_projected(value: Self::Projected) -> Self {
+        Self::new(value.index, value.r#type.into())
+    }
+
+    #[inline]
+    fn projected(&self) -> Result<Self::ProjectedRef<'_>, TypeError> {
+        Ok(ProjectedValueRef::new(self, <&P>::try_from(&self.r#type)?))
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        let r#type = <&P>::try_from(&self.r#type)?.clone();
+        Ok(CaptureReference::new(self.index, r#type))
     }
 }
 
@@ -472,11 +499,13 @@ mod tests {
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EmptyRegionDriver, ProgramBuilder, ProgramError, RegionId, RegionSlot, TypeIdentityRenaming,
+        EmptyRegionDriver, ProgramBuilder, ProgramError, RegionId, RegionSlot, TypeIdentityRenaming, ValueProjection,
     };
     use crate::tests::TestRegionOperation;
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
-    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::types::{
+        ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+    };
 
     use super::*;
 
@@ -497,6 +526,29 @@ mod tests {
         assert_eq!(
             renamed.r#type().as_ref(),
             &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target)])),
+        );
+    }
+
+    #[test]
+    fn test_capture_reference_projection_preserves_capture_index() {
+        let array_type = ArrayType::scalar(DataType::F32);
+        let capture = CaptureReference::new(3, ArrayProgramType::Array(array_type.clone()));
+        let projected =
+            <CaptureReference<ArrayProgramType> as ValueProjection<ArrayType>>::projected(&capture).unwrap();
+        assert_eq!(projected.value().index(), 3);
+        assert_eq!(projected.r#type().as_ref(), &array_type);
+
+        let projected =
+            <CaptureReference<ArrayProgramType> as ValueProjection<ArrayType>>::into_projected(capture).unwrap();
+        assert_eq!(projected.index(), 3);
+        assert_eq!(projected.r#type().as_ref(), &array_type);
+        let lifted = <CaptureReference<ArrayProgramType> as ValueProjection<ArrayType>>::from_projected(projected);
+        assert_eq!(lifted.index(), 3);
+        assert_eq!(lifted.r#type().as_ref(), &ArrayProgramType::Array(array_type));
+
+        assert_eq!(
+            <CaptureReference<ArrayProgramType> as ValueProjection<DimensionType>>::projected(&lifted),
+            Err(TypeError::invalid("expected dimension type but got array type")),
         );
     }
 

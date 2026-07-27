@@ -102,8 +102,8 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::BindingRegionDriver;
-use crate::programs::types::Typed;
-use crate::programs::values::Value;
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::{ProjectedValue, ProjectedValueRef, Value, ValueProjection};
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
 /// [`Atom`](crate::Atom) or _poisoned_, meaning that it corresponds to an error.
@@ -261,6 +261,33 @@ impl<C: StagingContext> Value for Tracer<C> {
     #[inline]
     fn execution_domain(&self) -> C {
         self.context().clone()
+    }
+}
+
+impl<C: StagingContext, T: Type + 'static> ValueProjection<T> for Tracer<C>
+where
+    for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
+{
+    type Projected = ProjectedValue<T, Self>;
+    type ProjectedRef<'v>
+        = ProjectedValueRef<'v, T, Self>
+    where
+        Self: 'v;
+
+    #[inline]
+    fn from_projected(value: Self::Projected) -> Self {
+        value.into_value()
+    }
+
+    #[inline]
+    fn projected(&self) -> Result<Self::ProjectedRef<'_>, TypeError> {
+        Ok(ProjectedValueRef::new(self, <&T>::try_from(&self.r#type)?))
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        let r#type = <&T>::try_from(&self.r#type)?.clone();
+        Ok(ProjectedValue::new(self, r#type))
     }
 }
 
