@@ -54,6 +54,26 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 /// # Ok(())
 /// # }
 /// ```
+///
+/// Extract vector elements with ordinary array operations before crossing this gateway. This keeps indexing a general
+/// array concern and makes this operation the only numerical-data-to-dimension boundary:
+///
+/// ```rust
+/// # use ryft_core::{
+/// #     DimensionBounds, DimensionFromScalar, DimensionVariable, ProgramError, Reshape, Shape, Slice,
+/// # };
+/// # use ryft_core::backends::arrays::Array;
+/// # fn main() -> Result<(), ProgramError> {
+/// let extents = Array::vector(vec![3_i32, 5_i32]);
+/// let sequence = extents.slice(&[1], &[2], &[1])?.reshape(Shape::scalar())?;
+/// let sequence = sequence.to_dimension(DimensionVariable::new(
+///     "sequence",
+///     DimensionBounds::new(1, Some(9))?,
+/// ))?;
+/// assert_eq!(sequence.extent(), 5);
+/// # Ok(())
+/// # }
+/// ```
 pub trait DimensionFromScalar<Output = Self>: Typed + Sized {
     /// Returns this rank-zero integer array as a first-class dimension described by `result`.
     fn to_dimension(&self, result: DimensionVariable) -> Result<Output, ProgramError>;

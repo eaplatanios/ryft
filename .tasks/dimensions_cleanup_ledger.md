@@ -577,10 +577,11 @@ ledger disagrees with Git.
 
 ## P3d: checked scalar-array to dimension gateway
 
-- Status: ready for review
-- Branch: `u/eaplatanios/dynamic-shapes` (unstaged owner-review changes)
-- Source commit: pending
-- Integration commit: pending
+- Status: landed
+- Branch: `u/eaplatanios/dynamic-shapes`
+- Source commit: `eda43571b`
+- Integration commit: `eda43571b`
+- Owner follow-up commit: `8dc2c4f4b`
 - Remainder reconciliation commit: pending
 - Immutable archive unchanged: yes
 - Scope: introduce the sole checked `rank-0 integer array -> dimension` gateway, with one fresh declared result
@@ -596,6 +597,36 @@ ledger disagrees with Git.
   with one ignored; the two projection allocation tests; package checks; formatting; and diff hygiene pass
 - Residual search: exactly one production operation declaration and one outer-family variant; no homogeneous operation
   contract, data-source adapter, host-readback path, expression witness, source-array field, generic mixed bucket, or
-  unchecked lowering was introduced; the vector-element gateway remains absent and assigned to P3e
+  unchecked lowering was introduced; vector elements cross this scalar gateway only after ordinary array extraction
+- Review method: line by line
+- Owner follow-up: namespaced all dimension operation modules and arithmetic capability methods with the
+  `dimension_` prefix while preserving standard operator syntax
+- Next action: reconcile the landed commits into the mutable remainder during the next bookkeeping pass
+
+## P3e: vector-element composition
+
+- Status: ready for review
+- Branch: `u/eaplatanios/dynamic-shapes` (unstaged owner-review changes)
+- Source commit: not applicable; the proposed dedicated operation was removed before landing
+- Integration commit: not applicable
+- Remainder reconciliation commit: pending
+- Immutable archive unchanged: yes
+- Scope: decide whether indexed vector-data-to-dimension conversion needs a dedicated mixed operation or should compose
+  existing array extraction, scalarization, and `DimensionFromScalarOperation`
+- Decision: remove `DimensionFromVectorElementOperation`, its capability, outer-family variant, eager implementation,
+  batching rule, lowering deferral, exports, and tests. It fused generic indexing with an already canonical authority
+  gateway, had no production consumer, and had no direct JAX or StableHLO counterpart
+- Replacement: statically sized vectors use `slice -> reshape-to-scalar -> dimension_from_scalar`; this path is now
+  documented on `DimensionFromScalar`. A future dynamic use case must use checked ordinary array indexing or an
+  explicit logical-length requirement before scalarization. If existing array operations remain insufficient after
+  mixed slicing migrates, add a general checked array-element operation rather than dimension-specific machinery
+- Deferred: dimension comparison remains P3f; device-side checks for `DimensionFromScalarOperation` remain P7; general
+  dynamic checked indexing is demand-driven and is not part of the dimension operation family
+- Plan: `.tasks/plan_p3e_dimension_from_vector_element.md` records the rejected prototype and removal decision
+- Verification: all 975 core library tests; 57 executable core doctests with 16 ignored; all 398 executable XLA
+  library tests with one ignored benchmark; formatting; and diff hygiene pass
+- Residual search: no production operation, capability, export, dispatcher variant, transform rule, backend
+  implementation, lowering case, or test named `DimensionFromVectorElement` or
+  `dimension_from_vector_element` remains
 - Review method: line by line
 - Next action: owner review, staging, commit, and push

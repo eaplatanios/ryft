@@ -1032,8 +1032,15 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       payloads, and centralize their shared contract in `ArithmeticDimensionOperation`.
 - [x] P2b.2: remove the concrete backend dependency from generic arithmetic operation generation, make operations own
       capability-constrained interpretation, and make backends own concrete capability implementations.
-- [ ] P3a–P3f: introduce the production array-program dispatcher, then complete the dimension operation family one
-      reviewable boundary at a time with `dimension_size`, the explicit data conversion and gateways, and comparisons;
+- [x] P3a: introduce the production array-program dispatcher.
+- [x] P3b: make `dimension_size` the sole canonical `array -> dimension` observation.
+- [x] P3c: add the sole explicit `dimension -> scalar-array` conversion.
+- [x] P3d: add the checked `rank-0 integer array -> dimension` gateway.
+- [x] P3e: reject a dedicated indexed `rank-1 integer array -> dimension` gateway. Extract vector elements with
+      ordinary array indexing/slicing and scalarization, then cross the sole `DimensionFromScalarOperation` gateway.
+      Add a general checked element-indexing primitive only if existing array operations cannot express a required
+      dynamic case; do not encode indexing inside the dimension operation family.
+- [ ] P3f: add first-class dimension comparison.
       P2a and P2b already provide ordinary dimension SSA, constants, arithmetic, and requirements.
 - [x] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
 - [x] Integrate inconclusive requirements with the existing effects model as `Effect::OrderedAssertion`; specify
@@ -1066,7 +1073,7 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 ### Phase 3: establish canonical mixed operation signatures
 
 - [x] Make `DimensionSizeOperation` exclusively `array -> dimension`.
-- [ ] Keep `DimensionToScalarOperation` as the only `dimension -> scalar-array` conversion.
+- [x] Keep `DimensionToScalarOperation` as the only `dimension -> scalar-array` conversion.
 - [ ] Migrate reshape and broadcast first as the canonical mixed vertical slice.
 - [ ] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
       first-class result-dimension operands. After this point, a fresh output reference without an available operand or
@@ -1872,3 +1879,51 @@ values clone only their parent tracer/transform representation and preserve SSA 
 cross-context allocation and latency measurement once production outer dispatch is present.
 
 Verification and residual-audit results are recorded in the P2d cleanup-ledger entry at handoff.
+
+### Execution: P3a production array-program dispatcher
+
+P3a introduced `ArrayProgramOperation<A>` as the sole stored dispatcher for heterogeneous array/dimension programs.
+Homogeneous array and dimension operations retain their native type contracts and pass through generic projection and
+lifting. Genuinely mixed signatures receive explicit outer-family variants rather than a generic mixed bucket.
+P3a added no mixed operation; verification and residual-audit results are recorded in the P3a cleanup-ledger entry.
+
+### Execution: P3b canonical first-class dimension size
+
+P3b introduced the sole `array -> dimension` `DimensionSizeOperation`. The operation records the selected declared
+axis dimension, preserves dynamic identity structurally, produces exact static results, and works through eager
+interpretation, tracing, import, partial evaluation, and the initial composite lowering path. The owner consolidated
+host extent extraction and composite first-class results under one `DimensionSize<Output>` capability.
+Verification and residual-audit results are recorded in the P3b cleanup-ledger entry.
+
+### Execution: P3c explicit dimension-to-scalar conversion
+
+P3c introduced the sole `dimension -> rank-0 i64 array` `DimensionToScalarOperation`. It also added the minimum
+composite batching, structural differentiation, and StableHLO foundations needed to exercise the complete
+`dimension_size -> dimension_to_scalar` vertical slice. Dimension arithmetic remains host-side in eager execution,
+and the logical conversion lowers as scalar SSA identity. Verification and residual-audit results are recorded in the
+P3c cleanup-ledger entry.
+
+### Execution: P3d checked scalar-array gateway
+
+P3d introduced the sole checked `rank-0 integer array -> dimension` `DimensionFromScalarOperation`. The operation owns
+one declared result identity and bounds, reference eager execution checks all signed/unsigned integer payloads,
+ordinary partial evaluation folds or residualizes the gateway, batching rejects mapped shape authority with the typed
+diagnostic, and composite lowering explicitly defers checked runtime assertions to P7. The subsequent owner-reviewed
+namespacing cleanup prefixed every dimension operation module and arithmetic capability method with `dimension_`
+without changing standard operator syntax. Verification and residual-audit results are recorded in the P3d
+cleanup-ledger entry.
+
+### Execution: P3e vector-element composition
+
+The initial P3e implementation introduced `DimensionFromVectorElementOperation`, but review found that it fused two
+independent existing concepts: ordinary array element extraction and `DimensionFromScalarOperation`'s checked
+data-to-dimension authority boundary. It also had no production consumer and no direct JAX or StableHLO counterpart,
+yet required dedicated inference, eager, dispatch, batching, differentiation, lowering, and test wiring.
+
+The dedicated operation and all of its cross-cutting machinery were therefore removed before landing. Statically
+sized vectors compose `slice -> reshape-to-scalar -> dimension_from_scalar`; the scalar gateway documentation now
+demonstrates that canonical path. Dynamically sized vectors must use ordinary checked indexing or an explicit
+logical-length requirement before scalarization because `dynamic_slice` clamps out-of-range indices. If that use case
+cannot be expressed cleanly after the mixed slicing migration, Ryft should add a general checked array-element
+operation rather than another dimension-specific gateway. Verification and the residual audit are recorded in the
+P3e cleanup-ledger entry.
