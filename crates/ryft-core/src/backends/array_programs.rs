@@ -89,7 +89,10 @@ impl<A: Value<Type = ArrayType>> ValueProjection<ArrayType> for ArrayProgramValu
     }
 
     #[inline]
-    fn projected(&self) -> Result<&A, TypeError> {
+    fn projected<'v>(&'v self) -> Result<&'v A, TypeError>
+    where
+        ArrayType: 'v,
+    {
         match self {
             Self::Array(value) => Ok(value),
             Self::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
@@ -118,7 +121,10 @@ impl<A: Value<Type = ArrayType>> ValueProjection<DimensionType> for ArrayProgram
     }
 
     #[inline]
-    fn projected(&self) -> Result<&DimensionValue, TypeError> {
+    fn projected<'v>(&'v self) -> Result<&'v DimensionValue, TypeError>
+    where
+        DimensionType: 'v,
+    {
         match self {
             Self::Array(_) => Err(TypeError::invalid("expected dimension type but got array type")),
             Self::Dimension(value) => Ok(value),
