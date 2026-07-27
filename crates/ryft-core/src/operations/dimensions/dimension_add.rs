@@ -16,7 +16,7 @@ define_arithmetic_dimension_operation!(
     DimensionAddOperation,
     DIMENSION_ADD_OPERATION_NAME,
     DimensionAdd,
-    add,
+    dimension_add,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} + {}", left.variable(), right.variable())
     },
@@ -37,7 +37,7 @@ define_arithmetic_dimension_capability!(
     ///
     /// The result owns a fresh dimension identity whose bounds contain every representable sum admitted by the
     /// operands. Addition fails when either inferred bounds or a concrete result exceeds Ryft's portable dimension
-    /// representation. [`DimensionAdd::add`] is the fallible counterpart to [`std::ops::Add`];
+    /// representation. [`DimensionAdd::dimension_add`] is the fallible counterpart to [`std::ops::Add`];
     /// [`DimensionValue`](crate::DimensionValue) supports `+` as panicking convenience syntax.
     ///
     /// # Example
@@ -45,14 +45,14 @@ define_arithmetic_dimension_capability!(
     /// ```rust
     /// # use ryft_core::{DimensionAdd, DimensionValue, ProgramError};
     /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(3)?.add(&DimensionValue::constant(4)?)?;
+    /// let result = DimensionValue::constant(3)?.dimension_add(&DimensionValue::constant(4)?)?;
     /// assert_eq!(result.extent(), 7);
     /// # Ok(())
     /// # }
     /// ```
     DimensionAdd,
     /// Returns the checked sum of `self` and `right`.
-    add(right),
+    dimension_add(right),
     DimensionAddOperation,
 );
 
@@ -91,7 +91,11 @@ mod tests {
         assert_eq!(operation.right_type(), &right);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(3, Some(13)).unwrap());
         assert_eq!(
-            DimensionValue::constant(7).unwrap().add(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
+            DimensionValue::constant(7)
+                .unwrap()
+                .dimension_add(&DimensionValue::constant(3).unwrap())
+                .unwrap()
+                .extent(),
             10,
         );
     }
@@ -132,7 +136,7 @@ mod tests {
         let (traced_type, traced_program) = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
             |left| {
                 let right = left.context().lift(DimensionValue::constant(2)?)?;
-                left.add(&right)?.add(&right)
+                left.dimension_add(&right)?.dimension_add(&right)
             },
             left_type.clone(),
         )

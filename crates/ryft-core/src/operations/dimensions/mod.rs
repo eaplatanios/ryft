@@ -11,43 +11,43 @@ use crate::programs::operations::Operation;
 use crate::programs::types::{Type, TypeError};
 use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
 
-pub mod add;
+pub mod dimension_add;
+pub mod dimension_div_floor;
 pub mod dimension_from_scalar;
+pub mod dimension_max;
+pub mod dimension_min;
+pub mod dimension_mul;
+pub mod dimension_pow;
+pub mod dimension_rem;
+pub mod dimension_requirement;
+pub mod dimension_saturating_sub;
 pub mod dimension_size;
+pub mod dimension_sub;
 pub mod dimension_to_scalar;
-pub mod div_floor;
-pub mod max;
-pub mod min;
-pub mod mul;
-pub mod pow;
-pub mod rem;
-pub mod requirement;
-pub mod saturating_sub;
-pub mod sub;
 
-pub use add::{DIMENSION_ADD_OPERATION_NAME, DimensionAdd, DimensionAddOperation};
+pub use dimension_add::{DIMENSION_ADD_OPERATION_NAME, DimensionAdd, DimensionAddOperation};
+pub use dimension_div_floor::{DIMENSION_DIV_FLOOR_OPERATION_NAME, DimensionDivFloor, DimensionDivFloorOperation};
 pub use dimension_from_scalar::{
     DIMENSION_FROM_SCALAR_OPERATION_NAME, DimensionFromScalar, DimensionFromScalarOperation,
 };
-pub use dimension_size::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize, DimensionSizeOperation};
-pub use dimension_to_scalar::{
-    DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionToScalar, DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,
-};
-pub use div_floor::{DIMENSION_DIV_FLOOR_OPERATION_NAME, DimensionDivFloor, DimensionDivFloorOperation};
-pub use max::{DIMENSION_MAX_OPERATION_NAME, DimensionMax, DimensionMaxOperation};
-pub use min::{DIMENSION_MIN_OPERATION_NAME, DimensionMin, DimensionMinOperation};
-pub use mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMul, DimensionMulOperation};
-pub use pow::{DIMENSION_POW_OPERATION_NAME, DimensionPow, DimensionPowOperation};
-pub use rem::{DIMENSION_REM_OPERATION_NAME, DimensionRem, DimensionRemOperation};
-pub use requirement::{
+pub use dimension_max::{DIMENSION_MAX_OPERATION_NAME, DimensionMax, DimensionMaxOperation};
+pub use dimension_min::{DIMENSION_MIN_OPERATION_NAME, DimensionMin, DimensionMinOperation};
+pub use dimension_mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMul, DimensionMulOperation};
+pub use dimension_pow::{DIMENSION_POW_OPERATION_NAME, DimensionPow, DimensionPowOperation};
+pub use dimension_rem::{DIMENSION_REM_OPERATION_NAME, DimensionRem, DimensionRemOperation};
+pub use dimension_requirement::{
     DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME,
     DIMENSION_REQUIRE_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DimensionRequirement,
     DimensionRequirementOperation, DimensionRequirementPredicate,
 };
-pub use saturating_sub::{
+pub use dimension_saturating_sub::{
     DIMENSION_SATURATING_SUB_OPERATION_NAME, DimensionSaturatingSub, DimensionSaturatingSubOperation,
 };
-pub use sub::{DIMENSION_SUB_OPERATION_NAME, DimensionSub, DimensionSubOperation};
+pub use dimension_size::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize, DimensionSizeOperation};
+pub use dimension_sub::{DIMENSION_SUB_OPERATION_NAME, DimensionSub, DimensionSubOperation};
+pub use dimension_to_scalar::{
+    DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionToScalar, DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,
+};
 
 /// Shared contract implemented by binary first-class-dimension arithmetic operations.
 ///

@@ -14,7 +14,7 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionSub`] for semantic details and an example.
     DimensionSubOperation, DIMENSION_SUB_OPERATION_NAME,
-    DimensionSub, sub,
+    DimensionSub, dimension_sub,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} - {}", left.variable(), right.variable())
     },
@@ -32,7 +32,7 @@ impl SubOperationFor for DimensionType {
 
 define_arithmetic_dimension_capability!(
     /// Subtracts one first-class runtime dimension from another and rejects negative results.
-    /// [`DimensionSub::sub`] is the fallible counterpart to [`std::ops::Sub`];
+    /// [`DimensionSub::dimension_sub`] is the fallible counterpart to [`std::ops::Sub`];
     /// [`DimensionValue`](crate::DimensionValue) supports `-` as panicking convenience syntax.
     ///
     /// # Example
@@ -40,15 +40,15 @@ define_arithmetic_dimension_capability!(
     /// ```rust
     /// # use ryft_core::{DimensionSub, DimensionValue, ProgramError};
     /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(7)?.sub(&DimensionValue::constant(3)?)?;
+    /// let result = DimensionValue::constant(7)?.dimension_sub(&DimensionValue::constant(3)?)?;
     /// assert_eq!(result.extent(), 4);
-    /// assert!(DimensionValue::constant(3)?.sub(&DimensionValue::constant(7)?).is_err());
+    /// assert!(DimensionValue::constant(3)?.dimension_sub(&DimensionValue::constant(7)?).is_err());
     /// # Ok(())
     /// # }
     /// ```
     DimensionSub,
     /// Returns `self - right`, failing if `right` is greater than `self`.
-    sub(right),
+    dimension_sub(right),
     DimensionSubOperation,
 );
 
@@ -82,7 +82,11 @@ mod tests {
         assert_eq!(operation.to_string(), DIMENSION_SUB_OPERATION_NAME);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(8)).unwrap());
         assert_eq!(
-            DimensionValue::constant(7).unwrap().sub(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
+            DimensionValue::constant(7)
+                .unwrap()
+                .dimension_sub(&DimensionValue::constant(3).unwrap())
+                .unwrap()
+                .extent(),
             4,
         );
     }

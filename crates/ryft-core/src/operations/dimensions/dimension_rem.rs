@@ -14,7 +14,7 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionRem`] for semantic details and an example.
     DimensionRemOperation, DIMENSION_REM_OPERATION_NAME,
-    DimensionRem, rem,
+    DimensionRem, dimension_rem,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} % {}", left.variable(), right.variable())
     },
@@ -32,7 +32,7 @@ impl RemOperationFor for DimensionType {
 
 define_arithmetic_dimension_capability!(
     /// Computes the remainder of one runtime dimension divided by a positive runtime dimension.
-    /// [`DimensionRem::rem`] is the fallible counterpart to [`std::ops::Rem`];
+    /// [`DimensionRem::dimension_rem`] is the fallible counterpart to [`std::ops::Rem`];
     /// [`DimensionValue`](crate::DimensionValue) supports `%` as panicking convenience syntax.
     ///
     /// # Example
@@ -40,14 +40,14 @@ define_arithmetic_dimension_capability!(
     /// ```rust
     /// # use ryft_core::{DimensionRem, DimensionValue, ProgramError};
     /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(7)?.rem(&DimensionValue::constant(3)?)?;
+    /// let result = DimensionValue::constant(7)?.dimension_rem(&DimensionValue::constant(3)?)?;
     /// assert_eq!(result.extent(), 1);
     /// # Ok(())
     /// # }
     /// ```
     DimensionRem,
     /// Returns `self % right`, failing when `right` is zero.
-    rem(right),
+    dimension_rem(right),
     DimensionRemOperation,
 );
 
@@ -77,7 +77,11 @@ mod tests {
         assert_eq!(operation.to_string(), DIMENSION_REM_OPERATION_NAME);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(4)).unwrap());
         assert_eq!(
-            DimensionValue::constant(7).unwrap().rem(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
+            DimensionValue::constant(7)
+                .unwrap()
+                .dimension_rem(&DimensionValue::constant(3).unwrap())
+                .unwrap()
+                .extent(),
             1,
         );
     }

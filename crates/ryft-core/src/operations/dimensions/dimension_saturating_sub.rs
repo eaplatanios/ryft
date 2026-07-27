@@ -12,7 +12,7 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionSaturatingSub`] for semantic details and an example.
     DimensionSaturatingSubOperation, DIMENSION_SATURATING_SUB_OPERATION_NAME,
-    DimensionSaturatingSub, saturating_sub,
+    DimensionSaturatingSub, dimension_saturating_sub,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("max(0, {} - {})", left.variable(), right.variable())
     },
@@ -28,14 +28,14 @@ define_arithmetic_dimension_capability!(
     /// # use ryft_core::{DimensionSaturatingSub, DimensionValue, ProgramError};
     /// # fn main() -> Result<(), ProgramError> {
     /// let result = DimensionValue::constant(3)?
-    ///     .saturating_sub(&DimensionValue::constant(7)?)?;
+    ///     .dimension_saturating_sub(&DimensionValue::constant(7)?)?;
     /// assert_eq!(result.extent(), 0);
     /// # Ok(())
     /// # }
     /// ```
     DimensionSaturatingSub,
     /// Returns `max(0, self - right)`.
-    saturating_sub(right),
+    dimension_saturating_sub(right),
     DimensionSaturatingSubOperation,
 );
 
@@ -69,7 +69,7 @@ mod tests {
         assert_eq!(
             DimensionValue::constant(3)
                 .unwrap()
-                .saturating_sub(&DimensionValue::constant(7).unwrap())
+                .dimension_saturating_sub(&DimensionValue::constant(7).unwrap())
                 .unwrap()
                 .extent(),
             0,

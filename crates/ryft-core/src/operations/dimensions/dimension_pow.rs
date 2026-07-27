@@ -12,7 +12,7 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionPow`] for semantic details and an example.
     DimensionPowOperation, DIMENSION_POW_OPERATION_NAME,
-    DimensionPow, pow,
+    DimensionPow, dimension_pow,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} ^ {}", left.variable(), right.variable())
     },
@@ -27,14 +27,14 @@ define_arithmetic_dimension_capability!(
     /// ```rust
     /// # use ryft_core::{DimensionPow, DimensionValue, ProgramError};
     /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(3)?.pow(&DimensionValue::constant(4)?)?;
+    /// let result = DimensionValue::constant(3)?.dimension_pow(&DimensionValue::constant(4)?)?;
     /// assert_eq!(result.extent(), 81);
     /// # Ok(())
     /// # }
     /// ```
     DimensionPow,
     /// Returns `self` raised to the nonnegative integer power `right`.
-    pow(right),
+    dimension_pow(right),
     DimensionPowOperation,
 );
 
@@ -80,7 +80,11 @@ mod tests {
         assert_eq!(operation.to_string(), DIMENSION_POW_OPERATION_NAME);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(5)).unwrap());
         assert_eq!(
-            DimensionValue::constant(3).unwrap().pow(&DimensionValue::constant(4).unwrap()).unwrap().extent(),
+            DimensionValue::constant(3)
+                .unwrap()
+                .dimension_pow(&DimensionValue::constant(4).unwrap())
+                .unwrap()
+                .extent(),
             81,
         );
     }

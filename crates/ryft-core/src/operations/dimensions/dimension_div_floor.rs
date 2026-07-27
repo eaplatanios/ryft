@@ -14,7 +14,7 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionDivFloor`] for semantic details and an example.
     DimensionDivFloorOperation, DIMENSION_DIV_FLOOR_OPERATION_NAME,
-    DimensionDivFloor, div_floor,
+    DimensionDivFloor, dimension_div_floor,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} // {}", left.variable(), right.variable())
     },
@@ -31,23 +31,24 @@ impl DivOperationFor for DimensionType {
 }
 
 define_arithmetic_dimension_capability!(
-    /// Floor-divides one runtime dimension by a positive runtime dimension. [`DimensionDivFloor::div_floor`] is
-    /// the fallible counterpart to [`std::ops::Div`]; because dimensions are nonnegative integers,
-    /// [`DimensionValue`](crate::DimensionValue)'s `/` operator has these same floor-division semantics.
+    /// Floor-divides one runtime dimension by a positive runtime dimension.
+    /// [`DimensionDivFloor::dimension_div_floor`] is the fallible counterpart to [`std::ops::Div`]; because dimensions
+    /// are nonnegative integers, [`DimensionValue`](crate::DimensionValue)'s `/` operator has these same floor-division
+    /// semantics.
     ///
     /// # Example
     ///
     /// ```rust
     /// # use ryft_core::{DimensionDivFloor, DimensionValue, ProgramError};
     /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(7)?.div_floor(&DimensionValue::constant(3)?)?;
+    /// let result = DimensionValue::constant(7)?.dimension_div_floor(&DimensionValue::constant(3)?)?;
     /// assert_eq!(result.extent(), 2);
     /// # Ok(())
     /// # }
     /// ```
     DimensionDivFloor,
     /// Returns `self // right`, failing when `right` is zero.
-    div_floor(right),
+    dimension_div_floor(right),
     DimensionDivFloorOperation,
 );
 
@@ -79,7 +80,7 @@ mod tests {
         assert_eq!(
             DimensionValue::constant(7)
                 .unwrap()
-                .div_floor(&DimensionValue::constant(3).unwrap())
+                .dimension_div_floor(&DimensionValue::constant(3).unwrap())
                 .unwrap()
                 .extent(),
             2,

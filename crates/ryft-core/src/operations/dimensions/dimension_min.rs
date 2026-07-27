@@ -12,7 +12,7 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionMin`] for semantic details and an example.
     DimensionMinOperation, DIMENSION_MIN_OPERATION_NAME,
-    DimensionMin, min,
+    DimensionMin, dimension_min,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("min({}, {})", left.variable(), right.variable())
     },
@@ -27,14 +27,14 @@ define_arithmetic_dimension_capability!(
     /// ```rust
     /// # use ryft_core::{DimensionMin, DimensionValue, ProgramError};
     /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(7)?.min(&DimensionValue::constant(3)?)?;
+    /// let result = DimensionValue::constant(7)?.dimension_min(&DimensionValue::constant(3)?)?;
     /// assert_eq!(result.extent(), 3);
     /// # Ok(())
     /// # }
     /// ```
     DimensionMin,
     /// Returns `min(self, right)`.
-    min(right),
+    dimension_min(right),
     DimensionMinOperation,
 );
 
@@ -63,7 +63,11 @@ mod tests {
         assert_eq!(operation.to_string(), DIMENSION_MIN_OPERATION_NAME);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(1, Some(5)).unwrap());
         assert_eq!(
-            DimensionValue::constant(7).unwrap().min(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
+            DimensionValue::constant(7)
+                .unwrap()
+                .dimension_min(&DimensionValue::constant(3).unwrap())
+                .unwrap()
+                .extent(),
             3,
         );
     }

@@ -12,7 +12,7 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionMax`] for semantic details and an example.
     DimensionMaxOperation, DIMENSION_MAX_OPERATION_NAME,
-    DimensionMax, max,
+    DimensionMax, dimension_max,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("max({}, {})", left.variable(), right.variable())
     },
@@ -27,14 +27,14 @@ define_arithmetic_dimension_capability!(
     /// ```rust
     /// # use ryft_core::{DimensionMax, DimensionValue, ProgramError};
     /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(7)?.max(&DimensionValue::constant(3)?)?;
+    /// let result = DimensionValue::constant(7)?.dimension_max(&DimensionValue::constant(3)?)?;
     /// assert_eq!(result.extent(), 7);
     /// # Ok(())
     /// # }
     /// ```
     DimensionMax,
     /// Returns `max(self, right)`.
-    max(right),
+    dimension_max(right),
     DimensionMaxOperation,
 );
 
@@ -63,7 +63,11 @@ mod tests {
         assert_eq!(operation.to_string(), DIMENSION_MAX_OPERATION_NAME);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(2, Some(9)).unwrap());
         assert_eq!(
-            DimensionValue::constant(7).unwrap().max(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
+            DimensionValue::constant(7)
+                .unwrap()
+                .dimension_max(&DimensionValue::constant(3).unwrap())
+                .unwrap()
+                .extent(),
             7,
         );
     }

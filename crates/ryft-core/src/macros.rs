@@ -236,8 +236,10 @@ macro_rules! check_builders {
 /// ```rust,ignore
 /// define_arithmetic_dimension_operation!(
 ///     /// Checked dimension-addition operation used by [`DimensionAdd`].
-///     DimensionAddOperation, DIMENSION_ADD_OPERATION_NAME,
-///     DimensionAdd, add,
+///     DimensionAddOperation,
+///     DIMENSION_ADD_OPERATION_NAME,
+///     DimensionAdd,
+///     dimension_add,
 ///     result_name = |left: &DimensionType, right: &DimensionType| {
 ///         format!("{} + {}", left.variable(), right.variable())
 ///     },
@@ -252,7 +254,7 @@ macro_rules! check_builders {
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `DIMENSION_ADD_OPERATION_NAME`).
 ///   - `$capability`: Value-level capability required by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `DimensionAdd`).
-///   - `$method`: Semantic capability method used for interpretation (e.g., `add`).
+///   - `$method`: Semantic capability method used for interpretation (e.g., `dimension_add`).
 ///   - `$result_name`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
 ///     the fresh result identity's diagnostic name.
 ///   - `$infer_bounds`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
@@ -426,7 +428,7 @@ macro_rules! define_arithmetic_dimension_operation {
 ///     /// Adds two first-class runtime dimensions.
 ///     DimensionAdd,
 ///     /// Returns the checked sum of `self` and `right`.
-///     add(right),
+///     dimension_add(right),
 ///     DimensionAddOperation,
 /// );
 /// ```
@@ -436,7 +438,7 @@ macro_rules! define_arithmetic_dimension_operation {
 ///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
 ///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `DimensionAdd`).
 ///   - `$(#[$method_documentation])*`: Documentation attributes attached to the generated capability method.
-///   - `$method`: Identifier of the generated binary capability method (e.g., `add`).
+///   - `$method`: Identifier of the generated binary capability method (e.g., `dimension_add`).
 ///   - `$argument`: Name of the capability method's non-receiver argument (e.g., `right`).
 ///   - `$operation`: Dimension-arithmetic operation constructed and bound by the generated implementation (e.g.,
 ///     `DimensionAddOperation`).
