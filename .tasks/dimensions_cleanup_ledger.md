@@ -414,10 +414,11 @@ ledger disagrees with Git.
 
 ## P2c: generic storage-sum projection
 
-- Status: ready for owner review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p2c-generic-storage-projection`
-- Source commit: pending
-- Integration commit: pending owner review
+- Source commit: `064ed670259e3660506e46fcc26a9f1487ccecde`
+- Integration commit: `e5aeef0c4557dda3eefcc80e32005a1c028417e7`
+- Remainder reconciliation commit: `0057c4636`
 - Immutable archive unchanged: yes
 - Scope: introduce the array/dimension storage type and value sums plus generic borrowed and consuming projection
   contracts, preserving concrete eager payload ownership and symbolic SSA identity without introducing projected
@@ -438,5 +439,39 @@ ledger disagrees with Git.
   storage, projection, type, value, or allocation-test implementation
 - Residual search: no archived `ArrayProgramProjection`, array/dimension-specific context view, projected context,
   `.cloned()` eager projection, mixed operation family, gateway, or `dimension_size` implementation was introduced
+- Review method: line by line
+- Next action: reconcile the reviewed increment into the mutable remainder before the P2d handoff
+
+## P2d: zero-state projected binding
+
+- Status: ready for owner review
+- Branch: `u/eaplatanios/increment/p2d-projected-context`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending
+- Immutable archive unchanged: yes
+- Scope: add one generic zero-state context that binds homogeneous member operations directly through a composite
+  parent operation family, plus the operation-family projection contract and the third-member extensibility gate
+- Deferred: production array-program operation-family construction and genuinely mixed operations remain P3;
+  region-carrying projected dispatch remains P4; batching and differentiation policies remain P5 and P6
+- Implemented: adds `OperationProjection<T>` with standard `From`-based lifting, the parent-only
+  `ProjectedContext<C, T>`, and one blanket
+  `Value for ProjectedValue<T, V>`; projected binding lifts exactly the supplied values and operation, rejects regions,
+  binds once through the parent, and projects the results without inspecting a program or reconstructing dependencies
+- Allocation behavior: nullary, unary, and binary projected binds lift inputs through fixed-size stack arrays, while
+  wider operations alone allocate a temporary input vector; output projection materializes the result vector required
+  by `Context::bind`, and final production outer-dispatch allocation and latency measurement remains part of P10
+- Extensibility gate: one test-only storage and operation family with three distinct member kinds exercises eager
+  binding, tracing, resolution, exact SSA identity, and compile-time `Value` support for tracer, partial-tracer, and
+  differentiation-tracer projections; the projected context has the same runtime size as its parent
+- Verification: `cargo check -p ryft-core -p ryft-xla` passed; `cargo test -p ryft-core --lib` passed all 964 tests;
+  `cargo test -p ryft-core --doc` passed 53 tests with 15 ignored; both allocation tests passed; and
+  `cargo test -p ryft-xla --lib -q` passed 396 tests with one ignored
+- Lint audit: strict Clippy remains nonzero because of 229 inherited warnings; the changed-file audit reports only the
+  pre-existing `contexts.rs` type-complexity and clone-on-copy warnings, neither in P2d-owned code
+- Residual search: one production `ProjectedContext`, one production `OperationProjection` trait, and one blanket
+  `Value for ProjectedValue` remain; no array/dimension-specific context view, replay hook, source-array field,
+  ambient-dimension field, or production mixed operation family was introduced; the remaining `with_dimensions`
+  matches are the unrelated reshape-permutation builder and its tests
 - Review method: line by line
 - Next action: commit and push the increment branch, then stage its no-commit merge for owner review

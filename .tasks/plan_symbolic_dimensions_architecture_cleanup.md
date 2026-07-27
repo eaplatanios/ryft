@@ -1032,8 +1032,8 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       payloads, and centralize their shared contract in `ArithmeticDimensionOperation`.
 - [x] P2b.2: remove the concrete backend dependency from generic arithmetic operation generation, make operations own
       capability-constrained interpretation, and make backends own concrete capability implementations.
-- [ ] Introduce ordinary `DimensionType`/`DimensionValue` scalar SSA and the minimal dimension operation family for
-      constants, arithmetic, comparisons, gateways, `dimension_size`, and requirements.
+- [ ] P3a: complete the dimension operation family with comparisons, explicit data gateways, and `dimension_size`;
+      P2a and P2b already provide ordinary dimension SSA, constants, arithmetic, and requirements.
 - [x] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
 - [x] Integrate inconclusive requirements with the existing effects model as `Effect::OrderedAssertion`; specify
       ordering, DCE survival, known-side PE folding, runtime observation values, and diagnostic ownership before
@@ -1048,18 +1048,18 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       its heterogeneous batch representation here would prematurely encode P5's replicated-dimension policy.
 - [x] Replace duplicated projected-value wrappers with one generic owned projected value and one borrowed projected
       view where the concrete eager value cannot be returned directly.
-- [ ] Introduce a zero-state `ProjectedContext<C, T>` that binds homogeneous inner operations directly into the outer
+- [x] Introduce a zero-state `ProjectedContext<C, T>` that binds homogeneous inner operations directly into the outer
       graph.
-- [ ] Add one generic inner-operation lift contract implemented by the outer operation family.
+- [x] Add one generic inner-operation lift contract implemented by the outer operation family.
 - [x] Preserve SSA atom identity exactly through staged projections.
 - [x] Preserve concrete eager values without boxing or heap allocation.
 - [x] Add allocation and payload-size tests proving that projecting a large reference-backend array neither allocates
       nor copies its `Scalar` payload.
 - [x] Pin canonical wrong-kind diagnostics as compile/runtime goldens. Wrong-count diagnostics belong to P3's mixed
       operand schemas because P2c introduces no operand-count projection.
-- [ ] Add a compile-only toy third member kind to prove that another kind needs projection and policy
+- [x] Add a compile-only toy third member kind to prove that another kind needs projection and policy
       implementations, not changes to generic `Program`, `Context`, capture, tracer, or projected-context machinery.
-- [ ] Gate: the projected context contains no semantic state other than its parent, and the vertical slice creates no
+- [x] Gate: the projected context contains no semantic state other than its parent, and the vertical slice creates no
       implicit dimension dependency.
 
 ### Phase 3: establish canonical mixed operation signatures
@@ -1125,9 +1125,16 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 
 ### Phase 5: simplify batching around value-kind policy
 
+- [ ] Promote the toy composite projection fixtures from the `contexts.rs` unit tests (`ProjectedMemberType`,
+      `ProjectedMemberValue`, `ProjectedProgramType`, `ProjectedProgramValue`, `ProjectedProgramOperation`, and the
+      `impl_projected_test_member!` macro) into a `pub(crate)` shared test fixture the moment this phase's generic
+      dispatch tests become their second consumer. Do not duplicate a synthetic composite universe; the promoted
+      fixture is also the vehicle for Phase 6's dispatch tests and the verification matrix's toy third-kind gate.
 - [ ] Represent a dynamic batching extent with its first-class dimension value, not metadata alone.
 - [ ] Make the generic outer dispatcher project array primitives, invoke their existing homogeneous batching rule
-      through the zero-state context, and lift results.
+      through the zero-state context, and lift results. Test the generic projection/lift path against the promoted
+      toy composite fixture in addition to the production array-program universe, so the dispatch machinery is proven
+      member-kind-agnostic rather than array-specific.
 - [ ] Handle dimension-only operations with the replicated-only dimension batching policy.
 - [ ] Reject mapped dimension authority at the boundary with the existing typed diagnostic.
 - [ ] Keep dedicated rules only for genuinely mixed shape-changing and region-carrying operations.
@@ -1154,7 +1161,8 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       mixed inference segment, eager input handling, and composite differentiation special case.
 - [ ] Audit concatenate, mean/reductions, slice, pad, and gather transposes and migrate every analogous extent need to
       the same residual contract.
-- [ ] Make generic outer dispatch project/lift array-only JVP, VJP, and transpose rules.
+- [ ] Make generic outer dispatch project/lift array-only JVP, VJP, and transpose rules, reusing the shared toy
+      composite fixture promoted in Phase 5 for the member-kind-agnostic dispatch tests.
 - [ ] Preserve dimension values as ordinary structural residuals without tangent slots.
 - [ ] Keep explicit mixed rules only where primal dimension operands control array results or region interfaces.
 - [ ] Remove temporary homogeneous differentiation programs and dimension recovery.
@@ -1802,3 +1810,34 @@ authority policies assigned to P5. P2d can therefore prototype direct projected 
 without pulling transformation policy forward.
 
 Verification and residual-audit results are recorded in the P2c cleanup-ledger entry at handoff.
+
+### Execution: P2d zero-state projected binding
+
+P2d completes the generic member adapter without introducing the production array-program dispatcher or any mixed
+shape operation:
+
+- `OperationProjection<T>` associates a composite operation family with one homogeneous member family, while its
+  required standard `From` implementation provides the sole lift into the outer dispatcher;
+- `ProjectedContext<C, T>` stores only `C` plus a zero-sized type marker, delegates eagerness and resolution, and
+  performs one project/lift/bind/project round trip with no program inspection or dependency reconstruction;
+- nullary, unary, and binary projected binds reconstruct parent inputs in fixed-size stack arrays; only wider
+  homogeneous operations allocate a temporary input vector; projecting the parent context's returned output vector
+  still materializes the projected output vector required by the current `Context::bind` API;
+- projected binding rejects both declared and attached regions because heterogeneous region signatures remain owned by
+  the outer higher-order operations in P4;
+- one blanket `Value for ProjectedValue<T, V>` supplies dispatch and execution domains for tracers, partial tracers,
+  and differentiation tracers; no carrier-specific `Value` implementation is added;
+- a three-member test family exercises eager binding, ordinary trace staging, exact SSA identity, constant/staged
+  resolution, absence of implicit operands and regions, and unchanged generic support for tracer and transform
+  carriers; and
+- the context-size assertion pins that the type marker adds no runtime storage beyond the parent context.
+
+Production `ArrayProgramOperation`, mixed operand schemas, shape operations, higher-order region projection, batching,
+and differentiation policies remain assigned to P3–P6. The existing reference-array allocation tests continue to prove
+that borrowed and consuming eager value projection neither allocates nor copies payloads. Projected-context binding
+temporarily reconstructs parent values from borrowed inputs because the generic `Context::bind` contract accepts a
+slice; concrete eager member values continue to dispatch through their native contexts, while symbolic projected
+values clone only their parent tracer/transform representation and preserve SSA identity. P10 retains the final
+cross-context allocation and latency measurement once production outer dispatch is present.
+
+Verification and residual-audit results are recorded in the P2d cleanup-ledger entry at handoff.
