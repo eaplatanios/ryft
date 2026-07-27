@@ -48,7 +48,7 @@ use crate::operations::control_flow::{ConditionOperation, ScanOperation, SelectO
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{CoordinateBasisOperation, StopGradient, StopGradientOperation};
-use crate::operations::dimensions::{DIMENSION_SIZE_OPERATION_NAME, DimensionExtent};
+use crate::operations::dimensions::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize};
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
 use crate::operations::manipulation::conversion::ElementType;
 use crate::operations::manipulation::{
@@ -445,17 +445,19 @@ impl Value for Array {
     }
 }
 
-impl DimensionExtent for Array {
-    fn dimension_extent(&self, axis: usize) -> Result<usize, ProgramError> {
-        let Some(dimension) = self.r#type.shape().dimensions().get(axis) else {
-            return Err(TypeError::invalid(format!(
+impl DimensionSize<usize> for Array {
+    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<usize, ProgramError> {
+        let axis = axis.into();
+        let position = axis.normalize(self.r#type.rank()).map_err(|_| {
+            TypeError::invalid(format!(
                 "'{DIMENSION_SIZE_OPERATION_NAME}' axis {axis} is out of bounds for rank {}",
                 self.r#type.rank(),
             ))
-            .into());
-        };
+        })?;
+        let dimension = &self.r#type.shape().dimensions()[position];
         dimension.value().ok_or_else(|| {
-            TypeError::invalid(format!("materialized reference array has a dynamic dimension at axis {axis}",)).into()
+            TypeError::invalid(format!("materialized reference array has a dynamic dimension at axis {position}",))
+                .into()
         })
     }
 }

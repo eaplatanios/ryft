@@ -7,7 +7,7 @@ use crate::backends::arrays::ArrayOperation;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::contexts::EagerContext;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::operations::dimensions::{DimensionExtent, DimensionSize, DimensionSizeOperation};
+use crate::operations::dimensions::{DimensionSize, DimensionSizeOperation};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::effects::Effects;
@@ -265,7 +265,7 @@ where
     Ok(outputs.into_iter().map(<ArrayProgramValue<A> as ValueProjection<T>>::from_projected).collect())
 }
 
-impl<A: DimensionExtent + Value<Type = ArrayType>>
+impl<A: DimensionSize<usize> + Value<Type = ArrayType>>
     InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
 where
     ArrayOperation<A>: InterpretableOperation<EagerContext<A, ArrayOperation<A>>>,
@@ -361,12 +361,12 @@ impl<A: Value<Type = ArrayType>> Value for ArrayProgramValue<A> {
     }
 }
 
-impl<A: DimensionExtent + Value<Type = ArrayType>> DimensionSize for ArrayProgramValue<A> {
+impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayProgramValue<A> {
     fn dimension_size<AxisValue: Into<crate::Axis>>(&self, axis: AxisValue) -> Result<Self, ProgramError> {
         let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let input_type = array.r#type();
         let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
-        let extent = array.dimension_extent(operation.axis())?;
+        let extent = <A as DimensionSize<usize>>::dimension_size(array, operation.axis())?;
         Ok(Self::Dimension(DimensionValue::new(operation.result_type().clone(), extent)?))
     }
 }

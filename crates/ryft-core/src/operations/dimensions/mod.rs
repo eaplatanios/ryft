@@ -24,7 +24,7 @@ pub mod saturating_sub;
 pub mod sub;
 
 pub use add::{DIMENSION_ADD_OPERATION_NAME, DimensionAdd, DimensionAddOperation};
-pub use dimension_size::{DIMENSION_SIZE_OPERATION_NAME, DimensionExtent, DimensionSize, DimensionSizeOperation};
+pub use dimension_size::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize, DimensionSizeOperation};
 pub use div_floor::{DIMENSION_DIV_FLOOR_OPERATION_NAME, DimensionDivFloor, DimensionDivFloorOperation};
 pub use max::{DIMENSION_MAX_OPERATION_NAME, DimensionMax, DimensionMaxOperation};
 pub use min::{DIMENSION_MIN_OPERATION_NAME, DimensionMin, DimensionMinOperation};

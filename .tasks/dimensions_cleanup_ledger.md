@@ -520,8 +520,9 @@ ledger disagrees with Git.
   eager refinement; the production payload retains the selected declared axis dimension and validates refinement
   directionally
 - Implementation: added the sole mixed `array -> dimension` operation, dynamic identity forwarding, exact static
-  results, one constant-time reference-backend extent provider, outer-family eager dispatch, projected-array staging,
-  ordinary partial evaluation, and composite trace/import coverage
+  results, a shared `DimensionSize<Output>` capability with constant-time `DimensionSize<usize>` reference-backend
+  extraction, outer-family eager dispatch, projected-array staging, ordinary partial evaluation, and composite
+  trace/import coverage
 - Verification: focused operation and dispatcher tests, allocation integration tests, core check/lib/doc suites, XLA
   check/lib suite, formatting, diff check, changed-file Clippy attribution, and architectural residual searches pass
 - Residual search: no homogeneous array contract, rank-zero integer result, runtime-dimension data type, array-family
