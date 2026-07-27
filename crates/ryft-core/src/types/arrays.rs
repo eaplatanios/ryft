@@ -466,16 +466,9 @@ impl Type for ArrayType {
         declared: &[Self],
         actual: &[Self],
     ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-        if declared.len() != actual.len() {
-            return Err(TypeError::invalid(format!(
-                "declared type count {} does not match actual type count {}",
-                declared.len(),
-                actual.len(),
-            )));
-        }
         let mut renaming = TypeIdentityRenaming::new();
         let mut refinements = ArrayTypeRefinements::default();
-        declared.iter().zip(actual).try_for_each(|(declared, actual)| {
+        visit_signature_pairs(declared, actual, |declared, actual| {
             Self::extend_identity_renaming(declared, actual, &mut renaming, &mut refinements)
         })?;
         refinements.require_disjoint_from(&renaming)?;
@@ -725,14 +718,27 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
     }
 }
 
-/// [`Type`] used in [`Program`](crate::Program)s that may contain both [`ArrayType`]-valued and
-/// [`DimensionType`]-valued values. This enum is a storage boundary rather than the semantic contract of ordinary
-/// primitives. Array-only [`Operation`](crate::Operation)s use [`ArrayType`], dimension-only operations use
-/// [`DimensionType`], and genuinely mixed operations use this type directly. Standard [`From`] and [`TryFrom`]
-/// conversions provide a checked bridge between those contracts.
+/// [`Type`] of values stored in [`Program`](crate::Program)s that mix ordinary arrays with first-class runtime
+/// dimensions. It is the type-level counterpart of
+/// [`ArrayProgramValue`](crate::backends::array_programs::ArrayProgramValue), with one member per value kind.
+///
+/// The sum is a storage boundary rather than the contract ordinary primitives are written against: array-only
+/// [`Operation`](crate::Operation)s and transform rules keep consuming [`ArrayType`], dimension-only operations keep
+/// consuming [`DimensionType`], and only genuinely mixed operations — shape-carrying operations whose dynamic output
+/// extents are explicit dimension operands — consume this type directly. [`From`] lifts each member type into the
+/// sum, and the borrowing [`TryFrom`] implementations project it back out with a checked kind diagnostic. The same
+/// bridge backs the value-level [`ValueProjection`](crate::programs::ValueProjection) implementations.
+///
+/// Both members carry [`DimensionVariable`] identities, so one renaming and refinement vocabulary spans a complete
+/// signature: an [`ArrayType`] member *references* the variables named by its dynamic axes, while a [`DimensionType`]
+/// member *defines* its variable. [`Type::derive_identity_renaming`] therefore checks a variable repeated across
+/// array and dimension members for consistency, exactly as it does within one member kind.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayProgramType {
+    /// An ordinary array type.
     Array(ArrayType),
+
+    /// A first-class runtime dimension type.
     Dimension(DimensionType),
 }
 
@@ -784,7 +790,6 @@ impl<'t> TryFrom<&'t ArrayProgramType> for &'t DimensionType {
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl Type for ArrayProgramType {
     type Identity = DimensionVariable;
     type Refinements = ArrayProgramTypeRefinements;
@@ -801,17 +806,9 @@ impl Type for ArrayProgramType {
         declared: &[Self],
         actual: &[Self],
     ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-        if declared.len() != actual.len() {
-            return Err(TypeError::invalid(format!(
-                "declared type count {} does not match actual type count {}",
-                declared.len(),
-                actual.len(),
-            )));
-        }
-
         let mut renaming = TypeIdentityRenaming::new();
         let mut refinements = ArrayTypeRefinements::default();
-        declared.iter().zip(actual).try_for_each(|(declared, actual)| match (declared, actual) {
+        visit_signature_pairs(declared, actual, |declared, actual| match (declared, actual) {
             (Self::Array(declared), Self::Array(actual)) => {
                 ArrayType::extend_identity_renaming(declared, actual, &mut renaming, &mut refinements)
             }
@@ -829,6 +826,7 @@ impl Type for ArrayProgramType {
         Ok(renaming)
     }
 
+    #[inline]
     fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
         match self {
             Self::Array(r#type) => Ok(Self::Array(r#type.rename_identities(renaming)?)),
@@ -836,6 +834,7 @@ impl Type for ArrayProgramType {
         }
     }
 
+    #[inline]
     fn is_compatible_with(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Array(left), Self::Array(right)) => left.is_compatible_with(right),
@@ -844,6 +843,7 @@ impl Type for ArrayProgramType {
         }
     }
 
+    #[inline]
     fn is_refined_by(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Array(left), Self::Array(right)) => left.is_refined_by(right),
@@ -854,27 +854,34 @@ impl Type for ArrayProgramType {
 
     #[inline]
     fn is_scalar(&self) -> bool {
-        matches!(self, Self::Array(r#type) if r#type.is_scalar())
+        match self {
+            Self::Array(r#type) => r#type.is_scalar(),
+            Self::Dimension(r#type) => r#type.is_scalar(),
+        }
     }
 
     #[inline]
     fn is_complex(&self) -> bool {
-        matches!(self, Self::Array(r#type) if r#type.is_complex())
+        match self {
+            Self::Array(r#type) => r#type.is_complex(),
+            Self::Dimension(r#type) => r#type.is_complex(),
+        }
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// [`TypeRefinements`] established while refining one complete [`ArrayProgramType`] signature.
 ///
-/// Only array members can refine a dynamic dimension identity to a static extent. Dimension members still participate
-/// in ordinary bounds checks and identity renaming through [`ArrayProgramType`]'s [`Type`] implementation.
+/// Every refinement fact comes from an array member: a declared dynamic axis met by a static extent contributes a
+/// dynamic-to-static binding that all array members of the signature share, following the [`ArrayTypeRefinements`]
+/// rules unchanged. Dimension members contribute no facts, because a [`DimensionType`] never carries a concrete
+/// extent — a first-class dimension's runtime extent lives in its *value*, not its type descriptor. Refining a
+/// dimension member therefore only checks that the actual member's bounds stay within the declared member's bounds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrayProgramTypeRefinements {
-    /// Refinement facts shared by all array members of the heterogeneous signature.
+    /// Refinement facts shared by all array members of the signature.
     arrays: ArrayTypeRefinements,
 }
 
-// TODO(eaplatanios): Review this.
 impl ArrayProgramTypeRefinements {
     /// Validates one storage-kind pair and delegates array-specific refinement work to `visit_array`.
     fn visit_pair(
@@ -902,7 +909,6 @@ impl ArrayProgramTypeRefinements {
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl TypeRefinements<ArrayProgramType> for ArrayProgramTypeRefinements {
     fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
     where
@@ -911,24 +917,15 @@ impl TypeRefinements<ArrayProgramType> for ArrayProgramTypeRefinements {
         D::Item: Borrow<ArrayProgramType>,
         A::Item: Borrow<ArrayProgramType>,
     {
-        let declared = declared.into_iter();
-        let actual = actual.into_iter();
-        if declared.len() != actual.len() {
-            return Err(TypeError::invalid(format!(
-                "declared type count {} does not match actual type count {}",
-                declared.len(),
-                actual.len(),
-            )));
-        }
-
-        declared.zip(actual).try_fold(Self::default(), |mut refinements, (declared, actual)| {
-            Self::visit_pair(declared.borrow(), actual.borrow(), |declared, actual| {
+        let mut refinements = Self::default();
+        visit_signature_pairs(declared, actual, |declared, actual| {
+            Self::visit_pair(declared, actual, |declared, actual| {
                 ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
                     refinements.arrays.bind(variable, extent)
                 })
-            })?;
-            Ok(refinements)
-        })
+            })
+        })?;
+        Ok(refinements)
     }
 
     fn validate<D: IntoIterator, A: IntoIterator>(
@@ -943,19 +940,9 @@ impl TypeRefinements<ArrayProgramType> for ArrayProgramTypeRefinements {
         D::Item: Borrow<ArrayProgramType>,
         A::Item: Borrow<ArrayProgramType>,
     {
-        let declared = declared.into_iter();
-        let actual = actual.into_iter();
-        if declared.len() != actual.len() {
-            return Err(TypeError::invalid(format!(
-                "declared type count {} does not match actual type count {}",
-                declared.len(),
-                actual.len(),
-            )));
-        }
-
         let mut refinements = self.clone();
-        declared.zip(actual).try_for_each(|(declared, actual)| {
-            Self::visit_pair(declared.borrow(), actual.borrow(), |declared, actual| {
+        visit_signature_pairs(declared, actual, |declared, actual| {
+            Self::visit_pair(declared, actual, |declared, actual| {
                 ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
                     refinements.arrays.validate_or_bind(variable, extent, locally_defined_identities)
                 })

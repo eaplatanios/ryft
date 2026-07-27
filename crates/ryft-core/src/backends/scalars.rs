@@ -53,7 +53,7 @@ use crate::types::DataType;
 
 // TODO(eaplatanios): Review this module.
 
-/// Closed [`Scalar`] [`Operation`] type for ordinary staged scalar [`Program`](crate::Program)s.
+/// Closed [`Operation`] type for staged [`Scalar`] [`Program`](crate::Program)s.
 #[derive(Clone, Debug, Operation)]
 #[ryft(dispatch(differentiation, transposition))]
 pub enum ScalarOperation<V: Value<Type = DataType>> {

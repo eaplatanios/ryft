@@ -20,6 +20,25 @@ use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
 use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
 
+// TODO(eaplatanios): Why can we not use `AddOperation` instead of `DimensionAddOperation`, etc.? That would also
+//  remove the need for `AddOperationFor`, etc.
+
+/// Closed [`Operation`] type for staged [`DimensionValue`] [`Program`](crate::Program)s.
+#[derive(Clone, Debug, Operation)]
+pub enum DimensionOperation<V: Value<Type = DimensionType>> {
+    Constant(ConstantOperation<V>),
+    Add(DimensionAddOperation),
+    Sub(DimensionSubOperation),
+    SaturatingSub(DimensionSaturatingSubOperation),
+    Mul(DimensionMulOperation),
+    Pow(DimensionPowOperation),
+    DivFloor(DimensionDivFloorOperation),
+    Rem(DimensionRemOperation),
+    Min(DimensionMinOperation),
+    Max(DimensionMaxOperation),
+    Requirement(DimensionRequirementOperation),
+}
+
 /// [`TracingContext`] over [`DimensionValue`]s and [`DimensionOperation`]s.
 pub type DimensionTracingContext = TracingContext<DimensionValue, DimensionOperation<DimensionValue>>;
 
@@ -337,47 +356,6 @@ impl DimensionRequirement for DimensionValue {
             .evaluate_extents(self.extent, None)
             .map_err(Into::into)
     }
-}
-
-/// Closed operation family stored by programs over first-class dimensions.
-///
-/// Each arithmetic variant contains a distinct nominal operation type. This enum is the single dynamic dispatch
-/// boundary needed to store heterogeneous instructions in a homogeneous [`crate::Program`]; the operation itself
-/// contains no second arithmetic selector.
-#[derive(Clone, Debug, Operation)]
-pub enum DimensionOperation<V: Value<Type = DimensionType>> {
-    /// Dimension literal.
-    Constant(ConstantOperation<V>),
-
-    /// Checked dimension addition.
-    Add(DimensionAddOperation),
-
-    /// Checked dimension subtraction.
-    Sub(DimensionSubOperation),
-
-    /// Saturating dimension subtraction.
-    SaturatingSub(DimensionSaturatingSubOperation),
-
-    /// Checked dimension multiplication.
-    Mul(DimensionMulOperation),
-
-    /// Checked dimension exponentiation.
-    Pow(DimensionPowOperation),
-
-    /// Checked dimension floor division.
-    DivFloor(DimensionDivFloorOperation),
-
-    /// Checked dimension remainder.
-    Rem(DimensionRemOperation),
-
-    /// Dimension minimum.
-    Min(DimensionMinOperation),
-
-    /// Dimension maximum.
-    Max(DimensionMaxOperation),
-
-    /// Ordered dimension requirement.
-    Requirement(DimensionRequirementOperation),
 }
 
 #[cfg(test)]
