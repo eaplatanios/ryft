@@ -393,6 +393,22 @@ where
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
+            Self::Compare(_) => {
+                let [left, right] = inputs else {
+                    return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+                };
+                // First-class dimensions describe one shared array shape, so mapping either operand would make the
+                // comparison predicate vary per batch item without a corresponding ragged-shape model.
+                left.validate_replicated_dimension()?;
+                right.validate_replicated_dimension()?;
+                // Comparing two replicated dimensions produces ordinary replicated Boolean array data.
+                Ok(context
+                    .parent
+                    .bind(self.clone(), Vec::new(), &[left.value.clone(), right.value.clone()])?
+                    .into_iter()
+                    .map(ArrayProgramBatch::replicated)
+                    .collect())
+            }
             Self::DimensionFromScalar(operation) => {
                 let [input] = inputs else {
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -456,6 +472,7 @@ mod tests {
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroOperation;
     use crate::operations::dimensions::{
         DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionToScalar,
@@ -525,6 +542,40 @@ mod tests {
             dimension_to_scalar.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&mapped_dimension)),
             Err(BatchingError::MappedDimension { r#type: Box::new(dimension_type.clone()), axis: BatchAxis::new(0) }),
         );
+        let comparison = ArrayProgramOperation::<Array>::from(CompareOperation::new(ComparisonDirection::LessThan));
+        let comparison_right = ArrayProgramValue::Dimension(DimensionValue::new(dimension_type.clone(), 5).unwrap());
+        assert_eq!(
+            comparison.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    ArrayProgramBatch::replicated(dimension.clone()),
+                    ArrayProgramBatch::replicated(comparison_right.clone()),
+                ],
+            ),
+            Ok(vec![ArrayProgramBatch::replicated(ArrayProgramValue::Array(Array::scalar(true)))]),
+        );
+        assert_eq!(
+            comparison.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[mapped_dimension.clone(), ArrayProgramBatch::replicated(comparison_right.clone())],
+            ),
+            Err(BatchingError::MappedDimension { r#type: Box::new(dimension_type.clone()), axis: BatchAxis::new(0) }),
+        );
+        let mapped_comparison_right = ArrayProgramBatch {
+            value: comparison_right,
+            batch_axis: BatchAxis::new(0),
+            r#type: ArrayProgramType::Dimension(dimension_type.clone()),
+        };
+        assert_eq!(
+            comparison.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayProgramBatch::replicated(dimension.clone()), mapped_comparison_right],
+            ),
+            Err(BatchingError::MappedDimension { r#type: Box::new(dimension_type.clone()), axis: BatchAxis::new(0) }),
+        );
         let dimension_add = ArrayProgramOperation::<Array>::from(DimensionOperation::Add(
             DimensionAddOperation::new(&dimension_type, &dimension_type).unwrap(),
         ));
@@ -534,7 +585,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[mapped_dimension, ArrayProgramBatch::replicated(dimension.clone())],
             ),
-            Err(BatchingError::MappedDimension { r#type: Box::new(dimension_type), axis: BatchAxis::new(0) }),
+            Err(BatchingError::MappedDimension { r#type: Box::new(dimension_type.clone()), axis: BatchAxis::new(0) }),
         );
 
         let gateway_variable = DimensionVariable::new("gateway", DimensionBounds::new(0, Some(9)).unwrap());

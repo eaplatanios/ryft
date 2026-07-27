@@ -605,10 +605,10 @@ ledger disagrees with Git.
 
 ## P3e: vector-element composition
 
-- Status: ready for review
-- Branch: `u/eaplatanios/dynamic-shapes` (unstaged owner-review changes)
-- Source commit: not applicable; the proposed dedicated operation was removed before landing
-- Integration commit: not applicable
+- Status: landed
+- Branch: `u/eaplatanios/dynamic-shapes`
+- Source commit: `faa79e49296a6861022529fba4fb01567e196cc1`
+- Integration commit: `faa79e49296a6861022529fba4fb01567e196cc1`
 - Remainder reconciliation commit: pending
 - Immutable archive unchanged: yes
 - Scope: decide whether indexed vector-data-to-dimension conversion needs a dedicated mixed operation or should compose
@@ -628,5 +628,53 @@ ledger disagrees with Git.
 - Residual search: no production operation, capability, export, dispatcher variant, transform rule, backend
   implementation, lowering case, or test named `DimensionFromVectorElement` or
   `dimension_from_vector_element` remains
+- Review method: line by line
+- Next action: none
+
+## P3f: first-class dimension comparison
+
+- Status: ready for review
+- Branch: `u/eaplatanios/dynamic-shapes`
+- Baseline commit: `faa79e49296a6861022529fba4fb01567e196cc1`
+- Immutable archive unchanged: yes
+- Scope: extend the canonical `CompareOperation` and `Compare<Output>` capability with the composite member signature
+  `(Dimension, Dimension) -> Array(Boolean scalar)`, then carry it through eager execution, tracing, partial
+  evaluation, batching, differentiation/transposition, import, and direct StableHLO lowering
+- Design: treat comparison as a benign multi-contract operation; reuse its existing payload, direction enum,
+  rendering, purity, and value capability rather than adding a dimension-specific operation or method vocabulary
+- Prototype gate: the initial associated-output capability conflicted with the blanket staged-value implementation.
+  Replacing the associated output with an `Output = Self` generic parameter makes homogeneous `Compare<Self>` and
+  projected-dimension `Compare<ParentValue>` distinct coherent trait instantiations without adding a provider trait
+- Explicit exclusions: no `DimensionCompareOperation`, `DimensionCompare` capability, Boolean dimension, expression,
+  witness, bounds prover, host readback, data-gateway detour, or new projection/context abstraction
+- Plan: `.tasks/plan_p3f_dimension_compare.md`
+- Toolchain baseline: `rustc 1.93.1`, `cargo 1.93.1`
+- Verification baseline: inherited P3e handoff passed 975 core library tests, 57 executable core doctests with 16
+  ignored, and 398 executable XLA library tests with one ignored benchmark
+- Implementation: `CompareOperation` now has the precise composite contract
+  `(Dimension, Dimension) -> Array(Boolean scalar)`. The associated `Compare::Output` type became an
+  `Output = Self` trait parameter so projected dimensions can select their parent array-program value as the output
+  without overlapping the homogeneous blanket implementation. Projected dimensions bind the existing operation
+  directly in the parent context, while homogeneous array comparisons retain their existing projected array-family
+  path
+- Execution and transforms: the reference eager backend compares checked extents directly; partial evaluation folds
+  known inputs and residualizes unknown inputs once; batching accepts replicated dimensions and returns replicated
+  predicate data; JVP assigns structural-zero differential space; transposition retains the canonical rejection
+- Lowering: both scalar `i64` dimension operands feed the existing signed StableHLO comparison lowering directly.
+  Structural checks prove one compare per result and no `dimension_to_scalar`; CPU PJRT execution covers equality and
+  ordered comparison
+- Verification: 976/976 core library tests; 58 executable core doctests with 16 ignored; 399/400 XLA library tests
+  with one ignored benchmark; both projection-allocation guards; targeted core/XLA comparison tests; core/XLA
+  compilation; formatting and whitespace checks
+- Clippy attribution: the workspace-wide `-D warnings` run remains blocked by inherited diagnostics. Filtered
+  changed-file output found no P3f diagnostics after removing the two `CompareOperation::render` needless borrows;
+  remaining matches in touched legacy files predate and do not overlap this increment
+- Residual audit: no dimension-specific comparison type, capability, or method vocabulary exists. One direct
+  `ArrayProgramOperation::Compare(CompareOperation)` complements the pre-existing homogeneous array-family variant;
+  no comparison result uses `DimensionType`/`DimensionValue`, and no expression, witness, bounds prover, host readback,
+  data gateway, or extra projection/context abstraction was introduced
+- Review size: 17 tracked files, 553 inserted and 89 removed lines relative to the baseline, including
+  tests, documentation, ledger updates, and mechanical `Compare<Output = V>` to `Compare<V>` bound migrations; below
+  the 800-line P3f review budget
 - Review method: line by line
 - Next action: owner review, staging, commit, and push

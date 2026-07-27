@@ -11,6 +11,7 @@ use crate::differentiation::{
     TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::dimensions::{
     DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
@@ -57,6 +58,20 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// Homogeneous first-class-dimension operation.
     Dimension(DimensionOperation<DimensionValue>),
 
+    /// Mixed comparison of two first-class dimensions that produces ordinary rank-zero Boolean array data.
+    ///
+    /// This variant has the precise composite member signature
+    /// `(Dimension, Dimension) -> Array(Boolean scalar)`. It lives directly in [`ArrayProgramOperation`] because
+    /// [`DimensionOperation`] is intentionally homogeneous: its inputs and outputs are all first-class dimensions.
+    /// Storing comparison there would break that invariant because a predicate is ordinary data rather than shape
+    /// authority.
+    ///
+    /// Homogeneous array comparison remains [`ArrayProgramOperation::Array`] wrapping
+    /// [`ArrayOperation::Compare`]. This variant does not permit array-dimension or dimension-array comparisons; it
+    /// reuses [`CompareOperation`] for the dimension-dimension signature whose result crosses from the dimension
+    /// member kind to the array member kind.
+    Compare(CompareOperation),
+
     /// Mixed operation that reads an array axis as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
 
@@ -85,6 +100,13 @@ impl<A: Value<Type = ArrayType>> From<DimensionOperation<DimensionValue>> for Ar
     #[inline]
     fn from(operation: DimensionOperation<DimensionValue>) -> Self {
         Self::Dimension(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<CompareOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: CompareOperation) -> Self {
+        Self::Compare(operation)
     }
 }
 
@@ -169,6 +191,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Zero(operation) => operation.name(),
             Self::Array(operation) => operation.name(),
             Self::Dimension(operation) => operation.name(),
+            Self::Compare(operation) => Operation::<ArrayProgramType>::name(operation),
             Self::DimensionSize(operation) => operation.name(),
             Self::DimensionFromScalar(operation) => operation.name(),
             Self::DimensionToScalar(operation) => operation.name(),
@@ -181,6 +204,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Zero(operation) => operation.region_slots(),
             Self::Array(operation) => operation.region_slots(),
             Self::Dimension(operation) => operation.region_slots(),
+            Self::Compare(operation) => Operation::<ArrayProgramType>::region_slots(operation),
             Self::DimensionSize(operation) => operation.region_slots(),
             Self::DimensionFromScalar(operation) => operation.region_slots(),
             Self::DimensionToScalar(operation) => operation.region_slots(),
@@ -210,6 +234,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                     .map(|types| types.map(|types| types.into_iter().map(Into::into).collect()))
                     .collect())
             }
+            Self::Compare(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::DimensionSize(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::DimensionFromScalar(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::DimensionToScalar(operation) => operation.infer_region_input_types(input_types, region_interfaces),
@@ -244,6 +269,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                     .map(Into::into)
                     .collect())
             }
+            Self::Compare(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::DimensionSize(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::DimensionFromScalar(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::DimensionToScalar(operation) => operation.infer_output_types(input_types, region_interfaces),
@@ -256,6 +282,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Zero(operation) => operation.output_region_provenance(output_index),
             Self::Array(operation) => operation.output_region_provenance(output_index),
             Self::Dimension(operation) => operation.output_region_provenance(output_index),
+            Self::Compare(operation) => {
+                Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
+            }
             Self::DimensionSize(operation) => operation.output_region_provenance(output_index),
             Self::DimensionFromScalar(operation) => operation.output_region_provenance(output_index),
             Self::DimensionToScalar(operation) => operation.output_region_provenance(output_index),
@@ -268,6 +297,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Zero(operation) => operation.is_zero(output_index),
             Self::Array(operation) => operation.is_zero(output_index),
             Self::Dimension(operation) => operation.is_zero(output_index),
+            Self::Compare(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
             Self::DimensionSize(operation) => operation.is_zero(output_index),
             Self::DimensionFromScalar(operation) => operation.is_zero(output_index),
             Self::DimensionToScalar(operation) => operation.is_zero(output_index),
@@ -280,6 +310,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Zero(operation) => operation.effects(),
             Self::Array(operation) => operation.effects(),
             Self::Dimension(operation) => operation.effects(),
+            Self::Compare(operation) => Operation::<ArrayProgramType>::effects(operation),
             Self::DimensionSize(operation) => operation.effects(),
             Self::DimensionFromScalar(operation) => operation.effects(),
             Self::DimensionToScalar(operation) => operation.effects(),
@@ -291,6 +322,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Zero(operation) => Ok(Self::Zero(operation.rename_type_identities(renaming)?)),
             Self::Array(operation) => Ok(Self::Array(operation.rename_type_identities(renaming)?)),
             Self::Dimension(operation) => Ok(Self::Dimension(operation.rename_type_identities(renaming)?)),
+            Self::Compare(operation) => {
+                Ok(Self::Compare(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
             Self::DimensionSize(operation) => Ok(Self::DimensionSize(operation.rename_type_identities(renaming)?)),
             Self::DimensionFromScalar(operation) => {
                 Ok(Self::DimensionFromScalar(operation.rename_type_identities(renaming)?))
@@ -307,6 +341,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Zero(operation) => operation.render(formatter, indentation),
             Self::Array(operation) => operation.render(formatter, indentation),
             Self::Dimension(operation) => operation.render(formatter, indentation),
+            Self::Compare(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
             Self::DimensionSize(operation) => operation.render(formatter, indentation),
             Self::DimensionFromScalar(operation) => operation.render(formatter, indentation),
             Self::DimensionToScalar(operation) => operation.render(formatter, indentation),
@@ -358,7 +393,7 @@ where
 impl<A: DimensionFromScalar<DimensionValue> + DimensionSize<usize> + Value<Type = ArrayType>>
     InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
 where
-    DimensionValue: DimensionToScalar<A>,
+    DimensionValue: Compare<A> + DimensionToScalar<A>,
     EagerContext<A, ArrayOperation<A>>: Zero<A>,
     ArrayOperation<A>: InterpretableOperation<EagerContext<A, ArrayOperation<A>>>,
     DimensionOperation<DimensionValue>:
@@ -384,6 +419,11 @@ where
             ),
             Self::Array(operation) => interpret_homogeneous_operation(operation, inputs),
             Self::Dimension(operation) => interpret_homogeneous_operation(operation, inputs),
+            Self::Compare(operation) => operation.interpret(
+                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
+                &EmptyRegionDriver,
+                inputs,
+            ),
             Self::DimensionSize(operation) => operation.interpret(
                 &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
                 &EmptyRegionDriver,
@@ -632,6 +672,20 @@ impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayP
     }
 }
 
+impl Compare<Array> for DimensionValue {
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Array, ProgramError> {
+        let result = match direction {
+            ComparisonDirection::Equal => self.extent() == rhs.extent(),
+            ComparisonDirection::NotEqual => self.extent() != rhs.extent(),
+            ComparisonDirection::LessThan => self.extent() < rhs.extent(),
+            ComparisonDirection::LessThanOrEqual => self.extent() <= rhs.extent(),
+            ComparisonDirection::GreaterThan => self.extent() > rhs.extent(),
+            ComparisonDirection::GreaterThanOrEqual => self.extent() >= rhs.extent(),
+        };
+        Ok(Array::scalar(result))
+    }
+}
+
 impl DimensionToScalar<Array> for DimensionValue {
     fn to_scalar(&self) -> Result<Array, ProgramError> {
         // `DimensionValue::new` enforces the portable extent ceiling, which is no greater than `i64::MAX`.
@@ -679,6 +733,17 @@ impl<A: DimensionFromScalar<DimensionValue> + Value<Type = ArrayType>> Dimension
     fn to_dimension(&self, result: DimensionVariable) -> Result<Self, ProgramError> {
         let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
         Ok(Self::Dimension(<A as DimensionFromScalar<DimensionValue>>::to_dimension(array, result)?))
+    }
+}
+
+impl<A: Value<Type = ArrayType>> Compare for ArrayProgramValue<A>
+where
+    DimensionValue: Compare<A>,
+{
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
+        let left = <Self as ValueProjection<DimensionType>>::projected(self)?;
+        let right = <Self as ValueProjection<DimensionType>>::projected(rhs)?;
+        Ok(Self::Array(left.compare(right, direction)?))
     }
 }
 

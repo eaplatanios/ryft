@@ -1040,8 +1040,12 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       ordinary array indexing/slicing and scalarization, then cross the sole `DimensionFromScalarOperation` gateway.
       Add a general checked element-indexing primitive only if existing array operations cannot express a required
       dynamic case; do not encode indexing inside the dimension operation family.
-- [ ] P3f: add first-class dimension comparison.
-      P2a and P2b already provide ordinary dimension SSA, constants, arithmetic, and requirements.
+- [x] P3f: extend the canonical `CompareOperation` with
+      `(Dimension, Dimension) -> Array(Boolean scalar)`, using an output-parameterized `Compare<Output>` capability
+      rather than a dimension-specific operation or comparison vocabulary. Preserve the two dimension operands as
+      explicit SSA through eager execution, partial evaluation, replicated-only batching, JVP/import, and direct
+      signed StableHLO comparison lowering. P2a and P2b already provide ordinary dimension SSA, constants, arithmetic,
+      and requirements.
 - [x] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
 - [x] Integrate inconclusive requirements with the existing effects model as `Effect::OrderedAssertion`; specify
       ordering, DCE survival, known-side PE folding, runtime observation values, and diagnostic ownership before
