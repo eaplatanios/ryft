@@ -1032,7 +1032,8 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       payloads, and centralize their shared contract in `ArithmeticDimensionOperation`.
 - [x] P2b.2: remove the concrete backend dependency from generic arithmetic operation generation, make operations own
       capability-constrained interpretation, and make backends own concrete capability implementations.
-- [ ] P3a: complete the dimension operation family with comparisons, explicit data gateways, and `dimension_size`;
+- [ ] P3a–P3f: introduce the production array-program dispatcher, then complete the dimension operation family one
+      reviewable boundary at a time with `dimension_size`, the explicit data conversion and gateways, and comparisons;
       P2a and P2b already provide ordinary dimension SSA, constants, arithmetic, and requirements.
 - [x] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
 - [x] Integrate inconclusive requirements with the existing effects model as `Effect::OrderedAssertion`; specify
