@@ -673,7 +673,7 @@ impl ArrayType {
             None => (BatchAxis::replicated(), None),
         })
     }
-    
+
     /// Returns the logical per-item [`ArrayType`] obtained by removing `batch_axis` from this physical [`ArrayType`].
     /// A replicated axis leaves the type unchanged. Possibly-negative mapped axes are normalized against the physical
     /// rank. When the removed dimension carries sharding, only manual mesh axes remain visible as varying manual axes
@@ -1800,18 +1800,6 @@ mod tests {
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let matrix_type = matrix.r#type().into_owned();
 
-        // The public type-only API removes mapped axes without requiring an array value, preserves replicated types,
-        // normalizes negative axes, and reports invalid physical axes through the batching error contract.
-        assert_eq!(
-            matrix_type.unbatched_type(BatchAxis::new(-1)),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))),
-        );
-        assert_eq!(matrix_type.unbatched_type(BatchAxis::replicated()), Ok(matrix_type.clone()));
-        assert_eq!(
-            matrix_type.unbatched_type(2),
-            Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(matrix_type.clone()), axis: Axis::from(2) }),
-        );
-
         // `new` builds a batched value when the mapped axis is in bounds, and the accessors report the packed value,
         // its physical type, the batch size read off the mapped axis, and the per-item type with that axis removed.
         let batched = ArrayBatch::new(matrix_type.clone(), matrix.clone(), Some(0)).unwrap();
@@ -2115,6 +2103,33 @@ mod tests {
             assert_eq!(outputs[0].r#type(), Cow::Borrowed(&physical_type));
             assert_eq!(outputs[0].batch_axis(), BatchAxis::from_position(batch_axis));
         }
+    }
+
+    #[test]
+    fn test_array_type_normalize_batch_axis() {
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        assert_eq!(r#type.normalize_batch_axis(BatchAxis::replicated()), Ok((BatchAxis::replicated(), None)));
+        assert_eq!(r#type.normalize_batch_axis(BatchAxis::new(0)), Ok((BatchAxis::new(0), Some(0))));
+        assert_eq!(r#type.normalize_batch_axis(BatchAxis::new(-1)), Ok((BatchAxis::new(1), Some(1))));
+        assert_eq!(
+            r#type.normalize_batch_axis(BatchAxis::new(2)),
+            Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(r#type.clone()), axis: Axis::from(2) }),
+        );
+        assert_eq!(
+            r#type.normalize_batch_axis(BatchAxis::new(-3)),
+            Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(r#type), axis: Axis::from(-3) }),
+        );
+    }
+
+    #[test]
+    fn test_array_type_unbatched_type() {
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        assert_eq!(r#type.unbatched_type(BatchAxis::replicated()), Ok(r#type.clone()));
+        assert_eq!(r#type.unbatched_type(0), Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))));
+        assert_eq!(
+            r#type.unbatched_type(BatchAxis::new(-1)),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))),
+        );
     }
 
     #[test]
