@@ -1,4 +1,7 @@
+use std::borrow::Cow;
 use std::fmt::{Debug, Display};
+
+use ryft_macros::Parameter;
 
 use crate::batching::{ArrayBatch, BatchingTracer};
 use crate::captures::CaptureReference;
@@ -196,6 +199,146 @@ impl<V: Value<Type = ArrayType> + Concretizable<bool>> Concretizable<bool> for A
     }
 }
 
+/// Provides checked access to one member kind of a composite [`Value`]. Some program families store several kinds of
+/// values in one [`Value`] type so that all of them can flow through the same [`Program`](crate::Program). For example,
+/// [`ArrayProgramValue`](crate::ArrayProgramValue) is either a backend array or a first-class runtime dimension,
+/// mirroring the two member types of [`ArrayProgramType`](crate::ArrayProgramType). Most operations and transform
+/// rules, however, are written against exactly one member kind (e.g., array-only rules consume values with `Value<Type
+/// = ArrayType>`), and `ValueProjection<T>` is what lets them accept a composite value. [`Self::projected`] returns
+/// a read-only view of the value as its `T`-typed member, [`Self::into_projected`] consumes the value and returns an
+/// owned member representation, and [`Self::from_projected`] embeds a member representation back into the composite
+/// value type. Both projection methods fail with a [`TypeError`] when the value holds a different member kind than the
+/// requested one. The associated representations depend on how a value relates to its member:
+///
+///   - Values that contain their member directly, such as [`ArrayProgramValue`](crate::ArrayProgramValue), project to
+///     the member itself (e.g., `&A` and `A` for the array member), so no payload is ever cloned or copied.
+///   - Values that refer to a program instead of containing data (e.g, a [`Tracer`] naming an [`Atom`](crate::Atom),
+///     or a [`CaptureReference`] naming a capture-table entry) have no member payload to extract. They project to
+///     [`ProjectedValueRef`] and [`ProjectedValue`] views (or to a retyped copy of themselves, as [`CaptureReference`]
+///     does), which keep the original value and the program identity it carries intact and only narrow the type it
+///     reports.
+pub trait ValueProjection<T: Type + 'static>: Value {
+    /// Owned representation of this [`Value`]'s `T`-typed member.
+    type Projected: Typed<Type = T>;
+
+    /// Read-only representation of this [`Value`]'s `T`-typed member.
+    type ProjectedRef<'v>: Typed<Type = T>
+    where
+        Self: 'v;
+
+    /// Embeds an owned `T`-typed member representation back into this composite [`Value`] type.
+    fn from_projected(value: Self::Projected) -> Self;
+
+    /// Returns a read-only view of this [`Value`] as its `T`-typed member, without cloning any payload.
+    /// Returns a [`TypeError`] when this value holds a different member kind.
+    fn projected(&self) -> Result<Self::ProjectedRef<'_>, TypeError>;
+
+    /// Consumes this [`Value`] and returns an owned representation of its `T`-typed member, transferring rather than
+    /// copying any contained payload. Returns a [`TypeError`] when this value holds a different member kind.
+    fn into_projected(self) -> Result<Self::Projected, TypeError>;
+}
+
+/// A [`Value`] whose reported [`Type`] has been narrowed to one member kind of its composite type, as returned by
+/// [`ValueProjection::into_projected`]. This wrapper exists for values that refer to a program rather than containing
+/// a member payload, such as a [`Tracer`] naming a Single Static Assignment (SSA) [`Atom`](crate::Atom) or a
+/// [`PartialTracer`] carrying known/unknown state. Such a value cannot be split into its member the way an enum of
+/// payloads can, so projecting it keeps the value intact (i.e., preserving the program identity it carries) and pairs
+/// it with the member type it was validated against. [`Typed`] consequently reports that member type rather than the
+/// value's original composite type.
+///
+/// Projection alone does not define how [`Operation`](crate::Operation)s on the wrapped value dispatch. A context
+/// adapter that binds member-typed operations through the surrounding composite program provides that behavior
+/// separately.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct ProjectedValue<T: Type, V> {
+    /// Original value, kept intact so the program identity it carries is preserved.
+    value: V,
+
+    /// Member [`Type`] validated against `value` at construction.
+    r#type: T,
+}
+
+impl<T: Type, V> ProjectedValue<T, V> {
+    /// Creates a new [`ProjectedValue`] after the caller has validated `type` against `value`.
+    #[inline]
+    pub fn new(value: V, r#type: T) -> Self {
+        Self { value, r#type }
+    }
+
+    /// Borrows the original value.
+    #[inline]
+    pub fn value(&self) -> &V {
+        &self.value
+    }
+
+    /// Consumes this [`ProjectedValue`] and returns the original value.
+    #[inline]
+    pub fn into_value(self) -> V {
+        self.value
+    }
+}
+
+impl<T: Type, V: Display> Display for ProjectedValue<T, V> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(formatter)
+    }
+}
+
+impl<T: Type, V> Typed for ProjectedValue<T, V> {
+    type Type = T;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, T> {
+        Cow::Borrowed(&self.r#type)
+    }
+}
+
+/// Borrowed counterpart of [`ProjectedValue`], as returned by [`ValueProjection::projected`]. This view borrows both
+/// the original [`Value`] and the member [`Type`] it was validated against, so read-only consumers can treat a value
+/// as its member kind without cloning either. Like [`ProjectedValue`], it leaves the underlying value intact and
+/// reports the narrowed member type through [`Typed`]. Values whose type is stored directly (e.g., a [`Tracer`]'s
+/// staged type) can hand out this view. Values that compute their type on demand return an owning [`ProjectedValue`]
+/// from [`ValueProjection::projected`] instead, because a borrow cannot outlive the computed type.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct ProjectedValueRef<'v, T: Type, V: ?Sized> {
+    /// Original value, kept intact so the program identity it carries is preserved.
+    value: &'v V,
+
+    /// Member [`Type`] borrowed from the value's validated type metadata.
+    r#type: &'v T,
+}
+
+impl<'v, T: Type, V: ?Sized> ProjectedValueRef<'v, T, V> {
+    /// Constructs a new [`ProjectedValueRef`] after the caller has validated `type` against `value`.
+    #[inline]
+    pub(crate) fn new(value: &'v V, r#type: &'v T) -> Self {
+        Self { value, r#type }
+    }
+
+    /// Borrows the original value.
+    #[inline]
+    pub fn value(&self) -> &'v V {
+        self.value
+    }
+}
+
+impl<T: Type, V: Display + ?Sized> Display for ProjectedValueRef<'_, T, V> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(formatter)
+    }
+}
+
+impl<T: Type, V: ?Sized> Typed for ProjectedValueRef<'_, T, V> {
+    type Type = T;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, T> {
+        Cow::Borrowed(self.r#type)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -259,5 +402,26 @@ mod tests {
                  implementation",
             )),
         );
+    }
+
+    #[test]
+    fn test_projected_value_and_projected_value_ref() {
+        let r#type = ArrayType::scalar(DataType::F32);
+        let value = "value".to_string();
+        let projected = ProjectedValueRef::new(&value, &r#type);
+        assert_eq!(projected.value(), &value);
+        assert_eq!(projected.r#type(), Cow::Borrowed(&r#type));
+        assert_eq!(projected.to_string(), value);
+    }
+
+    #[test]
+    fn test_projected_value_ref() {
+        let r#type = ArrayType::scalar(DataType::F32);
+        let value = "value".to_string();
+        let projected = ProjectedValue::new(value.clone(), r#type.clone());
+        assert_eq!(projected.value(), &value);
+        assert_eq!(projected.r#type(), Cow::Borrowed(&r#type));
+        assert_eq!(projected.to_string(), value);
+        assert_eq!(projected.into_value(), "value");
     }
 }

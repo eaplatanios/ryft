@@ -141,7 +141,7 @@ pub use regions::{
     RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
 };
 pub use types::{Type, TypeError, TypeRefinements, Typed};
-pub use values::{Concretizable, Value, ValueId};
+pub use values::{Concretizable, ProjectedValue, ProjectedValueRef, Value, ValueId, ValueProjection};
 
 /// Represents errors related to [`Program`]s in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
