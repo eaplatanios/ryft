@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -13,10 +13,10 @@ use crate::macros::{
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::Tracer;
 use crate::types::ArrayType;
 
@@ -136,6 +136,23 @@ impl<V: Value, O: Operation<V::Type>> Constant<V, V> for EagerContext<V, O> {
     #[inline]
     fn constant(&self, value: V) -> Result<V, ProgramError> {
         Ok(value)
+    }
+}
+
+impl<C: Context, T: Type>
+    Constant<<C::Value as ValueProjection<T>>::Projected, <C::Constant as ValueProjection<T>>::Projected>
+    for ProjectedContext<C, T>
+where
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Operation: OperationProjection<T>,
+{
+    #[inline]
+    fn constant(
+        &self,
+        value: <C::Constant as ValueProjection<T>>::Projected,
+    ) -> Result<<C::Value as ValueProjection<T>>::Projected, ProgramError> {
+        self.lift(value)
     }
 }
 

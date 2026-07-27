@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -12,9 +12,10 @@ use crate::macros::{
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
@@ -127,6 +128,19 @@ impl_nullary_batchable_operation!(@replicated <F> FillOperation<ArrayType, F>);
 pub trait Fill<S, V: Typed> {
     /// Returns a value of [`Type`] `type` with every element it holds set to `value`.
     fn fill(&self, r#type: &V::Type, value: S) -> Result<V, ProgramError>;
+}
+
+impl<C: Context, T: Type, S: Clone + Display> Fill<S, <C::Value as ValueProjection<T>>::Projected>
+    for ProjectedContext<C, T>
+where
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Operation: OperationProjection<T, Projected: From<FillOperation<T, S>>>,
+{
+    #[inline]
+    fn fill(&self, r#type: &T, value: S) -> Result<<C::Value as ValueProjection<T>>::Projected, ProgramError> {
+        Ok(self.bind(FillOperation::new(r#type.clone(), value), Vec::new(), &[])?.remove(0))
+    }
 }
 
 impl<V: Clone + Display, C: StagingContext<Operation: From<FillOperation<C::Type, V>>>> Fill<V, Tracer<C>> for C {

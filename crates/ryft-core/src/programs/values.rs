@@ -320,6 +320,13 @@ where
     }
 }
 
+impl<T: Type, C, V: Concretizable<C>> Concretizable<C> for ProjectedValue<T, V> {
+    #[inline]
+    fn concretize(&self) -> Result<C, ProgramError> {
+        self.value.concretize()
+    }
+}
+
 /// Borrowed counterpart of [`ProjectedValue`], as returned by [`ValueProjection::projected`]. This view borrows both
 /// the original [`Value`] and the member [`Type`] it was validated against, so read-only consumers can treat a value
 /// as its member kind without cloning either. Like [`ProjectedValue`], it leaves the underlying value intact and

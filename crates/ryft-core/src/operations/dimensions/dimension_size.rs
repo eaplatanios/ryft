@@ -234,10 +234,14 @@ impl<C: Domain<Type = ArrayProgramType, Value: DimensionSize<C::Value>>> Interpr
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
-        _driver: &D,
+        driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
+        let region_count = driver.region_count();
+        if region_count != 0 {
+            return Err(TypeError::invalid(format!("expected 0 regions but got {region_count}")).into());
+        }
         let input_type = inputs[0].r#type();
         self.validate_input_type(input_type.as_ref())?;
         Ok(vec![inputs[0].dimension_size(self.axis)?])

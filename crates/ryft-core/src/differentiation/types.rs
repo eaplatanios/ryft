@@ -11,7 +11,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::TracingContext;
-use crate::types::{ArrayType, DataType, Dimension, Shape};
+use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, Shape};
 
 /// A [`Type`] whose forward perturbations and reverse adjoints carry well-defined differential representations.
 /// Differential values need not use the primal representation. A compact primal storage format may require a wider
@@ -114,6 +114,41 @@ impl DifferentiableType for ArrayType {
         let data_type = self.data_type().cotangent();
         let layout = if data_type == self.data_type() { self.layout.clone() } else { None };
         Self { data_type, layout, sharding: self.sharding.as_ref().map(Sharding::cotangent), ..self.clone() }
+    }
+}
+
+impl DifferentiableType for ArrayProgramType {
+    #[inline]
+    fn is_zero_space(&self) -> bool {
+        match self {
+            Self::Array(r#type) => r#type.is_zero_space(),
+            Self::Dimension(_) => true,
+        }
+    }
+
+    #[inline]
+    fn tangent(&self) -> Self {
+        match self {
+            Self::Array(r#type) => Self::Array(r#type.tangent()),
+            Self::Dimension(_) => {
+                // First-class dimensions are shape authority rather than numerical data. Their tangent space is
+                // structurally zero and uses the ordinary array member so generic zero materialization has one
+                // canonical backend representation.
+                Self::Array(ArrayType::scalar(DataType::Zero))
+            }
+        }
+    }
+
+    #[inline]
+    fn cotangent(&self) -> Self {
+        match self {
+            Self::Array(r#type) => Self::Array(r#type.cotangent()),
+            Self::Dimension(_) => {
+                // As in forward mode, dimensions receive no live adjoint. Keeping the zero space in the array
+                // member prevents a zero value from accidentally granting first-class shape authority.
+                Self::Array(ArrayType::scalar(DataType::Zero))
+            }
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -12,9 +12,10 @@ use crate::macros::{
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
@@ -113,6 +114,18 @@ impl_nullary_batchable_operation!(@replicated ZeroOperation<ArrayType>);
 pub trait Zero<V: Typed> {
     /// Returns a _zero_ value for the provided [`Type`].
     fn zero(&self, r#type: &V::Type) -> Result<V, ProgramError>;
+}
+
+impl<C: Context, T: Type> Zero<<C::Value as ValueProjection<T>>::Projected> for ProjectedContext<C, T>
+where
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Operation: OperationProjection<T, Projected: From<ZeroOperation<T>>>,
+{
+    #[inline]
+    fn zero(&self, r#type: &T) -> Result<<C::Value as ValueProjection<T>>::Projected, ProgramError> {
+        Ok(self.bind(ZeroOperation::new(r#type.clone()), Vec::new(), &[])?.remove(0))
+    }
 }
 
 impl<C: StagingContext<Operation: From<ZeroOperation<C::Type>>>> Zero<Tracer<C>> for C {

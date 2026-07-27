@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -12,9 +12,10 @@ use crate::macros::{
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
@@ -128,6 +129,18 @@ pub trait Iota<V: Typed> {
     ///   - `r#type`: Type of the value to produce.
     ///   - `dimension`: Dimension of `type` along which the produced values increase from `0`.
     fn iota(&self, r#type: &V::Type, dimension: usize) -> Result<V, ProgramError>;
+}
+
+impl<C: Context, T: Type> Iota<<C::Value as ValueProjection<T>>::Projected> for ProjectedContext<C, T>
+where
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Operation: OperationProjection<T, Projected: From<IotaOperation<T>>>,
+{
+    #[inline]
+    fn iota(&self, r#type: &T, dimension: usize) -> Result<<C::Value as ValueProjection<T>>::Projected, ProgramError> {
+        Ok(self.bind(IotaOperation::new(r#type.clone(), dimension), Vec::new(), &[])?.remove(0))
+    }
 }
 
 impl<C: StagingContext<Operation: From<IotaOperation<C::Type>>>> Iota<Tracer<C>> for C {

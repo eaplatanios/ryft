@@ -25,8 +25,8 @@ use ryft_core::operations::differentiation::CoordinateBasisOperation;
 use ryft_core::operations::manipulation::ReshapeParameters;
 use ryft_core::operations::manipulation::{
     BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, DynamicBroadcastOperation, GatherOperation,
-    GatherScatterMode, PadOperation, Reshape, ReshapeDimensionExpression, ReshapeOperation, ScatterOperation,
-    ScatterReductionKind, Slice, SliceOperation, TransposeOperation, UpdateSlice,
+    GatherScatterMode, PadOperation, ReshapeDimensionExpression, ReshapeOperation, ScatterOperation,
+    ScatterReductionKind, SliceOperation, TransposeOperation,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
@@ -58,6 +58,9 @@ use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaPro
 use crate::mlir::ToMlir;
 
 use super::shard_map::{ShardMap, ShardMapError};
+
+mod composite;
+pub use composite::{ArrayProgramLoweringError, lower_array_program_to_stable_hlo};
 
 /// Error type for StableHLO/Shardy lowering.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -4209,10 +4212,7 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
         .collect())
 }
 
-impl<V> LowerableXlaOperation<V> for ArrayOperation<V>
-where
-    V: MlirLowerableValue + Slice + UpdateSlice + Reshape,
-{
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -7234,8 +7234,8 @@ fn replay_region_ref_into_block<'b, 'c: 'b, 't: 'c, O, V, LiftConstant, ApplyOp>
     mut apply_op: ApplyOp,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType>,
+    V: Value,
+    O: Operation<V::Type>,
     LiftConstant: FnMut(
         AtomId,
         &V,

@@ -2480,7 +2480,9 @@ macro_rules! impl_nullary_batchable_operation {
 
 /// Implements a foreign `std::ops` operator trait as panicking sugar for the four core transform tracer types (i.e.,
 /// [`Tracer`](crate::Tracer), [`PartialTracer`](crate::PartialTracer), [`BatchingTracer`](crate::BatchingTracer), and
-/// [`DifferentiationTracer`](crate::DifferentiationTracer)) by binding the operation through each tracer's own context.
+/// [`DifferentiationTracer`](crate::DifferentiationTracer)) and for [`ProjectedValue`](crate::ProjectedValue) member
+/// views by binding the operation through each value's own context.
+///
 /// The operator traits (i.e., `std::ops::Add`, `std::ops::Neg`, `std::ops::BitAnd`, etc.) are foreign and so a single
 /// `impl<V: Value>` blanket implementation (i.e., the shape used for the fallible in-crate capability traits) is not
 /// allowed due to the orphan rule. This macro stamps out the implementations that a blanket would otherwise cover. Note
@@ -2497,7 +2499,7 @@ macro_rules! impl_nullary_batchable_operation {
 /// Binary invocations may provide a unit-struct operation directly or use `provider = ProviderTrait` when the operation
 /// type depends on the program's [`Type`](crate::Type) family. A provider constructs its associated operation from both
 /// operand types. Provider-construction failures poison ordinary staged tracers and fail immediately for direct-binding
-/// transform tracers, preserving each tracer family's established error behavior.
+/// transform tracers and projected member views, preserving each value family's established error behavior.
 ///
 /// # Parameters
 ///
@@ -2515,6 +2517,30 @@ macro_rules! impl_nullary_batchable_operation {
 macro_rules! define_tracer_operator {
     // This branch implements receiver-only operator syntax for every transform tracer family.
     (@unary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
+        impl<T: $crate::Type, V> $trait for $crate::ProjectedValue<T, V>
+        where
+            $crate::ProjectedValue<T, V>: $crate::Value<Type = T>,
+            <$crate::ProjectedValue<T, V> as $crate::Value>::DispatchDomain: $crate::Context<
+                    Type = T,
+                    Value = $crate::ProjectedValue<T, V>,
+                    Operation: ::std::convert::From<$operation>,
+                >,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self) -> Self {
+                $crate::Context::bind(
+                    &$crate::Value::dispatch_domain(&self),
+                    $operation,
+                    Vec::new(),
+                    ::std::slice::from_ref(&self),
+                )
+                .expect($message)
+                .remove(0)
+            }
+        }
+
         impl<C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait for $crate::Tracer<C> {
             type Output = Self;
 
@@ -2572,6 +2598,34 @@ macro_rules! define_tracer_operator {
 
     // This binary form statically selects and constructs a type-family-specific operation through a provider.
     (@binary $trait:path, $method:ident, provider = $provider:path, $message:literal $(,)?) => {
+        impl<T: $crate::Type + $provider, V> $trait for $crate::ProjectedValue<T, V>
+        where
+            $crate::ProjectedValue<T, V>: $crate::Value<Type = T>,
+            <$crate::ProjectedValue<T, V> as $crate::Value>::DispatchDomain: $crate::Context<
+                    Type = T,
+                    Value = $crate::ProjectedValue<T, V>,
+                    Operation: ::std::convert::From<<T as $provider>::Operation>,
+                >,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, right: Self) -> Self {
+                let left_type = $crate::Typed::r#type(&self);
+                let right_type = $crate::Typed::r#type(&right);
+                let operation = <T as $provider>::operation(left_type.as_ref(), right_type.as_ref())
+                    .unwrap_or_else(|error| panic!("{error}"));
+                $crate::Context::bind(
+                    &$crate::Value::dispatch_domain(&self),
+                    operation,
+                    Vec::new(),
+                    &[self.clone(), right],
+                )
+                .expect($message)
+                .remove(0)
+            }
+        }
+
         impl<C: $crate::StagingContext> $trait for $crate::Tracer<C>
         where
             C::Type: $provider,
@@ -2662,6 +2716,30 @@ macro_rules! define_tracer_operator {
 
     // This branch implements two-operand operator syntax for every transform tracer family.
     (@binary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
+        impl<T: $crate::Type, V> $trait for $crate::ProjectedValue<T, V>
+        where
+            $crate::ProjectedValue<T, V>: $crate::Value<Type = T>,
+            <$crate::ProjectedValue<T, V> as $crate::Value>::DispatchDomain: $crate::Context<
+                    Type = T,
+                    Value = $crate::ProjectedValue<T, V>,
+                    Operation: ::std::convert::From<$operation>,
+                >,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, right: Self) -> Self {
+                $crate::Context::bind(
+                    &$crate::Value::dispatch_domain(&self),
+                    $operation,
+                    Vec::new(),
+                    &[self.clone(), right],
+                )
+                .expect($message)
+                .remove(0)
+            }
+        }
+
         impl<C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait for $crate::Tracer<C> {
             type Output = Self;
 
@@ -4192,7 +4270,8 @@ mod tests {
     use indoc::indoc;
     use num_complex::Complex;
 
-    use crate::backends::arrays::Array;
+    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingTracer};
@@ -4219,6 +4298,7 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::{Type, TypeError, Typed};
+    use crate::programs::values::ValueProjection;
     use crate::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingError};
     use crate::tracing::{Tracer, TracingContext};
     use crate::types::{
@@ -4447,6 +4527,18 @@ mod tests {
     impl From<AddOperation> for TestBinaryOperation {
         fn from(_operation: AddOperation) -> Self {
             Self
+        }
+    }
+
+    impl From<TestUnaryOperation> for ArrayOperation<Array> {
+        fn from(_operation: TestUnaryOperation) -> Self {
+            Self::Neg(NegOperation)
+        }
+    }
+
+    impl From<TestBinaryOperation> for ArrayOperation<Array> {
+        fn from(_operation: TestBinaryOperation) -> Self {
+            Self::Add(AddOperation)
         }
     }
 
@@ -6053,6 +6145,15 @@ mod tests {
         assert_eq!(builder.instructions()[0].inputs(), &[input_id]);
         drop(builder);
 
+        let context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = context.input(ArrayType::scalar(DataType::F32).into());
+        let input = <Tracer<_> as ValueProjection<ArrayType>>::into_projected(input).unwrap();
+        let output = input.apply_unary();
+        let builder = context.builder().borrow();
+        assert!(matches!(builder.instructions()[0].operation(), ArrayProgramOperation::Array(ArrayOperation::Neg(_))));
+        assert_eq!(output.value().atom_id(), Ok(builder.instructions()[0].outputs()[0]));
+        drop(builder);
+
         let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestUnaryOperation>::new());
         let input = PartialTracer::new(context, PartialEvaluationValue::known(Scalar::from(2.0f32)));
         assert_eq!(input.apply_unary().into_value().unwrap().as_known(), Some(&Scalar::from(-2.0f32)));
@@ -6084,6 +6185,17 @@ mod tests {
         assert_eq!(builder.instructions().len(), 1);
         assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_BINARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs(), &input_ids);
+        drop(builder);
+
+        let context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let left = context.input(ArrayType::scalar(DataType::F32).into());
+        let right = context.input(ArrayType::scalar(DataType::F32).into());
+        let left = <Tracer<_> as ValueProjection<ArrayType>>::into_projected(left).unwrap();
+        let right = <Tracer<_> as ValueProjection<ArrayType>>::into_projected(right).unwrap();
+        let output = left.apply_binary(right);
+        let builder = context.builder().borrow();
+        assert!(matches!(builder.instructions()[0].operation(), ArrayProgramOperation::Array(ArrayOperation::Add(_))));
+        assert_eq!(output.value().atom_id(), Ok(builder.instructions()[0].outputs()[0]));
         drop(builder);
 
         let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestBinaryOperation>::new());
@@ -6124,6 +6236,17 @@ mod tests {
         assert_eq!(builder.instructions().len(), 1);
         assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_BINARY_OPERATION_NAME,);
         assert_eq!(builder.instructions()[0].inputs(), &input_ids);
+        drop(builder);
+
+        let context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let left = context.input(ArrayType::scalar(DataType::F32).into());
+        let right = context.input(ArrayType::scalar(DataType::F32).into());
+        let left = <Tracer<_> as ValueProjection<ArrayType>>::into_projected(left).unwrap();
+        let right = <Tracer<_> as ValueProjection<ArrayType>>::into_projected(right).unwrap();
+        let output = left.apply_provided_binary(right);
+        let builder = context.builder().borrow();
+        assert!(matches!(builder.instructions()[0].operation(), ArrayProgramOperation::Array(ArrayOperation::Add(_))));
+        assert_eq!(output.value().atom_id(), Ok(builder.instructions()[0].outputs()[0]));
         drop(builder);
 
         // The same operator implementation selects the nominal dimension operation in the dimension universe.

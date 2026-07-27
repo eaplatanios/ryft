@@ -13,6 +13,7 @@ use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVari
 
 pub mod add;
 pub mod dimension_size;
+pub mod dimension_to_scalar;
 pub mod div_floor;
 pub mod max;
 pub mod min;
@@ -25,6 +26,9 @@ pub mod sub;
 
 pub use add::{DIMENSION_ADD_OPERATION_NAME, DimensionAdd, DimensionAddOperation};
 pub use dimension_size::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize, DimensionSizeOperation};
+pub use dimension_to_scalar::{
+    DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionToScalar, DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,
+};
 pub use div_floor::{DIMENSION_DIV_FLOOR_OPERATION_NAME, DimensionDivFloor, DimensionDivFloorOperation};
 pub use max::{DIMENSION_MAX_OPERATION_NAME, DimensionMax, DimensionMaxOperation};
 pub use min::{DIMENSION_MIN_OPERATION_NAME, DimensionMin, DimensionMinOperation};

@@ -94,7 +94,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::TracingContext;
-use crate::types::{ArrayType, Dimension, Shape};
+use crate::types::{ArrayType, Dimension, DimensionType, Shape};
 
 /// Represents batching-related errors.
 ///
@@ -127,6 +127,9 @@ pub enum BatchingError {
 
     #[error("batch axis {axis} is out of bounds for array type {type}")]
     BatchAxisOutOfBounds { r#type: Box<ArrayType>, axis: Axis },
+
+    #[error("dimension type {type} cannot carry mapped batch axis {axis}")]
+    MappedDimension { r#type: Box<DimensionType>, axis: BatchAxis },
 
     #[error("{message}")]
     UnsupportedOperation { message: String },
@@ -337,15 +340,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// Creates a new [`ArrayBatch`].
     #[inline]
     pub fn new<A: Into<BatchAxis>>(r#type: ArrayType, value: V, batch_axis: A) -> Result<Self, BatchingError> {
-        // A possibly-negative mapped axis is normalized against the physical rank, following Python/JAX indexing:
-        // valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
-        let batch_axis = match batch_axis.into().axis() {
-            Some(axis) => match axis.normalize(r#type.rank()) {
-                Ok(position) => BatchAxis::from_position(position),
-                Err(_) => return Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(r#type), axis }),
-            },
-            None => BatchAxis::replicated(),
-        };
+        let (batch_axis, _) = r#type.normalize_batch_axis(batch_axis.into())?;
         Ok(Self { r#type, value, batch_axis })
     }
 
@@ -398,47 +393,9 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     }
 
     /// Returns the [`ArrayType`] of each item in the batch (i.e., with the batch axis removed, if any).
+    #[inline]
     pub fn unbatched_type(&self) -> ArrayType {
-        let Some(axis) = self.batch_axis_position() else {
-            return self.r#type.clone();
-        };
-
-        // This is a logical transform view, not an ordinary rank-changing array operation. In particular, explicit
-        // placement on the transform-owned mapped dimension describes how the batch is distributed; it is not part
-        // of each batch item's placement. `ArrayType::without_dimension` correctly rejects dropping such placement
-        // information for regular array dimensions, and so it cannot be used for these batching-specific semantics.
-        let mut dimensions = self.r#type.shape().dimensions().to_vec();
-        dimensions.remove(axis);
-        let sharding = self.r#type.sharding().map(|sharding| {
-            let mut sharding_dimensions = sharding.dimensions().to_vec();
-            let removed_dimension = sharding_dimensions.remove(axis);
-            let mut varying_manual_axes = sharding.varying_manual_axes().clone();
-
-            // Manual axes remain semantically visible after their ranked dimension is removed because values may
-            // still vary across those axes. All other mesh axes are intentionally omitted (they placed the batch
-            // dimension itself, which is outside the logical per-item type).
-            if let ShardingDimension::Sharded(axis_names) = removed_dimension {
-                varying_manual_axes.extend(
-                    axis_names.into_iter().filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual)),
-                );
-            }
-
-            Sharding {
-                mesh: sharding.mesh().clone(),
-                dimensions: sharding_dimensions,
-                unreduced_axes: sharding.unreduced_axes().clone(),
-                reduced_axes: sharding.reduced_axes().clone(),
-                varying_manual_axes,
-            }
-        });
-
-        ArrayType {
-            data_type: self.r#type.data_type(),
-            shape: Shape::new(dimensions),
-            layout: None,
-            sharding,
-            memory: self.r#type.memory(),
-        }
+        self.r#type.unbatched_type(self.batch_axis).unwrap()
     }
 
     /// Computes and validates the common batch size across `inputs`, returning `None` when no input is batched.
@@ -697,6 +654,83 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
     #[inline]
     fn execution_domain(&self) -> EagerContext<Self> {
         EagerContext::new()
+    }
+}
+
+impl ArrayType {
+    /// Normalizes and validates the provided [`BatchAxis`] against this physical [`ArrayType`],
+    /// returning its canonical [`BatchAxis`] and physical position.
+    pub fn normalize_batch_axis(&self, batch_axis: BatchAxis) -> Result<(BatchAxis, Option<usize>), BatchingError> {
+        // A possibly-negative mapped axis is normalized against the physical rank, following Python/JAX indexing:
+        // valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
+        Ok(match batch_axis.axis() {
+            Some(axis) => match axis.normalize(self.rank()) {
+                Ok(position) => (BatchAxis::from_position(position), Some(position)),
+                Err(_) => {
+                    return Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(self.clone()), axis });
+                }
+            },
+            None => (BatchAxis::replicated(), None),
+        })
+    }
+    
+    /// Returns the logical per-item [`ArrayType`] obtained by removing `batch_axis` from this physical [`ArrayType`].
+    /// A replicated axis leaves the type unchanged. Possibly-negative mapped axes are normalized against the physical
+    /// rank. When the removed dimension carries sharding, only manual mesh axes remain visible as varying manual axes
+    /// in the per-item type because all other placement belongs to the transform-owned batch dimension.
+    #[inline]
+    pub fn unbatched_type<A: Into<BatchAxis>>(&self, batch_axis: A) -> Result<Self, BatchingError> {
+        self.unbatched_type_and_axis(batch_axis.into()).map(|(r#type, _)| r#type)
+    }
+
+    /// Returns the logical per-item [`ArrayType`] together with the normalized [`BatchAxis`]. This internal form lets
+    /// composite batch carriers validate and retain canonical axis metadata without cloning or otherwise projecting
+    /// their array payloads.
+    pub(crate) fn unbatched_type_and_axis(&self, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
+        let (batch_axis, axis) = self.normalize_batch_axis(batch_axis)?;
+        let Some(axis) = axis else {
+            return Ok((self.clone(), batch_axis));
+        };
+
+        // This is a logical transform view, not an ordinary rank-changing array operation. In particular, explicit
+        // placement on the transform-owned mapped dimension describes how the batch is distributed; it is not part
+        // of each batch item's placement. `ArrayType::without_dimension` correctly rejects dropping such placement
+        // information for regular array dimensions, and so it cannot be used for these batching-specific semantics.
+        let mut dimensions = self.shape().dimensions().to_vec();
+        dimensions.remove(axis);
+        let sharding = self.sharding().map(|sharding| {
+            let mut sharding_dimensions = sharding.dimensions().to_vec();
+            let removed_dimension = sharding_dimensions.remove(axis);
+            let mut varying_manual_axes = sharding.varying_manual_axes().clone();
+
+            // Manual axes remain semantically visible after their ranked dimension is removed because values may
+            // still vary across those axes. All other mesh axes are intentionally omitted (they placed the batch
+            // dimension itself, which is outside the logical per-item type).
+            if let ShardingDimension::Sharded(axis_names) = removed_dimension {
+                varying_manual_axes.extend(
+                    axis_names.into_iter().filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual)),
+                );
+            }
+
+            Sharding {
+                mesh: sharding.mesh().clone(),
+                dimensions: sharding_dimensions,
+                unreduced_axes: sharding.unreduced_axes().clone(),
+                reduced_axes: sharding.reduced_axes().clone(),
+                varying_manual_axes,
+            }
+        });
+
+        Ok((
+            Self {
+                data_type: self.data_type(),
+                shape: Shape::new(dimensions),
+                layout: None,
+                sharding,
+                memory: self.memory(),
+            },
+            batch_axis,
+        ))
     }
 }
 
@@ -1765,6 +1799,18 @@ mod tests {
     fn test_array_batch() {
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let matrix_type = matrix.r#type().into_owned();
+
+        // The public type-only API removes mapped axes without requiring an array value, preserves replicated types,
+        // normalizes negative axes, and reports invalid physical axes through the batching error contract.
+        assert_eq!(
+            matrix_type.unbatched_type(BatchAxis::new(-1)),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))),
+        );
+        assert_eq!(matrix_type.unbatched_type(BatchAxis::replicated()), Ok(matrix_type.clone()));
+        assert_eq!(
+            matrix_type.unbatched_type(2),
+            Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(matrix_type.clone()), axis: Axis::from(2) }),
+        );
 
         // `new` builds a batched value when the mapped axis is in bounds, and the accessors report the packed value,
         // its physical type, the batch size read off the mapped axis, and the per-item type with that axis removed.

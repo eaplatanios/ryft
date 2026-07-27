@@ -38,12 +38,13 @@ pub use dimensions::{
     DIMENSION_POW_OPERATION_NAME, DIMENSION_REM_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME,
     DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME, DIMENSION_REQUIRE_EQUAL_OPERATION_NAME,
     DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_SATURATING_SUB_OPERATION_NAME,
-    DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME, DimensionAdd, DimensionAddOperation,
-    DimensionDivFloor, DimensionDivFloorOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
-    DimensionMinOperation, DimensionMul, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRem,
-    DimensionRemOperation, DimensionRequirement, DimensionRequirementOperation, DimensionRequirementPredicate,
-    DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSub,
-    DimensionSubOperation,
+    DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME, DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionAdd,
+    DimensionAddOperation, DimensionDivFloor, DimensionDivFloorOperation, DimensionMax, DimensionMaxOperation,
+    DimensionMin, DimensionMinOperation, DimensionMul, DimensionMulOperation, DimensionPow, DimensionPowOperation,
+    DimensionRem, DimensionRemOperation, DimensionRequirement, DimensionRequirementOperation,
+    DimensionRequirementPredicate, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
+    DimensionSizeOperation, DimensionSub, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation,
+    RUNTIME_DIMENSION_DATA_TYPE,
 };
 pub use logical::*;
 pub use manipulation::*;
