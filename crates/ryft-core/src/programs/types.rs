@@ -287,12 +287,21 @@ pub trait Typed {
     fn r#type(&self) -> Cow<'_, Self::Type>;
 }
 
+impl<V: Typed + ?Sized> Typed for &V {
+    type Type = V::Type;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, Self::Type> {
+        (*self).r#type()
+    }
+}
+
 #[allow(clippy::let_unit_value)]
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
@@ -356,5 +365,12 @@ mod tests {
             ),
             Err(TypeError::invalid("type f64 does not refine declared type f32")),
         );
+    }
+
+    #[test]
+    fn test_typed_reference_delegates_to_referent() {
+        let value = ArrayType::scalar(DataType::F32);
+        let reference = &value;
+        assert_eq!(reference.r#type(), value.r#type());
     }
 }
