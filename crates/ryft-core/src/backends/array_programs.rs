@@ -40,10 +40,9 @@ pub mod batching;
 /// [`DimensionOperation`]: it selects the member family, projects the composite type boundary once, delegates to that
 /// family, and lifts the inferred result types back into [`ArrayProgramType`].
 ///
-/// Operations whose signatures mix arrays and dimensions are represented as explicit outer-family variants when their
-/// operand contracts are migrated, because no homogeneous member family can express such a signature.
-/// [`ArrayProgramOperation::DimensionSize`] is the canonical first example: it consumes an array and produces a
-/// first-class dimension without changing either homogeneous family.
+/// Operations whose signatures mix arrays and dimensions are represented as explicit variants because no homogeneous
+/// member family can express such a signature. For example, [`DimensionSizeOperation`] consumes an array and produces
+/// a first-class dimension without changing either homogeneous family.
 #[derive(Clone, Debug)]
 pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// Array-member zero constructor used for structural tangent and cotangent materialization.

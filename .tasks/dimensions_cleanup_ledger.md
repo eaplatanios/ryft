@@ -683,19 +683,20 @@ ledger disagrees with Git.
 
 ## P3g: explicit reshape and broadcast dimensions
 
-- Status: planning
+- Status: ready for owner review — Delivery A
 - Branch: `u/eaplatanios/dynamic-shapes`
-- Baseline commit: `162a8241b54212309f7caeb243959efe8a7e5cd3`
+- Baseline commit: `beadf85bd3f96bbf8105bd6f48845a00a4ee2c4f`
+- Delivery A source commit: pending owner review
+- Delivery A integration commit: pending
 - Immutable archive unchanged: yes
-- Scope: introduce the centralized dimension-operand schema through the first two shape-producing mixed operations,
-  giving reshape and broadcast the canonical signatures
-  `(Array, output dynamic dimensions...) -> Array`
-- Design: dynamic output dimensions are individual first-class dimension SSA operands ordered by output axis. Static
-  invocations use the same mixed payload with an empty dimension segment. The operation payload retains only declared
-  array metadata and semantic attributes; it never stores dimension expressions, packed shape data, witnesses, or
-  transform-only residual manifests
-- Review staging: land schema/mixed-family containment, reshape, broadcast, and transform/lowering closure as separate
-  owner-reviewed increments so the 42 explicit shape-operation bounds and approximately 149 shape-operation calls are
+- Scope: introduce the first two shape-producing mixed operations, giving reshape and broadcast the canonical
+  signatures `(Array, output extent for axis 0, ..., output extent for axis rank - 1) -> Array`
+- Design: every output axis is one first-class dimension SSA operand ordered by axis. Exact constants represent static
+  axes, bounded non-exact values represent dynamic axes, and inference derives the complete output shape from operand
+  types. Operation payloads retain only genuine non-shape semantic attributes; they never duplicate a declared shape
+  or store dimension expressions, packed shape data, witnesses, or transform-only residual manifests
+- Review staging: land the operand contract/flat-family containment, reshape, broadcast, and transform/lowering closure
+  as separate owner-reviewed increments so the 42 explicit shape-operation bounds and 182 shape-operation calls are
   never migrated as one opaque sweep
 - Transitional boundary: P3g adds and validates the canonical mixed paths. The following deletion increment migrates
   every remaining homogeneous consumer before removing `ReshapeDimensionExpression`, `DynamicBroadcastOperation`, the
@@ -705,7 +706,32 @@ ledger disagrees with Git.
   packed rank-one shape operand, Boolean or arithmetic dimension metadata, ragged mapped dimensions, final
   `RuntimeShape` public API, or reshape-specific differentiation residual field
 - Plan: `.tasks/plan_p3g_reshape_broadcast.md`
+- Delivery A inventory: 42 explicit reshape/broadcast conversion bounds, 182 core reshape/broadcast method calls, and
+  120 `ArrayProgramOperation` references across core and XLA at baseline
+- Delivery A containment decision: retain the four existing cross-member primitives as direct
+  `ArrayProgramOperation` variants. A derived nested `MixedArrayDimensionOperation` prototype reduced handwritten
+  forwarding but leaked a storage-oriented family into the public API. Flattening avoids nested variants and requires
+  no new derive surface. A projection-aware derive was rejected because projected interpretation would recreate the
+  eager `Context`/`InterpretableOperation` obligation cycle and composite `Zero` still requires its existing
+  array-result validation
+- Delivery A operand contract: every reshape/broadcast output axis is represented by one ordered dimension operand.
+  Exact dimension constants encode static axes, while bounded non-exact values encode dynamic axes. Inference derives
+  output shape metadata directly from these operand types, avoiding shape duplication and identity reconciliation
+- Delivery A schema disposition: the `DimensionOperandSchema` prototype, its module, and its tests were removed. The
+  uniform positional contract only needs ordinary count/member-kind inference; a parallel segment and identity
+  language would add complexity without representing additional semantics
 - Verification baseline: 976 core library tests, 58 executable core doctests with 16 ignored, 399 XLA library tests
   with one ignored benchmark, and two projection-allocation guards
+- Delivery A verification before removing the superseded schema prototype: 977 core library tests, 58 executable core
+  doctests with 16 ignored, both projection-allocation guards, 399 XLA library tests with one ignored benchmark, all
+  17 operation-derive integration tests including all eight compile-fail cases, core/XLA compilation, focused
+  flat-dispatch tests, formatting, and whitespace checks. Post-removal verification is recorded in the P3g plan review
+- Delivery A post-removal verification: all 976 core library tests passed, core/XLA compilation passed, formatting and
+  whitespace checks passed, and a production-code residual search found no schema type, module, or use site
+- Delivery A Clippy attribution: library-only Clippy reports 132 inherited diagnostics and none in a changed
+  production file
+- Delivery A residuals: no `MixedArrayDimensionOperation`, nested `ArrayProgramOperation::Mixed`, or explicit-type
+  derive extension remains. The 42 legacy conversion bounds and 182 shape calls remain intentionally unchanged until
+  the reshape, broadcast, and closure deliveries
 - Review method: line by line
-- Next action: owner review of the P3g plan and its four delivery boundaries
+- Next action: owner review, staging, commit, and push of Delivery A; do not begin Delivery B before that gate

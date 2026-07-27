@@ -141,7 +141,9 @@ exact source state immediately before execution.
 - Runtime dimension arithmetic is ordinary SSA in the same program as array computation.
 - Rank stays static.
 - A dynamic array axis stores one dimension identity and its authoritative bounds, never an arithmetic expression.
-- Shape operations consume every independently computed dynamic extent as an explicit dimension operand.
+- Mixed shape operations consume their runtime extents as explicit dimension operands. When an operation's output
+  shape is fully described by those operands, exact dimension constants represent static axes and the output shape is
+  derived rather than duplicated in the payload.
 - Dimension values are never reconstructed from rendered strings, names, ambient maps, or expression metadata.
 
 Leaf-only dimensions remain a deliberate trade, not an unexamined assumption. They keep type metadata decidable and
@@ -314,59 +316,49 @@ operation payloads, infer residuals from cotangent type expressions, or add tang
 Delete `ReshapeOperation::transpose_dimension_variables`, its rendering and identity-renaming behavior, and every
 reshape-specific composite differentiation branch that exists only to populate or consume that field.
 
-### Central dimension-operand schemas
+### Explicit dimension-operand signatures
 
-The order and identity of explicit dimension operands are part of a mixed operation's semantic signature. Replace the
-current family of ad hoc `runtime_dimension_variables` methods and copied validation loops with one mixed-operation
-schema contract. Conceptually, it yields ordered segments such as:
+The order of explicit dimension operands is part of each mixed operation's semantic signature. Replace the current
+family of ad hoc `runtime_dimension_variables` methods and recovery loops with direct positional contracts. For
+reshape and broadcast, the contract is deliberately uniform: one array followed by one dimension value per output
+axis. Exact constants represent static axes, bounded non-exact values represent dynamic axes, and inference derives
+the complete output shape from the operand types.
 
-```rust,ignore
-DimensionOperandSchema {
-    segments: [
-        operation_derived("starts", start_dimensions),
-        shape("sizes", size_dimensions),
-    ],
-}
-```
+Do not introduce a parallel `DimensionOperandSchema` or another metadata language describing operands already present
+in SSA. Operation inference is the authoritative declaration of operand count, kind, order, and result construction.
+Eager interpretation, transforms, and lowering preserve and consume the same ordered edges.
 
-The final schema representation must:
-
-- identify the array-program operand position of every dimension value;
-- name fixed, optional, repeated, and operation-derived segments;
-- carry the expected `DimensionVariable` identity and bounds;
-- validate count, kind, identity, bounds, and deterministic ordering once;
-- expose borrowed typed slices/views to inference, eager interpretation, transforms, and lowering;
-- support schemas whose expected variables depend on already-projected array input types, such as pad or reduce; and
-- produce canonical operation/segment/index diagnostics.
-
-Keep this contract on the mixed operation/schema layer, not on the generic `Operation` trait. Scalar and unrelated
-operation families must not acquire dimension-specific methods. A local `runtime_dimension_variables` helper may
-remain only as the implementation of the centralized schema builder; operation consumers may not call independent
-collectors or repeat validation loops.
+Later mixed operations may need additional semantic segments, such as slice starts or pad widths. Extend the existing
+typed mixed projection cursor only when repeated call-site code justifies a small helper. Keep such helpers structural:
+they may project fixed or repeated member kinds and produce canonical count/kind diagnostics, but must not carry a
+second copy of dimension identities, bounds, or output shapes.
 
 ### Operation families
 
 The final production families are:
 
 ```text
-ArrayPrimitiveOperation<A>       Operation<Type = ArrayType>
-DimensionOperation              Operation<Type = DimensionType>
-MixedArrayDimensionOperation<A> Operation<Type = ArrayProgramType>
-ArrayProgramOperation<A>        Operation<Type = ArrayProgramType>
+ArrayPrimitiveOperation<A> Operation<Type = ArrayType>
+DimensionOperation        Operation<Type = DimensionType>
+ArrayProgramOperation<A>  Operation<Type = ArrayProgramType>
 ```
 
 The names may be simplified after the migration, but the roles are fixed.
 
 - `ArrayPrimitiveOperation` contains operations whose complete signature is array-only.
 - `DimensionOperation` contains dimension-only operations.
-- `MixedArrayDimensionOperation` contains every operation with cross-kind operands/results and every higher-order
-  operation whose regions may carry both kinds.
-- `ArrayProgramOperation` is the sole stored dispatcher and the sole operation family of public array-program
-  execution contexts.
+- `ArrayProgramOperation` is the sole stored dispatcher and public array-program operation family. It projects the two
+  homogeneous member families and stores cross-kind and higher-order operations as direct flat variants.
+
+Do not introduce a separate mixed-operation family solely to reduce forwarding match arms. Such a family describes
+storage organization rather than a semantic operation contract, leaks nested variants into the public API, and adds a
+second policy match in transforms and lowering. Reconsider generated forwarding only if it can preserve flat variants,
+native eager member interpretation, and composite-operation validation without new public wrappers or special-purpose
+derive modes.
 
 Generic nullary constructors remain homogeneous only for types whose complete output geometry is metadata-only. Array
-construction with dynamic axes uses one mixed shaped-constructor wrapper that owns the explicit dimension-operand
-schema and delegates the element-generation semantics to `ZeroOperation<ArrayType>`, `OneOperation<ArrayType>`,
+construction with dynamic axes uses one mixed shaped-constructor wrapper that consumes explicit dimension operands
+and delegates the element-generation semantics to `ZeroOperation<ArrayType>`, `OneOperation<ArrayType>`,
 `FillOperation<ArrayType, V>`, or `IotaOperation<ArrayType>`. This avoids overlapping a blanket `Operation<T>`
 implementation with an `ArrayProgramType` implementation for the same instantiated payload.
 
@@ -398,9 +390,9 @@ The vocabulary must support:
 - borrowed projections without temporary vectors when practical; and
 - one canonical count/kind diagnostic.
 
-Prefer a small declarative schema macro or typed cursor extension over a new general procedural-macro language.
-Generate code only when it deletes more handwritten code than it introduces. The operation declaration is the sole
-source for outer enum variants, `From` conversions, type projection/lifting, and transform dispatch classification.
+Prefer a small typed cursor extension over a new declarative or procedural schema language. Generate code only when it
+deletes more handwritten code than it introduces. The operation declaration is the sole source for outer enum
+variants, `From` conversions, type projection/lifting, and transform dispatch classification.
 
 ### Transform-owned value-kind policies
 
@@ -530,9 +522,9 @@ wrap `TypeError` in `ProgramError` only at outward program boundaries.
   named-field destructuring remains supported; and
 - compatibility shims for the retired homogeneous shape-program API.
 
-One centralized schema implementation may internally collect dynamic variables from `Shape` metadata. What must
-disappear is independent per-consumer collection, copied validation, and any use of a schema to recover operands absent
-from the staged graph.
+Inference may derive result metadata from explicit operand types. What must disappear is independent per-consumer
+collection, copied identity/order validation, duplicated payload shape metadata, and any helper that recovers operands
+absent from the staged graph.
 
 ## Execution staging and review process
 
@@ -691,7 +683,7 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | `P2b.2` | Restore backend-neutral eager dimension interpretation                    | Line by line              |
 | `P2c`  | Generic storage-sum type/value projection                                  | Line by line              |
 | `P2d`  | Zero-state projected binding and third-member extensibility gate           | Line by line              |
-| `P3.*` | Central schemas, constructors, and one increment per mixed shape operation  | Line by line              |
+| `P3.*` | Explicit extent operands, constructors, and one increment per mixed shape operation | Line by line       |
 | `P4`   | Control flow, partial evaluation, import, and higher-order composition       | Line by line              |
 | `P5`   | Batching and replicated dimension authority                               | Line by line              |
 | `P6`   | Differentiation, transposition, and ordinary dimension residuals            | Line by line              |
@@ -935,7 +927,7 @@ semantics; the P0 release build is its regression gate.
 - [x] Inventory every transpose that needs primal dimension values unavailable from the cotangent and record the
       explicit SSA residuals it requires. Include reshape, concatenate, mean/reductions, slice, pad, and gather.
 - [x] Inventory every independent `runtime_dimension_variables` collector and every copied dimension-operand
-      validation loop; design its centralized schema segment before the sweep.
+      validation loop; assign each operation a direct positional operand contract before the sweep.
 - [x] Audit eager backend clone cost, beginning with reference `Array`'s `Vec<Scalar>` payload, and identify every
       current or proposed projection that clones an eager value.
 - [x] Decide the projection ownership model—borrowed views, immutable shared eager payloads, or both—before the
@@ -1046,6 +1038,12 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       explicit SSA through eager execution, partial evaluation, replicated-only batching, JVP/import, and direct
       signed StableHLO comparison lowering. P2a and P2b already provide ordinary dimension SSA, constants, arithmetic,
       and requirements.
+- [x] P3g Delivery A: retain cross-member primitives as flat `ArrayProgramOperation` variants and specify one explicit
+      dimension operand per reshape/broadcast output axis. Exact constants represent static axes and inference derives
+      the output shape from operand types. The rejected `DimensionOperandSchema`, nested-family prototype, and
+      projection-aware-derive analysis are recorded in the P3g plan; none remains in production.
+- [ ] P3g Deliveries B–D: migrate reshape, migrate broadcast, and close the combined transform/lowering vertical slice
+      before deleting their legacy homogeneous contracts in the immediately following increment.
 - [x] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
 - [x] Integrate inconclusive requirements with the existing effects model as `Effect::OrderedAssertion`; specify
       ordering, DCE survival, known-side PE folding, runtime observation values, and diagnostic ownership before
@@ -1068,7 +1066,7 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [x] Add allocation and payload-size tests proving that projecting a large reference-backend array neither allocates
       nor copies its `Scalar` payload.
 - [x] Pin canonical wrong-kind diagnostics as compile/runtime goldens. Wrong-count diagnostics belong to P3's mixed
-      operand schemas because P2c introduces no operand-count projection.
+      operation inference because P2c introduces no operand-count projection.
 - [x] Add a compile-only toy third member kind to prove that another kind needs projection and policy
       implementations, not changes to generic `Program`, `Context`, capture, tracer, or projected-context machinery.
 - [x] Gate: the projected context contains no semantic state other than its parent, and the vertical slice creates no
@@ -1092,17 +1090,18 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       supplies geometry.
 - [ ] Keep homogeneous nullary zero/one/fill/iota only for fully static array output types.
 - [ ] Route dynamic zero/one/fill/iota through one mixed shaped-constructor wrapper whose only additional operands are
-      the explicit dynamic extents required by its centralized schema.
+      its explicit dynamic extents.
 - [ ] Sweep shape-changing collectives and every other operation whose result metadata references first-class
       dimension operands.
-- [ ] Implement the centralized dimension-operand schema and migrate each mixed operation's inference, eager rule,
-      transforms, and lowering to its typed views.
-- [ ] Delete copied dimension operand identity, bounds, count, and ordering validation after each operation migrates.
+- [ ] Give each mixed operation one direct positional operand contract and migrate its inference, eager rule,
+      transforms, and lowering to preserve those same SSA edges.
+- [ ] Delete copied dimension operand identity, bounds, and ordering validation after inference derives result metadata
+      directly from operand types. Centralize only genuinely repeated count/kind projection.
 - [ ] Replace shape-metadata zero/one materialization inside transforms with structural zero or `zero_like`/`one_like`
       wherever semantics allow.
-- [ ] Ensure static invocations of canonical mixed shape operations bind the same payload with an empty
-      explicit-dimension segment rather than a second contract. Constructors follow the explicit static-homogeneous
-      versus dynamic-shaped-wrapper split above.
+- [ ] Ensure static reshape and broadcast invocations bind the same payload with exact constant dimension operands
+      rather than a second contract. Constructors follow the explicit static-homogeneous versus
+      dynamic-shaped-wrapper split above.
 - [ ] Add a residual search proving no concrete payload implements materially different operation type contracts.
 - [ ] Add a residual search proving generic constructors have no overlapping array-program-specific implementation.
 - [ ] Add a residual search proving no operation consumer independently calls an ad hoc
@@ -1254,16 +1253,17 @@ rename only part of the problem while introducing another carrier.
 
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
 - [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.
-- [ ] Make the centralized dimension-operand schema the authoritative source for dimension operand positions,
-      segments, variables, bounds, and diagnostics.
+- [ ] Make each mixed operation's inference contract the authoritative source for dimension operand positions,
+      member kinds, ordering, and result metadata.
 - [ ] Extend the typed mixed projection vocabulary only for repeated fixed/optional/segmented patterns found in the
       Phase 0 inventory.
-- [ ] Generate or centralize schema validation so inference, eager interpretation, transforms, and lowering cannot
-      disagree about dimension operand order.
+- [ ] Centralize only structural projection needed to ensure eager interpretation, transforms, and lowering preserve
+      the operand order declared by inference.
 - [ ] Delete redundant local variant lists, conversion macros, manual wrong-kind matches, and projection boilerplate.
-- [ ] Delete independent `runtime_dimension_variables` methods after their operation schemas migrate.
+- [ ] Delete independent `runtime_dimension_variables` methods after their operations consume explicit operands.
 - [ ] Keep semantically meaningful operation rules handwritten and colocated with their payload.
-- [ ] Add compile-fail coverage for malformed schemas and runtime goldens for canonical projection diagnostics.
+- [ ] Add compile-fail coverage for invalid generated operation declarations and runtime goldens for canonical
+      projection diagnostics.
 - [ ] Run macro unit and integration tests and compare generated token counts/compile time with the baseline.
 - [ ] Gate: one new array-only primitive requires one family declaration and its semantic/backend rules; one new mixed
       operation declares its signature once and does not add projection ceremony to transforms.
@@ -1320,8 +1320,8 @@ rename only part of the problem while introducing another carrier.
 - [ ] Static array-only primitives never inspect the heterogeneous storage sum.
 - [ ] Dimension-only primitives never inspect array variants.
 - [ ] Mixed inference covers fixed, repeated, optional, and segmented operands.
-- [ ] One centralized schema defines every explicit dimension operand's segment, position, identity, bounds, and
-      diagnostic.
+- [ ] Each mixed operation defines its explicit dimension operands once through its inference signature, with no
+      parallel payload metadata or schema.
 - [ ] `dimension_size` has exactly one result kind.
 - [ ] Dimension-to-data conversion occurs only through explicit gateways.
 - [ ] Shape operations retain all explicit dimension operands through tracing, import, PE, batching, AD, and lowering.
@@ -1357,11 +1357,10 @@ Stop the current phase and revise this plan if any of the following occurs:
 - an array-only rule still needs ambient dimension lookup after its operation classification is corrected;
 - removing the homogeneous shape language forces duplicate semantic implementations rather than direct outer binding;
 - transform policy leaks batching/differentiation hooks back onto `Type`;
-- mixed signature generation becomes a second general operation DSL with more code than the handwritten schemas;
+- mixed signature generation becomes a second general operation DSL with more code than direct inference contracts;
 - structural identity ownership cannot represent a valid operation without weakening closure soundness;
 - differentiation requires a new operation-specific dimension residual field after the generic residual migration;
-- inference, transforms, eager interpretation, and lowering derive different dimension operand orderings instead of
-  consuming one schema;
+- inference, transforms, eager interpretation, and lowering disagree about the operation's direct operand order;
 - diagnostics regress to generic assertion/type errors;
 - a phase increases production code after its temporary coexistence code should have been deleted;
 - a broad Rust check causes extreme memory growth; reduce generic obligations before rerunning;
@@ -1377,7 +1376,7 @@ The cleanup is complete only when:
 3. `dimension_size` always returns a dimension and the data gateway is distinct.
 4. Dynamic zero, one, fill, and iota construction has one mixed shaped-constructor contract; transform-generated
    values use structural or operand-relative construction where possible.
-5. Every shape-carrying operation consumes explicit dimension operands described by one centralized schema.
+5. Every shape-carrying operation consumes explicit dimension operands through one direct operation signature.
 6. No ambient dimension/source-array replay environment exists.
 7. No complete homogeneous implicit-shape array program exists in production.
 8. Eager projection borrows or transfers ownership without copying payloads.
@@ -1398,7 +1397,7 @@ Execution notes, per-phase summaries, measurements, superseded decisions, and ve
 here as the plan is executed. Do not check an item solely because a test happens to pass; record the implementation or
 deletion that satisfies it.
 
-### Plan revision: projection ownership, constructors, residuals, and schemas
+### Plan revision: projection ownership, constructors, residuals, and explicit operands
 
 The pre-execution review identified four missing design decisions and this revision resolves them:
 
@@ -1408,8 +1407,8 @@ The pre-execution review identified four missing design decisions and this revis
   transforms, homogeneous construction for static geometry, and one mixed wrapper for dynamic geometry;
 - leaf-only dimensions remain explicit policy, while transpose-only primal extents move through one
   differentiation-owned ordinary SSA residual mechanism and `transpose_dimension_variables` is deleted; and
-- one mixed-operation dimension-operand schema owns positions, segments, identities, bounds, ordering, validation,
-  diagnostics, and consumer views across inference, eager execution, transforms, and lowering.
+- each mixed operation owns one direct positional dimension-operand contract, and all consumers preserve those SSA
+  edges without a parallel schema or payload copy of the shape.
 
 The revision also retains the structured `TypeError` enum while selecting a named `Invalid { message: String }`
 variant, with all construction routed through `TypeError::invalid(...)`, as a separately reviewable mechanical cleanup.
@@ -1874,7 +1873,7 @@ shape operation:
   carriers; and
 - the context-size assertion pins that the type marker adds no runtime storage beyond the parent context.
 
-Production `ArrayProgramOperation`, mixed operand schemas, shape operations, higher-order region projection, batching,
+Production `ArrayProgramOperation`, mixed operand contracts, shape operations, higher-order region projection, batching,
 and differentiation policies remain assigned to P3–P6. The existing reference-array allocation tests continue to prove
 that borrowed and consuming eager value projection neither allocates nor copies payloads. Projected-context binding
 temporarily reconstructs parent values from borrowed inputs because the generic `Context::bind` contract accepts a
