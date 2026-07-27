@@ -7,6 +7,7 @@ use crate::backends::arrays::ArrayOperation;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::contexts::EagerContext;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::operations::dimensions::{DimensionExtent, DimensionSize, DimensionSizeOperation};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::effects::Effects;
@@ -24,9 +25,10 @@ use crate::types::{ArrayProgramType, ArrayType, DimensionType, DimensionVariable
 /// [`DimensionOperation`]: it selects the member family, projects the composite type boundary once, delegates to that
 /// family, and lifts the inferred result types back into [`ArrayProgramType`].
 ///
-/// Operations whose signatures mix arrays and dimensions are intentionally not represented here. They are introduced
-/// as explicit outer-family variants when their operand contracts are migrated, because no homogeneous member family
-/// can express such a signature.
+/// Operations whose signatures mix arrays and dimensions are represented as explicit outer-family variants when their
+/// operand contracts are migrated, because no homogeneous member family can express such a signature.
+/// [`ArrayProgramOperation::DimensionSize`] is the canonical first example: it consumes an array and produces a
+/// first-class dimension without changing either homogeneous family.
 #[derive(Clone, Debug)]
 pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// Homogeneous array operation.
@@ -34,6 +36,9 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
 
     /// Homogeneous first-class-dimension operation.
     Dimension(DimensionOperation<DimensionValue>),
+
+    /// Mixed operation that reads an array axis as a first-class dimension.
+    DimensionSize(DimensionSizeOperation),
 }
 
 impl<A: Value<Type = ArrayType>> Display for ArrayProgramOperation<A> {
@@ -54,6 +59,13 @@ impl<A: Value<Type = ArrayType>> From<DimensionOperation<DimensionValue>> for Ar
     #[inline]
     fn from(operation: DimensionOperation<DimensionValue>) -> Self {
         Self::Dimension(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<DimensionSizeOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: DimensionSizeOperation) -> Self {
+        Self::DimensionSize(operation)
     }
 }
 
@@ -102,6 +114,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Array(operation) => operation.name(),
             Self::Dimension(operation) => operation.name(),
+            Self::DimensionSize(operation) => operation.name(),
         }
     }
 
@@ -110,6 +123,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Array(operation) => operation.region_slots(),
             Self::Dimension(operation) => operation.region_slots(),
+            Self::DimensionSize(operation) => operation.region_slots(),
         }
     }
 
@@ -135,6 +149,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                     .map(|types| types.map(|types| types.into_iter().map(Into::into).collect()))
                     .collect())
             }
+            Self::DimensionSize(operation) => operation.infer_region_input_types(input_types, region_interfaces),
         }
     }
 
@@ -160,6 +175,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                     .map(Into::into)
                     .collect())
             }
+            Self::DimensionSize(operation) => operation.infer_output_types(input_types, region_interfaces),
         }
     }
 
@@ -168,6 +184,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Array(operation) => operation.output_region_provenance(output_index),
             Self::Dimension(operation) => operation.output_region_provenance(output_index),
+            Self::DimensionSize(operation) => operation.output_region_provenance(output_index),
         }
     }
 
@@ -176,6 +193,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Array(operation) => operation.is_zero(output_index),
             Self::Dimension(operation) => operation.is_zero(output_index),
+            Self::DimensionSize(operation) => operation.is_zero(output_index),
         }
     }
 
@@ -184,6 +202,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Array(operation) => operation.effects(),
             Self::Dimension(operation) => operation.effects(),
+            Self::DimensionSize(operation) => operation.effects(),
         }
     }
 
@@ -191,6 +210,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Array(operation) => Ok(Self::Array(operation.rename_type_identities(renaming)?)),
             Self::Dimension(operation) => Ok(Self::Dimension(operation.rename_type_identities(renaming)?)),
+            Self::DimensionSize(operation) => Ok(Self::DimensionSize(operation.rename_type_identities(renaming)?)),
         }
     }
 
@@ -199,6 +219,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Array(operation) => operation.render(formatter, indentation),
             Self::Dimension(operation) => operation.render(formatter, indentation),
+            Self::DimensionSize(operation) => operation.render(formatter, indentation),
         }
     }
 }
@@ -244,8 +265,8 @@ where
     Ok(outputs.into_iter().map(<ArrayProgramValue<A> as ValueProjection<T>>::from_projected).collect())
 }
 
-impl<A: Value<Type = ArrayType>> InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>
-    for ArrayProgramOperation<A>
+impl<A: DimensionExtent + Value<Type = ArrayType>>
+    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
 where
     ArrayOperation<A>: InterpretableOperation<EagerContext<A, ArrayOperation<A>>>,
     DimensionOperation<DimensionValue>:
@@ -266,6 +287,11 @@ where
         match self {
             Self::Array(operation) => interpret_homogeneous_operation(operation, inputs),
             Self::Dimension(operation) => interpret_homogeneous_operation(operation, inputs),
+            Self::DimensionSize(operation) => operation.interpret(
+                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
+                &EmptyRegionDriver,
+                inputs,
+            ),
         }
     }
 }
@@ -332,6 +358,16 @@ impl<A: Value<Type = ArrayType>> Value for ArrayProgramValue<A> {
             Self::Array(value) => Ok(Self::Array(value.rename_type_identities(renaming)?)),
             Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
         }
+    }
+}
+
+impl<A: DimensionExtent + Value<Type = ArrayType>> DimensionSize for ArrayProgramValue<A> {
+    fn dimension_size<AxisValue: Into<crate::Axis>>(&self, axis: AxisValue) -> Result<Self, ProgramError> {
+        let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let input_type = array.r#type();
+        let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
+        let extent = array.dimension_extent(operation.axis())?;
+        Ok(Self::Dimension(DimensionValue::new(operation.result_type().clone(), extent)?))
     }
 }
 
@@ -422,7 +458,7 @@ mod tests {
     use crate::differentiation::DifferentiationTracer;
     use crate::operations::constants::{ConstantOperation, ZeroOperation};
     use crate::operations::control_flow::ConditionOperation;
-    use crate::operations::dimensions::{DimensionAddOperation, DimensionRequirementOperation};
+    use crate::operations::dimensions::{DimensionAddOperation, DimensionRequirementOperation, DimensionSizeOperation};
     use crate::operations::math::AddOperation;
     use crate::partial::PartialTracer;
     use crate::programs::effects::{Effect, Effects};
@@ -571,7 +607,7 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
         let zero = ArrayProgramOperation::<Array>::from(ArrayOperation::Zero(ZeroOperation::new(dynamic_type)));
         let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(source, target.clone()).unwrap();
+        renaming.insert(source.clone(), target.clone()).unwrap();
         let ArrayProgramOperation::Array(ArrayOperation::Zero(zero)) = zero.rename_type_identities(&renaming).unwrap()
         else {
             panic!("expected a renamed array zero operation");
@@ -588,6 +624,18 @@ mod tests {
         };
         assert_eq!(add.left_type().variable(), &renamed_left);
         assert_eq!(add.right_type(), &right_type);
+
+        // A genuinely mixed operation is represented directly by the outer family rather than either homogeneous
+        // member projection.
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
+        let dimension_size =
+            ArrayProgramOperation::<Array>::from(DimensionSizeOperation::new(&dynamic_type, 0).unwrap());
+        assert!(matches!(dimension_size, ArrayProgramOperation::DimensionSize(_)));
+        assert_eq!(dimension_size.name(), "dimension_size");
+        assert_eq!(
+            dimension_size.infer_output_types(&[dynamic_type.into()], &[]),
+            Ok(vec![DimensionType::new(source).into()]),
+        );
     }
 
     #[test]
