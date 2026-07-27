@@ -633,9 +633,11 @@ ledger disagrees with Git.
 
 ## P3f: first-class dimension comparison
 
-- Status: ready for review
+- Status: landed
 - Branch: `u/eaplatanios/dynamic-shapes`
 - Baseline commit: `faa79e49296a6861022529fba4fb01567e196cc1`
+- Source commit: `6a2af58e18cbb595878e682b8c54c1c9eeb40d9b`
+- Integration commit: `162a8241b54212309f7caeb243959efe8a7e5cd3`
 - Immutable archive unchanged: yes
 - Scope: extend the canonical `CompareOperation` and `Compare<Output>` capability with the composite member signature
   `(Dimension, Dimension) -> Array(Boolean scalar)`, then carry it through eager execution, tracing, partial
@@ -677,4 +679,33 @@ ledger disagrees with Git.
   tests, documentation, ledger updates, and mechanical `Compare<Output = V>` to `Compare<V>` bound migrations; below
   the 800-line P3f review budget
 - Review method: line by line
-- Next action: owner review, staging, commit, and push
+- Next action: none
+
+## P3g: explicit reshape and broadcast dimensions
+
+- Status: planning
+- Branch: `u/eaplatanios/dynamic-shapes`
+- Baseline commit: `162a8241b54212309f7caeb243959efe8a7e5cd3`
+- Immutable archive unchanged: yes
+- Scope: introduce the centralized dimension-operand schema through the first two shape-producing mixed operations,
+  giving reshape and broadcast the canonical signatures
+  `(Array, output dynamic dimensions...) -> Array`
+- Design: dynamic output dimensions are individual first-class dimension SSA operands ordered by output axis. Static
+  invocations use the same mixed payload with an empty dimension segment. The operation payload retains only declared
+  array metadata and semantic attributes; it never stores dimension expressions, packed shape data, witnesses, or
+  transform-only residual manifests
+- Review staging: land schema/mixed-family containment, reshape, broadcast, and transform/lowering closure as separate
+  owner-reviewed increments so the 42 explicit shape-operation bounds and approximately 149 shape-operation calls are
+  never migrated as one opaque sweep
+- Transitional boundary: P3g adds and validates the canonical mixed paths. The following deletion increment migrates
+  every remaining homogeneous consumer before removing `ReshapeDimensionExpression`, `DynamicBroadcastOperation`, the
+  homogeneous reshape/broadcast contracts, and their legacy transform/lowering paths. No new production consumer may
+  use those legacy paths after its P3g migration
+- Explicit exclusions: no ambient dimension lookup, source-array recovery, expression evaluation in mixed lowering,
+  packed rank-one shape operand, Boolean or arithmetic dimension metadata, ragged mapped dimensions, final
+  `RuntimeShape` public API, or reshape-specific differentiation residual field
+- Plan: `.tasks/plan_p3g_reshape_broadcast.md`
+- Verification baseline: 976 core library tests, 58 executable core doctests with 16 ignored, 399 XLA library tests
+  with one ignored benchmark, and two projection-allocation guards
+- Review method: line by line
+- Next action: owner review of the P3g plan and its four delivery boundaries
