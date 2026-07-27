@@ -46,21 +46,23 @@ composite transform policy, and backend lowering remain in their named later inc
 - Define `DIMENSION_SIZE_OPERATION_NAME` and a nominal `DimensionSizeOperation`.
 - Put the complete user-facing semantics and executable example on a `DimensionSize` capability trait. The operation
   type documentation refers to that capability instead of duplicating the explanation.
-- `DimensionSize::dimension_size(axis)` always returns a first-class dimension in its parent composite value carrier.
-  The capability's `Output` parameter lets a projected array member return that parent carrier directly; it never
-  returns integer array data.
+- `DimensionSize::dimension_size(axis)` returns the selected axis size in the representation chosen by its `Output`
+  parameter. Composite program values return a first-class dimension in their parent carrier, while concrete array
+  backends may return a host extent; neither path returns integer array data.
 - Give context-carrying `Value<Type = ArrayProgramType>` implementations one blanket staging implementation. It:
   1. projects the receiver's array type with the canonical borrowed `TryFrom`;
   2. constructs `DimensionSizeOperation` from that type and the requested axis; and
   3. binds the mixed operation once through the value's dispatch context.
 - Give `ProjectedValue<ArrayType, V>` the same capability with `Output = V`, so results of projected array operations
   can feed shape computation without an explicit adapter conversion or a second wrapper type.
-- Keep eager backend extraction separate through a small `DimensionExtent` provider capability owned by array
-  backends. It returns one checked host `usize` for a selected axis and does not create an SSA identity or expose a
-  second program operation contract.
-- Implement `DimensionExtent` for the reference `Array` backend. Implement `DimensionSize` for
-  `ArrayProgramValue<A>` when `A: DimensionExtent`, producing `ArrayProgramValue::Dimension`.
-- Do not add `DimensionSize` to homogeneous array values or `DimensionSizeOperation` to `ArrayOperation<A>`.
+- Use the same `DimensionSize<Output>` capability for eager backend extraction: array backends select
+  `Output = usize`, while composite values select their parent first-class-dimension carrier. The backend
+  implementation reads one checked host extent and does not create an SSA identity or expose a second program
+  operation contract.
+- Implement `DimensionSize<usize>` for the reference `Array` backend. Implement `DimensionSize` for
+  `ArrayProgramValue<A>` when `A: DimensionSize<usize>`, producing `ArrayProgramValue::Dimension`.
+- Do not add `DimensionSizeOperation` to `ArrayOperation<A>`; the homogeneous reference value implements only the
+  shared semantic capability that the composite eager implementation consumes.
 
 ### Operation payload and inference
 
@@ -118,7 +120,7 @@ composite transform policy, and backend lowering remain in their named later inc
       commits, and record this P3b branch and scope.
 - [x] Add the `dimension_size` operation module, canonical exports, operation constant, capability traits, payload,
       inference, identity renaming, rendering, interpretation, and ordinary partial-evaluation contract.
-- [x] Implement reference-array `DimensionExtent` extraction without allocation, payload traversal, or scalar-array
+- [x] Implement reference-array `DimensionSize<usize>` without allocation, payload traversal, or scalar-array
       materialization.
 - [x] Implement eager `DimensionSize` for `ArrayProgramValue<A>` without cloning the array payload.
 - [x] Add the mixed operation variant, lift, operation-contract dispatch, and eager interpretation arm to
@@ -174,7 +176,8 @@ composite transform policy, and backend lowering remain in their named later inc
 
 ## Acceptance Gates
 
-- [x] `dimension_size` has exactly one semantic result kind everywhere: a first-class dimension.
+- [x] `DimensionSizeOperation` has exactly one semantic result kind everywhere: a first-class dimension. Concrete
+      backend capability implementations may expose the same axis size as a host extent.
 - [x] Dynamic declared inputs accept compatible static eager refinements without weakening identity validation for
       staged dynamic inputs.
 - [x] The rendered graph contains one explicit array-to-dimension edge and no hidden extent reconstruction.
@@ -182,16 +185,16 @@ composite transform policy, and backend lowering remain in their named later inc
       no array payload allocation or copy.
 - [x] Repeated readers and program import preserve structural identity closure without operation-specific identity
       hooks.
-- [x] The implementation adds one mixed variant and one backend extent provider, not a parallel mixed-operation
-      framework or carrier-specific wrapper tower.
+- [x] The implementation adds one mixed variant and one concrete backend implementation of the shared capability, not
+      a parallel mixed-operation framework or carrier-specific wrapper tower.
 
 ## Review
 
 - Added the canonical mixed `DimensionSizeOperation` and its `DimensionSize` capability. Dynamic axes forward their
   declared identity; static axes define a fresh exact-bounds dimension.
-- Added one constant-time `DimensionExtent` backend capability and implemented it for the reference `Array` using only
-  shape metadata. The existing allocation test and a payload-pointer regression prove that no eager array payload is
-  cloned or scanned.
+- Implemented the shared `DimensionSize<Output>` capability for the reference `Array` with `Output = usize`, using
+  only shape metadata. The existing allocation test and a payload-pointer regression prove that no eager array payload
+  is cloned or scanned.
 - Added one explicit mixed `ArrayProgramOperation::DimensionSize` variant. Homogeneous operation projection remains
   unchanged, while eager interpretation dispatches this mixed signature directly.
 - The staging capability uses one generic outer-carrier implementation plus one `ProjectedValue<ArrayType, V>` bridge

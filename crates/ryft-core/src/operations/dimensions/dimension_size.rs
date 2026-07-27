@@ -1,7 +1,7 @@
 //! First-class extraction of an array axis extent.
 //!
-//! The user-facing semantics and example live on [`DimensionSize`]. Backends implement [`DimensionExtent`] to expose
-//! concrete shape metadata without turning dimensions into ordinary array data.
+//! The user-facing semantics and example live on [`DimensionSize`]. The capability's output type lets concrete
+//! backends expose host shape metadata while composite program values produce first-class dimensions.
 
 use std::fmt::Display;
 
@@ -26,12 +26,13 @@ use crate::types::{
 /// Canonical operation name for [`DimensionSizeOperation`].
 pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
 
-/// Reads the runtime extent of one array axis as a first-class dimension.
+/// Reads the runtime extent of one array axis.
 ///
-/// This is the program-level equivalent of using an array shape component such as `x.shape[axis]`: the result is a
-/// dimension SSA value that can be passed explicitly to shape-carrying operations and combined with other dimension
-/// operations. It is not an integer array. Convert a dimension to ordinary scalar data explicitly when a numerical
-/// computation needs the extent as data.
+/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation is
+/// selected by `Output`: a materialized array backend can return its host extent, while a composite program value
+/// returns a dimension SSA value that can be passed explicitly to shape-carrying operations and combined with other
+/// dimension operations. A program result is not an integer array; convert it to ordinary scalar data explicitly when
+/// a numerical computation needs the extent as data.
 ///
 /// In a composite trace, the capability works both on the outer array member and on a
 /// [`ProjectedValue<ArrayType, V>`]. The projected form stages into and returns the parent composite carrier, allowing
@@ -56,7 +57,7 @@ pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
 /// # }
 /// ```
 pub trait DimensionSize<Output = Self>: Typed + Sized {
-    /// Returns the runtime extent of `axis` as a first-class dimension in `Output`'s composite value carrier.
+    /// Returns the runtime extent of `axis` in the representation selected by `Output`.
     fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<Output, ProgramError>;
 }
 
@@ -86,15 +87,6 @@ where
             .bind(operation, Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0))
     }
-}
-
-/// Backend capability for reading one materialized array extent without converting it into ordinary array data.
-///
-/// Implementations perform only backend-specific shape metadata access. [`DimensionSizeOperation`] remains
-/// responsible for the first-class result identity, bounds, and program semantics.
-pub trait DimensionExtent: Typed<Type = ArrayType> {
-    /// Returns the concrete nonnegative extent at the already-normalized `axis`.
-    fn dimension_extent(&self, axis: usize) -> Result<usize, ProgramError>;
 }
 
 /// Mixed array-to-dimension operation used by [`DimensionSize`].
@@ -398,6 +390,8 @@ mod tests {
         assert_eq!(renamed_operation.result_type().variable(), &renamed);
 
         // Eager execution reads shape metadata without consuming or copying the array payload.
+        let reference_array = Array::matrix(2, 3, vec![0.0f32; 6]);
+        assert_eq!(reference_array.dimension_size(-1), Ok(3));
         let array = ArrayProgramValue::Array(Array::matrix(2, 3, vec![0.0f32; 6]));
         let payload = <ArrayProgramValue<Array> as crate::ValueProjection<ArrayType>>::projected(&array)
             .unwrap()
