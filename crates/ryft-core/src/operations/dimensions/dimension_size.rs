@@ -23,6 +23,8 @@ use crate::types::{
     ArrayProgramType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
 };
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`DimensionSizeOperation`].
 pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
 
