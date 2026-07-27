@@ -537,11 +537,12 @@ ledger disagrees with Git.
 
 ## P3c: explicit dimension-to-scalar-array conversion
 
-- Status: ready for owner review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p3c-dimension-to-scalar`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending
+- Source commit: `7b224d993`
+- Integration commit: `a7ae31167401e08c200768b2cf953b9266861507` (including owner review commits
+  `dd5294aa7` and `98452be79`)
+- Remainder reconciliation commit: `12398a196`
 - Immutable archive unchanged: yes
 - Scope: introduce the sole `dimension -> scalar-array` `DimensionToScalarOperation`, its shared value capability,
   one explicit mixed outer-family variant, and reference-backend eager materialization as a rank-zero signed 64-bit
@@ -572,4 +573,23 @@ ledger disagrees with Git.
   mixed bucket, reverse data-to-dimension gateway, expression reconstruction environment, production host readback, or
   copied archived transform/lowering monolith was introduced
 - Review method: line by line, including a final ownership/allocation audit
-- Next action: owner review and source commit
+- Next action: none
+
+## P3d: checked scalar-array to dimension gateway
+
+- Status: in progress
+- Branch: `u/eaplatanios/increment/p3d-dimension-from-scalar`
+- Source commit: pending
+- Integration commit: pending
+- Remainder reconciliation commit: pending
+- Immutable archive unchanged: yes
+- Scope: introduce the sole checked `rank-0 integer array -> dimension` gateway, with one fresh declared result
+  identity, reference-eager validation, ordinary partial evaluation, replicated-only batching, and explicit deferred
+  XLA lowering
+- Deferred: indexed extraction from rank-one integer arrays remains P3e; dimension comparison remains P3f; checked
+  device-side gateway lowering and observed-value assertions remain P7; batching-adapter consolidation remains P5
+- Plan: `.tasks/plan_p3d_dimension_from_scalar.md`
+- Verification: pending
+- Residual search: pending
+- Review method: line by line
+- Next action: review the operation-specific plan before production implementation
