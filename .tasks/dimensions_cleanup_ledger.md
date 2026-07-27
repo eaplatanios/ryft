@@ -577,8 +577,8 @@ ledger disagrees with Git.
 
 ## P3d: checked scalar-array to dimension gateway
 
-- Status: in progress
-- Branch: `u/eaplatanios/increment/p3d-dimension-from-scalar`
+- Status: ready for review
+- Branch: `u/eaplatanios/dynamic-shapes` (unstaged owner-review changes)
 - Source commit: pending
 - Integration commit: pending
 - Remainder reconciliation commit: pending
@@ -587,9 +587,15 @@ ledger disagrees with Git.
   identity, reference-eager validation, ordinary partial evaluation, replicated-only batching, and explicit deferred
   XLA lowering
 - Deferred: indexed extraction from rank-one integer arrays remains P3e; dimension comparison remains P3f; checked
-  device-side gateway lowering and observed-value assertions remain P7; batching-adapter consolidation remains P5
+  device-side gateway lowering and observed-value assertions remain P7. That lowering must convert the input integer
+  scalar to canonical `i64`, check nonnegativity, declared lower/upper bounds, and `MAX_DIMENSION_EXTENT`, preserve
+  actor-named diagnostics with the observed value, and return the checked scalar as dimension SSA. Batching-adapter
+  consolidation remains P5
 - Plan: `.tasks/plan_p3d_dimension_from_scalar.md`
-- Verification: pending
-- Residual search: pending
+- Verification: all 975 core library tests; 56 executable core doctests with 16 ignored; all 398 XLA library tests
+  with one ignored; the two projection allocation tests; package checks; formatting; and diff hygiene pass
+- Residual search: exactly one production operation declaration and one outer-family variant; no homogeneous operation
+  contract, data-source adapter, host-readback path, expression witness, source-array field, generic mixed bucket, or
+  unchecked lowering was introduced; the vector-element gateway remains absent and assigned to P3e
 - Review method: line by line
-- Next action: review the operation-specific plan before production implementation
+- Next action: owner review, staging, commit, and push

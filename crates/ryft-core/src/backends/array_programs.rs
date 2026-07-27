@@ -13,7 +13,8 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::dimensions::{
-    DimensionSize, DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation,
+    DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
+    DimensionToScalarOperation,
 };
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, Placeholder};
@@ -59,6 +60,9 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// Mixed operation that reads an array axis as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
 
+    /// Mixed operation that converts ordinary scalar-array data into a checked first-class dimension.
+    DimensionFromScalar(DimensionFromScalarOperation),
+
     /// Mixed operation that converts a first-class dimension into ordinary scalar-array data.
     DimensionToScalar(DimensionToScalarOperation),
 }
@@ -88,6 +92,13 @@ impl<A: Value<Type = ArrayType>> From<DimensionSizeOperation> for ArrayProgramOp
     #[inline]
     fn from(operation: DimensionSizeOperation) -> Self {
         Self::DimensionSize(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<DimensionFromScalarOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: DimensionFromScalarOperation) -> Self {
+        Self::DimensionFromScalar(operation)
     }
 }
 
@@ -159,6 +170,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Array(operation) => operation.name(),
             Self::Dimension(operation) => operation.name(),
             Self::DimensionSize(operation) => operation.name(),
+            Self::DimensionFromScalar(operation) => operation.name(),
             Self::DimensionToScalar(operation) => operation.name(),
         }
     }
@@ -170,6 +182,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Array(operation) => operation.region_slots(),
             Self::Dimension(operation) => operation.region_slots(),
             Self::DimensionSize(operation) => operation.region_slots(),
+            Self::DimensionFromScalar(operation) => operation.region_slots(),
             Self::DimensionToScalar(operation) => operation.region_slots(),
         }
     }
@@ -198,6 +211,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                     .collect())
             }
             Self::DimensionSize(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            Self::DimensionFromScalar(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::DimensionToScalar(operation) => operation.infer_region_input_types(input_types, region_interfaces),
         }
     }
@@ -231,6 +245,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                     .collect())
             }
             Self::DimensionSize(operation) => operation.infer_output_types(input_types, region_interfaces),
+            Self::DimensionFromScalar(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::DimensionToScalar(operation) => operation.infer_output_types(input_types, region_interfaces),
         }
     }
@@ -242,6 +257,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Array(operation) => operation.output_region_provenance(output_index),
             Self::Dimension(operation) => operation.output_region_provenance(output_index),
             Self::DimensionSize(operation) => operation.output_region_provenance(output_index),
+            Self::DimensionFromScalar(operation) => operation.output_region_provenance(output_index),
             Self::DimensionToScalar(operation) => operation.output_region_provenance(output_index),
         }
     }
@@ -253,6 +269,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Array(operation) => operation.is_zero(output_index),
             Self::Dimension(operation) => operation.is_zero(output_index),
             Self::DimensionSize(operation) => operation.is_zero(output_index),
+            Self::DimensionFromScalar(operation) => operation.is_zero(output_index),
             Self::DimensionToScalar(operation) => operation.is_zero(output_index),
         }
     }
@@ -264,6 +281,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Array(operation) => operation.effects(),
             Self::Dimension(operation) => operation.effects(),
             Self::DimensionSize(operation) => operation.effects(),
+            Self::DimensionFromScalar(operation) => operation.effects(),
             Self::DimensionToScalar(operation) => operation.effects(),
         }
     }
@@ -274,6 +292,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Array(operation) => Ok(Self::Array(operation.rename_type_identities(renaming)?)),
             Self::Dimension(operation) => Ok(Self::Dimension(operation.rename_type_identities(renaming)?)),
             Self::DimensionSize(operation) => Ok(Self::DimensionSize(operation.rename_type_identities(renaming)?)),
+            Self::DimensionFromScalar(operation) => {
+                Ok(Self::DimensionFromScalar(operation.rename_type_identities(renaming)?))
+            }
             Self::DimensionToScalar(operation) => {
                 Ok(Self::DimensionToScalar(operation.rename_type_identities(renaming)?))
             }
@@ -287,6 +308,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Array(operation) => operation.render(formatter, indentation),
             Self::Dimension(operation) => operation.render(formatter, indentation),
             Self::DimensionSize(operation) => operation.render(formatter, indentation),
+            Self::DimensionFromScalar(operation) => operation.render(formatter, indentation),
             Self::DimensionToScalar(operation) => operation.render(formatter, indentation),
         }
     }
@@ -333,7 +355,7 @@ where
     Ok(outputs.into_iter().map(<ArrayProgramValue<A> as ValueProjection<T>>::from_projected).collect())
 }
 
-impl<A: DimensionSize<usize> + Value<Type = ArrayType>>
+impl<A: DimensionFromScalar<DimensionValue> + DimensionSize<usize> + Value<Type = ArrayType>>
     InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
 where
     DimensionValue: DimensionToScalar<A>,
@@ -363,6 +385,11 @@ where
             Self::Array(operation) => interpret_homogeneous_operation(operation, inputs),
             Self::Dimension(operation) => interpret_homogeneous_operation(operation, inputs),
             Self::DimensionSize(operation) => operation.interpret(
+                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
+                &EmptyRegionDriver,
+                inputs,
+            ),
+            Self::DimensionFromScalar(operation) => operation.interpret(
                 &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
                 &EmptyRegionDriver,
                 inputs,
@@ -612,6 +639,32 @@ impl DimensionToScalar<Array> for DimensionValue {
     }
 }
 
+impl DimensionFromScalar<DimensionValue> for Array {
+    fn to_dimension(&self, result: DimensionVariable) -> Result<DimensionValue, ProgramError> {
+        let operation = DimensionFromScalarOperation::new(result);
+        DimensionFromScalarOperation::validate_input_type(self.r#type().as_ref())?;
+        let scalar = self.values()[0];
+        let extent = match scalar {
+            crate::backends::scalars::Scalar::I8(value) => usize::try_from(value),
+            crate::backends::scalars::Scalar::I16(value) => usize::try_from(value),
+            crate::backends::scalars::Scalar::I32(value) => usize::try_from(value),
+            crate::backends::scalars::Scalar::I64(value) => usize::try_from(value),
+            crate::backends::scalars::Scalar::U8(value) => Ok(usize::from(value)),
+            crate::backends::scalars::Scalar::U16(value) => Ok(usize::from(value)),
+            crate::backends::scalars::Scalar::U32(value) => usize::try_from(value),
+            crate::backends::scalars::Scalar::U64(value) => usize::try_from(value),
+            _ => unreachable!("dimension_from_scalar input type is validated before reading its payload"),
+        }
+        .map_err(|_| ProgramError::InvalidArgument {
+            message: format!(
+                "'{}' scalar input must be a nonnegative host-representable extent but is {scalar}",
+                operation.name(),
+            ),
+        })?;
+        Ok(DimensionValue::new(operation.result_type().clone(), extent)?)
+    }
+}
+
 impl<A: Value<Type = ArrayType>> DimensionToScalar for ArrayProgramValue<A>
 where
     DimensionValue: DimensionToScalar<A>,
@@ -619,6 +672,13 @@ where
     fn to_scalar(&self) -> Result<Self, ProgramError> {
         let dimension = <Self as ValueProjection<DimensionType>>::projected(self)?;
         Ok(Self::Array(<DimensionValue as DimensionToScalar<A>>::to_scalar(dimension)?))
+    }
+}
+
+impl<A: DimensionFromScalar<DimensionValue> + Value<Type = ArrayType>> DimensionFromScalar for ArrayProgramValue<A> {
+    fn to_dimension(&self, result: DimensionVariable) -> Result<Self, ProgramError> {
+        let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        Ok(Self::Dimension(<A as DimensionFromScalar<DimensionValue>>::to_dimension(array, result)?))
     }
 }
 

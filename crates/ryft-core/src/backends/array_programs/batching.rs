@@ -393,6 +393,24 @@ where
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
+            Self::DimensionFromScalar(operation) => {
+                let [input] = inputs else {
+                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+                };
+                <&ArrayType>::try_from(input.unbatched_type())?;
+                if !input.batch_axis.is_replicated() {
+                    return Err(BatchingError::MappedDimension {
+                        r#type: Box::new(operation.result_type().clone()),
+                        axis: input.batch_axis,
+                    });
+                }
+                Ok(context
+                    .parent
+                    .bind(self.clone(), Vec::new(), std::slice::from_ref(&input.value))?
+                    .into_iter()
+                    .map(ArrayProgramBatch::replicated)
+                    .collect())
+            }
             Self::DimensionToScalar(DimensionToScalarOperation) => {
                 let [input] = inputs else {
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -440,7 +458,8 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::constants::ZeroOperation;
     use crate::operations::dimensions::{
-        DimensionAddOperation, DimensionSize, DimensionToScalar, DimensionToScalarOperation,
+        DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionToScalar,
+        DimensionToScalarOperation,
     };
     use crate::operations::{CollectiveKind, CollectiveOperation};
     use crate::parameters::Placeholder;
@@ -518,6 +537,41 @@ mod tests {
             Err(BatchingError::MappedDimension { r#type: Box::new(dimension_type), axis: BatchAxis::new(0) }),
         );
 
+        let gateway_variable = DimensionVariable::new("gateway", DimensionBounds::new(0, Some(9)).unwrap());
+        let gateway_operation =
+            ArrayProgramOperation::<Array>::from(DimensionFromScalarOperation::new(gateway_variable.clone()));
+        let gateway_output = gateway_operation
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayProgramBatch::replicated(ArrayProgramValue::Array(Array::scalar(4_i32)))],
+            )
+            .unwrap();
+        let [gateway_output] = gateway_output.as_slice() else {
+            panic!("expected one dimension-from-scalar batching result");
+        };
+        assert_eq!(gateway_output.batch_axis(), BatchAxis::replicated());
+        assert_eq!(
+            gateway_output.value(),
+            &ArrayProgramValue::Dimension(
+                DimensionValue::new(DimensionType::new(gateway_variable.clone()), 4).unwrap(),
+            ),
+        );
+        let mapped_gateway_input =
+            ArrayProgramBatch::new(ArrayProgramValue::Array(Array::vector(vec![4_i32, 5_i32])), BatchAxis::new(0))
+                .unwrap();
+        assert_eq!(
+            gateway_operation.batch(&context, &EmptyRegionDriver, &[mapped_gateway_input]),
+            Err(BatchingError::MappedDimension {
+                r#type: Box::new(DimensionType::new(gateway_variable.clone())),
+                axis: BatchAxis::new(0),
+            }),
+        );
+        assert_eq!(
+            gateway_operation.batch(&context, &EmptyRegionDriver, &[]),
+            Err(BatchingError::from(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
+        );
+
         let zero = ArrayProgramOperation::<Array>::from(ZeroOperation::new(ArrayProgramType::Array(
             ArrayType::scalar(DataType::F32),
         )));
@@ -534,6 +588,14 @@ mod tests {
         let scalar = dimension.to_scalar().unwrap().into_batch();
         assert_eq!(scalar.batch_axis(), BatchAxis::replicated());
         assert_eq!(scalar.into_value(), ArrayProgramValue::Array(Array::scalar(4_i64)));
+
+        let scalar = ArrayProgramBatchingTracer::new(
+            context.clone(),
+            ArrayProgramBatch::replicated(ArrayProgramValue::Array(Array::scalar(4_i32))),
+        );
+        let dimension = scalar.to_dimension(gateway_variable).unwrap().into_batch();
+        assert_eq!(dimension.batch_axis(), BatchAxis::replicated());
+        assert!(matches!(dimension.into_value(), ArrayProgramValue::Dimension(value) if value.extent() == 4));
 
         let array = ArrayProgramValue::Array(Array::matrix(2, 3, vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0]));
         let array = ArrayProgramBatch::new(array, BatchAxis::new(0)).unwrap();

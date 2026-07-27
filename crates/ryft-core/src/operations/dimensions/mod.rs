@@ -12,6 +12,7 @@ use crate::programs::types::{Type, TypeError};
 use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
 
 pub mod add;
+pub mod dimension_from_scalar;
 pub mod dimension_size;
 pub mod dimension_to_scalar;
 pub mod div_floor;
@@ -25,6 +26,9 @@ pub mod saturating_sub;
 pub mod sub;
 
 pub use add::{DIMENSION_ADD_OPERATION_NAME, DimensionAdd, DimensionAddOperation};
+pub use dimension_from_scalar::{
+    DIMENSION_FROM_SCALAR_OPERATION_NAME, DimensionFromScalar, DimensionFromScalarOperation,
+};
 pub use dimension_size::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize, DimensionSizeOperation};
 pub use dimension_to_scalar::{
     DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionToScalar, DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,

@@ -150,6 +150,9 @@ where
                 }
             }
         }
+        ArrayProgramOperation::DimensionFromScalar(_) => Err(LoweringError::UnsupportedOp {
+            op: "dimension_from_scalar requires checked runtime assertion lowering".to_string(),
+        }),
         ArrayProgramOperation::DimensionToScalar(_) => {
             let [input] = input_values else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
@@ -303,7 +306,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::contexts::StagingContext;
-    use ryft_core::operations::dimensions::{DimensionSize, DimensionToScalar};
+    use ryft_core::operations::dimensions::{DimensionFromScalar, DimensionSize, DimensionToScalar};
     use ryft_core::parameters::Placeholder;
     use ryft_core::tracing::TracingContext;
     use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
@@ -401,5 +404,33 @@ mod tests {
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<i64>(output_bytes.as_slice()), vec![7]);
+    }
+
+    #[test]
+    fn test_dimension_from_scalar_lowering_is_deferred() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(17)).unwrap());
+        let context = TestContext::new();
+        let input = context.input(ArrayType::scalar(DataType::I32).into());
+        let output = input.to_dimension(variable).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            lower_array_program_to_stable_hlo(&program, "main"),
+            Err(ArrayProgramLoweringError::Lowering {
+                message: "unsupported staged op 'dimension_from_scalar requires checked runtime assertion lowering' \
+                          during XLA lowering"
+                    .to_string(),
+            }),
+        );
     }
 }
