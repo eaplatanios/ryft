@@ -1452,7 +1452,7 @@ fn apply_attention_masks<C, V>(
     masked_fill: &V,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + And + Broadcast + Compare<Output = V> + Select + Sub,
+    V: Value<Type = ArrayType> + And + Broadcast + Compare<V> + Select + Sub,
     C: Fill<Scalar, V> + Iota<V>,
 {
     if mask == AttentionMask::None && key_value_sequence_lengths.is_none() {
@@ -1501,16 +1501,7 @@ fn attention_logits<C, V>(
     sliding_window: Option<usize>,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType>
-        + Add
-        + And
-        + Broadcast
-        + Compare<Output = V>
-        + ConvertElementType
-        + Dot
-        + Mul
-        + Select
-        + Sub,
+    V: Value<Type = ArrayType> + Add + And + Broadcast + Compare<V> + ConvertElementType + Dot + Mul + Select + Sub,
     C: Fill<Scalar, V> + Iota<V>,
 {
     let data_type = query.r#type().data_type();
@@ -1554,7 +1545,7 @@ fn zero_out_of_range_query_rows<C, V>(
     row_axis: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + Broadcast + Compare<Output = V> + Select,
+    V: Value<Type = ArrayType> + Broadcast + Compare<V> + Select,
     C: Fill<Scalar, V> + Iota<V>,
 {
     let value_type = value.r#type().into_owned();
@@ -1597,7 +1588,7 @@ where
         + Add
         + And
         + Broadcast
-        + Compare<Output = V>
+        + Compare<V>
         + ConvertElementType
         + Div
         + Dot
@@ -1730,7 +1721,7 @@ where
         + Add
         + And
         + Broadcast
-        + Compare<Output = V>
+        + Compare<V>
         + ConvertElementType
         + Dot
         + Exp

@@ -52,7 +52,7 @@ impl_differentiable_operation! {
     where
         C::Type: DifferentiableType,
         C::Value: Abs
-            + Compare<Output = C::Value>
+            + Compare<C::Value>
             + Complex
             + Conjugate
             + Imaginary

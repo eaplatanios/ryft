@@ -165,7 +165,7 @@ impl Operation<ArrayType> for CoordinateBasisOperation<ArrayType> {
 impl<C> InterpretableOperation<C> for CoordinateBasisOperation<ArrayType>
 where
     C: Domain<Type = ArrayType> + Fill<Scalar, C::Value> + Iota<C::Value> + One<C::Value> + Zero<C::Value>,
-    C::Value: Add<Output = C::Value> + Mul<Output = C::Value> + Compare<Output = C::Value> + Select,
+    C::Value: Add<Output = C::Value> + Mul<Output = C::Value> + Compare<C::Value> + Select,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,

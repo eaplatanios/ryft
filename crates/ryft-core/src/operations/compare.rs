@@ -11,8 +11,8 @@ use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::TypeError;
-use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType};
+use crate::programs::values::{ProjectedValue, Value};
+use crate::types::{ArrayProgramType, ArrayType, DataType, DimensionType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -44,8 +44,8 @@ impl Display for ComparisonDirection {
     }
 }
 
-/// [`Operation`] that performs pairwise comparisons. The semantics of the comparison
-/// are described by [`direction`](Self::direction).
+/// [`Operation`] that performs pairwise comparisons. Refer to [`Compare`] for its elementwise and first-class
+/// dimension semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CompareOperation {
     /// [`ComparisonDirection`] used by this [`CompareOperation`].
@@ -102,7 +102,32 @@ impl<T: Broadcastable + ElementType> Operation<T> for CompareOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, COMPARE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("direction", &self.direction))
+            .bracketed(|operation| operation.field("direction", self.direction))
+    }
+}
+
+impl Operation<ArrayProgramType> for CompareOperation {
+    #[inline]
+    fn name(&self) -> &'static str {
+        COMPARE_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayProgramType],
+        region_interfaces: &[RegionInterface<ArrayProgramType>],
+    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        input_types.iter().try_for_each(|r#type| <&DimensionType>::try_from(r#type).map(|_| ()))?;
+        // Comparing shape authority produces ordinary predicate data rather than another first-class dimension.
+        Ok(vec![ArrayType::scalar(DataType::Boolean).into()])
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, COMPARE_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("direction", self.direction))
     }
 }
 
@@ -120,8 +145,8 @@ impl ElementwiseOperation for CompareOperation {
 
 impl<C: Domain> InterpretableOperation<C> for CompareOperation
 where
-    C::Value: Compare<Output = C::Value>,
-    C::Type: Broadcastable + ElementType,
+    CompareOperation: Operation<C::Type>,
+    C::Value: Compare<C::Value>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -134,70 +159,82 @@ where
     }
 }
 
-impl<C: Context<Operation: From<CompareOperation>>> PartiallyEvaluatableOperation<C> for CompareOperation {}
+impl<C: Context<Operation: From<CompareOperation>>> PartiallyEvaluatableOperation<C> for CompareOperation where
+    CompareOperation: Operation<C::Type>
+{
+}
 
 impl_differentiable_elementwise_operation!(@non_differentiable CompareOperation);
 
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing
-/// the `i`-th elements of `left` and `right` according to `direction`. The input arrays must be broadcast-compatible,
-/// in this case, and they must also have the same [`DataType`](crate::DataType). For this example, the output
-/// has [`DataType::Boolean`](crate::DataType::Boolean) and the broadcasted shape of the two input arrays.
+/// the `i`-th elements of `left` and `right` according to `direction`. The input arrays must have broadcast-compatible
+/// shapes and promotable [`DataType`](crate::DataType)s. The result has [`DataType::Boolean`](crate::DataType::Boolean)
+/// and the broadcasted shape of the two input arrays.
 ///
-/// The associated [`Output`](Compare::Output) type lets concrete backends choose how they represent Boolean results:
+/// First-class dimensions use the same comparison operation but return ordinary rank-zero Boolean array data. This
+/// keeps the predicate available to selection and control-flow operations without granting the result shape authority:
 ///
-/// - **In-Band Encoding (i.e., `Output = Self`):** Keep the input element type and encode Boolean values
-///   as `T::zero()` or `T::one()`.
-/// - **True Boolean Representation (i.e., `Output = Array<bool>`-like):** Produce a dedicated Boolean value type.
-///   This is what an `ndarray` backend with a separate `Array<bool>` may want for direct user calls, even though the
-///   staged operation path still uses in-band encoding.
-pub trait Compare<Rhs = Self>: Sized {
-    /// Result type of the comparison.
-    type Output;
-
+/// ```rust
+/// # use ryft_core::{ArrayProgramValue, Compare, DimensionValue, ProgramError};
+/// # use ryft_core::backends::arrays::Array;
+/// # fn main() -> Result<(), ProgramError> {
+/// let left = ArrayProgramValue::<Array>::Dimension(DimensionValue::constant(3)?);
+/// let right = ArrayProgramValue::<Array>::Dimension(DimensionValue::constant(5)?);
+/// let ArrayProgramValue::Array(result) = left.less_than(&right)? else {
+///     unreachable!("comparing dimensions always returns an array member");
+/// };
+/// assert_eq!(result, Array::scalar(true));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The `Output` type parameter lets the comparison result use a different value carrier when the input carrier cannot
+/// represent Boolean data. Scalar and array backends use the default `Output = Self` and return honestly
+/// Boolean-typed values. [`DimensionValue`](crate::DimensionValue), by contrast, uses an array output because a
+/// first-class dimension is shape authority rather than a general scalar-data carrier.
+pub trait Compare<Output = Self>: Sized {
     /// Compares `self` and `rhs` using a predicate determined by the provided `direction`.
-    fn compare(&self, rhs: &Rhs, direction: ComparisonDirection) -> Result<Self::Output, ProgramError>;
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Output, ProgramError>;
 
     /// Computes `self == rhs` using [`CompareOperation`].
     #[inline]
-    fn equal(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
+    fn equal(&self, rhs: &Self) -> Result<Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::Equal)
     }
 
     /// Computes `self != rhs` using [`CompareOperation`].
     #[inline]
-    fn not_equal(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
+    fn not_equal(&self, rhs: &Self) -> Result<Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::NotEqual)
     }
 
     /// Computes `self < rhs` using [`CompareOperation`].
     #[inline]
-    fn less_than(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
+    fn less_than(&self, rhs: &Self) -> Result<Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::LessThan)
     }
 
     /// Computes `self <= rhs` using [`CompareOperation`].
     #[inline]
-    fn less_than_or_equal(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
+    fn less_than_or_equal(&self, rhs: &Self) -> Result<Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::LessThanOrEqual)
     }
 
     /// Computes `self > rhs` using [`CompareOperation`].
     #[inline]
-    fn greater_than(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
+    fn greater_than(&self, rhs: &Self) -> Result<Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::GreaterThan)
     }
 
     /// Computes `self >= rhs` using [`CompareOperation`].
     #[inline]
-    fn greater_than_or_equal(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
+    fn greater_than_or_equal(&self, rhs: &Self) -> Result<Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::GreaterThanOrEqual)
     }
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compare for V {
-    type Output = Self;
-
+impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compare<V> for V {
     #[inline]
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
         Ok(self
@@ -207,19 +244,44 @@ impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compa
     }
 }
 
+impl<V: Value<Type = ArrayProgramType>> Compare<V> for ProjectedValue<DimensionType, V>
+where
+    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    <V::DispatchDomain as Domain>::Operation: From<CompareOperation>,
+{
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<V, ProgramError> {
+        Ok(self
+            .value()
+            .dispatch_domain()
+            .bind(CompareOperation::new(direction), Vec::new(), &[self.value().clone(), rhs.value().clone()])?
+            .remove(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
     use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::dimensions::DimensionValue;
     use crate::backends::scalars::Scalar;
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::DifferentiationError;
     use crate::differentiation::forward::{DifferentiationTracer, jvp};
+    use crate::differentiation::reverse::TransposableOperation;
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
+    use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
-    use crate::types::DataType;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::effects::Effects;
+    use crate::programs::regions::{EmptyRegionDriver, RegionInterface};
+    use crate::programs::types::Typed;
+    use crate::programs::values::ValueProjection;
+    use crate::tracing::{Tracer, TracingContext};
+    use crate::types::{ArrayProgramType, ArrayType, DataType, DimensionBounds, DimensionType, DimensionVariable};
 
     use super::*;
 
@@ -243,6 +305,19 @@ mod tests {
         assert_eq!(left().less_than_or_equal(&right()).unwrap().values(), &[true, true, false]);
         assert_eq!(left().greater_than(&right()).unwrap().values(), &[false, false, true]);
         assert_eq!(left().greater_than_or_equal(&right()).unwrap().values(), &[false, true, true]);
+
+        let left = DimensionValue::constant(3).unwrap();
+        let right = DimensionValue::constant(5).unwrap();
+        assert_eq!(left.equal(&right), Ok(Array::scalar(false)));
+        assert_eq!(left.not_equal(&right), Ok(Array::scalar(true)));
+        assert_eq!(left.less_than(&right), Ok(Array::scalar(true)));
+        assert_eq!(left.less_than_or_equal(&right), Ok(Array::scalar(true)));
+        assert_eq!(left.greater_than(&right), Ok(Array::scalar(false)));
+        assert_eq!(left.greater_than_or_equal(&right), Ok(Array::scalar(false)));
+
+        let left = ArrayProgramValue::<Array>::Dimension(left);
+        let right = ArrayProgramValue::<Array>::Dimension(right);
+        assert_eq!(left.less_than(&right), Ok(ArrayProgramValue::Array(Array::scalar(true))));
     }
 
     #[test]
@@ -272,6 +347,39 @@ mod tests {
                 input_data_types = [DataType::C64, DataType::C64],
                 output_data_types = [DataType::Boolean],
             }],
+        );
+
+        let bounds = DimensionBounds::new(0, Some(9)).unwrap();
+        let left = DimensionType::new(DimensionVariable::new("left", bounds));
+        let right = DimensionType::new(DimensionVariable::new("right", bounds));
+        let operation = CompareOperation::new(ComparisonDirection::LessThan);
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                &[left.clone().into(), right.clone().into()],
+                &[],
+            ),
+            Ok(vec![ArrayType::scalar(DataType::Boolean).into()]),
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                &[ArrayType::scalar(DataType::I64).into(), right.clone().into()],
+                &[],
+            ),
+            Err(TypeError::invalid("expected dimension type but got array type")),
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(&operation, &[left.clone().into()], &[]),
+            Err(TypeError::invalid("expected 2 inputs but got 1")),
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                &[left.into(), right.into()],
+                &[RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE)],
+            ),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
         );
     }
 
@@ -320,5 +428,132 @@ mod tests {
             inputs = [Scalar::from(1.0), Scalar::from(0.0)],
             expected = Scalar::from(true),
         );
+
+        let bounds = DimensionBounds::new(0, Some(9)).unwrap();
+        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
+        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        check_operation_partial_evaluation!(
+            backend = (ArrayProgramValue<Array>, ArrayProgramOperation<Array>),
+            operation = CompareOperation::new(ComparisonDirection::LessThan),
+            cases = [
+                {
+                    inputs = [
+                        (@known, ArrayProgramValue::Dimension(
+                            DimensionValue::new(left_type.clone(), 3).unwrap()
+                        )),
+                        (@known, ArrayProgramValue::Dimension(
+                            DimensionValue::new(right_type.clone(), 5).unwrap()
+                        )),
+                    ],
+                    outputs = [
+                        (@known, ArrayProgramValue::Array(Array::scalar(true))),
+                    ],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(
+                            type = ArrayProgramType::Dimension(left_type.clone()),
+                            replay = ArrayProgramValue::Dimension(
+                                DimensionValue::new(left_type.clone(), 3).unwrap()
+                            )
+                        )),
+                        (@unknown(
+                            type = ArrayProgramType::Dimension(right_type.clone()),
+                            replay = ArrayProgramValue::Dimension(
+                                DimensionValue::new(right_type.clone(), 5).unwrap()
+                            )
+                        )),
+                    ],
+                    outputs = [
+                        (@residual, ArrayProgramValue::Array(Array::scalar(true))),
+                    ],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_compare_array_program() {
+        type TestContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+
+        let bounds = DimensionBounds::new(0, Some(9)).unwrap();
+        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
+        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let context = TestContext::new();
+        let left = context.input(left_type.clone().into());
+        let right = context.input(right_type.clone().into());
+        let left_id = left.atom_id().unwrap();
+        let right_id = right.atom_id().unwrap();
+        let left = <Tracer<TestContext> as ValueProjection<DimensionType>>::into_projected(left).unwrap();
+        let right = <Tracer<TestContext> as ValueProjection<DimensionType>>::into_projected(right).unwrap();
+        let output = left.less_than(&right).unwrap();
+        let output_id = output.atom_id().unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayProgramType::Array(ArrayType::scalar(DataType::Boolean)));
+
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected one comparison instruction");
+        };
+        assert_eq!(instruction.inputs(), &[left_id, right_id]);
+        assert_eq!(instruction.outputs(), &[output_id]);
+        assert!(instruction.regions().is_empty());
+        assert!(matches!(instruction.operation(), ArrayProgramOperation::Compare(_)));
+        let program = builder
+            .clone()
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output_id],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        drop(builder);
+
+        assert_eq!(
+            program.interpret(vec![
+                ArrayProgramValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap()),
+                ArrayProgramValue::Dimension(DimensionValue::new(right_type.clone(), 5).unwrap()),
+            ]),
+            Ok(vec![ArrayProgramValue::Array(Array::scalar(true))]),
+        );
+
+        let mut relocated_builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let relocated_left =
+            relocated_builder.add_input(DimensionType::new(DimensionVariable::new("relocated_left", bounds)).into());
+        let relocated_right =
+            relocated_builder.add_input(DimensionType::new(DimensionVariable::new("relocated_right", bounds)).into());
+        let relocated_outputs = relocated_builder.splice_program(&program, &[relocated_left, relocated_right]).unwrap();
+        let [relocated_instruction] = relocated_builder.instructions() else {
+            panic!("expected one relocated comparison instruction");
+        };
+        assert_eq!(relocated_instruction.inputs(), &[relocated_left, relocated_right]);
+        assert_eq!(relocated_instruction.outputs(), relocated_outputs.as_slice());
+        assert!(matches!(relocated_instruction.operation(), ArrayProgramOperation::Compare(_)));
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_ids().len(), 4);
+        assert_eq!(jvp.output_ids().len(), 2);
+        assert_eq!(
+            jvp.outputs().last().unwrap().r#type().as_ref(),
+            &ArrayProgramType::Array(ArrayType::scalar(DataType::Zero)),
+        );
+
+        let operation = ArrayProgramOperation::<Array>::from(CompareOperation::new(ComparisonDirection::LessThan));
+        let mut transposition_context = TestContext::new();
+        assert!(matches!(
+            <ArrayProgramOperation<Array> as TransposableOperation<
+                ArrayProgramValue<Array>,
+                ArrayProgramOperation<Array>,
+            >>::transpose(
+                &operation,
+                &mut transposition_context,
+                &EmptyRegionDriver,
+                &[],
+                &[],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `compare` is not transposable",
+        ));
     }
 }

@@ -35,7 +35,7 @@ impl_differentiable_elementwise_operation! {
     where
         C::Value: Pow
             + Log
-            + Compare<Output = C::Value>
+            + Compare<C::Value>
             + Select
             + OneLike
             + ZeroLike

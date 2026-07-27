@@ -3357,7 +3357,7 @@ mod tests {
             + Logistic
             + Dot
             + Reduce
-            + Compare<Output = V>
+            + Compare<V>
             + Select
             + TopK
             + ArgMax

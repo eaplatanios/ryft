@@ -30,7 +30,7 @@ impl_differentiable_elementwise_operation! {
     MaxOperation,
     jvp<C>
     where
-        C::Value: Compare<Output = C::Value> + Select + ZeroLike,
+        C::Value: Compare<C::Value> + Select + ZeroLike,
     {
         // The tangent follows the winning operand, with ties routing to the left operand: each contribution masks
         // its own tangent by the same `left >= right` predicate, so the combined tangent is

@@ -2073,12 +2073,10 @@ impl Imaginary for Scalar {
 }
 
 impl Compare for Scalar {
-    type Output = Scalar;
-
     /// Compares two equal-[`DataType`] [`Scalar`]s and returns the Boolean result as an honestly Boolean-typed
     /// [`Scalar::Bool`], never a numeric variant. Mismatched variants return a [`TypeError`]. Complex scalars are
     /// unordered, so they support only the equality directions and return a [`TypeError`] for ordered ones.
-    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self::Output, ProgramError> {
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
         /// Evaluates a comparison `direction` against an optional `ordering`, where `None` (an unordered pair, e.g.,
         /// one involving a NaN) satisfies only the `NotEqual` direction.
         fn evaluate(ordering: Option<Ordering>, direction: ComparisonDirection) -> bool {

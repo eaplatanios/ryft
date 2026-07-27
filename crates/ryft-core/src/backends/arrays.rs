@@ -1872,9 +1872,7 @@ impl DynamicUpdateSlice for Array {
 }
 
 impl Compare for Array {
-    type Output = Self;
-
-    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self::Output, ProgramError> {
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
         // Broadcast the operand types together (including element-type promotion) so mixed-precision comparisons
         // mirror the `CompareOperation` type-inference contract, then compare the promoted elements pairwise. The
         // output type is the Boolean-typed counterpart of the broadcast type.

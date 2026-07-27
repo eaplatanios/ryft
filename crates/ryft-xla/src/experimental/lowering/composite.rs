@@ -13,8 +13,8 @@ use ryft_mlir::{
 
 use super::{
     LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode,
-    lower_constant_elements_attribute, lower_constant_output, lower_tensor_type, merge_logical_meshes,
-    normalize_function_name, replay_region_ref_into_block,
+    lower_compare_to_mlir, lower_constant_elements_attribute, lower_constant_output, lower_tensor_type,
+    merge_logical_meshes, normalize_function_name, replay_region_ref_into_block,
 };
 use crate::experimental::ops::XlaConstant;
 use crate::mlir::ToMlir;
@@ -121,6 +121,14 @@ where
         ArrayProgramOperation::Dimension(operation) => Err(LoweringError::UnsupportedOp {
             op: format!("first-class dimension operation `{}` has not been lowered yet", operation.name()),
         }),
+        ArrayProgramOperation::Compare(operation) => {
+            let [left, right] = input_values else {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() }.into());
+            };
+            // Dimension atoms already lower to scalar `i64` SSA values, so the ordinary comparison lowering can
+            // consume them directly without a data gateway or host-side shape reconstruction.
+            Ok(vec![lower_compare_to_mlir(operation.direction(), *left, *right, block, location)?])
+        }
         ArrayProgramOperation::DimensionSize(operation) => {
             let [input] = input_values else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
@@ -306,11 +314,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::contexts::StagingContext;
+    use ryft_core::operations::compare::{Compare, ComparisonDirection};
     use ryft_core::operations::dimensions::{DimensionFromScalar, DimensionSize, DimensionToScalar};
     use ryft_core::parameters::Placeholder;
+    use ryft_core::programs::values::ValueProjection;
+    use ryft_core::tracing::Tracer;
     use ryft_core::tracing::TracingContext;
     use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
-    use ryft_core::types::{DataType, Shape};
+    use ryft_core::types::{DataType, DimensionType, Shape};
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{
         BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
@@ -319,6 +330,27 @@ mod tests {
 
     use super::*;
     use crate::tests::{values_from_bytes, values_to_bytes};
+
+    /// Returns the ordinary single-device compilation options used by the composite CPU execution tests.
+    fn cpu_compilation_options() -> CompilationOptions {
+        CompilationOptions {
+            argument_layouts: Vec::new(),
+            parameter_is_tupled_arguments: false,
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: 1,
+                ..Default::default()
+            }),
+            compile_portable_executable: false,
+            profile_version: 0,
+            serialized_multi_slice_configuration: Vec::new(),
+            environment_option_overrides: std::collections::HashMap::new(),
+            target_config: None,
+            allow_in_place_mlir_modification: false,
+            matrix_unit_operand_precision: Precision::Default as i32,
+        }
+    }
 
     #[test]
     fn test_array_program_lowering() {
@@ -369,23 +401,7 @@ mod tests {
         // `dimension_to_scalar`, without a host readback or reconstruction step.
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let options = CompilationOptions {
-            argument_layouts: Vec::new(),
-            parameter_is_tupled_arguments: false,
-            executable_build_options: Some(ExecutableCompilationOptions {
-                device_ordinal: -1,
-                replica_count: 1,
-                partition_count: 1,
-                ..Default::default()
-            }),
-            compile_portable_executable: false,
-            profile_version: 0,
-            serialized_multi_slice_configuration: Vec::new(),
-            environment_option_overrides: std::collections::HashMap::new(),
-            target_config: None,
-            allow_in_place_mlir_modification: false,
-            matrix_unit_operand_precision: Precision::Default as i32,
-        };
+        let options = cpu_compilation_options();
         let executable = client.compile(&PjrtProgram::Mlir { bytecode: static_module.into_bytes() }, &options).unwrap();
         let device = executable.addressable_devices().unwrap()[0].clone();
         let input_values = [0.0_f32; 7];
@@ -404,6 +420,76 @@ mod tests {
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<i64>(output_bytes.as_slice()), vec![7]);
+    }
+
+    #[test]
+    fn test_dimension_comparison_lowering() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        for (direction, stable_hlo_direction, left_extent, right_extent) in
+            [(ComparisonDirection::Equal, "EQ", 3_i64, 3_i64), (ComparisonDirection::LessThan, "LT", 3_i64, 5_i64)]
+        {
+            let bounds = DimensionBounds::new(0, Some(17)).unwrap();
+            let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
+            let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+            let context = TestContext::new();
+            let left = context.input(left_type.into());
+            let right = context.input(right_type.into());
+            let left = <Tracer<TestContext> as ValueProjection<DimensionType>>::into_projected(left).unwrap();
+            let right = <Tracer<TestContext> as ValueProjection<DimensionType>>::into_projected(right).unwrap();
+            let output = left.compare(&right, direction).unwrap();
+            let program = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                    vec![output.atom_id().unwrap()],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+
+            let module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+            assert_eq!(module.matches("stablehlo.compare").count(), 1);
+            assert!(module.contains(&format!("stablehlo.compare {stable_hlo_direction}")), "{module}");
+            assert!(module.contains("SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>"), "{module}");
+            assert_eq!(module.matches("dimension_to_scalar").count(), 0);
+
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap()[0].clone();
+            let left_bytes = values_to_bytes(&[left_extent]);
+            let right_bytes = values_to_bytes(&[right_extent]);
+            let inputs = ExecutionDeviceInputs {
+                inputs: &[
+                    ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(left_bytes.as_slice(), BufferType::I64, &[], None, device.clone(), None)
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    },
+                    ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(right_bytes.as_slice(), BufferType::I64, &[], None, device.clone(), None)
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    },
+                ],
+                ..Default::default()
+            };
+            let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+            let mut outputs = execution.block_until_ready().unwrap().remove(0);
+            assert_eq!(outputs.outputs.len(), 1);
+            let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<u8>(output_bytes.as_slice()), vec![1]);
+        }
     }
 
     #[test]

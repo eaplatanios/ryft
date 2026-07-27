@@ -454,7 +454,7 @@ where
         + From<MulOperation>,
     C::Value: Reduce
         + Broadcast
-        + Compare<Output = C::Value>
+        + Compare<C::Value>
         + Div<Output = C::Value>
         + ElementwiseDerivativeAlignment<ArrayType>
         + Mul<Output = C::Value>,

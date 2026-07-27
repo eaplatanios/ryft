@@ -450,10 +450,10 @@ mod tests {
 
         // Check that differentiation routes tangents and cotangents through the selected branch. This stays explicit
         // because the operation-check helper's finite-difference oracle cannot perturb a Boolean condition input.
-        fn piecewise<V>(x: V, y: V) -> Result<V, ProgramError>
-        where
-            V: Clone + Compare<Output = V> + Select + std::ops::Add<Output = V>,
-        {
+        fn piecewise<V: Clone + Compare<V> + Select + std::ops::Add<Output = V>>(
+            x: V,
+            y: V,
+        ) -> Result<V, ProgramError> {
             let mask = x.compare(&y, ComparisonDirection::GreaterThan)?;
             Select::select(&mask, &(x.clone() + x.clone()), &(y.clone() + y.clone() + y.clone()))
         }
