@@ -10,7 +10,7 @@ use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::Value;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
-use crate::programs::types::{Type, TypeError, TypeRefinements, Typed};
+use crate::programs::types::{Type, TypeError, TypeRefinements, Typed, visit_type_signature_pairs};
 use crate::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
 use crate::types::data::DataType;
 use crate::types::dimensions::{Dimension, DimensionError, DimensionType, DimensionVariable, Shape, StaticShape};
@@ -468,7 +468,7 @@ impl Type for ArrayType {
     ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
         let mut renaming = TypeIdentityRenaming::new();
         let mut refinements = ArrayTypeRefinements::default();
-        visit_signature_pairs(declared, actual, |declared, actual| {
+        visit_type_signature_pairs(declared, actual, |declared, actual| {
             Self::extend_identity_renaming(declared, actual, &mut renaming, &mut refinements)
         })?;
         refinements.require_disjoint_from(&renaming)?;
@@ -671,21 +671,13 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         D::Item: Borrow<ArrayType>,
         A::Item: Borrow<ArrayType>,
     {
-        let declared = declared.into_iter();
-        let actual = actual.into_iter();
-        if declared.len() != actual.len() {
-            return Err(TypeError::invalid(format!(
-                "declared type count {} does not match actual type count {}",
-                declared.len(),
-                actual.len(),
-            )));
-        }
-        declared.zip(actual).try_fold(Self::default(), |mut refinements, (declared, actual)| {
-            Self::visit_dynamic_to_static_refinements(declared.borrow(), actual.borrow(), |variable, extent| {
+        let mut refinements = Self::default();
+        visit_type_signature_pairs(declared, actual, |declared, actual| {
+            Self::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
                 refinements.bind(variable, extent)
-            })?;
-            Ok(refinements)
-        })
+            })
+        })?;
+        Ok(refinements)
     }
 
     fn validate<D: IntoIterator, A: IntoIterator>(
@@ -700,18 +692,9 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         D::Item: Borrow<ArrayType>,
         A::Item: Borrow<ArrayType>,
     {
-        let declared = declared.into_iter();
-        let actual = actual.into_iter();
-        if declared.len() != actual.len() {
-            return Err(TypeError::invalid(format!(
-                "declared type count {} does not match actual type count {}",
-                declared.len(),
-                actual.len(),
-            )));
-        }
         let mut refinements = self.clone();
-        declared.zip(actual).try_for_each(|(declared, actual)| {
-            Self::visit_dynamic_to_static_refinements(declared.borrow(), actual.borrow(), |variable, extent| {
+        visit_type_signature_pairs(declared, actual, |declared, actual| {
+            Self::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
                 refinements.validate_or_bind(variable, extent, locally_defined_identities)
             })
         })
@@ -808,7 +791,7 @@ impl Type for ArrayProgramType {
     ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
         let mut renaming = TypeIdentityRenaming::new();
         let mut refinements = ArrayTypeRefinements::default();
-        visit_signature_pairs(declared, actual, |declared, actual| match (declared, actual) {
+        visit_type_signature_pairs(declared, actual, |declared, actual| match (declared, actual) {
             (Self::Array(declared), Self::Array(actual)) => {
                 ArrayType::extend_identity_renaming(declared, actual, &mut renaming, &mut refinements)
             }
@@ -869,21 +852,20 @@ impl Type for ArrayProgramType {
     }
 }
 
-/// [`TypeRefinements`] established while refining one complete [`ArrayProgramType`] signature.
-///
-/// Every refinement fact comes from an array member: a declared dynamic axis met by a static extent contributes a
-/// dynamic-to-static binding that all array members of the signature share, following the [`ArrayTypeRefinements`]
-/// rules unchanged. Dimension members contribute no facts, because a [`DimensionType`] never carries a concrete
-/// extent — a first-class dimension's runtime extent lives in its *value*, not its type descriptor. Refining a
-/// dimension member therefore only checks that the actual member's bounds stay within the declared member's bounds.
+/// [`TypeRefinements`] established while refining one complete [`ArrayProgramType`] signature. Every refinement fact
+/// comes from an array member. A declared dynamic axis met by a static extent contributes a dynamic-to-static binding
+/// that all array members of the signature share, following the [`ArrayTypeRefinements`] rules unchanged. Dimension
+/// members contribute no facts, because a [`DimensionType`] never carries a concrete extent (a first-class dimension's
+/// runtime extent lives in its *value*, not its type descriptor). Refining a dimension member therefore only checks
+/// that the actual member's bounds stay within the declared member's bounds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrayProgramTypeRefinements {
-    /// Refinement facts shared by all array members of the signature.
+    /// [`ArrayTypeRefinements`] shared by all array members of the signature.
     arrays: ArrayTypeRefinements,
 }
 
 impl ArrayProgramTypeRefinements {
-    /// Validates one storage-kind pair and delegates array-specific refinement work to `visit_array`.
+    /// Validates a pair of [`ArrayProgramType`]s and delegates [`ArrayType`]-specific refinement work to `visit_array`.
     fn visit_pair(
         declared: &ArrayProgramType,
         actual: &ArrayProgramType,
@@ -918,7 +900,7 @@ impl TypeRefinements<ArrayProgramType> for ArrayProgramTypeRefinements {
         A::Item: Borrow<ArrayProgramType>,
     {
         let mut refinements = Self::default();
-        visit_signature_pairs(declared, actual, |declared, actual| {
+        visit_type_signature_pairs(declared, actual, |declared, actual| {
             Self::visit_pair(declared, actual, |declared, actual| {
                 ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
                     refinements.arrays.bind(variable, extent)
@@ -941,7 +923,7 @@ impl TypeRefinements<ArrayProgramType> for ArrayProgramTypeRefinements {
         A::Item: Borrow<ArrayProgramType>,
     {
         let mut refinements = self.clone();
-        visit_signature_pairs(declared, actual, |declared, actual| {
+        visit_type_signature_pairs(declared, actual, |declared, actual| {
             Self::visit_pair(declared, actual, |declared, actual| {
                 ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
                     refinements.arrays.validate_or_bind(variable, extent, locally_defined_identities)

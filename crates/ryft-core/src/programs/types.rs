@@ -250,23 +250,12 @@ impl<T: Type> TypeRefinements<T> for () {
         D::Item: Borrow<T>,
         A::Item: Borrow<T>,
     {
-        let declared = declared.into_iter();
-        let actual = actual.into_iter();
-        if declared.len() != actual.len() {
-            return Err(TypeError::invalid(format!(
-                "declared type count {} does not match actual type count {}",
-                declared.len(),
-                actual.len(),
-            )));
-        }
-        for (declared, actual) in declared.zip(actual) {
-            let declared = declared.borrow();
-            let actual = actual.borrow();
+        visit_type_signature_pairs(declared, actual, |declared, actual| {
             if !declared.is_refined_by(actual) {
                 return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")));
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -294,6 +283,31 @@ impl<V: Typed + ?Sized> Typed for &V {
     fn r#type(&self) -> Cow<'_, Self::Type> {
         (*self).r#type()
     }
+}
+
+/// Zips one complete declared/actual [`Type`] signature and applies `visitor` to each corresponding pair, rejecting
+/// signatures of different lengths with the canonical count diagnostic. This is the shared driver behind complete
+/// signature walks such as [`TypeRefinements::establish`], [`TypeRefinements::validate`], and
+/// [`Type::derive_identity_renaming`], so that every such walk agrees on the length contract and its diagnostic.
+pub(crate) fn visit_type_signature_pairs<
+    T: Type,
+    D: IntoIterator<Item: Borrow<T>, IntoIter: ExactSizeIterator>,
+    A: IntoIterator<Item: Borrow<T>, IntoIter: ExactSizeIterator>,
+>(
+    declared: D,
+    actual: A,
+    mut visitor: impl FnMut(&T, &T) -> Result<(), TypeError>,
+) -> Result<(), TypeError> {
+    let declared = declared.into_iter();
+    let actual = actual.into_iter();
+    if declared.len() != actual.len() {
+        return Err(TypeError::invalid(format!(
+            "declared type count {} does not match actual type count {}",
+            declared.len(),
+            actual.len(),
+        )));
+    }
+    declared.zip(actual).try_for_each(|(declared, actual)| visitor(declared.borrow(), actual.borrow()))
 }
 
 #[allow(clippy::let_unit_value)]

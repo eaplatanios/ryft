@@ -11,7 +11,7 @@ use crate::axes::Axis;
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::identities::{TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming};
-use crate::programs::types::{Type, TypeError};
+use crate::programs::types::{Type, TypeError, visit_type_signature_pairs};
 
 /// Largest runtime dimension extent that every supported backend representation can carry. Host values use [`usize`],
 /// while compiled dimension Single Static Assignment (SSA) values use signed 64-bit scalars. On narrower hosts every
@@ -337,18 +337,10 @@ impl Type for DimensionType {
         declared: &[Self],
         actual: &[Self],
     ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-        if declared.len() != actual.len() {
-            return Err(TypeError::invalid(format!(
-                "declared type count {} does not match actual type count {}",
-                declared.len(),
-                actual.len(),
-            )));
-        }
         let mut renaming = TypeIdentityRenaming::new();
-        declared
-            .iter()
-            .zip(actual)
-            .try_for_each(|(declared, actual)| Self::extend_identity_renaming(declared, actual, &mut renaming))?;
+        visit_type_signature_pairs(declared, actual, |declared, actual| {
+            Self::extend_identity_renaming(declared, actual, &mut renaming)
+        })?;
         Ok(renaming)
     }
 
