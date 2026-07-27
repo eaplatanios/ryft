@@ -707,7 +707,7 @@ impl<C: Context> Value for DifferentiationTracer<C> {
     }
 }
 
-impl<C: Context, T: Type + 'static> ValueProjection<T> for DifferentiationTracer<C>
+impl<C: Context, T: Type> ValueProjection<T> for DifferentiationTracer<C>
 where
     for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
 {
@@ -715,7 +715,8 @@ where
     type ProjectedRef<'v>
         = ProjectedValue<T, &'v Self>
     where
-        Self: 'v;
+        Self: 'v,
+        T: 'v;
 
     #[inline]
     fn from_projected(value: Self::Projected) -> Self {
@@ -723,7 +724,10 @@ where
     }
 
     #[inline]
-    fn projected(&self) -> Result<Self::ProjectedRef<'_>, TypeError> {
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        T: 'v,
+    {
         Ok(ProjectedValue::new(self, <&T>::try_from(self.r#type().as_ref())?.clone()))
     }
 

@@ -5,13 +5,14 @@ use ryft_macros::Parameter;
 
 use crate::batching::{ArrayBatch, BatchingTracer};
 use crate::captures::CaptureReference;
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::DifferentiationTracer;
 use crate::parameters::Parameter;
 use crate::partial::{PartialTracer, PartialValue};
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::identities::TypeIdentityRenaming;
+use crate::programs::operations::OperationProjection;
 use crate::programs::regions::RegionId;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::Tracer;
@@ -217,21 +218,25 @@ impl<V: Value<Type = ArrayType> + Concretizable<bool>> Concretizable<bool> for A
 ///     [`ProjectedValueRef`] and [`ProjectedValue`] views (or to a retyped copy of themselves, as [`CaptureReference`]
 ///     does), which keep the original value and the program identity it carries intact and only narrow the type it
 ///     reports.
-pub trait ValueProjection<T: Type + 'static>: Value {
+pub trait ValueProjection<T: Type>: Value {
     /// Owned representation of this [`Value`]'s `T`-typed member.
     type Projected: Typed<Type = T>;
 
-    /// Read-only representation of this [`Value`]'s `T`-typed member.
+    /// Read-only representation of this [`Value`]'s `T`-typed member. `T: 'v` limits the view to a lifetime for which
+    /// borrowed member-type metadata remains valid without requiring every projected type to be `'static`.
     type ProjectedRef<'v>: Typed<Type = T>
     where
-        Self: 'v;
+        Self: 'v,
+        T: 'v;
 
     /// Embeds an owned `T`-typed member representation back into this composite [`Value`] type.
     fn from_projected(value: Self::Projected) -> Self;
 
     /// Returns a read-only view of this [`Value`] as its `T`-typed member, without cloning any payload.
     /// Returns a [`TypeError`] when this value holds a different member kind.
-    fn projected(&self) -> Result<Self::ProjectedRef<'_>, TypeError>;
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        T: 'v;
 
     /// Consumes this [`Value`] and returns an owned representation of its `T`-typed member, transferring rather than
     /// copying any contained payload. Returns a [`TypeError`] when this value holds a different member kind.
@@ -246,9 +251,9 @@ pub trait ValueProjection<T: Type + 'static>: Value {
 /// it with the member type it was validated against. [`Typed`] consequently reports that member type rather than the
 /// value's original composite type.
 ///
-/// Projection alone does not define how [`Operation`](crate::Operation)s on the wrapped value dispatch. A context
-/// adapter that binds member-typed operations through the surrounding composite program provides that behavior
-/// separately.
+/// The projection alone does not define how [`Operation`](crate::Operation)s on the wrapped value dispatch.
+/// [`ProjectedContext`] provides that behavior through this type's blanket [`Value`] implementation whenever the
+/// surrounding composite domains expose the corresponding [`OperationProjection`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ProjectedValue<T: Type, V> {
     /// Original value, kept intact so the program identity it carries is preserved.
@@ -294,12 +299,37 @@ impl<T: Type, V> Typed for ProjectedValue<T, V> {
     }
 }
 
+impl<T: Type, V: ValueProjection<T, Projected = Self>> Value for ProjectedValue<T, V>
+where
+    <V::DispatchDomain as Domain>::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    <V::DispatchDomain as Domain>::Operation: OperationProjection<T>,
+    <V::ExecutionDomain as Domain>::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    <V::ExecutionDomain as Domain>::Operation: OperationProjection<T>,
+{
+    type DispatchDomain = ProjectedContext<V::DispatchDomain, T>;
+    type ExecutionDomain = ProjectedContext<V::ExecutionDomain, T>;
+
+    #[inline]
+    fn dispatch_domain(&self) -> Self::DispatchDomain {
+        ProjectedContext::new(self.value.dispatch_domain())
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> Self::ExecutionDomain {
+        ProjectedContext::new(self.value.execution_domain())
+    }
+}
+
 /// Borrowed counterpart of [`ProjectedValue`], as returned by [`ValueProjection::projected`]. This view borrows both
 /// the original [`Value`] and the member [`Type`] it was validated against, so read-only consumers can treat a value
 /// as its member kind without cloning either. Like [`ProjectedValue`], it leaves the underlying value intact and
 /// reports the narrowed member type through [`Typed`]. Values whose type is stored directly (e.g., a [`Tracer`]'s
 /// staged type) can hand out this view. Values that compute their type on demand return an owning [`ProjectedValue`]
 /// from [`ValueProjection::projected`] instead, because a borrow cannot outlive the computed type.
+///
+/// This borrowed view deliberately does not implement [`Value`]. Applying an operation must be able to return newly
+/// produced owned values, while a `ProjectedValueRef<'v, T, V>` can only describe data and type metadata borrowed for
+/// `'v`. Use [`ProjectedValue`] when a projected member must flow through a [`Context`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ProjectedValueRef<'v, T: Type, V: ?Sized> {
     /// Original value, kept intact so the program identity it carries is preserved.

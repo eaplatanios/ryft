@@ -111,7 +111,7 @@ impl<T: Type> Value for CaptureReference<T> {
     }
 }
 
-impl<T: Type + From<P>, P: Type + 'static> ValueProjection<P> for CaptureReference<T>
+impl<T: Type + From<P>, P: Type> ValueProjection<P> for CaptureReference<T>
 where
     for<'a> &'a P: TryFrom<&'a T, Error = TypeError>,
 {
@@ -119,7 +119,8 @@ where
     type ProjectedRef<'v>
         = ProjectedValueRef<'v, P, Self>
     where
-        Self: 'v;
+        Self: 'v,
+        P: 'v;
 
     #[inline]
     fn from_projected(value: Self::Projected) -> Self {
@@ -127,7 +128,10 @@ where
     }
 
     #[inline]
-    fn projected(&self) -> Result<Self::ProjectedRef<'_>, TypeError> {
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        P: 'v,
+    {
         Ok(ProjectedValueRef::new(self, <&P>::try_from(&self.r#type)?))
     }
 

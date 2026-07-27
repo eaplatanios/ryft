@@ -264,7 +264,7 @@ impl<C: StagingContext> Value for Tracer<C> {
     }
 }
 
-impl<C: StagingContext, T: Type + 'static> ValueProjection<T> for Tracer<C>
+impl<C: StagingContext, T: Type> ValueProjection<T> for Tracer<C>
 where
     for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
 {
@@ -272,7 +272,8 @@ where
     type ProjectedRef<'v>
         = ProjectedValueRef<'v, T, Self>
     where
-        Self: 'v;
+        Self: 'v,
+        T: 'v;
 
     #[inline]
     fn from_projected(value: Self::Projected) -> Self {
@@ -280,7 +281,10 @@ where
     }
 
     #[inline]
-    fn projected(&self) -> Result<Self::ProjectedRef<'_>, TypeError> {
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        T: 'v,
+    {
         Ok(ProjectedValueRef::new(self, <&T>::try_from(&self.r#type)?))
     }
 
