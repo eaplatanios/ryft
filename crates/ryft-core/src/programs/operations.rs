@@ -387,6 +387,48 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
         self.as_ref().render(formatter, indentation)
     }
 }
+
+/// Names the `T`-typed member [`Operation`] family embedded in a composite [`Operation`] family. [`Program`]s that
+/// store several kinds of values in one composite [`Type`] still keep most of their operations narrow. For example,
+/// in a program mixing arrays with first-class runtime dimensions, array-only operations implement
+/// `Operation<ArrayType>` and dimension-only operations implement `Operation<DimensionType>`, while the composite
+/// operation family merely stores and dispatches them, providing one [`From`] implementation per member family to lift
+/// member operations into it. Those [`From`] implementations cannot, however, answer the reverse question that generic
+/// code needs: *given* the composite family and a member type `T`, which family is *the* `T`-typed member? [`From`] is
+/// many-to-one (a composite family is [`From`] many payload types), so the answer must be a type-level function from
+/// `(composite family, T)` to the member family. The [`Projected`](Self::Projected) associated type is that function.
+/// This trait adds no methods as lifting a member operation into the composite family remains the [`From`] trait's job.
+///
+/// A composite operation family implements this trait once per member kind, pointing at the member family that its
+/// corresponding [`From`] implementation lifts. For example:
+///
+/// ```rust,ignore
+/// impl<A: Value<Type = ArrayType>> OperationProjection<ArrayType> for ArrayProgramOperation<A> {
+///     type Projected = ArrayOperation<A>;
+/// }
+///
+/// impl<A: Value<Type = ArrayType>> OperationProjection<DimensionType> for ArrayProgramOperation<A> {
+///     type Projected = DimensionOperation<DimensionValue>;
+/// }
+/// ```
+///
+/// The consumers are the projection adapters that must *name* the member family rather than merely
+/// convert into the composite one: [`ProjectedContext`](crate::ProjectedContext) defines its member-typed
+/// [`Domain::Operation`](crate::Domain::Operation) as `<C::Operation as OperationProjection<T>>::Projected`
+/// so that member-typed operations bind directly through the composite parent context, and
+/// [`ProjectedValue`](crate::ProjectedValue)'s blanket [`Value`] implementation derives its dispatch domains
+/// the same way. Code that only needs to convert a known operation into the composite family should keep writing plain
+/// `Operation: From<X>` bounds instead of this trait. Genuinely mixed operations, whose signatures cross member kinds,
+/// belong to no member family and are deliberately not projectable; dispatchers that inspect a composite operation must
+/// classify their own variants explicitly.
+pub trait OperationProjection<T: Type>: From<Self::Projected> {
+    /// The `T`-typed member [`Operation`] family embedded in this composite family. This is the operation-side
+    /// counterpart of [`ValueProjection::Projected`](crate::ValueProjection::Projected). Lifting a member operation
+    /// into the composite family goes through the [`From`] super-trait, and trait coherence guarantees that each
+    /// composite family names at most one member family per member type `T`.
+    type Projected: Operation<T>;
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
