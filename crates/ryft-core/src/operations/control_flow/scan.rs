@@ -21,8 +21,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, Reshape, ReshapeOperation, Slice, SliceOperation, Transpose, TransposeOperation,
-    UpdateSlice, UpdateSliceOperation,
+    Broadcast, BroadcastOperation, LegacyReshapeOperation, Reshape, Slice, SliceOperation, Transpose,
+    TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -1404,7 +1404,7 @@ where
         + From<TransposeOperation>
         + From<SliceOperation>
         + From<UpdateSliceOperation>
-        + From<ReshapeOperation>
+        + From<LegacyReshapeOperation>
         + From<ScanOperation<C::Constant>>,
 {
     fn batch<D: BatchingDriver<C>>(

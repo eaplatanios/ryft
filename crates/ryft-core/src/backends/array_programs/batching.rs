@@ -15,6 +15,8 @@ use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError};
 use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
 use crate::operations::dimensions::{DimensionSizeOperation, DimensionToScalarOperation};
+use crate::operations::manipulation::reshaping::lift_reshape_output_sharding;
+use crate::operations::manipulation::{ReshapeOperation, Transpose};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationProjection};
@@ -325,7 +327,7 @@ where
             Constant: ValueProjection<ArrayType, Projected = A>
                           + ValueProjection<DimensionType, Projected = DimensionValue>,
         >,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     C::Operation: From<ArrayProgramOperation<A>>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
@@ -459,6 +461,65 @@ where
                     .into_iter()
                     .map(ArrayProgramBatch::replicated)
                     .collect())
+            }
+            Self::Reshape(operation) => {
+                let Some((input, output_extents)) = inputs.split_first() else {
+                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+                };
+                <&ArrayType>::try_from(input.unbatched_type())?;
+                for extent in output_extents {
+                    extent.validate_replicated_dimension()?;
+                }
+
+                if input.batch_axis.is_replicated() {
+                    return Ok(context
+                        .parent
+                        .bind(
+                            self.clone(),
+                            Vec::new(),
+                            &inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>(),
+                        )?
+                        .into_iter()
+                        .map(ArrayProgramBatch::replicated)
+                        .collect());
+                }
+
+                let physical_type = <&ArrayType>::try_from(input.value.r#type().as_ref())?.clone();
+                let moved_input = ArrayBatch::new(
+                    physical_type,
+                    <C::Value as ValueProjection<ArrayType>>::into_projected(input.value.clone())?,
+                    input.batch_axis,
+                )?
+                .move_axis(0)?;
+                let moved_input = <C::Value as ValueProjection<ArrayType>>::from_projected(moved_input.into_value());
+                let axis_extent = DimensionValue::constant(context.axis_size()).map_err(ProgramError::from)?;
+                let axis_extent = <C::Constant as ValueProjection<DimensionType>>::from_projected(axis_extent);
+                let axis_extent = context.parent.lift(axis_extent)?;
+
+                let mut lifted_operation = ReshapeOperation::new();
+                if let Some(dimensions) = operation.dimensions() {
+                    let mut lifted_dimensions = Vec::with_capacity(dimensions.len() + 1);
+                    lifted_dimensions.push(0);
+                    lifted_dimensions.extend(dimensions.iter().map(|dimension| dimension + 1));
+                    lifted_operation = lifted_operation.with_dimensions(lifted_dimensions);
+                }
+                if let Some(output_sharding) = operation.output_sharding() {
+                    lifted_operation = lifted_operation.with_output_sharding(lift_reshape_output_sharding(
+                        output_sharding,
+                        context.axis_sharding().clone(),
+                    )?);
+                }
+
+                let mut lifted_inputs = Vec::with_capacity(inputs.len() + 1);
+                lifted_inputs.push(moved_input);
+                lifted_inputs.push(axis_extent);
+                lifted_inputs.extend(output_extents.iter().map(|extent| extent.value.clone()));
+                context
+                    .parent
+                    .bind(ArrayProgramOperation::<A>::from(lifted_operation), Vec::new(), lifted_inputs.as_slice())?
+                    .into_iter()
+                    .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(0)))
+                    .collect()
             }
         }
     }
@@ -633,6 +694,60 @@ mod tests {
                 &[ArrayProgramBatch::replicated(ArrayProgramValue::Array(Array::scalar(1.0_f32)))],
             ),
             Err(BatchingError::from(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
+        );
+
+        let reshape = ArrayProgramOperation::<Array>::from(ReshapeOperation::new());
+        let reshape_input = ArrayProgramBatch::new(
+            ArrayProgramValue::Array(Array::matrix(2, 6, (0..12).map(|value| value as f32).collect())),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let first_extent = ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap());
+        let first_extent_type = first_extent.r#type().into_owned();
+        let second_extent = ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap());
+        let reshape_output = reshape
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    reshape_input,
+                    ArrayProgramBatch::replicated(first_extent.clone()),
+                    ArrayProgramBatch::replicated(second_extent.clone()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(reshape_output.len(), 1);
+        assert_eq!(reshape_output[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            reshape_output[0].value(),
+            &ArrayProgramValue::Array(Array::from_f64s(
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(3)]),
+                ),
+                (0..12).map(|value| value as f64).collect(),
+            )),
+        );
+        assert_eq!(
+            reshape.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    ArrayProgramBatch::replicated(ArrayProgramValue::Array(Array::vector(vec![
+                        0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0,
+                    ]))),
+                    ArrayProgramBatch {
+                        value: first_extent,
+                        batch_axis: BatchAxis::new(0),
+                        r#type: first_extent_type.clone(),
+                    },
+                    ArrayProgramBatch::replicated(second_extent),
+                ],
+            ),
+            Err(BatchingError::MappedDimension {
+                r#type: Box::new(<&DimensionType>::try_from(&first_extent_type).unwrap().clone()),
+                axis: BatchAxis::new(0),
+            }),
         );
 
         let dimension = ArrayProgramBatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(dimension));

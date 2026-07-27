@@ -1044,6 +1044,8 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       projection-aware-derive analysis are recorded in the P3g plan; none remains in production.
 - [ ] P3g Deliveries B–D: migrate reshape, migrate broadcast, and close the combined transform/lowering vertical slice
       before deleting their legacy homogeneous contracts in the immediately following increment.
+      Delivery B is implemented in the current working tree and ready for owner review; Deliveries C and D have not
+      begun.
 - [x] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
 - [x] Integrate inconclusive requirements with the existing effects model as `Effect::OrderedAssertion`; specify
       ordering, DCE survival, known-side PE folding, runtime observation values, and diagnostic ownership before

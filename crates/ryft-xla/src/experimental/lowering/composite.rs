@@ -4,17 +4,18 @@ use ryft_core::backends::array_programs::{ArrayProgramOperation, ArrayProgramVal
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{Operation as CoreOperation, Program, ProgramError, Typed};
 use ryft_core::sharding::LogicalMesh;
-use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension};
-use ryft_mlir::dialects::{func, stable_hlo};
+use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, Shape};
+use ryft_mlir::dialects::{func, stable_hlo, tensor};
 use ryft_mlir::{
-    Block, Context as MlirContext, Location, Operation as MlirOperation, Region, Type as MlirType, TypeAndAttributes,
-    Value as MlirValue, ValueRef,
+    Block, Context as MlirContext, Location, Operation as MlirOperation, Region, Size as MlirSize, Type as MlirType,
+    TypeAndAttributes, Value as MlirValue, ValueRef,
 };
 
 use super::{
     LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode,
-    lower_compare_to_mlir, lower_constant_elements_attribute, lower_constant_output, lower_tensor_type,
-    merge_logical_meshes, normalize_function_name, replay_region_ref_into_block,
+    lower_compare_to_mlir, lower_constant_elements_attribute, lower_constant_output, lower_sharding_constraint,
+    lower_tensor_type, merge_logical_meshes, normalize_function_name, replay_region_ref_into_block,
+    reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::experimental::ops::XlaConstant;
 use crate::mlir::ToMlir;
@@ -71,6 +72,41 @@ fn lower_array_program_constant<'b, 'c: 'b, 't: 'c, A: MlirLowerableValue>(
             Ok(operation.result(0).expect("stablehlo.constant should return one result").as_ref())
         }
     }
+}
+
+/// Packs scalar first-class dimension operands into the rank-one `i64` shape tensor consumed by
+/// `stablehlo.dynamic_reshape`.
+fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
+    extents: &[ValueRef<'b, 'c, 't>],
+    block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: ryft_mlir::LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let shape_type = context
+        .tensor_type(context.signless_integer_type(64), &[MlirSize::Static(extents.len())], None, location)
+        .map_err(|_| LoweringError::InvalidTensorType {
+            array_type: ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(extents.len())])),
+        })?;
+    if extents.is_empty() {
+        let elements = context
+            .dense_i64_elements_attribute(shape_type, &[])
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+        let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+        return Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref());
+    }
+
+    let dimensions = extents
+        .iter()
+        .map(|extent| {
+            let reshape = block.append_operation(stable_hlo::reshape(*extent, &[1], location)?)?;
+            Ok(reshape.result(0).expect("stablehlo.reshape should return one result").as_ref())
+        })
+        .collect::<Result<Vec<_>, LoweringError>>()?;
+    if let [dimension] = dimensions.as_slice() {
+        return Ok(*dimension);
+    }
+    let shape = block.append_operation(stable_hlo::concatenate(dimensions.as_slice(), 0, location)?)?;
+    Ok(shape.result(0).expect("stablehlo.concatenate should return one result").as_ref())
 }
 
 /// Lowers one array-program instruction.
@@ -166,6 +202,59 @@ where
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
             };
             Ok(vec![*input])
+        }
+        ArrayProgramOperation::Reshape(operation) => {
+            let Some((input, output_extents)) = input_values.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let [output_type] = output_types else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+            };
+            let output_type =
+                <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let input = if let Some(dimensions) = operation.dimensions() {
+                let transpose =
+                    block.append_operation(stable_hlo::transpose(*input, dimensions.as_slice(), location)?)?;
+                transpose.result(0).expect("stablehlo.transpose should return one result").as_ref()
+            } else {
+                *input
+            };
+            let result = if output_type.static_shape().is_some() {
+                let output_shape = static_dimensions(output_type)?;
+                for dimension in &output_shape {
+                    reshape_dimension_i64(*dimension)?;
+                }
+                let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
+                reshape.result(0).expect("stablehlo.reshape should return one result").as_ref()
+            } else {
+                let shape = lower_explicit_reshape_shape(output_extents, block, context, location)?;
+                let output_bounds = output_type
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .map(|dimension| match dimension {
+                        Dimension::Static(extent) => Some(*extent),
+                        Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(dimension),
+                    })
+                    .collect::<Vec<_>>();
+                let reshape =
+                    block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
+                let result = reshape.result(0).expect("stablehlo.dynamic_reshape should return one result").as_ref();
+                let expected_type = lower_tensor_type(output_type, context, location)?;
+                if result.r#type()? == expected_type.as_ref() {
+                    result
+                } else {
+                    let cast = block.append_operation(tensor::cast(result, expected_type, location)?)?;
+                    cast.result(0).expect("tensor.cast should return one result").as_ref()
+                }
+            };
+            if operation.output_sharding().is_some() {
+                let output_sharding =
+                    output_type.sharding().expect("reshape type inference should preserve requested output sharding");
+                lower_sharding_constraint(&[result], output_sharding, block, location)
+            } else {
+                Ok(vec![result])
+            }
         }
     }
 }
@@ -313,9 +402,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::contexts::StagingContext;
+    use ryft_core::contexts::{Context, StagingContext};
     use ryft_core::operations::compare::{Compare, ComparisonDirection};
     use ryft_core::operations::dimensions::{DimensionFromScalar, DimensionSize, DimensionToScalar};
+    use ryft_core::operations::manipulation::ReshapeOperation;
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::values::ValueProjection;
     use ryft_core::tracing::Tracer;
@@ -420,6 +510,88 @@ mod tests {
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<i64>(output_bytes.as_slice()), vec![7]);
+    }
+
+    #[test]
+    fn test_explicit_reshape_lowering() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        let context = TestContext::new();
+        let input = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(6)])).into());
+        let first_extent =
+            context.constant(ArrayProgramValue::Dimension(ryft_core::DimensionValue::constant(2).unwrap()));
+        let second_extent =
+            context.constant(ArrayProgramValue::Dimension(ryft_core::DimensionValue::constant(3).unwrap()));
+        let output = context
+            .bind(ReshapeOperation::new(), Vec::new(), &[input, first_extent, second_extent])
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let static_module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(static_module.matches("stablehlo.reshape").count(), 1);
+        assert_eq!(static_module.matches("stablehlo.dynamic_reshape").count(), 0);
+        assert_eq!(static_module.matches("stablehlo.get_dimension_size").count(), 0);
+        assert_eq!(static_module.matches("dimension_to_scalar").count(), 0);
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: static_module.into_bytes() }, &cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let input_values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let input_bytes = values_to_bytes(input_values.as_slice());
+        let inputs = ExecutionDeviceInputs {
+            inputs: &[ExecutionInput {
+                buffer: Arc::new(
+                    client.buffer(input_bytes.as_slice(), BufferType::F32, &[6], None, device, None).unwrap(),
+                ),
+                donatable: false,
+            }],
+            ..Default::default()
+        };
+        let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+        let mut outputs = execution.block_until_ready().unwrap().remove(0);
+        assert_eq!(outputs.outputs.len(), 1);
+        let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), input_values);
+
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let context = TestContext::new();
+        let input = context.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable), Dimension::Static(4)])).into(),
+        );
+        let first_extent = input.dimension_size(0).unwrap();
+        let second_extent =
+            context.constant(ArrayProgramValue::Dimension(ryft_core::DimensionValue::constant(4).unwrap()));
+        let output = context
+            .bind(ReshapeOperation::new(), Vec::new(), &[input, first_extent, second_extent])
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let dynamic_module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(dynamic_module.matches("stablehlo.get_dimension_size").count(), 1);
+        assert_eq!(dynamic_module.matches("stablehlo.dynamic_reshape").count(), 1);
+        assert_eq!(dynamic_module.matches("stablehlo.concatenate").count(), 1);
+        assert_eq!(dynamic_module.matches("dimension_to_scalar").count(), 0);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::Fill;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, Reshape, ReshapeOperation,
+    Broadcast, BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, LegacyReshapeOperation, Reshape,
     Transpose,
 };
 use crate::operations::math::{Abs, Div, Exp, Floor, Log, Max, Mul, MulOperation, Reduce, ReductionKind, Sub};
@@ -1248,7 +1248,7 @@ where
         + From<ConvertElementTypeOperation>
         + From<DotOperation>
         + From<MulOperation>
-        + From<ReshapeOperation>,
+        + From<LegacyReshapeOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

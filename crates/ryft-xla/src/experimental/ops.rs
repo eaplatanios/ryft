@@ -27,7 +27,7 @@ use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradi
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
     BroadcastOperation, ConcatenateOperation, ConvertElementTypeOperation, DynamicBroadcastOperation,
-    DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation, PadOperation, Reshape, ReshapeOperation,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation, LegacyReshapeOperation, PadOperation, Reshape,
     ScatterOperation, Slice, SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
@@ -125,7 +125,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     DotProductAttention(DotProductAttentionOperation),
     DotProductAttentionBackward(DotProductAttentionBackwardOperation),
     Transpose(TransposeOperation),
-    Reshape(ReshapeOperation),
+    Reshape(LegacyReshapeOperation),
     Reshard(ReshardOperation),
     ShardingConstraint(ShardingConstraintOperation),
     Broadcast(BroadcastOperation),

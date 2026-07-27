@@ -54,8 +54,8 @@ use crate::operations::manipulation::conversion::ElementType;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation,
     DynamicBroadcast, DynamicBroadcastOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, Gather, GatherOperation, GatherScatterMode, Pad, PadOperation, Permutation, Reshape,
-    ReshapeOperation, ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation,
+    DynamicUpdateSliceOperation, Gather, GatherOperation, GatherScatterMode, LegacyReshapeOperation, Pad, PadOperation,
+    Permutation, Reshape, ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation,
     Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::math::dot::dot_general_evaluate;
@@ -156,7 +156,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     AllToAll(AllToAllOperation),
     AxisIndex(AxisIndexOperation),
     Transpose(TransposeOperation),
-    Reshape(ReshapeOperation),
+    Reshape(LegacyReshapeOperation),
     Broadcast(BroadcastOperation),
     DynamicBroadcast(DynamicBroadcastOperation),
     Pad(PadOperation),

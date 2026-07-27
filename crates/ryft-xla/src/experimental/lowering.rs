@@ -25,7 +25,7 @@ use ryft_core::operations::differentiation::CoordinateBasisOperation;
 use ryft_core::operations::manipulation::ReshapeParameters;
 use ryft_core::operations::manipulation::{
     BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, DynamicBroadcastOperation, GatherOperation,
-    GatherScatterMode, PadOperation, ReshapeDimensionExpression, ReshapeOperation, ScatterOperation,
+    GatherScatterMode, LegacyReshapeOperation, PadOperation, ReshapeDimensionExpression, ScatterOperation,
     ScatterReductionKind, SliceOperation, TransposeOperation,
 };
 use ryft_core::operations::math::{
@@ -1321,7 +1321,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<V> {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LegacyReshapeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1334,9 +1334,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
     }
 }
 
-/// Lowers a [`ReshapeOperation`] after validating its unary input and single output contract.
+/// Lowers a [`LegacyReshapeOperation`] after validating its unary input and single output contract.
 fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &ReshapeOperation,
+    operation: &LegacyReshapeOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2342,7 +2342,7 @@ where
                 mode,
                 lowerer,
             ),
-            Self::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            Self::Reshape(operation) => <LegacyReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 regions,
@@ -4615,7 +4615,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Reshape(operation) => <LegacyReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 regions,
@@ -9582,7 +9582,8 @@ mod tests {
     use ryft_core::operations::logical::{AndOperation, OrOperation, XorOperation};
     use ryft_core::operations::manipulation::{
         BroadcastOperation, ConcatenateOperation, DynamicBroadcastOperation, DynamicSliceOperation,
-        DynamicUpdateSliceOperation, PadOperation, ReshapeOperation, SliceOperation, Transpose, UpdateSliceOperation,
+        DynamicUpdateSliceOperation, LegacyReshapeOperation, PadOperation, SliceOperation, Transpose,
+        UpdateSliceOperation,
     };
     use ryft_core::operations::math::{
         Atan2Operation, Cos, DivOperation, Dot, DotDimensionNumbers, ReduceOperation, Sin,
@@ -9760,11 +9761,11 @@ mod tests {
     #[test]
     fn test_plain_reshape_dimensions_lower_transpose_before_reshape() {
         let input_type = test_matrix_type(2, 3);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(
+                LegacyReshapeOperation::new(
                     ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
                 ),
                 Vec::new(),
@@ -9794,9 +9795,9 @@ mod tests {
     #[test]
     fn test_plain_fixed_dynamic_identity_reshape_lowers_without_an_operation() {
         let shape = Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(3)]);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, shape.clone()));
-        let output = builder.add_instruction(ReshapeOperation::new(shape), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(LegacyReshapeOperation::new(shape), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -9821,11 +9822,11 @@ mod tests {
         let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(5)).unwrap());
         let input_shape = Shape::new(vec![rows.clone().into(), Dimension::Static(3), columns.clone().into()]);
         let output_shape = Shape::new(vec![columns.into(), rows.into(), Dimension::Static(3)]);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, input_shape));
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(ReshapeParameters::new(output_shape).with_dimensions([2, 0, 1])),
+                LegacyReshapeOperation::new(ReshapeParameters::new(output_shape).with_dimensions([2, 0, 1])),
                 Vec::new(),
                 vec![input],
             )
@@ -9862,11 +9863,11 @@ mod tests {
             ])),
             denominator: Box::new(ReshapeDimensionExpression::Constant(factor)),
         };
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(
+                LegacyReshapeOperation::new(
                     ReshapeParameters::from_dimension_expressions(vec![
                         normalized_input_dimension(0, 2),
                         normalized_input_dimension(1, 3),
@@ -9912,14 +9913,14 @@ mod tests {
 
     #[test]
     fn test_plain_symbolic_reshape_refines_inferred_mixed_output_dimensions() {
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(
             DataType::F32,
             Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(6)]),
         ));
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(ReshapeParameters::from_dimension_expressions(vec![
+                LegacyReshapeOperation::new(ReshapeParameters::from_dimension_expressions(vec![
                     ReshapeDimensionExpression::InputDimension(0),
                     ReshapeDimensionExpression::Constant(2),
                     ReshapeDimensionExpression::Constant(3),
@@ -9957,14 +9958,14 @@ mod tests {
 
     #[test]
     fn test_plain_symbolic_reshape_rejects_derived_dynamic_bounds_without_result_operands() {
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(
             DataType::F32,
             Shape::new(vec![dynamic_dimension("rows", Some(6)), Dimension::Static(4)]),
         ));
         assert_eq!(
             builder.add_instruction(
-                ReshapeOperation::new(ReshapeParameters::from_dimension_expressions(vec![
+                LegacyReshapeOperation::new(ReshapeParameters::from_dimension_expressions(vec![
                     ReshapeDimensionExpression::Product(vec![
                         ReshapeDimensionExpression::InputDimension(0),
                         ReshapeDimensionExpression::Constant(2),
@@ -10075,7 +10076,7 @@ mod tests {
         let module = context.module(location).unwrap();
         let mut block = module.body().unwrap();
         let error = lower_reshape_to_mlir(
-            &ReshapeOperation::new(Shape::new(vec![Dimension::Static(4)])),
+            &LegacyReshapeOperation::new(Shape::new(vec![Dimension::Static(4)])),
             &[],
             &[test_vector_type(4)],
             &mut block,
@@ -10094,7 +10095,7 @@ mod tests {
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(
+                LegacyReshapeOperation::new(
                     ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
                 ),
                 Vec::new(),
@@ -10126,11 +10127,11 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_sharding =
             Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
         let input = builder.add_input(test_vector_type(4));
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(
+                LegacyReshapeOperation::new(
                     ReshapeParameters::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
                         .with_output_sharding(output_sharding),
                 ),

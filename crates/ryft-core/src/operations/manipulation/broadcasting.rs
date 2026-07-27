@@ -11,7 +11,7 @@ use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::Fill;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
-use crate::operations::manipulation::reshaping::ReshapeOperation;
+use crate::operations::manipulation::reshaping::LegacyReshapeOperation;
 use crate::operations::manipulation::transposition::TransposeOperation;
 use crate::operations::math::ReduceOperation;
 use crate::operations::sharding::ReshardOperation;
@@ -153,7 +153,7 @@ impl_differentiable_operation! {
             + From<ConvertElementTypeOperation>
             + From<ReduceOperation>
             + From<TransposeOperation>
-            + From<ReshapeOperation>
+            + From<LegacyReshapeOperation>
             + From<ReshardOperation>,
     {
         |operation, _context, _driver, inputs, outputs| {
@@ -414,7 +414,7 @@ impl_differentiable_operation! {
             + From<ConvertElementTypeOperation>
             + From<ReduceOperation>
             + From<TransposeOperation>
-            + From<ReshapeOperation>
+            + From<LegacyReshapeOperation>
             + From<ReshardOperation>,
     {
         |operation, _context, _driver, inputs, outputs| {

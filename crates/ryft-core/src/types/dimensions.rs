@@ -285,6 +285,18 @@ impl DimensionType {
         self.variable.bounds()
     }
 
+    /// Returns the most precise [`Dimension`] described by this [`DimensionType`]. Exact singleton bounds become a
+    /// static dimension. All other bounds retain this type's [`DimensionVariable`] as a dynamic dimension.
+    #[inline]
+    pub fn to_dimension(&self) -> Dimension {
+        let bounds = self.bounds();
+        if bounds.lower().checked_add(1) == bounds.upper() {
+            Dimension::Static(bounds.lower())
+        } else {
+            Dimension::Dynamic(self.variable.clone())
+        }
+    }
+
     /// Extends a complete-signature [`TypeIdentityRenaming`] with one declared/actual dimension-type pair. This is
     /// the per-pair fold step behind [`Type::derive_identity_renaming`] for dimension types: signature-level drivers
     /// (including the dimension arms of [`ArrayProgramType`](crate::types::ArrayProgramType)) call it once per member
@@ -846,6 +858,9 @@ mod tests {
         assert!(!declared.is_scalar());
         assert!(!declared.is_complex());
         assert!(declared.is_refined_by(&actual));
+        assert_eq!(declared.to_dimension(), Dimension::Dynamic(declared_variable.clone()));
+        let exact_variable = DimensionVariable::new("7", DimensionBounds::new(7, Some(8)).unwrap());
+        assert_eq!(DimensionType::new(exact_variable).to_dimension(), Dimension::Static(7));
 
         let mut identities = Vec::new();
         declared.visit_identities(&mut |position, variable| identities.push((position, variable.clone())));

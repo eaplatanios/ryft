@@ -683,11 +683,11 @@ ledger disagrees with Git.
 
 ## P3g: explicit reshape and broadcast dimensions
 
-- Status: ready for owner review — Delivery A
+- Status: ready for owner review — Delivery B
 - Branch: `u/eaplatanios/dynamic-shapes`
 - Baseline commit: `beadf85bd3f96bbf8105bd6f48845a00a4ee2c4f`
-- Delivery A source commit: pending owner review
-- Delivery A integration commit: pending
+- Delivery A source commit: `cd58f0a52`
+- Delivery A integration commit: `cd58f0a52`
 - Immutable archive unchanged: yes
 - Scope: introduce the first two shape-producing mixed operations, giving reshape and broadcast the canonical
   signatures `(Array, output extent for axis 0, ..., output extent for axis rank - 1) -> Array`
@@ -733,5 +733,23 @@ ledger disagrees with Git.
 - Delivery A residuals: no `MixedArrayDimensionOperation`, nested `ArrayProgramOperation::Mixed`, or explicit-type
   derive extension remains. The 42 legacy conversion bounds and 182 shape calls remain intentionally unchanged until
   the reshape, broadcast, and closure deliveries
+- Delivery B canonical reshape: `ReshapeOperation` is now exclusively the mixed
+  `(array, extent axis 0, ..., extent axis rank - 1) -> array` contract. Its output shape is derived from operand types,
+  and its payload retains only input permutation and output-sharding attributes. Exact constants represent static
+  axes; dynamic extent operands preserve their dimension-variable identities
+- Delivery B legacy boundary: the behaviorally unchanged homogeneous/expression implementation is now
+  `LegacyReshapeOperation`. Its expression evaluator, lowering, transform rules, and remaining production users are
+  intentionally retained until the post-P3g deletion increment
+- Delivery B transform/lowering closure: eager interpretation, partial evaluation, batching, JVP, static transpose,
+  direct static/dynamic StableHLO lowering, projected binding, identity instantiation, and cross-program import are
+  covered. Dynamic transpose is explicitly deferred to Phase 6 because recovering dynamic input extents requires
+  transform-owned residuals
+- Delivery B CPU limitation: static mixed reshape compiles and executes on CPU. Bounded-dynamic lowering is
+  structurally verified, but end-to-end CPU compilation remains blocked by the existing `PadToStatic` custom-call
+  requirement
+- Delivery B verification: 979 core library tests, 58 executable core doctests with 16 ignored, 400 XLA library tests
+  with one ignored benchmark, the empty XLA doctest suite, both projection-allocation guards, focused mixed/legacy
+  reshape and transform/lowering tests, core/XLA compilation, formatting, whitespace checks, residual searches, and
+  changed-file Clippy attribution
 - Review method: line by line
-- Next action: owner review, staging, commit, and push of Delivery A; do not begin Delivery B before that gate
+- Next action: owner review, stage, commit, and push Delivery B; then execute Delivery C as a separate increment
