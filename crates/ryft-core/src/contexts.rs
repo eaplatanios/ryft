@@ -119,11 +119,11 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::builders::ProgramBuilder;
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::programs::Program;
 use crate::programs::regions::BindingRegionDriver;
 use crate::programs::types::{Type, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
 /// Type/value universe at the core of Ryft that is used by program interpretation, tracing, and transformations like
@@ -354,6 +354,140 @@ impl<V: Value, O: Operation<V::Type> + InterpretableOperation<Self>> Context for
     }
 }
 
+/// Zero-state typed view of a composite parent domain or context.
+///
+/// A composite program can store several value kinds in one type/value universe even though most operations remain
+/// homogeneous. `ProjectedContext<C, T>` exposes the `T`-typed member selected by
+/// [`ValueProjection<T>`](ValueProjection) and [`OperationProjection<T>`](OperationProjection), while retaining only
+/// its parent `C`. Binding a homogeneous operation lifts its operands and operation into the composite families,
+/// binds once through the parent context, and projects the results back to `T`. It never inspects a staged program,
+/// reconstructs dependencies, or stores dimensions, source arrays, identity mappings, or other semantic state.
+///
+/// Projected binding is intentionally limited to region-free homogeneous operations. Regions can carry values of
+/// several member kinds and therefore require the composite region contracts owned by higher-order operations rather
+/// than homogeneous projection.
+pub struct ProjectedContext<C: Domain, T: Type + 'static> {
+    /// Composite parent domain or context.
+    parent: C,
+
+    /// Zero-sized marker selecting the homogeneous member [`Type`].
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<C: Domain, T: Type + 'static> ProjectedContext<C, T> {
+    /// Creates a homogeneous member view of `parent`.
+    #[inline]
+    pub const fn new(parent: C) -> Self {
+        Self { parent, marker: PhantomData }
+    }
+
+    /// Returns the composite parent domain or context.
+    #[inline]
+    pub fn parent(&self) -> &C {
+        &self.parent
+    }
+}
+
+impl<C: Domain + Clone, T: Type + 'static> Clone for ProjectedContext<C, T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self::new(self.parent.clone())
+    }
+}
+
+impl<C: Domain, T: Type + 'static> Domain for ProjectedContext<C, T>
+where
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Operation: OperationProjection<T>,
+{
+    type Type = T;
+    type Value = <C::Value as ValueProjection<T>>::Projected;
+    type Constant = <C::Constant as ValueProjection<T>>::Projected;
+    type Operation = <C::Operation as OperationProjection<T>>::Projected;
+}
+
+impl<C: Context, T: Type + 'static> Context for ProjectedContext<C, T>
+where
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Operation: OperationProjection<T>,
+{
+    fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
+        self.parent
+            .lift(<C::Constant as ValueProjection<T>>::from_projected(constant))?
+            .into_projected()
+            .map_err(Into::into)
+    }
+
+    fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+        &self,
+        operation: O,
+        driver: D,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        let operation = operation.into();
+        if !operation.region_slots().is_empty() || driver.region_count() != 0 {
+            return Err(ProgramError::MalformedProgram(format!(
+                "projected operation `{}` cannot carry regions",
+                operation.name(),
+            )));
+        }
+
+        let operation = <C::Operation as OperationProjection<T>>::from_projected(operation);
+        let regions = Vec::<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>::new();
+
+        // `Context::bind` borrows its inputs while embedding a projected member consumes it, so clone each member
+        // representation to construct temporary composite values for the parent. Keep the common nullary, unary, and
+        // binary cases on the stack; only uncommon wider homogeneous operations allocate an input vector. Symbolic
+        // projected values retain their parent value and therefore preserve SSA identity through this clone. Concrete
+        // eager values ordinarily dispatch through their native member contexts rather than through this adapter.
+        let outputs = match inputs {
+            [] => self.parent.bind(operation, regions, &[]),
+            [input] => {
+                let inputs = [<C::Value as ValueProjection<T>>::from_projected(input.clone())];
+                self.parent.bind(operation, regions, &inputs)
+            }
+            [left, right] => {
+                let inputs = [
+                    <C::Value as ValueProjection<T>>::from_projected(left.clone()),
+                    <C::Value as ValueProjection<T>>::from_projected(right.clone()),
+                ];
+                self.parent.bind(operation, regions, &inputs)
+            }
+            inputs => {
+                let inputs =
+                    inputs.iter().cloned().map(<C::Value as ValueProjection<T>>::from_projected).collect::<Vec<_>>();
+                self.parent.bind(operation, regions, inputs.as_slice())
+            }
+        }?;
+        outputs
+            .into_iter()
+            .map(<C::Value as ValueProjection<T>>::into_projected)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    #[inline]
+    fn is_eager(&self) -> bool {
+        self.parent.is_eager()
+    }
+
+    fn resolve(&self, value: &Self::Value) -> ValueResolution<Self::Constant> {
+        // Resolution must ask the parent about the original composite value. For the symbolic values that use this
+        // context through `ProjectedValue`, cloning preserves the same underlying tracer or transform state.
+        let value = <C::Value as ValueProjection<T>>::from_projected(value.clone());
+        match self.parent.resolve(&value) {
+            ValueResolution::Constant(constant) => match constant.into_projected() {
+                Ok(constant) => ValueResolution::Constant(constant),
+                Err(_) => ValueResolution::Opaque,
+            },
+            ValueResolution::Staged(atom) => ValueResolution::Staged(atom),
+            ValueResolution::Opaque => ValueResolution::Opaque,
+        }
+    }
+}
+
 /// Staging [`Context`] whose flowing [`Domain::Value`] is a [`Tracer`] into an active [`ProgramBuilder`].
 /// Binding records [`Operation`] invocations as [`Program`] [`Instruction`](crate::Instruction)s rather than
 /// interpreting them, and this trait owns the builder-dependent staging API: [`constant`](StagingContext::constant),
@@ -572,26 +706,463 @@ impl<V> ValueResolution<V> {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::fmt::Display;
 
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::differentiation::DifferentiationTracer;
+    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{OneOperation, ZeroOperation};
     use crate::operations::control_flow::WhileOperation;
     use crate::operations::math::{AddOperation, NegOperation};
-    use crate::parameters::Placeholder;
+    use crate::parameters::{Parameter, Placeholder};
+    use crate::partial::PartialTracer;
     use crate::programs::ProgramError;
     use crate::programs::atoms::{Atom, AtomId};
     use crate::programs::builders::ProgramBuilder;
+    use crate::programs::identities::NoIdentity;
+    use crate::programs::operations::OperationProjection;
     use crate::programs::regions::{CalleeRegionDriver, RegionInterface};
-    use crate::programs::types::{TypeError, Typed};
-    use crate::tracing::{DomainTracingContext, TracerState, TracingContext};
+    use crate::programs::types::{Type, TypeError, Typed};
+    use crate::programs::values::{ProjectedValue, ValueProjection};
+    use crate::tracing::{DomainTracingContext, Tracer, TracerState, TracingContext};
     use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
+
+    /// Test-only homogeneous member type used by the generic projected-context fixtures.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ProjectedMemberType<const MEMBER: u8>;
+
+    impl<const MEMBER: u8> Display for ProjectedMemberType<MEMBER> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "member_{MEMBER}")
+        }
+    }
+
+    impl<const MEMBER: u8> Parameter for ProjectedMemberType<MEMBER> {}
+
+    impl<const MEMBER: u8> Type for ProjectedMemberType<MEMBER> {
+        type Identity = NoIdentity;
+        type Refinements = ();
+
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_scalar(&self) -> bool {
+            true
+        }
+
+        fn is_complex(&self) -> bool {
+            false
+        }
+    }
+
+    /// Test-only concrete value for one homogeneous projected member.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ProjectedMemberValue<const MEMBER: u8>(usize);
+
+    impl<const MEMBER: u8> Display for ProjectedMemberValue<MEMBER> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}", self.0)
+        }
+    }
+
+    impl<const MEMBER: u8> Parameter for ProjectedMemberValue<MEMBER> {}
+
+    impl<const MEMBER: u8> Typed for ProjectedMemberValue<MEMBER> {
+        type Type = ProjectedMemberType<MEMBER>;
+
+        fn r#type(&self) -> Cow<'_, Self::Type> {
+            Cow::Owned(ProjectedMemberType)
+        }
+    }
+
+    impl<const MEMBER: u8> Value for ProjectedMemberValue<MEMBER> {
+        type DispatchDomain = EagerContext<Self>;
+        type ExecutionDomain = EagerContext<Self>;
+
+        fn dispatch_domain(&self) -> Self::DispatchDomain {
+            EagerContext::new()
+        }
+
+        fn execution_domain(&self) -> Self::ExecutionDomain {
+            EagerContext::new()
+        }
+    }
+
+    /// Test-only storage type with three distinct homogeneous member kinds.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum ProjectedProgramType {
+        /// First member kind.
+        First(ProjectedMemberType<0>),
+
+        /// Second member kind.
+        Second(ProjectedMemberType<1>),
+
+        /// Third member kind, which exercises the extensibility gate.
+        Third(ProjectedMemberType<2>),
+    }
+
+    impl Display for ProjectedProgramType {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::First(r#type) => Display::fmt(r#type, formatter),
+                Self::Second(r#type) => Display::fmt(r#type, formatter),
+                Self::Third(r#type) => Display::fmt(r#type, formatter),
+            }
+        }
+    }
+
+    impl Parameter for ProjectedProgramType {}
+
+    impl Type for ProjectedProgramType {
+        type Identity = NoIdentity;
+        type Refinements = ();
+
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_scalar(&self) -> bool {
+            true
+        }
+
+        fn is_complex(&self) -> bool {
+            false
+        }
+    }
+
+    /// Test-only storage value mirroring [`ProjectedProgramType`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum ProjectedProgramValue {
+        /// First member value.
+        First(ProjectedMemberValue<0>),
+
+        /// Second member value.
+        Second(ProjectedMemberValue<1>),
+
+        /// Third member value, which exercises the extensibility gate.
+        Third(ProjectedMemberValue<2>),
+    }
+
+    impl Display for ProjectedProgramValue {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::First(value) => Display::fmt(value, formatter),
+                Self::Second(value) => Display::fmt(value, formatter),
+                Self::Third(value) => Display::fmt(value, formatter),
+            }
+        }
+    }
+
+    impl Parameter for ProjectedProgramValue {}
+
+    impl Typed for ProjectedProgramValue {
+        type Type = ProjectedProgramType;
+
+        fn r#type(&self) -> Cow<'_, Self::Type> {
+            Cow::Owned(match self {
+                Self::First(_) => ProjectedProgramType::First(ProjectedMemberType),
+                Self::Second(_) => ProjectedProgramType::Second(ProjectedMemberType),
+                Self::Third(_) => ProjectedProgramType::Third(ProjectedMemberType),
+            })
+        }
+    }
+
+    impl Value for ProjectedProgramValue {
+        type DispatchDomain = EagerContext<Self>;
+        type ExecutionDomain = EagerContext<Self>;
+
+        fn dispatch_domain(&self) -> Self::DispatchDomain {
+            EagerContext::new()
+        }
+
+        fn execution_domain(&self) -> Self::ExecutionDomain {
+            EagerContext::new()
+        }
+    }
+
+    macro_rules! impl_projected_test_member {
+        // Implements type/value conversion and projection for one named member of the test composite family.
+        ($member:literal, $variant:ident) => {
+            impl From<ProjectedMemberType<$member>> for ProjectedProgramType {
+                fn from(r#type: ProjectedMemberType<$member>) -> Self {
+                    Self::$variant(r#type)
+                }
+            }
+
+            impl<'t> TryFrom<&'t ProjectedProgramType> for &'t ProjectedMemberType<$member> {
+                type Error = TypeError;
+
+                fn try_from(r#type: &'t ProjectedProgramType) -> Result<Self, Self::Error> {
+                    match r#type {
+                        ProjectedProgramType::$variant(r#type) => Ok(r#type),
+                        _ => Err(TypeError::invalid(format!("expected member {} but got {type}", $member, type = r#type))),
+                    }
+                }
+            }
+
+            impl ValueProjection<ProjectedMemberType<$member>> for ProjectedProgramValue {
+                type Projected = ProjectedMemberValue<$member>;
+                type ProjectedRef<'v>
+                    = &'v ProjectedMemberValue<$member>
+                where
+                    Self: 'v;
+
+                fn from_projected(value: Self::Projected) -> Self {
+                    Self::$variant(value)
+                }
+
+                fn projected(&self) -> Result<Self::ProjectedRef<'_>, TypeError> {
+                    match self {
+                        Self::$variant(value) => Ok(value),
+                        _ => Err(TypeError::invalid(format!(
+                            "expected member {} but got {type}",
+                            $member,
+                            type = self.r#type(),
+                        ))),
+                    }
+                }
+
+                fn into_projected(self) -> Result<Self::Projected, TypeError> {
+                    match self {
+                        Self::$variant(value) => Ok(value),
+                        _ => Err(TypeError::invalid(format!(
+                            "expected member {} but got {type}",
+                            $member,
+                            type = self.r#type(),
+                        ))),
+                    }
+                }
+            }
+        };
+    }
+
+    impl_projected_test_member!(0, First);
+    impl_projected_test_member!(1, Second);
+    impl_projected_test_member!(2, Third);
+
+    /// Test-only homogeneous identity operation for one projected member kind.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ProjectedMemberOperation<const MEMBER: u8>;
+
+    impl<const MEMBER: u8> Operation<ProjectedMemberType<MEMBER>> for ProjectedMemberOperation<MEMBER> {
+        fn name(&self) -> &'static str {
+            "projected_member"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ProjectedMemberType<MEMBER>],
+            region_interfaces: &[RegionInterface<ProjectedMemberType<MEMBER>>],
+        ) -> Result<Vec<ProjectedMemberType<MEMBER>>, TypeError> {
+            if input_types.len() != 1 {
+                return Err(TypeError::invalid(format!("expected 1 input but got {}", input_types.len())));
+            }
+            if !region_interfaces.is_empty() {
+                return Err(TypeError::invalid(format!(
+                    "expected 0 region interfaces but got {}",
+                    region_interfaces.len(),
+                )));
+            }
+            Ok(input_types.to_vec())
+        }
+    }
+
+    /// Test-only composite operation family embedding all three homogeneous member families.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum ProjectedProgramOperation {
+        /// First member operation.
+        First(ProjectedMemberOperation<0>),
+
+        /// Second member operation.
+        Second(ProjectedMemberOperation<1>),
+
+        /// Third member operation, which exercises the extensibility gate.
+        Third(ProjectedMemberOperation<2>),
+    }
+
+    impl ProjectedProgramOperation {
+        /// Delegates composite inference to one homogeneous member operation.
+        fn infer_member<const MEMBER: u8>(
+            operation: &ProjectedMemberOperation<MEMBER>,
+            input_types: &[ProjectedProgramType],
+            region_interfaces: &[RegionInterface<ProjectedProgramType>],
+        ) -> Result<Vec<ProjectedProgramType>, TypeError>
+        where
+            for<'t> &'t ProjectedMemberType<MEMBER>: TryFrom<&'t ProjectedProgramType, Error = TypeError>,
+            ProjectedProgramType: From<ProjectedMemberType<MEMBER>>,
+        {
+            let input_types = input_types
+                .iter()
+                .map(|r#type| <&ProjectedMemberType<MEMBER>>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()?;
+            if !region_interfaces.is_empty() {
+                return Err(TypeError::invalid(format!(
+                    "expected 0 region interfaces but got {}",
+                    region_interfaces.len(),
+                )));
+            }
+            operation
+                .infer_output_types(input_types.as_slice(), &[])
+                .map(|types| types.into_iter().map(Into::into).collect())
+        }
+    }
+
+    impl Operation<ProjectedProgramType> for ProjectedProgramOperation {
+        fn name(&self) -> &'static str {
+            match self {
+                Self::First(operation) => operation.name(),
+                Self::Second(operation) => operation.name(),
+                Self::Third(operation) => operation.name(),
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ProjectedProgramType],
+            region_interfaces: &[RegionInterface<ProjectedProgramType>],
+        ) -> Result<Vec<ProjectedProgramType>, TypeError> {
+            match self {
+                Self::First(operation) => Self::infer_member(operation, input_types, region_interfaces),
+                Self::Second(operation) => Self::infer_member(operation, input_types, region_interfaces),
+                Self::Third(operation) => Self::infer_member(operation, input_types, region_interfaces),
+            }
+        }
+    }
+
+    macro_rules! impl_projected_test_operation {
+        // Selects and embeds one homogeneous member operation family in the test composite operation family.
+        ($member:literal, $variant:ident) => {
+            impl OperationProjection<ProjectedMemberType<$member>> for ProjectedProgramOperation {
+                type Projected = ProjectedMemberOperation<$member>;
+
+                fn from_projected(operation: Self::Projected) -> Self {
+                    Self::$variant(operation)
+                }
+            }
+        };
+    }
+
+    impl_projected_test_operation!(0, First);
+    impl_projected_test_operation!(1, Second);
+    impl_projected_test_operation!(2, Third);
+
+    impl InterpretableOperation<EagerContext<ProjectedProgramValue, Self>> for ProjectedProgramOperation {
+        fn interpret<D: InterpretationDriver<EagerContext<ProjectedProgramValue, Self>>>(
+            &self,
+            _context: &EagerContext<ProjectedProgramValue, Self>,
+            _driver: &D,
+            inputs: &[ProjectedProgramValue],
+        ) -> Result<Vec<ProjectedProgramValue>, ProgramError> {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            self.infer_output_types(input_types.as_slice(), &[])?;
+            Ok(inputs.to_vec())
+        }
+    }
+
+    #[test]
+    fn test_projected_context() {
+        type TestEagerContext = EagerContext<ProjectedProgramValue, ProjectedProgramOperation>;
+
+        let context = ProjectedContext::<_, ProjectedMemberType<0>>::new(TestEagerContext::new());
+        assert_eq!(
+            size_of::<ProjectedContext<TestEagerContext, ProjectedMemberType<0>>>(),
+            size_of::<TestEagerContext>()
+        );
+        assert!(context.is_eager());
+        assert_eq!(
+            context.bind(ProjectedMemberOperation, Vec::new(), &[ProjectedMemberValue::<0>(7)]),
+            Ok(vec![ProjectedMemberValue::<0>(7)]),
+        );
+        assert_eq!(context.lift(ProjectedMemberValue::<0>(11)), Ok(ProjectedMemberValue::<0>(11)));
+        assert_eq!(
+            context.resolve(&ProjectedMemberValue::<0>(13)),
+            ValueResolution::Constant(ProjectedMemberValue::<0>(13)),
+        );
+
+        // Homogeneous projected operations cannot smuggle composite values through attached regions.
+        let mut builder = ProgramBuilder::<ProjectedMemberValue<0>, ProjectedMemberOperation<0>>::new();
+        let input = builder.add_input(ProjectedMemberType);
+        let region = builder
+            .build::<Vec<ProjectedMemberValue<0>>, Vec<ProjectedMemberValue<0>>>(
+                vec![input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            context.bind(
+                ProjectedMemberOperation,
+                vec![region],
+                &[ProjectedMemberValue::<0>(17)],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "projected operation `projected_member` cannot carry regions",
+        ));
+    }
+
+    #[test]
+    fn test_projected_context_stages_without_implicit_dependencies() {
+        type TestTracingContext = TracingContext<ProjectedProgramValue, ProjectedProgramOperation>;
+
+        let parent = TestTracingContext::new();
+        let input = parent.input(ProjectedProgramType::First(ProjectedMemberType));
+        let input_atom = input.atom_id().unwrap();
+        let input =
+            <Tracer<TestTracingContext> as ValueProjection<ProjectedMemberType<0>>>::into_projected(input).unwrap();
+        let context = input.dispatch_domain();
+        let output = context.bind(ProjectedMemberOperation, Vec::new(), &[input]).unwrap().remove(0);
+
+        assert_eq!(output.value().atom_id(), Ok(AtomId::new(1)));
+        assert_eq!(context.resolve(&output), ValueResolution::Staged(AtomId::new(1)));
+        let builder = parent.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected one projected instruction");
+        };
+        assert_eq!(instruction.inputs(), &[input_atom]);
+        assert_eq!(instruction.outputs(), &[AtomId::new(1)]);
+        assert!(matches!(instruction.operation(), ProjectedProgramOperation::First(ProjectedMemberOperation)));
+        assert!(instruction.regions().is_empty());
+    }
+
+    #[test]
+    fn test_projected_context_supports_a_third_member() {
+        type TestEagerContext = EagerContext<ProjectedProgramValue, ProjectedProgramOperation>;
+        type TestTracingContext = TracingContext<ProjectedProgramValue, ProjectedProgramOperation>;
+
+        // Adding a third member requires only its composite type/value conversions and operation-family projection.
+        // Generic projected values for ordinary tracing and both transform carriers remain unchanged.
+        fn assert_value<V: Value>() {}
+        assert_value::<ProjectedValue<ProjectedMemberType<2>, Tracer<TestTracingContext>>>();
+        assert_value::<ProjectedValue<ProjectedMemberType<2>, PartialTracer<TestEagerContext>>>();
+        assert_value::<ProjectedValue<ProjectedMemberType<2>, DifferentiationTracer<TestEagerContext>>>();
+
+        let parent = TestTracingContext::new();
+        let input = parent.input(ProjectedProgramType::Third(ProjectedMemberType));
+        let input =
+            <Tracer<TestTracingContext> as ValueProjection<ProjectedMemberType<2>>>::into_projected(input).unwrap();
+        let output = input.dispatch_domain().bind(ProjectedMemberOperation, Vec::new(), &[input]).unwrap().remove(0);
+        assert_eq!(output.value().atom_id(), Ok(AtomId::new(1)));
+        assert!(matches!(
+            parent.builder().borrow().instructions()[0].operation(),
+            ProjectedProgramOperation::Third(ProjectedMemberOperation),
+        ));
+    }
 
     #[test]
     fn test_domain() {

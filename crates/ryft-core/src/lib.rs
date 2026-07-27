@@ -36,7 +36,7 @@ pub use batching::{
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::*;
-pub use contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
+pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::*;
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{InterpretableOperation, InterpretationDriver};

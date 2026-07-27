@@ -1048,18 +1048,18 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       its heterogeneous batch representation here would prematurely encode P5's replicated-dimension policy.
 - [x] Replace duplicated projected-value wrappers with one generic owned projected value and one borrowed projected
       view where the concrete eager value cannot be returned directly.
-- [ ] Introduce a zero-state `ProjectedContext<C, T>` that binds homogeneous inner operations directly into the outer
+- [x] Introduce a zero-state `ProjectedContext<C, T>` that binds homogeneous inner operations directly into the outer
       graph.
-- [ ] Add one generic inner-operation lift contract implemented by the outer operation family.
+- [x] Add one generic inner-operation lift contract implemented by the outer operation family.
 - [x] Preserve SSA atom identity exactly through staged projections.
 - [x] Preserve concrete eager values without boxing or heap allocation.
 - [x] Add allocation and payload-size tests proving that projecting a large reference-backend array neither allocates
       nor copies its `Scalar` payload.
 - [x] Pin canonical wrong-kind diagnostics as compile/runtime goldens. Wrong-count diagnostics belong to P3's mixed
       operand schemas because P2c introduces no operand-count projection.
-- [ ] Add a compile-only toy third member kind to prove that another kind needs projection and policy
+- [x] Add a compile-only toy third member kind to prove that another kind needs projection and policy
       implementations, not changes to generic `Program`, `Context`, capture, tracer, or projected-context machinery.
-- [ ] Gate: the projected context contains no semantic state other than its parent, and the vertical slice creates no
+- [x] Gate: the projected context contains no semantic state other than its parent, and the vertical slice creates no
       implicit dimension dependency.
 
 ### Phase 3: establish canonical mixed operation signatures
@@ -1802,3 +1802,34 @@ authority policies assigned to P5. P2d can therefore prototype direct projected 
 without pulling transformation policy forward.
 
 Verification and residual-audit results are recorded in the P2c cleanup-ledger entry at handoff.
+
+### Execution: P2d zero-state projected binding
+
+P2d completes the generic member adapter without introducing the production array-program dispatcher or any mixed
+shape operation:
+
+- `OperationProjection<T>` associates a composite operation family with one homogeneous member family and provides
+  the sole `from_projected` lift into the outer dispatcher;
+- `ProjectedContext<C, T>` stores only `C` plus a zero-sized type marker, delegates eagerness and resolution, and
+  performs one project/lift/bind/project round trip with no program inspection or dependency reconstruction;
+- nullary, unary, and binary projected binds reconstruct parent inputs in fixed-size stack arrays; only wider
+  homogeneous operations allocate a temporary input vector; projecting the parent context's returned output vector
+  still materializes the projected output vector required by the current `Context::bind` API;
+- projected binding rejects both declared and attached regions because heterogeneous region signatures remain owned by
+  the outer higher-order operations in P4;
+- one blanket `Value for ProjectedValue<T, V>` supplies dispatch and execution domains for tracers, partial tracers,
+  and differentiation tracers; no carrier-specific `Value` implementation is added;
+- a three-member test family exercises eager binding, ordinary trace staging, exact SSA identity, constant/staged
+  resolution, absence of implicit operands and regions, and unchanged generic support for tracer and transform
+  carriers; and
+- the context-size assertion pins that the type marker adds no runtime storage beyond the parent context.
+
+Production `ArrayProgramOperation`, mixed operand schemas, shape operations, higher-order region projection, batching,
+and differentiation policies remain assigned to P3–P6. The existing reference-array allocation tests continue to prove
+that borrowed and consuming eager value projection neither allocates nor copies payloads. Projected-context binding
+temporarily reconstructs parent values from borrowed inputs because the generic `Context::bind` contract accepts a
+slice; concrete eager member values continue to dispatch through their native contexts, while symbolic projected
+values clone only their parent tracer/transform representation and preserve SSA identity. P10 retains the final
+cross-context allocation and latency measurement once production outer dispatch is present.
+
+Verification and residual-audit results are recorded in the P2d cleanup-ledger entry at handoff.

@@ -5,13 +5,14 @@ use ryft_macros::Parameter;
 
 use crate::batching::{ArrayBatch, BatchingTracer};
 use crate::captures::CaptureReference;
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::DifferentiationTracer;
 use crate::parameters::Parameter;
 use crate::partial::{PartialTracer, PartialValue};
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::identities::TypeIdentityRenaming;
+use crate::programs::operations::OperationProjection;
 use crate::programs::regions::RegionId;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::Tracer;
@@ -246,9 +247,10 @@ pub trait ValueProjection<T: Type + 'static>: Value {
 /// it with the member type it was validated against. [`Typed`] consequently reports that member type rather than the
 /// value's original composite type.
 ///
-/// Projection alone does not define how [`Operation`](crate::Operation)s on the wrapped value dispatch. A context
-/// adapter that binds member-typed operations through the surrounding composite program provides that behavior
-/// separately.
+/// Projection alone does not define how [`Operation`](crate::Operation)s on the wrapped value dispatch.
+/// [`ProjectedContext`](crate::ProjectedContext) provides that behavior through this type's blanket [`Value`]
+/// implementation whenever the surrounding composite domains expose the corresponding
+/// [`OperationProjection`](crate::OperationProjection).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ProjectedValue<T: Type, V> {
     /// Original value, kept intact so the program identity it carries is preserved.
@@ -291,6 +293,27 @@ impl<T: Type, V> Typed for ProjectedValue<T, V> {
     #[inline]
     fn r#type(&self) -> Cow<'_, T> {
         Cow::Borrowed(&self.r#type)
+    }
+}
+
+impl<T: Type + 'static, V: ValueProjection<T, Projected = Self>> Value for ProjectedValue<T, V>
+where
+    <V::DispatchDomain as Domain>::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    <V::DispatchDomain as Domain>::Operation: OperationProjection<T>,
+    <V::ExecutionDomain as Domain>::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    <V::ExecutionDomain as Domain>::Operation: OperationProjection<T>,
+{
+    type DispatchDomain = ProjectedContext<V::DispatchDomain, T>;
+    type ExecutionDomain = ProjectedContext<V::ExecutionDomain, T>;
+
+    #[inline]
+    fn dispatch_domain(&self) -> Self::DispatchDomain {
+        ProjectedContext::new(self.value.dispatch_domain())
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> Self::ExecutionDomain {
+        ProjectedContext::new(self.value.execution_domain())
     }
 }
 

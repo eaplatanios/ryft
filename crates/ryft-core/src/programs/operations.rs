@@ -333,6 +333,26 @@ pub trait Operation<T: Type>: Clone {
     }
 }
 
+/// Associates a composite [`Operation`] family with one homogeneous member family.
+///
+/// Composite programs store several value kinds in one type/value universe, while most operation payloads retain
+/// their narrower type contract. For example, an array program can store both arrays and first-class dimensions, but
+/// array-only operations still implement `Operation<ArrayType>` and dimension-only operations still implement
+/// `Operation<DimensionType>`. Implementing `OperationProjection<T>` for the composite operation family selects its
+/// homogeneous `T`-typed operation family and defines the single lift from that family into the composite dispatcher.
+///
+/// [`ProjectedContext`](crate::ProjectedContext) uses this contract to bind a homogeneous operation directly through
+/// its composite parent context. The trait deliberately provides no projection from an arbitrary outer operation:
+/// genuinely mixed operations do not belong to any homogeneous member family, and dispatchers that inspect an outer
+/// operation must classify their own variants explicitly.
+pub trait OperationProjection<T: Type> {
+    /// Homogeneous `T`-typed [`Operation`] family embedded by this composite family.
+    type Projected: Operation<T>;
+
+    /// Embeds a homogeneous member operation into this composite [`Operation`] family.
+    fn from_projected(operation: Self::Projected) -> Self;
+}
+
 impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
     #[inline]
     fn name(&self) -> &'static str {
