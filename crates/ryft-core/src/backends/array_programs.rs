@@ -3,20 +3,33 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::backends::arrays::ArrayOperation;
+use crate::backends::arrays::{Array, ArrayOperation};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
-use crate::contexts::EagerContext;
+use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::operations::dimensions::{DimensionSize, DimensionSizeOperation};
-use crate::parameters::Parameter;
+use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::dimensions::{
+    DimensionSize, DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation,
+};
+use crate::operations::math::AddOperation;
+use crate::parameters::{Parameter, Placeholder};
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::effects::Effects;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::regions::{EmptyRegionDriver, OutputRegionProvenance, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayProgramType, ArrayType, DimensionType, DimensionVariable};
+
+pub mod batching;
 
 // TODO(eaplatanios): Review this module.
 
@@ -31,6 +44,12 @@ use crate::types::{ArrayProgramType, ArrayType, DimensionType, DimensionVariable
 /// first-class dimension without changing either homogeneous family.
 #[derive(Clone, Debug)]
 pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
+    /// Array-member zero constructor used for structural tangent and cotangent materialization.
+    ///
+    /// Its composite type parameter lets generic differentiation code request a zero, while outer inference rejects
+    /// dimension-member result types so a zero constructor can never grant first-class shape authority.
+    Zero(ZeroOperation<ArrayProgramType>),
+
     /// Homogeneous array operation.
     Array(ArrayOperation<A>),
 
@@ -39,6 +58,9 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
 
     /// Mixed operation that reads an array axis as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
+
+    /// Mixed operation that converts a first-class dimension into ordinary scalar-array data.
+    DimensionToScalar(DimensionToScalarOperation),
 }
 
 impl<A: Value<Type = ArrayType>> Display for ArrayProgramOperation<A> {
@@ -66,6 +88,27 @@ impl<A: Value<Type = ArrayType>> From<DimensionSizeOperation> for ArrayProgramOp
     #[inline]
     fn from(operation: DimensionSizeOperation) -> Self {
         Self::DimensionSize(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<DimensionToScalarOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: DimensionToScalarOperation) -> Self {
+        Self::DimensionToScalar(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: ZeroOperation<ArrayProgramType>) -> Self {
+        Self::Zero(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<AddOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: AddOperation) -> Self {
+        Self::Array(ArrayOperation::Add(operation))
     }
 }
 
@@ -112,18 +155,22 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     #[inline]
     fn name(&self) -> &'static str {
         match self {
+            Self::Zero(operation) => operation.name(),
             Self::Array(operation) => operation.name(),
             Self::Dimension(operation) => operation.name(),
             Self::DimensionSize(operation) => operation.name(),
+            Self::DimensionToScalar(operation) => operation.name(),
         }
     }
 
     #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
         match self {
+            Self::Zero(operation) => operation.region_slots(),
             Self::Array(operation) => operation.region_slots(),
             Self::Dimension(operation) => operation.region_slots(),
             Self::DimensionSize(operation) => operation.region_slots(),
+            Self::DimensionToScalar(operation) => operation.region_slots(),
         }
     }
 
@@ -133,6 +180,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         region_interfaces: &[RegionInterface<ArrayProgramType>],
     ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
         match self {
+            Self::Zero(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::Array(operation) => {
                 let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
                 Ok(operation
@@ -150,6 +198,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                     .collect())
             }
             Self::DimensionSize(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            Self::DimensionToScalar(operation) => operation.infer_region_input_types(input_types, region_interfaces),
         }
     }
 
@@ -159,6 +208,12 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         region_interfaces: &[RegionInterface<ArrayProgramType>],
     ) -> Result<Vec<ArrayProgramType>, TypeError> {
         match self {
+            Self::Zero(operation) => {
+                // Differential zeros always use the ordinary array member. Rejecting a dimension result here prevents
+                // this generic constructor from bypassing the checked gateways that alone may create shape authority.
+                <&ArrayType>::try_from(operation.r#type())?;
+                operation.infer_output_types(input_types, region_interfaces)
+            }
             Self::Array(operation) => {
                 let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
                 Ok(operation
@@ -176,50 +231,63 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                     .collect())
             }
             Self::DimensionSize(operation) => operation.infer_output_types(input_types, region_interfaces),
+            Self::DimensionToScalar(operation) => operation.infer_output_types(input_types, region_interfaces),
         }
     }
 
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         match self {
+            Self::Zero(operation) => operation.output_region_provenance(output_index),
             Self::Array(operation) => operation.output_region_provenance(output_index),
             Self::Dimension(operation) => operation.output_region_provenance(output_index),
             Self::DimensionSize(operation) => operation.output_region_provenance(output_index),
+            Self::DimensionToScalar(operation) => operation.output_region_provenance(output_index),
         }
     }
 
     #[inline]
     fn is_zero(&self, output_index: usize) -> bool {
         match self {
+            Self::Zero(operation) => operation.is_zero(output_index),
             Self::Array(operation) => operation.is_zero(output_index),
             Self::Dimension(operation) => operation.is_zero(output_index),
             Self::DimensionSize(operation) => operation.is_zero(output_index),
+            Self::DimensionToScalar(operation) => operation.is_zero(output_index),
         }
     }
 
     #[inline]
     fn effects(&self) -> Effects {
         match self {
+            Self::Zero(operation) => operation.effects(),
             Self::Array(operation) => operation.effects(),
             Self::Dimension(operation) => operation.effects(),
             Self::DimensionSize(operation) => operation.effects(),
+            Self::DimensionToScalar(operation) => operation.effects(),
         }
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         match self {
+            Self::Zero(operation) => Ok(Self::Zero(operation.rename_type_identities(renaming)?)),
             Self::Array(operation) => Ok(Self::Array(operation.rename_type_identities(renaming)?)),
             Self::Dimension(operation) => Ok(Self::Dimension(operation.rename_type_identities(renaming)?)),
             Self::DimensionSize(operation) => Ok(Self::DimensionSize(operation.rename_type_identities(renaming)?)),
+            Self::DimensionToScalar(operation) => {
+                Ok(Self::DimensionToScalar(operation.rename_type_identities(renaming)?))
+            }
         }
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         match self {
+            Self::Zero(operation) => operation.render(formatter, indentation),
             Self::Array(operation) => operation.render(formatter, indentation),
             Self::Dimension(operation) => operation.render(formatter, indentation),
             Self::DimensionSize(operation) => operation.render(formatter, indentation),
+            Self::DimensionToScalar(operation) => operation.render(formatter, indentation),
         }
     }
 }
@@ -268,6 +336,8 @@ where
 impl<A: DimensionSize<usize> + Value<Type = ArrayType>>
     InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
 where
+    DimensionValue: DimensionToScalar<A>,
+    EagerContext<A, ArrayOperation<A>>: Zero<A>,
     ArrayOperation<A>: InterpretableOperation<EagerContext<A, ArrayOperation<A>>>,
     DimensionOperation<DimensionValue>:
         InterpretableOperation<EagerContext<DimensionValue, DimensionOperation<DimensionValue>>>,
@@ -285,6 +355,11 @@ where
             )));
         }
         match self {
+            Self::Zero(operation) => operation.interpret(
+                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
+                &EmptyRegionDriver,
+                inputs,
+            ),
             Self::Array(operation) => interpret_homogeneous_operation(operation, inputs),
             Self::Dimension(operation) => interpret_homogeneous_operation(operation, inputs),
             Self::DimensionSize(operation) => operation.interpret(
@@ -292,7 +367,166 @@ where
                 &EmptyRegionDriver,
                 inputs,
             ),
+            Self::DimensionToScalar(operation) => operation.interpret(
+                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
+                &EmptyRegionDriver,
+                inputs,
+            ),
         }
+    }
+}
+
+impl<A: Value<Type = ArrayType>, C: Context<Type = ArrayProgramType, Operation: From<ArrayProgramOperation<A>>>>
+    PartiallyEvaluatableOperation<C> for ArrayProgramOperation<A>
+{
+}
+
+impl<
+    A: Value<Type = ArrayType>,
+    C: Context<Type = ArrayProgramType, Constant: ValueProjection<ArrayType, Projected = A>>,
+> DifferentiableOperation<C> for ArrayProgramOperation<A>
+where
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: From<ArrayProgramOperation<A>> + OperationProjection<ArrayType, Projected = ArrayOperation<A>>,
+    ArrayOperation<A>: DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let Self::Array(operation) = self else {
+            // Dimension-only and mixed shape-observation operations carry no differential dependence. Replaying the
+            // primal through the composite context preserves their explicit SSA dependencies while structural zeros
+            // prevent dimension authority from entering the tangent program.
+            return Ok(context
+                .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>())?
+                .into_iter()
+                .map(DifferentiationDual::new_with_zero_tangent)
+                .collect());
+        };
+
+        let projected_inputs = inputs
+            .iter()
+            .map(|input| {
+                let primal = <C::Value as ValueProjection<ArrayType>>::into_projected(input.primal().clone())?;
+                let tangent = match input.tangent() {
+                    MaybeZero::Zero(r#type) => MaybeZero::Zero(<&ArrayType>::try_from(r#type)?.clone()),
+                    MaybeZero::Value(value) => {
+                        MaybeZero::Value(<C::Value as ValueProjection<ArrayType>>::into_projected(value.clone())?)
+                    }
+                };
+                DifferentiationDual::new(primal, tangent)
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+
+        operation
+            .jvp(&ProjectedContext::new(context.clone()), &EmptyRegionDriver, projected_inputs.as_slice())?
+            .into_iter()
+            .map(|output| {
+                let (primal, tangent) = output.into_parts();
+                let primal = <C::Value as ValueProjection<ArrayType>>::from_projected(primal);
+                let tangent = match tangent {
+                    MaybeZero::Zero(r#type) => MaybeZero::Zero(ArrayProgramType::Array(r#type)),
+                    MaybeZero::Value(value) => {
+                        MaybeZero::Value(<C::Value as ValueProjection<ArrayType>>::from_projected(value))
+                    }
+                };
+                DifferentiationDual::new(primal, tangent)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
+impl<
+    A: Value<Type = ArrayType>,
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected = A>,
+    O: Operation<ArrayProgramType>
+        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+        + From<ArrayProgramOperation<A>>,
+> TransposableOperation<V, O> for ArrayProgramOperation<A>
+where
+    ArrayOperation<A>: TransposableOperation<A, ArrayOperation<A>>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TracingContext<V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        let Self::Array(operation) = self else {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("operation `{}` is not transposable", self.name()),
+            }
+            .into());
+        };
+
+        // Record the homogeneous array rule in a short-lived array-only program. Replaying that program through a
+        // projected view of the composite builder preserves the original SSA identities while keeping every primitive
+        // transposition rule written against its native `ArrayType` contract.
+        let mut rule_context = TracingContext::<A, ArrayOperation<A>>::new();
+        let mut replay_inputs = Vec::new();
+        let rule_inputs = inputs
+            .iter()
+            .map(|input| match input {
+                PartialValue::Unknown(r#type) => Ok(PartialValue::Unknown(<&ArrayType>::try_from(r#type)?.clone())),
+                PartialValue::Known(value) => {
+                    replay_inputs.push(<Tracer<TracingContext<V, O>> as ValueProjection<ArrayType>>::into_projected(
+                        value.clone(),
+                    )?);
+                    Ok(PartialValue::Known(
+                        rule_context.input(<&ArrayType>::try_from(value.r#type().as_ref())?.clone()),
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+        let rule_outputs = outputs
+            .iter()
+            .map(|output| match output {
+                MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(<&ArrayType>::try_from(r#type)?.clone())),
+                MaybeZero::Value(value) => {
+                    replay_inputs.push(<Tracer<TracingContext<V, O>> as ValueProjection<ArrayType>>::into_projected(
+                        value.clone(),
+                    )?);
+                    Ok(MaybeZero::Value(rule_context.input(<&ArrayType>::try_from(value.r#type().as_ref())?.clone())))
+                }
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+        let rule_cotangents =
+            operation.transpose(&mut rule_context, &EmptyRegionDriver, &rule_inputs, &rule_outputs)?;
+        let output_ids = rule_cotangents
+            .iter()
+            .filter_map(|cotangent| cotangent.as_value())
+            .map(Tracer::atom_id)
+            .collect::<Result<Vec<_>, _>>()?;
+        let rule_program = rule_context.builder().borrow().clone().build::<Vec<A>, Vec<A>>(
+            output_ids,
+            vec![Placeholder; replay_inputs.len()],
+            vec![Placeholder; rule_cotangents.iter().filter(|cotangent| !cotangent.is_zero()).count()],
+        )?;
+        let mut replay_outputs = rule_program
+            .interpret_in_context(&ProjectedContext::new(context.clone()), replay_inputs)?
+            .into_iter();
+
+        rule_cotangents
+            .into_iter()
+            .map(|cotangent| match cotangent {
+                MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(ArrayProgramType::Array(r#type))),
+                MaybeZero::Value(_) => Ok(MaybeZero::Value(
+                    replay_outputs
+                        .next()
+                        .ok_or_else(|| {
+                            ProgramError::MalformedProgram(
+                                "array transposition adapter omitted a live cotangent output".to_string(),
+                            )
+                        })?
+                        .into_value(),
+                )),
+            })
+            .collect()
     }
 }
 
@@ -368,6 +602,34 @@ impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayP
         let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
         let extent = <A as DimensionSize<usize>>::dimension_size(array, operation.axis())?;
         Ok(Self::Dimension(DimensionValue::new(operation.result_type().clone(), extent)?))
+    }
+}
+
+impl DimensionToScalar<Array> for DimensionValue {
+    fn to_scalar(&self) -> Result<Array, ProgramError> {
+        // `DimensionValue::new` enforces the portable extent ceiling, which is no greater than `i64::MAX`.
+        Ok(Array::scalar(i64::try_from(self.extent()).unwrap()))
+    }
+}
+
+impl<A: Value<Type = ArrayType>> DimensionToScalar for ArrayProgramValue<A>
+where
+    DimensionValue: DimensionToScalar<A>,
+{
+    fn to_scalar(&self) -> Result<Self, ProgramError> {
+        let dimension = <Self as ValueProjection<DimensionType>>::projected(self)?;
+        Ok(Self::Array(<DimensionValue as DimensionToScalar<A>>::to_scalar(dimension)?))
+    }
+}
+
+impl<A: Value<Type = ArrayType>, O: Operation<ArrayProgramType>> Zero<ArrayProgramValue<A>>
+    for EagerContext<ArrayProgramValue<A>, O>
+where
+    EagerContext<A, ArrayOperation<A>>: Zero<A>,
+{
+    fn zero(&self, r#type: &ArrayProgramType) -> Result<ArrayProgramValue<A>, ProgramError> {
+        let array_type = <&ArrayType>::try_from(r#type)?;
+        Ok(ArrayProgramValue::Array(EagerContext::<A, ArrayOperation<A>>::new().zero(array_type)?))
     }
 }
 
@@ -564,6 +826,12 @@ mod tests {
         assert_eq!(
             dimension_operation.infer_output_types(&[array_type.clone().into(), array_type.clone().into()], &[]),
             Err(TypeError::invalid("expected dimension type but got array type")),
+        );
+        let dimension_zero =
+            ArrayProgramOperation::<Array>::from(ZeroOperation::new(ArrayProgramType::Dimension(left_type.clone())));
+        assert_eq!(
+            dimension_zero.infer_output_types(&[], &[]),
+            Err(TypeError::invalid("expected array type but got dimension type")),
         );
 
         // Region projection preserves the complete higher-order interface, including effects, before delegating to

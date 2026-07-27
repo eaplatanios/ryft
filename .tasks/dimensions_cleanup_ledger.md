@@ -505,11 +505,11 @@ ledger disagrees with Git.
 
 ## P3b: canonical first-class dimension size
 
-- Status: ready for owner review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p3b-dimension-size`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending
+- Source commit: `21ed403fe27241d1965914d012a5fe2c4576f626`
+- Integration commit: `017e775a551df03c07dd299c42ba90234e593f75`
+- Remainder reconciliation commit: `00c6aa4991edc321a11c03f1aba576ceb5478979`
 - Immutable archive unchanged: yes
 - Scope: introduce the sole `array -> dimension` `DimensionSizeOperation`, add it as one genuinely mixed outer-family
   variant, and support explicit staging plus constant-time reference-backend eager extent extraction
@@ -529,4 +529,47 @@ ledger disagrees with Git.
   variant, carrier-specific wrapper tower, or implicit witness/source-array/replay mechanism; P3c/P5/P6/P7 retain their
   named data-conversion, transform, and lowering work
 - Review method: line by line
-- Next action: commit and push the increment branch, then stage its no-commit merge for owner review
+- Owner corrections: consolidated concrete host extent extraction and composite first-class results under the single
+  `DimensionSize<Output>` capability, removing `DimensionExtent` and its separate method vocabulary
+- Remainder note: merging the reviewed integration retained later archived array-program work; the remainder's known
+  pre-existing module-path collision and unmatched delimiter still prevent `ryft-core` from compiling independently
+- Next action: none
+
+## P3c: explicit dimension-to-scalar-array conversion
+
+- Status: ready for owner review
+- Branch: `u/eaplatanios/increment/p3c-dimension-to-scalar`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending
+- Immutable archive unchanged: yes
+- Scope: introduce the sole `dimension -> scalar-array` `DimensionToScalarOperation`, its shared value capability,
+  one explicit mixed outer-family variant, and reference-backend eager materialization as a rank-zero signed 64-bit
+  array
+- Deferred: array-data-to-dimension gateways remain P3d/P3e and comparison remains P3f. At the owner's request, this
+  increment includes the reusable composite batching, differentiation/transposition, and XLA lowering foundations
+  necessary for the complete `dimension_size -> dimension_to_scalar` vertical slice.
+- Plan: `.tasks/plan_p3c_dimension_to_scalar.md`
+- Audit correction: the portable `DimensionValue` invariant already guarantees that every concrete extent fits the
+  signed 64-bit result representation, so reference eager conversion does not need a second user-facing width failure
+- Implemented: added the sole explicit `dimension -> rank-0 i64 array` operation and capability; direct outer-family
+  dispatch; reference and composite eager conversion; stored-program batching, JVP/VJP, and transposition policies; and
+  public composite StableHLO lowering for the complete `dimension_size -> dimension_to_scalar` path
+- Performance: lowering keeps dynamic extents as scalar SSA and lowers the conversion itself as an identity; composite
+  batch construction computes its logical array type without projecting or cloning eager array payloads
+- Owner corrections: restored typed mapped-dimension diagnostics in every dimension-consuming batching rule, forwarded
+  mapped-axis names and sharding into homogeneous array rules, validated the structural-zero rule's nullary contract,
+  and documented the Phase 5 ownership of dynamic batch extents and region-driver use
+- Verification: focused operation, batching, differentiation, lowering, and CPU execution tests; all 972 core library
+  tests; 55 executable core doctests with 16 ignored; all 397 XLA library tests with one ignored; the two projection
+  allocation tests; package checks; formatting; and diff hygiene pass
+- Lint audit: strict workspace Clippy remains nonzero because of the inherited warning backlog; filtering diagnostics
+  to increment-owned files found no new warning
+- Runtime qualification: static StableHLO compiles and executes on the CPU PJRT plugin with the expected `i64` result.
+  The bounded-dynamic module verifies and has the expected `get_dimension_size -> convert` path, but local CPU
+  execution remains blocked by that plugin's unavailable `PadToStatic` custom call
+- Residual search: no homogeneous operation contract or family variant, second output-provider abstraction, generic
+  mixed bucket, reverse data-to-dimension gateway, expression reconstruction environment, production host readback, or
+  copied archived transform/lowering monolith was introduced
+- Review method: line by line, including a final ownership/allocation audit
+- Next action: owner review and source commit

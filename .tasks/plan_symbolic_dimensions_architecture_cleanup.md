@@ -1126,6 +1126,36 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 
 ### Phase 5: simplify batching around value-kind policy
 
+P3c advances the smallest composite batching implementation needed to make the
+`dimension_size -> dimension_to_scalar` vertical slice reachable. Treat the semantics it establishes as durable
+(arrays may be mapped or replicated, while first-class dimensions are replicated-only), but do not assume that its
+parallel `ArrayProgramBatchingContext`, `ArrayProgramBatchingTracer`, or exact `ArrayProgramBatch` representation is
+the final architecture. A projected-array wrapper alone cannot represent dimension members, mixed operations,
+region recursion, or a first-class dynamic batching extent, and so merely adding a public `ProjectedArrayBatch` would
+rename only part of the problem while introducing another carrier.
+
+- [ ] Before expanding the composite operation sweep, inventory the duplicated responsibilities across `ArrayBatch`,
+      `BatchingContext`, `BatchingTracer`, `BatchableOperation`, and their P3c array-program counterparts. Classify
+      each responsibility as value-kind-neutral, array-specific, or genuinely composite.
+- [ ] Prototype a transform-owned batching-policy abstraction that can select the batch carrier and batching-extent
+      representation for a parent context. The concrete shape is deliberately open, but evaluate a design equivalent
+      in power to `BatchingPolicy<C> { type Batch; type AxisExtent; ... }` before committing to the parallel composite
+      context/tracer tower. Keep this policy in batching machinery; do not add batching hooks to [`Type`].
+- [ ] Exercise the prototype with one homogeneous array operation, one dimension operation, `dimension_size`,
+      `dimension_to_scalar`, the promoted toy third member kind, and one nested-region operation. Prove that array
+      members reuse ordinary `ArrayBatch` semantics, dimension members remain replicated-only, and genuinely mixed
+      operations retain explicit rules.
+- [ ] Reuse [`ValueProjection`] for borrowed and consuming member access. Do not add a separate public
+      `ProjectedArrayBatch` unless a concrete residual need remains after the policy prototype, and reject any design
+      that clones or allocates eager array payloads merely to project a batch.
+- [ ] Prefer one generic batching context/tracer over the P3c parallel array-program context/tracer when the prototype
+      removes more code than it adds, keeps existing array batching rules unchanged or mechanically adaptable, and
+      has neutral trait-solver, compile-time, and allocation behavior. If the policy parameter spreads equivalent or
+      greater ceremony through ordinary batching, retain a localized composite adapter, document the evidence, and
+      reduce it to the smallest value-kind policy layer rather than forcing the abstraction.
+- [ ] Gate: the final design has one canonical representation for each necessary batching concept, no wrapper that
+      merely renames `ArrayProgramBatch`, and no parallel context/tracer tower unless the rejected-policy evidence
+      demonstrates that the localized duplication is the simpler implementation.
 - [ ] Promote the toy composite projection fixtures from the `contexts.rs` unit tests (`ProjectedMemberType`,
       `ProjectedMemberValue`, `ProjectedProgramType`, `ProjectedProgramValue`, `ProjectedProgramOperation`, and the
       `impl_projected_test_member!` macro) into a `pub(crate)` shared test fixture the moment this phase's generic
