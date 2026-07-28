@@ -16,7 +16,8 @@ use ryft_mlir::{
 use super::{
     LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode,
     broadcast_changes_explicit_sharding, lower_compare_to_mlir, lower_constant_elements_attribute,
-    lower_constant_output, lower_sharding_constraint, lower_tensor_type, merge_logical_meshes, normalize_function_name,
+    lower_constant_output, lower_custom_call_to_mlir, lower_pad_to_mlir, lower_rng_bit_generator_to_mlir,
+    lower_sharding_constraint, lower_tensor_type, merge_logical_meshes, normalize_function_name,
     replay_region_ref_into_block, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::experimental::ops::XlaConstant;
@@ -386,6 +387,159 @@ where
             let result = block.append_operation(stable_hlo::concatenate(array_inputs, operation.axis(), location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
         }
+        ArrayProgramOperation::CustomCall(operation) => {
+            let dynamic_output_dimension_count = operation
+                .output_types()
+                .iter()
+                .flat_map(|output_type| output_type.shape().dimensions())
+                .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+                .count();
+            let Some(array_input_count) = input_values.len().checked_sub(dynamic_output_dimension_count) else {
+                return Err(ProgramError::InvalidInputCount {
+                    expected: dynamic_output_dimension_count,
+                    actual: input_values.len(),
+                }
+                .into());
+            };
+            let (array_inputs, output_extents) = input_values.split_at(array_input_count);
+            let physical_output_types = operation
+                .output_types()
+                .iter()
+                .map(|output_type| {
+                    let dimensions = output_type
+                        .shape()
+                        .dimensions()
+                        .iter()
+                        .map(|dimension| match dimension {
+                            Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+                            Dimension::Dynamic(variable) => variable
+                                .bounds()
+                                .upper()
+                                .and_then(|upper| upper.checked_sub(1))
+                                .map(Dimension::Static)
+                                .ok_or_else(|| LoweringError::UnsupportedOp {
+                                    op: format!(
+                                        "custom-call output dimension '{}' needs a finite upper bound for physical \
+                                         buffer allocation",
+                                        variable,
+                                    ),
+                                }),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(output_type.clone().with_shape(Shape::new(dimensions)))
+                })
+                .collect::<Result<Vec<_>, LoweringError>>()?;
+            let mut results = lower_custom_call_to_mlir(
+                operation,
+                array_inputs,
+                physical_output_types.as_slice(),
+                block,
+                context,
+                location,
+            )?;
+            let i32_scalar_type = context
+                .tensor_type(context.signless_integer_type(32), &[], None, location)
+                .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+            let mut output_extents = output_extents.iter();
+            for (output_index, output_type) in operation.output_types().iter().enumerate() {
+                let mut refined_type = physical_output_types[output_index].clone();
+                for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
+                    if !matches!(dimension, Dimension::Dynamic(_)) {
+                        continue;
+                    }
+                    let extent = *output_extents.next().unwrap();
+                    let extent = block.append_operation(stable_hlo::convert(extent, i32_scalar_type, location)?)?;
+                    let extent = extent.result(0).expect("stablehlo.convert should return one result").as_ref();
+                    let mut dimensions = refined_type.shape().dimensions().to_vec();
+                    dimensions[axis] = dimension;
+                    refined_type = refined_type.with_shape(Shape::new(dimensions));
+                    let refined_tensor_type = lower_tensor_type(&refined_type, context, location)?;
+                    let result = block.append_operation(stable_hlo::set_dimension_size(
+                        results[output_index],
+                        extent,
+                        refined_tensor_type,
+                        axis,
+                        location,
+                    )?)?;
+                    results[output_index] =
+                        result.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+                }
+            }
+            Ok(results)
+        }
+        ArrayProgramOperation::Pad(operation) => {
+            let [output_type] = output_types else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+            };
+            let output_type =
+                <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let expected_input_count = output_type.rank() + 2;
+            if input_values.len() != expected_input_count {
+                return Err(ProgramError::InvalidInputCount {
+                    expected: expected_input_count,
+                    actual: input_values.len(),
+                }
+                .into());
+            }
+            let mut results = lower_pad_to_mlir(
+                operation,
+                &input_values[..2],
+                std::slice::from_ref(output_type),
+                block,
+                context,
+                location,
+            )?;
+            let i32_scalar_type = context
+                .tensor_type(context.signless_integer_type(32), &[], None, location)
+                .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+            let mut refined_type = output_type.clone();
+            for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
+                if !matches!(dimension, Dimension::Dynamic(_)) {
+                    continue;
+                }
+                let extent =
+                    block.append_operation(stable_hlo::convert(input_values[axis + 2], i32_scalar_type, location)?)?;
+                let extent = extent.result(0).expect("stablehlo.convert should return one result").as_ref();
+                let mut dimensions = refined_type.shape().dimensions().to_vec();
+                dimensions[axis] = dimension;
+                refined_type = refined_type.with_shape(Shape::new(dimensions));
+                let refined_tensor_type = lower_tensor_type(&refined_type, context, location)?;
+                let result = block.append_operation(stable_hlo::set_dimension_size(
+                    results[0],
+                    extent,
+                    refined_tensor_type,
+                    axis,
+                    location,
+                )?)?;
+                results[0] = result.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+            }
+            Ok(results)
+        }
+        ArrayProgramOperation::RngBitGenerator(operation) => {
+            let has_dynamic_output = operation
+                .output_type()
+                .shape()
+                .dimensions()
+                .iter()
+                .any(|dimension| matches!(dimension, Dimension::Dynamic(_)));
+            if has_dynamic_output {
+                return Err(LoweringError::UnsupportedOp {
+                    op: "rng-bit-generator with dynamic output extents cannot lower by generating the physical \
+                         upper-bound shape because that would advance its functional state by the physical rather \
+                         than logical element count"
+                        .to_string(),
+                });
+            }
+            let expected_input_count = 1;
+            if input_values.len() != expected_input_count {
+                return Err(ProgramError::InvalidInputCount {
+                    expected: expected_input_count,
+                    actual: input_values.len(),
+                }
+                .into());
+            }
+            lower_rng_bit_generator_to_mlir(operation, input_values, block, context, location)
+        }
     }
 }
 
@@ -534,11 +688,15 @@ mod tests {
 
     use ryft_core::contexts::{Context, StagingContext};
     use ryft_core::operations::compare::{Compare, ComparisonDirection};
+    use ryft_core::operations::custom_call::CustomCallOperation;
     use ryft_core::operations::dimensions::{
         DimensionAddOperation, DimensionFromScalar, DimensionMulOperation, DimensionSize, DimensionSizeOperation,
         DimensionToScalar,
     };
-    use ryft_core::operations::manipulation::{BroadcastOperation, ConcatenateOperation, ReshapeOperation};
+    use ryft_core::operations::manipulation::{
+        BroadcastOperation, ConcatenateOperation, PadOperation, ReshapeOperation,
+    };
+    use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::ProgramBuilder;
     use ryft_core::programs::values::ValueProjection;
@@ -672,6 +830,156 @@ mod tests {
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<i64>(output_bytes.as_slice()), vec![7]);
+    }
+
+    #[test]
+    fn test_explicit_custom_call_lowering() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        let context = TestContext::new();
+        let input = context.input(output_type.clone().into());
+        let output_extent = input.dimension_size(0).unwrap();
+        let output = context
+            .bind(CustomCallOperation::new("ryft.test.dynamic", vec![output_type]), Vec::new(), &[input, output_extent])
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.custom_call @ryft.test.dynamic").count(), 1);
+        assert!(
+            module.contains("stablehlo.custom_call @ryft.test.dynamic(%arg0)"),
+            "the logical extent operand must not enter the foreign-kernel ABI:\n{module}",
+        );
+        assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 1);
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 1);
+        assert!(module.contains("-> tensor<8xf32>"), "{module}");
+
+        let variable = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        let context = TestContext::new();
+        let input = context.input(output_type.clone().into());
+        let output_extent = input.dimension_size(0).unwrap();
+        let output = context
+            .bind(CustomCallOperation::new("ryft.test.dynamic", vec![output_type]), Vec::new(), &[input, output_extent])
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            lower_array_program_to_stable_hlo(&program, "main"),
+            Err(ArrayProgramLoweringError::Lowering {
+                message: "unsupported staged op 'custom-call output dimension 'unbounded' needs a finite upper bound \
+                          for physical buffer allocation' during XLA lowering"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_explicit_pad_lowering() {
+        let input_variable = DimensionVariable::new("input", DimensionBounds::new(1, Some(5)).unwrap());
+        let output_variable = DimensionVariable::new("output", DimensionBounds::new(3, Some(7)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(input_variable)]));
+        let padding_value_type = ArrayType::scalar(DataType::F32);
+        let output_extent_type = DimensionType::new(output_variable);
+        let mut builder = ProgramBuilder::<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>::new();
+        let input = builder.add_input(input_type.into());
+        let padding_value = builder.add_input(padding_value_type.into());
+        let output_extent = builder.add_input(output_extent_type.into());
+        let output = builder
+            .add_instruction(
+                PadOperation::new(vec![1], vec![1], vec![0]).unwrap(),
+                Vec::new(),
+                vec![input, padding_value, output_extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.pad").count(), 1);
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 1);
+        assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 0);
+    }
+
+    #[test]
+    fn test_explicit_rng_bit_generator_lowering() {
+        let mut builder = ProgramBuilder::<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>::new();
+        let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
+        let outputs = builder
+            .add_instruction(
+                RngBitGeneratorOperation::new(
+                    RandomAlgorithm::ThreeFry,
+                    ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(8)])),
+                ),
+                Vec::new(),
+                vec![state],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                outputs,
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.rng_bit_generator").count(), 1);
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 0);
+
+        let output_variable = DimensionVariable::new("count", DimensionBounds::new(1, Some(9)).unwrap());
+        let output_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(output_variable.clone())]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>::new();
+        let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
+        let output_extent = builder.add_input(DimensionType::new(output_variable).into());
+        let outputs = builder
+            .add_instruction(
+                RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, output_type),
+                Vec::new(),
+                vec![state, output_extent],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                outputs,
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            lower_array_program_to_stable_hlo(&program, "main"),
+            Err(ArrayProgramLoweringError::Lowering {
+                message: "unsupported staged op 'rng-bit-generator with dynamic output extents cannot lower by \
+                          generating the physical upper-bound shape because that would advance its functional state \
+                          by the physical rather than logical element count' during XLA lowering"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]

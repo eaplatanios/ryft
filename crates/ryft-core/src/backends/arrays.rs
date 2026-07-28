@@ -1067,7 +1067,10 @@ impl RngBitGenerator for Array {
 impl CustomCall for Array {
     /// The reference array backend has no foreign-kernel registry, so custom calls always report an
     /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-    fn custom_call(operation: &CustomCallOperation, _inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {
+    fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
+        operation: &CustomCallOperation,
+        _inputs: I,
+    ) -> Result<Vec<Self>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "the reference array backend cannot execute the foreign kernel '{}'",

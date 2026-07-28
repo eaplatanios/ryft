@@ -14,16 +14,18 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::dimensions::{
     DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
     DimensionToScalarOperation,
 };
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, Reshape,
-    ReshapeOperation, ReshapeParameters, Transpose,
+    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, Pad, PadOperation,
+    Reshape, ReshapeOperation, ReshapeParameters, Transpose,
 };
 use crate::operations::math::AddOperation;
+use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
@@ -99,6 +101,15 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
 
     /// Mixed operation that concatenates array operands using one trailing result-extent operand.
     Concatenate(ConcatenateOperation),
+
+    /// Mixed foreign-kernel call whose trailing dimension operands define its dynamic output axes.
+    CustomCall(CustomCallOperation),
+
+    /// Mixed padding operation with one explicit result-extent operand per output axis.
+    Pad(PadOperation),
+
+    /// Mixed bit generator whose trailing dimension operands define its dynamic bits-output axes.
+    RngBitGenerator(RngBitGeneratorOperation),
 }
 
 impl<A: Value<Type = ArrayType>> Display for ArrayProgramOperation<A> {
@@ -171,6 +182,27 @@ impl<A: Value<Type = ArrayType>> From<ConcatenateOperation> for ArrayProgramOper
     }
 }
 
+impl<A: Value<Type = ArrayType>> From<CustomCallOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: CustomCallOperation) -> Self {
+        Self::CustomCall(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<PadOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: PadOperation) -> Self {
+        Self::Pad(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<RngBitGeneratorOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: RngBitGeneratorOperation) -> Self {
+        Self::RngBitGenerator(operation)
+    }
+}
+
 impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
     #[inline]
     fn from(operation: ZeroOperation<ArrayProgramType>) -> Self {
@@ -238,6 +270,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Reshape(operation) => operation.name(),
             Self::Broadcast(operation) => operation.name(),
             Self::Concatenate(operation) => Operation::<ArrayProgramType>::name(operation),
+            Self::CustomCall(operation) => Operation::<ArrayProgramType>::name(operation),
+            Self::Pad(operation) => Operation::<ArrayProgramType>::name(operation),
+            Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::name(operation),
         }
     }
 
@@ -254,6 +289,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Reshape(operation) => operation.region_slots(),
             Self::Broadcast(operation) => operation.region_slots(),
             Self::Concatenate(operation) => Operation::<ArrayProgramType>::region_slots(operation),
+            Self::CustomCall(operation) => Operation::<ArrayProgramType>::region_slots(operation),
+            Self::Pad(operation) => Operation::<ArrayProgramType>::region_slots(operation),
+            Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::region_slots(operation),
         }
     }
 
@@ -287,6 +325,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Reshape(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::Broadcast(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::Concatenate(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            Self::CustomCall(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            Self::Pad(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            Self::RngBitGenerator(operation) => operation.infer_region_input_types(input_types, region_interfaces),
         }
     }
 
@@ -325,6 +366,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Reshape(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Broadcast(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Concatenate(operation) => operation.infer_output_types(input_types, region_interfaces),
+            Self::CustomCall(operation) => operation.infer_output_types(input_types, region_interfaces),
+            Self::Pad(operation) => operation.infer_output_types(input_types, region_interfaces),
+            Self::RngBitGenerator(operation) => operation.infer_output_types(input_types, region_interfaces),
         }
     }
 
@@ -345,6 +389,13 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Concatenate(operation) => {
                 Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
             }
+            Self::CustomCall(operation) => {
+                Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
+            }
+            Self::Pad(operation) => Operation::<ArrayProgramType>::output_region_provenance(operation, output_index),
+            Self::RngBitGenerator(operation) => {
+                Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
+            }
         }
     }
 
@@ -361,6 +412,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Reshape(operation) => operation.is_zero(output_index),
             Self::Broadcast(operation) => operation.is_zero(output_index),
             Self::Concatenate(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
+            Self::CustomCall(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
+            Self::Pad(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
+            Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
         }
     }
 
@@ -377,6 +431,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Reshape(operation) => operation.effects(),
             Self::Broadcast(operation) => operation.effects(),
             Self::Concatenate(operation) => Operation::<ArrayProgramType>::effects(operation),
+            Self::CustomCall(operation) => Operation::<ArrayProgramType>::effects(operation),
+            Self::Pad(operation) => Operation::<ArrayProgramType>::effects(operation),
+            Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::effects(operation),
         }
     }
 
@@ -400,6 +457,15 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Concatenate(operation) => {
                 Ok(Self::Concatenate(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
             }
+            Self::CustomCall(operation) => {
+                Ok(Self::CustomCall(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            Self::Pad(operation) => {
+                Ok(Self::Pad(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            Self::RngBitGenerator(operation) => {
+                Ok(Self::RngBitGenerator(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
         }
     }
 
@@ -416,6 +482,11 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Reshape(operation) => operation.render(formatter, indentation),
             Self::Broadcast(operation) => operation.render(formatter, indentation),
             Self::Concatenate(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
+            Self::CustomCall(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
+            Self::Pad(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
+            Self::RngBitGenerator(operation) => {
+                Operation::<ArrayProgramType>::render(operation, formatter, indentation)
+            }
         }
     }
 }
@@ -464,9 +535,12 @@ where
 impl<
     A: Broadcast
         + Concatenate
+        + CustomCall
         + DimensionFromScalar<DimensionValue>
         + DimensionSize<usize>
+        + Pad
         + Reshape
+        + RngBitGenerator
         + Value<Type = ArrayType>,
 > InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
 where
@@ -603,6 +677,21 @@ where
                 }
                 Ok(vec![ArrayProgramValue::Array(A::concatenate(inputs.iter().copied(), operation.axis())?)])
             }
+            Self::CustomCall(operation) => operation.interpret(
+                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
+                &EmptyRegionDriver,
+                inputs,
+            ),
+            Self::Pad(operation) => operation.interpret(
+                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
+                &EmptyRegionDriver,
+                inputs,
+            ),
+            Self::RngBitGenerator(operation) => operation.interpret(
+                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
+                &EmptyRegionDriver,
+                inputs,
+            ),
         }
     }
 }
@@ -666,6 +755,46 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // TODO(eaplatatanios): Split these out into per-payload `DifferentiableOperation` implementations in the
         //  corresponding modules and then have this implementation simply delegate.
+        if let Self::Pad(_) = self {
+            if inputs.len() < 2 {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+            }
+            let (array_inputs, output_extents) = inputs.split_at(2);
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+            let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
+                MaybeZero::Zero(primal.r#type().tangent())
+            } else {
+                let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
+                let mut tangent_inputs = array_inputs
+                    .iter()
+                    .map(|input| -> Result<C::Value, DifferentiationError> {
+                        let tangent = match input.tangent() {
+                            MaybeZero::Zero(r#type) => MaybeZero::Zero(<&ArrayType>::try_from(r#type)?.clone()),
+                            MaybeZero::Value(value) => MaybeZero::Value(
+                                <C::Value as ValueProjection<ArrayType>>::into_projected(value.clone())?,
+                            ),
+                        };
+                        Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(
+                            tangent.materialize(&projected_context)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
+                MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
+            };
+            return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
+        }
+        if let Self::CustomCall(operation) = self {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "custom call '{}' has no differentiation rule; wrap it with `custom_jvp` or `custom_vjp` to \
+                     provide one",
+                    operation.target_name(),
+                ),
+            }
+            .into());
+        }
         if let Self::Concatenate(_) = self {
             let Some((result_extent, array_inputs)) = inputs.split_last() else {
                 return Err(TypeError::invalid(format!(
@@ -802,6 +931,48 @@ where
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        if let Self::CustomCall(operation) = self {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "custom call '{}' cannot be transposed because foreign kernels are opaque",
+                    operation.target_name(),
+                ),
+            }
+            .into());
+        }
+        if matches!(self, Self::RngBitGenerator(_)) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "'rng_bit_generator' cannot be transposed because random bits are discrete".to_string(),
+            }
+            .into());
+        }
+        if let Self::Pad(operation) = self {
+            if inputs.len() < 2 {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+            }
+            let (array_inputs, output_extents) = inputs.split_at(2);
+            if array_inputs.iter().any(|input| {
+                <&ArrayType>::try_from(input.r#type().as_ref()).is_ok_and(|r#type| {
+                    r#type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+                })
+            }) || output_extents.iter().any(|extent| {
+                <&DimensionType>::try_from(extent.r#type().as_ref())
+                    .is_ok_and(|r#type| matches!(r#type.to_dimension(), Dimension::Dynamic(_)))
+            }) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "'pad' transpose with dynamic extents requires Phase 6 dimension residuals".to_string(),
+                }
+                .into());
+            }
+
+            // Exact extents make the mixed instruction identical to the established homogeneous pad map. Delegate
+            // that pullback for the two differentiable array operands and assign structural-zero cotangents to the
+            // trailing extent authority values.
+            let array_operation = Self::Array(ArrayOperation::from(operation.clone()));
+            let mut cotangents = array_operation.transpose(context, driver, array_inputs, outputs)?;
+            cotangents.extend(output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())));
+            return Ok(cotangents);
+        }
         if let Self::Concatenate(operation) = self {
             let Some((result_extent, array_inputs)) = inputs.split_last() else {
                 return Err(TypeError::invalid(format!(
@@ -1282,7 +1453,7 @@ mod tests {
     use crate::operations::dimensions::{
         DimensionAddOperation, DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation,
     };
-    use crate::operations::manipulation::{BroadcastOperation, ConcatenateOperation, ReshapeOperation};
+    use crate::operations::manipulation::{BroadcastOperation, ConcatenateOperation, PadOperation, ReshapeOperation};
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
     use crate::partial::PartialTracer;
@@ -1838,6 +2009,66 @@ mod tests {
             Err(crate::differentiation::DifferentiationError::Program(
                 ProgramError::UnsupportedOperation { message },
             )) if message == "'reshape' transpose with dynamic input extents requires Phase 6 dimension residuals",
+        ));
+    }
+
+    #[test]
+    fn test_array_program_pad_differentiation() {
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).into());
+        let padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let output_extent = builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(8).unwrap()));
+        let output = builder
+            .add_instruction(
+                PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+                Vec::new(),
+                vec![input, padding_value, output_extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        assert_eq!(
+            program.transpose_with_respect_to(&[0, 1]).unwrap().interpret(vec![ArrayProgramValue::Array(
+                Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,])
+            )]),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![2.0_f64, 4.0, 6.0])),
+                ArrayProgramValue::Array(Array::scalar(24.0_f64)),
+            ]),
+        );
+
+        let source = DimensionVariable::new("source", DimensionBounds::new(1, Some(5)).unwrap());
+        let result = DimensionVariable::new("result", DimensionBounds::new(4, Some(12)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input =
+            builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source)])).into());
+        let padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let output_extent = builder.add_input(DimensionType::new(result).into());
+        let output = builder
+            .add_instruction(
+                PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+                Vec::new(),
+                vec![input, padding_value, output_extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0, 1]),
+            Err(crate::differentiation::DifferentiationError::Program(
+                ProgramError::UnsupportedOperation { message },
+            )) if message == "'pad' transpose with dynamic extents requires Phase 6 dimension residuals",
         ));
     }
 

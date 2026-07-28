@@ -14,11 +14,17 @@ use crate::backends::arrays::ArrayOperation;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError};
 use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
+use crate::macros::check_count;
+use crate::operations::constants::{One, OneOperation, Zero, ZeroOperation};
+use crate::operations::control_flow::SelectOperation;
+use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::dimensions::{DimensionSizeOperation, DimensionToScalarOperation};
 use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, ReshapeOperation, Transpose,
+    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, PadOperation, ReshapeOperation,
+    Transpose,
 };
+use crate::operations::random::RngBitGeneratorOperation;
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationProjection};
@@ -26,7 +32,7 @@ use crate::programs::regions::{BindingRegionDriver, EmptyRegionDriver, RegionDri
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::ShardingDimension;
-use crate::types::{ArrayProgramType, ArrayType, DimensionType};
+use crate::types::{ArrayProgramType, ArrayType, DataType, DimensionType};
 
 /// Kind-aware batched view of one composite array-program value.
 #[derive(Clone, Debug, Parameter)]
@@ -129,7 +135,7 @@ pub trait ArrayProgramBatchableOperation<C: Context<Type = ArrayProgramType>>: O
     /// to recurse into their attached regions rather than treating it as permanently unused.
     fn batch<D: RegionDriver<C::Constant, C::Operation>>(
         &self,
-        context: &ArrayProgramBatchingContext<C>,
+        _context: &ArrayProgramBatchingContext<C>,
         _driver: &D,
         inputs: &[ArrayProgramBatch<C::Value>],
     ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError>;
@@ -410,6 +416,191 @@ where
     }
 }
 
+impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for CustomCallOperation {
+    fn batch<D: RegionDriver<C::Constant, C::Operation>>(
+        &self,
+        _context: &ArrayProgramBatchingContext<C>,
+        _driver: &D,
+        _inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "custom call '{}' has no batching rule; invoke a kernel that understands the batch axis instead",
+                self.target_name(),
+            ),
+        })
+    }
+}
+
+impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for PadOperation
+where
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
+    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
+    C::Operation: From<BroadcastOperation>
+        + From<PadOperation>
+        + OperationProjection<
+            ArrayType,
+            Projected: From<OneOperation<ArrayType>> + From<SelectOperation> + From<ZeroOperation<ArrayType>>,
+        >,
+{
+    fn batch<D: RegionDriver<C::Constant, C::Operation>>(
+        &self,
+        context: &ArrayProgramBatchingContext<C>,
+        _driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        if inputs.len() < 2 {
+            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+        }
+        let (array_inputs, output_extents) = inputs.split_at(2);
+        let [operand, padding_value] = array_inputs else {
+            unreachable!();
+        };
+        <&ArrayType>::try_from(operand.unbatched_type())?;
+        <&ArrayType>::try_from(padding_value.unbatched_type())?;
+        for extent in output_extents {
+            extent.validate_replicated_dimension()?;
+        }
+        let operand_type = <&ArrayType>::try_from(operand.value.r#type().as_ref())?.clone();
+        let padding_value_type = <&ArrayType>::try_from(padding_value.value.r#type().as_ref())?.clone();
+        let operand_batch = ArrayBatch::new(
+            operand_type,
+            <C::Value as ValueProjection<ArrayType>>::into_projected(operand.value.clone())?,
+            operand.batch_axis,
+        )?;
+        let padding_value_batch = ArrayBatch::new(
+            padding_value_type,
+            <C::Value as ValueProjection<ArrayType>>::into_projected(padding_value.value.clone())?,
+            padding_value.batch_axis,
+        )?;
+        let Some(batch_axis) = operand_batch
+            .batch_axis_position()
+            .or(Some(0).filter(|_| !padding_value_batch.batch_axis().is_replicated()))
+        else {
+            return Ok(context
+                .parent
+                .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>())?
+                .into_iter()
+                .map(ArrayProgramBatch::replicated)
+                .collect());
+        };
+
+        let operand_batch =
+            operand_batch.match_axis(batch_axis, context.axis_size(), context.axis_sharding().clone())?;
+        let mut edge_padding_low = self.edge_padding_low().to_vec();
+        edge_padding_low.insert(batch_axis, 0);
+        let mut edge_padding_high = self.edge_padding_high().to_vec();
+        edge_padding_high.insert(batch_axis, 0);
+        let mut interior_padding = self.interior_padding().to_vec();
+        interior_padding.insert(batch_axis, 0);
+        let lifted_operation = PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?;
+        let batch_extent = DimensionValue::constant(context.axis_size()).map_err(ProgramError::from)?;
+        let batch_extent = <C::Constant as ValueProjection<DimensionType>>::from_projected(batch_extent);
+        let batch_extent = context.parent.lift(batch_extent)?;
+        let mut lifted_output_extents = Vec::with_capacity(output_extents.len() + 1);
+        lifted_output_extents.extend(output_extents[..batch_axis].iter().map(|extent| extent.value.clone()));
+        lifted_output_extents.push(batch_extent);
+        lifted_output_extents.extend(output_extents[batch_axis..].iter().map(|extent| extent.value.clone()));
+
+        if padding_value_batch.batch_axis().is_replicated() {
+            let mut lifted_inputs = Vec::with_capacity(lifted_output_extents.len() + 2);
+            lifted_inputs.push(<C::Value as ValueProjection<ArrayType>>::from_projected(operand_batch.into_value()));
+            lifted_inputs.push(padding_value.value.clone());
+            lifted_inputs.extend(lifted_output_extents);
+            return context
+                .parent
+                .bind(lifted_operation, Vec::new(), lifted_inputs.as_slice())?
+                .into_iter()
+                .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(batch_axis)))
+                .collect();
+        }
+
+        // A mapped scalar padding value cannot be passed directly to `pad`, whose padding operand is scalar. Pad the
+        // aligned operand with zero, construct a Boolean mask for the original input positions, broadcast the mapped
+        // padding values across the result, and select them only at padding positions. This is the same semantic
+        // decomposition as the homogeneous array rule, but every shape-changing operation receives the canonical
+        // first-class result extents.
+        let array_context = ProjectedContext::<C, ArrayType>::new(context.parent.clone());
+        let padding_scalar_type = padding_value_batch.unbatched_type();
+        let zero_padding =
+            <C::Value as ValueProjection<ArrayType>>::from_projected(array_context.zero(&padding_scalar_type)?);
+        let operand = <C::Value as ValueProjection<ArrayType>>::from_projected(operand_batch.into_value());
+        let mut padded_inputs = Vec::with_capacity(lifted_output_extents.len() + 2);
+        padded_inputs.push(operand.clone());
+        padded_inputs.push(zero_padding);
+        padded_inputs.extend(lifted_output_extents.iter().cloned());
+        let mut padded = context.parent.bind(lifted_operation.clone(), Vec::new(), padded_inputs.as_slice())?;
+        check_count!("output", padded, 1, ProgramError);
+        let padded = padded.remove(0);
+
+        let operand_type = <&ArrayType>::try_from(operand.r#type().as_ref())?
+            .clone()
+            .with_data_type(DataType::Boolean)
+            .with_layout(None);
+        let mask_input = <C::Value as ValueProjection<ArrayType>>::from_projected(array_context.one(&operand_type)?);
+        let mask_padding_type = padding_scalar_type.with_data_type(DataType::Boolean).with_layout(None);
+        let mask_padding =
+            <C::Value as ValueProjection<ArrayType>>::from_projected(array_context.zero(&mask_padding_type)?);
+        let mut mask_inputs = Vec::with_capacity(lifted_output_extents.len() + 2);
+        mask_inputs.push(mask_input);
+        mask_inputs.push(mask_padding);
+        mask_inputs.extend(lifted_output_extents.iter().cloned());
+        let mut mask = context.parent.bind(lifted_operation, Vec::new(), mask_inputs.as_slice())?;
+        check_count!("output", mask, 1, ProgramError);
+        let mask = mask.remove(0);
+
+        let mut broadcast_inputs = Vec::with_capacity(lifted_output_extents.len() + 1);
+        broadcast_inputs.push(<C::Value as ValueProjection<ArrayType>>::from_projected(
+            padding_value_batch.move_axis(0)?.into_value(),
+        ));
+        broadcast_inputs.extend(lifted_output_extents);
+        let mut broadcasted_padding =
+            context
+                .parent
+                .bind(BroadcastOperation::new(vec![batch_axis]), Vec::new(), broadcast_inputs.as_slice())?;
+        check_count!("output", broadcasted_padding, 1, ProgramError);
+        let broadcasted_padding = broadcasted_padding.remove(0);
+
+        let mask = <C::Value as ValueProjection<ArrayType>>::into_projected(mask)?;
+        let padded = <C::Value as ValueProjection<ArrayType>>::into_projected(padded)?;
+        let broadcasted_padding = <C::Value as ValueProjection<ArrayType>>::into_projected(broadcasted_padding)?;
+        let mut output = array_context.bind(SelectOperation, Vec::new(), &[mask, padded, broadcasted_padding])?;
+        check_count!("output", output, 1, ProgramError);
+        Ok(vec![ArrayProgramBatch::new(
+            <C::Value as ValueProjection<ArrayType>>::from_projected(output.remove(0)),
+            BatchAxis::from_position(batch_axis),
+        )?])
+    }
+}
+
+impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for RngBitGeneratorOperation {
+    fn batch<D: RegionDriver<C::Constant, C::Operation>>(
+        &self,
+        _context: &ArrayProgramBatchingContext<C>,
+        _driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let Some((state, output_extents)) = inputs.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+        };
+        for extent in output_extents {
+            extent.validate_replicated_dimension()?;
+        }
+        if state.batch_axis().is_replicated() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "'rng_bit_generator' cannot batch a replicated state because every batch item would see \
+                          the same state; derive one state per batch item with `split_key` and map over the states \
+                          explicitly"
+                    .to_string(),
+            });
+        }
+        Err(BatchingError::UnsupportedOperation {
+            message: "'rng_bit_generator' batching requires Phase 5 composite scan-region support".to_string(),
+        })
+    }
+}
+
 impl<A, C> ArrayProgramBatchableOperation<C> for ArrayProgramOperation<A>
 where
     A: Value<Type = ArrayType>,
@@ -421,7 +612,9 @@ where
     C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     C::Operation: From<ArrayProgramOperation<A>>
+        + From<BroadcastOperation>
         + From<ConcatenateOperation>
+        + From<PadOperation>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     ArrayOperation<A>: BatchableOperation<ProjectedContext<C, ArrayType>>,
@@ -555,6 +748,11 @@ where
                     .collect())
             }
             Self::Concatenate(operation) => ArrayProgramBatchableOperation::batch(operation, context, driver, inputs),
+            Self::CustomCall(operation) => ArrayProgramBatchableOperation::batch(operation, context, driver, inputs),
+            Self::Pad(operation) => ArrayProgramBatchableOperation::batch(operation, context, driver, inputs),
+            Self::RngBitGenerator(operation) => {
+                ArrayProgramBatchableOperation::batch(operation, context, driver, inputs)
+            }
             Self::Reshape(operation) => {
                 let Some((input, output_extents)) = inputs.split_first() else {
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -678,6 +876,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::Scalar;
     use crate::backends::array_programs::ArrayProgramValue;
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
@@ -688,6 +887,7 @@ mod tests {
         DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionToScalar,
         DimensionToScalarOperation,
     };
+    use crate::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use crate::operations::{CollectiveKind, CollectiveOperation};
     use crate::parameters::Placeholder;
     use crate::tracing::TracingContext;
@@ -948,6 +1148,94 @@ mod tests {
             Err(BatchingError::MappedDimension {
                 r#type: Box::new(<&DimensionType>::try_from(&mapped_broadcast_extent_type).unwrap().clone()),
                 axis: BatchAxis::new(0),
+            }),
+        );
+
+        // A mapped padding value is decomposed into zero-padding, a padding-position mask, a broadcast of the
+        // per-item scalar, and a select. Every shape-changing instruction in that decomposition receives the same
+        // explicit output extents, including the inserted physical batch extent.
+        let pad = ArrayProgramOperation::<Array>::from(PadOperation::new(vec![1], vec![0], vec![0]).unwrap());
+        let pad_output = pad
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    ArrayProgramBatch::new(
+                        ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+                        BatchAxis::new(0),
+                    )
+                    .unwrap(),
+                    ArrayProgramBatch::new(
+                        ArrayProgramValue::Array(Array::vector(vec![8.0_f32, 9.0])),
+                        BatchAxis::new(0),
+                    )
+                    .unwrap(),
+                    ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap())),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            pad_output,
+            vec![
+                ArrayProgramBatch::new(
+                    ArrayProgramValue::Array(Array::matrix(2, 3, vec![8.0_f32, 1.0, 2.0, 9.0, 3.0, 4.0],)),
+                    BatchAxis::new(0),
+                )
+                .unwrap()
+            ],
+        );
+
+        // Mapped RNG state batching is scan-based. Composite region-carrying operations deliberately arrive in
+        // Phase 5, so the current boundary rejects mapped states without attempting to project a region through
+        // `ProjectedContext`.
+        let states = Array::new(
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+            vec![Scalar::U64(1), Scalar::U64(0), Scalar::U64(2), Scalar::U64(0)],
+        )
+        .unwrap();
+        let state_batch = ArrayProgramBatch::new(ArrayProgramValue::Array(states.clone()), BatchAxis::new(0)).unwrap();
+        let static_rng = ArrayProgramOperation::<Array>::from(RngBitGeneratorOperation::new(
+            RandomAlgorithm::ThreeFry,
+            ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(2)])),
+        ));
+        assert_eq!(
+            static_rng.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&state_batch)),
+            Err(BatchingError::UnsupportedOperation {
+                message: "'rng_bit_generator' batching requires Phase 5 composite scan-region support".to_string(),
+            }),
+        );
+
+        let dynamic_rng_extent = DimensionVariable::new("rng_count", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_rng = ArrayProgramOperation::<Array>::from(RngBitGeneratorOperation::new(
+            RandomAlgorithm::ThreeFry,
+            ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(dynamic_rng_extent.clone())])),
+        ));
+        assert_eq!(
+            dynamic_rng.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    state_batch,
+                    ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(
+                        DimensionValue::new(DimensionType::new(dynamic_rng_extent), 2).unwrap(),
+                    )),
+                ],
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "'rng_bit_generator' batching requires Phase 5 composite scan-region support".to_string(),
+            }),
+        );
+        assert_eq!(
+            static_rng.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayProgramBatch::replicated(ArrayProgramValue::Array(states))],
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "'rng_bit_generator' cannot batch a replicated state because every batch item would see \
+                          the same state; derive one state per batch item with `split_key` and map over the states \
+                          explicitly"
+                    .to_string(),
             }),
         );
 

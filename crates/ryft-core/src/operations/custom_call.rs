@@ -1,18 +1,20 @@
 use std::fmt::Display;
 
+use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::impl_differentiable_operation;
+use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::dimensions::DimensionSize;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::effects::{Effect, Effects};
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
-use crate::programs::values::Value;
-use crate::types::ArrayType;
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::{Value, ValueProjection};
+use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, DimensionVariable};
 
 // TODO(eaplatanios): Review this module.
 
@@ -83,8 +85,14 @@ impl From<f64> for CustomCallAttribute {
 
 /// [`Operation`] that calls a foreign kernel registered with the executing backend under a target name — the
 /// analogue of [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/ffi.html). The operation is opaque to Ryft:
-/// its output types are declared up front instead of inferred (type inference validates nothing beyond returning
-/// the declaration), and typed [`CustomCallAttribute`]s are forwarded verbatim to the kernel as its configuration.
+/// its output types are declared up front instead of inferred, and typed [`CustomCallAttribute`]s are forwarded
+/// verbatim to the kernel as its configuration.
+///
+/// In an array program, each dynamic axis occurrence in the declared outputs requires one trailing first-class
+/// dimension operand, ordered first by output and then by axis. Type inference verifies that each operand defines the
+/// exact variable referenced by its corresponding output axis. These logical result extents do not enter the foreign
+/// kernel ABI: only the leading array operands are passed to the kernel. Eager execution and backend lowering use the
+/// trailing operands to verify or attach the declared logical sizes to the returned buffers.
 ///
 /// The XLA backend lowers this operation to a
 /// [`stablehlo.custom_call`](https://openxla.org/stablehlo/spec#custom_call) using the typed FFI calling convention
@@ -183,7 +191,7 @@ impl CustomCallOperation {
 
 impl Display for CustomCallOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, 0)
+        Operation::<ArrayProgramType>::render(self, formatter, 0)
     }
 }
 
@@ -230,10 +238,67 @@ impl Operation<ArrayType> for CustomCallOperation {
                 operation.field(name, value)?;
             }
             if self.has_side_effect {
-                operation.field("has_side_effect", &true)?;
+                operation.field("has_side_effect", true)?;
             }
             Ok(())
         })
+    }
+}
+
+impl Operation<ArrayProgramType> for CustomCallOperation {
+    #[inline]
+    fn name(&self) -> &'static str {
+        CUSTOM_CALL_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayProgramType],
+        region_interfaces: &[RegionInterface<ArrayProgramType>],
+    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        let dynamic_output_dimensions = self
+            .output_types
+            .iter()
+            .flat_map(|output_type| output_type.shape().dimensions())
+            .filter_map(Dimension::variable)
+            .collect::<Vec<_>>();
+        let Some(array_input_count) = input_types.len().checked_sub(dynamic_output_dimensions.len()) else {
+            return Err(TypeError::invalid(format!(
+                "'{CUSTOM_CALL_OPERATION_NAME}' expects {} trailing output-extent dimensions but only {} inputs were \
+                 provided",
+                dynamic_output_dimensions.len(),
+                input_types.len(),
+            )));
+        };
+        for input_type in &input_types[..array_input_count] {
+            <&ArrayType>::try_from(input_type)?;
+        }
+        for (input_type, expected_variable) in input_types[array_input_count..].iter().zip(dynamic_output_dimensions) {
+            let actual_variable = <&crate::DimensionType>::try_from(input_type)?.variable();
+            if actual_variable != expected_variable {
+                return Err(TypeError::invalid(format!(
+                    "'{CUSTOM_CALL_OPERATION_NAME}' output-extent operand defines dimension variable \
+                     '{actual_variable}', but the corresponding declared output axis refers to \
+                     '{expected_variable}'",
+                )));
+            }
+        }
+        Ok(self.output_types.iter().cloned().map(Into::into).collect())
+    }
+
+    #[inline]
+    fn effects(&self) -> Effects {
+        Operation::<ArrayType>::effects(self)
+    }
+
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
+        Operation::<ArrayType>::rename_type_identities(self, renaming)
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        Operation::<ArrayType>::render(self, formatter, indentation)
     }
 }
 
@@ -245,6 +310,57 @@ impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> f
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         C::Value::custom_call(self, inputs)
+    }
+}
+
+impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
+    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for CustomCallOperation
+{
+    fn interpret<D: InterpretationDriver<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>>(
+        &self,
+        _context: &EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>,
+        driver: &D,
+        inputs: &[ArrayProgramValue<A>],
+    ) -> Result<Vec<ArrayProgramValue<A>>, ProgramError> {
+        if driver.region_count() != 0 {
+            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
+        }
+        self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
+        let dynamic_output_dimension_count = self
+            .output_types
+            .iter()
+            .flat_map(|output_type| output_type.shape().dimensions())
+            .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+            .count();
+        let array_input_count = inputs.len() - dynamic_output_dimension_count;
+        let array_inputs = inputs[..array_input_count]
+            .iter()
+            .map(<ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_extents = inputs[array_input_count..]
+            .iter()
+            .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        let outputs = A::custom_call(self, array_inputs.iter().copied())?;
+        check_count!("output", outputs, self.output_types.len(), ProgramError);
+        let mut output_extents = output_extents.into_iter();
+        for (output_index, (output, output_type)) in outputs.iter().zip(&self.output_types).enumerate() {
+            for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
+                if matches!(dimension, Dimension::Dynamic(_)) {
+                    let expected_extent = output_extents.next().unwrap().extent();
+                    let actual_extent = output.dimension_size(axis)?;
+                    if actual_extent != expected_extent {
+                        return Err(ProgramError::InvalidArgument {
+                            message: format!(
+                                "'{CUSTOM_CALL_OPERATION_NAME}' output {output_index} axis {axis} has extent \
+                                 {actual_extent}, but its explicit extent operand is {expected_extent}",
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(outputs.into_iter().map(ArrayProgramValue::Array).collect())
     }
 }
 
@@ -306,7 +422,12 @@ impl<C: Context<Type = ArrayType>> BatchableOperation<C> for CustomCallOperation
 pub trait CustomCall: Sized {
     /// Calls the foreign kernel described by `operation` with the provided inputs, returning one value per
     /// declared output type, and a [`ProgramError`] if something goes wrong.
-    fn custom_call(operation: &CustomCallOperation, inputs: &[Self]) -> Result<Vec<Self>, ProgramError>;
+    fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
+        operation: &CustomCallOperation,
+        inputs: I,
+    ) -> Result<Vec<Self>, ProgramError>
+    where
+        Self: 'a;
 }
 
 /// Any context-carrying value calls foreign kernels by binding a [`CustomCallOperation`] through its own context.
@@ -317,7 +438,14 @@ impl<V: Value<Type = ArrayType>> CustomCall for V
 where
     V::DispatchDomain: Context<Operation: From<CustomCallOperation>>,
 {
-    fn custom_call(operation: &CustomCallOperation, inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {
+    fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
+        operation: &CustomCallOperation,
+        inputs: I,
+    ) -> Result<Vec<Self>, ProgramError>
+    where
+        Self: 'a,
+    {
+        let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -327,7 +455,7 @@ where
                 ),
             });
         };
-        first.dispatch_domain().bind(operation.clone(), Vec::new(), inputs)
+        first.dispatch_domain().bind(operation.clone(), Vec::new(), inputs.as_slice())
     }
 }
 
@@ -345,7 +473,8 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::ShardingDimension;
     use crate::tracing::{DomainTracer, Trace};
-    use crate::types::{DataType, Dimension, Shape};
+    use crate::types::dimensions::{DimensionBounds, DimensionVariable};
+    use crate::types::{DataType, Dimension, DimensionType, Shape};
 
     use super::*;
 
@@ -375,8 +504,8 @@ mod tests {
             ],
         );
         assert!(operation.has_side_effect());
-        assert_eq!(operation.name(), CUSTOM_CALL_OPERATION_NAME);
-        assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
+        assert_eq!(Operation::<ArrayType>::name(&operation), CUSTOM_CALL_OPERATION_NAME);
+        assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::single(Effect::OrderedIo));
         assert_eq!(operation.infer_output_types(&[vector_type()], &[]), Ok(vec![vector_type()]),);
         // Long attribute lists wrap onto one line per field.
         assert_eq!(
@@ -397,6 +526,50 @@ mod tests {
         let pure = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
         assert_eq!(Operation::<ArrayType>::effects(&pure), Effects::PURE);
         assert_eq!(pure.to_string(), "custom_call [target=ryft.test.add_one]");
+
+        // Composite output extents are positional SSA operands: output-major and then axis-major.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(17)).unwrap());
+        let dynamic_output_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(rows.clone()),
+                Dimension::Static(3),
+                Dimension::Dynamic(columns.clone()),
+            ]),
+        );
+        let dynamic_operation = CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_output_type.clone()]);
+        let input_types = vec![
+            vector_type().into(),
+            DimensionType::new(rows.clone()).into(),
+            DimensionType::new(columns.clone()).into(),
+        ];
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(&dynamic_operation, &input_types, &[]),
+            Ok(vec![dynamic_output_type.into()]),
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &dynamic_operation,
+                &[vector_type().into(), DimensionType::new(columns).into(), DimensionType::new(rows).into()],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "'custom_call' output-extent operand defines dimension variable 'columns', but the corresponding \
+                 declared output axis refers to 'rows'",
+            )),
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &dynamic_operation,
+                &[DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap(),))
+                    .into()],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "'custom_call' expects 2 trailing output-extent dimensions but only 1 inputs were provided",
+            )),
+        );
     }
 
     #[test]

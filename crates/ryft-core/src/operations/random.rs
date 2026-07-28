@@ -1,12 +1,14 @@
 use std::fmt::Display;
 
+use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
 use crate::backends::scalars::Scalar;
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::operations::constants::{Fill, ZeroLike};
 use crate::operations::control_flow::ScanOperation;
+use crate::operations::dimensions::DimensionSize;
 use crate::operations::manipulation::{Concatenate, ConvertElementType, Slice, Transpose};
 use crate::operations::math::{Add, Cos, Div, Log, Mul, Neg, Sqrt, Sub};
 use crate::operations::sort::ArgMax;
@@ -18,9 +20,9 @@ use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::ShardingDimension;
-use crate::types::{ArrayType, DataType, Dimension, Shape};
+use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -72,14 +74,20 @@ impl Display for RandomAlgorithm {
 ///
 /// The output element type must be an unsigned-integer type (`ui8`, `ui16`, `ui32`, or `ui64`); distributions over
 /// floating-point values are compositions on top of the raw bits (see [`uniform`](RngBitGenerator::uniform)).
-/// The declared output shape must be static and must not be sharded (each shard would otherwise see the same bits;
-/// derive per-shard states inside `shard_map` instead).
+/// The declared output must not be sharded (each shard would otherwise see the same bits; derive per-shard states
+/// inside `shard_map` instead). The homogeneous array contract requires a static output shape. In an
+/// [`ArrayProgramType`] graph, a bounded dynamic bits axis instead has one trailing first-class dimension operand;
+/// eager execution resolves those operands before generating bits. XLA lowering rejects dynamic bits outputs:
+/// generating the physical upper-bound buffer would advance the functional generator state by the physical rather
+/// than logical element count, which is observably incorrect.
 ///
 /// Both outputs are discrete, so differentiation assigns structural-zero tangents and transposition is rejected.
-/// Batching a *mapped* state (one state per batch item, e.g. derived with [`split_key`]) stages one carry-free
-/// [`ScanOperation`] over the per-item states, so each batch item draws its own bits from its own state; batching a
-/// *replicated* state is rejected because every batch item would see the same state and draw identical bits. The
-/// reference array backend implements both [`ThreeFry`](RandomAlgorithm::ThreeFry) and
+/// Homogeneous array batching of a *mapped* state (one state per batch item, e.g. derived with [`split_key`]) stages
+/// one carry-free [`ScanOperation`] over the per-item states, so each batch item draws its own bits from its own state.
+/// Composite array-program batching requires the Phase 5 region-carrying operation migration before that scan can
+/// retain first-class extent operands and currently returns an exact unsupported diagnostic. Batching a *replicated*
+/// state is rejected in either contract because every batch item would see the same state and draw identical bits.
+/// The reference array backend implements both [`ThreeFry`](RandomAlgorithm::ThreeFry) and
 /// [`Philox`](RandomAlgorithm::Philox) bit-exactly with XLA's implementation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RngBitGeneratorOperation {
@@ -112,8 +120,42 @@ impl RngBitGeneratorOperation {
 
 impl Display for RngBitGeneratorOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, 0)
+        Operation::<ArrayProgramType>::render(self, formatter, 0)
     }
+}
+
+/// Validates state, bits element type, and sharding for both RNG operation contracts.
+fn validate_rng_bit_generator_types(
+    algorithm: RandomAlgorithm,
+    state_type: &ArrayType,
+    output_type: &ArrayType,
+) -> Result<(), TypeError> {
+    let expected_state_type = algorithm.state_type();
+    if state_type.data_type() != expected_state_type.data_type() || state_type.shape() != expected_state_type.shape() {
+        return Err(TypeError::invalid(format!(
+            "'rng_bit_generator' with the {algorithm} algorithm needs a {expected_state_type} state but got \
+             {state_type}",
+        )));
+    }
+    if !matches!(output_type.data_type(), DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64) {
+        return Err(TypeError::invalid(format!(
+            "'rng_bit_generator' does not support output data type {}",
+            output_type.data_type(),
+        )));
+    }
+    let has_sharded_dimension = |array_type: &ArrayType| {
+        array_type.sharding().is_some_and(|sharding| {
+            sharding.dimensions().iter().any(|dimension| matches!(dimension, ShardingDimension::Sharded(_)))
+        })
+    };
+    if has_sharded_dimension(state_type) || has_sharded_dimension(output_type) {
+        return Err(TypeError::invalid(
+            "'rng_bit_generator' does not support sharded states or outputs; derive per-shard states inside shard_map \
+             instead"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl Operation<ArrayType> for RngBitGeneratorOperation {
@@ -128,34 +170,10 @@ impl Operation<ArrayType> for RngBitGeneratorOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        let state_type = self.algorithm.state_type();
-        if input_types[0].data_type() != state_type.data_type() || input_types[0].shape() != state_type.shape() {
-            return Err(TypeError::invalid(format!(
-                "'rng_bit_generator' with the {} algorithm needs a {} state but got {}",
-                self.algorithm, state_type, input_types[0],
-            )));
-        }
-        if !matches!(self.output_type.data_type(), DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64,) {
-            return Err(TypeError::invalid(format!(
-                "'rng_bit_generator' does not support output data type {}",
-                self.output_type.data_type(),
-            )));
-        }
+        validate_rng_bit_generator_types(self.algorithm, &input_types[0], &self.output_type)?;
         if self.output_type.static_shape().is_none() {
             return Err(TypeError::invalid(
                 "'rng_bit_generator' does not support dynamically shaped outputs".to_string(),
-            ));
-        }
-        let has_sharded_dimension = |array_type: &ArrayType| {
-            array_type.sharding().is_some_and(|sharding| {
-                sharding.dimensions().iter().any(|dimension| matches!(dimension, ShardingDimension::Sharded(_)))
-            })
-        };
-        if has_sharded_dimension(&input_types[0]) || has_sharded_dimension(&self.output_type) {
-            return Err(TypeError::invalid(
-                "'rng_bit_generator' does not support sharded states or outputs; derive per-shard states \
-                          inside shard_map instead"
-                    .to_string(),
             ));
         }
         Ok(vec![input_types[0].clone(), self.output_type.clone()])
@@ -170,9 +188,52 @@ impl Operation<ArrayType> for RngBitGeneratorOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, RNG_BIT_GENERATOR_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("algorithm", &self.algorithm)?;
+            operation.field("algorithm", self.algorithm)?;
             operation.field("output_type", &self.output_type)
         })
+    }
+}
+
+impl Operation<ArrayProgramType> for RngBitGeneratorOperation {
+    #[inline]
+    fn name(&self) -> &'static str {
+        RNG_BIT_GENERATOR_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayProgramType],
+        region_interfaces: &[RegionInterface<ArrayProgramType>],
+    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        let dynamic_output_dimensions =
+            self.output_type.shape().dimensions().iter().filter_map(Dimension::variable).collect::<Vec<_>>();
+        let expected_input_count = dynamic_output_dimensions.len() + 1;
+        check_count!("input", input_types, expected_input_count, TypeError);
+        let state_type = <&ArrayType>::try_from(&input_types[0])?;
+        validate_rng_bit_generator_types(self.algorithm, state_type, &self.output_type)?;
+        for (input_type, expected_variable) in input_types[1..].iter().zip(dynamic_output_dimensions) {
+            let actual_variable = <&DimensionType>::try_from(input_type)?.variable();
+            if actual_variable != expected_variable {
+                return Err(TypeError::invalid(format!(
+                    "'{RNG_BIT_GENERATOR_OPERATION_NAME}' output-extent operand defines dimension variable \
+                     '{actual_variable}', but the corresponding declared bits axis refers to '{expected_variable}'",
+                )));
+            }
+        }
+        Ok(vec![state_type.clone().into(), self.output_type.clone().into()])
+    }
+
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayProgramType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Operation::<ArrayType>::rename_type_identities(self, renaming)
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        Operation::<ArrayType>::render(self, formatter, indentation)
     }
 }
 
@@ -186,6 +247,57 @@ impl<C: Domain<Type = ArrayType, Value: RngBitGenerator>> InterpretableOperation
         check_count!("input", inputs, 1, ProgramError);
         let (state, bits) = inputs[0].rng_bit_generator(self.algorithm, &self.output_type)?;
         Ok(vec![state, bits])
+    }
+}
+
+impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
+    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for RngBitGeneratorOperation
+{
+    fn interpret<D: InterpretationDriver<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>>(
+        &self,
+        _context: &EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>,
+        driver: &D,
+        inputs: &[ArrayProgramValue<A>],
+    ) -> Result<Vec<ArrayProgramValue<A>>, ProgramError> {
+        if driver.region_count() != 0 {
+            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
+        }
+        self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
+        let state = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
+        let mut output_extents = inputs[1..].iter();
+        let concrete_output_dimensions = self
+            .output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| match dimension {
+                Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+                Dimension::Dynamic(_) => {
+                    let extent = output_extents.next().unwrap();
+                    Ok(Dimension::Static(
+                        <ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected(extent)?.extent(),
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+        let concrete_output_type = self.output_type.clone().with_shape(Shape::new(concrete_output_dimensions));
+        let (advanced_state, bits) = state.rng_bit_generator(self.algorithm, &concrete_output_type)?;
+        for (axis, dimension) in self.output_type.shape().dimensions().iter().enumerate() {
+            if matches!(dimension, Dimension::Dynamic(_)) {
+                let expected_extent =
+                    concrete_output_type.shape().dimensions()[axis].value().expect("the concrete output is static");
+                let actual_extent = bits.dimension_size(axis)?;
+                if actual_extent != expected_extent {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "'{RNG_BIT_GENERATOR_OPERATION_NAME}' bits output axis {axis} has extent {actual_extent}, \
+                             but its explicit extent operand is {expected_extent}",
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(vec![ArrayProgramValue::Array(advanced_state), ArrayProgramValue::Array(bits)])
     }
 }
 
@@ -580,7 +692,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
     use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::dimensions::DimensionValue;
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
     use crate::macros::check_operation_type_inference;
@@ -589,6 +703,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::ShardingDimension;
+    use crate::types::{ArrayProgramType, DimensionBounds, DimensionType, DimensionVariable};
 
     use super::*;
 
@@ -703,7 +818,7 @@ mod tests {
     #[test]
     fn test_rng_bit_generator() {
         let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(5));
-        assert_eq!(operation.name(), RNG_BIT_GENERATOR_OPERATION_NAME);
+        assert_eq!(Operation::<ArrayType>::name(&operation), RNG_BIT_GENERATOR_OPERATION_NAME);
         assert_eq!(operation.algorithm(), RandomAlgorithm::ThreeFry);
         assert_eq!(operation.output_type(), &bits_type(5));
         assert_eq!(operation.to_string(), "rng_bit_generator [algorithm=three_fry, output_type=u32[5]]");
@@ -734,6 +849,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(replayed, outputs);
+
+        let extent_variable = DimensionVariable::new("count", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_bits_type =
+            ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent_variable.clone())]));
+        let dynamic_operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, dynamic_bits_type.clone());
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &dynamic_operation,
+                &[RandomAlgorithm::ThreeFry.state_type().into(), DimensionType::new(extent_variable.clone()).into(),],
+                &[],
+            ),
+            Ok(vec![RandomAlgorithm::ThreeFry.state_type().into(), dynamic_bits_type.into()]),
+        );
+        let dynamic_outputs =
+            InterpretableOperation::<EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>>::interpret(
+                &dynamic_operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[
+                    ArrayProgramValue::Array(state),
+                    ArrayProgramValue::Dimension(DimensionValue::new(DimensionType::new(extent_variable), 5).unwrap()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(dynamic_outputs[0], ArrayProgramValue::Array(outputs[0].clone()));
+        assert_eq!(dynamic_outputs[1], ArrayProgramValue::Array(outputs[1].clone()));
 
         // Staging through a program builder produces one instruction with both outputs.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();

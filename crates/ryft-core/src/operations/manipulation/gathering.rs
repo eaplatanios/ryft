@@ -1051,7 +1051,7 @@ mod tests {
         check_operation_type_inference,
     };
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DataType, Memory};
+    use crate::types::{DataType, DimensionBounds, DimensionVariable, Memory};
 
     use super::*;
 
@@ -1112,6 +1112,16 @@ mod tests {
                              Device",
                 },
             ],
+        );
+
+        // Query-batch axes come directly from the indices array. A dynamic query extent therefore preserves the same
+        // identity in the output and needs no separate first-class dimension operand on `gather`.
+        let query = DimensionVariable::new("query", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_indices =
+            ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(query.clone()), Dimension::Static(1)]));
+        assert_eq!(
+            operation.infer_output_types(&[operand.clone(), dynamic_indices], &[]),
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(query), Dimension::Static(2)]),)]),
         );
 
         assert_eq!(

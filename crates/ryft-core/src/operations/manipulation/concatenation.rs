@@ -230,16 +230,19 @@ impl_differentiable_operation! {
                             .shape()
                             .dimensions()
                             .iter()
-                            .map(|size| size.value().unwrap_or(0))
-                            .collect::<Vec<_>>();
+                            .enumerate()
+                            .map(|(other_axis, dimension)| {
+                                dimension.value().ok_or_else(|| {
+                                    TypeError::invalid(format!(
+                                        "'{CONCATENATE_OPERATION_NAME}' transpose requires a static size on axis \
+                                         {other_axis} but operand {index} has size {dimension}",
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
                         start_indices[axis] = offset;
                         limit_indices[axis] = offset + input_axis_size;
-                        let full_extent_axes =
-                            input_type.shape().dimensions().iter().enumerate().filter_map(|(other_axis, size)| {
-                                (other_axis != axis && size.value().is_none()).then_some(other_axis)
-                            });
-                        let slice = SliceOperation::new(start_indices, limit_indices)
-                            .with_full_extent_axes(full_extent_axes)?;
+                        let slice = SliceOperation::new(start_indices, limit_indices);
                         let outputs = context.stage_operation(slice, Vec::new(), std::slice::from_ref(cotangent))?;
                         check_count!("output", outputs, 1, ProgramError);
                         let input_cotangent =
@@ -997,7 +1000,6 @@ mod tests {
             .with_memory(Memory::Host { pinned: true });
         let placed_output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![5.into()])).with_memory(Memory::Host { pinned: true });
-        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
         check_operation_transposition!(
             @exact,
             operation = ConcatenateOperation::new(0, 1).unwrap(),
@@ -1032,27 +1034,6 @@ mod tests {
                 },
                 {
                     inputs = [
-                        (@linear(type = ArrayType::new(
-                            DataType::F64,
-                            Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns.clone())]),
-                        ))),
-                        (@linear(type = ArrayType::new(
-                            DataType::F64,
-                            Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(columns)]),
-                        ))),
-                    ],
-                    output_cotangents = [Array::matrix(
-                        5,
-                        2,
-                        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
-                    )],
-                    input_cotangents = [
-                        Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
-                        Array::matrix(3, 2, vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
-                    ],
-                },
-                {
-                    inputs = [
                         (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![0.into()])))),
                         (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
                     ],
@@ -1083,6 +1064,31 @@ mod tests {
                 ],
             }],
         );
+
+        // A dynamic non-concatenated axis cannot be reconstructed by a static slice. Phase 6 will make that runtime
+        // extent an explicit transform residual; until then, transposition rejects the case instead of consulting
+        // hidden input-shape metadata.
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
+        let left_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns.clone())]));
+        let right_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(columns)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(left_type);
+        let right = builder.add_input(right_type);
+        let output = builder
+            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![left, right])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0, 1]),
+            Err(crate::differentiation::DifferentiationError::Program(ProgramError::Type(
+                TypeError::Invalid { message },
+            ))) if message
+                == "'concatenate' transpose requires a static size on axis 1 but operand 0 has size columns",
+        ));
     }
 
     #[test]

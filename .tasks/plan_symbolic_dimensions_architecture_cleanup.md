@@ -1089,7 +1089,7 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       execution and residual
       audits. The dependency correction and review-sized delivery are specified in
       `.tasks/plan_p3h_concatenate.md`.
-- [ ] P3i: finish the remaining shape-operation sweep. Reuse the existing custom-call, pad, and RNG payloads for the
+- [x] P3i: finish the remaining shape-operation sweep. Reuse the existing custom-call, pad, and RNG payloads for the
       three genuinely mixed contracts; retain dynamic slice, JAX-compatible gather, ordinary slice, and reduce as
       array-only operations; and do not introduce the archived slice-scatter payload. The complete classification,
       migration, and deletion gates are specified in `.tasks/plan_p3i_remaining_shape_operations.md`.
@@ -1099,7 +1099,7 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [ ] Delete each frozen homogeneous reshape/broadcast implementation and transform rule as its owning Phase 4–9
       consumer migrates. Do not attempt the final zero-residual deletion before the composite public capability and
       transform domains replace the current homogeneous `Reshape`/`Broadcast` implementations.
-- [ ] Complete and remove the remaining-operation inventory through P3i's explicit mixed migration or array-only
+- [x] Complete and remove the remaining-operation inventory through P3i's explicit mixed migration or array-only
       classification proof: custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and the
       archived slice-scatter proposal.
 - [ ] Remove the array-program-specific `Operation<ArrayProgramType>` implementations from
@@ -1204,6 +1204,10 @@ rename only part of the problem while introducing another carrier.
 - [ ] Handle dimension-only operations with the replicated-only dimension batching policy.
 - [ ] Reject mapped dimension authority at the boundary with the existing typed diagnostic.
 - [ ] Keep dedicated rules only for genuinely mixed shape-changing and region-carrying operations.
+- [ ] Move mapped-state RNG batching's carry-free `scan` into the composite region contract and thread every dynamic
+      bits-output extent through that body as replicated first-class shape authority. Delete P3i's exact
+      `"requires Phase 5 composite scan-region support"` boundary only after the resulting program remains
+      size-independent in the mapped-axis extent and preserves the existing replicated-state diagnostic.
 - [ ] Centralize explicit dynamic alignment/broadcasting so elementwise rules do not rediscover extents.
 - [ ] Remove repeated outer-enum matches that only project/lift batches.
 - [ ] Delete dimension/source-array reconstruction in dynamic slice, concatenate, reduce, collectives, RNG, and
