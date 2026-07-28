@@ -10,7 +10,7 @@ pub mod transposition;
 
 pub use broadcasting::{
     BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation, DYNAMIC_BROADCAST_OPERATION_NAME, DynamicBroadcast,
-    DynamicBroadcastOperation,
+    DynamicBroadcastOperation, LegacyBroadcastOperation,
 };
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation};
 pub use conversion::{

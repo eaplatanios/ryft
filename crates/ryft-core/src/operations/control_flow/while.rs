@@ -28,7 +28,7 @@ use crate::operations::control_flow::scan::stacked_scan_type;
 use crate::operations::control_flow::{ScanOperation, Select, SelectOperation};
 use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Transpose, TransposeOperation,
+    Broadcast, DynamicUpdateSlice, DynamicUpdateSliceOperation, LegacyBroadcastOperation, Transpose, TransposeOperation,
 };
 use crate::operations::math::{Add, AddOperation, Reduce, ReduceOperation, ReductionKind};
 use crate::parameters::Placeholder;
@@ -876,7 +876,7 @@ where
     <C as Domain>::Value: Broadcast + Transpose,
     O: Operation<ArrayType>
         + From<TransposeOperation>
-        + From<BroadcastOperation>
+        + From<LegacyBroadcastOperation>
         + From<ReduceOperation>
         + From<SelectOperation>
         + From<AndOperation>
@@ -1123,7 +1123,7 @@ where
     C::Operation: From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
         + From<AddOperation>
-        + From<BroadcastOperation>
+        + From<LegacyBroadcastOperation>
         + From<DynamicUpdateSliceOperation>
         + From<SelectOperation>
         + From<ReduceOperation>
@@ -1241,7 +1241,7 @@ where
             let condition_type = ArrayType::new(DataType::Boolean, state_type.shape().clone());
             let stacked_condition_type = stacked_scan_type(&condition_type, bound);
             let mut broadcasted = context.bind(
-                C::Operation::from(BroadcastOperation::new(stacked_condition_type, vec![0])),
+                C::Operation::from(LegacyBroadcastOperation::new(stacked_condition_type, vec![0])),
                 Vec::new(),
                 std::slice::from_ref(&mask_stack),
             )?;
@@ -1549,7 +1549,7 @@ where
         + From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
         + From<AddOperation>
-        + From<BroadcastOperation>
+        + From<LegacyBroadcastOperation>
         + From<DynamicUpdateSliceOperation>,
 {
     let state_count = condition.input_types().len();
@@ -1667,7 +1667,7 @@ where
         + From<ReduceOperation>
         + From<SelectOperation>
         + From<AndOperation>
-        + From<BroadcastOperation>,
+        + From<LegacyBroadcastOperation>,
 {
     let state_types = body.input_types();
     let state_count = state_types.len();
@@ -3371,7 +3371,7 @@ mod tests {
                         <V::DispatchDomain as crate::Domain>::Operation,
                     >,
                 > + From<crate::operations::manipulation::TransposeOperation>
-                + From<crate::operations::manipulation::BroadcastOperation>,
+                + From<crate::operations::manipulation::LegacyBroadcastOperation>,
         {
             let context = x.dispatch_domain();
             let mapped = Batch::batch(

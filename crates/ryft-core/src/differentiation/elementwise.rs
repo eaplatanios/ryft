@@ -78,8 +78,8 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
         let offset = target.rank() - rank;
         let output_axes = (0..rank).map(|axis| axis + offset).collect::<Vec<_>>();
         value = value.broadcast(target.clone(), output_axes.as_slice())?;
-
-        // `BroadcastOperation` carries the requested output type, but changing an explicit/manual sharding is a
+        
+        // The broadcasting operation carries the requested output type, but changing an explicit/manual sharding is a
         // semantic redistribution rather than a metadata-only broadcast. Here we stage that transition explicitly so
         // that backend lowering cannot silently relabel the tangent when the primal result is placed differently from
         // this operand.
@@ -104,10 +104,10 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
 }
 
 /// [`ArrayType`]-typed [`Value`] whose cotangents can additionally be _unaligned_ through the adjoint of an *explicit*
-/// broadcast (e.g., [`BroadcastOperation`](crate::BroadcastOperation)) that placed the operand's axes at arbitrary
-/// result positions. This extends [`ElementwiseDerivativeAlignment`] as a separate trait because axis placement is a
-/// concept that is specific to [`ArrayType`]-typed values. Scalar types have no axes and participate only in implicit
-/// suffix-aligned alignment maps.
+/// broadcast (e.g., using [`Broadcast`]) that placed the operand's axes at arbitrary result positions. This extends
+/// [`ElementwiseDerivativeAlignment`] as a separate trait because axis placement is a concept that is specific to
+/// [`ArrayType`]-typed values. Scalar types have no axes and participate only in implicit suffix-aligned alignment
+/// maps.
 pub trait BroadcastDerivativeAlignment: ElementwiseDerivativeAlignment<ArrayType> {
     /// Unaligns this cotangent [`Value`] back to `target` by applying the adjoint of an explicit broadcast that
     /// mapped each axis of `target` to the axis of this [`Value`] named by the corresponding entry of `output_axes`.

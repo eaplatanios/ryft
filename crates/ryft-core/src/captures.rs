@@ -19,7 +19,7 @@ use crate::differentiation::forward::{DifferentiableOperation, DifferentiationCo
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
-use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
+use crate::operations::manipulation::{LegacyBroadcastOperation, TransposeOperation};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
@@ -199,7 +199,7 @@ where
     C::Operation: BatchableOperation<C>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>>
         + From<TransposeOperation>
-        + From<BroadcastOperation>,
+        + From<LegacyBroadcastOperation>,
 {
     type Capture = C::Capture;
 

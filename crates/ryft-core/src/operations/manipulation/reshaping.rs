@@ -747,7 +747,7 @@ where
             lifted_parameters = lifted_parameters.with_dimensions(lifted_dimensions);
         }
         if let Some(output_sharding) = self.parameters.output_sharding() {
-            lifted_parameters = lifted_parameters.with_output_sharding(lift_reshape_output_sharding(
+            lifted_parameters = lifted_parameters.with_output_sharding(lift_output_sharding_for_leading_batch_axis(
                 output_sharding,
                 ArrayBatch::sharding_for_inputs(inputs)?,
             )?);
@@ -761,7 +761,7 @@ where
 }
 
 /// Inserts batching's physical leading dimension into a logical per-item output sharding.
-pub(crate) fn lift_reshape_output_sharding(
+pub(crate) fn lift_output_sharding_for_leading_batch_axis(
     output_sharding: &Sharding,
     batch_dimension: ShardingDimension,
 ) -> Result<Sharding, BatchingError> {
@@ -2012,7 +2012,7 @@ mod tests {
                 .with_varying_manual_axes(["x"])
                 .unwrap();
         assert_eq!(
-            lift_reshape_output_sharding(&per_item_sharding, ShardingDimension::sharded(["x"])),
+            lift_output_sharding_for_leading_batch_axis(&per_item_sharding, ShardingDimension::sharded(["x"])),
             Ok(Sharding::new(
                 mesh,
                 vec![

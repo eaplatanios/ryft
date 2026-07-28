@@ -21,7 +21,7 @@ use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::control_flow::{Select, SelectOperation};
 use crate::operations::manipulation::conversion::ElementType;
-use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::manipulation::{Broadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
@@ -803,7 +803,7 @@ where
     <C as Domain>::Value: Concretizable<bool> + Broadcast + Transpose + Select,
     O: Operation<ArrayType>
         + From<TransposeOperation>
-        + From<BroadcastOperation>
+        + From<LegacyBroadcastOperation>
         + From<SelectOperation>
         + From<ConditionOperation<C::Constant>>,
 {
@@ -914,7 +914,7 @@ pub(crate) fn batch_condition_with_interpreter<C, F>(
 where
     C: Context<Type = ArrayType>,
     C::Value: Broadcast + Transpose + Select,
-    C::Operation: From<BroadcastOperation> + From<SelectOperation> + From<TransposeOperation>,
+    C::Operation: From<LegacyBroadcastOperation> + From<SelectOperation> + From<TransposeOperation>,
     F: FnMut(usize, Vec<ArrayBatch<C::Value>>) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>,
 {
     let true_outputs = batch_branch(0, operand_inputs.to_vec())?;

@@ -956,7 +956,7 @@ macro_rules! define_elementwise_capability {
 ///
 /// ```rust,ignore
 /// impl_differentiable_operation! {
-///     BroadcastOperation,
+///     LegacyBroadcastOperation,
 ///     jvp<C> where C: Context<Type = ArrayType, Value: Broadcast> {
 ///         |operation, _context, _driver, inputs| {
 ///             broadcast_jvp(operation, inputs)
@@ -965,7 +965,7 @@ macro_rules! define_elementwise_capability {
 ///     transpose<V, O>
 ///     where
 ///         V: Value<Type = ArrayType>,
-///         O: Operation<ArrayType> + From<BroadcastOperation>,
+///         O: Operation<ArrayType> + From<LegacyBroadcastOperation>,
 ///     {
 ///         |operation, context, driver, inputs, outputs| {
 ///             broadcast_transpose(operation, context, driver, inputs, outputs)
@@ -4284,7 +4284,7 @@ mod tests {
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::constants::ZeroOperation;
-    use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
+    use crate::operations::manipulation::{LegacyBroadcastOperation, TransposeOperation};
     use crate::operations::math::{
         Abs, AbsOperation, Add, AddOperation, DivOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce,
         ReductionKind, SinOperation, Sub, SubOperation,
@@ -4502,8 +4502,8 @@ mod tests {
         }
     }
 
-    impl From<BroadcastOperation> for TestUnaryOperation {
-        fn from(_operation: BroadcastOperation) -> Self {
+    impl From<LegacyBroadcastOperation> for TestUnaryOperation {
+        fn from(_operation: LegacyBroadcastOperation) -> Self {
             Self
         }
     }
@@ -4520,8 +4520,8 @@ mod tests {
         }
     }
 
-    impl From<BroadcastOperation> for TestBinaryOperation {
-        fn from(_operation: BroadcastOperation) -> Self {
+    impl From<LegacyBroadcastOperation> for TestBinaryOperation {
+        fn from(_operation: LegacyBroadcastOperation) -> Self {
             Self
         }
     }

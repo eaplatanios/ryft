@@ -24,8 +24,8 @@ use ryft_core::operations::differentiation::CoordinateBasisOperation;
 #[cfg(test)]
 use ryft_core::operations::manipulation::ReshapeParameters;
 use ryft_core::operations::manipulation::{
-    BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, DynamicBroadcastOperation, GatherOperation,
-    GatherScatterMode, LegacyReshapeOperation, PadOperation, ReshapeDimensionExpression, ScatterOperation,
+    ConvertElementType, ConvertElementTypeOperation, DynamicBroadcastOperation, GatherOperation, GatherScatterMode,
+    LegacyBroadcastOperation, LegacyReshapeOperation, PadOperation, ReshapeDimensionExpression, ScatterOperation,
     ScatterReductionKind, SliceOperation, TransposeOperation,
 };
 use ryft_core::operations::math::{
@@ -1528,7 +1528,7 @@ fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locatio
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LegacyBroadcastOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1619,7 +1619,7 @@ fn broadcast_changes_explicit_sharding(input_type: &ArrayType, output_type: &Arr
 /// Lowers a broadcast and explicitly constrains any placement transition over an explicit mesh axis.
 #[allow(clippy::too_many_arguments)]
 fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &BroadcastOperation,
+    operation: &LegacyBroadcastOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
@@ -2356,7 +2356,7 @@ where
             Self::ShardingConstraint(operation) => {
                 lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
             }
-            Self::Broadcast(operation) => <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            Self::Broadcast(operation) => <LegacyBroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 regions,
@@ -4629,14 +4629,16 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::ShardingConstraint(operation) => {
                 lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
             }
-            ArrayOperation::Broadcast(operation) => <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
+            ArrayOperation::Broadcast(operation) => {
+                <LegacyBroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    regions,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             ArrayOperation::DynamicBroadcast(operation) => {
                 <DynamicBroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                     operation,
@@ -9581,8 +9583,8 @@ mod tests {
     use ryft_core::operations::control_flow::SelectOperation;
     use ryft_core::operations::logical::{AndOperation, OrOperation, XorOperation};
     use ryft_core::operations::manipulation::{
-        BroadcastOperation, ConcatenateOperation, DynamicBroadcastOperation, DynamicSliceOperation,
-        DynamicUpdateSliceOperation, LegacyReshapeOperation, PadOperation, SliceOperation, Transpose,
+        ConcatenateOperation, DynamicBroadcastOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+        LegacyBroadcastOperation, LegacyReshapeOperation, PadOperation, SliceOperation, Transpose,
         UpdateSliceOperation,
     };
     use ryft_core::operations::math::{
@@ -9732,10 +9734,10 @@ mod tests {
         let output_type = test_vector_type(4)
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyBroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
-            .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input])
+            .add_instruction(LegacyBroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
             .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -10314,10 +10316,10 @@ mod tests {
         let output_type = test_vector_type(4)
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyBroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
-            .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input])
+            .add_instruction(LegacyBroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
             .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -10352,7 +10354,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let output = builder
-            .add_instruction(BroadcastOperation::new(output_type.clone(), vec![0]), Vec::new(), vec![input])
+            .add_instruction(LegacyBroadcastOperation::new(output_type.clone(), vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -10413,7 +10415,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let output = builder
-            .add_instruction(BroadcastOperation::new(output_type.clone(), vec![0]), Vec::new(), vec![input])
+            .add_instruction(LegacyBroadcastOperation::new(output_type.clone(), vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])

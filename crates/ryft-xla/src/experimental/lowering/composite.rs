@@ -13,9 +13,9 @@ use ryft_mlir::{
 
 use super::{
     LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode,
-    lower_compare_to_mlir, lower_constant_elements_attribute, lower_constant_output, lower_sharding_constraint,
-    lower_tensor_type, merge_logical_meshes, normalize_function_name, replay_region_ref_into_block,
-    reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
+    broadcast_changes_explicit_sharding, lower_compare_to_mlir, lower_constant_elements_attribute,
+    lower_constant_output, lower_sharding_constraint, lower_tensor_type, merge_logical_meshes, normalize_function_name,
+    replay_region_ref_into_block, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::experimental::ops::XlaConstant;
 use crate::mlir::ToMlir;
@@ -74,9 +74,9 @@ fn lower_array_program_constant<'b, 'c: 'b, 't: 'c, A: MlirLowerableValue>(
     }
 }
 
-/// Packs scalar first-class dimension operands into the rank-one `i64` shape tensor consumed by
-/// `stablehlo.dynamic_reshape`.
-fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
+/// Packs scalar first-class dimension operands into the rank-one `i64` shape tensor consumed by dynamic StableHLO
+/// shape operations.
+fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
     extents: &[ValueRef<'b, 'c, 't>],
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -227,7 +227,7 @@ where
                 let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
                 reshape.result(0).expect("stablehlo.reshape should return one result").as_ref()
             } else {
-                let shape = lower_explicit_reshape_shape(output_extents, block, context, location)?;
+                let shape = lower_explicit_shape(output_extents, block, context, location)?;
                 let output_bounds = output_type
                     .shape()
                     .dimensions()
@@ -252,6 +252,55 @@ where
                 let output_sharding =
                     output_type.sharding().expect("reshape type inference should preserve requested output sharding");
                 lower_sharding_constraint(&[result], output_sharding, block, location)
+            } else {
+                Ok(vec![result])
+            }
+        }
+        ArrayProgramOperation::Broadcast(operation) => {
+            let Some((input, output_extents)) = input_values.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let Some(input_type) = input_types.first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let input_type =
+                <&ArrayType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let [output_type] = output_types else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+            };
+            let output_type =
+                <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let result = if output_type.static_shape().is_some() {
+                let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+                let broadcast = block.append_operation(stable_hlo::broadcast(
+                    *input,
+                    output_tensor_type,
+                    operation.output_axes(),
+                    location,
+                )?)?;
+                broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()
+            } else {
+                let shape = lower_explicit_shape(output_extents, block, context, location)?;
+                let broadcast = block.append_operation(stable_hlo::dynamic_broadcast(
+                    *input,
+                    shape,
+                    operation.output_axes(),
+                    None,
+                    None,
+                    location,
+                )?)?;
+                let result =
+                    broadcast.result(0).expect("stablehlo.dynamic_broadcast_in_dim should return one result").as_ref();
+                let expected_type = lower_tensor_type(output_type, context, location)?;
+                if result.r#type()? == expected_type.as_ref() {
+                    result
+                } else {
+                    let cast = block.append_operation(tensor::cast(result, expected_type, location)?)?;
+                    cast.result(0).expect("tensor.cast should return one result").as_ref()
+                }
+            };
+            if broadcast_changes_explicit_sharding(input_type, output_type, operation.output_axes()) {
+                lower_sharding_constraint(&[result], output_type.sharding().unwrap(), block, location)
             } else {
                 Ok(vec![result])
             }
@@ -405,7 +454,7 @@ mod tests {
     use ryft_core::contexts::{Context, StagingContext};
     use ryft_core::operations::compare::{Compare, ComparisonDirection};
     use ryft_core::operations::dimensions::{DimensionFromScalar, DimensionSize, DimensionToScalar};
-    use ryft_core::operations::manipulation::ReshapeOperation;
+    use ryft_core::operations::manipulation::{BroadcastOperation, ReshapeOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::values::ValueProjection;
     use ryft_core::tracing::Tracer;
@@ -591,6 +640,85 @@ mod tests {
         assert_eq!(dynamic_module.matches("stablehlo.get_dimension_size").count(), 1);
         assert_eq!(dynamic_module.matches("stablehlo.dynamic_reshape").count(), 1);
         assert_eq!(dynamic_module.matches("stablehlo.concatenate").count(), 1);
+        assert_eq!(dynamic_module.matches("dimension_to_scalar").count(), 0);
+    }
+
+    #[test]
+    fn test_explicit_broadcast_lowering() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        let context = TestContext::new();
+        let input = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
+        let first_extent =
+            context.constant(ArrayProgramValue::Dimension(ryft_core::DimensionValue::constant(3).unwrap()));
+        let second_extent =
+            context.constant(ArrayProgramValue::Dimension(ryft_core::DimensionValue::constant(2).unwrap()));
+        let output = context
+            .bind(BroadcastOperation::new(vec![1]), Vec::new(), &[input, first_extent, second_extent])
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let static_module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(static_module.matches("stablehlo.broadcast_in_dim").count(), 1);
+        assert_eq!(static_module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 0);
+        assert_eq!(static_module.matches("stablehlo.get_dimension_size").count(), 0);
+        assert_eq!(static_module.matches("dimension_to_scalar").count(), 0);
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: static_module.into_bytes() }, &cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let input_values = [1.0_f32, 2.0];
+        let input_bytes = values_to_bytes(input_values.as_slice());
+        let inputs = ExecutionDeviceInputs {
+            inputs: &[ExecutionInput {
+                buffer: Arc::new(
+                    client.buffer(input_bytes.as_slice(), BufferType::F32, &[2], None, device, None).unwrap(),
+                ),
+                donatable: false,
+            }],
+            ..Default::default()
+        };
+        let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+        let mut outputs = execution.block_until_ready().unwrap().remove(0);
+        let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![1.0_f32, 2.0, 1.0, 2.0, 1.0, 2.0],);
+
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let context = TestContext::new();
+        let input = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into());
+        let first_extent = context.input(DimensionType::new(variable).into());
+        let second_extent =
+            context.constant(ArrayProgramValue::Dimension(ryft_core::DimensionValue::constant(1).unwrap()));
+        let output = context
+            .bind(BroadcastOperation::new(vec![1]), Vec::new(), &[input, first_extent, second_extent])
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let dynamic_module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(dynamic_module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 1);
+        assert_eq!(dynamic_module.matches("stablehlo.concatenate").count(), 1);
+        assert_eq!(dynamic_module.matches("stablehlo.get_dimension_size").count(), 0);
         assert_eq!(dynamic_module.matches("dimension_to_scalar").count(), 0);
     }
 

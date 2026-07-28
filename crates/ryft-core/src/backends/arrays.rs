@@ -52,9 +52,9 @@ use crate::operations::dimensions::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
 use crate::operations::manipulation::conversion::ElementType;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation,
-    DynamicBroadcast, DynamicBroadcastOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, Gather, GatherOperation, GatherScatterMode, LegacyReshapeOperation, Pad, PadOperation,
+    Broadcast, Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation, DynamicBroadcast,
+    DynamicBroadcastOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
+    Gather, GatherOperation, GatherScatterMode, LegacyBroadcastOperation, LegacyReshapeOperation, Pad, PadOperation,
     Permutation, Reshape, ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation,
     Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
@@ -157,7 +157,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     AxisIndex(AxisIndexOperation),
     Transpose(TransposeOperation),
     Reshape(LegacyReshapeOperation),
-    Broadcast(BroadcastOperation),
+    Broadcast(LegacyBroadcastOperation),
     DynamicBroadcast(DynamicBroadcastOperation),
     Pad(PadOperation),
     Concatenate(ConcatenateOperation),

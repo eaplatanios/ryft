@@ -7,8 +7,9 @@ use crate::backends::arrays::{Array, ArrayOperation};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, TransposableOperation, TranspositionDriver,
+    BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment, TransposableOperation,
+    TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
@@ -17,7 +18,10 @@ use crate::operations::dimensions::{
     DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
     DimensionToScalarOperation,
 };
-use crate::operations::manipulation::{Reshape, ReshapeOperation, ReshapeParameters, Transpose};
+use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
+use crate::operations::manipulation::{
+    Broadcast, BroadcastOperation, Reshape, ReshapeOperation, ReshapeParameters, Transpose,
+};
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{
@@ -88,6 +92,9 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
 
     /// Mixed operation that reshapes an array using one first-class dimension operand per output axis.
     Reshape(ReshapeOperation),
+
+    /// Mixed operation that broadcasts an array using one first-class dimension operand per output axis.
+    Broadcast(BroadcastOperation),
 }
 
 impl<A: Value<Type = ArrayType>> Display for ArrayProgramOperation<A> {
@@ -143,6 +150,13 @@ impl<A: Value<Type = ArrayType>> From<ReshapeOperation> for ArrayProgramOperatio
     #[inline]
     fn from(operation: ReshapeOperation) -> Self {
         Self::Reshape(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<BroadcastOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: BroadcastOperation) -> Self {
+        Self::Broadcast(operation)
     }
 }
 
@@ -211,6 +225,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionFromScalar(operation) => operation.name(),
             Self::DimensionToScalar(operation) => operation.name(),
             Self::Reshape(operation) => operation.name(),
+            Self::Broadcast(operation) => operation.name(),
         }
     }
 
@@ -225,6 +240,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionFromScalar(operation) => operation.region_slots(),
             Self::DimensionToScalar(operation) => operation.region_slots(),
             Self::Reshape(operation) => operation.region_slots(),
+            Self::Broadcast(operation) => operation.region_slots(),
         }
     }
 
@@ -256,6 +272,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionFromScalar(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::DimensionToScalar(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::Reshape(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            Self::Broadcast(operation) => operation.infer_region_input_types(input_types, region_interfaces),
         }
     }
 
@@ -292,6 +309,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionFromScalar(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::DimensionToScalar(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Reshape(operation) => operation.infer_output_types(input_types, region_interfaces),
+            Self::Broadcast(operation) => operation.infer_output_types(input_types, region_interfaces),
         }
     }
 
@@ -308,6 +326,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionFromScalar(operation) => operation.output_region_provenance(output_index),
             Self::DimensionToScalar(operation) => operation.output_region_provenance(output_index),
             Self::Reshape(operation) => operation.output_region_provenance(output_index),
+            Self::Broadcast(operation) => operation.output_region_provenance(output_index),
         }
     }
 
@@ -322,6 +341,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionFromScalar(operation) => operation.is_zero(output_index),
             Self::DimensionToScalar(operation) => operation.is_zero(output_index),
             Self::Reshape(operation) => operation.is_zero(output_index),
+            Self::Broadcast(operation) => operation.is_zero(output_index),
         }
     }
 
@@ -336,6 +356,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionFromScalar(operation) => operation.effects(),
             Self::DimensionToScalar(operation) => operation.effects(),
             Self::Reshape(operation) => operation.effects(),
+            Self::Broadcast(operation) => operation.effects(),
         }
     }
 
@@ -355,6 +376,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                 Ok(Self::DimensionToScalar(operation.rename_type_identities(renaming)?))
             }
             Self::Reshape(operation) => Ok(Self::Reshape(operation.rename_type_identities(renaming)?)),
+            Self::Broadcast(operation) => Ok(Self::Broadcast(operation.rename_type_identities(renaming)?)),
         }
     }
 
@@ -369,6 +391,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionFromScalar(operation) => operation.render(formatter, indentation),
             Self::DimensionToScalar(operation) => operation.render(formatter, indentation),
             Self::Reshape(operation) => operation.render(formatter, indentation),
+            Self::Broadcast(operation) => operation.render(formatter, indentation),
         }
     }
 }
@@ -414,7 +437,7 @@ where
     Ok(outputs.into_iter().map(<ArrayProgramValue<A> as ValueProjection<T>>::from_projected).collect())
 }
 
-impl<A: DimensionFromScalar<DimensionValue> + DimensionSize<usize> + Reshape + Value<Type = ArrayType>>
+impl<A: Broadcast + DimensionFromScalar<DimensionValue> + DimensionSize<usize> + Reshape + Value<Type = ArrayType>>
     InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
 where
     DimensionValue: Compare<A> + DimensionToScalar<A>,
@@ -484,6 +507,24 @@ where
                 }
                 Ok(vec![ArrayProgramValue::Array(input.reshape(parameters)?)])
             }
+            Self::Broadcast(operation) => {
+                let Some((input, output_extents)) = inputs.split_first() else {
+                    return Err(
+                        TypeError::invalid("'broadcast' expects an array followed by its output extents").into()
+                    );
+                };
+                let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
+                let output_shape = Shape::new(
+                    output_extents
+                        .iter()
+                        .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
+                        .map(|result| result.map(|extent: &DimensionValue| Dimension::Static(extent.extent())))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let output_type =
+                    infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, operation)?;
+                Ok(vec![ArrayProgramValue::Array(input.broadcast(output_type, operation.output_axes())?)])
+            }
         }
     }
 }
@@ -512,6 +553,20 @@ impl<A: Value<Type = ArrayType>, C: Context<Type = ArrayProgramType, Operation: 
             // directly so an unknown array does not leave a redundant reshape in the residual program.
             return Ok(vec![input.clone()]);
         }
+        if let Self::Broadcast(operation) = self
+            && operation.output_sharding().is_none()
+            && driver.region_count() == 0
+            && let Some(input) = inputs.first()
+            && let Ok(input_type) = <&ArrayType>::try_from(input.r#type().as_ref())
+            && input_type.static_shape().is_some()
+            && operation.output_axes().iter().copied().eq(0..input_type.rank())
+            && operation
+                .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?
+                == vec![input.r#type().into_owned()]
+        {
+            // An entirely static identity broadcast cannot observe its exact dimension operands.
+            return Ok(vec![input.clone()]);
+        }
         context.fold_or_residualize(self.clone(), driver.regions().map(|region| region.to_program()).collect(), inputs)
     }
 }
@@ -531,7 +586,7 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if let Self::Reshape(_) = self {
+        if matches!(self, Self::Reshape(_) | Self::Broadcast(_)) {
             let Some((array, output_extents)) = inputs.split_first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -542,7 +597,7 @@ where
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
                 MaybeZero::Value(array_tangent) => {
                     // Output extents are structural shape authority: replay their primal values unchanged while
-                    // applying the same reshape to the live array tangent.
+                    // applying the same shape operation to the live array tangent.
                     let mut tangent_inputs = Vec::with_capacity(inputs.len());
                     tangent_inputs.push(array_tangent.clone());
                     tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
@@ -607,7 +662,8 @@ impl<
 > TransposableOperation<V, O> for ArrayProgramOperation<A>
 where
     ArrayOperation<A>: TransposableOperation<A, ArrayOperation<A>>,
-    ProjectedValue<ArrayType, Tracer<TracingContext<V, O>>>: ElementwiseDerivativeAlignment<ArrayType> + Transpose,
+    ProjectedValue<ArrayType, Tracer<TracingContext<V, O>>>:
+        BroadcastDerivativeAlignment + ElementwiseDerivativeAlignment<ArrayType> + Transpose,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -616,6 +672,42 @@ where
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        if let Self::Broadcast(operation) = self {
+            let Some((input, output_extents)) = inputs.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let [output] = outputs else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
+            };
+            let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent();
+            let extent_cotangents =
+                || output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())).collect::<Vec<_>>();
+            if input_cotangent_type
+                .shape()
+                .dimensions()
+                .iter()
+                .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+            {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "'broadcast' transpose with dynamic input extents requires Phase 6 dimension residuals"
+                        .to_string(),
+                }
+                .into());
+            }
+            let MaybeZero::Value(output_cotangent) = output else {
+                let mut cotangents = vec![MaybeZero::Zero(ArrayProgramType::Array(input_cotangent_type))];
+                cotangents.extend(extent_cotangents());
+                return Ok(cotangents);
+            };
+            let projected =
+                <Tracer<TracingContext<V, O>> as ValueProjection<ArrayType>>::into_projected(output_cotangent.clone())?;
+            let mut cotangents = vec![MaybeZero::Value(
+                projected.unalign_cotangent_along(&input_cotangent_type, operation.output_axes())?.into_value(),
+            )];
+            cotangents.extend(extent_cotangents());
+            return Ok(cotangents);
+        }
+
         if let Self::Reshape(operation) = self {
             let Some((input, output_extents)) = inputs.split_first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -1010,7 +1102,7 @@ mod tests {
     use crate::operations::constants::{ConstantOperation, ZeroOperation};
     use crate::operations::control_flow::ConditionOperation;
     use crate::operations::dimensions::{DimensionAddOperation, DimensionRequirementOperation, DimensionSizeOperation};
-    use crate::operations::manipulation::ReshapeOperation;
+    use crate::operations::manipulation::{BroadcastOperation, ReshapeOperation};
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
     use crate::partial::PartialTracer;
@@ -1592,6 +1684,189 @@ mod tests {
             &ArrayProgramType::Array(ArrayType::new(
                 DataType::F32,
                 Shape::new(vec![Dimension::Dynamic(target), Dimension::Static(4)]),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_array_program_broadcast() {
+        let input = ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0]));
+        let first_extent = ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap());
+        let second_extent = ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap());
+        let expected_output = ArrayProgramValue::Array(Array::matrix(3, 2, vec![1.0_f64, 2.0, 1.0, 2.0, 1.0, 2.0]));
+        let context = EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        assert_eq!(
+            context.bind(
+                BroadcastOperation::new(vec![1]),
+                Vec::new(),
+                &[input.clone(), first_extent.clone(), second_extent.clone()],
+            ),
+            Ok(vec![expected_output.clone()]),
+        );
+        let eager_dynamic_type =
+            DimensionType::new(DimensionVariable::new("eager_extent", DimensionBounds::new(1, Some(9)).unwrap()));
+        assert_eq!(
+            context.bind(
+                BroadcastOperation::new(vec![1]),
+                Vec::new(),
+                &[
+                    ArrayProgramValue::Array(Array::vector(vec![7.0_f64])),
+                    ArrayProgramValue::Dimension(DimensionValue::new(eager_dynamic_type, 3).unwrap()),
+                    ArrayProgramValue::Dimension(DimensionValue::constant(1).unwrap()),
+                ],
+            ),
+            Ok(vec![ArrayProgramValue::Array(Array::matrix(3, 1, vec![7.0_f64, 7.0, 7.0]))]),
+        );
+
+        let input_type = input.r#type().into_owned();
+        check_operation_partial_evaluation!(
+            backend = (ArrayProgramValue<Array>, ArrayProgramOperation<Array>),
+            operation = BroadcastOperation::new(vec![1]),
+            cases = [
+                {
+                    inputs = [
+                        (@known, input.clone()),
+                        (@known, first_extent.clone()),
+                        (@known, second_extent.clone()),
+                    ],
+                    outputs = [(@known, expected_output.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = input_type, replay = input.clone())),
+                        (@known, first_extent.clone()),
+                        (@known, second_extent.clone()),
+                    ],
+                    outputs = [(@residual, expected_output.clone())],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        let identity_input = ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0]));
+        check_operation_partial_evaluation!(
+            backend = (ArrayProgramValue<Array>, ArrayProgramOperation<Array>),
+            operation = BroadcastOperation::new(vec![0]),
+            cases = [{
+                inputs = [
+                    (@unknown(type = identity_input.r#type().into_owned(), replay = identity_input.clone())),
+                    (@known, second_extent.clone()),
+                ],
+                outputs = [(@residual, identity_input)],
+                residual_instructions = 0,
+            }],
+        );
+
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
+        let first_extent = builder.add_constant(first_extent);
+        let second_extent = builder.add_constant(second_extent);
+        let output = builder
+            .add_instruction(BroadcastOperation::new(vec![1]), Vec::new(), vec![input, first_extent, second_extent])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(program.instructions()[0].operation(), ArrayProgramOperation::Broadcast(_)));
+        assert_eq!(program.instructions()[0].inputs(), &[input, first_extent, second_extent]);
+        assert!(program.to_string().contains("broadcast [output_axes=[1]]"));
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0])),
+                ArrayProgramValue::Array(Array::vector(vec![3.0_f64, 4.0])),
+            ]),
+            Ok(vec![
+                expected_output,
+                ArrayProgramValue::Array(Array::matrix(3, 2, vec![3.0_f64, 4.0, 3.0, 4.0, 3.0, 4.0])),
+            ]),
+        );
+        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            pullback.interpret(vec![ArrayProgramValue::Array(Array::matrix(
+                3,
+                2,
+                vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ))]),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![9.0_f64, 12.0]))]),
+        );
+
+        let dynamic_variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_extent = DimensionType::new(dynamic_variable.clone());
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder
+            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dynamic_variable)])).into());
+        let extent = builder.add_input(dynamic_extent.into());
+        let output =
+            builder.add_instruction(BroadcastOperation::new(vec![0]), Vec::new(), vec![input, extent]).unwrap()[0];
+        let dynamic_program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(dynamic_program.jvp().is_ok());
+        assert!(matches!(
+            dynamic_program.transpose_with_respect_to(&[0]),
+            Err(crate::differentiation::DifferentiationError::Program(
+                ProgramError::UnsupportedOperation { message },
+            )) if message == "'broadcast' transpose with dynamic input extents requires Phase 6 dimension residuals",
+        ));
+
+        let bounds = DimensionBounds::new(1, Some(9)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
+        let extent = builder.add_input(DimensionType::new(source.clone()).into());
+        let one = builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(1).unwrap()));
+        let output = builder
+            .add_instruction(BroadcastOperation::new(vec![1]), Vec::new(), vec![input, extent, one])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let target = DimensionVariable::new("target", bounds);
+        let instantiated = program
+            .with_instantiated_type_identities(&[
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into(),
+                DimensionType::new(target.clone()).into(),
+            ])
+            .unwrap()
+            .into_owned();
+        assert_eq!(
+            instantiated.output_types(),
+            vec![
+                ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Dynamic(target.clone()), Dimension::Static(1)]),
+                )
+                .into()
+            ],
+        );
+        let mut destination = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = destination.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
+        let extent = destination.add_input(DimensionType::new(target.clone()).into());
+        let outputs = destination.splice_program(&instantiated, &[input, extent]).unwrap();
+        let [instruction] = destination.instructions() else {
+            panic!("expected the imported broadcast instruction");
+        };
+        assert_eq!(instruction.inputs()[..2], [input, extent]);
+        assert_eq!(
+            destination.atoms()[outputs[0].index()].r#type().as_ref(),
+            &ArrayProgramType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(target), Dimension::Static(1)]),
             )),
         );
     }

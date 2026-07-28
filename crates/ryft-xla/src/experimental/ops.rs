@@ -26,9 +26,9 @@ use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
-    BroadcastOperation, ConcatenateOperation, ConvertElementTypeOperation, DynamicBroadcastOperation,
-    DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation, LegacyReshapeOperation, PadOperation, Reshape,
-    ScatterOperation, Slice, SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    ConcatenateOperation, ConvertElementTypeOperation, DynamicBroadcastOperation, DynamicSliceOperation,
+    DynamicUpdateSliceOperation, GatherOperation, LegacyBroadcastOperation, LegacyReshapeOperation, PadOperation,
+    Reshape, ScatterOperation, Slice, SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
@@ -128,7 +128,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Reshape(LegacyReshapeOperation),
     Reshard(ReshardOperation),
     ShardingConstraint(ShardingConstraintOperation),
-    Broadcast(BroadcastOperation),
+    Broadcast(LegacyBroadcastOperation),
     DynamicBroadcast(DynamicBroadcastOperation),
     Slice(SliceOperation),
     UpdateSlice(UpdateSliceOperation),

@@ -21,7 +21,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, LegacyReshapeOperation, Reshape, Slice, SliceOperation, Transpose,
+    Broadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Reshape, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::parameters::Placeholder;
@@ -1400,7 +1400,7 @@ where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
     <C as Domain>::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     C::Operation: From<ZeroOperation<ArrayType>>
-        + From<BroadcastOperation>
+        + From<LegacyBroadcastOperation>
         + From<TransposeOperation>
         + From<SliceOperation>
         + From<UpdateSliceOperation>

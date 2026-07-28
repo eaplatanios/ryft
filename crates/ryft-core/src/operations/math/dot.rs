@@ -15,8 +15,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::Fill;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, LegacyReshapeOperation, Reshape,
-    Transpose,
+    Broadcast, ConvertElementType, ConvertElementTypeOperation, LegacyBroadcastOperation, LegacyReshapeOperation,
+    Reshape, Transpose,
 };
 use crate::operations::math::{Abs, Div, Exp, Floor, Log, Max, Mul, MulOperation, Reduce, ReductionKind, Sub};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -1244,7 +1244,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ScaledDotOperation
 where
     O: Operation<ArrayType>
-        + From<BroadcastOperation>
+        + From<LegacyBroadcastOperation>
         + From<ConvertElementTypeOperation>
         + From<DotOperation>
         + From<MulOperation>

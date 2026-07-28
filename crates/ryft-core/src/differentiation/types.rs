@@ -3,7 +3,9 @@ use crate::contexts::Context;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
 use crate::operations::differentiation::CoordinateBasisOperation;
-use crate::operations::manipulation::{Broadcast, BroadcastOperation, Reshape, Slice, Transpose, TransposeOperation};
+use crate::operations::manipulation::{
+    Broadcast, LegacyBroadcastOperation, Reshape, Slice, Transpose, TransposeOperation,
+};
 use crate::parameters::ParameterPath;
 use crate::programs::ProgramError;
 use crate::programs::regions::RegionRef;
@@ -342,7 +344,7 @@ where
         + BatchableOperation<TracingContext<C::Constant, C::Operation>>
         + From<CoordinateBasisOperation<ArrayType>>
         + From<TransposeOperation>
-        + From<BroadcastOperation>,
+        + From<LegacyBroadcastOperation>,
 {
     type PackedValue = ArrayBatch<C::Value>;
 

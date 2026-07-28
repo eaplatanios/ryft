@@ -16,7 +16,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::FillOperation;
-use crate::operations::manipulation::{Broadcast, BroadcastOperation};
+use crate::operations::manipulation::{Broadcast, LegacyBroadcastOperation};
 use crate::operations::math::{DivOperation, MulOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
@@ -448,7 +448,7 @@ pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> (Vec<usize>, usize
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReduceOperation
 where
     C::Operation: From<ReduceOperation>
-        + From<BroadcastOperation>
+        + From<LegacyBroadcastOperation>
         + From<CompareOperation>
         + From<DivOperation>
         + From<MulOperation>,
@@ -523,7 +523,10 @@ where
 /// differentiable.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperation
 where
-    O: Operation<ArrayType> + From<BroadcastOperation> + From<FillOperation<ArrayType, Scalar>> + From<MulOperation>,
+    O: Operation<ArrayType>
+        + From<LegacyBroadcastOperation>
+        + From<FillOperation<ArrayType, Scalar>>
+        + From<MulOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

@@ -82,7 +82,7 @@ use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolu
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::ElementwiseOperation;
-use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::manipulation::{Broadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
@@ -811,7 +811,7 @@ where
     C::Operation: BatchableOperation<C>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>>
         + From<TransposeOperation>
-        + From<BroadcastOperation>,
+        + From<LegacyBroadcastOperation>,
 {
     #[inline]
     fn batch_region(
@@ -1181,7 +1181,7 @@ impl<C> BatchingContext<C> {
         C::Operation: BatchableOperation<C>
             + BatchableOperation<TracingContext<C::Constant, C::Operation>>
             + From<TransposeOperation>
-            + From<BroadcastOperation>,
+            + From<LegacyBroadcastOperation>,
     {
         let region_mappings = RegionReplayMappings::new();
         region.interpret_with(
@@ -1209,7 +1209,7 @@ where
     C::Operation: BatchableOperation<C>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>>
         + From<TransposeOperation>
-        + From<BroadcastOperation>,
+        + From<LegacyBroadcastOperation>,
 {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<BatchingTracer<C>, ProgramError> {
@@ -1346,7 +1346,7 @@ impl<C: Context<Type = ArrayType>> Value for BatchingTracer<C> {
 
 impl<
     V: Value<Type = ArrayType>,
-    O: BatchableOperation<TracingContext<V, O>> + From<TransposeOperation> + From<BroadcastOperation>,
+    O: BatchableOperation<TracingContext<V, O>> + From<TransposeOperation> + From<LegacyBroadcastOperation>,
 > RegionRef<'_, V, O>
 {
     /// Batches this borrowed [`Region`](crate::Region) so that the resulting program operates over batched inputs
@@ -1492,7 +1492,7 @@ impl<
 
 impl<
     V: Value<Type = ArrayType>,
-    O: BatchableOperation<TracingContext<V, O>> + From<TransposeOperation> + From<BroadcastOperation>,
+    O: BatchableOperation<TracingContext<V, O>> + From<TransposeOperation> + From<LegacyBroadcastOperation>,
 > Program<V, O, Vec<V>, Vec<V>>
 {
     /// Batches this [`Program`] over the provided input axes. Refer to [`RegionRef::batched`] for the complete
@@ -2815,7 +2815,8 @@ mod tests {
     #[test]
     fn test_batch_broadcasts_scalar_replicated_operand_to_full_shape() {
         // A replicated scalar constant added to a mapped [3, 4] input: the elementwise rule materializes a
-        // `BroadcastOperation` to the full common batched shape so the staged add receives shape-congruent operands.
+        // `LegacyBroadcastOperation` to the full common batched shape so the staged add receives shape-congruent
+        // operands.
         // This is required for backends such as XLA whose elementwise lowerings (e.g., `stablehlo.add`) have no
         // implicit broadcasting.
         let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();

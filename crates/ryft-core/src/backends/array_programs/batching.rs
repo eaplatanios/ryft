@@ -15,8 +15,8 @@ use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError};
 use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
 use crate::operations::dimensions::{DimensionSizeOperation, DimensionToScalarOperation};
-use crate::operations::manipulation::reshaping::lift_reshape_output_sharding;
-use crate::operations::manipulation::{ReshapeOperation, Transpose};
+use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
+use crate::operations::manipulation::{BroadcastOperation, ReshapeOperation, Transpose};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationProjection};
@@ -504,10 +504,66 @@ where
                     lifted_operation = lifted_operation.with_dimensions(lifted_dimensions);
                 }
                 if let Some(output_sharding) = operation.output_sharding() {
-                    lifted_operation = lifted_operation.with_output_sharding(lift_reshape_output_sharding(
-                        output_sharding,
-                        context.axis_sharding().clone(),
-                    )?);
+                    lifted_operation = lifted_operation.with_output_sharding(
+                        lift_output_sharding_for_leading_batch_axis(output_sharding, context.axis_sharding().clone())?,
+                    );
+                }
+
+                let mut lifted_inputs = Vec::with_capacity(inputs.len() + 1);
+                lifted_inputs.push(moved_input);
+                lifted_inputs.push(axis_extent);
+                lifted_inputs.extend(output_extents.iter().map(|extent| extent.value.clone()));
+                context
+                    .parent
+                    .bind(ArrayProgramOperation::<A>::from(lifted_operation), Vec::new(), lifted_inputs.as_slice())?
+                    .into_iter()
+                    .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(0)))
+                    .collect()
+            }
+            Self::Broadcast(operation) => {
+                let Some((input, output_extents)) = inputs.split_first() else {
+                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+                };
+                <&ArrayType>::try_from(input.unbatched_type())?;
+                for extent in output_extents {
+                    extent.validate_replicated_dimension()?;
+                }
+
+                if input.batch_axis.is_replicated() {
+                    return Ok(context
+                        .parent
+                        .bind(
+                            self.clone(),
+                            Vec::new(),
+                            &inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>(),
+                        )?
+                        .into_iter()
+                        .map(ArrayProgramBatch::replicated)
+                        .collect());
+                }
+
+                // Canonicalize the physical mapped axis to the leading position, then represent that axis in both the
+                // explicit output extents and the input-to-output mapping of the lifted broadcast.
+                let physical_type = <&ArrayType>::try_from(input.value.r#type().as_ref())?.clone();
+                let moved_input = ArrayBatch::new(
+                    physical_type,
+                    <C::Value as ValueProjection<ArrayType>>::into_projected(input.value.clone())?,
+                    input.batch_axis,
+                )?
+                .move_axis(0)?;
+                let moved_input = <C::Value as ValueProjection<ArrayType>>::from_projected(moved_input.into_value());
+                let axis_extent = DimensionValue::constant(context.axis_size()).map_err(ProgramError::from)?;
+                let axis_extent = <C::Constant as ValueProjection<DimensionType>>::from_projected(axis_extent);
+                let axis_extent = context.parent.lift(axis_extent)?;
+
+                let mut lifted_output_axes = Vec::with_capacity(operation.output_axes().len() + 1);
+                lifted_output_axes.push(0);
+                lifted_output_axes.extend(operation.output_axes().iter().map(|axis| axis + 1));
+                let mut lifted_operation = BroadcastOperation::new(lifted_output_axes);
+                if let Some(output_sharding) = operation.output_sharding() {
+                    lifted_operation = lifted_operation.with_output_sharding(
+                        lift_output_sharding_for_leading_batch_axis(output_sharding, context.axis_sharding().clone())?,
+                    );
                 }
 
                 let mut lifted_inputs = Vec::with_capacity(inputs.len() + 1);
@@ -746,6 +802,58 @@ mod tests {
             ),
             Err(BatchingError::MappedDimension {
                 r#type: Box::new(<&DimensionType>::try_from(&first_extent_type).unwrap().clone()),
+                axis: BatchAxis::new(0),
+            }),
+        );
+
+        let broadcast = ArrayProgramOperation::<Array>::from(BroadcastOperation::new(vec![1]));
+        let broadcast_input = ArrayProgramBatch::new(
+            ArrayProgramValue::Array(Array::matrix(2, 1, vec![1.0_f32, 2.0])),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let broadcast_output = broadcast
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    broadcast_input,
+                    ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap())),
+                    ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(DimensionValue::constant(1).unwrap())),
+                ],
+            )
+            .unwrap();
+        assert_eq!(broadcast_output.len(), 1);
+        assert_eq!(broadcast_output[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            broadcast_output[0].value(),
+            &ArrayProgramValue::Array(Array::from_f64s(
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(1),]),
+                ),
+                vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+            )),
+        );
+
+        let mapped_broadcast_extent = ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap());
+        let mapped_broadcast_extent_type = mapped_broadcast_extent.r#type().into_owned();
+        assert_eq!(
+            broadcast.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    ArrayProgramBatch::replicated(ArrayProgramValue::Array(Array::vector(vec![1.0_f32]))),
+                    ArrayProgramBatch {
+                        value: mapped_broadcast_extent,
+                        batch_axis: BatchAxis::new(0),
+                        r#type: mapped_broadcast_extent_type.clone(),
+                    },
+                    ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(DimensionValue::constant(1).unwrap(),)),
+                ],
+            ),
+            Err(BatchingError::MappedDimension {
+                r#type: Box::new(<&DimensionType>::try_from(&mapped_broadcast_extent_type).unwrap().clone()),
                 axis: BatchAxis::new(0),
             }),
         );

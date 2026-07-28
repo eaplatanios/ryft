@@ -39,7 +39,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::manipulation::{Broadcast, BroadcastOperation};
+use crate::operations::manipulation::{Broadcast, LegacyBroadcastOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
@@ -231,7 +231,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: Operation<ArrayType> + From<BroadcastOperation> + From<ReshardOperation>,
+        O: Operation<ArrayType> + From<LegacyBroadcastOperation> + From<ReshardOperation>,
     {
         |_operation, _context, _driver, inputs, outputs| {
             // Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output
