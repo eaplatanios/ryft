@@ -850,3 +850,31 @@ ledger disagrees with Git.
   diagnostic in a Delivery B production file
 - Review method: line by line
 - Next action: owner review, commit, and push Delivery B; then execute P3h Delivery C direct lowering and closure
+
+## P3h Delivery C: explicit concatenate lowering and closure
+
+- Status: ready for owner review — Delivery C
+- Branch: `u/eaplatanios/dynamic-shapes`
+- Baseline commit: `21b3a87c154560a345a351e072e3a6fac14d03db`
+- Scope: lower exact canonical mixed concatenate programs directly, preserve the dynamic runtime-equality boundary,
+  compile and execute the exact path on CPU, measure the golden program, and close the residual audit
+- Lowering: the canonical four-instruction
+  `dimension_size(left), dimension_size(right), dimension_add, concatenate` program lowers to scalar constants, one
+  scalar `stablehlo.add`, and one `stablehlo.concatenate` over the two physical array operands. The explicit extent is
+  consumed as compile-time authority after mixed inference proves equality with the exact input-axis sum
+- Dynamic boundary: a dynamic input-axis sum returns
+  `concatenate with first-class dimensions requires runtime equality assertion lowering when its explicit result
+  extent is not statically proven equal to the input extent sum`; lowering does not trust or reconstruct the extent
+- CPU execution: inputs `[1, 2]` and `[3, 4, 5]` compile and execute to `[1, 2, 3, 4, 5]`
+- Measurements: 4 stored instructions, 223 rendered-program bytes, 379 StableHLO bytes, 28,795 microseconds warm local
+  CPU compile time, and 354 microseconds for execution, synchronization, and host copy. No timing instrumentation
+  remains in production or tests
+- Residuals: no legacy concatenate payload exists. Intentional homogeneous consumers are the reference/public array
+  capability and transforms, `ArrayOperation`, `XlaOperation`, their frozen lowerers, and tests. No expression,
+  witness, packed shape operand, source-array recovery, ambient lookup, `get_dimension_size` reconstruction, or host
+  readback was introduced
+- Verification: focused lowering and CPU execution passed; all 404 XLA library tests passed with one ignored test;
+  the empty XLA doctest suite, core/XLA compilation, formatting, whitespace checks, and residual searches passed.
+  Strict XLA Clippy remains blocked by inherited diagnostics, with none in Delivery C changes
+- Review method: line by line
+- Next action: owner review, commit, and push Delivery C; then continue the Phase 3 mixed-operation migration

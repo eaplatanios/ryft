@@ -1085,7 +1085,8 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       result-dimension recovery. Composite batching aligns mapped array axes while requiring replicated extent
       authority. JVP reuses the same extent SSA value for primal and tangent concatenates; static transpose reuses the
       established slicing pullback and dynamic transpose names the Phase 6 residual requirement.
-- [ ] P3h Delivery C: lower explicit-extent concatenate directly and close its measured CPU execution and residual
+- [x] P3h Delivery C: lower statically proven explicit-extent concatenate directly and close its measured CPU
+      execution and residual
       audits. The dependency correction and review-sized delivery are specified in
       `.tasks/plan_p3h_concatenate.md`.
 - [ ] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
@@ -2001,3 +2002,18 @@ delegates to the established homogeneous slice-based pullback and gives the exte
 Dynamic concatenated axes retain the explicit Phase 6 dimension-residual boundary. The dynamic
 `dimension_size -> dimension_add -> concatenate` acceptance program now passes eager execution, partial evaluation,
 batching, JVP, identity instantiation, and import; direct lowering remains P3h Delivery C.
+
+### Execution: P3h Delivery C concatenate lowering
+
+P3h Delivery C lowers the canonical four-instruction
+`dimension_size(left), dimension_size(right), dimension_add, concatenate` program directly when every concatenated
+input extent and the explicit result extent are exact. Mixed inference proves their equality; lowering consumes the
+trailing scalar as compile-time shape authority and emits one `stablehlo.concatenate` over only the physical arrays.
+The CPU plugin compiles and executes the result successfully.
+
+Dynamic concatenated axes retain the Phase 7 runtime-equality-assertion boundary with an exact diagnostic. Lowering
+does not trust the explicit scalar, reconstruct dimensions from arrays, emit a packed shape operand, or perform host
+readback. The golden exact program contains 4 instructions, renders to 223 bytes, and lowers to 379 bytes of
+StableHLO; a warm local probe compiled in 28,795 microseconds and executed/synchronized/copied in 354 microseconds.
+Verification and the classified homogeneous-consumer residual audit are recorded in
+`.tasks/plan_p3h_concatenate.md` and the cleanup ledger.

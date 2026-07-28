@@ -352,9 +352,40 @@ where
                 Ok(vec![result])
             }
         }
-        ArrayProgramOperation::Concatenate(_) => Err(LoweringError::UnsupportedOp {
-            op: format!("first-class-dimension {} is implemented by P3h Delivery C", CONCATENATE_OPERATION_NAME,),
-        }),
+        ArrayProgramOperation::Concatenate(operation) => {
+            let Some((_result_extent, array_inputs)) = input_values.split_last() else {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }.into());
+            };
+            let Some((result_extent_type, array_input_types)) = input_types.split_last() else {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_types.len() }.into());
+            };
+            if array_inputs.is_empty() {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() }.into());
+            }
+            let result_extent_type =
+                <&DimensionType>::try_from(result_extent_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let input_extents_are_static = array_input_types.iter().try_fold(true, |all_static, r#type| {
+                let r#type = <&ArrayType>::try_from(r#type).map_err(|error| LoweringError::Tracing(error.into()))?;
+                Ok::<_, LoweringError>(
+                    all_static && matches!(r#type.shape().dimensions()[operation.axis()], Dimension::Static(_)),
+                )
+            })?;
+            if !input_extents_are_static || matches!(result_extent_type.to_dimension(), Dimension::Dynamic(_)) {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "{} with first-class dimensions requires runtime equality assertion lowering when its \
+                         explicit result extent is not statically proven equal to the input extent sum",
+                        CONCATENATE_OPERATION_NAME,
+                    ),
+                });
+            }
+
+            // The mixed type-inference contract has already proven that the exact trailing extent equals the sum of
+            // the exact concatenated input axes. The scalar extent is therefore consumed as compile-time shape
+            // authority, while StableHLO receives only the physical array operands.
+            let result = block.append_operation(stable_hlo::concatenate(array_inputs, operation.axis(), location)?)?;
+            Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
+        }
     }
 }
 
@@ -504,10 +535,12 @@ mod tests {
     use ryft_core::contexts::{Context, StagingContext};
     use ryft_core::operations::compare::{Compare, ComparisonDirection};
     use ryft_core::operations::dimensions::{
-        DimensionAddOperation, DimensionFromScalar, DimensionMulOperation, DimensionSize, DimensionToScalar,
+        DimensionAddOperation, DimensionFromScalar, DimensionMulOperation, DimensionSize, DimensionSizeOperation,
+        DimensionToScalar,
     };
-    use ryft_core::operations::manipulation::{BroadcastOperation, ReshapeOperation};
+    use ryft_core::operations::manipulation::{BroadcastOperation, ConcatenateOperation, ReshapeOperation};
     use ryft_core::parameters::Placeholder;
+    use ryft_core::programs::ProgramBuilder;
     use ryft_core::programs::values::ValueProjection;
     use ryft_core::tracing::Tracer;
     use ryft_core::tracing::TracingContext;
@@ -541,6 +574,34 @@ mod tests {
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
         }
+    }
+
+    /// Builds the canonical stored concatenate program whose result extent is computed from its array inputs.
+    fn explicit_concatenate_program(
+        left_type: ArrayType,
+        right_type: ArrayType,
+    ) -> Program<
+        ArrayProgramValue<XlaConstant>,
+        ArrayProgramOperation<XlaConstant>,
+        Vec<ArrayProgramValue<XlaConstant>>,
+        Vec<ArrayProgramValue<XlaConstant>>,
+    > {
+        let left_size_operation = DimensionSizeOperation::new(&left_type, 0).unwrap();
+        let right_size_operation = DimensionSizeOperation::new(&right_type, 0).unwrap();
+        let add_operation =
+            DimensionAddOperation::new(left_size_operation.result_type(), right_size_operation.result_type()).unwrap();
+        let mut builder = ProgramBuilder::<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>::new();
+        let left = builder.add_input(left_type.into());
+        let right = builder.add_input(right_type.into());
+        let left_extent = builder.add_instruction(left_size_operation, Vec::new(), vec![left]).unwrap()[0];
+        let right_extent = builder.add_instruction(right_size_operation, Vec::new(), vec![right]).unwrap()[0];
+        let result_extent = builder
+            .add_instruction(DimensionOperation::Add(add_operation), Vec::new(), vec![left_extent, right_extent])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(ConcatenateOperation::new(0, 1).unwrap(), Vec::new(), vec![left, right, result_extent])
+            .unwrap()[0];
+        builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
     #[test]
@@ -611,6 +672,79 @@ mod tests {
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<i64>(output_bytes.as_slice()), vec![7]);
+    }
+
+    #[test]
+    fn test_explicit_concatenate_lowering() {
+        // Compute the exact result extent through ordinary dimension SSA and prove that lowering retains only the
+        // physical arrays as StableHLO concatenate operands.
+        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
+        let program = explicit_concatenate_program(left_type, right_type);
+        assert_eq!(program.instructions().len(), 4);
+
+        let module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 0);
+        assert_eq!(module.matches("stablehlo.add").count(), 1);
+        assert_eq!(module.matches("stablehlo.concatenate").count(), 1);
+        assert!(
+            module.contains(
+                "stablehlo.concatenate %arg0, %arg1, dim = 0 : (tensor<2xf32>, tensor<3xf32>) -> tensor<5xf32>",
+            ),
+            "{module}",
+        );
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let left_values = [1.0_f32, 2.0];
+        let right_values = [3.0_f32, 4.0, 5.0];
+        let left_bytes = values_to_bytes(left_values.as_slice());
+        let right_bytes = values_to_bytes(right_values.as_slice());
+        let inputs = ExecutionDeviceInputs {
+            inputs: &[
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(left_bytes.as_slice(), BufferType::F32, &[2], None, device.clone(), None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(right_bytes.as_slice(), BufferType::F32, &[3], None, device, None).unwrap(),
+                    ),
+                    donatable: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+        let mut outputs = execution.block_until_ready().unwrap().remove(0);
+        assert_eq!(outputs.outputs.len(), 1);
+        let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![1.0_f32, 2.0, 3.0, 4.0, 5.0]);
+
+        // A dynamic input sum still has an explicit SSA extent, but lowering cannot trust it until the assertion
+        // effect can verify the equality at runtime.
+        let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(5)).unwrap());
+        let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(6)).unwrap());
+        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(left_variable)]));
+        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(right_variable)]));
+        let program = explicit_concatenate_program(left_type, right_type);
+        assert_eq!(
+            lower_array_program_to_stable_hlo(&program, "main"),
+            Err(ArrayProgramLoweringError::Lowering {
+                message: "unsupported staged op 'concatenate with first-class dimensions requires runtime equality \
+                          assertion lowering when its explicit result extent is not statically proven equal to the \
+                          input extent sum' during XLA lowering"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]
