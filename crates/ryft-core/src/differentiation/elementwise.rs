@@ -78,7 +78,7 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
         let offset = target.rank() - rank;
         let output_axes = (0..rank).map(|axis| axis + offset).collect::<Vec<_>>();
         value = value.broadcast(target.clone(), output_axes.as_slice())?;
-        
+
         // The broadcasting operation carries the requested output type, but changing an explicit/manual sharding is a
         // semantic redistribution rather than a metadata-only broadcast. Here we stage that transition explicitly so
         // that backend lowering cannot silently relabel the tangent when the primal result is placed differently from

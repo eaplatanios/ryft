@@ -332,7 +332,12 @@ impl DimensionType {
 impl Display for DimensionType {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "dimension<{}: {}>", self.variable, self.bounds())
+        let bounds = self.bounds();
+        if bounds.lower().checked_add(1) == bounds.upper() {
+            write!(formatter, "dimension<{}>", bounds.lower())
+        } else {
+            write!(formatter, "dimension<{} ∈ {bounds}>", self.variable)
+        }
     }
 }
 
@@ -854,13 +859,15 @@ mod tests {
 
         assert_eq!(declared.variable(), &declared_variable);
         assert_eq!(declared.bounds(), DimensionBounds::new(1, Some(65)).unwrap());
-        assert_eq!(declared.to_string(), "dimension<declared: [1, 65)>");
+        assert_eq!(declared.to_string(), "dimension<declared ∈ [1, 65)>");
         assert!(!declared.is_scalar());
         assert!(!declared.is_complex());
         assert!(declared.is_refined_by(&actual));
         assert_eq!(declared.to_dimension(), Dimension::Dynamic(declared_variable.clone()));
         let exact_variable = DimensionVariable::new("7", DimensionBounds::new(7, Some(8)).unwrap());
-        assert_eq!(DimensionType::new(exact_variable).to_dimension(), Dimension::Static(7));
+        let exact_type = DimensionType::new(exact_variable);
+        assert_eq!(exact_type.to_string(), "dimension<7>");
+        assert_eq!(exact_type.to_dimension(), Dimension::Static(7));
 
         let mut identities = Vec::new();
         declared.visit_identities(&mut |position, variable| identities.push((position, variable.clone())));
@@ -877,8 +884,8 @@ mod tests {
         assert_eq!(
             DimensionType::derive_identity_renaming(&[declared.clone()], &[wider]),
             Err(TypeError::invalid(
-                "dimension type dimension<wider: [0, 129)> cannot instantiate declared type \
-                 dimension<declared: [1, 65)>",
+                "dimension type dimension<wider ∈ [0, 129)> cannot instantiate declared type \
+                 dimension<declared ∈ [1, 65)>",
             )),
         );
 

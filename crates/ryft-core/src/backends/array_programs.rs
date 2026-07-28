@@ -1095,13 +1095,19 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::array_programs::batching::{
+        ArrayProgramBatch, ArrayProgramBatchingContext, ArrayProgramBatchingTracer,
+    };
     use crate::backends::arrays::Array;
+    use crate::batching::BatchAxis;
     use crate::contexts::{Context, StagingContext};
     use crate::differentiation::DifferentiationTracer;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::constants::{ConstantOperation, ZeroOperation};
     use crate::operations::control_flow::ConditionOperation;
-    use crate::operations::dimensions::{DimensionAddOperation, DimensionRequirementOperation, DimensionSizeOperation};
+    use crate::operations::dimensions::{
+        DimensionAddOperation, DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation,
+    };
     use crate::operations::manipulation::{BroadcastOperation, ReshapeOperation};
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
@@ -1482,8 +1488,8 @@ mod tests {
             reshape_program.to_string(),
             indoc! {"
                 lambda %0:f32[6] .
-                let %1:dimension<2: [2, 3)> = const
-                    %2:dimension<3: [3, 4)> = const
+                let %1:dimension<2> = const
+                    %2:dimension<3> = const
                     %3:f32[2, 3] = reshape %0 %1 %2
                 in (%3)
             "}
@@ -1869,6 +1875,167 @@ mod tests {
                 Shape::new(vec![Dimension::Dynamic(target), Dimension::Static(1)]),
             )),
         );
+    }
+
+    #[test]
+    fn test_array_program_explicit_shape_vertical_slice() {
+        let bounds = DimensionBounds::new(1, Some(5)).unwrap();
+        let extent_variable = DimensionVariable::new("extent", bounds);
+        let extent_type = DimensionType::new(extent_variable.clone());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_variable.clone())]));
+
+        // Build one stored program in which ordinary dimension arithmetic supplies explicit reshape and broadcast
+        // operands. The repeated extent edge deliberately feeds both shape operations.
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let extent = builder.add_input(extent_type.clone().into());
+        let one_value = DimensionValue::constant(1).unwrap();
+        let one_type = one_value.r#type().clone();
+        let one = builder.add_constant(ArrayProgramValue::Dimension(one_value));
+        let repeated_extent = builder
+            .add_instruction(
+                DimensionOperation::Mul(DimensionMulOperation::new(&extent_type, &one_type).unwrap()),
+                Vec::new(),
+                vec![extent, one],
+            )
+            .unwrap()[0];
+        let two = builder
+            .add_instruction(
+                DimensionOperation::Add(DimensionAddOperation::new(&one_type, &one_type).unwrap()),
+                Vec::new(),
+                vec![one, one],
+            )
+            .unwrap()[0];
+        let reshaped = builder
+            .add_instruction(ReshapeOperation::new(), Vec::new(), vec![input, one, repeated_extent])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(BroadcastOperation::new(vec![0, 1]), Vec::new(), vec![reshaped, two, repeated_extent])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let [multiply_instruction, add_instruction, reshape_instruction, broadcast_instruction] =
+            program.instructions()
+        else {
+            panic!("expected dimension arithmetic followed by reshape and broadcast");
+        };
+        assert_eq!(reshape_instruction.inputs(), &[input, one, multiply_instruction.outputs()[0]]);
+        assert_eq!(
+            broadcast_instruction.inputs(),
+            &[reshape_instruction.outputs()[0], add_instruction.outputs()[0], multiply_instruction.outputs()[0]],
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[extent], %1:dimension<extent ∈ [1, 5)> .
+                let %2:dimension<1> = const
+                    %3:dimension<extent * 1 ∈ [1, 5)> = dimension_mul %1 %2
+                    %4:dimension<2> = dimension_add %2 %2
+                    %5:f64[1, extent * 1] = reshape %0 %2 %3
+                    %6:f64[2, extent * 1] = broadcast [output_axes=[0, 1]] %5 %4 %3
+                in (%6)
+            "}
+            .trim_end(),
+        );
+
+        let extent_value = ArrayProgramValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
+        let input_value = ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));
+        let expected = ArrayProgramValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0]));
+        assert_eq!(program.interpret(vec![input_value.clone(), extent_value.clone()]), Ok(vec![expected.clone()]));
+
+        // Known dimension arithmetic folds during partial evaluation while the two shape operations retain their
+        // explicit extent inputs in the residual program.
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Unknown(input_type.clone().into()),
+                PartialValue::Known(extent_value.clone()),
+            ])
+            .unwrap();
+        assert_eq!(evaluation.program().instructions().len(), 2);
+        assert!(matches!(evaluation.program().instructions()[0].operation(), ArrayProgramOperation::Reshape(_),));
+        assert!(matches!(evaluation.program().instructions()[1].operation(), ArrayProgramOperation::Broadcast(_),));
+        assert_eq!(
+            evaluation.interpret(
+                &EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new(),
+                std::slice::from_ref(&input_value),
+            ),
+            Ok(vec![expected.clone()]),
+        );
+
+        // Forward differentiation replays both shape operations over the live array tangent while every dimension
+        // value remains structural.
+        let tangent = ArrayProgramValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]));
+        let expected_tangent = ArrayProgramValue::Array(Array::matrix(2, 3, vec![4.0_f64, 5.0, 6.0, 4.0, 5.0, 6.0]));
+        assert_eq!(
+            program.jvp().unwrap().interpret(vec![
+                input_value.clone(),
+                extent_value.clone(),
+                tangent,
+                ArrayProgramValue::Array(Array::scalar(crate::Scalar::Zero)),
+            ]),
+            Ok(vec![expected.clone(), expected_tangent]),
+        );
+
+        // Batching inserts one physical leading axis while the extent remains replicated shared shape authority.
+        let batching_context = ArrayProgramBatchingContext::new(
+            EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new(),
+            2,
+        );
+        let batched_input = ArrayProgramBatchingTracer::new(
+            batching_context.clone(),
+            ArrayProgramBatch::new(
+                ArrayProgramValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])),
+                BatchAxis::new(0),
+            )
+            .unwrap(),
+        );
+        let batched_extent = ArrayProgramBatchingTracer::new(
+            batching_context.clone(),
+            ArrayProgramBatch::replicated(extent_value.clone()),
+        );
+        let batched_output = program
+            .interpret_in_context(&batching_context, vec![batched_input, batched_extent])
+            .unwrap()
+            .remove(0);
+        assert_eq!(batched_output.batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            batched_output.batch().value(),
+            &ArrayProgramValue::Array(Array::from_f64s(
+                ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(3)]),
+                ),
+                vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0],
+            )),
+        );
+
+        // Instantiation and import rename the boundary identity while preserving the internal arithmetic result and
+        // both consumers of its SSA value.
+        let target_variable = DimensionVariable::new("target", bounds);
+        let target_type = DimensionType::new(target_variable.clone());
+        let target_array_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(target_variable.clone())]));
+        let instantiated = program
+            .with_instantiated_type_identities(&[target_array_type.clone().into(), target_type.clone().into()])
+            .unwrap()
+            .into_owned();
+        let mut destination = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let imported_input = destination.add_input(target_array_type.into());
+        let imported_extent = destination.add_input(target_type.into());
+        let imported_outputs = destination.splice_program(&instantiated, &[imported_input, imported_extent]).unwrap();
+        assert_eq!(destination.instructions().len(), 4);
+        let [_, _, imported_reshape, imported_broadcast] = destination.instructions() else {
+            panic!("expected the complete imported vertical slice");
+        };
+        assert_eq!(imported_reshape.inputs()[0], imported_input);
+        assert_eq!(imported_broadcast.inputs()[0], imported_reshape.outputs()[0]);
+        assert_eq!(imported_broadcast.outputs(), imported_outputs.as_slice());
     }
 
     #[test]

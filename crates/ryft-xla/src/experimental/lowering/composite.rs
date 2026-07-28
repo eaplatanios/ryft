@@ -1,10 +1,11 @@
 //! StableHLO lowering for programs that mix arrays with first-class dimensions.
 
 use ryft_core::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+use ryft_core::backends::dimensions::DimensionOperation;
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{Operation as CoreOperation, Program, ProgramError, Typed};
 use ryft_core::sharding::LogicalMesh;
-use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, Shape};
+use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, MAX_DIMENSION_EXTENT, Shape};
 use ryft_mlir::dialects::{func, stable_hlo, tensor};
 use ryft_mlir::{
     Block, Context as MlirContext, Location, Operation as MlirOperation, Region, Size as MlirSize, Type as MlirType,
@@ -154,9 +155,54 @@ where
                 &mut lowerer,
             )
         }
-        ArrayProgramOperation::Dimension(operation) => Err(LoweringError::UnsupportedOp {
-            op: format!("first-class dimension operation `{}` has not been lowered yet", operation.name()),
-        }),
+        ArrayProgramOperation::Dimension(operation) => {
+            match operation {
+                DimensionOperation::Add(_) | DimensionOperation::Mul(_) => {
+                    let [left, right] = input_values else {
+                        return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() }.into());
+                    };
+                    let [left_type, right_type] = input_types else {
+                        return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_types.len() }.into());
+                    };
+                    let left_type =
+                        <&DimensionType>::try_from(left_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+                    let right_type =
+                        <&DimensionType>::try_from(right_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+                    let maximum = |r#type: &DimensionType| r#type.bounds().upper()?.checked_sub(1);
+                    let maximum_result =
+                        maximum(left_type).zip(maximum(right_type)).and_then(|(left, right)| match operation {
+                            DimensionOperation::Add(_) => left.checked_add(right),
+                            DimensionOperation::Mul(_) => left.checked_mul(right),
+                            _ => unreachable!(),
+                        });
+                    // A bounds proof makes these physical scalar `i64` operations equivalent to checked dimension
+                    // arithmetic. P7 owns runtime overflow assertions for cases whose declared bounds cannot prove
+                    // this.
+                    if !maximum_result.is_some_and(|result| result <= MAX_DIMENSION_EXTENT) {
+                        return Err(LoweringError::UnsupportedOp {
+                            op: format!(
+                                "first-class dimension operation `{}` requires checked runtime assertion lowering",
+                                operation.name(),
+                            ),
+                        });
+                    }
+                    let result = match operation {
+                        DimensionOperation::Add(_) => {
+                            block.append_operation(stable_hlo::add(*left, *right, location)?)?
+                        }
+                        DimensionOperation::Mul(_) => {
+                            block.append_operation(stable_hlo::multiply(*left, *right, location)?)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    Ok(vec![result.result(0).unwrap().as_ref()])
+                }
+                _ => Err(LoweringError::UnsupportedOp {
+                    op: format!("first-class dimension operation `{}` has not been lowered yet", operation.name()),
+                }
+                .into()),
+            }
+        }
         ArrayProgramOperation::Compare(operation) => {
             let [left, right] = input_values else {
                 return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() }.into());
@@ -453,7 +499,9 @@ mod tests {
 
     use ryft_core::contexts::{Context, StagingContext};
     use ryft_core::operations::compare::{Compare, ComparisonDirection};
-    use ryft_core::operations::dimensions::{DimensionFromScalar, DimensionSize, DimensionToScalar};
+    use ryft_core::operations::dimensions::{
+        DimensionAddOperation, DimensionFromScalar, DimensionMulOperation, DimensionSize, DimensionToScalar,
+    };
     use ryft_core::operations::manipulation::{BroadcastOperation, ReshapeOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::values::ValueProjection;
@@ -720,6 +768,160 @@ mod tests {
         assert_eq!(dynamic_module.matches("stablehlo.concatenate").count(), 1);
         assert_eq!(dynamic_module.matches("stablehlo.get_dimension_size").count(), 0);
         assert_eq!(dynamic_module.matches("dimension_to_scalar").count(), 0);
+    }
+
+    #[test]
+    fn test_explicit_shape_vertical_slice_lowering() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        // The static program uses the same computed dimension SSA value as a reshape and broadcast operand.
+        let context = TestContext::new();
+        let input = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
+        let one_value = ryft_core::DimensionValue::constant(1).unwrap();
+        let one_type = one_value.r#type().clone();
+        let one = context.constant(ArrayProgramValue::Dimension(one_value));
+        let two = context
+            .bind(
+                DimensionOperation::Add(DimensionAddOperation::new(&one_type, &one_type).unwrap()),
+                Vec::new(),
+                &[one.clone(), one.clone()],
+            )
+            .unwrap()
+            .remove(0);
+        let reshaped = context.bind(ReshapeOperation::new(), Vec::new(), &[input, one, two.clone()]).unwrap().remove(0);
+        let output = context
+            .bind(BroadcastOperation::new(vec![0, 1]), Vec::new(), &[reshaped, two.clone(), two])
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.instructions().len(), 3);
+        let static_module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(static_module.matches("stablehlo.add").count(), 1);
+        assert_eq!(static_module.matches("stablehlo.reshape").count(), 1);
+        assert_eq!(static_module.matches("stablehlo.broadcast_in_dim").count(), 1);
+        assert_eq!(static_module.matches("stablehlo.dynamic_reshape").count(), 0);
+        assert_eq!(static_module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 0);
+        assert_eq!(static_module.matches("stablehlo.get_dimension_size").count(), 0);
+        assert_eq!(static_module.matches("dimension_to_scalar").count(), 0);
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: static_module.into_bytes() }, &cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let input_values = [1.0_f32, 2.0];
+        let input_bytes = values_to_bytes(input_values.as_slice());
+        let inputs = ExecutionDeviceInputs {
+            inputs: &[ExecutionInput {
+                buffer: Arc::new(
+                    client.buffer(input_bytes.as_slice(), BufferType::F32, &[2], None, device, None).unwrap(),
+                ),
+                donatable: false,
+            }],
+            ..Default::default()
+        };
+        let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+        let mut outputs = execution.block_until_ready().unwrap().remove(0);
+        let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![1.0_f32, 2.0, 1.0, 2.0]);
+
+        // The dynamic program proves that arithmetic results remain scalar SSA edges through both dynamic shape
+        // operations. The pinned XLA translator cannot compile dynamic_broadcast_in_dim, so this case is structural.
+        let extent_variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let extent_type = DimensionType::new(extent_variable.clone());
+        let context = TestContext::new();
+        let input =
+            context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent_variable)])).into());
+        let extent = context.input(extent_type.clone().into());
+        let one_value = ryft_core::DimensionValue::constant(1).unwrap();
+        let one_type = one_value.r#type().clone();
+        let one = context.constant(ArrayProgramValue::Dimension(one_value));
+        let repeated_extent = context
+            .bind(
+                DimensionOperation::Mul(DimensionMulOperation::new(&extent_type, &one_type).unwrap()),
+                Vec::new(),
+                &[extent, one.clone()],
+            )
+            .unwrap()
+            .remove(0);
+        let two = context
+            .bind(
+                DimensionOperation::Add(DimensionAddOperation::new(&one_type, &one_type).unwrap()),
+                Vec::new(),
+                &[one.clone(), one.clone()],
+            )
+            .unwrap()
+            .remove(0);
+        let reshaped = context
+            .bind(ReshapeOperation::new(), Vec::new(), &[input, one, repeated_extent.clone()])
+            .unwrap()
+            .remove(0);
+        let output = context
+            .bind(BroadcastOperation::new(vec![0, 1]), Vec::new(), &[reshaped, two, repeated_extent])
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.instructions().len(), 4);
+        let dynamic_module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(dynamic_module.matches("stablehlo.multiply").count(), 1);
+        assert_eq!(dynamic_module.matches("stablehlo.add").count(), 1);
+        assert_eq!(dynamic_module.matches("stablehlo.dynamic_reshape").count(), 1);
+        assert_eq!(dynamic_module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 1);
+        assert_eq!(dynamic_module.matches("stablehlo.get_dimension_size").count(), 0);
+        assert_eq!(dynamic_module.matches("dimension_to_scalar").count(), 0);
+
+        // Bounds that cannot prove representable arithmetic remain deferred to checked assertion lowering instead of
+        // silently accepting StableHLO integer overflow.
+        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::unbounded()));
+        let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::unbounded()));
+        let context = TestContext::new();
+        let left = context.input(left_type.clone().into());
+        let right = context.input(right_type.clone().into());
+        let output = context
+            .bind(
+                DimensionOperation::Add(DimensionAddOperation::new(&left_type, &right_type).unwrap()),
+                Vec::new(),
+                &[left, right],
+            )
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            lower_array_program_to_stable_hlo(&program, "main"),
+            Err(ArrayProgramLoweringError::Lowering {
+                message: "unsupported staged op 'first-class dimension operation `dimension_add` requires checked \
+                          runtime assertion lowering' during XLA lowering"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]

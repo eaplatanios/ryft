@@ -89,6 +89,7 @@ use crate::parameters::{Parameter, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::builders::ProgramBuilder;
+use crate::programs::identities::TypeIdentityPosition;
 use crate::programs::operations::Operation;
 use crate::programs::programs::{FlatProgram, Program};
 use crate::programs::regions::{
@@ -858,7 +859,20 @@ impl<C: Context> PartialEvaluationContext<C> {
                 .parent
                 .bind(operation, regions, &known)?
                 .into_iter()
-                .map(PartialEvaluationValue::known)
+                .map(|value| {
+                    // A folded value that owns a type identity must remain a producer when it crosses into residual
+                    // work. Embedding its cheap constant payload does that structurally. Symbolic known values remain
+                    // residual inputs because their parent-context producer stays live.
+                    let mut defines_identity = false;
+                    value.r#type().visit_identities(&mut |position, _| {
+                        defines_identity |= position == TypeIdentityPosition::Definition;
+                    });
+                    if defines_identity && self.parent.resolve(&value).is_constant() {
+                        PartialEvaluationValue::known_constant(value)
+                    } else {
+                        PartialEvaluationValue::known(value)
+                    }
+                })
                 .collect())
         } else {
             self.residualize(operation, regions, inputs)
