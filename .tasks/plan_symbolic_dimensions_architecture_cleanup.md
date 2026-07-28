@@ -1073,15 +1073,21 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       the output shape from operand types. The rejected `DimensionOperandSchema`, nested-family prototype, and
       projection-aware-derive analysis are recorded in the P3g plan; none remains in production.
 - [x] P3g Deliveries B–D: migrate reshape, migrate broadcast, and close the combined transform/lowering vertical slice
-      before deleting their legacy homogeneous contracts in the immediately following increment. Delivery B landed at
-      `1aeea5329`, Delivery C landed at `7aef33d93`, and Delivery D is ready for owner review. The combined acceptance
+      before freezing their legacy homogeneous contracts for consumer-by-consumer deletion. Delivery B landed at
+      `1aeea5329`, Delivery C landed at `7aef33d93`, and Delivery D landed at `a4f2c833`. The combined acceptance
       program preserves dimension arithmetic through eager execution, partial evaluation, batching, JVP, import,
       direct StableHLO lowering, and PJRT compilation/execution. The exact legacy-consumer and deletion manifest is in
       `.tasks/plan_p3g_reshape_broadcast.md`.
+- [ ] P3h: migrate concatenate to one mixed contract with a trailing explicit result-extent operand. Preserve its
+      ordinary array inputs, axis semantics, eager validation, transforms, and lowering without result-dimension
+      recovery. The dependency correction and review-sized deliveries are specified in
+      `.tasks/plan_p3h_concatenate.md`.
 - [ ] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
       first-class result-dimension operands. After this point, a fresh output reference without an available operand or
       a definition-position occurrence is a closure error.
-- [ ] Delete their homogeneous operation implementations and every transform rule that depends on those contracts.
+- [ ] Delete each frozen homogeneous reshape/broadcast implementation and transform rule as its owning Phase 4–9
+      consumer migrates. Do not attempt the final zero-residual deletion before the composite public capability and
+      transform domains replace the current homogeneous `Reshape`/`Broadcast` implementations.
 - [ ] Migrate the remaining dual-contract operations:
       concatenate, custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and slice scatter.
 - [ ] Remove the array-program-specific `Operation<ArrayProgramType>` implementations from

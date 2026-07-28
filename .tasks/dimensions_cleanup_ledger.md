@@ -774,5 +774,11 @@ ledger disagrees with Git.
   benchmark; the empty XLA doctest suite; formatting; and whitespace checks passed. The inherited Clippy baseline
   reports no diagnostic in a Delivery D production file.
 - Review method: line by line
-- Next action: owner review, stage, commit, and push Delivery D; then execute the classified legacy-consumer deletion
-  increment
+- P3g source: Delivery D and its rendering follow-up landed at
+  `a4f2c833b01667c363b6ec2aa56065cf8c2508cb`.
+- Deletion-order correction: the classified legacy paths own the homogeneous public capabilities used by consumers
+  assigned to Phases 4–9. They remain frozen and are deleted consumer by consumer during those migrations; attempting
+  immediate wholesale deletion would require either implicit-dimension adapters or collapsing Phases 4–9 into one
+  increment.
+- Next action: execute P3h's explicit concatenate result-extent deliveries from
+  `.tasks/plan_p3h_concatenate.md`
