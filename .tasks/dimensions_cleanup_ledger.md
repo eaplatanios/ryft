@@ -683,7 +683,7 @@ ledger disagrees with Git.
 
 ## P3g: explicit reshape and broadcast dimensions
 
-- Status: ready for owner review — Delivery B
+- Status: ready for owner review — Delivery D
 - Branch: `u/eaplatanios/dynamic-shapes`
 - Baseline commit: `beadf85bd3f96bbf8105bd6f48845a00a4ee2c4f`
 - Delivery A source commit: `cd58f0a52`
@@ -751,5 +751,28 @@ ledger disagrees with Git.
   with one ignored benchmark, the empty XLA doctest suite, both projection-allocation guards, focused mixed/legacy
   reshape and transform/lowering tests, core/XLA compilation, formatting, whitespace checks, residual searches, and
   changed-file Clippy attribution
+- Delivery C source: `7aef33d93c01e926fd98275ec476045cbe8f396d`
+- Delivery C canonical broadcast: `BroadcastOperation` now consumes one array and one dimension operand per output
+  axis; inference derives the result shape while the payload retains only output-axis mapping and output sharding.
+  Eager execution, partial evaluation, batching, JVP, static transpose, identity instantiation/import, direct
+  static/dynamic StableHLO lowering, and static CPU execution are covered.
+- Delivery D combined slice: one stored program computes dimension multiplication and addition, reshapes with their
+  results, then broadcasts using the same explicit SSA edges. It passes eager execution, partial evaluation, batching,
+  JVP, identity instantiation/import, structural dynamic lowering, and static PJRT compile/execute coverage.
+- Delivery D correction: known-side folding now embeds constant-resolvable values whose types define identities as
+  local residual constants. This generic rule prevents a folded dimension result from becoming an unjustified
+  boundary identity while leaving symbolic known values as ordinary residual inputs.
+- Delivery D lowering boundary: bounds-proven dimension addition and multiplication lower directly to scalar
+  StableHLO. Arithmetic without a sufficient upper-bound proof is rejected pending Phase 7 checked runtime
+  assertions; all other first-class dimension operations retain the operation-named unsupported diagnostic.
+- Delivery D residual inventory: 80 `ReshapeDimensionExpression`, 68 `LegacyReshapeOperation`, 81
+  `LegacyBroadcastOperation`, and 35 `DynamicBroadcastOperation` core/XLA occurrences remain. Their exact owning files,
+  42 legacy `From` bounds, 206 legacy method calls, deletion order, and acceptance suite are classified in the P3g
+  plan. No occurrence is unrelated MLIR syntax.
+- Delivery D verification: core/XLA checks; both focused combined tests; all 982 core library tests; 58 executable core
+  doctests with 16 ignored; both projection-allocation guards; all 402 executable XLA library tests with one ignored
+  benchmark; the empty XLA doctest suite; formatting; and whitespace checks passed. The inherited Clippy baseline
+  reports no diagnostic in a Delivery D production file.
 - Review method: line by line
-- Next action: owner review, stage, commit, and push Delivery B; then execute Delivery C as a separate increment
+- Next action: owner review, stage, commit, and push Delivery D; then execute the classified legacy-consumer deletion
+  increment

@@ -1024,28 +1024,6 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       payloads, and centralize their shared contract in `ArithmeticDimensionOperation`.
 - [x] P2b.2: remove the concrete backend dependency from generic arithmetic operation generation, make operations own
       capability-constrained interpretation, and make backends own concrete capability implementations.
-- [x] P3a: introduce the production array-program dispatcher.
-- [x] P3b: make `dimension_size` the sole canonical `array -> dimension` observation.
-- [x] P3c: add the sole explicit `dimension -> scalar-array` conversion.
-- [x] P3d: add the checked `rank-0 integer array -> dimension` gateway.
-- [x] P3e: reject a dedicated indexed `rank-1 integer array -> dimension` gateway. Extract vector elements with
-      ordinary array indexing/slicing and scalarization, then cross the sole `DimensionFromScalarOperation` gateway.
-      Add a general checked element-indexing primitive only if existing array operations cannot express a required
-      dynamic case; do not encode indexing inside the dimension operation family.
-- [x] P3f: extend the canonical `CompareOperation` with
-      `(Dimension, Dimension) -> Array(Boolean scalar)`, using an output-parameterized `Compare<Output>` capability
-      rather than a dimension-specific operation or comparison vocabulary. Preserve the two dimension operands as
-      explicit SSA through eager execution, partial evaluation, replicated-only batching, JVP/import, and direct
-      signed StableHLO comparison lowering. P2a and P2b already provide ordinary dimension SSA, constants, arithmetic,
-      and requirements.
-- [x] P3g Delivery A: retain cross-member primitives as flat `ArrayProgramOperation` variants and specify one explicit
-      dimension operand per reshape/broadcast output axis. Exact constants represent static axes and inference derives
-      the output shape from operand types. The rejected `DimensionOperandSchema`, nested-family prototype, and
-      projection-aware-derive analysis are recorded in the P3g plan; none remains in production.
-- [ ] P3g Deliveries B–D: migrate reshape, migrate broadcast, and close the combined transform/lowering vertical slice
-      before deleting their legacy homogeneous contracts in the immediately following increment.
-      Deliveries B and C are implemented; Delivery B landed at `1aeea5329`, Delivery C is ready for owner review, and
-      Delivery D has not begun.
 - [x] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
 - [x] Integrate inconclusive requirements with the existing effects model as `Effect::OrderedAssertion`; specify
       ordering, DCE survival, known-side PE folding, runtime observation values, and diagnostic ownership before
@@ -1076,9 +1054,30 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 
 ### Phase 3: establish canonical mixed operation signatures
 
-- [x] Make `DimensionSizeOperation` exclusively `array -> dimension`.
-- [x] Keep `DimensionToScalarOperation` as the only `dimension -> scalar-array` conversion.
-- [ ] Migrate reshape and broadcast first as the canonical mixed vertical slice.
+- [x] P3a: introduce the production array-program dispatcher.
+- [x] P3b: make `DimensionSizeOperation` the sole canonical `array -> dimension` observation.
+- [x] P3c: keep `DimensionToScalarOperation` as the sole explicit `dimension -> scalar-array` conversion.
+- [x] P3d: add the checked `rank-0 integer array -> dimension` gateway.
+- [x] P3e: reject a dedicated indexed `rank-1 integer array -> dimension` gateway. Extract vector elements with
+      ordinary array indexing/slicing and scalarization, then cross the sole `DimensionFromScalarOperation` gateway.
+      Add a general checked element-indexing primitive only if existing array operations cannot express a required
+      dynamic case; do not encode indexing inside the dimension operation family.
+- [x] P3f: extend the canonical `CompareOperation` with
+      `(Dimension, Dimension) -> Array(Boolean scalar)`, using an output-parameterized `Compare<Output>` capability
+      rather than a dimension-specific operation or comparison vocabulary. Preserve the two dimension operands as
+      explicit SSA through eager execution, partial evaluation, replicated-only batching, JVP/import, and direct
+      signed StableHLO comparison lowering. P2a and P2b already provide ordinary dimension SSA, constants, arithmetic,
+      and requirements.
+- [x] P3g Delivery A: retain cross-member primitives as flat `ArrayProgramOperation` variants and specify one explicit
+      dimension operand per reshape/broadcast output axis. Exact constants represent static axes and inference derives
+      the output shape from operand types. The rejected `DimensionOperandSchema`, nested-family prototype, and
+      projection-aware-derive analysis are recorded in the P3g plan; none remains in production.
+- [x] P3g Deliveries B–D: migrate reshape, migrate broadcast, and close the combined transform/lowering vertical slice
+      before deleting their legacy homogeneous contracts in the immediately following increment. Delivery B landed at
+      `1aeea5329`, Delivery C landed at `7aef33d93`, and Delivery D is ready for owner review. The combined acceptance
+      program preserves dimension arithmetic through eager execution, partial evaluation, batching, JVP, import,
+      direct StableHLO lowering, and PJRT compilation/execution. The exact legacy-consumer and deletion manifest is in
+      `.tasks/plan_p3g_reshape_broadcast.md`.
 - [ ] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
       first-class result-dimension operands. After this point, a fresh output reference without an available operand or
       a definition-position occurrence is a closure error.
@@ -1932,3 +1931,26 @@ logical-length requirement before scalarization because `dynamic_slice` clamps o
 cannot be expressed cleanly after the mixed slicing migration, Ryft should add a general checked array-element
 operation rather than another dimension-specific gateway. Verification and the residual audit are recorded in the
 P3e cleanup-ledger entry.
+
+### Execution: P3f first-class dimension comparison
+
+P3f extended the existing `CompareOperation` rather than adding a dimension-specific comparison language. Its
+output-parameterized capability supports both ordinary homogeneous comparisons and
+`(Dimension, Dimension) -> Array(Boolean scalar)` in the flat array-program dispatcher. Dimension comparison now
+preserves explicit operands through eager execution, partial evaluation, replicated-only batching, structural
+differentiation, import, rendering, and direct signed StableHLO comparison lowering. Verification and the residual
+audit are recorded in the P3f cleanup-ledger entry.
+
+### Execution: P3g explicit reshape and broadcast dimensions
+
+P3g made canonical reshape and broadcast mixed operations whose output extents are ordered first-class dimension
+operands. Exact constants and dynamic extents use the same contract; inference derives the complete output shape and
+the operation payload stores only non-shape semantics. Deliveries B and C established the individual reshape and
+broadcast paths. Delivery D proves dimension arithmetic feeding both operations in one stored program across eager
+execution, partial evaluation, batching, JVP, identity instantiation, import, direct StableHLO lowering, and static
+PJRT execution.
+
+The old expression/homogeneous implementations remain deliberately isolated for the immediately following consumer
+migration and deletion increment. Their exact symbol counts, owning files, `From` bounds, call-site counts, deletion
+order, and required acceptance tests are recorded in `.tasks/plan_p3g_reshape_broadcast.md`; the Phase 3 homogeneous
+deletion items remain open until that residual search reaches zero.
