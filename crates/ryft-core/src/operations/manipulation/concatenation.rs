@@ -23,13 +23,13 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Dimension, Shape};
+use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, Shape};
 
 /// Canonical operation name for [`ConcatenateOperation`].
 pub const CONCATENATE_OPERATION_NAME: &str = "concatenate";
 
-/// [`Operation`] that joins one or more input arrays end to end along one axis.
-/// Refer to the documentation of [`Concatenate`] for more information.
+/// [`Operation`] that joins array operands along one axis using an explicit result-extent operand.
+/// Refer to the documentation of [`Concatenate`] for general concatenation semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ConcatenateOperation {
     /// Axis along which the operands are joined.
@@ -42,7 +42,10 @@ impl ConcatenateOperation {
     pub fn new<A: Into<Axis>>(axis: A, rank: usize) -> Result<Self, TypeError> {
         let axis = axis.into();
         axis.normalize(rank).map(|axis| Self { axis }).map_err(|_| {
-            TypeError::invalid(format!("'concatenate' axis {axis} is out of bounds for operands of rank {rank}"))
+            TypeError::invalid(format!(
+                "'{}' axis {axis} is out of bounds for operands of rank {rank}",
+                CONCATENATE_OPERATION_NAME,
+            ))
         })
     }
 
@@ -56,7 +59,71 @@ impl ConcatenateOperation {
 impl Display for ConcatenateOperation {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
+        <Self as Operation<ArrayProgramType>>::render(self, formatter, 0)
+    }
+}
+
+impl Operation<ArrayProgramType> for ConcatenateOperation {
+    #[inline]
+    fn name(&self) -> &'static str {
+        CONCATENATE_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayProgramType],
+        region_interfaces: &[RegionInterface<ArrayProgramType>],
+    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        let Some((result_extent, inputs)) = input_types.split_last() else {
+            return Err(TypeError::invalid(format!(
+                "'{}' expects at least one array followed by its result extent",
+                CONCATENATE_OPERATION_NAME,
+            )));
+        };
+        if inputs.is_empty() {
+            return match result_extent {
+                ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
+                    "'{}' expects a trailing result-extent dimension",
+                    CONCATENATE_OPERATION_NAME,
+                ))),
+                ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
+                    "'{}' expects at least one array before its result extent",
+                    CONCATENATE_OPERATION_NAME,
+                ))),
+            };
+        }
+        let inputs = inputs.iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
+        let result_extent = <&DimensionType>::try_from(result_extent)?;
+        let static_sum = validate_concatenation_inputs(&inputs, self.axis)?;
+        let result_dimension = result_extent.to_dimension();
+        if let Some(static_sum) = static_sum
+            && result_dimension != Dimension::Static(static_sum)
+        {
+            return Err(TypeError::invalid(format!(
+                "'{}' result extent is {} but the static input extent sum is {static_sum}",
+                CONCATENATE_OPERATION_NAME, result_dimension,
+            )));
+        }
+
+        let first = inputs[0];
+        let mut dimensions = first.shape().dimensions().to_vec();
+        dimensions[self.axis] = result_dimension;
+        let output_shape = Shape::new(dimensions);
+        if inputs.len() == 1 && first.shape() == &output_shape {
+            return Ok(vec![first.clone().into()]);
+        }
+        let output_type = ArrayType::new(first.data_type(), output_shape)
+            .with_memory(first.memory())
+            .with_sharding(infer_concatenation_sharding(&inputs)?)
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        Ok(vec![output_type.into()])
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, CONCATENATE_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("axis", self.axis))
     }
 }
 
@@ -81,7 +148,7 @@ impl Operation<ArrayType> for ConcatenateOperation {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?
+        OperationFormatter::new(formatter, indentation, CONCATENATE_OPERATION_NAME)?
             .bracketed(|operation| operation.field("axis", self.axis))
     }
 }
@@ -307,7 +374,12 @@ impl Concatenate for ArrayType {
         let rank = first.rank();
         let axis = ConcatenateOperation::new(axis, rank)?.axis();
         let mut dimensions = first.shape().dimensions().to_vec();
-        dimensions[axis] = infer_concatenated_dimension_size(&inputs, axis)?;
+        dimensions[axis] = validate_concatenation_inputs(&inputs, axis)?.map(Dimension::Static).ok_or_else(|| {
+            TypeError::invalid(format!(
+                "'{}' dynamic axis {axis} requires an explicit result-dimension operand",
+                CONCATENATE_OPERATION_NAME,
+            ))
+        })?;
         ArrayType::new(first.data_type(), Shape::new(dimensions))
             .with_memory(first.memory())
             .with_sharding(infer_concatenation_sharding(&inputs)?)
@@ -326,8 +398,8 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         V: 'i,
     {
         // Any context-carrying value concatenates by binding a `ConcatenateOperation` through its own context. The
-        // `From<ConcatenateOperation>` bound makes this disjoint from the eager value types (whose context operation
-        // is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
+        // `From<ConcatenateOperation>` bound makes this disjoint from the eager value types (whose operation is
+        // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
         // implementations.
         let mut inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
         let Some(rank) = inputs.first().map(|input| input.r#type().rank()) else {
@@ -347,11 +419,17 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     }
 }
 
-/// Validates `inputs` and returns their combined dimension [`Dimension`] along `axis`.
-fn infer_concatenated_dimension_size(inputs: &[&ArrayType], axis: usize) -> Result<Dimension, TypeError> {
+/// Validates concatenation array inputs and returns their static axis sum when every input extent is exact.
+fn validate_concatenation_inputs(inputs: &[&ArrayType], axis: usize) -> Result<Option<usize>, TypeError> {
     let first = inputs[0];
     let rank = first.rank();
+    if axis >= rank {
+        return Err(TypeError::invalid(format!(
+            "'{CONCATENATE_OPERATION_NAME}' axis {axis} is out of bounds for operands of rank {rank}",
+        )));
+    }
     let mut concatenated_static = 0usize;
+    let mut all_static = true;
     for (index, operand) in inputs.iter().enumerate() {
         if operand.data_type() != first.data_type() {
             return Err(TypeError::invalid(format!(
@@ -405,14 +483,12 @@ fn infer_concatenated_dimension_size(inputs: &[&ArrayType], axis: usize) -> Resu
                 })?;
             }
             Dimension::Dynamic(_) => {
-                return Err(TypeError::invalid(format!(
-                    "'{CONCATENATE_OPERATION_NAME}' dynamic axis {axis} requires an explicit result-dimension operand",
-                )));
+                all_static = false;
             }
         }
     }
 
-    Ok(Dimension::Static(concatenated_static))
+    Ok(all_static.then_some(concatenated_static))
 }
 
 /// Infers the [`Sharding`] of the result of a concatenation operation using JAX's independent spatial,
@@ -496,6 +572,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::dimensions::DimensionValue;
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -510,6 +587,130 @@ mod tests {
     use crate::types::{DataType, DimensionBounds, DimensionVariable, Layout, Memory, StridedLayout};
 
     use super::*;
+
+    #[test]
+    fn test_explicit_concatenate_operation() {
+        let operation = ConcatenateOperation::new(-2, 2).unwrap();
+        assert_eq!(operation.axis(), 0);
+        assert_eq!(Operation::<ArrayProgramType>::name(&operation), CONCATENATE_OPERATION_NAME);
+        assert_eq!(operation.to_string(), "concatenate [axis=0]");
+        let infer = |input_types: &[ArrayProgramType]| {
+            Operation::<ArrayProgramType>::infer_output_types(&operation, input_types, &[])
+        };
+
+        let first_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
+        let second_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let four = DimensionValue::constant(4).unwrap().r#type().clone();
+        assert_eq!(
+            infer(&[first_type.clone().into(), second_type.clone().into(), four.clone().into()],),
+            Ok(vec![
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])).into()
+            ]),
+        );
+        assert_eq!(
+            infer(&[first_type.clone().into(), DimensionValue::constant(1).unwrap().r#type().clone().into()],),
+            Ok(vec![first_type.clone().into()]),
+        );
+
+        let left = DimensionVariable::new("left", DimensionBounds::new(1, Some(5)).unwrap());
+        let right = DimensionVariable::new("right", DimensionBounds::new(1, Some(6)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::positive(Some(4)).unwrap());
+        let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(10)).unwrap());
+        let dynamic_left = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(left), Dimension::Dynamic(columns.clone())]),
+        );
+        let dynamic_right = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(right), Dimension::Dynamic(columns.clone())]),
+        );
+        assert_eq!(
+            infer(&[dynamic_left.into(), dynamic_right.into(), DimensionType::new(result.clone()).into(),],),
+            Ok(vec![
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(result), Dimension::Dynamic(columns)]),
+                )
+                .into()
+            ]),
+        );
+
+        let placed_first = first_type
+            .clone()
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8, 4])))
+            .with_memory(Memory::Host { pinned: true });
+        let placed_second = second_type
+            .clone()
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8, 4])))
+            .with_memory(Memory::Host { pinned: true });
+        assert_eq!(
+            infer(&[placed_first.into(), placed_second.into(), four.clone().into()]),
+            Ok(vec![
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)]))
+                    .with_memory(Memory::Host { pinned: true })
+                    .into()
+            ]),
+        );
+
+        assert_eq!(
+            infer(&[]),
+            Err(TypeError::invalid(format!(
+                "'{}' expects at least one array followed by its result extent",
+                CONCATENATE_OPERATION_NAME,
+            ))),
+        );
+        assert_eq!(
+            infer(&[first_type.clone().into()]),
+            Err(TypeError::invalid(format!(
+                "'{}' expects a trailing result-extent dimension",
+                CONCATENATE_OPERATION_NAME,
+            ))),
+        );
+        assert_eq!(
+            infer(&[four.clone().into()]),
+            Err(TypeError::invalid(format!(
+                "'{}' expects at least one array before its result extent",
+                CONCATENATE_OPERATION_NAME,
+            ))),
+        );
+        assert_eq!(
+            infer(&[four.clone().into(), four.clone().into()]),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        assert_eq!(
+            infer(&[first_type.clone().into(), four.clone().into(), four.clone().into()]),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        assert_eq!(
+            infer(&[first_type.clone().into(), second_type.clone().into()]),
+            Err(TypeError::invalid("expected dimension type but got array type")),
+        );
+        assert_eq!(
+            infer(&[
+                first_type.clone().into(),
+                second_type.into(),
+                DimensionValue::constant(5).unwrap().r#type().clone().into(),
+            ],),
+            Err(TypeError::invalid(format!(
+                "'{}' result extent is 5 but the static input extent sum is 4",
+                CONCATENATE_OPERATION_NAME,
+            ))),
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &ConcatenateOperation::new(1, 2).unwrap(),
+                &[
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
+                    DimensionValue::constant(1).unwrap().r#type().clone().into(),
+                ],
+                &[],
+            ),
+            Err(TypeError::invalid(format!(
+                "'{}' axis 1 is out of bounds for operands of rank 1",
+                CONCATENATE_OPERATION_NAME,
+            ))),
+        );
+    }
 
     #[test]
     fn test_concatenate() {
@@ -528,7 +729,7 @@ mod tests {
         let operation = ConcatenateOperation::new(0, 2).unwrap();
 
         // Operation identity and accessors.
-        assert_eq!(operation.name(), CONCATENATE_OPERATION_NAME);
+        assert_eq!(Operation::<ArrayType>::name(&operation), CONCATENATE_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "concatenate [axis=0]");
         assert_eq!(operation.axis(), 0);
 
@@ -564,18 +765,22 @@ mod tests {
             operation = operation.clone(),
             cases = [
                 {
+                    type = ArrayType,
                     input_types = [first_type.clone(), second_type.clone()],
                     output_types = [output_type.clone()],
                 },
                 {
+                    type = ArrayType,
                     input_types = [dynamic_stack, fixed_slice.clone()],
                     error = "'concatenate' dynamic axis 0 requires an explicit result-dimension operand",
                 },
                 {
+                    type = ArrayType,
                     input_types = [bounded_stack, fixed_slice],
                     error = "'concatenate' dynamic axis 0 requires an explicit result-dimension operand",
                 },
                 {
+                    type = ArrayType,
                     input_types = [dynamic_non_axis.clone(), dynamic_non_axis.clone()],
                     output_types = [ArrayType::new(
                         DataType::F64,
@@ -583,15 +788,18 @@ mod tests {
                     )],
                 },
                 {
+                    type = ArrayType,
                     input_types = [],
                     error = "'concatenate' expects at least one operand but got none",
                 },
                 {
+                    type = ArrayType,
                     input_types = [first_type.clone(), ArrayType::scalar(DataType::F64)],
                     error = "'concatenate' operands must share one rank but operand 1 has rank 0 and operand 0 has \
                         rank 2",
                 },
                 {
+                    type = ArrayType,
                     input_types = [
                         first_type.clone(),
                         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
@@ -600,6 +808,7 @@ mod tests {
                         operand 0 has data type f64",
                 },
                 {
+                    type = ArrayType,
                     input_types = [
                         first_type.clone(),
                         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(5)])),
@@ -608,6 +817,7 @@ mod tests {
                         on axis 1 and operand 0 has size 2",
                 },
                 {
+                    type = ArrayType,
                     input_types = [
                         dynamic_non_axis,
                         ArrayType::new(

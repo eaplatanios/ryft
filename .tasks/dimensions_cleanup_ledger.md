@@ -782,3 +782,38 @@ ledger disagrees with Git.
   increment.
 - Next action: execute P3h's explicit concatenate result-extent deliveries from
   `.tasks/plan_p3h_concatenate.md`
+
+## P3h Delivery A: explicit concatenate result extent
+
+- Status: ready for owner review — Delivery A
+- Branch: `u/eaplatanios/dynamic-shapes`
+- Baseline commit: `a4f2c833b01667c363b6ec2aa56065cf8c2508cb`
+- Scope: add the canonical mixed `(Array..., Dimension) -> Array` concatenate contract, reference eager execution,
+  tracing, partial evaluation, boundary instantiation, and cross-program import
+- Representation: retain one axis-only `ConcatenateOperation` and implement both `Operation<ArrayType>` and
+  `Operation<ArrayProgramType>` for it. A second nominal concatenate payload was rejected as redundant because the two
+  contracts have identical payloads; only their operand type families differ
+- Inference: require one or more array operands followed by exactly one result-extent dimension, preserve the
+  existing data-type/rank/memory/non-axis/sharding rules, clear layout when concatenation changes shape, preserve a
+  sole identical input, reject contradictory exact sums, and take dynamic result identity solely from the final
+  operand
+- Eager execution: borrow-project every array member, compute the observed axis sum with checked `usize` arithmetic,
+  report expected and supplied extents on mismatch, and delegate successful execution to the existing array
+  concatenate kernel
+- Stored-program acceptance: the dynamic golden contains two `dimension_size` instructions, one `dimension_add`, and
+  one concatenate with the exact array and result-extent SSA edges. All-known partial evaluation folds; either an
+  unknown array or unknown extent retains one concatenate. Generic identity instantiation and program import rename
+  and preserve the trailing result identity
+- Delivery boundary: composite batching and differentiation return explicit P3h Delivery B errors; composite lowering
+  returns an explicit P3h Delivery C error. No generic zero-tangent or homogeneous lowering path silently handles the
+  new mixed variant
+- Residuals: no second nominal concatenate payload exists. Homogeneous concatenate consumers in `ArrayOperation`, the
+  reference backend, `XlaOperation`, and legacy lowering are unchanged from the baseline. No new expression, witness,
+  packed shape operand, implicit source recovery, or ambient dimension lookup was introduced
+- Verification: core/XLA checks; focused mixed and homogeneous concatenate tests; all 985 core library tests; 58
+  executable core doctests with 16 ignored; both projection-allocation guards; all 402 executable XLA library tests
+  with one ignored benchmark; the empty XLA doctest suite; formatting; whitespace checks; and residual searches pass.
+  Library Clippy remains blocked by the inherited 132 `ryft-core` warnings and 10 `ryft-mlir` errors, with no
+  diagnostic in a Delivery A production file
+- Review method: line by line
+- Next action: owner review, commit, and push Delivery A; then execute P3h Delivery B batching and differentiation

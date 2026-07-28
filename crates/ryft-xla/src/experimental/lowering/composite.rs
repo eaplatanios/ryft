@@ -2,6 +2,7 @@
 
 use ryft_core::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
 use ryft_core::backends::dimensions::DimensionOperation;
+use ryft_core::operations::manipulation::CONCATENATE_OPERATION_NAME;
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{Operation as CoreOperation, Program, ProgramError, Typed};
 use ryft_core::sharding::LogicalMesh;
@@ -351,6 +352,9 @@ where
                 Ok(vec![result])
             }
         }
+        ArrayProgramOperation::Concatenate(_) => Err(LoweringError::UnsupportedOp {
+            op: format!("first-class-dimension {} is implemented by P3h Delivery C", CONCATENATE_OPERATION_NAME,),
+        }),
     }
 }
 

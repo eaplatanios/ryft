@@ -16,7 +16,7 @@ use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext
 use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
 use crate::operations::dimensions::{DimensionSizeOperation, DimensionToScalarOperation};
 use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
-use crate::operations::manipulation::{BroadcastOperation, ReshapeOperation, Transpose};
+use crate::operations::manipulation::{BroadcastOperation, CONCATENATE_OPERATION_NAME, ReshapeOperation, Transpose};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationProjection};
@@ -462,6 +462,10 @@ where
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
+            Self::Concatenate(_) => Err(ProgramError::UnsupportedOperation {
+                message: format!("'{}' batching is implemented by P3h Delivery B", CONCATENATE_OPERATION_NAME),
+            }
+            .into()),
             Self::Reshape(operation) => {
                 let Some((input, output_extents)) = inputs.split_first() else {
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());

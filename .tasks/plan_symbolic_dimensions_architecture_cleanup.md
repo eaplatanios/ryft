@@ -1078,9 +1078,11 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       program preserves dimension arithmetic through eager execution, partial evaluation, batching, JVP, import,
       direct StableHLO lowering, and PJRT compilation/execution. The exact legacy-consumer and deletion manifest is in
       `.tasks/plan_p3g_reshape_broadcast.md`.
-- [ ] P3h: migrate concatenate to one mixed contract with a trailing explicit result-extent operand. Preserve its
-      ordinary array inputs, axis semantics, eager validation, transforms, and lowering without result-dimension
-      recovery. The dependency correction and review-sized deliveries are specified in
+- [x] P3h Delivery A: give the existing `ConcatenateOperation` a canonical mixed contract with a trailing explicit
+      result-extent operand while retaining its unchanged homogeneous contract on the same axis-only payload. Mixed
+      inference, eager validation, tracing, partial evaluation, identity instantiation, and import are complete.
+- [ ] P3h Deliveries B–C: preserve the explicit result extent through batching, differentiation, and direct lowering
+      without result-dimension recovery. The dependency correction and review-sized deliveries are specified in
       `.tasks/plan_p3h_concatenate.md`.
 - [ ] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
       first-class result-dimension operands. After this point, a fresh output reference without an available operand or
@@ -1960,3 +1962,18 @@ The old expression/homogeneous implementations remain deliberately isolated for 
 migration and deletion increment. Their exact symbol counts, owning files, `From` bounds, call-site counts, deletion
 order, and required acceptance tests are recorded in `.tasks/plan_p3g_reshape_broadcast.md`; the Phase 3 homogeneous
 deletion items remain open until that residual search reaches zero.
+
+### Execution: P3h Delivery A explicit concatenate result extent
+
+P3h Delivery A extended the existing axis-only `ConcatenateOperation` with
+`Operation<ArrayProgramType>` rather than creating a redundant legacy payload. Its canonical mixed signature is
+`(Array..., Dimension) -> Array`: inference derives the concatenated result axis exclusively from the final
+dimension operand, rejects contradictory exact sums, and preserves dynamic result identities. Eager execution
+validates the supplied extent against the checked observed input sum before calling the existing array kernel.
+
+The dynamic acceptance program computes both input extents with `dimension_size`, combines them with
+`dimension_add`, and passes the resulting ordinary SSA value directly to concatenate. Exact rendering, partial
+evaluation, identity instantiation, and cross-program import preserve that edge without expressions, witnesses,
+packed shape data, or source-array recovery. Batching/differentiation and lowering remain explicit Delivery B/C
+rejections rather than receiving incorrect generic behavior. Verification and residual evidence are recorded in
+`.tasks/plan_p3h_concatenate.md` and the cleanup ledger.

@@ -20,7 +20,8 @@ use crate::operations::dimensions::{
 };
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, Reshape, ReshapeOperation, ReshapeParameters, Transpose,
+    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, Reshape,
+    ReshapeOperation, ReshapeParameters, Transpose,
 };
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, Placeholder};
@@ -95,6 +96,9 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
 
     /// Mixed operation that broadcasts an array using one first-class dimension operand per output axis.
     Broadcast(BroadcastOperation),
+
+    /// Mixed operation that concatenates array operands using one trailing result-extent operand.
+    Concatenate(ConcatenateOperation),
 }
 
 impl<A: Value<Type = ArrayType>> Display for ArrayProgramOperation<A> {
@@ -157,6 +161,13 @@ impl<A: Value<Type = ArrayType>> From<BroadcastOperation> for ArrayProgramOperat
     #[inline]
     fn from(operation: BroadcastOperation) -> Self {
         Self::Broadcast(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<ConcatenateOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: ConcatenateOperation) -> Self {
+        Self::Concatenate(operation)
     }
 }
 
@@ -226,6 +237,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionToScalar(operation) => operation.name(),
             Self::Reshape(operation) => operation.name(),
             Self::Broadcast(operation) => operation.name(),
+            Self::Concatenate(operation) => Operation::<ArrayProgramType>::name(operation),
         }
     }
 
@@ -241,6 +253,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionToScalar(operation) => operation.region_slots(),
             Self::Reshape(operation) => operation.region_slots(),
             Self::Broadcast(operation) => operation.region_slots(),
+            Self::Concatenate(operation) => Operation::<ArrayProgramType>::region_slots(operation),
         }
     }
 
@@ -273,6 +286,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionToScalar(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::Reshape(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::Broadcast(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            Self::Concatenate(operation) => operation.infer_region_input_types(input_types, region_interfaces),
         }
     }
 
@@ -310,6 +324,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionToScalar(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Reshape(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Broadcast(operation) => operation.infer_output_types(input_types, region_interfaces),
+            Self::Concatenate(operation) => operation.infer_output_types(input_types, region_interfaces),
         }
     }
 
@@ -327,6 +342,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionToScalar(operation) => operation.output_region_provenance(output_index),
             Self::Reshape(operation) => operation.output_region_provenance(output_index),
             Self::Broadcast(operation) => operation.output_region_provenance(output_index),
+            Self::Concatenate(operation) => {
+                Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
+            }
         }
     }
 
@@ -342,6 +360,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionToScalar(operation) => operation.is_zero(output_index),
             Self::Reshape(operation) => operation.is_zero(output_index),
             Self::Broadcast(operation) => operation.is_zero(output_index),
+            Self::Concatenate(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
         }
     }
 
@@ -357,6 +376,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionToScalar(operation) => operation.effects(),
             Self::Reshape(operation) => operation.effects(),
             Self::Broadcast(operation) => operation.effects(),
+            Self::Concatenate(operation) => Operation::<ArrayProgramType>::effects(operation),
         }
     }
 
@@ -377,6 +397,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             }
             Self::Reshape(operation) => Ok(Self::Reshape(operation.rename_type_identities(renaming)?)),
             Self::Broadcast(operation) => Ok(Self::Broadcast(operation.rename_type_identities(renaming)?)),
+            Self::Concatenate(operation) => {
+                Ok(Self::Concatenate(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
         }
     }
 
@@ -392,6 +415,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DimensionToScalar(operation) => operation.render(formatter, indentation),
             Self::Reshape(operation) => operation.render(formatter, indentation),
             Self::Broadcast(operation) => operation.render(formatter, indentation),
+            Self::Concatenate(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
         }
     }
 }
@@ -437,8 +461,14 @@ where
     Ok(outputs.into_iter().map(<ArrayProgramValue<A> as ValueProjection<T>>::from_projected).collect())
 }
 
-impl<A: Broadcast + DimensionFromScalar<DimensionValue> + DimensionSize<usize> + Reshape + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
+impl<
+    A: Broadcast
+        + Concatenate
+        + DimensionFromScalar<DimensionValue>
+        + DimensionSize<usize>
+        + Reshape
+        + Value<Type = ArrayType>,
+> InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
 where
     DimensionValue: Compare<A> + DimensionToScalar<A>,
     EagerContext<A, ArrayOperation<A>>: Zero<A>,
@@ -525,6 +555,54 @@ where
                     infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, operation)?;
                 Ok(vec![ArrayProgramValue::Array(input.broadcast(output_type, operation.output_axes())?)])
             }
+            Self::Concatenate(operation) => {
+                let Some((result_extent, inputs)) = inputs.split_last() else {
+                    return Err(TypeError::invalid(format!(
+                        "'{}' expects at least one array followed by its result extent",
+                        CONCATENATE_OPERATION_NAME,
+                    ))
+                    .into());
+                };
+                if inputs.is_empty() {
+                    return match result_extent {
+                        ArrayProgramValue::Array(_) => Err(TypeError::invalid(format!(
+                            "'{}' expects a trailing result-extent dimension",
+                            CONCATENATE_OPERATION_NAME,
+                        ))
+                        .into()),
+                        ArrayProgramValue::Dimension(_) => Err(TypeError::invalid(format!(
+                            "'{}' expects at least one array before its result extent",
+                            CONCATENATE_OPERATION_NAME,
+                        ))
+                        .into()),
+                    };
+                }
+                let result_extent = <ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected(result_extent)?;
+                let inputs = inputs
+                    .iter()
+                    .map(<ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let actual_extent = inputs.iter().try_fold(0usize, |extent, input| {
+                    extent.checked_add(input.dimension_size(operation.axis())?).ok_or_else(|| {
+                        ProgramError::from(TypeError::invalid(format!(
+                            "'{}' result extent overflows usize",
+                            CONCATENATE_OPERATION_NAME,
+                        )))
+                    })
+                })?;
+                if result_extent.extent() != actual_extent {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "'{}' result extent must equal the sum of input axis {} extents; expected {actual_extent} \
+                             but got {}",
+                            CONCATENATE_OPERATION_NAME,
+                            operation.axis(),
+                            result_extent.extent(),
+                        ),
+                    });
+                }
+                Ok(vec![ArrayProgramValue::Array(A::concatenate(inputs.iter().copied(), operation.axis())?)])
+            }
         }
     }
 }
@@ -586,6 +664,12 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        if matches!(self, Self::Concatenate(_)) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'{}' differentiation is implemented by P3h Delivery B", CONCATENATE_OPERATION_NAME,),
+            }
+            .into());
+        }
         if matches!(self, Self::Reshape(_) | Self::Broadcast(_)) {
             let Some((array, output_extents)) = inputs.split_first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -672,6 +756,12 @@ where
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        if matches!(self, Self::Concatenate(_)) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'{}' transposition is implemented by P3h Delivery B", CONCATENATE_OPERATION_NAME,),
+            }
+            .into());
+        }
         if let Self::Broadcast(operation) = self {
             let Some((input, output_extents)) = inputs.split_first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -1108,7 +1198,7 @@ mod tests {
     use crate::operations::dimensions::{
         DimensionAddOperation, DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation,
     };
-    use crate::operations::manipulation::{BroadcastOperation, ReshapeOperation};
+    use crate::operations::manipulation::{BroadcastOperation, ConcatenateOperation, ReshapeOperation};
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
     use crate::partial::PartialTracer;
@@ -1495,6 +1585,47 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        let concatenate_context = TestContext::new();
+        let left =
+            concatenate_context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
+        let right =
+            concatenate_context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into());
+        let extent = concatenate_context.constant(ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let left_atom = left.atom_id().unwrap();
+        let right_atom = right.atom_id().unwrap();
+        let extent_atom = extent.atom_id().unwrap();
+        let output = concatenate_context
+            .bind(ConcatenateOperation::new(0, 1).unwrap(), Vec::new(), &[left, right, extent])
+            .unwrap()
+            .remove(0);
+        let concatenate_builder = concatenate_context.builder().borrow();
+        let [instruction] = concatenate_builder.instructions() else {
+            panic!("expected one concatenate instruction");
+        };
+        assert_eq!(instruction.inputs(), &[left_atom, right_atom, extent_atom]);
+        assert!(matches!(instruction.operation(), ArrayProgramOperation::Concatenate(_)));
+        drop(concatenate_builder);
+        let concatenate_program = concatenate_context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            concatenate_program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[1] .
+                let %2:dimension<3> = const
+                    %3:f32[3] = concatenate [axis=0] %0 %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -1873,6 +2004,199 @@ mod tests {
             &ArrayProgramType::Array(ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![Dimension::Dynamic(target), Dimension::Static(1)]),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_array_program_concatenate() {
+        let operation = ConcatenateOperation::new(0, 1).unwrap();
+        let left = ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0]));
+        let right = ArrayProgramValue::Array(Array::vector(vec![3.0_f32]));
+        let extent = ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap());
+        let output = ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let context = EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+
+        // Eager execution consumes the explicit extent without copying either array during member projection.
+        assert_eq!(
+            context.bind(operation.clone(), Vec::new(), &[left.clone(), right.clone(), extent.clone()],),
+            Ok(vec![output.clone()]),
+        );
+        assert_eq!(
+            context.bind(
+                operation.clone(),
+                Vec::new(),
+                &[left.clone(), ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()),],
+            ),
+            Ok(vec![left.clone()]),
+        );
+
+        let observed_extent_type =
+            DimensionType::new(DimensionVariable::new("observed", DimensionBounds::new(1, Some(9)).unwrap()));
+        assert_eq!(
+            ArrayProgramOperation::<Array>::from(operation.clone()).interpret(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    left.clone(),
+                    right.clone(),
+                    ArrayProgramValue::Dimension(DimensionValue::new(observed_extent_type, 4).unwrap()),
+                ],
+            ),
+            Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "'{}' result extent must equal the sum of input axis 0 extents; expected 3 but got 4",
+                    CONCATENATE_OPERATION_NAME,
+                ),
+            }),
+        );
+
+        // Partial evaluation folds a fully known concatenate and otherwise retains exactly one operation with the
+        // explicit extent edge, including when only that extent is unknown.
+        check_operation_partial_evaluation!(
+            backend = (ArrayProgramValue<Array>, ArrayProgramOperation<Array>),
+            operation = operation.clone(),
+            cases = [
+                {
+                    inputs = [(@known, left.clone()), (@known, right.clone()), (@known, extent.clone())],
+                    outputs = [(@known, output.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = left.r#type().into_owned(), replay = left.clone())),
+                        (@known, right.clone()),
+                        (@known, extent.clone()),
+                    ],
+                    outputs = [(@residual, output.clone())],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@known, left.clone()),
+                        (@known, right.clone()),
+                        (@unknown(type = extent.r#type().into_owned(), replay = extent.clone())),
+                    ],
+                    outputs = [(@residual, output.clone())],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // A stored dynamic program computes the trailing extent through ordinary dimension SSA and records every
+        // dependency explicitly on the concatenate instruction.
+        let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(5)).unwrap());
+        let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(6)).unwrap());
+        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(left_variable.clone())]));
+        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(right_variable.clone())]));
+        let left_size_operation = DimensionSizeOperation::new(&left_type, 0).unwrap();
+        let right_size_operation = DimensionSizeOperation::new(&right_type, 0).unwrap();
+        let left_size_type = left_size_operation.result_type().clone();
+        let right_size_type = right_size_operation.result_type().clone();
+        let add_operation = DimensionAddOperation::new(&left_size_type, &right_size_type).unwrap();
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let left_input = builder.add_input(left_type.into());
+        let right_input = builder.add_input(right_type.into());
+        let left_size = builder.add_instruction(left_size_operation, Vec::new(), vec![left_input]).unwrap()[0];
+        let right_size = builder.add_instruction(right_size_operation, Vec::new(), vec![right_input]).unwrap()[0];
+        let result_extent = builder
+            .add_instruction(DimensionOperation::Add(add_operation), Vec::new(), vec![left_size, right_size])
+            .unwrap()[0];
+        let concatenated = builder
+            .add_instruction(operation, Vec::new(), vec![left_input, right_input, result_extent])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![concatenated],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let [left_size_instruction, right_size_instruction, add_instruction, concatenate_instruction] =
+            program.instructions()
+        else {
+            panic!("expected two dimension reads, one dimension addition, and one concatenate");
+        };
+        assert_eq!(left_size_instruction.inputs(), &[left_input]);
+        assert_eq!(right_size_instruction.inputs(), &[right_input]);
+        assert_eq!(add_instruction.inputs(), &[left_size, right_size]);
+        assert_eq!(concatenate_instruction.inputs(), &[left_input, right_input, result_extent]);
+        assert!(matches!(concatenate_instruction.operation(), ArrayProgramOperation::Concatenate(_),));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[left], %1:f32[right] .
+                let %2:dimension<left ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %3:dimension<right ∈ [1, 6)> = dimension_size [axis=0] %1
+                    %4:dimension<left + right ∈ [2, 10)> = dimension_add %2 %3
+                    %5:f32[left + right] = concatenate [axis=0] %0 %1 %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(program.interpret(vec![left, right]), Ok(vec![output]));
+    }
+
+    #[test]
+    fn test_array_program_concatenate_identity_instantiation() {
+        let bounds = DimensionBounds::new(1, Some(9)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(12)).unwrap());
+        let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
+        let fixed_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let source_array = builder.add_input(source_array_type.into());
+        let fixed_array = builder.add_input(fixed_array_type.clone().into());
+        let result_extent = builder.add_input(DimensionType::new(result.clone()).into());
+        let output = builder
+            .add_instruction(
+                ConcatenateOperation::new(0, 1).unwrap(),
+                Vec::new(),
+                vec![source_array, fixed_array, result_extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let target = DimensionVariable::new("target", bounds);
+        let target_result = DimensionVariable::new("target_result", DimensionBounds::new(2, Some(12)).unwrap());
+        let target_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target.clone())]));
+        let target_result_type = DimensionType::new(target_result.clone());
+        let instantiated = program
+            .with_instantiated_type_identities(&[
+                target_array_type.clone().into(),
+                fixed_array_type.clone().into(),
+                target_result_type.clone().into(),
+            ])
+            .unwrap()
+            .into_owned();
+        assert_eq!(
+            instantiated.output_types(),
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target_result.clone())])).into()],
+        );
+
+        let mut destination = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let imported_source = destination.add_input(target_array_type.into());
+        let imported_fixed = destination.add_input(fixed_array_type.into());
+        let imported_extent = destination.add_input(target_result_type.into());
+        let imported_outputs = destination
+            .splice_program(&instantiated, &[imported_source, imported_fixed, imported_extent])
+            .unwrap();
+        let [instruction] = destination.instructions() else {
+            panic!("expected the imported concatenate instruction");
+        };
+        assert_eq!(instruction.inputs(), &[imported_source, imported_fixed, imported_extent]);
+        assert_eq!(instruction.outputs(), imported_outputs.as_slice());
+        assert_eq!(
+            destination.atoms()[imported_outputs[0].index()].r#type().as_ref(),
+            &ArrayProgramType::Array(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(target_result)]),
             )),
         );
     }
