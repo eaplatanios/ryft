@@ -84,20 +84,23 @@ payloads currently implement both `Operation<ArrayType>` and `Operation<ArrayPro
 - `SliceOperation`; and
 - `SliceScatterOperation`.
 
-The inventory must also include overlapping generic constructor contracts, which are a distinct and harder case:
+The archived inventory also included overlapping generic constructor contracts, which are a distinct and harder
+case:
 
 - `ZeroOperation<ArrayType>`;
 - `OneOperation<ArrayType>`;
 - `FillOperation<ArrayType, V>`; and
 - `IotaOperation<ArrayType>`.
 
-Each constructor has a generic homogeneous `Operation<T>` implementation and an array-program-specific implementation
-that adds explicit dynamic-dimension operands. These cannot be resolved by merely selecting one of two handwritten
-implementations while retaining the blanket generic contract. The canonical destination is:
+The current branch has already removed those four archived array-program-specific implementations. `One`, `Fill`, and
+`Iota` now appear only in the homogeneous array family. One temporary exception remains:
+`ArrayProgramOperation::Zero(ZeroOperation<ArrayProgramType>)`, which lets generic differentiation machinery
+materialize a composite array zero without explicit geometry. The final constructor design cannot be resolved merely
+by retaining that generic escape hatch. The canonical destination is:
 
 - operand-relative `zero_like`/`one_like` for transform-generated values whenever a source array exists;
 - a homogeneous static constructor only when its output type has no dynamic axes; and
-- one explicitly mixed shaped-constructor wrapper for zero, one, fill, and iota when dynamic extents are operands.
+- one explicitly mixed shaped-constructor wrapper for zero, one, fill, and iota when runtime extents are operands.
 
 The wrapper is a distinct operation contract around the homogeneous constructor payload; the payload itself does not
 implement a second type-family contract. Static and dynamic construction must not be distinguished by ambient operand
@@ -357,10 +360,12 @@ native eager member interpretation, and composite-operation validation without n
 derive modes.
 
 Generic nullary constructors remain homogeneous only for types whose complete output geometry is metadata-only. Array
-construction with dynamic axes uses one mixed shaped-constructor wrapper that consumes explicit dimension operands
-and delegates the element-generation semantics to `ZeroOperation<ArrayType>`, `OneOperation<ArrayType>`,
-`FillOperation<ArrayType, V>`, or `IotaOperation<ArrayType>`. This avoids overlapping a blanket `Operation<T>`
-implementation with an `ArrayProgramType` implementation for the same instantiated payload.
+construction with dynamic axes uses one mixed shaped-constructor wrapper that consumes one explicit dimension operand
+per output axis, including exact constants, and delegates the element-generation semantics to
+`ZeroOperation<ArrayType>`, `OneOperation<ArrayType>`, `FillOperation<ArrayType, V>`, or
+`IotaOperation<ArrayType>`. This avoids overlapping a blanket `Operation<T>` implementation with an
+`ArrayProgramType` implementation for the same instantiated payload and gives constructors the same direct positional
+shape contract as reshape and broadcast.
 
 Delete the complete homogeneous `backends::arrays::ArrayOperation` shape-program family. If the shorter name
 `ArrayOperation` remains desirable, give it to the array-only primitive family after consumers migrate. Do not keep a
@@ -1102,14 +1107,16 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [x] Complete and remove the remaining-operation inventory through P3i's explicit mixed migration or array-only
       classification proof: custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and the
       archived slice-scatter proposal.
-- [ ] Remove the array-program-specific `Operation<ArrayProgramType>` implementations from
-      `ZeroOperation<ArrayType>`, `OneOperation<ArrayType>`, `FillOperation<ArrayType, V>`, and
-      `IotaOperation<ArrayType>`.
+- [ ] P3j: introduce the single shaped-constructor wrapper and complete the constructor migration specified in
+      `.tasks/plan_p3j_shaped_constructors.md`. The current branch has no direct array-program-specific operation
+      implementations for the four `ArrayType` payloads; cleanup instead removes the temporary
+      `ArrayProgramOperation::Zero(ZeroOperation<ArrayProgramType>)` escape hatch once transform-owned explicit extent
+      residuals can replace it.
 - [ ] Route transform-generated zero/one values through structural zero or `zero_like`/`one_like` whenever an operand
       supplies geometry.
 - [ ] Keep homogeneous nullary zero/one/fill/iota only for fully static array output types.
-- [ ] Route dynamic zero/one/fill/iota through one mixed shaped-constructor wrapper whose only additional operands are
-      its explicit dynamic extents.
+- [ ] Route dynamic zero/one/fill/iota through one mixed shaped-constructor wrapper with one explicit dimension
+      operand per output axis, including exact constants.
 - [ ] Sweep shape-changing collectives and every other operation whose result metadata references first-class
       dimension operands.
 - [ ] Give each mixed operation one direct positional operand contract and migrate its inference, eager rule,
