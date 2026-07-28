@@ -817,3 +817,36 @@ ledger disagrees with Git.
   diagnostic in a Delivery A production file
 - Review method: line by line
 - Next action: owner review, commit, and push Delivery A; then execute P3h Delivery B batching and differentiation
+
+## P3h Delivery B: explicit concatenate transforms
+
+- Status: ready for owner review — Delivery B
+- Branch: `u/eaplatanios/dynamic-shapes`
+- Baseline commit: `0461874998fb87435722c8eef0ef26b1c294eb11`
+- Scope: preserve the canonical mixed concatenate's trailing result-extent operand through composite batching, JVP,
+  and static transpose while retaining the Phase 6 dynamic-transpose boundary
+- Batching: require replicated extent authority, return the typed `BatchingError::MappedDimension` for a malformed
+  mapped extent, align mapped and replicated array operands through `ArrayBatch::match_axis`, preserve the composite
+  mapped-axis sharding when materializing a replicated operand, shift the logical concatenate axis around the common
+  physical batch axis, and stage the same mixed concatenate with the unchanged extent value. The payload
+  `ConcatenateOperation` owns this rule and the outer composite operation dispatcher only forwards to it
+- Differentiation: stage primal and live-tangent concatenates with one shared transformed extent SSA value; materialize
+  structural zero array tangents in the existing projected array context rather than broadening the composite
+  operation contract; delegate static transpose to the homogeneous slice pullback and append a structural-zero extent
+  cotangent
+- Dynamic boundary: reject transpose when any concatenated input axis is dynamic with the exact Phase 6
+  dimension-residual diagnostic; JVP remains supported for both exact and dynamic extents
+- Composition: the stored `dimension_size(left), dimension_size(right), dimension_add, concatenate` program passes
+  JVP and composite batching. Its JVP graph contains primal and tangent concatenate instructions whose final operand
+  is the same transformed `dimension_add` result
+- Residuals: no P3h Delivery B placeholder rejection remains. No expression, witness, packed shape operand,
+  source-array recovery, or ambient dimension lookup was introduced. Direct composite lowering remains the explicit
+  Delivery C boundary
+- Verification: focused concatenate batching/differentiation tests; all 986 core library tests; 58 executable core
+  doctests with 16 ignored; both projection-allocation guards; all 402 executable XLA library tests with one ignored
+  benchmark; the empty XLA doctest suite; core/XLA compilation; formatting; whitespace checks; and residual searches
+  pass.
+  Library Clippy remains blocked by the inherited 132 `ryft-core` warnings and 10 `ryft-mlir` errors, with no
+  diagnostic in a Delivery B production file
+- Review method: line by line
+- Next action: owner review, commit, and push Delivery B; then execute P3h Delivery C direct lowering and closure

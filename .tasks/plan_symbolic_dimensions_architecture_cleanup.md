@@ -1081,8 +1081,12 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [x] P3h Delivery A: give the existing `ConcatenateOperation` a canonical mixed contract with a trailing explicit
       result-extent operand while retaining its unchanged homogeneous contract on the same axis-only payload. Mixed
       inference, eager validation, tracing, partial evaluation, identity instantiation, and import are complete.
-- [ ] P3h Deliveries B–C: preserve the explicit result extent through batching, differentiation, and direct lowering
-      without result-dimension recovery. The dependency correction and review-sized deliveries are specified in
+- [x] P3h Delivery B: preserve the explicit result extent through batching and differentiation without
+      result-dimension recovery. Composite batching aligns mapped array axes while requiring replicated extent
+      authority. JVP reuses the same extent SSA value for primal and tangent concatenates; static transpose reuses the
+      established slicing pullback and dynamic transpose names the Phase 6 residual requirement.
+- [ ] P3h Delivery C: lower explicit-extent concatenate directly and close its measured CPU execution and residual
+      audits. The dependency correction and review-sized delivery are specified in
       `.tasks/plan_p3h_concatenate.md`.
 - [ ] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
       first-class result-dimension operands. After this point, a fresh output reference without an available operand or
@@ -1172,6 +1176,12 @@ rename only part of the problem while introducing another carrier.
       has neutral trait-solver, compile-time, and allocation behavior. If the policy parameter spreads equivalent or
       greater ceremony through ordinary batching, retain a localized composite adapter, document the evidence, and
       reduce it to the smallest value-kind policy layer rather than forcing the abstraction.
+- [ ] Generalize the operation batching contract alongside the carrier, context, and driver so that one
+      `BatchableOperation` can serve homogeneous and composite batching, then delete
+      `ArrayProgramBatchableOperation`. Do not generalize the operation trait in isolation: its inputs, outputs,
+      active context, and recursive driver must all come from the same transform-owned batching policy. If the
+      prototype gate rejects the generic policy because it adds more ceremony than it removes, retain the localized
+      composite trait and record that evidence explicitly.
 - [ ] Gate: the final design has one canonical representation for each necessary batching concept, no wrapper that
       merely renames `ArrayProgramBatch`, and no parallel context/tracer tower unless the rejected-policy evidence
       demonstrates that the localized duplication is the simpler implementation.
@@ -1977,3 +1987,17 @@ evaluation, identity instantiation, and cross-program import preserve that edge 
 packed shape data, or source-array recovery. Batching/differentiation and lowering remain explicit Delivery B/C
 rejections rather than receiving incorrect generic behavior. Verification and residual evidence are recorded in
 `.tasks/plan_p3h_concatenate.md` and the cleanup ledger.
+
+### Execution: P3h Delivery B concatenate transforms
+
+P3h Delivery B preserves the explicit result extent through batching and differentiation. Composite batching rejects
+mapped dimension authority with `BatchingError::MappedDimension`, aligns every mapped or replicated array operand on
+one physical batch axis using the existing `ArrayBatch` machinery, shifts the logical concatenate axis when needed,
+and stages the same mixed operation with the unchanged extent operand.
+
+Forward differentiation stages primal and tangent concatenates against the same transformed extent SSA value and
+materializes structural zero array tangents only through the existing projected array context. Static transposition
+delegates to the established homogeneous slice-based pullback and gives the extent a structural-zero cotangent.
+Dynamic concatenated axes retain the explicit Phase 6 dimension-residual boundary. The dynamic
+`dimension_size -> dimension_add -> concatenate` acceptance program now passes eager execution, partial evaluation,
+batching, JVP, identity instantiation, and import; direct lowering remains P3h Delivery C.

@@ -16,7 +16,9 @@ use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext
 use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
 use crate::operations::dimensions::{DimensionSizeOperation, DimensionToScalarOperation};
 use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
-use crate::operations::manipulation::{BroadcastOperation, CONCATENATE_OPERATION_NAME, ReshapeOperation, Transpose};
+use crate::operations::manipulation::{
+    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, ReshapeOperation, Transpose,
+};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationProjection};
@@ -319,6 +321,95 @@ where
     }
 }
 
+// TODO(eaplatanios): Move this to the module where `ConcatenateOperation` is defined.
+impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for ConcatenateOperation
+where
+    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
+    C::Operation: From<ConcatenateOperation>,
+{
+    fn batch<D: RegionDriver<C::Constant, C::Operation>>(
+        &self,
+        context: &ArrayProgramBatchingContext<C>,
+        _driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let Some((result_extent, inputs)) = inputs.split_last() else {
+            return Err(TypeError::invalid(format!(
+                "'{}' expects at least one array followed by its result extent",
+                CONCATENATE_OPERATION_NAME,
+            ))
+            .into());
+        };
+        if inputs.is_empty() {
+            return match result_extent.unbatched_type() {
+                ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
+                    "'{}' expects a trailing result-extent dimension",
+                    CONCATENATE_OPERATION_NAME,
+                ))
+                .into()),
+                ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
+                    "'{}' expects at least one array before its result extent",
+                    CONCATENATE_OPERATION_NAME,
+                ))
+                .into()),
+            };
+        }
+        // A mapped extent would authorize a different output shape for each batch item, which requires a ragged
+        // representation. Concatenate therefore accepts only one replicated result extent.
+        result_extent.validate_replicated_dimension()?;
+
+        let projected_inputs = inputs
+            .iter()
+            .map(|input| {
+                let r#type = <&ArrayType>::try_from(input.value.r#type().as_ref())?.clone();
+                ArrayBatch::new(
+                    r#type,
+                    <C::Value as ValueProjection<ArrayType>>::into_projected(input.value.clone())?,
+                    input.batch_axis,
+                )
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()?;
+        let Some(batch_axis) = projected_inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
+            return Ok(context
+                .parent
+                .bind(
+                    self.clone(),
+                    Vec::new(),
+                    &inputs
+                        .iter()
+                        .chain(std::iter::once(result_extent))
+                        .map(|input| input.value.clone())
+                        .collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .map(ArrayProgramBatch::replicated)
+                .collect());
+        };
+
+        // Align every physical array on one mapped axis. Replicated operands gain that axis using the transform's
+        // declared sharding, so each batch item concatenates the corresponding logical arrays.
+        let axis_size = ArrayBatch::common_batch_size(&projected_inputs)?.expect("a mapped input pins the batch size");
+        let aligned_inputs = projected_inputs
+            .iter()
+            .map(|input| input.match_axis(batch_axis, axis_size, context.axis_sharding.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
+        let lifted_operation = ConcatenateOperation::new(lifted_axis, aligned_inputs[0].r#type().rank())?;
+        let mut lifted_inputs = aligned_inputs
+            .into_iter()
+            .map(ArrayBatch::into_value)
+            .map(<C::Value as ValueProjection<ArrayType>>::from_projected)
+            .collect::<Vec<_>>();
+        lifted_inputs.push(result_extent.value.clone());
+        context
+            .parent
+            .bind(lifted_operation, Vec::new(), lifted_inputs.as_slice())?
+            .into_iter()
+            .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(batch_axis)))
+            .collect()
+    }
+}
+
 impl<A, C> ArrayProgramBatchableOperation<C> for ArrayProgramOperation<A>
 where
     A: Value<Type = ArrayType>,
@@ -327,9 +418,10 @@ where
             Constant: ValueProjection<ArrayType, Projected = A>
                           + ValueProjection<DimensionType, Projected = DimensionValue>,
         >,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
+    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     C::Operation: From<ArrayProgramOperation<A>>
+        + From<ConcatenateOperation>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     ArrayOperation<A>: BatchableOperation<ProjectedContext<C, ArrayType>>,
@@ -337,7 +429,7 @@ where
     fn batch<D: RegionDriver<C::Constant, C::Operation>>(
         &self,
         context: &ArrayProgramBatchingContext<C>,
-        _driver: &D,
+        driver: &D,
         inputs: &[ArrayProgramBatch<C::Value>],
     ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
         match self {
@@ -462,10 +554,7 @@ where
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
-            Self::Concatenate(_) => Err(ProgramError::UnsupportedOperation {
-                message: format!("'{}' batching is implemented by P3h Delivery B", CONCATENATE_OPERATION_NAME),
-            }
-            .into()),
+            Self::Concatenate(operation) => ArrayProgramBatchableOperation::batch(operation, context, driver, inputs),
             Self::Reshape(operation) => {
                 let Some((input, output_extents)) = inputs.split_first() else {
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -858,6 +947,84 @@ mod tests {
             ),
             Err(BatchingError::MappedDimension {
                 r#type: Box::new(<&DimensionType>::try_from(&mapped_broadcast_extent_type).unwrap().clone()),
+                axis: BatchAxis::new(0),
+            }),
+        );
+
+        // Concatenate aligns mapped array operands before shifting the logical concatenation axis around the common
+        // physical batch axis. Its trailing extent remains replicated shape authority.
+        let concatenate = ArrayProgramOperation::<Array>::from(ConcatenateOperation::new(0, 1).unwrap());
+        let concatenate_extent = ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap());
+        let concatenate_output = concatenate
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    ArrayProgramBatch::new(
+                        ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0])),
+                        BatchAxis::new(1),
+                    )
+                    .unwrap(),
+                    ArrayProgramBatch::new(
+                        ArrayProgramValue::Array(Array::matrix(2, 1, vec![5.0_f32, 6.0])),
+                        BatchAxis::new(0),
+                    )
+                    .unwrap(),
+                    ArrayProgramBatch::replicated(concatenate_extent.clone()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            concatenate_output,
+            vec![
+                ArrayProgramBatch::new(
+                    ArrayProgramValue::Array(Array::matrix(3, 2, vec![1.0_f32, 3.0, 2.0, 4.0, 5.0, 6.0])),
+                    BatchAxis::new(1),
+                )
+                .unwrap()
+            ],
+        );
+        assert_eq!(
+            concatenate
+                .batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[
+                        ArrayProgramBatch::new(
+                            ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+                            BatchAxis::new(0),
+                        )
+                        .unwrap(),
+                        ArrayProgramBatch::replicated(ArrayProgramValue::Array(Array::vector(vec![5.0_f32]))),
+                        ArrayProgramBatch::replicated(concatenate_extent.clone()),
+                    ],
+                )
+                .unwrap(),
+            vec![
+                ArrayProgramBatch::new(
+                    ArrayProgramValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 5.0, 3.0, 4.0, 5.0],)),
+                    BatchAxis::new(0),
+                )
+                .unwrap()
+            ],
+        );
+        let concatenate_extent_type = concatenate_extent.r#type().into_owned();
+        assert_eq!(
+            concatenate.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    ArrayProgramBatch::replicated(ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0]))),
+                    ArrayProgramBatch::replicated(ArrayProgramValue::Array(Array::vector(vec![3.0_f32]))),
+                    ArrayProgramBatch {
+                        value: concatenate_extent,
+                        batch_axis: BatchAxis::new(0),
+                        r#type: concatenate_extent_type.clone(),
+                    },
+                ],
+            ),
+            Err(BatchingError::MappedDimension {
+                r#type: Box::new(<&DimensionType>::try_from(&concatenate_extent_type).unwrap().clone()),
                 axis: BatchAxis::new(0),
             }),
         );

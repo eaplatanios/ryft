@@ -664,11 +664,57 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if matches!(self, Self::Concatenate(_)) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'{}' differentiation is implemented by P3h Delivery B", CONCATENATE_OPERATION_NAME,),
+        // TODO(eaplatatanios): Split these out into per-payload `DifferentiableOperation` implementations in the
+        //  corresponding modules and then have this implementation simply delegate.
+        if let Self::Concatenate(_) = self {
+            let Some((result_extent, array_inputs)) = inputs.split_last() else {
+                return Err(TypeError::invalid(format!(
+                    "'{}' differentiation expects at least one array followed by its result extent",
+                    CONCATENATE_OPERATION_NAME,
+                ))
+                .into());
+            };
+            if array_inputs.is_empty() {
+                return match result_extent.primal().r#type().as_ref() {
+                    ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
+                        "'{}' differentiation expects a trailing result-extent dimension",
+                        CONCATENATE_OPERATION_NAME,
+                    ))
+                    .into()),
+                    ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
+                        "'{}' differentiation expects at least one array before its result extent",
+                        CONCATENATE_OPERATION_NAME,
+                    ))
+                    .into()),
+                };
             }
-            .into());
+
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+            let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
+                MaybeZero::Zero(primal.r#type().tangent())
+            } else {
+                // Concatenation is linear in its array operands. Materialize only the structural zero array tangents
+                // needed beside live tangents, and replay the primal result extent as unchanged shape authority.
+                let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
+                let mut tangent_inputs = array_inputs
+                    .iter()
+                    .map(|input| -> Result<C::Value, DifferentiationError> {
+                        let tangent = match input.tangent() {
+                            MaybeZero::Zero(r#type) => MaybeZero::Zero(<&ArrayType>::try_from(r#type)?.clone()),
+                            MaybeZero::Value(value) => MaybeZero::Value(
+                                <C::Value as ValueProjection<ArrayType>>::into_projected(value.clone())?,
+                            ),
+                        };
+                        Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(
+                            tangent.materialize(&projected_context)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                tangent_inputs.push(result_extent.primal().clone());
+                MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
+            };
+            return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
         }
         if matches!(self, Self::Reshape(_) | Self::Broadcast(_)) {
             let Some((array, output_extents)) = inputs.split_first() else {
@@ -752,15 +798,53 @@ where
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
-        _driver: &D,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        if matches!(self, Self::Concatenate(_)) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'{}' transposition is implemented by P3h Delivery B", CONCATENATE_OPERATION_NAME,),
+        if let Self::Concatenate(operation) = self {
+            let Some((result_extent, array_inputs)) = inputs.split_last() else {
+                return Err(TypeError::invalid(format!(
+                    "'{}' transpose expects at least one array followed by its result extent",
+                    CONCATENATE_OPERATION_NAME,
+                ))
+                .into());
+            };
+            if array_inputs.is_empty() {
+                return match result_extent.r#type().as_ref() {
+                    ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
+                        "'{}' transpose expects a trailing result-extent dimension",
+                        CONCATENATE_OPERATION_NAME,
+                    ))
+                    .into()),
+                    ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
+                        "'{}' transpose expects at least one array before its result extent",
+                        CONCATENATE_OPERATION_NAME,
+                    ))
+                    .into()),
+                };
             }
-            .into());
+            for input in array_inputs {
+                let input_type = input.r#type();
+                let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+                if matches!(input_type.dimension(operation.axis()), Dimension::Dynamic(_)) {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "'{}' transpose with dynamic input extents requires Phase 6 dimension residuals",
+                            CONCATENATE_OPERATION_NAME,
+                        ),
+                    }
+                    .into());
+                }
+            }
+
+            // Static concatenation uses the established homogeneous pullback, which slices the output cotangent at
+            // cumulative input offsets. The explicit result extent is shape authority and has a structural-zero
+            // cotangent.
+            let array_operation = Self::Array(ArrayOperation::from(operation.clone()));
+            let mut cotangents = array_operation.transpose(context, driver, array_inputs, outputs)?;
+            cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()));
+            return Ok(cotangents);
         }
         if let Self::Broadcast(operation) = self {
             let Some((input, output_extents)) = inputs.split_first() else {
@@ -2134,7 +2218,120 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(program.interpret(vec![left, right]), Ok(vec![output]));
+        assert_eq!(program.interpret(vec![left, right]), Ok(vec![output.clone()]));
+
+        // The same stored dynamic program composes dimension arithmetic with both forward differentiation and
+        // batching. The explicit result extent remains an ordinary replicated SSA dependency in both transforms.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_types().len(), 4);
+        let transformed_result_extent = jvp
+            .instructions()
+            .iter()
+            .find_map(|instruction| {
+                matches!(instruction.operation(), ArrayProgramOperation::Dimension(DimensionOperation::Add(_)),)
+                    .then_some(instruction.outputs()[0])
+            })
+            .unwrap();
+        assert_eq!(
+            jvp.instructions()
+                .iter()
+                .filter_map(|instruction| match instruction.operation() {
+                    ArrayProgramOperation::Concatenate(_) => instruction.inputs().last().copied(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![transformed_result_extent, transformed_result_extent],
+        );
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+                ArrayProgramValue::Array(Array::vector(vec![3.0_f32])),
+                ArrayProgramValue::Array(Array::vector(vec![4.0_f32, 5.0])),
+                ArrayProgramValue::Array(Array::vector(vec![6.0_f32])),
+            ]),
+            Ok(vec![output, ArrayProgramValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0])),]),
+        );
+
+        type Parent = EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        let batching_context = ArrayProgramBatchingContext::new(Parent::new(), 2)
+            .with_axis_name("items".to_string())
+            .with_axis_sharding(crate::ShardingDimension::Unconstrained);
+        let batched_outputs = program
+            .interpret_in_context(
+                &batching_context,
+                vec![
+                    ArrayProgramBatchingTracer::new(
+                        batching_context.clone(),
+                        ArrayProgramBatch::new(
+                            ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 4.0, 5.0])),
+                            BatchAxis::new(0),
+                        )
+                        .unwrap(),
+                    ),
+                    ArrayProgramBatchingTracer::new(
+                        batching_context.clone(),
+                        ArrayProgramBatch::new(
+                            ArrayProgramValue::Array(Array::matrix(2, 1, vec![3.0_f32, 6.0])),
+                            BatchAxis::new(0),
+                        )
+                        .unwrap(),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(batched_outputs.len(), 1);
+        assert_eq!(batched_outputs[0].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            batched_outputs[0].batch().value(),
+            &ArrayProgramValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],)),
+        );
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0, 1]),
+            Err(crate::differentiation::DifferentiationError::Program(
+                ProgramError::UnsupportedOperation { message },
+            )) if message == "'concatenate' transpose with dynamic input extents requires Phase 6 dimension residuals",
+        ));
+    }
+
+    #[test]
+    fn test_array_program_concatenate_differentiation() {
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let left = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
+        let right = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
+        let extent = builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let output = builder
+            .add_instruction(ConcatenateOperation::new(0, 1).unwrap(), Vec::new(), vec![left, right, extent])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        assert_eq!(
+            program.jvp().unwrap().interpret(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0])),
+                ArrayProgramValue::Array(Array::vector(vec![3.0_f64])),
+                ArrayProgramValue::Array(Array::vector(vec![4.0_f64, 5.0])),
+                ArrayProgramValue::Array(Array::vector(vec![6.0_f64])),
+            ]),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0])),
+                ArrayProgramValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0])),
+            ]),
+        );
+        assert_eq!(
+            program
+                .transpose_with_respect_to(&[0, 1])
+                .unwrap()
+                .interpret(vec![ArrayProgramValue::Array(Array::vector(vec![7.0_f64, 8.0, 9.0]))]),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![7.0_f64, 8.0])),
+                ArrayProgramValue::Array(Array::vector(vec![9.0_f64])),
+            ]),
+        );
     }
 
     #[test]
