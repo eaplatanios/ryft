@@ -1089,14 +1089,19 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       execution and residual
       audits. The dependency correction and review-sized delivery are specified in
       `.tasks/plan_p3h_concatenate.md`.
+- [ ] P3i: finish the remaining shape-operation sweep. Reuse the existing custom-call, pad, and RNG payloads for the
+      three genuinely mixed contracts; retain dynamic slice, JAX-compatible gather, ordinary slice, and reduce as
+      array-only operations; and do not introduce the archived slice-scatter payload. The complete classification,
+      migration, and deletion gates are specified in `.tasks/plan_p3i_remaining_shape_operations.md`.
 - [ ] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
       first-class result-dimension operands. After this point, a fresh output reference without an available operand or
       a definition-position occurrence is a closure error.
 - [ ] Delete each frozen homogeneous reshape/broadcast implementation and transform rule as its owning Phase 4–9
       consumer migrates. Do not attempt the final zero-residual deletion before the composite public capability and
       transform domains replace the current homogeneous `Reshape`/`Broadcast` implementations.
-- [ ] Migrate the remaining dual-contract operations:
-      concatenate, custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and slice scatter.
+- [ ] Complete and remove the remaining-operation inventory through P3i's explicit mixed migration or array-only
+      classification proof: custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and the
+      archived slice-scatter proposal.
 - [ ] Remove the array-program-specific `Operation<ArrayProgramType>` implementations from
       `ZeroOperation<ArrayType>`, `OneOperation<ArrayType>`, `FillOperation<ArrayType, V>`, and
       `IotaOperation<ArrayType>`.
