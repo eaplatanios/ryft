@@ -11,7 +11,7 @@ use crate::macros::{
 };
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
-use crate::programs::identities::TypeIdentityRenaming;
+use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
@@ -64,7 +64,23 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
         input_types: &[T],
         _region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
+        // A reference-position identity in a nullary constructor's output type names a runtime quantity that no operand
+        // supplies. Dynamic arrays must instead use the composite mixed constructor with one explicit dimension operand
+        // per dynamic axis. Definition-position identities remain valid because the constructed value itself
+        // establishes them.
         check_count!("input", input_types, 0, TypeError);
+        let mut reference = None;
+        self.r#type.visit_identities(&mut |position, identity| {
+            if reference.is_none() && position == TypeIdentityPosition::Reference {
+                reference = Some(identity.to_string());
+            }
+        });
+        if let Some(reference) = reference {
+            return Err(TypeError::invalid(format!(
+                "'{}' cannot construct type {} without operands because it references identity {}",
+                ZERO_OPERATION_NAME, self.r#type, reference,
+            )));
+        }
         Ok(vec![self.r#type.clone()])
     }
 
@@ -185,7 +201,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::DataType;
+    use crate::types::{DataType, Dimension, DimensionBounds, DimensionType, Shape};
 
     use super::*;
 
@@ -242,6 +258,25 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].r#type().into_owned(), scalar_type);
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0]);
+
+        // Nullary construction rejects output types with ungrounded identity *references* (a dynamic array axis),
+        // which must instead be constructed through the mixed dimension-operand contract owned by the composite
+        // operation family. Definition-position identities remain constructible: a dimension value's type defines
+        // its own variable, so nullary construction leaves no dangling reference.
+        let rows = crate::types::DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]));
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&ZeroOperation::new(dynamic_type.clone()), &[], &[]),
+            Err(TypeError::invalid(
+                "'zero' cannot construct type f32[rows, 3] without operands because it references identity rows",
+            )),
+        );
+        let dimension_type = DimensionType::new(rows);
+        assert_eq!(
+            Operation::<DimensionType>::infer_output_types(&ZeroOperation::new(dimension_type.clone()), &[], &[]),
+            Ok(vec![dimension_type]),
+        );
 
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Scalar, ZeroOperation<DataType>>::new();

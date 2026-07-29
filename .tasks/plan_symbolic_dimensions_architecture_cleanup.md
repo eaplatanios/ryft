@@ -2,9 +2,22 @@
 
 ## Status
 
-Approved for staged execution; bootstrap has not started. This plan is a containment and simplification follow-up to
-`.tasks/plan_first_class_dimension_programs.md`. It preserves that plan's user-visible capabilities and its decision to
-represent runtime dimensions as ordinary SSA values, but supersedes the following implementation compromises:
+Active; repository state was re-audited on 2026-07-28 after the original side-chat history was lost. Phases 0–2 and
+P3a–P3i are committed on `u/eaplatanios/dynamic-shapes` at `21c7442fee3e94eb422b440cc25b479691526df5`.
+The owner checkout currently contains one unstaged P3j shaped-zero prototype plus this plan revision. That prototype is
+nearly ready to land. The third implementation correctly removes `DimensionType::known_extent`, keeps concrete
+extents out of structural types and cache identity, uses the region's complete closed identity authority
+allocation-free, narrows `TypeRefinements` to the identity slice it needs, validates eager constructor bounds, and
+proves retained-specialization reuse. Its constructor contract, eager materialization, batching policy,
+differentiation behavior, transposition, and XLA lowering pass the core/XLA suites. The remaining P3j acceptance work
+is narrow: exercise actual cross-program instantiation/import rather than only direct operation renaming, make both
+runtime extents in the XLA axis-pairing fixture distinct from each other as well as from the static axis, deliberately
+refresh the stale macro trybuild diagnostic, and remove an unrelated whitespace-only diff. Phase 4 has not begun as a
+complete migration.
+
+This plan remains a containment and simplification follow-up to `.tasks/plan_first_class_dimension_programs.md`. It
+preserves that plan's user-visible capabilities and its decision to represent runtime dimensions as ordinary SSA
+values, but supersedes the following implementation compromises:
 
 - one operation payload implementing materially different `Operation<ArrayType>` and
   `Operation<ArrayProgramType>` contracts;
@@ -19,9 +32,10 @@ The migration must not restore expression trees, witnesses, scopes, substitution
 shape tensors, host readback, or a second dimension program. Backwards compatibility is not a goal. Do not add
 compatibility aliases or retain the old homogeneous shape-program surface after its consumers migrate.
 
-Before executing any phase, read **Execution staging and review process** below. That section defines the branch
-topology, the increment catalog, the per-increment workflow, the delivery ledger, and the resumption protocol. No
-work may land outside that process.
+The original archive/increment workflow is retained below as historical execution evidence, not as the current source
+of truth. The immutable archive branch remains protected, but the mutable remainder and delivery ledger stopped being
+maintained after P3c/P3h respectively and must not be used to overwrite or reconstruct the newer integration tree.
+The 2026-07-28 repository audit in the **Review** section and the live integration worktree now determine resumption.
 
 ## Objective
 
@@ -68,21 +82,21 @@ variables, searching ambient dimension values, or synthesizing `dimension_size` 
 hidden dependency environment. It is smaller than the deleted expression/witness machinery, but it violates the same
 architectural invariant: the graph temporarily stops being the complete source of data dependencies.
 
-The current operation trait permits the same payload to implement multiple type-family contracts. The following
-payloads currently implement both `Operation<ArrayType>` and `Operation<ArrayProgramType>`:
+The current operation trait still permits the same payload to implement multiple type-family contracts, but the
+original inventory is no longer current. As of the 2026-07-28 audit:
 
-- `BroadcastOperation`;
-- `ConcatenateOperation`;
-- `CustomCallOperation`;
-- `DimensionSizeOperation`;
-- `DynamicSliceOperation`;
-- `GatherOperation`;
-- `PadOperation`;
-- `ReduceOperation`;
-- `ReshapeOperation`;
-- `RngBitGeneratorOperation`;
-- `SliceOperation`; and
-- `SliceScatterOperation`.
+- `ConcatenateOperation`, `CustomCallOperation`, `PadOperation`, and `RngBitGeneratorOperation` directly implement
+  both `Operation<ArrayType>` and `Operation<ArrayProgramType>`;
+- `CompareOperation` has a generic homogeneous `Operation<T>` implementation plus its distinct composite dimension
+  comparison contract;
+- `BroadcastOperation`, `ReshapeOperation`, and `DimensionSizeOperation` now have one canonical composite contract,
+  while their remaining homogeneous behavior lives under explicit legacy payloads where still needed; and
+- dynamic slice, gather, reduce, and ordinary slice are intentionally array-only. The archived slice-scatter proposal
+  was never introduced.
+
+The remaining five dual-contract payloads are transitional and still block Phase 8's associated-type operation
+contract. Constructor mixed semantics must continue to live in the composite variant arm rather than adding a sixth
+dual-contract payload.
 
 The archived inventory also included overlapping generic constructor contracts, which are a distinct and harder
 case:
@@ -92,19 +106,31 @@ case:
 - `FillOperation<ArrayType, V>`; and
 - `IotaOperation<ArrayType>`.
 
-The current branch has already removed those four archived array-program-specific implementations. `One`, `Fill`, and
-`Iota` now appear only in the homogeneous array family. One temporary exception remains:
+The current branch has removed those four archived array-program-specific implementations. `One`, `Fill`, and `Iota`
+appear only in the homogeneous array family. One temporary exception remains:
 `ArrayProgramOperation::Zero(ZeroOperation<ArrayProgramType>)`, which lets generic differentiation machinery
 materialize a composite array zero without explicit geometry. The final constructor design cannot be resolved merely
 by retaining that generic escape hatch. The canonical destination is:
 
 - operand-relative `zero_like`/`one_like` for transform-generated values whenever a source array exists;
-- a homogeneous static constructor only when its output type has no dynamic axes; and
-- one explicitly mixed shaped-constructor wrapper for zero, one, fill, and iota when runtime extents are operands.
+- a homogeneous nullary constructor only when its stored output type is identity-free, enforced by a generic
+  identity-free rule in the blanket `Operation<T>` inference of zero, one, fill, and iota; and
+- for identity-bearing output types, a mixed `Operation<ArrayProgramType>` contract owned by the corresponding flat
+  `ArrayProgramOperation` variant arm over `ZeroOperation<ArrayType>`, `OneOperation<ArrayType>`,
+  `FillOperation<ArrayType, V>`, or `IotaOperation<ArrayType>`. The stored `ArrayType` is the complete output
+  authority and the variant consumes one explicit dimension operand per dynamic axis of its stored shape, in axis
+  order, validated by identity — the same contract every mixed shape-carrying operation follows.
 
-The wrapper is a distinct operation contract around the homogeneous constructor payload; the payload itself does not
-implement a second type-family contract. Static and dynamic construction must not be distinguished by ambient operand
-recovery.
+No wrapper type exists and no payload carries two trait implementations: the mixed contract is owned by the
+`ArrayProgramOperation::DynamicZero` variant arm, which delegates rendering, identity renaming, and structural flags
+to the payload's single `Operation<ArrayType>` implementation and calls the shared dynamic-constructor inference
+helper directly. The `From<ZeroOperation<ArrayType>>` conversion routes canonically: reference-bearing dynamic output
+types become `DynamicZero`, identity-free types become the homogeneous member family's zero, and the helper rejects
+reference-free stored types so each zero has exactly one encoding. Static and dynamic construction must not be
+distinguished by ambient operand recovery. `DynamicZero` is the unambiguous migration name while the temporary generic
+composite `Zero` variant still exists. Phase 6 deletes that generic variant and then renames `DynamicZero` to `Zero`;
+the final top-level name denotes the genuinely mixed `(Dimension...) -> Array` adapter, while identity-free zeros
+remain nested under the homogeneous `Array` member family.
 
 `DimensionSizeOperation` demonstrates why this is unsafe: its homogeneous contract returns a rank-zero integer array,
 while its heterogeneous contract returns a first-class `DimensionType`. An operation's result kind must not depend on
@@ -116,8 +142,8 @@ differentiation-only residual manifest understood only by reshape and composite 
 will need the same primal-extent retention. Residual selection and threading belong to the differentiation transform,
 not to individual primal operation payloads.
 
-The current working-tree baseline is provisional because the parent refactor is still uncommitted, but Phase 0 must
-capture at least:
+The original working-tree baseline was provisional because the parent refactor was uncommitted. Phase 0 subsequently
+captured:
 
 - tracked and untracked production/test line counts relative to `HEAD`;
 - non-test line counts for `backends/array_programs/{mod,batching,differentiation}.rs`;
@@ -167,12 +193,20 @@ expression language while solving only the algebraic subset of residual needs.
 
 ### One operation contract
 
-- One concrete operation payload has one operand/result/region contract.
+- One concrete operation payload has one operand/result/region contract, and therefore one `Operation` trait
+  implementation. When a payload with an existing homogeneous contract needs mixed composite semantics, those
+  semantics are owned by the composite family's variant arm (the nominal adapter), not by a second trait
+  implementation on the payload. This is what keeps the design representable under Phase 8's associated-type
+  `Operation { type Type; }`, whose compile-fail goal is precisely that a payload cannot acquire two type contracts.
+  Remaining transitional dual implementations (e.g., `CompareOperation`) stay in the Phase 0 inventory and must be
+  resolved the same way before Phase 8 lands.
 - `dimension_size` means `array -> dimension` in every context.
 - `dimension_to_scalar` is the explicit `dimension -> scalar-array` gateway.
 - A shape-carrying operation is mixed even when a particular invocation happens to have only static dimensions.
 - A static convenience API may omit dimension operands only when the payload's metadata proves there are none; it
-  still binds the same mixed operation contract.
+  still binds the same mixed operation contract. Constructors are the documented exception: an identity-free
+  constructor has one canonical encoding inside the homogeneous array member family, and the mixed dynamic
+  constructor rejects reference-free stored types so equivalent zeros cannot acquire two enum representations.
 
 ### Contained heterogeneity
 
@@ -198,7 +232,12 @@ expression language while solving only the algebraic subset of residual needs.
   retain `Effect::OrderedAssertion`.
 - No cleanup may weaken actor names, observed values, bounds, divisibility, equality, overflow, or underflow
   diagnostics.
-- Assertion effect ordering, DCE survival, partial-evaluation behavior, and backend lowering remain unchanged.
+- Assertion effect ordering, DCE survival, and partial-evaluation behavior remain unchanged.
+- Backend lowering must finish the semantic distinction that the effect model already exposes. The current XLA
+  lowerer has one `Option<ValueRef>` token per lowering scope and therefore serializes assertions and ordered I/O on
+  the same chain, despite `Effect` documentation promising one chain per ordered class. Phase 7 must lower
+  `OrderedAssertion` and `OrderedIo` through independent deterministic chains and thread the active chain set through
+  condition, while, scan, rematerialization, and inlined calls.
 
 ## Target architecture
 
@@ -359,13 +398,16 @@ second policy match in transforms and lowering. Reconsider generated forwarding 
 native eager member interpretation, and composite-operation validation without new public wrappers or special-purpose
 derive modes.
 
-Generic nullary constructors remain homogeneous only for types whose complete output geometry is metadata-only. Array
-construction with dynamic axes uses one mixed shaped-constructor wrapper that consumes one explicit dimension operand
-per output axis, including exact constants, and delegates the element-generation semantics to
-`ZeroOperation<ArrayType>`, `OneOperation<ArrayType>`, `FillOperation<ArrayType, V>`, or
-`IotaOperation<ArrayType>`. This avoids overlapping a blanket `Operation<T>` implementation with an
-`ArrayProgramType` implementation for the same instantiated payload and gives constructors the same direct positional
-shape contract as reshape and broadcast.
+Generic nullary constructors remain homogeneous only for output types with no identity *references*, enforced by a
+shared position-aware rule in their blanket `Operation<T>` inference (definition-position identities, such as a
+`DimensionType`'s own variable, are grounded by the constructed value itself and stay constructible). Array
+construction with dynamic axes routes to a composite variant (`DynamicZero`) whose mixed contract is owned by the
+composite family's variant arm over the payload's single `Operation<ArrayType>` implementation: the stored
+`ArrayType` is the complete output authority (static axes keep stored extents, mixed static/dynamic shapes are
+first-class) and each dynamic axis consumes one explicit dimension operand, validated by identity in axis order.
+This operand contract is deliberately *narrower* than mixed reshape/broadcast, which derive every output axis from an
+operand including exact constants: constructor static axes have no input geometry to relate to, so dynamic-only
+operands minimize IR and correspond one-to-one with `stablehlo.set_dimension_size`.
 
 Delete the complete homogeneous `backends::arrays::ArrayOperation` shape-program family. If the shorter name
 `ArrayOperation` remains desirable, give it to the array-only primitive family after consumers migrate. Do not keep a
@@ -455,7 +497,8 @@ After behavior stabilizes, place concepts with their semantic owner:
 - `types::dimensions`: `Dimension`, `DimensionVariable`, `DimensionBounds`, `DimensionType`, and `Shape`;
 - `operations::dimensions`: constants, arithmetic, comparisons, gateways, requirements, and `dimension_size`;
 - backend modules: concrete eager `DimensionValue` representation and XLA interpretation/lowering;
-- a neutral public dimension API module: `RuntimeDimension` and `RuntimeShape`; and
+- a neutral public dimension API only if the P9 audit finds a capability not already provided by the first-class
+  dimension value traits; the removed `RuntimeDimension`/`RuntimeShape` wrappers are not a mandatory destination; and
 - array-program storage/dispatch: only the sum value, outer operation family, and generic projection implementations.
 
 Do not perform module moves before the semantic deletions. Late moves keep reviewable diffs and avoid moving code that
@@ -497,11 +540,13 @@ wrap `TypeError` in `ProgramError` only at outward program boundaries.
 - interval, congruence, order, equality, and constant abstract interpretation;
 - `Effect::OrderedAssertion`;
 - the bounded-input ABI, hidden physical extents, and `PadToStatic`;
-- existing StableHLO dynamic-shape operands and assertion lowering;
+- existing StableHLO dynamic-shape operands; ordered runtime assertion lowering and per-effect token separation remain
+  Phase 7 work;
 - behavioral JAX parity tests;
 - exact diagnostics;
 - identity alpha-renaming and cache behavior; and
-- public `RuntimeDimension`/`RuntimeShape` ergonomics, after decoupling them from backend-specific projection names.
+- public first-class dimension ergonomics without reviving expression-era `RuntimeDimension`/`RuntimeShape` wrappers
+  unless a concrete missing capability is demonstrated.
 
 ### Deletes
 
@@ -531,9 +576,23 @@ Inference may derive result metadata from explicit operand types. What must disa
 collection, copied identity/order validation, duplicated payload shape metadata, and any helper that recovers operands
 absent from the staged graph.
 
-## Execution staging and review process
+## Historical execution staging and review process
 
 ### Why this section exists
+
+This section records how the original 142-path archive was made recoverable and how Phases S0–P3c were mined from it.
+It is no longer the active execution protocol. The immutable archive still provides evidence and must never move, but:
+
+- the integration branch has advanced to `21c7442fe`;
+- the mutable remainder stopped at `12398a196` after P3c;
+- the staging worktree remains on the obsolete P3d increment; and
+- `.tasks/dimensions_cleanup_ledger.md` stops at P3h even though P3i is committed.
+
+Trying to resume by reconciling the stale remainder would reintroduce superseded code over a much newer tree. From the
+2026-07-28 audit onward, resume from the live integration branch, preserve the current dirty P3j work, update this plan
+with each review unit, and use ordinary focused commits after owner review. The archive, remainder, and old increment
+branches are read-only historical evidence. P11 replaces the former “empty mutable remainder” gate with a current-tree
+residual audit plus confirmation that the immutable archive still points at its recorded commit.
 
 The parent refactor exists as one uncommitted working tree containing 112 tracked changes and 29 nonignored untracked
 paths, for 141 expanded status entries, plus this ignored plan. It spans unrelated refactors and several generations
@@ -541,7 +600,8 @@ of the dimension design. It cannot be reviewed, bisected, or safely resumed in t
 This section first preserves that tree exactly, then mines only the correct pieces into the target architecture as
 small reviewed increments.
 
-Read this section completely before running any command. It is written to be executed literally.
+The rest of this section is intentionally preserved as the historical procedure that produced the committed
+increments. Do not execute it against the current owner checkout.
 
 ### Roles, branches, and working areas
 
@@ -898,7 +958,9 @@ restate these constraints in its own prompt:
 ## Execution phases
 
 Execute these specifications in order: `P0`, `P1`, `P2`, `P3.*`, `P4`, `P5`, `P6`, `P7`, `P8`, `P9`, `P10`, and
-`P11`. The increment catalog controls any further split within a phase.
+`P11`. The current resumption unit is the P3j boundary correction and shaped-zero gate. Split later work into
+review-sized vertical slices recorded directly in this plan; do not revive the obsolete increment branches or treat
+the stale delivery ledger as authoritative.
 
 ### Phase 0: freeze evidence and classify the migration
 
@@ -922,7 +984,7 @@ semantics; the P0 release build is its regression gate.
       array-only, dimension-only, mixed, region-polymorphic, or erroneous dual contract.
 - [x] Separately inventory blanket generic constructor implementations that overlap array-program-specific
       instantiations: zero, one, fill, and iota. Assign each static, dynamic, public-API, transform, and lowering use to
-      the homogeneous constructor, operand-relative operation, or mixed shaped-constructor wrapper.
+      the homogeneous constructor, operand-relative operation, or variant-owned mixed stored-type contract.
 - [x] Inventory every use of the complete homogeneous `ArrayOperation` outside tests and assign its migration target.
 - [x] Inventory every `ArrayContextView`/`DimensionContextView` construction and state why the caller needs a view.
 - [x] For every `with_dimensions`, `with_source_array`, and `bind_replayed` path, record the explicit SSA dependency
@@ -999,7 +1061,8 @@ one nominal payload and capability per primitive, with shared behavior centraliz
 `ArithmeticDimensionOperation`; this flattens stored-program dispatch to the outer operation-family selection without
 duplicating inference or identity plumbing. This advances only the primitive-operation ownership portion of Phase 9:
 concrete host values and the reference backend's closed operation family remain under `backends`, while neutral
-`RuntimeDimension`/`RuntimeShape` API placement remains in P9.
+public dimension ergonomics remain a P9 capability/API audit. The absent expression-era
+`RuntimeDimension`/`RuntimeShape` wrappers are not a required destination.
 
 `P2b.2` is a narrow ownership correction to the final P2b.1 macro follow-up. Dimension operations follow the same
 capability-based interpretation architecture as scalar and array operations: each operation owns a generic
@@ -1107,16 +1170,78 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [x] Complete and remove the remaining-operation inventory through P3i's explicit mixed migration or array-only
       classification proof: custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and the
       archived slice-scatter proposal.
-- [ ] P3j: introduce the single shaped-constructor wrapper and complete the constructor migration specified in
-      `.tasks/plan_p3j_shaped_constructors.md`. The current branch has no direct array-program-specific operation
-      implementations for the four `ArrayType` payloads; cleanup instead removes the temporary
-      `ArrayProgramOperation::Zero(ZeroOperation<ArrayProgramType>)` escape hatch once transform-owned explicit extent
-      residuals can replace it.
+- [ ] P3j: constructor contracts. The wrapper-based Delivery A from
+      `.tasks/plan_p3j_shaped_constructors.md` (Delivery A) was implemented and then replaced by the
+      stored-type-authoritative design recorded in the diagnosis and target-architecture sections, corrected by a
+      second review pass (see the constructor revision notes in the Review section). The current unstaged prototype has
+      the right variant-owned `DynamicZero(ZeroOperation<ArrayType>)` contract, canonical routing, eager rule,
+      replicated batching rule, structural differentiation behavior, and direct bounded XLA lowering. The
+      `known_extent` leak is now gone and the structural boundary path works, but the phase remains incomplete until
+      actual cross-program import, the strengthened XLA operand-order fixture, and the full verification gates below
+      pass. Do not mark P3j complete merely because the current 994 core and 408 XLA tests pass.
+- [x] P3j boundary-refinement correction: remove `DimensionType::known_extent`,
+      `DimensionType::with_known_extent`, all observed-extent logic from `ArrayProgramValue::r#type`, and the
+      corresponding equality/hash/display/renaming and `DimensionValue` checks. Do not replace them with a new
+      `Value`, `Typed`, `Type`, or array-program-specific boundary-evidence abstraction.
+- [x] Let a concrete output establish the first refinement for any identity already established by the formal input
+      signature as well as for an identity defined internally. This is sound without inspecting runtime payloads:
+      structural region closure already rejects an instruction result reference unless that instruction consumes or
+      defines the identity (or is temporarily classified as an internal definition by P1c's fresh-reference fallback),
+      and each mixed eager rule validates or constructs its concrete output from those explicit operands. The
+      allocation-free one-vector/input-split representation is implemented.
+      `TypeRefinements::validate` is parameterized by the complete identity *slice* (`&[T::Identity]`) rather than the
+      `TypeIdentitySignature` container; refinement validation needs authority membership but not the signature's
+      input/internal partition.
+- [x] Add focused negative tests proving that an already-established output identity without a consumed/defined edge
+      fails closure and that two concrete outputs for one input-owned identity must agree. Preserve the temporary
+      fresh-result-reference fallback until the explicit-operand migration item above deletes it; do not add a test
+      that contradicts that documented transitional behavior. Positive non-exact eager/refinement coverage exists for
+      reshape, broadcast, and `DynamicZero`.
+- [x] Validate every concrete `DynamicZero` extent against the corresponding stored dynamic variable's bounds inside
+      the eager rule before allocating the output. Program interpretation does not validate intermediate instruction
+      result types, and `EagerContext::bind` does not run inference, so final-boundary refinement alone is insufficient
+      when a malformed extent feeds a later instruction or the operation is bound directly. Preserve alpha-renamed
+      input identities during program interpretation; the runtime check is the stored bounds plus operand kind/count,
+      not literal variable-name equality.
+- [x] Add a retained-staging/JIT cache test showing that two calls with the same `DimensionType` identity and bounds but
+      different concrete extents reuse one specialization while producing correctly sized outputs. Pin that
+      `DimensionType` equality, hashing, display, rendering, and persisted signatures are independent of the observed
+      extent. `test_array_program_dynamic_zero_retained_jit_reuses_one_specialization` exercises two concrete extents,
+      observes distinct output shapes, and proves one trace/lowering/compilation with one retained-cache hit.
+- [ ] Add a non-exact `DynamicZero` cross-program instantiation/import test. Direct operation identity renaming,
+      alpha-renamed boundary interpretation, and transposition are covered, but the current test named
+      `test_array_program_dynamic_zero_alpha_renamed_instantiation` does not call the program instantiation or splice
+      path. Keep the transpose test proving the array cotangent is ignored while every explicit extent operand receives
+      a structural-zero cotangent.
+- [x] Re-audit the pending generic fused-JVP zero-primal reuse and Jacobian validation reordering after the boundary
+      correction. Retain each only if an independently named regression test requires it; otherwise remove it as
+      constructor-driven global complexity. The UFCS-only `fill` and `iota` residue has been removed. If the Jacobian
+      ordering remains temporarily necessary until Phase 6 removes dynamic nullary tangent materialization, document
+      that dependency and keep the existing exact non-finite-coordinate diagnostics tests as its gate. The zero-primal
+      reuse is independently covered by the shaped-zero JVP regression. The Jacobian reordering now names its Phase 6
+      dependency and remains gated by the exact non-finite-coordinate diagnostics tests.
+- [ ] Strengthen the mixed static/dynamic XLA execution fixture with distinct static and runtime dynamic extents so its
+      observed output shape catches axis/operand pairing mistakes rather than only an out-of-bounds operand index. All
+      three axis extents must be pairwise distinct; the current `3 x 2 x 3` fixture cannot detect a swap between the two
+      dynamic operands.
+- [ ] P3j gate: `DimensionType` is exactly identity plus bounds; `Typed::r#type` is structural; dynamic zero has one
+      canonical explicit-operand encoding; reference eager execution, PE, batching, JVP/transpose, import, direct XLA
+      lowering, CPU PJRT execution, exact diagnostics, and retained specialization reuse all pass.
+- [ ] Land `One`, `Fill`, and `Iota` as complete vertical slices mirroring zero: the position-aware reference guard on
+      their blanket inference, variant-owned mixed contracts through the shared helper, canonical `From` routing,
+      composite eager rules, batching arms, lowering, and tests. Land them as separate review units after corrected
+      `DynamicZero`; a slice may coincide with its first composite consumer, but all three must be complete before the
+      Phase 3 gate. The first implementation of their guards and payload-level mixed contracts was deliberately
+      reverted for reviewability; do not restrict their homogeneous contracts before the replacement is usable.
 - [ ] Route transform-generated zero/one values through structural zero or `zero_like`/`one_like` whenever an operand
       supplies geometry.
-- [ ] Keep homogeneous nullary zero/one/fill/iota only for fully static array output types.
-- [ ] Route dynamic zero/one/fill/iota through one mixed shaped-constructor wrapper with one explicit dimension
-      operand per output axis, including exact constants.
+- [ ] Migrate transform consumers that stage `ZeroOperation<ArrayType>` with possibly-dynamic types (condition, scan,
+      while, gather, scatter, slice, pad, and differentiation rules) to `zero_like`, structural zeros, or Phase 6
+      extent residuals, with dynamic-shape acceptance tests per consumer. The zero reference guard is not complete
+      until this lands.
+- [ ] Keep `DimensionType` strictly identity plus bounds throughout all later phases. Concrete extents are runtime
+      values and output-refinement observations, never part of `Typed::r#type`, structural equality, hashing,
+      rendering, persistence, or cache identity.
 - [ ] Sweep shape-changing collectives and every other operation whose result metadata references first-class
       dimension operands.
 - [ ] Give each mixed operation one direct positional operand contract and migrate its inference, eager rule,
@@ -1125,23 +1250,24 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       directly from operand types. Centralize only genuinely repeated count/kind projection.
 - [ ] Replace shape-metadata zero/one materialization inside transforms with structural zero or `zero_like`/`one_like`
       wherever semantics allow.
-- [ ] Ensure static reshape and broadcast invocations bind the same payload with exact constant dimension operands
-      rather than a second contract. Constructors follow the explicit static-homogeneous versus
-      dynamic-shaped-wrapper split above.
+- [x] Static and dynamic reshape/broadcast invocations bind the same canonical payload with exact constants or dynamic
+      dimension SSA operands. Constructors intentionally use static homogeneous encoding versus the variant-owned
+      dynamic stored-type contract described above.
 - [ ] Add a residual search proving no concrete payload implements materially different operation type contracts.
-- [ ] Add a residual search proving generic constructors have no overlapping array-program-specific implementation.
-- [ ] Add a residual search proving no operation consumer independently calls an ad hoc
+- [x] Generic constructors have no overlapping array-program-specific payload implementation. `DynamicZero` is a
+      composite variant-arm contract, while the temporary `ZeroOperation<ArrayProgramType>` is a different generic
+      instantiation restricted to identity-free member types until Phase 6 deletes it.
+- [x] No operation consumer independently calls an ad hoc
       `runtime_dimension_variables` contract.
 - [ ] Gate: every shape dependency in rendered IR is an operand edge or an explicit `dimension_size` instruction.
 
 ### Phase 4: remove implicit-shape replay and the parallel array language
 
-- [ ] Rewrite each `ArrayContextView::with_dimensions` call to pass the required dimension values through the actual
-      operation/transform input.
-- [ ] Rewrite each `with_source_array` call to consume an existing explicit dimension value or stage an explicit
-      `dimension_size` at the semantic point that needs it.
-- [ ] Delete the operation-classification match in `bind_replayed`.
-- [ ] Delete ambient dimension and source-array fields.
+- [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
+      the unrelated `ReshapeParameters`/`ReshapeOperation` permutation builder and carry no ambient extent state.
+- [x] `with_source_array` no longer exists.
+- [x] `bind_replayed` and its operation-classification match no longer exist.
+- [x] Ambient dimension and source-array context-view fields no longer exist.
 - [ ] Delete temporary homogeneous program construction used only to replay shape-carrying rules.
 - [ ] Narrow the homogeneous operation family to array-only primitives.
 - [ ] Migrate public/reference `EagerContext<Array, ArrayOperation<Array>>` consumers to the canonical array-program
@@ -1234,8 +1360,9 @@ rename only part of the problem while introducing another carrier.
 - [ ] Thread dimension residuals through nested regions, rematerialization, custom derivatives, JVP/VJP construction,
       import, and transpose exactly like other residual values.
 - [ ] Rewrite reshape transposition to consume ordinary dimension residual inputs.
-- [ ] Delete `ReshapeOperation::transpose_dimension_variables`, its builder/accessor, rendering, identity renaming,
-      mixed inference segment, eager input handling, and composite differentiation special case.
+- [x] `ReshapeOperation::transpose_dimension_variables` and every exact identifier occurrence are absent from the
+      integration tree. Do not reintroduce an equivalent payload residual manifest while implementing the ordinary
+      residual path above.
 - [ ] Audit concatenate, mean/reductions, slice, pad, and gather transposes and migrate every analogous extent need to
       the same residual contract.
 - [ ] Make generic outer dispatch project/lift array-only JVP, VJP, and transpose rules, reusing the shared toy
@@ -1246,19 +1373,58 @@ rename only part of the problem while introducing another carrier.
 - [ ] Add a residual search proving no primal operation payload stores differentiation-only dimension variables or
       residual manifests.
 - [ ] Prefer structural zeros over materializing shaped zero arrays.
+- [ ] Inventory every production construction of `ZeroOperation<ArrayProgramType>` and every composite
+      `Zero<ArrayProgramValue<_>>` materialization path, including the retained-linearization residual-zero sites in
+      `differentiation/forward.rs`. Classify each as a structural zero that should remain unmaterialized, an
+      operand-relative `zero_like`, an identity-free homogeneous array zero, or a genuinely dynamic zero whose
+      explicit dimension SSA operands must already be available.
+- [ ] Migrate those callers so generic differentiation and transposition never request a zero from
+      `ArrayProgramType` alone. Preserve [`MaybeZero`] structurally for as long as possible; use `zero_like` when an
+      array value supplies runtime geometry; stage `Array(ArrayOperation::Zero(ZeroOperation<ArrayType>))` only for
+      identity-free array types; and stage the mixed constructor with explicit dimension operands when a dynamic array
+      zero truly must be materialized. A dimension-member zero must be unrepresentable rather than constructed and
+      rejected later by inference.
+- [ ] Delete `ArrayProgramOperation::Zero(ZeroOperation<ArrayProgramType>)`,
+      `From<ZeroOperation<ArrayProgramType>>`, and every dedicated inference, eager, batching, differentiation,
+      rendering, identity-renaming, and lowering arm once the generic callers are gone. Do not replace them with
+      another type-only composite constructor or a hidden extent-recovery path.
+- [ ] Rename `ArrayProgramOperation::DynamicZero(ZeroOperation<ArrayType>)` to
+      `ArrayProgramOperation::Zero(ZeroOperation<ArrayType>)` after deleting the conflicting generic variant. Expand
+      its rustdoc to explain that this top-level variant owns the mixed `(Dimension...) -> Array` signature because
+      homogeneous `Array(...)` projection cannot accept dimension operands and structural types do not contain
+      concrete runtime extents. Update all tests, diagnostics, rendering expectations, and documentation directly
+      without a compatibility alias.
+- [ ] Add canonical-representation tests proving identity-free zeros use
+      `Array(ArrayOperation::Zero(ZeroOperation<ArrayType>))`, identity-bearing zeros use the renamed top-level
+      `Zero(ZeroOperation<ArrayType>)` with one explicit operand per dynamic axis, and no operation can encode a
+      dimension-member zero. Add residual searches requiring zero source occurrences of
+      `ZeroOperation<ArrayProgramType>` and `DynamicZero`.
 - [ ] Preserve proven/disproven/residual requirement behavior and `OrderedAssertion` effects.
 - [ ] Verify nested JVP/VJP, linearization, transpose, rematerialization, custom derivatives, condition, while, and
       scan.
 - [ ] Add exact rendered-IR tests proving residual dimension atoms are explicit dataflow edges shared by the forward
       linearization and transpose, with no type expression or payload witness.
-- [ ] Gate: adding an array-only primitive with ordinary AD/PE rules requires no handwritten composite dispatcher case.
+- [ ] Gate: adding an array-only primitive with ordinary AD/PE rules requires no handwritten composite dispatcher
+      case, the generic composite zero escape hatch is gone, and the only top-level zero variant is the explicit mixed
+      constructor.
 
 ### Phase 7: backend execution and lowering
 
 - [ ] Verify every mixed operation lowers explicit dimension operands directly with no reconstruction environment.
 - [ ] Verify eager XLA dimension arithmetic remains host integer computation with zero device dispatch/cache probes.
 - [ ] Verify bounded-input ABI argument counts and `set_dimension_size` behavior are unchanged.
-- [ ] Verify ordered runtime assertions preserve exact actor-named diagnostics and deterministic order.
+- [ ] Lower every residual `DimensionRequirementOperation` to a runtime assertion that observes the concrete operand
+      values and preserves its exact actor name, predicate, bounds/divisor, and observed-value diagnostic.
+- [ ] Replace each lowering scope's single shared `Option<ValueRef>` token with one deterministic token slot per
+      ordered `Effect` class. Assertions advance only `OrderedAssertion`; prints advance only `OrderedIo`; unordered
+      I/O does not acquire an ordered chain merely because another effect exists.
+- [ ] Thread the active ordered-effect token set through condition results, while/scan state, rematerialization,
+      custom derivatives, and effectful inlined calls. Pure regions add no token state, and a region containing only
+      one ordered class carries only that class.
+- [ ] Add structural MLIR tests for assertion→assertion, print→print, assertion interleaved with print, pure/effectful
+      branches, loops, scan, rematerialization, and repeated inlined calls. Add CPU execution tests proving
+      deterministic first-failure order within the assertion class and independence from ordered I/O.
+- [ ] Verify ordered runtime assertions preserve exact actor-named diagnostics and deterministic same-class order.
 - [ ] Run CPU and CUDA eager/JIT parity for the full dynamic operation matrix, including `PadToStatic`.
 - [ ] Gate: backend behavior, diagnostics, and bounded physical storage match or exceed the archived golden evidence.
 
@@ -1268,7 +1434,7 @@ rename only part of the problem while introducing another carrier.
       constructors. Capture the resulting implementor and bound inventory before changing the trait.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
       `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
-      `DimensionSizeOperation`, one mixed shaped-constructor wrapper, `ReshapeOperation`, and
+      `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and
       `ArrayProgramOperation`.
 - [ ] Parameterize `SelectOperation`, `StopGradientOperation`, and `TestNullaryOperation` by their operation type so
       each concrete payload instantiation has exactly one associated contract.
@@ -1309,11 +1475,14 @@ rename only part of the problem while introducing another carrier.
 - [ ] Confirm the `S4` typed `Custom`/`DimensionError` recovery behavior and canonical invalid projection diagnostics
       remain intact;
       do not mix another error-representation migration into the module move.
-- [ ] Split core dimension operations from the eager host representation currently colocated under `backends`.
-- [ ] Move operation semantics to `operations::dimensions`.
-- [ ] Keep concrete eager values and backend-specific behavior under backend ownership.
-- [ ] Move `RuntimeDimension`/`RuntimeShape` to a neutral public module and replace backend-specific trait bounds with
-      generic projection/binding capabilities.
+- [x] Core dimension operation semantics are split from the eager host representation.
+- [x] Dimension operation semantics live in `operations::dimensions`.
+- [x] `DimensionValue`, its closed eager operation family, and concrete capability implementations remain under backend
+      ownership.
+- [ ] Re-evaluate the historical `RuntimeDimension`/`RuntimeShape` item: neither identifier exists in the current
+      tree. Confirm that the public first-class dimension capabilities cover the intended ergonomics; do not recreate
+      wrapper types merely to satisfy the old module-move wording. If a neutral public alias/API is still needed, add
+      only the smallest capability-based surface after the operation and transform families settle.
 - [ ] Audit names after responsibilities settle; rename only where the final name is materially clearer.
 - [ ] Update every in-repo use site directly without compatibility re-exports.
 - [ ] Update rustdoc, examples, error links, and behavioral JAX fixtures.
@@ -1329,12 +1498,13 @@ rename only part of the problem while introducing another carrier.
 ### Phase 11: deletion and minimality gate
 
 - [ ] Delete every item in the deletes ledger.
-- [ ] Reconcile every path on `u/eaplatanios/wip/dimensions-remainder` as landed, superseded, or deliberately dropped.
-      Require an empty unexplained remainder and a complete archive-disposition ledger; do not alter the immutable
-      archive to make this check pass.
+- [ ] Treat `u/eaplatanios/wip/dimensions-remainder` as retired historical state at `12398a196`; it stopped being
+      reconciled after P3c and is not a valid representation of pending work. Prove final completeness from the current
+      integration tree, this plan's residual searches, and the already-complete 142-path archive-disposition table.
+      Do not merge the stale remainder or alter the immutable archive to make bookkeeping appear current.
 - [ ] Verify `origin/u/eaplatanios/archive/dimensions-wip-2026-07-24` still points to the recorded bootstrap commit.
-- [ ] Land a final bookkeeping increment that closes the last substantive ledger entry with its integration and
-      remainder reconciliation commits.
+- [ ] Record a final current-tree review entry in this plan. The historical delivery ledger may be annotated as retired
+      after P3h, but must not be backfilled with invented increment/remainder commits.
 - [ ] Remove dead imports, helper traits, macros, tests, documentation, and allowances made obsolete by the cleanup.
 - [ ] Run a repository-wide residual search for retired identifiers and classify every match.
 - [ ] Compare production/test/generated line counts against Phase 0.
@@ -1410,7 +1580,8 @@ The cleanup is complete only when:
 1. Runtime dimensions remain ordinary SSA values in one program graph.
 2. Each operation payload has one compiler-enforced semantic contract.
 3. `dimension_size` always returns a dimension and the data gateway is distinct.
-4. Dynamic zero, one, fill, and iota construction has one mixed shaped-constructor contract; transform-generated
+4. Dynamic zero, one, fill, and iota construction binds the constructors' own mixed stored-type contracts;
+   transform-generated
    values use structural or operand-relative construction where possible.
 5. Every shape-carrying operation consumes explicit dimension operands through one direct operation signature.
 6. No ambient dimension/source-array replay environment exists.
@@ -1433,6 +1604,232 @@ Execution notes, per-phase summaries, measurements, superseded decisions, and ve
 here as the plan is executed. Do not check an item solely because a test happens to pass; record the implementation or
 deletion that satisfies it.
 
+### Resumption audit: 2026-07-28
+
+The repository, not the expired side-chat history, establishes the current boundary:
+
+- `u/eaplatanios/dynamic-shapes` and its remote both point to
+  `21c7442fee3e94eb422b440cc25b479691526df5`;
+- the immutable archive still points to `770e77d001547c72150a44843c170ea6417ab41e`;
+- the mutable remainder is stale at `12398a196d96a61088fb2d81000c18ce6fd26f40` and differs from integration by
+  109 files, 34,626 insertions, and 19,263 deletions;
+- the staging worktree is still parked on the obsolete P3d increment;
+- the delivery ledger stops after P3h, while commits through P3i are present on integration; and
+- the owner checkout has 13 modified paths: this plan plus 12 P3j prototype source/test files, for 987 source/plan
+  insertions and 91 deletions before this audit's plan edits.
+
+The committed architecture has completed Phases 0–2 and P3a–P3i. Repository searches confirm that
+`ArrayContextView`, `DimensionContextView`, `with_source_array`, `bind_replayed`, `runtime_dimension_variables`,
+`OutputIdentityRole`, and `transpose_dimension_variables` have zero occurrences. The remaining `with_dimensions`
+identifier is only reshape permutation configuration. Phase 4 is nevertheless not complete:
+`ReshapeDimensionExpression` has 80 occurrences, `LegacyReshapeOperation` 68,
+`LegacyBroadcastOperation` 81, `DynamicBroadcastOperation` 51, and the complete homogeneous `ArrayOperation` family
+remains a production transform/backend language. Phase 5's separate `ArrayProgramBatchingContext`,
+`ArrayProgramBatchingTracer`, and `ArrayProgramBatchableOperation` also remain, as do the composite differentiation
+dispatcher and the five transitional dual-contract payloads listed in the diagnosis. `Operation` is still generic as
+`Operation<T>`; Phases 8–11 have not begun.
+
+The current unstaged P3j prototype was reviewed path by path:
+
+- **Retain after correction:** the position-aware nullary constructor guard; the shared variant-owned dynamic
+  constructor inference; canonical `ZeroOperation<ArrayType>` routing; the flat `DynamicZero` variant; eager
+  materialization from compact dynamic-axis operands; replicated-only batching; structural-zero extent cotangents;
+  direct upper-bound allocation plus `stablehlo.set_dimension_size`; the mixed static/dynamic axis pairing fix; and
+  their focused tests.
+- **Delete rather than generalize:** `DimensionType::known_extent`, `with_known_extent`, observed extents injected by
+  `ArrayProgramValue::r#type`, `ArrayProgramTypeRefinements`' dependence on those type payloads, the extra
+  `DimensionValue` validation, and all equality/hash/display/renaming tests for this field. These make one runtime
+  value part of the structural type and would specialize caches per extent.
+- **Re-evaluate before retaining:** the global fused-JVP “reuse a zero primal as its tangent” rule and the Jacobian
+  coordinate-validation reorder. Both are plausible independently, but the current comments justify them as
+  workarounds for constructor/type behavior. They need exact standalone regression tests after the boundary correction
+  or they should be removed.
+- **Remove as residue:** the UFCS-only `fill` and `iota` test changes. Their mixed vertical slices were deliberately
+  deferred and the edits no longer resolve an ambiguity in the retained design.
+
+The corrected boundary design uses machinery already present. `Region::type_identity_signature` proves that every
+reference-position instruction result identity is consumed by that instruction or defined by it; otherwise closure
+fails. `TypeRefinements::validate` can therefore allow a static output to establish the first concrete refinement for
+an identity in the formal input identity set as well as an internally defined identity. The mixed eager operation
+remains responsible for constructing or validating the concrete output from its explicit dimension operand. This
+deletes the need for value-payload inspection, a boundary-refinement provider, and any new `Type`, `Typed`, or `Value`
+surface. Store the closed input/internal identities so the complete authority slice is available without a new
+per-interpretation concatenation allocation.
+
+Current verification evidence:
+
+- `cargo test -p ryft-core --lib` passed all 990 tests;
+- `cargo test -p ryft-xla --lib` passed 408 tests with one intentional benchmark ignored;
+- the dynamic-zero structural and CPU PJRT tests ran inside the XLA suite;
+- `cargo fmt -p ryft-core -p ryft-xla -- --check` passed; and
+- `git diff --check` passed.
+
+This evidence proved that the first prototype was internally consistent, not that it was architecturally complete. At
+that audit, the next review unit was strictly P3j boundary correction and shaped-zero closure:
+
+1. delete the `known_extent` path and implement input/internal refinement authority using structural identity closure;
+2. add dynamic eager reshape/broadcast/zero, conflicting-output, dangling-edge, and retained-specialization tests;
+3. reassess and minimize the forward/Jacobian changes;
+4. rerun core, macro, XLA, doctest, formatting, and residual gates; and
+5. update this review with the final retained diff before beginning `One`, `Fill`, `Iota`, Phase 4, or Phase 6.
+
+### P3j second review: 2026-07-28
+
+The owner revised the prototype after the resumption audit. The current checkout contains this plan plus 13 modified
+source/test paths (874 source insertions and 107 source deletions relative to `HEAD`). The original architectural
+blocker is resolved:
+
+- `known_extent` and `with_known_extent` have zero source occurrences;
+- `DimensionType` is again exactly identity plus bounds, with exact extents derived only from singleton bounds;
+- `ArrayProgramValue::r#type` no longer incorporates runtime observations;
+- `TypeIdentitySignature` stores one ordered identity vector with an input/internal split, so the complete authority
+  set is available without concatenating or cloning vectors during interpretation;
+- output refinement admits both input-owned and internally defined closed identities and rejects inconsistent repeated
+  concrete observations; and
+- the stale `fill`/`iota` changes are gone.
+
+The variant-owned `DynamicZero` vertical slice remains directionally correct: canonical `From` routing distinguishes
+identity-free homogeneous zeros from reference-bearing mixed zeros; inference requires one matching dimension operand
+per dynamic axis; eager execution materializes the concrete shape; PE folds only fully known calls; batching rejects
+mapped extent authority; differentiation preserves extent operands as nondifferentiable structure; and XLA allocates
+the finite upper-bound buffer before applying one `stablehlo.set_dimension_size` per dynamic axis.
+
+The second review found these remaining blockers:
+
+1. `TypeRefinements::validate` now receives `&TypeIdentitySignature<T::Identity>`, but validation uses only
+   `identities()`. Pass the identity slice directly so the generic type-refinement contract does not depend on the
+   region-metadata container or its input/internal partition. This also restores the allocation-free `&[]` path for
+   refinement-free types and removes repeated empty-signature construction in tests.
+2. The eager `DynamicZero` rule consumes extents without checking them against the corresponding stored variable's
+   bounds. `EagerContext::bind` does not run inference, and `Program::interpret_with` checks counts but not
+   intermediate result types, so relying on final program-output refinement misses malformed direct calls and
+   malformed constructor results consumed internally. Check operand kind/count and stored bounds before allocation;
+   do not require literal identity equality because runtime program inputs may carry alpha-renamed identities.
+3. `test_array_program_dimension_values_share_one_abstract_type` proves equality, hashing, and display only. It does
+   not prove that retained dispatch, tracing, lowering, and compilation reuse one specialization while two different
+   extents produce different logical output shapes. The named retained-specialization gate remains open.
+4. The slice has no non-exact identity-instantiation/import acceptance test and no transpose acceptance test, despite
+   implementing both renaming and structural-zero extent cotangents.
+5. The mixed static/dynamic XLA fixture uses `2` for both its static middle axis and trailing runtime extent. It catches
+   the historical out-of-range operand index, but distinct values would make output shape/length also prove correct
+   axis pairing.
+6. The generic fused-JVP zero-primal reuse is semantically sound for the only operations currently reporting
+   `is_zero`, and it avoids materializing an invalid nullary dynamic zero at the fused output boundary. The Jacobian
+   reordering preserves existing exact `NonFiniteCoordinateSpace` tests, but remains symptom-oriented duplication
+   pending Phase 6's structural-zero cleanup. Keep neither merely because the broad suites pass: document the temporary
+   dependency or replace it with the narrower structural fix.
+7. Two comments in `interpretation.rs` still say only internally defined identities may establish output facts. Update
+   them to describe the now-implemented complete closed boundary authority.
+
+Verification for this second review:
+
+- `cargo test -p ryft-core --lib`: 991 passed;
+- `cargo test -p ryft-xla --lib`: 408 passed and one timing benchmark ignored;
+- `cargo test -p ryft-macros`: 53 passed;
+- `cargo test -p ryft-macros-tests`: operation tests passed, but the parameter trybuild suite failed because its
+  expected `$N others` diagnostic omits already-committed composite `Parameter` implementors; this appears to be a
+  stale snapshot rather than a P3j semantic failure, but the full gate is not green until it is deliberately resolved;
+- `cargo test -p ryft-core --doc`: 58 passed and 16 ignored;
+- `cargo fmt -p ryft-core -p ryft-xla -- --check`: passed; and
+- `git diff --check`: passed.
+
+P3j therefore advances from “architecturally incorrect” to “correct core design with bounded completion work.” Finish
+the seven items above before marking the phase complete or beginning the `One`, `Fill`, and `Iota` slices.
+
+### P3j third review: 2026-07-28
+
+The owner addressed the material findings from the second review:
+
+- `TypeRefinements::validate` now receives only `&[T::Identity]`, and interpretation passes the closed identity
+  signature's borrowed identity slice;
+- `TypeIdentitySignature::new` now accepts the complete ordered identity vector plus `input_count`; region closure
+  uses that same vector as its dominance environment and transfers it directly into retained metadata, eliminating
+  the cloned input-identity vector, the parallel internal-identity vector, and their duplicate identity cloning;
+- the position-aware nullary identity-reference check is inlined in `ZeroOperation` while zero is its sole production
+  caller. `One`, `Fill`, and `Iota` remain intentionally unguarded until their complete mixed vertical slices land;
+  extract shared machinery only when that migration creates a second real caller;
+- eager `DynamicZero` checks each concrete extent against the corresponding stored dynamic variable's bounds before
+  allocating, while continuing to accept alpha-renamed interpreted inputs;
+- a test-local retained JIT domain calls the same program with extents `3` and `4`, observes different logical output
+  shapes, and proves one trace, one lowering, one compilation, one cache miss, and one cache hit;
+- transposition has a focused regression proving that the output cotangent is ignored and the extent receives a
+  structural-zero cotangent;
+- the fused-JVP zero-primal reuse has an independent shaped-zero regression, while the retained Jacobian validation
+  order now explicitly records its transitional Phase 6 dependency; and
+- the stale interpretation comments now describe complete closed input/internal boundary authority.
+
+No new implementation correctness defect was found in the revised core or XLA paths. Three acceptance details still
+prevent closing P3j:
+
+1. `test_array_program_dynamic_zero_alpha_renamed_instantiation` directly renames the operation and separately
+   interprets a program with an alpha-renamed boundary value, but it does not invoke program instantiation,
+   cross-program import, or `splice_program`. Add one real cross-program vertical test so the operation's renaming
+   implementation is exercised through the production import machinery.
+2. The XLA execution fixture now distinguishes its static middle axis (`2`) from its runtime extents, but both runtime
+   extents are `3`. Make all three extents pairwise distinct so reversing the compact dynamic operands changes the
+   observed shape and output length.
+3. The full macro integration gate still fails only because
+   `crates/ryft-macros-tests/tests/parameters/error_structs.stderr` has a stale compiler-generated implementor list.
+   Refresh that snapshot deliberately after reviewing the actual diagnostic. Also remove the unrelated blank-line-only
+   diff in `backends/dimensions.rs` before landing the increment.
+
+Verification for this third review:
+
+- `cargo test -p ryft-core --lib`: 994 passed;
+- `cargo test -p ryft-xla --lib`: 408 passed and one timing benchmark ignored;
+- `cargo test -p ryft-macros`: 53 passed;
+- `cargo test -p ryft-macros-tests`: operation tests passed, while the parameter trybuild suite has the single stale
+  snapshot failure described above;
+- `cargo test -p ryft-core --doc`: 58 passed and 16 ignored;
+- `cargo fmt -p ryft-core -p ryft-xla -- --check`: passed; and
+- `git diff --check`: passed.
+
+P3j is now a correct and nearly complete vertical slice. Close only the three bounded items above, rerun the same
+gates, review the final source-only diff for minimality, and then begin the separate `One`, `Fill`, and `Iota` slices.
+
+### Plan revision: constructor contracts without a wrapper
+
+The shaped-constructor wrapper (P3j Delivery A) was replaced after review by the stored-type-authoritative design:
+constructor payloads keep their possibly-dynamic output `ArrayType`, and dynamic axes consume explicit
+identity-validated dimension operands. This deleted `ShapedConstructorOperation`, `ArrayConstructorOperation`, and
+the template-shape representation entirely, and resolved the template-shape canonicalization question by making it
+unrepresentable. Jacobian forward and reverse entry points now validate input and output coordinate spaces before
+linearization and pullback, preserving their precise `NonFiniteCoordinateSpace` diagnostics ahead of the new
+constructor rule.
+
+A second review pass corrected the first implementation of this design:
+
+- the mixed contract moved from a second `impl Operation<ArrayProgramType>` on `ZeroOperation<ArrayType>` to the
+  `ArrayProgramOperation::DynamicZero` variant arm, restoring one trait implementation per payload and Phase 8
+  compatibility;
+- the nullary guard became position-aware: it rejects only ungrounded identity *references* (dynamic array axes) and
+  allows definition-position identities such as a `DimensionType`'s own variable;
+- `From<ZeroOperation<ArrayType>>` routes canonically (reference-bearing types to `DynamicZero`, identity-free types
+  to the homogeneous member family) and the dynamic-constructor inference rejects reference-free stored types, so
+  each zero has one encoding;
+- XLA lowering was fixed to treat the dimension operands as compact (one per dynamic axis, in axis order) instead of
+  indexing them by physical axis number, with a mixed static/dynamic lowering-and-execution test;
+- the intermediate `DimensionType::rename_identities` implementation revalidated a carried `known_extent` instead of
+  copying it; the 2026-07-28 audit supersedes that field and deletes the entire path rather than polishing it further;
+  and
+- the increment was narrowed to zero only: the `One`/`Fill`/`Iota` guards and mixed contracts were reverted and land
+  as complete vertical slices with their composite wiring, per review preference for reviewability.
+
+Two review findings remain open as blocking follow-ups:
+
+- `DimensionType::known_extent` participates in `Typed::r#type`, structural equality, and hashing, so concrete
+  boundary extents leak into retained-JIT cache keys and specialize compilation per extent — the opposite of the
+  feature's intent. The 2026-07-28 audit found that no replacement provider is necessary: structural closure already
+  proves that each output reference identity is consumed or defined by its producing instruction, so complete-signature
+  output validation may establish its first concrete fact for input-owned as well as internally defined identities.
+  Keep `DimensionType` strictly identity plus bounds and add a retained-JIT test proving one specialization serves
+  multiple extents.
+- Transform consumers that stage `ZeroOperation<ArrayType>` (condition, scan, while, gather, scatter, slice, pad,
+  and differentiation rules) can now hit the nullary reference guard when a dynamic `ArrayType` reaches them. The
+  Jacobian reordering preserves precise diagnostics at two entry points but treats a symptom; Phase 6 owns migrating
+  those consumers to `zero_like`, structural zeros, or explicit extent residuals, with dynamic-shape acceptance
+  tests per consumer.
+
 ### Plan revision: projection ownership, constructors, residuals, and explicit operands
 
 The pre-execution review identified four missing design decisions and this revision resolves them:
@@ -1440,7 +1837,7 @@ The pre-execution review identified four missing design decisions and this revis
 - projection now has distinct borrowed and consuming paths, and Phase 0 must decide whether the immutable reference
   `Array` payload also moves from `Vec<Scalar>` to measured shared storage before the prototype;
 - generic zero/one/fill/iota overlap is part of the dual-contract inventory, with operand-relative construction for
-  transforms, homogeneous construction for static geometry, and one mixed wrapper for dynamic geometry;
+  transforms, homogeneous construction for static geometry, and one variant-owned mixed contract for dynamic geometry;
 - leaf-only dimensions remain explicit policy, while transpose-only primal extents move through one
   differentiation-owned ordinary SSA residual mechanism and `transpose_dimension_variables` is deleted; and
 - each mixed operation owns one direct positional dimension-operand contract, and all consumers preserve those SSA
@@ -2033,3 +2430,31 @@ readback. The golden exact program contains 4 instructions, renders to 223 bytes
 StableHLO; a warm local probe compiled in 28,795 microseconds and executed/synchronized/copied in 354 microseconds.
 Verification and the classified homogeneous-consumer residual audit are recorded in
 `.tasks/plan_p3h_concatenate.md` and the cleanup ledger.
+
+### Execution: P3j Delivery A shaped-zero architecture gate (HISTORICAL — superseded)
+
+This section records the wrapper-based Delivery A as executed. The wrapper design it describes was subsequently
+replaced by the stored-type-authoritative `DynamicZero` design (variant-owned mixed contract, dynamic-only operands,
+canonical `From` routing); see the constructor revision notes in the Review section. It is retained as the execution
+record of the superseded increment only.
+
+
+P3j Delivery A introduced the sole generic `ShapedConstructorOperation<C>` adapter and proved its zero specialization
+as a flat `ArrayProgramOperation::ShapedZero` variant. The operation consumes one explicit first-class dimension
+operand per output axis, including exact constants, and derives its complete result shape from those operand types.
+The wrapped homogeneous zero contributes only element type, expected rank, and placement metadata; no identity,
+bounds, extent ordering, witness, or packed shape data is duplicated in the payload.
+
+Eager execution resolves those values to one concrete static allocation. Complete-signature validation carries the
+observed concrete extent as a private `DimensionType` boundary refinement, keeping variable identity and bounds
+authoritative while avoiding a generic `Value` payload-inspection hook. Partial evaluation folds known extents and
+residualizes unknown ones; batching requires replicated extent authority; transpose gives extents structural-zero
+cotangents; and fused JVP reuses the same-typed zero primal for its zero tangent so no nullary dynamic zero is
+invented.
+
+Bounded XLA lowering materializes the upper-bound zero buffer and attaches each dynamic logical size with
+`stablehlo.set_dimension_size` using the explicit SSA operand. Its test emits no `get_dimension_size` and compiles and
+executes through CPU PJRT. Generic linearization and disconnected-input pullback still need transform-owned dimension
+residuals, so deletion of the temporary `Zero(ZeroOperation<ArrayProgramType>)` escape hatch remains P3j Delivery D
+and may move to the first Phase 6 residual delivery rather than adding type-to-value recovery. Exact inventory,
+measurements, verification, and residual evidence are recorded in `.tasks/plan_p3j_shaped_constructors.md`.
