@@ -16,6 +16,7 @@ use crate::partial::{
 };
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, MaybeZero};
+use crate::programs::identities::TypeIdentityPosition;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{
@@ -757,11 +758,11 @@ pub type LinearizationTracer<C> = DifferentiationTracer<PartialEvaluationContext
 /// receiver and runs the user's closure directly on transform tracers (i.e., [`DifferentiationTracer`] duals here,
 /// and [`BatchingTracer`](crate::BatchingTracer)s there), with eager-versus-staged behavior absorbed entirely by the
 /// wrapped context. It is what makes [`ForwardModeDifferentiate::jvp`] the single forward-mode entry point. Structural
-/// zero tangents stay symbolic [`MaybeZero::Zero`]s while they flow between rules. The [`bind`](Context::bind) fast
-/// path skips an operation's rule entirely when every input tangent is a structural zero, exactly like the
-/// program-level replay behind [`Program::linearize`], and so no zero values are constructed and no zero work
-/// is performed until a boundary [`materialize`](MaybeZero::materialize)s one through the inner context's [`Zero`]
-/// capability.
+/// zero tangents stay symbolic [`MaybeZero::Zero`]s while they flow between rules. When every input tangent is a
+/// structural zero, the [`bind`](Context::bind) fast path skips a region-free operation's rule only if each output
+/// zero tangent can be constructed without runtime identity operands (or the zero-producing primal itself is reusable).
+/// Eligible operations therefore construct no zero values until a boundary [`materialize`](MaybeZero::materialize)s
+/// one through the inner context's [`Zero`] capability.
 #[derive(Clone)]
 pub struct DifferentiationContext<C: Context> {
     /// Parent [`Context`] that carries the primal and tangent values and executes (or stages) the operations
@@ -819,16 +820,57 @@ where
         let input_duals = inputs.iter().map(|input| input.dual().clone()).collect::<Vec<_>>();
 
         // All-zero fast path mirroring `Program::jvp`. When an operation consumes at least one input and every input
-        // tangent is a structural zero, the operation's tangent is zero by the chain rule, and so the rule is skipped
-        // and the primal operation binds directly. Zero-input operations are excluded so their dedicated rules keep
-        // handling primal synthesis and tangent typing.
-        let output_duals = if !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero()) {
+        // tangent is a structural zero, skip its rule only when each output tangent can later be materialized without
+        // runtime identity operands. Zero-input operations remain excluded so their dedicated rules keep handling
+        // primal synthesis and tangent typing.
+        let zero_input_tangents = !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero());
+
+        // Dynamic one already relies on this routing to stage an explicit dynamic-zero tangent. Other dynamic-output
+        // rules that still return structural zeros need Phase 6 extent residuals, which must also revisit the
+        // region-carrying escape below.
+        let reusable_zero_outputs = if zero_input_tangents {
+            // Region-free operations can be inspected without reproducing the parent's region-identity instantiation.
+            // Region-carrying rules retain the established fast path here. Their explicit dynamic-output migration
+            // owns the corresponding policy when those operation families move to first-class extent operands.
+            if operation.region_slots().is_empty() {
+                let input_types =
+                    input_duals.iter().map(|dual| dual.primal().r#type().into_owned()).collect::<Vec<_>>();
+                let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
+                let mut reusable_zero_outputs = Vec::new();
+                let can_materialize = output_types.iter().enumerate().all(|(output_index, output_type)| {
+                    let tangent_type = output_type.tangent();
+                    if operation.is_zero(output_index) && output_type == &tangent_type {
+                        reusable_zero_outputs.push(output_index);
+                        true
+                    } else {
+                        tangent_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference)
+                    }
+                });
+                can_materialize.then_some(reusable_zero_outputs)
+            } else {
+                Some(Vec::new())
+            }
+        } else {
+            None
+        };
+        let output_duals = if let Some(reusable_zero_outputs) = reusable_zero_outputs {
             let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
             self.parent
                 .bind(operation, driver, &primal_inputs)?
                 .into_iter()
-                .map(DifferentiationDual::new_with_zero_tangent)
-                .collect()
+                .enumerate()
+                .map(|(output_index, primal)| {
+                    // When the primal operation is itself known to produce zero and its output already has the required
+                    // tangent type, the primal value is the canonical materialized tangent. Reusing it avoids inventing
+                    // a nullary dynamic zero when a staged tangent is later materialized, exactly like the fused replay
+                    // in `RegionRef::jvp`.
+                    if reusable_zero_outputs.contains(&output_index) {
+                        DifferentiationDual::new(primal.clone(), primal)
+                    } else {
+                        Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                    }
+                })
+                .collect::<Result<Vec<_>, TypeError>>()?
         } else {
             // Borrow the complete region driver directly, preserving operation-defined ordering without collecting
             // it into temporary storage.
@@ -926,13 +968,25 @@ where
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
 
-                // All-zero fast path: when an operation consumes at least one input and every input tangent is a
-                // structural zero, the operation's tangent is zero by the chain rule, so the rule is skipped. The
-                // primal outputs are staged directly and each output tangent is a typed structural zero. Zero-input
-                // operations are excluded so their dedicated rules keep handling primal synthesis and tangent typing.
-                let all_input_tangents_are_zero = input_duals.iter().all(|dual| dual.tangent().is_zero());
+                // TODO(eaplatanios): Does this need to be updated in Phase 6?
+                // All-zero fast path: skip the operation's rule only when every input tangent is structural zero and
+                // every output zero tangent can later be materialized without runtime identity operands (or by reusing
+                // a zero-producing primal). Zero-input operations remain excluded so their dedicated rules keep
+                // handling primal synthesis and tangent typing. Dynamic one already relies on this routing to stage
+                // an explicit dynamic-zero tangent. Other dynamic-output rules that still return structural zeros need
+                // Phase 6 extent residuals.
+                let all_input_tangents_are_zero =
+                    !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero());
+                let can_materialize_output_tangents_without_rules = || {
+                    instruction.outputs().iter().copied().enumerate().all(|(output_index, output_atom)| {
+                        let output_type = self.atoms()[output_atom.index()].r#type();
+                        let tangent_type = output_type.tangent();
+                        tangent_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference)
+                            || (instruction.operation().is_zero(output_index) && output_type.as_ref() == &tangent_type)
+                    })
+                };
                 let driver = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
-                let output_duals = if !input_duals.is_empty() && all_input_tangents_are_zero {
+                let output_duals = if all_input_tangents_are_zero && can_materialize_output_tangents_without_rules() {
                     let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
                     context
                         .stage_operation(instruction.operation().clone(), driver, primal_inputs.as_slice())?
@@ -1224,12 +1278,11 @@ where
     /// ordinary primal operations, and so the result contains no symbolic captures.
     ///
     /// Atoms that are not reached by any input tangent are structurally zero. Their tangents stay symbolic as typed
-    /// [`MaybeZero::Zero`]s and stage nothing. The shared all-zero fast path short-circuits the all-zero case (an
-    /// operation consuming at least one input whose every input tangent is a structural zero) by staging the primal
-    /// operation directly and pairing each primal output with a typed structural zero tangent, so that zero-ness
-    /// propagates transitively without staging or scanning [`Instruction`](crate::Instruction)s. Structural zero
-    /// tangents are materialized as typed [`ZeroOperation`] instructions only at the output boundary, preserving the
-    /// `(primal_outputs ++ tangent_outputs)` program contract.
+    /// [`MaybeZero::Zero`]s and stage nothing. The shared all-zero fast path short-circuits operations whose every
+    /// input tangent is structural zero only when each output zero tangent can be materialized without runtime identity
+    /// operands (or by reusing a compatible zero-producing primal). It stages the primal directly and pairs each output
+    /// with a typed structural zero tangent. Structural zeros are materialized as typed [`ZeroOperation`] instructions
+    /// only at the output boundary, preserving the `(primal_outputs ++ tangent_outputs)` program contract.
     #[inline]
     pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         self.entry_region_ref().jvp()

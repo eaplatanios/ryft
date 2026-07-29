@@ -2529,7 +2529,7 @@ mod tests {
             .unwrap();
 
         let jvp = program.jvp().unwrap();
-        let extent = ArrayProgramValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
+        let extent = ArrayProgramValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
         let zero_tangent =
             ArrayProgramValue::Array(Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
         assert_eq!(
@@ -2540,6 +2540,31 @@ mod tests {
             ]),
         );
         assert_eq!(jvp.instructions().iter().filter(|instruction| instruction.operation().is_zero(0)).count(), 1);
+
+        // Direct differentiation-context dispatch takes the same all-zero shortcut. Its tangent must reuse the shaped
+        // primal SSA value rather than materializing a nullary zero that has no access to the runtime extent.
+        type TestContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        let context = TestContext::new();
+        let extent = context.input(extent_type.clone().into());
+        let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let (primal, tangent) = context
+            .jvp(
+                move |extent| {
+                    let context = extent.context().clone();
+                    Ok(context.bind(ZeroOperation::new(dynamic_type), Vec::new(), &[extent])?.remove(0))
+                },
+                extent,
+                extent_tangent,
+            )
+            .unwrap();
+        assert_eq!(primal.atom_id(), tangent.atom_id());
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected one dynamic-zero instruction");
+        };
+        assert!(matches!(instruction.operation(), ArrayProgramOperation::DynamicZero(_)));
     }
 
     #[test]
