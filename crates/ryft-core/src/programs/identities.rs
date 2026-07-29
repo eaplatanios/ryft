@@ -101,30 +101,42 @@ pub struct TypeIdentitySignature<I: TypeIdentity> {
     /// so boundary validation can consume the complete list without making any new allocations.
     identities: Vec<I>,
 
-    /// Index of the first internally defined identity within [`identities`](Self::identities).
-    internal_start: usize,
+    /// Number of identities established by formal input types at the start of [`identities`](Self::identities).
+    input_count: usize,
 }
 
 impl<I: TypeIdentity> TypeIdentitySignature<I> {
-    /// Creates a new [`TypeIdentitySignature`].
+    /// Creates a new [`TypeIdentitySignature`] from one ordered identity list whose first `input_count` entries are
+    /// established by formal input types and whose remaining entries are established internally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `input_count` exceeds the number of provided identities.
+    ///
+    /// # Parameters
+    ///
+    ///   - `identities`: Complete ordered list of input identities followed by internally established identities.
+    ///   - `input_count`: Number of input identities at the start of `identities`.
     #[inline]
-    pub fn new(input_identities: Vec<I>, internal_identities: Vec<I>) -> Self {
-        let internal_start = input_identities.len();
-        let mut identities = input_identities;
-        identities.extend(internal_identities);
-        Self { identities, internal_start }
+    pub fn new(identities: Vec<I>, input_count: usize) -> Self {
+        assert!(
+            input_count <= identities.len(),
+            "input identity count {input_count} exceeds total identity count {}",
+            identities.len(),
+        );
+        Self { identities, input_count }
     }
 
     /// Returns the [`TypeIdentity`]s established by formal input types.
     #[inline]
     pub fn input_identities(&self) -> &[I] {
-        &self.identities[..self.internal_start]
+        &self.identities[..self.input_count]
     }
 
     /// Returns the [`TypeIdentity`]s established by [`Instruction`](crate::Instruction) results.
     #[inline]
     pub fn internal_identities(&self) -> &[I] {
-        &self.identities[self.internal_start..]
+        &self.identities[self.input_count..]
     }
 
     /// Returns the complete closed [`TypeIdentity`] set which consists of the input signature identities

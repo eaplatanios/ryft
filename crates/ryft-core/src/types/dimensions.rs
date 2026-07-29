@@ -260,6 +260,12 @@ impl TypeIdentity for DimensionVariable {}
 /// [`Type`] of a [`DimensionValue`](crate::DimensionValue). A value with this type defines `variable` as an ordinary
 /// Single Static Assignment (SSA) value. Array axes may refer to that same [`DimensionVariable`], while arithmetic
 /// relationships between dimension values remain explicit operation edges in the [`Program`](crate::Program) graph.
+///
+/// A [`DimensionType`] is strictly its [`DimensionVariable`] identity plus that variable's authoritative bounds.
+/// Concrete extents observed at execution boundaries are deliberately *not* part of the type (i.e., structural type
+/// equality, hashing, display, and retained-compilation cache identity must not distinguish two calls whose dynamic
+/// extents differ, or every concrete extent would acquire its own specialization). Boundary facts instead live in the
+/// complete-signature [`TypeRefinements`](crate::TypeRefinements) environment established at program boundaries.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct DimensionType {
     /// [`DimensionVariable`] defined by values of this type.
@@ -285,16 +291,20 @@ impl DimensionType {
         self.variable.bounds()
     }
 
+    /// Returns the exact extent implied by this type's bounds when they admit exactly one value, and [`None`] for
+    /// every wider range. This is derived metadata, not stored state: it exists so exact-constant dimensions (e.g.,
+    /// [`DimensionValue::constant`](crate::DimensionValue::constant) literals) stay recognizably static.
+    #[inline]
+    pub fn extent(&self) -> Option<usize> {
+        let bounds = self.bounds();
+        (bounds.lower().checked_add(1) == bounds.upper()).then_some(bounds.lower())
+    }
+
     /// Returns the most precise [`Dimension`] described by this [`DimensionType`]. Exact singleton bounds become a
-    /// static dimension. All other bounds retain this type's [`DimensionVariable`] as a dynamic dimension.
+    /// static dimension. All other cases retain this type's [`DimensionVariable`] as a dynamic dimension.
     #[inline]
     pub fn to_dimension(&self) -> Dimension {
-        let bounds = self.bounds();
-        if bounds.lower().checked_add(1) == bounds.upper() {
-            Dimension::Static(bounds.lower())
-        } else {
-            Dimension::Dynamic(self.variable.clone())
-        }
+        self.extent().map_or_else(|| Dimension::Dynamic(self.variable.clone()), Dimension::Static)
     }
 
     /// Extends a complete-signature [`TypeIdentityRenaming`] with one declared/actual dimension-type pair. This is
@@ -320,7 +330,7 @@ impl DimensionType {
         actual: &Self,
         renaming: &mut TypeIdentityRenaming<DimensionVariable>,
     ) -> Result<(), TypeError> {
-        if !declared.bounds().contains_bounds(actual.bounds()) {
+        if !declared.is_refined_by(actual) {
             return Err(TypeError::invalid(format!(
                 "dimension type {actual} cannot instantiate declared type {declared}",
             )));
@@ -332,11 +342,10 @@ impl DimensionType {
 impl Display for DimensionType {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let bounds = self.bounds();
-        if bounds.lower().checked_add(1) == bounds.upper() {
-            write!(formatter, "dimension<{}>", bounds.lower())
+        if let Some(extent) = self.extent() {
+            write!(formatter, "dimension<{extent}>")
         } else {
-            write!(formatter, "dimension<{} ∈ {bounds}>", self.variable)
+            write!(formatter, "dimension<{} ∈ {}>", self.variable, self.bounds())
         }
     }
 }
@@ -864,10 +873,17 @@ mod tests {
         assert!(!declared.is_complex());
         assert!(declared.is_refined_by(&actual));
         assert_eq!(declared.to_dimension(), Dimension::Dynamic(declared_variable.clone()));
+
+        // A dimension type is strictly identity plus bounds: exact singleton bounds are the only source of a static
+        // extent, and no concrete boundary observation participates in the type itself.
+        assert_eq!(declared.extent(), None);
         let exact_variable = DimensionVariable::new("7", DimensionBounds::new(7, Some(8)).unwrap());
         let exact_type = DimensionType::new(exact_variable);
+        assert_eq!(exact_type.extent(), Some(7));
         assert_eq!(exact_type.to_string(), "dimension<7>");
         assert_eq!(exact_type.to_dimension(), Dimension::Static(7));
+        assert!(declared.is_refined_by(&exact_type));
+        assert!(!exact_type.is_refined_by(&declared));
 
         let mut identities = Vec::new();
         declared.visit_identities(&mut |position, variable| identities.push((position, variable.clone())));

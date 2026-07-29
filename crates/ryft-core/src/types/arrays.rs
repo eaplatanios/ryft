@@ -579,27 +579,29 @@ impl ArrayTypeRefinements {
         }
     }
 
-    /// Validates one observed extent against an established input fact, or binds it when `variable` is a locally
-    /// defined identity. This is the validation-phase counterpart of [`Self::bind`]. For a variable that already has
-    /// a recorded extent, the two behave identically (i.e., a matching observation is accepted and a differing one is
-    /// rejected). They differ on a variable with no recorded fact. [`Self::bind`] treats the refinement set as *open*
-    /// and records the first observation as a new fact, which is correct while establishing facts from a complete input
-    /// signature (i.e., as [`TypeRefinements::establish`] and [`ArrayType::extend_identity_renaming`] do, where every
-    /// variable may legitimately appear for the first time). [`Self::validate_or_bind`] instead treats the set as
-    /// *closed* for boundary identities where an unrecorded variable is admitted only when it appears in
-    /// `locally_defined_identities`, meaning the identity is produced *inside* the program or region and therefore
-    /// cannot have an input-established fact and is first observed at an output. In that case, it delegates to
-    /// [`Self::bind`] so repeated observations of the same local identity across several outputs must still agree.
-    /// Every other unrecorded variable is rejected, because an output extent claimed for an input-owned identity that
-    /// the inputs never established cannot be justified. In short, use [`Self::bind`] where observations *create*
-    /// facts, and use this function where observations must be *justified* by previously established facts, as
-    /// [`TypeRefinements::validate`] does when checking an output signature against the facts established from
-    /// its input boundary.
+    /// Validates one observed extent against an established input fact, or binds it when `variable` belongs to the
+    /// validated boundary's closed identity signature. This is the validation-phase counterpart of [`Self::bind`].
+    /// For a variable that already has a recorded extent, the two behave identically (i.e., a matching observation
+    /// is accepted and a differing one is rejected). They differ on a variable with no recorded fact. [`Self::bind`]
+    /// treats the refinement set as *open* and records the first observation as a new fact, which is correct while
+    /// establishing facts from a complete input signature (i.e., as [`TypeRefinements::establish`] and
+    /// [`ArrayType::extend_identity_renaming`] do, where every variable may legitimately appear for the first time).
+    /// [`Self::validate_or_bind`] instead admits an unrecorded variable only when it appears in `closed_identities`,
+    /// the boundary's complete closed identity set (i.e., an identity established by the formal input signature, whose
+    /// first concrete fact may only become observable at an output, such as a first-class dimension input whose type is
+    /// strictly identity plus bounds, or an identity defined by an instruction inside the program or region). In either
+    /// case it delegates to [`Self::bind`] so repeated observations across several outputs must still agree; this is
+    /// sound without inspecting runtime payloads because structural region closure already proves that every output
+    /// reference identity is consumed or defined. Every variable outside the closed set is rejected, because an extent
+    /// claimed for an identity foreign to the boundary cannot be justified. In short, use [`Self::bind`] where
+    /// observations *create* facts, and use this function where observations must be *justified* against the boundary's
+    /// identity authority, as [`TypeRefinements::validate`] does when checking an output signature against the facts
+    /// established from its input boundary.
     fn validate_or_bind(
         &mut self,
         variable: &DimensionVariable,
         extent: usize,
-        locally_defined_identities: &[DimensionVariable],
+        closed_identities: &[DimensionVariable],
     ) -> Result<(), TypeError> {
         match self.bindings.iter().find_map(|(candidate, value)| (candidate == variable).then_some(*value)) {
             Some(expected) if expected != extent => Err(DimensionError::InputDimensionMismatch {
@@ -609,8 +611,10 @@ impl ArrayTypeRefinements {
             }
             .into()),
             Some(_) => Ok(()),
-            None if locally_defined_identities.contains(variable) => self.bind(variable, extent),
-            None => Err(TypeError::invalid(format!("dimension identity {variable} has no input refinement"))),
+            None if closed_identities.contains(variable) => self.bind(variable, extent),
+            None => Err(TypeError::invalid(format!(
+                "dimension identity {variable} does not belong to the validated boundary signature",
+            ))),
         }
     }
 
@@ -684,7 +688,7 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         &self,
         declared: D,
         actual: A,
-        locally_defined_identities: &[DimensionVariable],
+        closed_identities: &[DimensionVariable],
     ) -> Result<(), TypeError>
     where
         D::IntoIter: ExactSizeIterator,
@@ -695,7 +699,7 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         let mut refinements = self.clone();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
             Self::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
-                refinements.validate_or_bind(variable, extent, locally_defined_identities)
+                refinements.validate_or_bind(variable, extent, closed_identities)
             })
         })
     }
@@ -852,12 +856,13 @@ impl Type for ArrayProgramType {
     }
 }
 
-/// [`TypeRefinements`] established while refining one complete [`ArrayProgramType`] signature. Every refinement fact
-/// comes from an array member. A declared dynamic axis met by a static extent contributes a dynamic-to-static binding
-/// that all array members of the signature share, following the [`ArrayTypeRefinements`] rules unchanged. Dimension
-/// members contribute no facts, because a [`DimensionType`] never carries a concrete extent (a first-class dimension's
-/// runtime extent lives in its *value*, not its type descriptor). Refining a dimension member therefore only checks
-/// that the actual member's bounds stay within the declared member's bounds.
+/// [`TypeRefinements`] established while refining one complete [`ArrayProgramType`] signature. A declared dynamic array
+/// axis met by a static extent contributes a dynamic-to-static binding following the [`ArrayTypeRefinements`] rules
+/// unchanged. A dimension member contributes no concrete fact, because a [`DimensionType`] is strictly identity plus
+/// bounds: its variable belongs to the boundary's closed identity set (see
+/// [`TypeIdentitySignature`](crate::TypeIdentitySignature)), which lets output validation establish the concrete extent
+/// on first observation (e.g., relating an eagerly materialized static array output back to the dimension input that
+/// supplied its shape) while still rejecting inconsistent repeated observations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrayProgramTypeRefinements {
     /// [`ArrayTypeRefinements`] shared by all array members of the signature.
@@ -865,14 +870,16 @@ pub struct ArrayProgramTypeRefinements {
 }
 
 impl ArrayProgramTypeRefinements {
-    /// Validates a pair of [`ArrayProgramType`]s and delegates [`ArrayType`]-specific refinement work to `visit_array`.
+    /// Validates a pair of [`ArrayProgramType`]s and visits any concrete identity refinement it contributes.
     fn visit_pair(
         declared: &ArrayProgramType,
         actual: &ArrayProgramType,
-        visit_array: impl FnOnce(&ArrayType, &ArrayType) -> Result<(), TypeError>,
+        visit: impl FnMut(&DimensionVariable, usize) -> Result<(), TypeError>,
     ) -> Result<(), TypeError> {
         match (declared, actual) {
-            (ArrayProgramType::Array(declared), ArrayProgramType::Array(actual)) => visit_array(declared, actual),
+            (ArrayProgramType::Array(declared), ArrayProgramType::Array(actual)) => {
+                ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared, actual, visit)
+            }
             (ArrayProgramType::Dimension(declared), ArrayProgramType::Dimension(actual))
                 if declared.is_refined_by(actual) =>
             {
@@ -901,11 +908,7 @@ impl TypeRefinements<ArrayProgramType> for ArrayProgramTypeRefinements {
     {
         let mut refinements = Self::default();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::visit_pair(declared, actual, |declared, actual| {
-                ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
-                    refinements.arrays.bind(variable, extent)
-                })
-            })
+            Self::visit_pair(declared, actual, |variable, extent| refinements.arrays.bind(variable, extent))
         })?;
         Ok(refinements)
     }
@@ -914,7 +917,7 @@ impl TypeRefinements<ArrayProgramType> for ArrayProgramTypeRefinements {
         &self,
         declared: D,
         actual: A,
-        locally_defined_identities: &[DimensionVariable],
+        closed_identities: &[DimensionVariable],
     ) -> Result<(), TypeError>
     where
         D::IntoIter: ExactSizeIterator,
@@ -924,10 +927,8 @@ impl TypeRefinements<ArrayProgramType> for ArrayProgramTypeRefinements {
     {
         let mut refinements = self.clone();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::visit_pair(declared, actual, |declared, actual| {
-                ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
-                    refinements.arrays.validate_or_bind(variable, extent, locally_defined_identities)
-                })
+            Self::visit_pair(declared, actual, |variable, extent| {
+                refinements.arrays.validate_or_bind(variable, extent, closed_identities)
             })
         })
     }
@@ -1463,15 +1464,74 @@ mod tests {
             [actual_two.clone(), actual_two.clone()],
         )
         .unwrap();
-        assert_eq!(refinements.validate([declared_array.clone()], [actual_two], &[]), Ok(()),);
+        assert_eq!(refinements.validate([declared_array.clone()], [actual_two], &[],), Ok(()),);
         let error = ArrayProgramTypeRefinements::establish(
-            [declared_array.clone(), declared_array],
+            [declared_array.clone(), declared_array.clone()],
             [ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))), actual_three],
         )
         .unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
+        );
+
+        // A dimension member contributes no concrete fact (its type is strictly identity plus bounds). Its variable
+        // instead belongs to the boundary's closed identity signature, so output validation may establish the concrete
+        // extent for it on first observation and must reject an inconsistent repeated observation within the same
+        // validated signature.
+        let declared_dimension = ArrayProgramType::Dimension(DimensionType::new(batch.clone()));
+        let refinements = ArrayProgramTypeRefinements::establish(
+            std::slice::from_ref(&declared_dimension),
+            std::slice::from_ref(&declared_dimension),
+        )
+        .unwrap();
+        let closed_identities = [batch.clone()];
+        assert_eq!(
+            refinements.validate(
+                [declared_array.clone(), declared_array.clone()],
+                [
+                    ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
+                    ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
+                ],
+                &closed_identities,
+            ),
+            Ok(()),
+        );
+        let error = refinements
+            .validate(
+                [declared_array.clone(), declared_array.clone()],
+                [
+                    ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
+                    ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]))),
+                ],
+                &closed_identities,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
+        );
+
+        // An identity outside the boundary's closed signature stays rejected, and an internally defined identity may
+        // establish its first fact exactly like an input-signature identity.
+        let unrelated = DimensionVariable::new("unrelated", DimensionBounds::non_negative(Some(8)).unwrap());
+        let unrelated_array =
+            ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(unrelated.clone())])));
+        assert_eq!(
+            refinements.validate(
+                std::slice::from_ref(&unrelated_array),
+                [ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])))],
+                &closed_identities,
+            ),
+            Err(TypeError::invalid("dimension identity unrelated does not belong to the validated boundary signature")),
+        );
+        assert_eq!(
+            refinements.validate(
+                std::slice::from_ref(&unrelated_array),
+                [ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])))],
+                std::slice::from_ref(&unrelated),
+            ),
+            Ok(()),
         );
     }
 }

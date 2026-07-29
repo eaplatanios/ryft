@@ -199,25 +199,30 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
 
     /// Validates `actual` against `declared` using the refinement facts previously established from the corresponding
     /// input signature. Facts already stored in `self` must remain consistent at every occurrence of the corresponding
-    /// identity. An identity listed in `locally_defined_identities` was defined by an instruction inside the program or
-    /// region rather than introduced at its input boundary. Its first concrete occurrence in the validated signature
-    /// may therefore establish a new refinement fact, and subsequent occurrences must agree with that fact. An unbound
-    /// identity that was neither established from the inputs nor locally defined is rejected.
+    /// identity. An identity in `closed_identities` (i.e., the validated boundary's complete closed identity set,
+    /// covering both identities established by the formal input signature and identities defined by instructions inside
+    /// the program or region) may establish a new refinement fact at its first concrete occurrence in the validated
+    /// signature, and subsequent occurrences must agree with that fact. This is sound without inspecting runtime
+    /// payloads (structural region closure already rejects an instruction result reference unless the producing
+    /// instruction consumes or defines the identity, so validation only has to enforce cross-observation consistency).
+    /// An unbound identity outside the closed set is rejected.
     ///
-    /// `locally_defined_identities` is only an authority list identifying which identities may establish facts during
-    /// validation. It does not contain concrete extents or inspect runtime value payloads.
+    /// `closed_identities` is only an authority set identifying which identities may establish facts during validation.
+    /// It does not contain concrete extents or inspect runtime value payloads.
     ///
     /// # Parameters
     ///
     ///   - `declared`: Complete declared type signature being validated, normally a program or region output signature.
     ///   - `actual`: Corresponding refining type signature supplied at the validation site.
-    ///   - `locally_defined_identities`: Type identities structurally defined by instructions inside the program or
-    ///     region and therefore permitted to establish refinement facts when first encountered in `actual`.
+    ///   - `closed_identities`: The validated boundary's complete closed identity set
+    ///     (e.g., a [`TypeIdentitySignature`](crate::TypeIdentitySignature)'s
+    ///     [`identities`](crate::TypeIdentitySignature::identities) slice), whose members are permitted to establish
+    ///     refinement facts when first encountered in `actual`.
     fn validate<D: IntoIterator, A: IntoIterator>(
         &self,
         declared: D,
         actual: A,
-        locally_defined_identities: &[T::Identity],
+        closed_identities: &[T::Identity],
     ) -> Result<(), TypeError>
     where
         D::IntoIter: ExactSizeIterator,
@@ -242,7 +247,7 @@ impl<T: Type> TypeRefinements<T> for () {
         &self,
         declared: D,
         actual: A,
-        _locally_defined_identities: &[T::Identity],
+        _closed_identities: &[T::Identity],
     ) -> Result<(), TypeError>
     where
         D::IntoIter: ExactSizeIterator,

@@ -201,21 +201,19 @@ impl<V: Typed, O> Region<V, O> {
         O: Operation<V::Type>,
     {
         // Region inputs establish the identities that are available at entry. Preserve first-occurrence order and
-        // record each identity once even when several input types refer to the same dynamic quantity.
-        let mut input_identities = Vec::new();
+        // record each identity once even when several input types refer to the same dynamic quantity. Note that the
+        // complete ordered signature is also the dominance environment while walking the region. Every identity
+        // appended after `input_count` is established internally, so one vector records availability and retains
+        // the final input/internal partition without copying identities into parallel collections.
+        let mut identities = Vec::new();
         for input in &self.input_ids {
             self.atoms[input.index()].r#type().visit_identities(&mut |_, identity| {
-                if !input_identities.contains(identity) {
-                    input_identities.push(identity.clone());
+                if !identities.contains(identity) {
+                    identities.push(identity.clone());
                 }
             });
         }
-
-        // `available_identities` is the dominance environment while walking the region. Internal identities are
-        // recorded separately so boundary refinement can later distinguish caller-provided identities from quantities
-        // established by instructions inside this region.
-        let mut available_identities = input_identities.clone();
-        let mut internal_identities = Vec::new();
+        let input_count = identities.len();
 
         // A definition-position occurrence on a constant establishes one immutable Single Static Assignment (SSA) value
         // just like a definition-position instruction result. Process all such definitions before constant references
@@ -226,13 +224,12 @@ impl<V: Typed, O> Region<V, O> {
                 if position != TypeIdentityPosition::Definition {
                     return Ok(());
                 }
-                if available_identities.contains(identity) {
+                if identities.contains(identity) {
                     return Err(TypeError::invalid(format!(
                         "constant type defines identity {identity} more than once in this region",
                     )));
                 }
-                available_identities.push(identity.clone());
-                internal_identities.push(identity.clone());
+                identities.push(identity.clone());
                 Ok(())
             })
         })?;
@@ -245,7 +242,7 @@ impl<V: Typed, O> Region<V, O> {
                 if position != TypeIdentityPosition::Reference {
                     return Ok(());
                 }
-                if available_identities.contains(identity) {
+                if identities.contains(identity) {
                     Ok(())
                 } else {
                     Err(TypeError::invalid(format!(
@@ -264,7 +261,7 @@ impl<V: Typed, O> Region<V, O> {
             instruction.inputs().iter().try_for_each(|input| {
                 let r#type = self.atoms[input.index()].r#type();
                 Self::visit_type_identities(r#type.as_ref(), |_, identity| {
-                    if !available_identities.contains(identity) {
+                    if !identities.contains(identity) {
                         return Err(TypeError::invalid(format!(
                             "operation `{}` input type references identity {} before its definition",
                             instruction.operation().name(),
@@ -288,15 +285,14 @@ impl<V: Typed, O> Region<V, O> {
                     if position != TypeIdentityPosition::Definition || operand_identities.contains(identity) {
                         return Ok(());
                     }
-                    if available_identities.contains(identity) || defined_identities.contains(identity) {
+                    if identities.contains(identity) || defined_identities.contains(identity) {
                         return Err(TypeError::invalid(format!(
                             "operation `{}` output defines identity {} more than once in this region",
                             instruction.operation().name(),
                             identity,
                         )));
                     }
-                    available_identities.push(identity.clone());
-                    internal_identities.push(identity.clone());
+                    identities.push(identity.clone());
                     defined_identities.push(identity.clone());
                     Ok(())
                 })
@@ -312,9 +308,8 @@ impl<V: Typed, O> Region<V, O> {
                     if position != TypeIdentityPosition::Reference {
                         return Ok(());
                     }
-                    if !available_identities.contains(identity) {
-                        available_identities.push(identity.clone());
-                        internal_identities.push(identity.clone());
+                    if !identities.contains(identity) {
+                        identities.push(identity.clone());
                         defined_identities.push(identity.clone());
                         return Ok(());
                     }
@@ -330,9 +325,9 @@ impl<V: Typed, O> Region<V, O> {
             })
         })?;
 
-        // The resulting signature retains only the identities needed for later boundary instantiation and refinement:
-        // caller-established identities first, followed by identities established within the region.
-        Ok(TypeIdentitySignature::new(input_identities, internal_identities))
+        // The resulting signature transfers the dominance environment directly (caller-established identities occupy
+        // its prefix and identities established within the region occupy its suffix).
+        Ok(TypeIdentitySignature::new(identities, input_count))
     }
 }
 

@@ -135,6 +135,74 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
             lower_constant_output(output_types.as_slice(), 0, block, context, location)
         }
+        ArrayProgramOperation::DynamicZero(_) => {
+            let [output_type] = output_types else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+            };
+            let output_type =
+                <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let dynamic_count = output_type
+                .shape()
+                .dimensions()
+                .iter()
+                .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+                .count();
+            if input_values.len() != dynamic_count {
+                return Err(
+                    ProgramError::InvalidInputCount { expected: dynamic_count, actual: input_values.len() }.into()
+                );
+            }
+
+            // XLA materializes one statically bounded physical buffer. Each explicit dynamic extent then narrows the
+            // corresponding logical axis without recovering geometry from another array value.
+            let physical_dimensions = output_type
+                .shape()
+                .dimensions()
+                .iter()
+                .map(|dimension| match dimension {
+                    Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+                    Dimension::Dynamic(variable) => stable_hlo_dynamic_dimension_bound(dimension)
+                        .map(Dimension::Static)
+                        .ok_or_else(|| LoweringError::UnsupportedOp {
+                            op: format!(
+                                "zero output dimension '{}' needs a finite upper bound for physical buffer allocation",
+                                variable,
+                            ),
+                        }),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let physical_type = output_type.clone().with_shape(Shape::new(physical_dimensions));
+            let mut result =
+                lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
+            let i32_scalar_type = context
+                .tensor_type(context.signless_integer_type(32), &[], None, location)
+                .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+            let mut refined_type = physical_type;
+            // The dimension operands are compact (one per dynamic axis, in axis order), so advance the operand
+            // iterator only when a dynamic axis is encountered rather than indexing by the physical axis number.
+            let mut operands = input_values.iter();
+            for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
+                if !matches!(dimension, Dimension::Dynamic(_)) {
+                    continue;
+                }
+                let operand = *operands.next().unwrap();
+                let extent = block.append_operation(stable_hlo::convert(operand, i32_scalar_type, location)?)?;
+                let extent = extent.result(0).expect("stablehlo.convert should return one result").as_ref();
+                let mut dimensions = refined_type.shape().dimensions().to_vec();
+                dimensions[axis] = dimension;
+                refined_type = refined_type.with_shape(Shape::new(dimensions));
+                let refined_tensor_type = lower_tensor_type(&refined_type, context, location)?;
+                let operation = block.append_operation(stable_hlo::set_dimension_size(
+                    result,
+                    extent,
+                    refined_tensor_type,
+                    axis,
+                    location,
+                )?)?;
+                result = operation.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+            }
+            Ok(vec![result])
+        }
         ArrayProgramOperation::Array(operation) => {
             let input_types = input_types
                 .iter()
@@ -688,6 +756,7 @@ mod tests {
 
     use ryft_core::contexts::{Context, StagingContext};
     use ryft_core::operations::compare::{Compare, ComparisonDirection};
+    use ryft_core::operations::constants::ZeroOperation;
     use ryft_core::operations::custom_call::CustomCallOperation;
     use ryft_core::operations::dimensions::{
         DimensionAddOperation, DimensionFromScalar, DimensionMulOperation, DimensionSize, DimensionSizeOperation,
@@ -1438,6 +1507,139 @@ mod tests {
             let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<u8>(output_bytes.as_slice()), vec![1]);
         }
+    }
+
+    #[test]
+    fn test_dynamic_zero_lowering() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let context = TestContext::new();
+        let extent = context.input(extent_type.clone().into());
+        let output = context
+            .bind(
+                ZeroOperation::new(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+                )),
+                Vec::new(),
+                &[extent],
+            )
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 1);
+        assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 0);
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let extent_bytes = values_to_bytes(&[3_i64]);
+        let inputs = ExecutionDeviceInputs {
+            inputs: &[ExecutionInput {
+                buffer: Arc::new(
+                    client.buffer(extent_bytes.as_slice(), BufferType::I64, &[], None, device, None).unwrap(),
+                ),
+                donatable: false,
+            }],
+            ..Default::default()
+        };
+        let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+        let mut outputs = execution.block_until_ready().unwrap().remove(0);
+        assert_eq!(outputs.outputs.len(), 1);
+        let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_dynamic_zero_lowering_with_mixed_static_and_dynamic_axes() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        // The dimension operands are compact: the rank-three output has one dynamic leading axis, one static middle
+        // axis, and one dynamic trailing axis, so the constructor consumes exactly two operands and lowering must
+        // pair them with axes zero and two rather than indexing operands by physical axis number.
+        let rows_type = DimensionType::new(DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap()));
+        let planes_type =
+            DimensionType::new(DimensionVariable::new("planes", DimensionBounds::new(1, Some(4)).unwrap()));
+        let context = TestContext::new();
+        let rows = context.input(rows_type.clone().into());
+        let planes = context.input(planes_type.clone().into());
+        let output = context
+            .bind(
+                ZeroOperation::new(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![
+                        Dimension::Dynamic(rows_type.variable().clone()),
+                        Dimension::Static(2),
+                        Dimension::Dynamic(planes_type.variable().clone()),
+                    ]),
+                )),
+                Vec::new(),
+                &[rows, planes],
+            )
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 2);
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let rows_bytes = values_to_bytes(&[4_i64]);
+        let planes_bytes = values_to_bytes(&[3_i64]);
+        let inputs = ExecutionDeviceInputs {
+            inputs: &[
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(rows_bytes.as_slice(), BufferType::I64, &[], None, device.clone(), None).unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(planes_bytes.as_slice(), BufferType::I64, &[], None, device, None).unwrap(),
+                    ),
+                    donatable: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+        let mut outputs = execution.block_until_ready().unwrap().remove(0);
+        assert_eq!(outputs.outputs.len(), 1);
+        let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+        // All three extents are pairwise distinct (4 x 2 x 3), so a swapped operand-to-axis pairing would change
+        // the logical output length.
+        assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![0.0; 24]);
     }
 
     #[test]
