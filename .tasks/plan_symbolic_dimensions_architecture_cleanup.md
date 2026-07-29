@@ -98,23 +98,28 @@ case:
 
 - `ZeroOperation<ArrayType>`;
 - `OneOperation<ArrayType>`;
-- `FillOperation<ArrayType, V>`; and
+- rank-positive `FillOperation<ArrayType, V>`; and
 - `IotaOperation<ArrayType>`.
 
-The current branch has removed those four archived array-program-specific implementations. `One`, `Fill`, and `Iota`
+The current branch has removed those four archived array-program-specific implementations. `One`, fill, and `Iota`
 appear only in the homogeneous array family. One temporary exception remains:
 `ArrayProgramOperation::Zero(ZeroOperation<ArrayProgramType>)`, which lets generic differentiation machinery
 materialize a composite array zero without explicit geometry. The final constructor design cannot be resolved merely
 by retaining that generic escape hatch. The canonical destination is:
 
 - operand-relative `zero_like`/`one_like` for transform-generated values whenever a source array exists;
-- a homogeneous nullary constructor only when its stored output type is identity-free, enforced by a generic
-  identity-free rule in the blanket `Operation<T>` inference of zero, one, fill, and iota; and
-- for identity-bearing output types, a mixed `Operation<ArrayProgramType>` contract owned by the corresponding flat
-  `ArrayProgramOperation` variant arm over `ZeroOperation<ArrayType>`, `OneOperation<ArrayType>`,
-  `FillOperation<ArrayType, V>`, or `IotaOperation<ArrayType>`. The stored `ArrayType` is the complete output
-  authority and the variant consumes one explicit dimension operand per dynamic axis of its stored shape, in axis
-  order, validated by identity — the same contract every mixed shape-carrying operation follows.
+- a homogeneous nullary constructor for zero, one, and iota only when its stored output type is identity-free,
+  enforced by the blanket `Operation<T>` inference;
+- a rank-zero-only `FillOperation<T, Scalar>` literal materializer, followed by ordinary broadcast for every
+  rank-positive fill; and
+- for identity-bearing zero, one, and iota output types, a mixed `Operation<ArrayProgramType>` contract owned by the
+  corresponding flat `ArrayProgramOperation` variant arm. The stored `ArrayType` is the complete output authority and
+  the variant consumes one explicit dimension operand per dynamic axis in identity-validated axis order.
+
+Fill intentionally has no mixed constructor variant. JAX implements scalar `lax.full` as dtype conversion plus
+broadcast and implements array-valued `jax.numpy.full` through ordinary `broadcast_to`; Ryft follows that graph
+directly. A rank-zero literal fill or caller-provided array SSA value feeds the existing homogeneous or mixed
+broadcast operation, whose explicit dimension operands own dynamic output geometry.
 
 No wrapper type exists and no payload carries two trait implementations: the mixed contract is owned by the
 `ArrayProgramOperation::DynamicZero` variant arm, which delegates rendering, identity renaming, and structural flags
@@ -1223,17 +1228,18 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       lowering, CPU PJRT execution, exact diagnostics, and retained specialization reuse all pass.
 - [x] P3j dynamic-one slice: execute `.tasks/plan_p3j_dynamic_one.md` as the next isolated review unit. Mirror zero's
       stored-type-authoritative mixed contract and shared policies without touching fill or iota.
-- [ ] P3j dynamic-fill slice: specify and execute the next isolated review unit after dynamic one is reviewed and
-      committed. Preserve fill's scalar value operand and add only the compact first-class extent operands required by
-      identity-bearing output axes; do not fold iota into the same review unit.
-- [ ] P3j dynamic-iota slice: specify and execute the final constructor review unit after dynamic fill is reviewed and
-      committed.
-- [ ] Land `One`, `Fill`, and `Iota` as complete vertical slices mirroring zero: the position-aware reference guard on
-      their blanket inference, variant-owned mixed contracts through the shared helper, canonical `From` routing,
-      composite eager rules, batching arms, lowering, and tests. Land them as separate review units after corrected
-      `DynamicZero`; a slice may coincide with its first composite consumer, but all three must be complete before the
-      Phase 3 gate. The first implementation of their guards and payload-level mixed contracts was deliberately
-      reverted for reviewability; do not restrict their homogeneous contracts before the replacement is usable.
+- [ ] P3j full-parity fill slice: execute the reviewed `.tasks/plan_p3j_dynamic_fill.md` as the next isolated review
+      unit. Match JAX's scalar-SSA `lax.full` and array-broadcasting `jax.numpy.full` behavior by representing every
+      rank-positive fill as ordinary broadcast: a rank-zero or broadcast-compatible array SSA value followed by static
+      or first-class-dynamic output extents. Keep `FillOperation<T, Scalar>` only as a rank-zero literal materializer;
+      do not add `DynamicFill`, hide the fill value in a mixed payload, or fold iota into this review unit.
+- [ ] P3j dynamic-iota slice: specify and execute the final constructor review unit after the full-parity fill slice is
+      reviewed and committed.
+- [ ] Land `One`, full-parity fill, and `Iota` as separate complete vertical slices after corrected `DynamicZero`.
+      One and iota use variant-owned mixed constructor contracts through the shared helper. Fill is deliberately
+      different: JAX defines it as conversion plus broadcast, so rank-positive static and dynamic fill reuse the
+      canonical broadcast operations and transforms while `FillOperation<T, Scalar>` narrows to rank-zero literal
+      materialization. All three slices must be complete before the Phase 3 gate.
 - [ ] Route transform-generated zero/one values through structural zero or `zero_like`/`one_like` whenever an operand
       supplies geometry.
 - [ ] Migrate transform consumers that stage `ZeroOperation<ArrayType>` with possibly-dynamic types (condition, scan,
@@ -1581,9 +1587,9 @@ The cleanup is complete only when:
 1. Runtime dimensions remain ordinary SSA values in one program graph.
 2. Each operation payload has one compiler-enforced semantic contract.
 3. `dimension_size` always returns a dimension and the data gateway is distinct.
-4. Dynamic zero, one, fill, and iota construction binds the constructors' own mixed stored-type contracts;
-   transform-generated
-   values use structural or operand-relative construction where possible.
+4. Dynamic zero, one, and iota construction binds the constructors' own mixed stored-type contracts; fill values are
+   ordinary array SSA inputs to broadcast; transform-generated values use structural or operand-relative construction
+   where possible.
 5. Every shape-carrying operation consumes explicit dimension operands through one direct operation signature.
 6. No ambient dimension/source-array replay environment exists.
 7. No complete homogeneous implicit-shape array program exists in production.
@@ -1862,8 +1868,10 @@ The pre-execution review identified four missing design decisions and this revis
 
 - projection now has distinct borrowed and consuming paths, and Phase 0 must decide whether the immutable reference
   `Array` payload also moves from `Vec<Scalar>` to measured shared storage before the prototype;
-- generic zero/one/fill/iota overlap is part of the dual-contract inventory, with operand-relative construction for
-  transforms, homogeneous construction for static geometry, and one variant-owned mixed contract for dynamic geometry;
+- generic zero/one/iota overlap is part of the dual-contract inventory, with operand-relative construction for
+  transforms, homogeneous construction for static geometry, and one variant-owned mixed contract for dynamic
+  geometry; rank-positive fill instead composes a scalar literal or caller value with the canonical broadcast
+  operations for JAX parity;
 - leaf-only dimensions remain explicit policy, while transpose-only primal extents move through one
   differentiation-owned ordinary SSA residual mechanism and `transpose_dimension_variables` is deleted; and
 - each mixed operation owns one direct positional dimension-operand contract, and all consumers preserve those SSA
