@@ -637,7 +637,7 @@ where
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
-            Self::DynamicZero(_) | Self::DynamicOne(_) => {
+            Self::DynamicZero(_) | Self::DynamicOne(_) | Self::DynamicIota(_) => {
                 // Output extents are shared shape authority. A mapped extent would request a different output shape
                 // for each batch item, which requires a ragged representation that ordinary array batching lacks.
                 for extent in inputs {
@@ -899,7 +899,7 @@ mod tests {
     use crate::backends::dimensions::DimensionValue;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::constants::{OneOperation, ZeroOperation};
+    use crate::operations::constants::{IotaOperation, OneOperation, ZeroOperation};
     use crate::operations::dimensions::{
         DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionToScalar,
         DimensionToScalarOperation,
@@ -971,6 +971,34 @@ mod tests {
         assert_eq!(dynamic_one_output[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(dynamic_one_output[0].value(), &ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0])),);
 
+        let extent_value = DimensionValue::constant(3).unwrap();
+        let dynamic_iota = ArrayProgramOperation::<Array>::from(IotaOperation::new(
+            ArrayType::new(
+                DataType::I32,
+                Shape::new(vec![Dimension::Dynamic(extent_value.r#type().variable().clone())]),
+            ),
+            0,
+        ));
+        let dynamic_iota_output = dynamic_iota
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(extent_value))],
+            )
+            .unwrap();
+        assert_eq!(dynamic_iota_output.len(), 1);
+        assert_eq!(dynamic_iota_output[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(
+            dynamic_iota_output[0].value(),
+            &ArrayProgramValue::Array(
+                Array::new(
+                    ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])),
+                    vec![Scalar::I32(0), Scalar::I32(1), Scalar::I32(2)],
+                )
+                .unwrap(),
+            ),
+        );
+
         let mapped_type =
             DimensionType::new(DimensionVariable::new("mapped_extent", DimensionBounds::new(1, Some(5)).unwrap()));
         let mapped_extent = ArrayProgramBatch {
@@ -983,7 +1011,11 @@ mod tests {
             Err(BatchingError::MappedDimension { r#type: Box::new(mapped_type.clone()), axis: BatchAxis::new(0) }),
         );
         assert_eq!(
-            dynamic_one.batch(&context, &EmptyRegionDriver, &[mapped_extent]),
+            dynamic_one.batch(&context, &EmptyRegionDriver, &[mapped_extent.clone()]),
+            Err(BatchingError::MappedDimension { r#type: Box::new(mapped_type.clone()), axis: BatchAxis::new(0) }),
+        );
+        assert_eq!(
+            dynamic_iota.batch(&context, &EmptyRegionDriver, &[mapped_extent]),
             Err(BatchingError::MappedDimension { r#type: Box::new(mapped_type), axis: BatchAxis::new(0) }),
         );
 

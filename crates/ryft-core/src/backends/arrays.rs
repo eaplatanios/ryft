@@ -23,7 +23,6 @@ use ryft_macros::Operation;
 
 // TODO(eaplatanios): Review from here onwards.
 
-use crate::Select;
 use crate::axes::{Axis, AxisIndexOperation};
 use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
@@ -41,10 +40,10 @@ use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
 };
 use crate::operations::constants::{
-    ConstantOperation, Fill, FillOperation, IotaOperation, One, OneLike, OneLikeOperation, OneOperation, Zero,
-    ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, Fill, FillOperation, IOTA_OPERATION_NAME, IotaOperation, One, OneLike, OneLikeOperation,
+    OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
+use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{CoordinateBasisOperation, StopGradient, StopGradientOperation};
@@ -514,16 +513,21 @@ impl StopGradient for Array {
 
 impl<O: Operation<ArrayType>> Fill<Scalar, Array> for EagerContext<Array, O> {
     fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array, ProgramError> {
-        // The fill element must be losslessly representable in the array's element data type, so this uses the
-        // promotion-checked conversion rather than an unchecked cast: filling a real array with a complex scalar (or
-        // any other narrowing fill) is rejected instead of silently discarding payload.
-        let element = value.promote_element_type(r#type.data_type())?;
+        let element = value.convert_element_type(r#type.data_type())?;
         Ok(Array { r#type: r#type.clone(), values: vec![element; Array::materialized_element_count(r#type)?] })
     }
 }
 
 impl<O: Operation<ArrayType>> crate::operations::constants::Iota<Array> for EagerContext<Array, O> {
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
+        if !r#type.data_type().is_numeric() {
+            return Err(TypeError::invalid(format!(
+                "'{}' requires a numeric element type but has {}",
+                IOTA_OPERATION_NAME,
+                r#type.data_type(),
+            ))
+            .into());
+        }
         let sizes = r#type
             .shape()
             .dimensions()
@@ -2172,16 +2176,39 @@ mod tests {
             context.fill(&r#type, Scalar::F32(2.5)),
             Array::new(r#type.clone(), vec![Scalar::F32(2.5); 4]).map_err(|_| unreachable!()),
         );
-        // The fill element must promote into the array's element data type, so narrowing and complex-to-real fills
-        // are rejected instead of silently discarding payload.
-        assert!(context.fill(&r#type, Scalar::F64(2.5)).is_err());
-        assert!(context.fill(&r#type, Scalar::C64(ComplexNumber::new(1.0, 2.0))).is_err());
+        // Explicit output types use ordinary element conversion, including narrowing.
+        assert_eq!(
+            context.fill(&r#type, Scalar::F64(2.5)),
+            Array::new(r#type.clone(), vec![Scalar::F32(2.5); 4]).map_err(|_| unreachable!()),
+        );
+        assert_eq!(
+            context.fill(&r#type, Scalar::C64(ComplexNumber::new(1.0, 2.0))),
+            Array::new(r#type.clone(), vec![Scalar::F32(1.0); 4]).map_err(|_| unreachable!()),
+        );
+        let integer_type = array_type(DataType::I32, &[2]);
+        assert_eq!(
+            context.fill(&integer_type, Scalar::F64(2.5)),
+            Array::new(integer_type, vec![Scalar::I32(2); 2]).map_err(|_| unreachable!()),
+        );
+        let boolean_type = array_type(DataType::Boolean, &[2]);
+        assert_eq!(
+            context.fill(&boolean_type, Scalar::C64(ComplexNumber::new(0.0, 2.0))),
+            Array::new(boolean_type, vec![Scalar::Bool(true); 2]).map_err(|_| unreachable!()),
+        );
         // Iota materializes coordinates along the requested dimension in the declared element data type.
         assert_eq!(
             context.iota(&array_type(DataType::I32, &[2, 3]), 1).unwrap().values(),
             &[Scalar::I32(0), Scalar::I32(1), Scalar::I32(2), Scalar::I32(0), Scalar::I32(1), Scalar::I32(2)],
         );
         assert_eq!(context.iota(&array_type(DataType::F64, &[3]), 0).unwrap().to_f64s(), vec![0.0, 1.0, 2.0]);
+        assert_eq!(
+            context.iota(&array_type(DataType::C64, &[3]), 0).unwrap().values(),
+            &[
+                Scalar::C64(ComplexNumber::new(0.0, 0.0)),
+                Scalar::C64(ComplexNumber::new(1.0, 0.0)),
+                Scalar::C64(ComplexNumber::new(2.0, 0.0)),
+            ],
+        );
         // Kernels that materialize a payload from a type reject dynamically sized types.
         let dynamic_type = ArrayType::new(
             DataType::F64,

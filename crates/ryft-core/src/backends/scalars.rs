@@ -790,10 +790,7 @@ impl<O: Operation<DataType>> One<Scalar> for EagerContext<Scalar, O> {
 impl<O: Operation<DataType>> Fill<Scalar, Scalar> for EagerContext<Scalar, O> {
     #[inline]
     fn fill(&self, r#type: &DataType, value: Scalar) -> Result<Scalar, ProgramError> {
-        // Mirroring the array backend's fill, the fill element must be losslessly representable in the target data
-        // type, so this uses the promotion-checked conversion rather than an unchecked cast: filling a real scalar
-        // slot with a complex value (or any other narrowing fill) is rejected instead of silently discarding payload.
-        value.promote_element_type(*r#type)
+        value.convert_element_type(*r#type)
     }
 }
 
@@ -2719,6 +2716,7 @@ mod tests {
         assert_eq!(context.zero(&DataType::I32), Ok(Scalar::from(0i32)));
         assert_eq!(context.one(&DataType::Boolean), Ok(Scalar::from(true)));
         assert_eq!(context.zero(&DataType::F32), Ok(Scalar::from(0.0f32)));
+        assert_eq!(context.fill(&DataType::F32, Scalar::from(2.5_f64)), Ok(Scalar::from(2.5_f32)));
 
         // The like-typed constants adopt the source scalar's variant.
         assert_eq!(Scalar::from(5i16).zero_like(), Scalar::from(0i16));

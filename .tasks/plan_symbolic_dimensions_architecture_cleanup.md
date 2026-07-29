@@ -1228,14 +1228,14 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       lowering, CPU PJRT execution, exact diagnostics, and retained specialization reuse all pass.
 - [x] P3j dynamic-one slice: execute `.tasks/plan_p3j_dynamic_one.md` as the next isolated review unit. Mirror zero's
       stored-type-authoritative mixed contract and shared policies without touching fill or iota.
-- [ ] P3j full-parity fill slice: execute the reviewed `.tasks/plan_p3j_dynamic_fill.md` as the next isolated review
+- [x] P3j full-parity fill slice: execute the reviewed `.tasks/plan_p3j_dynamic_fill.md` as the next isolated review
       unit. Match JAX's scalar-SSA `lax.full` and array-broadcasting `jax.numpy.full` behavior by representing every
       rank-positive fill as ordinary broadcast: a rank-zero or broadcast-compatible array SSA value followed by static
       or first-class-dynamic output extents. Keep `FillOperation<T, Scalar>` only as a rank-zero literal materializer;
       do not add `DynamicFill`, hide the fill value in a mixed payload, or fold iota into this review unit.
-- [ ] P3j dynamic-iota slice: specify and execute the final constructor review unit after the full-parity fill slice is
+- [x] P3j dynamic-iota slice: specify and execute the final constructor review unit after the full-parity fill slice is
       reviewed and committed.
-- [ ] Land `One`, full-parity fill, and `Iota` as separate complete vertical slices after corrected `DynamicZero`.
+- [x] Land `One`, full-parity fill, and `Iota` as separate complete vertical slices after corrected `DynamicZero`.
       One and iota use variant-owned mixed constructor contracts through the shared helper. Fill is deliberately
       different: JAX defines it as conversion plus broadcast, so rank-positive static and dynamic fill reuse the
       canonical broadcast operations and transforms while `FillOperation<T, Scalar>` narrows to rank-zero literal
@@ -2492,3 +2492,31 @@ executes through CPU PJRT. Generic linearization and disconnected-input pullback
 residuals, so deletion of the temporary `Zero(ZeroOperation<ArrayProgramType>)` escape hatch remains P3j Delivery D
 and may move to the first Phase 6 residual delivery rather than adding type-to-value recovery. Exact inventory,
 measurements, verification, and residual evidence are recorded in `.tasks/plan_p3j_shaped_constructors.md`.
+
+### Execution: P3j full-parity fill and dynamic iota
+
+The constructor gate is complete. Fill deliberately does not add another composite constructor: current JAX source
+defines `lax.full` as scalar conversion plus broadcast and `jax.numpy.full` as scalar `lax.full` or array
+`broadcast_to`. Ryft now uses the same decomposition. `FillOperation` is a rank-zero literal materializer;
+rank-positive static fills bind homogeneous broadcast, while scalar or broadcast-compatible array SSA values with
+first-class extents bind the existing mixed `BroadcastOperation` through `BroadcastToDimensions`. There is no
+`DynamicFill`, captured runtime fill payload, copied extent schema, or geometry recovery.
+
+The general mixed-broadcast JVP materializes identity-bearing structural-zero tangents through one `DynamicZero` fed
+by the original extent operands. Existing broadcast implementations continue to own live JVP, transposition,
+batching, partial evaluation, import, and lowering. XLA broadcasts statically shaped inputs to finite physical bounds
+and refines logical axes directly from the extent operands, avoiding unsupported dynamic-broadcast legalization
+without observing input geometry.
+
+Dynamic iota is the final variant-owned mixed constructor. Identity-free outputs remain homogeneous
+`ArrayOperation::Iota`; identity-bearing outputs use `DynamicIota(IotaOperation<ArrayType>)` with compact dynamic
+extent operands. Inference accepts JAX's integer, floating-point, and complex numeric dtypes, validates the axis,
+and reuses the shared constructor signature. Eager execution, PE, batching, JVP, transpose, identity instantiation,
+and import preserve those edges. Lowering emits native `stablehlo.iota` followed by the shared bounded
+`set_dimension_size` refinement; a pairwise-distinct `4 x 2 x 3` complex fixture compiles and executes on CPU with no
+`get_dimension_size`.
+
+Final verification passed 1,002 core unit tests, 410 runnable XLA unit tests (one pre-existing ignored benchmark), all
+macro integration tests, and 58 runnable core doctests (16 ignored examples), plus formatting and diff checks. Exact
+implementation and review records are in `.tasks/plan_p3j_dynamic_fill.md` and
+`.tasks/plan_p3j_dynamic_iota.md`.
