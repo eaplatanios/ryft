@@ -275,8 +275,8 @@ impl<
 
         // Replayed values commonly retain the program's exact declared output types. Only a count difference or a
         // more precise output type requires validation. That validation reuses facts established from the inputs and
-        // permits a previously unbound output identity only when the region metadata proves an instruction inside this
-        // program defines it.
+        // permits a previously unbound output identity only when it belongs to this program's closed identity signature
+        // (established by the formal inputs or defined by an instruction inside it).
         let output_ids = self.output_ids();
         if output_ids.len() != outputs.len()
             || output_ids
@@ -288,7 +288,7 @@ impl<
                 .validate(
                     output_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
                     outputs.iter().map(Typed::r#type),
-                    self.type_identity_signature().internal_identities(),
+                    self.type_identity_signature().identities(),
                 )
                 .map_err(|error| contextualize_refinement_error(error, output_ids, &outputs, "output"))?;
         }
@@ -412,8 +412,8 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
         )?;
 
         // Skip output validation when replay preserved every declared type exactly. Refined outputs are checked
-        // against the input environment. Only identities structurally defined inside this region may establish new
-        // facts at the output boundary.
+        // against the input environment. Only identities in this region's closed identity signature (established by
+        // its formal inputs or defined by its instructions) may establish new facts at the output boundary.
         let output_ids = self.output_ids();
         if output_ids.len() != outputs.len()
             || output_ids
@@ -425,7 +425,7 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
                 .validate(
                     output_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
                     outputs.iter().map(Typed::r#type),
-                    self.type_identity_signature().internal_identities(),
+                    self.type_identity_signature().identities(),
                 )
                 .map_err(|error| contextualize_refinement_error(error, output_ids, &outputs, "output"))?;
         }
