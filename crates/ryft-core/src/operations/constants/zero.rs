@@ -9,9 +9,10 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
     impl_nullary_transposable_operation,
 };
+use crate::operations::constants::check_constructor_type_has_no_identity_references;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
-use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
@@ -64,23 +65,8 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
         input_types: &[T],
         _region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        // A reference-position identity in a nullary constructor's output type names a runtime quantity that no operand
-        // supplies. Dynamic arrays must instead use the composite mixed constructor with one explicit dimension operand
-        // per dynamic axis. Definition-position identities remain valid because the constructed value itself
-        // establishes them.
         check_count!("input", input_types, 0, TypeError);
-        let mut reference = None;
-        self.r#type.visit_identities(&mut |position, identity| {
-            if reference.is_none() && position == TypeIdentityPosition::Reference {
-                reference = Some(identity.to_string());
-            }
-        });
-        if let Some(reference) = reference {
-            return Err(TypeError::invalid(format!(
-                "'{}' cannot construct type {} without operands because it references identity {}",
-                ZERO_OPERATION_NAME, self.r#type, reference,
-            )));
-        }
+        check_constructor_type_has_no_identity_references(ZERO_OPERATION_NAME, &self.r#type)?;
         Ok(vec![self.r#type.clone()])
     }
 

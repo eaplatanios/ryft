@@ -2,18 +2,13 @@
 
 ## Status
 
-Active; repository state was re-audited on 2026-07-28 after the original side-chat history was lost. Phases 0–2 and
-P3a–P3i are committed on `u/eaplatanios/dynamic-shapes` at `21c7442fee3e94eb422b440cc25b479691526df5`.
-The owner checkout currently contains one unstaged P3j shaped-zero prototype plus this plan revision. That prototype is
-nearly ready to land. The third implementation correctly removes `DimensionType::known_extent`, keeps concrete
-extents out of structural types and cache identity, uses the region's complete closed identity authority
-allocation-free, narrows `TypeRefinements` to the identity slice it needs, validates eager constructor bounds, and
-proves retained-specialization reuse. Its constructor contract, eager materialization, batching policy,
-differentiation behavior, transposition, and XLA lowering pass the core/XLA suites. The remaining P3j acceptance work
-is narrow: exercise actual cross-program instantiation/import rather than only direct operation renaming, make both
-runtime extents in the XLA axis-pairing fixture distinct from each other as well as from the static axis, deliberately
-refresh the stale macro trybuild diagnostic, and remove an unrelated whitespace-only diff. Phase 4 has not begun as a
-complete migration.
+Active; repository state was re-audited on 2026-07-28 after the original side-chat history was lost. Phases 0–2,
+P3a–P3i, and the corrected P3j dynamic-zero slice are committed on `u/eaplatanios/dynamic-shapes` at
+`6d47d6996209b99a512f18471bc441e65c1d722b`. The owner checkout now contains the complete unstaged P3j dynamic-one
+review unit plus this plan revision. It adds the canonical explicit-extent `DynamicOne` contract, shares only the
+constructor mechanisms that are genuinely identical to dynamic zero, and closes eager, tracing, PE, batching,
+differentiation, transposition, import, direct StableHLO, and CPU execution coverage. `Fill` and `Iota` remain separate
+review units. Phase 4 has not begun as a complete migration.
 
 This plan remains a containment and simplification follow-up to `.tasks/plan_first_class_dimension_programs.md`. It
 preserves that plan's user-visible capabilities and its decision to represent runtime dimensions as ordinary SSA
@@ -1170,15 +1165,14 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [x] Complete and remove the remaining-operation inventory through P3i's explicit mixed migration or array-only
       classification proof: custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and the
       archived slice-scatter proposal.
-- [ ] P3j: constructor contracts. The wrapper-based Delivery A from
+- [x] P3j dynamic-zero constructor contract. The wrapper-based Delivery A from
       `.tasks/plan_p3j_shaped_constructors.md` (Delivery A) was implemented and then replaced by the
       stored-type-authoritative design recorded in the diagnosis and target-architecture sections, corrected by a
-      second review pass (see the constructor revision notes in the Review section). The current unstaged prototype has
+      second review pass (see the constructor revision notes in the Review section). The landed implementation has
       the right variant-owned `DynamicZero(ZeroOperation<ArrayType>)` contract, canonical routing, eager rule,
       replicated batching rule, structural differentiation behavior, and direct bounded XLA lowering. The
-      `known_extent` leak is now gone and the structural boundary path works, but the phase remains incomplete until
-      actual cross-program import, the strengthened XLA operand-order fixture, and the full verification gates below
-      pass. Do not mark P3j complete merely because the current 994 core and 408 XLA tests pass.
+      `known_extent` leak is gone; genuine cross-program instantiation, pairwise-distinct XLA operand/axis execution,
+      retained specialization, macro integration, and the complete zero verification gate pass.
 - [x] P3j boundary-refinement correction: remove `DimensionType::known_extent`,
       `DimensionType::with_known_extent`, all observed-extent logic from `ArrayProgramValue::r#type`, and the
       corresponding equality/hash/display/renaming and `DimensionValue` checks. Do not replace them with a new
@@ -1208,11 +1202,10 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       `DimensionType` equality, hashing, display, rendering, and persisted signatures are independent of the observed
       extent. `test_array_program_dynamic_zero_retained_jit_reuses_one_specialization` exercises two concrete extents,
       observes distinct output shapes, and proves one trace/lowering/compilation with one retained-cache hit.
-- [ ] Add a non-exact `DynamicZero` cross-program instantiation/import test. Direct operation identity renaming,
-      alpha-renamed boundary interpretation, and transposition are covered, but the current test named
-      `test_array_program_dynamic_zero_alpha_renamed_instantiation` does not call the program instantiation or splice
-      path. Keep the transpose test proving the array cotangent is ignored while every explicit extent operand receives
-      a structural-zero cotangent.
+- [x] Add a non-exact `DynamicZero` cross-program instantiation/import test. The test invokes
+      `with_instantiated_type_identities`, verifies the renamed payload and atom types, executes the instantiated
+      program, and separately covers alpha-renamed boundary interpretation. Keep the transpose test proving the array
+      cotangent is ignored while every explicit extent operand receives a structural-zero cotangent.
 - [x] Re-audit the pending generic fused-JVP zero-primal reuse and Jacobian validation reordering after the boundary
       correction. Retain each only if an independently named regression test requires it; otherwise remove it as
       constructor-driven global complexity. The UFCS-only `fill` and `iota` residue has been removed. If the Jacobian
@@ -1220,13 +1213,21 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       that dependency and keep the existing exact non-finite-coordinate diagnostics tests as its gate. The zero-primal
       reuse is independently covered by the shaped-zero JVP regression. The Jacobian reordering now names its Phase 6
       dependency and remains gated by the exact non-finite-coordinate diagnostics tests.
-- [ ] Strengthen the mixed static/dynamic XLA execution fixture with distinct static and runtime dynamic extents so its
+- [x] Strengthen the mixed static/dynamic XLA execution fixture with distinct static and runtime dynamic extents so its
       observed output shape catches axis/operand pairing mistakes rather than only an out-of-bounds operand index. All
-      three axis extents must be pairwise distinct; the current `3 x 2 x 3` fixture cannot detect a swap between the two
-      dynamic operands.
-- [ ] P3j gate: `DimensionType` is exactly identity plus bounds; `Typed::r#type` is structural; dynamic zero has one
+      three axis extents are pairwise distinct (`4 x 2 x 3`), so swapping the two dynamic operands changes the logical
+      output.
+- [x] P3j dynamic-zero gate: `DimensionType` is exactly identity plus bounds; `Typed::r#type` is structural; dynamic
+      zero has one
       canonical explicit-operand encoding; reference eager execution, PE, batching, JVP/transpose, import, direct XLA
       lowering, CPU PJRT execution, exact diagnostics, and retained specialization reuse all pass.
+- [x] P3j dynamic-one slice: execute `.tasks/plan_p3j_dynamic_one.md` as the next isolated review unit. Mirror zero's
+      stored-type-authoritative mixed contract and shared policies without touching fill or iota.
+- [ ] P3j dynamic-fill slice: specify and execute the next isolated review unit after dynamic one is reviewed and
+      committed. Preserve fill's scalar value operand and add only the compact first-class extent operands required by
+      identity-bearing output axes; do not fold iota into the same review unit.
+- [ ] P3j dynamic-iota slice: specify and execute the final constructor review unit after dynamic fill is reviewed and
+      committed.
 - [ ] Land `One`, `Fill`, and `Iota` as complete vertical slices mirroring zero: the position-aware reference guard on
       their blanket inference, variant-owned mixed contracts through the shared helper, canonical `From` routing,
       composite eager rules, batching arms, lowering, and tests. Land them as separate review units after corrected
@@ -1786,6 +1787,31 @@ Verification for this third review:
 
 P3j is now a correct and nearly complete vertical slice. Close only the three bounded items above, rerun the same
 gates, review the final source-only diff for minimality, and then begin the separate `One`, `Fill`, and `Iota` slices.
+
+### P3j dynamic-one review: 2026-07-28
+
+The corrected dynamic-zero unit was committed at `6d47d6996209b99a512f18471bc441e65c1d722b`. The next isolated unit,
+specified and reviewed in `.tasks/plan_p3j_dynamic_one.md`, is complete and unstaged:
+
+- identity-bearing ones use `DynamicOne(OneOperation<ArrayType>)` with one explicit dimension operand per dynamic
+  output axis, while identity-free ones retain the unchanged homogeneous representation;
+- zero and one share the position-aware nullary guard, eager concrete-shape materializer, replicated batching arm,
+  transpose arm, and bounded constant lowering without introducing a shaped-constructor wrapper;
+- dynamic one's JVP stages a dynamic zero tangent from the same extent SSA operands, and the generic all-zero fast path
+  now preserves operation rules when reference-position identities make nullary tangent materialization impossible;
+- inference, eager execution, tracing, PE, import/identity renaming, batching, JVP, transpose, StableHLO lowering, and
+  CPU PJRT execution have focused tests; and
+- the core, serial XLA, macro integration, doctest, formatting, and diff gates pass. The ordinary parallel XLA suite
+  exposed one pre-existing live-array telemetry race; its isolated rerun and the complete serial suite pass.
+
+The subsequent forward-mode review follow-up replaced callback-based type-identity visitation and the
+`first_identity_reference` convenience method with one allocation-free borrowed `Type::identities` iterator. It also
+removed the direct-context operation clone from the all-zero fast path by retaining only the reusable zero-output
+indices, and added a regression proving DynamicZero reuses its shaped primal SSA value as its tangent. The complete
+core, macro integration, doctest, and serial XLA gates remain green; exact results are recorded in the focused plan.
+
+No `FillOperation` or `IotaOperation` source changed. Dynamic fill is the next review unit after this increment is
+reviewed and committed.
 
 ### Plan revision: constructor contracts without a wrapper
 

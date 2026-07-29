@@ -9,6 +9,7 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
     impl_nullary_transposable_operation,
 };
+use crate::operations::constants::check_constructor_type_has_no_identity_references;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::identities::TypeIdentityRenaming;
@@ -65,6 +66,7 @@ impl<T: Type> Operation<T> for OneOperation<T> {
         _region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
+        check_constructor_type_has_no_identity_references(ONE_OPERATION_NAME, &self.r#type)?;
         Ok(vec![self.r#type.clone()])
     }
 
@@ -178,7 +180,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::DataType;
+    use crate::types::{DataType, Dimension, DimensionBounds, DimensionType, Shape};
 
     use super::*;
 
@@ -233,6 +235,23 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].r#type().into_owned(), scalar_type);
         assert_eq!(outputs[0].value().to_f64s(), vec![1.0]);
+
+        // Nullary construction rejects output types with ungrounded identity references, while a definition-position
+        // identity remains valid because the constructed value establishes it itself.
+        let rows = crate::types::DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]));
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&OneOperation::new(dynamic_type), &[], &[]),
+            Err(TypeError::invalid(
+                "'one' cannot construct type f32[rows, 3] without operands because it references identity rows",
+            )),
+        );
+        let dimension_type = DimensionType::new(rows);
+        assert_eq!(
+            Operation::<DimensionType>::infer_output_types(&OneOperation::new(dimension_type.clone()), &[], &[]),
+            Ok(vec![dimension_type]),
+        );
 
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Scalar, OneOperation<DataType>>::new();

@@ -14,9 +14,29 @@ pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation};
 pub use zero::{ZERO_OPERATION_NAME, Zero, ZeroOperation};
 pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 
+use crate::programs::identities::TypeIdentityPosition;
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::TypeError;
+use crate::programs::types::{Type, TypeError};
 use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType};
+
+/// Rejects a nullary constructor output [`Type`] that carries an ungrounded [`TypeIdentity`](crate::TypeIdentity)
+/// reference. A reference-position identity in a constructed-from-nothing type names a runtime quantity that no operand
+/// supplies. Such outputs must use a mixed constructor that consumes explicit dimension operands. Definition-position
+/// identities remain valid because the constructed value establishes them itself.
+pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
+    name: &str,
+    r#type: &T,
+) -> Result<(), TypeError> {
+    match r#type.identities().find(|(position, _)| *position == TypeIdentityPosition::Reference) {
+        Some((_, reference)) => Err(TypeError::invalid(format!(
+            "'{}' cannot construct type {} without operands because it references identity {}",
+            name,
+            r#type,
+            reference,
+        ))),
+        None => Ok(()),
+    }
+}
 
 /// Infers the output type of one mixed [`ArrayProgramType`] constructor whose stored [`ArrayType`] is the
 /// complete output authority. The constructor consumes one first-class dimension operand per *dynamic* dimension
