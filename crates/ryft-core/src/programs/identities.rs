@@ -96,30 +96,42 @@ impl<I: TypeIdentity> Default for TypeIdentityRenaming<I> {
 /// type-occurrence order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeIdentitySignature<I: TypeIdentity> {
-    /// [`TypeIdentity`]s established by formal input types.
-    input_identities: Vec<I>,
+    /// Complete closed [`TypeIdentity`] list which consists of the identities established by formal input types
+    /// followed by identities established by [`Instruction`](crate::Instruction) results, stored as one ordered vector
+    /// so boundary validation can consume the complete list without making any new allocations.
+    identities: Vec<I>,
 
-    /// [`TypeIdentity`]s established by [`Instruction`](crate::Instruction) results.
-    internal_identities: Vec<I>,
+    /// Index of the first internally defined identity within [`identities`](Self::identities).
+    internal_start: usize,
 }
 
 impl<I: TypeIdentity> TypeIdentitySignature<I> {
     /// Creates a new [`TypeIdentitySignature`].
     #[inline]
     pub fn new(input_identities: Vec<I>, internal_identities: Vec<I>) -> Self {
-        Self { input_identities, internal_identities }
+        let internal_start = input_identities.len();
+        let mut identities = input_identities;
+        identities.extend(internal_identities);
+        Self { identities, internal_start }
     }
 
     /// Returns the [`TypeIdentity`]s established by formal input types.
     #[inline]
     pub fn input_identities(&self) -> &[I] {
-        self.input_identities.as_slice()
+        &self.identities[..self.internal_start]
     }
 
     /// Returns the [`TypeIdentity`]s established by [`Instruction`](crate::Instruction) results.
     #[inline]
     pub fn internal_identities(&self) -> &[I] {
-        self.internal_identities.as_slice()
+        &self.identities[self.internal_start..]
+    }
+
+    /// Returns the complete closed [`TypeIdentity`] set which consists of the input signature identities
+    /// followed by internally defined ones.
+    #[inline]
+    pub fn identities(&self) -> &[I] {
+        self.identities.as_slice()
     }
 }
 

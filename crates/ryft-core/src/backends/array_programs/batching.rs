@@ -637,6 +637,23 @@ where
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
+            Self::DynamicZero(_) => {
+                // Output extents are shared shape authority. A mapped extent would request a different output shape
+                // for each batch item, which requires a ragged representation that ordinary array batching lacks.
+                for extent in inputs {
+                    extent.validate_replicated_dimension()?;
+                }
+                Ok(context
+                    .parent
+                    .bind(
+                        self.clone(),
+                        Vec::new(),
+                        &inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>(),
+                    )?
+                    .into_iter()
+                    .map(ArrayProgramBatch::replicated)
+                    .collect())
+            }
             Self::Array(operation) => {
                 let inputs = inputs
                     .iter()
@@ -925,6 +942,30 @@ mod tests {
             .with_axis_sharding(ShardingDimension::Unconstrained);
         assert_eq!(context.axis_name(), Some("items"));
         assert_eq!(context.axis_sharding(), &ShardingDimension::Unconstrained);
+
+        let extent_value = DimensionValue::constant(3).unwrap();
+        let dynamic_zero = ArrayProgramOperation::<Array>::from(ZeroOperation::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent_value.r#type().variable().clone())]),
+        )));
+        let extent = ArrayProgramValue::Dimension(extent_value);
+        let dynamic_zero_output =
+            dynamic_zero.batch(&context, &EmptyRegionDriver, &[ArrayProgramBatch::replicated(extent)]).unwrap();
+        assert_eq!(dynamic_zero_output.len(), 1);
+        assert_eq!(dynamic_zero_output[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(dynamic_zero_output[0].value(), &ArrayProgramValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0])),);
+
+        let mapped_type =
+            DimensionType::new(DimensionVariable::new("mapped_extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let mapped_extent = ArrayProgramBatch {
+            value: ArrayProgramValue::Dimension(DimensionValue::new(mapped_type.clone(), 3).unwrap()),
+            batch_axis: BatchAxis::new(0),
+            r#type: mapped_type.clone().into(),
+        };
+        assert_eq!(
+            dynamic_zero.batch(&context, &EmptyRegionDriver, &[mapped_extent]),
+            Err(BatchingError::MappedDimension { r#type: Box::new(mapped_type), axis: BatchAxis::new(0) }),
+        );
 
         // The composite boundary forwards the mapped-axis name into homogeneous array rules, allowing the matching
         // collective to consume the mapped axis instead of incorrectly forwarding an unbound collective.

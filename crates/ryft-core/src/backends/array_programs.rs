@@ -12,8 +12,9 @@ use crate::differentiation::{
     TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::macros::check_count;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
-use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::constants::{Zero, ZeroOperation, infer_dynamic_constructor_output_types};
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::dimensions::{
     DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
@@ -41,7 +42,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValue, Value, ValueProjection};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, DimensionVariable, Shape};
+use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
 
 pub mod batching;
 
@@ -63,6 +64,10 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// Its composite type parameter lets generic differentiation code request a zero, while outer inference rejects
     /// dimension-member result types so a zero constructor can never grant first-class shape authority.
     Zero(ZeroOperation<ArrayProgramType>),
+
+    /// Mixed zero constructor whose stored [`ArrayType`] is the complete output authority and whose dynamic
+    /// dimensions are consumed as explicit first-class dimension operands, one per dynamic axis in axis order.
+    DynamicZero(ZeroOperation<ArrayType>),
 
     /// Homogeneous array operation.
     Array(ArrayOperation<A>),
@@ -210,6 +215,25 @@ impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayProgramType>> for Array
     }
 }
 
+impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: ZeroOperation<ArrayType>) -> Self {
+        // Each zero has one canonical encoding: identity-free static zeros already belong to the homogeneous array
+        // member family, and only reference-bearing dynamic output types need the mixed dimension-operand variant.
+        if operation
+            .r#type()
+            .shape()
+            .dimensions()
+            .iter()
+            .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+        {
+            Self::DynamicZero(operation)
+        } else {
+            Self::Array(ArrayOperation::Zero(operation))
+        }
+    }
+}
+
 impl<A: Value<Type = ArrayType>> From<AddOperation> for ArrayProgramOperation<A> {
     #[inline]
     fn from(operation: AddOperation) -> Self {
@@ -261,6 +285,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn name(&self) -> &'static str {
         match self {
             Self::Zero(operation) => operation.name(),
+            Self::DynamicZero(operation) => operation.name(),
             Self::Array(operation) => operation.name(),
             Self::Dimension(operation) => operation.name(),
             Self::Compare(operation) => Operation::<ArrayProgramType>::name(operation),
@@ -280,6 +305,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn region_slots(&self) -> &'static [RegionSlot] {
         match self {
             Self::Zero(operation) => operation.region_slots(),
+            Self::DynamicZero(operation) => operation.region_slots(),
             Self::Array(operation) => operation.region_slots(),
             Self::Dimension(operation) => operation.region_slots(),
             Self::Compare(operation) => Operation::<ArrayProgramType>::region_slots(operation),
@@ -302,6 +328,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
         match self {
             Self::Zero(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            Self::DynamicZero(_) => Ok(vec![None; region_interfaces.len()]),
             Self::Array(operation) => {
                 let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
                 Ok(operation
@@ -343,6 +370,12 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                 <&ArrayType>::try_from(operation.r#type())?;
                 operation.infer_output_types(input_types, region_interfaces)
             }
+            Self::DynamicZero(operation) => infer_dynamic_constructor_output_types(
+                operation.name(),
+                operation.r#type(),
+                input_types,
+                region_interfaces,
+            ),
             Self::Array(operation) => {
                 let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
                 Ok(operation
@@ -376,6 +409,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         match self {
             Self::Zero(operation) => operation.output_region_provenance(output_index),
+            Self::DynamicZero(operation) => operation.output_region_provenance(output_index),
             Self::Array(operation) => operation.output_region_provenance(output_index),
             Self::Dimension(operation) => operation.output_region_provenance(output_index),
             Self::Compare(operation) => {
@@ -403,6 +437,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn is_zero(&self, output_index: usize) -> bool {
         match self {
             Self::Zero(operation) => operation.is_zero(output_index),
+            Self::DynamicZero(operation) => operation.is_zero(output_index),
             Self::Array(operation) => operation.is_zero(output_index),
             Self::Dimension(operation) => operation.is_zero(output_index),
             Self::Compare(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
@@ -422,6 +457,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn effects(&self) -> Effects {
         match self {
             Self::Zero(operation) => operation.effects(),
+            Self::DynamicZero(operation) => operation.effects(),
             Self::Array(operation) => operation.effects(),
             Self::Dimension(operation) => operation.effects(),
             Self::Compare(operation) => Operation::<ArrayProgramType>::effects(operation),
@@ -440,6 +476,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         match self {
             Self::Zero(operation) => Ok(Self::Zero(operation.rename_type_identities(renaming)?)),
+            Self::DynamicZero(operation) => Ok(Self::DynamicZero(operation.rename_type_identities(renaming)?)),
             Self::Array(operation) => Ok(Self::Array(operation.rename_type_identities(renaming)?)),
             Self::Dimension(operation) => Ok(Self::Dimension(operation.rename_type_identities(renaming)?)),
             Self::Compare(operation) => {
@@ -473,6 +510,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         match self {
             Self::Zero(operation) => operation.render(formatter, indentation),
+            Self::DynamicZero(operation) => operation.render(formatter, indentation),
             Self::Array(operation) => operation.render(formatter, indentation),
             Self::Dimension(operation) => operation.render(formatter, indentation),
             Self::Compare(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
@@ -568,6 +606,52 @@ where
                 &EmptyRegionDriver,
                 inputs,
             ),
+            Self::DynamicZero(operation) => {
+                // The stored type is the complete output authority: static axes keep their stored extents while each
+                // dynamic axis takes the concrete extent of its corresponding dimension operand, in axis order.
+                let expected = operation
+                    .r#type()
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+                    .count();
+                let mut extents = inputs.iter();
+                let dimensions = operation
+                    .r#type()
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .map(|dimension| match dimension {
+                        Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+                        Dimension::Dynamic(variable) => {
+                            let extent = extents
+                                .next()
+                                .ok_or(ProgramError::InvalidInputCount { expected, actual: inputs.len() })?;
+                            let extent: &DimensionValue =
+                                <ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected(extent)?;
+                            // Eager binds skip inference and intermediate results skip boundary refinement checks,
+                            // so each runtime extent must be validated against the stored output axis's authoritative
+                            // bounds here, before allocation. Identity equality is deliberately not required because
+                            // interpreted inputs may be alpha-renamed relative to the stored variable.
+                            if !variable.bounds().contains(extent.extent()) {
+                                return Err(DimensionError::BindingOutOfBounds {
+                                    variable: variable.to_string(),
+                                    value: extent.extent(),
+                                    bounds: variable.bounds(),
+                                }
+                                .into());
+                            }
+                            Ok(Dimension::Static(extent.extent()))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                if extents.next().is_some() {
+                    return Err(ProgramError::InvalidInputCount { expected, actual: inputs.len() });
+                }
+                let output_type = operation.r#type().clone().with_shape(Shape::new(dimensions));
+                Ok(vec![ArrayProgramValue::Array(EagerContext::<A, ArrayOperation<A>>::new().zero(&output_type)?)])
+            }
             Self::Array(operation) => interpret_homogeneous_operation(operation, inputs),
             Self::Dimension(operation) => interpret_homogeneous_operation(operation, inputs),
             Self::Compare(operation) => operation.interpret(
@@ -945,6 +1029,13 @@ where
                 message: "'rng_bit_generator' cannot be transposed because random bits are discrete".to_string(),
             }
             .into());
+        }
+        if matches!(self, Self::DynamicZero(_)) {
+            check_count!("output", outputs, 1, ProgramError);
+            // A shaped constructor depends on its extent operands only as non-differentiable shape authority. Its
+            // array value is constant with respect to those operands, so every extent receives a structural-zero
+            // cotangent regardless of the array output cotangent.
+            return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
         }
         if let Self::Pad(operation) = self {
             if inputs.len() < 2 {
@@ -1444,7 +1535,12 @@ mod tests {
         ArrayProgramBatch, ArrayProgramBatchingContext, ArrayProgramBatchingTracer,
     };
     use crate::backends::arrays::Array;
+    use crate::backends::scalars::Scalar;
     use crate::batching::BatchAxis;
+    use crate::compilation::{
+        CallRequest, CompilationDomain, CompilationTracer, CompileRequest, CompiledFunction, FlatCompilationProgram,
+        JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, try_jit,
+    };
     use crate::contexts::{Context, StagingContext};
     use crate::differentiation::DifferentiationTracer;
     use crate::macros::check_operation_partial_evaluation;
@@ -1464,6 +1560,166 @@ mod tests {
     use crate::types::{DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Memory, Shape, StridedLayout};
 
     use super::*;
+
+    /// Minimal composite compilation domain used to prove the retained-JIT contract over dimension inputs: it
+    /// stages through the ordinary tracing path, "lowers" and "compiles" to the lifted flat program itself, counts
+    /// backend compilations, and executes calls by eager interpretation of the compiled program.
+    #[derive(Clone)]
+    struct RetainedJitDomain {
+        /// Number of backend compilations performed by this domain.
+        compilations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Compilation options of [`RetainedJitDomain`], which requires none.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct RetainedJitOptions;
+
+    impl RetainedJitDomain {
+        fn new() -> Self {
+            Self { compilations: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
+        }
+
+        fn compilation_count(&self) -> usize {
+            self.compilations.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl crate::contexts::Domain for RetainedJitDomain {
+        type Type = ArrayProgramType;
+        type Value = ArrayProgramValue<Array>;
+        type Constant = crate::captures::CaptureReference<ArrayProgramType>;
+        type Operation = ArrayProgramOperation<Array>;
+    }
+
+    impl CompilationDomain for RetainedJitDomain {
+        type LoweredProgram = FlatCompilationProgram<Self>;
+        type CompiledProgram = FlatCompilationProgram<Self>;
+        type Options = RetainedJitOptions;
+        type Error = ProgramError;
+
+        fn stage<Request>(
+            &self,
+            request: Request,
+        ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, ProgramError>
+        where
+            Request: StageRequest<Self>,
+        {
+            request.trace(|_, output_types| Ok(output_types))
+        }
+
+        fn lower<Request>(
+            &self,
+            staged: Request,
+        ) -> Result<LoweredFunction<Self, Request::Input, Request::Output>, ProgramError>
+        where
+            Request: LoweringRequest<Self>,
+        {
+            let program = staged.lifted_program()?.as_ref().clone();
+            let output_types = staged.staged().output_types().to_vec();
+            Ok(staged.into_lowered(program, output_types))
+        }
+
+        fn compile<Request>(
+            &self,
+            lowered: Request,
+        ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, ProgramError>
+        where
+            Request: CompileRequest<Self>,
+        {
+            self.compilations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let program = lowered.lowered().lowered_program().clone();
+            let output_types = lowered.lowered().output_types().to_vec();
+            Ok(lowered.into_compiled(std::sync::Arc::new(program), output_types))
+        }
+
+        fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, ProgramError>
+        where
+            Request: CallRequest<Self>,
+        {
+            let executable = request.executable().clone();
+            let outputs = executable.compiled_program().interpret_with(
+                request.into_arguments(),
+                |_, capture| {
+                    Err(ProgramError::MalformedProgram(format!(
+                        "retained-JIT test program retained capture {}",
+                        capture.index(),
+                    )))
+                },
+                |instruction, inputs| {
+                    instruction.operation().interpret(
+                        &EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new(),
+                        &EmptyRegionDriver,
+                        inputs,
+                    )
+                },
+            )?;
+            Request::reconstruct(&executable, outputs)
+        }
+    }
+
+    #[test]
+    fn test_array_program_dynamic_zero_retained_jit_reuses_one_specialization() {
+        let domain = RetainedJitDomain::new();
+        let function: JittedFunction<RetainedJitDomain, _, (), ArrayProgramType, ArrayProgramType> =
+            try_jit(&domain, |(), extent: CompilationTracer<RetainedJitDomain>| {
+                let ArrayProgramType::Dimension(extent_type) = extent.r#type().into_owned() else {
+                    return Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() });
+                };
+                Ok(extent
+                    .context()
+                    .bind(
+                        ZeroOperation::new(ArrayType::new(
+                            DataType::F32,
+                            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+                        )),
+                        Vec::new(),
+                        std::slice::from_ref(&extent),
+                    )?
+                    .remove(0))
+            });
+
+        // Two calls with different runtime extents share one abstract input type, and therefore one retained trace,
+        // lowering, and compiled specialization, while still producing outputs with different logical shapes. This is
+        // the retained-JIT contract that would break if concrete extents ever became part of type or cache identity.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        assert_eq!(
+            function.call((), ArrayProgramValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap())),
+            Ok(ArrayProgramValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]))),
+        );
+        assert_eq!(
+            function.call((), ArrayProgramValue::Dimension(DimensionValue::new(extent_type, 4).unwrap())),
+            Ok(ArrayProgramValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0, 0.0]))),
+        );
+        assert_eq!(function.specialization_count(), 1);
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_misses, 1);
+        assert_eq!(statistics.dispatch_hits, 1);
+        assert_eq!(statistics.traces, 1);
+        assert_eq!(statistics.lowerings, 1);
+        assert_eq!(statistics.compilation_requests, 1);
+        assert_eq!(domain.compilation_count(), 1);
+    }
+
+    #[test]
+    fn test_array_program_dimension_values_share_one_abstract_type() {
+        use std::hash::{BuildHasher, RandomState};
+
+        // The retained-JIT dispatch key is built from `Typed::r#type` of each input, so dimension values with
+        // different runtime extents must report one identical abstract type: a `DimensionType` is strictly identity
+        // plus bounds, and concrete extents never participate in structural type equality, hashing, or display.
+        // Otherwise every concrete extent would acquire its own compiled specialization, turning a runtime dynamic
+        // dimension back into a static specialization parameter.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap()));
+        let three = ArrayProgramValue::<Array>::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
+        let four = ArrayProgramValue::<Array>::Dimension(DimensionValue::new(extent_type.clone(), 4).unwrap());
+        assert_eq!(three.r#type().into_owned(), ArrayProgramType::Dimension(extent_type));
+        assert_eq!(three.r#type().into_owned(), four.r#type().into_owned());
+        assert_eq!(three.r#type().to_string(), four.r#type().to_string());
+        let hasher = RandomState::new();
+        assert_eq!(hasher.hash_one(three.r#type().as_ref()), hasher.hash_one(four.r#type().as_ref()));
+    }
 
     #[test]
     fn test_array_program_value_projection() {
@@ -1752,6 +2008,46 @@ mod tests {
             vec![ArrayProgramValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],))],
         );
 
+        let rows = DimensionValue::constant(2).unwrap();
+        let columns = DimensionValue::constant(3).unwrap();
+        let zero = context
+            .bind(
+                ZeroOperation::new(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![
+                        Dimension::Dynamic(rows.r#type().variable().clone()),
+                        Dimension::Dynamic(columns.r#type().variable().clone()),
+                    ]),
+                )),
+                Vec::new(),
+                &[ArrayProgramValue::Dimension(rows), ArrayProgramValue::Dimension(columns)],
+            )
+            .unwrap();
+        assert_eq!(zero, vec![ArrayProgramValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))]);
+
+        // A runtime extent outside the stored output axis's authoritative bounds is rejected before allocation,
+        // even though eager binds skip inference: the operand's own variable admits the extent, so only the stored
+        // axis's bounds can catch it. Identity equality is deliberately not required (inputs may be alpha-renamed).
+        let bounded = DimensionVariable::new("bounded", DimensionBounds::new(1, Some(4)).unwrap());
+        let error = context
+            .bind(
+                ZeroOperation::new(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(bounded.clone())]),
+                )),
+                Vec::new(),
+                &[ArrayProgramValue::Dimension(DimensionValue::constant(5).unwrap())],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::BindingOutOfBounds {
+                variable: "bounded".to_string(),
+                value: 5,
+                bounds: DimensionBounds::new(1, Some(4)).unwrap(),
+            }),
+        );
+
         let condition = ArrayProgramOperation::<Array>::from(ArrayOperation::Condition(ConditionOperation::new()));
         assert_eq!(
             condition.interpret(&context, &EmptyRegionDriver, &[]),
@@ -1837,6 +2133,51 @@ mod tests {
                     %2:dimension<3> = const
                     %3:f32[2, 3] = reshape %0 %1 %2
                 in (%3)
+            "}
+            .trim_end(),
+        );
+
+        let zero_context = TestContext::new();
+        let rows_value = DimensionValue::constant(2).unwrap();
+        let columns_value = DimensionValue::constant(3).unwrap();
+        let zero_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(rows_value.r#type().variable().clone()),
+                Dimension::Dynamic(columns_value.r#type().variable().clone()),
+            ]),
+        );
+        let rows = zero_context.constant(ArrayProgramValue::Dimension(rows_value));
+        let columns = zero_context.constant(ArrayProgramValue::Dimension(columns_value));
+        let rows_atom = rows.atom_id().unwrap();
+        let columns_atom = columns.atom_id().unwrap();
+        let zero_output =
+            zero_context.bind(ZeroOperation::new(zero_type), Vec::new(), &[rows, columns]).unwrap().remove(0);
+        let zero_builder = zero_context.builder().borrow();
+        let [zero_instruction] = zero_builder.instructions() else {
+            panic!("expected one shaped-zero instruction");
+        };
+        assert_eq!(zero_instruction.inputs(), &[rows_atom, columns_atom]);
+        assert!(matches!(zero_instruction.operation(), ArrayProgramOperation::DynamicZero(_)));
+        drop(zero_builder);
+        let zero_program = zero_context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![zero_output.atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            zero_program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:dimension<2> = const
+                    %1:dimension<3> = const
+                    %2:f32[2, 3] = zero [type=f32[2, 3]] %0 %1
+                in (%2)
             "}
             .trim_end(),
         );
@@ -1930,6 +2271,162 @@ mod tests {
                 residual_instructions = 0,
             }],
         );
+    }
+
+    #[test]
+    fn test_array_program_shaped_zero_partial_evaluation() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent = ArrayProgramValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
+        let output = ArrayProgramValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]));
+        check_operation_partial_evaluation!(
+            backend = (ArrayProgramValue<Array>, ArrayProgramOperation<Array>),
+            operation = ZeroOperation::new(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+            )),
+            cases = [
+                {
+                    inputs = [(@known, extent.clone())],
+                    outputs = [(@known, output.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = extent_type.into(), replay = extent))],
+                    outputs = [(@residual, output)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_array_program_shaped_zero_differentiation() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let extent = builder.add_input(extent_type.clone().into());
+        let output = builder
+            .add_instruction(
+                ZeroOperation::new(ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+                )),
+                Vec::new(),
+                vec![extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        let extent = ArrayProgramValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
+        let zero_tangent =
+            ArrayProgramValue::Array(Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
+        assert_eq!(
+            jvp.interpret(vec![extent, zero_tangent]),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
+                ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
+            ]),
+        );
+        assert_eq!(jvp.instructions().iter().filter(|instruction| instruction.operation().is_zero(0)).count(), 1);
+    }
+
+    #[test]
+    fn test_array_program_dynamic_zero_alpha_renamed_instantiation() {
+        let formal = DimensionVariable::new("formal", DimensionBounds::new(1, Some(5)).unwrap());
+        let caller = DimensionVariable::new("caller", DimensionBounds::new(2, Some(4)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let extent = builder.add_input(DimensionType::new(formal.clone()).into());
+        let output = builder
+            .add_instruction(
+                ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(formal)]))),
+                Vec::new(),
+                vec![extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // Genuine cross-program instantiation: deriving the caller renaming from the complete boundary signature
+        // renames the whole program — including the dynamic zero's stored output type — and recloses its region
+        // arena, so the instantiated payload stays consistent with the instantiated atom types.
+        let caller_input = ArrayProgramType::Dimension(DimensionType::new(caller.clone()));
+        let instantiated = program.with_instantiated_type_identities(std::slice::from_ref(&caller_input)).unwrap();
+        assert_eq!(instantiated.input_types(), vec![caller_input]);
+        assert_eq!(
+            instantiated.output_types(),
+            vec![ArrayProgramType::Array(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(caller.clone())]),
+            ))],
+        );
+        let [instruction] = instantiated.instructions() else {
+            panic!("expected one instantiated instruction");
+        };
+        let ArrayProgramOperation::DynamicZero(instantiated_zero) = instruction.operation() else {
+            panic!("expected the instantiated operation to remain a dynamic zero");
+        };
+        assert_eq!(
+            instantiated_zero.r#type(),
+            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(caller.clone())])),
+        );
+        assert_eq!(
+            instantiated.interpret(vec![ArrayProgramValue::Dimension(
+                DimensionValue::new(DimensionType::new(caller.clone()), 3).unwrap()
+            )]),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]))]),
+        );
+
+        // A boundary interpretation of the *uninstantiated* program with an alpha-renamed actual input type takes
+        // the non-exact establishment path instead: the actual dimension member refines the declared one by bounds
+        // alone, and the concrete static output then establishes its first fact for the declared input identity
+        // through the closed identity signature.
+        assert_eq!(
+            program.interpret(vec![ArrayProgramValue::Dimension(
+                DimensionValue::new(DimensionType::new(caller), 3).unwrap()
+            )]),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]))]),
+        );
+    }
+
+    #[test]
+    fn test_array_program_dynamic_zero_transposition() {
+        // A dynamic zero depends on its extent operands only as non-differentiable shape authority, so every extent
+        // receives a structural-zero cotangent regardless of the output cotangent being live.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let operation = ArrayProgramOperation::<Array>::from(ZeroOperation::new(ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+        )));
+        let mut context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let output_cotangent = context.input(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())])).into(),
+        );
+        let cotangents = operation
+            .transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(extent_type.clone().into())],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+        let [cotangent] = cotangents.as_slice() else {
+            panic!("expected one cotangent per operation input");
+        };
+        assert!(matches!(cotangent, MaybeZero::Zero(_)));
     }
 
     #[test]

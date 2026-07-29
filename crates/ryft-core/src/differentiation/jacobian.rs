@@ -754,14 +754,45 @@ pub(crate) fn jacobian_forward_in_context<
     JacobianMode::Forward.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
 
+    // Assign each input parameter a contiguous range in the flattened input coordinate space. The final prefix offset
+    // is the total number of basis directions packed into the replay batch. Validating this before linearization also
+    // reports a non-finite input coordinate space with its input role before the closure observes the outputs.
+    let input_offsets = coordinate_prefix_offsets::<C, _>(
+        &input_types,
+        DerivativeTransform::JacobianForward,
+        DifferentiationParameterRole::Input,
+    )?;
+    let batch_size = input_offsets.last().copied().unwrap();
+
     // Evaluate and linearize the differentiated output once. `linearize` returns only the differentiated output,
     // so capture the auxiliary primals while its closure runs and move them back out after constructing the Jacobian.
+    // Output types are validated inside the closure, before linearization materializes boundary tangents, so that a
+    // non-finite output coordinate space surfaces the precise Jacobian diagnostic instead of the identity-bearing
+    // nullary-constructor error that materializing its zero tangent would otherwise raise first.
+    // TODO(eaplatanios): This in-closure validation is transitional duplication caused by dynamic nullary tangent
+    //  materialization at the linearize boundary. Phase 6's structural-zero preservation and explicit extent
+    //  residuals should remove the need to pre-validate here; revisit and minimize it in that phase.
     let mut auxiliary = None;
     let (output, pushforward) = context.linearize(
         |input| {
             let (output, value) = function(input)?;
             auxiliary = Some(extract_auxiliary_primals(value).map_err(ProgramError::from)?);
-            Ok(output)
+            let output_structure = output.parameter_structure();
+            let output_values = output.into_parameters().collect::<Vec<_>>();
+            let output_types = O::To::<C::Type>::from_parameters(
+                output_structure.clone(),
+                output_values.iter().map(|value| value.r#type().into_owned()),
+            )?;
+            JacobianMode::Forward
+                .validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)
+                .map_err(ProgramError::from)?;
+            coordinate_prefix_offsets::<C, _>(
+                &output_types,
+                DerivativeTransform::JacobianForward,
+                DifferentiationParameterRole::Output,
+            )
+            .map_err(ProgramError::from)?;
+            Ok(O::from_parameters(output_structure, output_values)?)
         },
         primals,
     )?;
@@ -775,21 +806,6 @@ pub(crate) fn jacobian_forward_in_context<
         output_values.iter().map(|value| value.r#type().into_owned()),
     )?;
     JacobianMode::Forward.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
-
-    // Assign each input parameter a contiguous range in the flattened input coordinate space. The final prefix offset
-    // is the total number of basis directions packed into the replay batch. Output offsets are unnecessary in forward
-    // mode, but computing them validates that every output also has a finite coordinate space.
-    let input_offsets = coordinate_prefix_offsets::<C, _>(
-        &input_types,
-        DerivativeTransform::JacobianForward,
-        DifferentiationParameterRole::Input,
-    )?;
-    coordinate_prefix_offsets::<C, _>(
-        &output_types,
-        DerivativeTransform::JacobianForward,
-        DifferentiationParameterRole::Output,
-    )?;
-    let batch_size = input_offsets.last().copied().unwrap();
 
     // A pushforward program consumes one tangent per input parameter followed by the closed-over primal residuals.
     // Verify that the derived program still satisfies this contract before constructing its packed inputs.
@@ -929,6 +945,18 @@ pub(crate) fn jacobian_reverse_in_context<
     JacobianMode::Reverse.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
 
+    // Validate the input coordinate spaces before deriving the pullback, so a non-finite input coordinate space
+    // reports its input role instead of the identity-bearing nullary-constructor error that materializing a zero
+    // input cotangent during the pullback trace would otherwise raise first.
+    // TODO(eaplatanios): This pre-validation is transitional duplication caused by dynamic nullary cotangent
+    //  materialization during the pullback trace. Phase 6's structural-zero preservation and explicit extent
+    //  residuals should remove the need for it; revisit and minimize it in that phase.
+    coordinate_prefix_offsets::<C, _>(
+        &input_types,
+        DerivativeTransform::JacobianReverse,
+        DifferentiationParameterRole::Input,
+    )?;
+
     // Evaluate the differentiated output once and construct its reusable pullback. `vjp` returns only the
     // differentiated output, so capture the auxiliary primals while its closure runs and move them back out after
     // constructing the Jacobian.
@@ -952,13 +980,8 @@ pub(crate) fn jacobian_reverse_in_context<
     )?;
     JacobianMode::Reverse.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
 
-    // Validate the input coordinate spaces and assign each output parameter a contiguous range in the flattened output
-    // coordinate space. The final output offset is the number of cotangent basis directions in the replay batch.
-    coordinate_prefix_offsets::<C, _>(
-        &input_types,
-        DerivativeTransform::JacobianReverse,
-        DifferentiationParameterRole::Input,
-    )?;
+    // Assign each output parameter a contiguous range in the flattened output coordinate space. The final output
+    // offset is the number of cotangent basis directions in the replay batch.
     let output_offsets = coordinate_prefix_offsets::<C, _>(
         &output_types,
         DerivativeTransform::JacobianReverse,

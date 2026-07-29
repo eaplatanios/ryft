@@ -937,8 +937,23 @@ where
                     context
                         .stage_operation(instruction.operation().clone(), driver, primal_inputs.as_slice())?
                         .into_iter()
-                        .map(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new_with_zero_tangent)
-                        .collect()
+                        .enumerate()
+                        .map(|(output_index, primal)| {
+                            // When the primal instruction is itself known to produce zero and its output already
+                            // has the required tangent type, the primal Single Static Assignment (SSA) value is the
+                            // canonical materialized tangent. Reusing it preserves source-relative geometry such as
+                            // explicit shaped-constructor extents and avoids inventing a nullary dynamic zero at the
+                            // fused Jacobian-Vector Product (JVP) boundary.
+                            let primal_type = primal.r#type();
+                            if instruction.operation().is_zero(output_index)
+                                && primal_type.as_ref() == &primal_type.tangent()
+                            {
+                                DifferentiationDual::new(primal.clone(), primal)
+                            } else {
+                                Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                            }
+                        })
+                        .collect::<Result<Vec<_>, TypeError>>()?
                 } else {
                     let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver };
                     instruction.operation().jvp(&context, &differentiation_driver, input_duals.as_slice())?
