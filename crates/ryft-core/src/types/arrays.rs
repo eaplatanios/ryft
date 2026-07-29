@@ -456,10 +456,12 @@ impl Type for ArrayType {
     type Identity = DimensionVariable;
     type Refinements = ArrayTypeRefinements;
 
-    fn visit_identities(&self, visitor: &mut impl FnMut(TypeIdentityPosition, &Self::Identity)) {
-        self.shape.dimensions().iter().filter_map(Dimension::variable).for_each(|variable| {
-            visitor(TypeIdentityPosition::Reference, variable);
-        });
+    fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
+        self.shape
+            .dimensions()
+            .iter()
+            .filter_map(Dimension::variable)
+            .map(|variable| (TypeIdentityPosition::Reference, variable))
     }
 
     fn derive_identity_renaming(
@@ -781,12 +783,19 @@ impl Type for ArrayProgramType {
     type Identity = DimensionVariable;
     type Refinements = ArrayProgramTypeRefinements;
 
-    #[inline]
-    fn visit_identities(&self, visitor: &mut impl FnMut(TypeIdentityPosition, &Self::Identity)) {
-        match self {
-            Self::Array(r#type) => r#type.visit_identities(visitor),
-            Self::Dimension(r#type) => r#type.visit_identities(visitor),
-        }
+    fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
+        let array = match self {
+            Self::Array(r#type) => Some(r#type),
+            Self::Dimension(_) => None,
+        };
+        let dimension = match self {
+            Self::Array(_) => None,
+            Self::Dimension(r#type) => Some(r#type),
+        };
+        array
+            .into_iter()
+            .flat_map(ArrayType::identities)
+            .chain(dimension.into_iter().flat_map(DimensionType::identities))
     }
 
     fn derive_identity_renaming(
@@ -1439,6 +1448,17 @@ mod tests {
             ArrayProgramType::Dimension(DimensionType::new(actual_variable.clone())),
             ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(actual_variable.clone())]))),
         ];
+        assert_eq!(
+            declared
+                .iter()
+                .flat_map(ArrayProgramType::identities)
+                .map(|(position, identity)| (position, identity.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (TypeIdentityPosition::Definition, declared_variable.clone()),
+                (TypeIdentityPosition::Reference, declared_variable.clone()),
+            ],
+        );
 
         let renaming = ArrayProgramType::derive_identity_renaming(&declared, &actual).unwrap();
         assert_eq!(renaming.rename(&declared_variable), actual_variable);

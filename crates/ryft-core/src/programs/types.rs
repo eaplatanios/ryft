@@ -74,10 +74,12 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// cross-value facts use `()`. Also, type refinements never inspect or retain runtime value payloads.
     type Refinements: TypeRefinements<Self>;
 
-    /// Visits the [`TypeIdentity`]s carried by this [`Type`] in deterministic positional order.
+    /// Returns the [`TypeIdentity`]s carried by this [`Type`] in deterministic positional order. Each item contains
+    /// the occurrence's [`TypeIdentityPosition`] and a borrowed identity. Types without identities return an empty
+    /// iterator.
     #[inline]
-    fn visit_identities(&self, visitor: &mut impl FnMut(TypeIdentityPosition, &Self::Identity)) {
-        let _ = visitor;
+    fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
+        std::iter::empty()
     }
 
     /// Derives the simultaneous [`TypeIdentityRenaming`] implied by matching a complete declared type signature

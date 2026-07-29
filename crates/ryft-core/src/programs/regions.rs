@@ -137,23 +137,6 @@ impl<V: Typed, O> Region<V, O> {
         instruction_by_output
     }
 
-    /// Visits [`TypeIdentity`](crate::TypeIdentity)s in `r#type` until `visitor` returns an error.
-    pub fn visit_type_identities(
-        r#type: &V::Type,
-        mut visitor: impl FnMut(TypeIdentityPosition, &<V::Type as Type>::Identity) -> Result<(), TypeError>,
-    ) -> Result<(), TypeError>
-    where
-        O: Operation<V::Type>,
-    {
-        let mut result = Ok(());
-        r#type.visit_identities(&mut |position, identity| {
-            if result.is_ok() {
-                result = visitor(position, identity);
-            }
-        });
-        result
-    }
-
     /// Returns this [`Region`] after simultaneously renaming [`TypeIdentity`](crate::TypeIdentity)s in its [`Atom`]s,
     /// constants, and [`Operation`]s/[`Instruction`]s.
     pub fn rename_type_identities(
@@ -207,11 +190,11 @@ impl<V: Typed, O> Region<V, O> {
         // the final input/internal partition without copying identities into parallel collections.
         let mut identities = Vec::new();
         for input in &self.input_ids {
-            self.atoms[input.index()].r#type().visit_identities(&mut |_, identity| {
+            for (_, identity) in self.atoms[input.index()].r#type().identities() {
                 if !identities.contains(identity) {
                     identities.push(identity.clone());
                 }
-            });
+            }
         }
         let input_count = identities.len();
 
@@ -220,7 +203,7 @@ impl<V: Typed, O> Region<V, O> {
         // so the atom-table order does not impose an artificial dominance relationship among constants.
         self.atoms.iter().filter_map(Atom::as_constant).try_for_each(|value| {
             let r#type = value.r#type();
-            Self::visit_type_identities(r#type.as_ref(), |position, identity| {
+            r#type.identities().try_for_each(|(position, identity)| {
                 if position != TypeIdentityPosition::Definition {
                     return Ok(());
                 }
@@ -238,7 +221,7 @@ impl<V: Typed, O> Region<V, O> {
         // constant. Constants cannot depend on instruction results because all constants exist before execution.
         self.atoms.iter().filter_map(Atom::as_constant).try_for_each(|value| {
             let r#type = value.r#type();
-            Self::visit_type_identities(r#type.as_ref(), |position, identity| {
+            r#type.identities().try_for_each(|(position, identity)| {
                 if position != TypeIdentityPosition::Reference {
                     return Ok(());
                 }
@@ -260,7 +243,7 @@ impl<V: Typed, O> Region<V, O> {
             let mut operand_identities = Vec::new();
             instruction.inputs().iter().try_for_each(|input| {
                 let r#type = self.atoms[input.index()].r#type();
-                Self::visit_type_identities(r#type.as_ref(), |_, identity| {
+                r#type.identities().try_for_each(|(_, identity)| {
                     if !identities.contains(identity) {
                         return Err(TypeError::invalid(format!(
                             "operation `{}` input type references identity {} before its definition",
@@ -281,7 +264,7 @@ impl<V: Typed, O> Region<V, O> {
             let mut defined_identities = Vec::new();
             instruction.outputs().iter().try_for_each(|output| {
                 let r#type = self.atoms[output.index()].r#type();
-                Self::visit_type_identities(r#type.as_ref(), |position, identity| {
+                r#type.identities().try_for_each(|(position, identity)| {
                     if position != TypeIdentityPosition::Definition || operand_identities.contains(identity) {
                         return Ok(());
                     }
@@ -304,7 +287,7 @@ impl<V: Typed, O> Region<V, O> {
             // operations whose explicit dimension producer operands have not yet replaced that legacy representation.
             instruction.outputs().iter().try_for_each(|output| {
                 let r#type = self.atoms[output.index()].r#type();
-                Self::visit_type_identities(r#type.as_ref(), |position, identity| {
+                r#type.identities().try_for_each(|(position, identity)| {
                     if position != TypeIdentityPosition::Reference {
                         return Ok(());
                     }
@@ -1261,13 +1244,11 @@ mod tests {
         type Identity = StructuralIdentity;
         type Refinements = ();
 
-        fn visit_identities(&self, visitor: &mut impl FnMut(TypeIdentityPosition, &Self::Identity)) {
-            for identity in &self.definitions {
-                visitor(TypeIdentityPosition::Definition, identity);
-            }
-            for identity in &self.references {
-                visitor(TypeIdentityPosition::Reference, identity);
-            }
+        fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
+            self.definitions
+                .iter()
+                .map(|identity| (TypeIdentityPosition::Definition, identity))
+                .chain(self.references.iter().map(|identity| (TypeIdentityPosition::Reference, identity)))
         }
 
         fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {

@@ -637,7 +637,7 @@ where
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
-            Self::DynamicZero(_) => {
+            Self::DynamicZero(_) | Self::DynamicOne(_) => {
                 // Output extents are shared shape authority. A mapped extent would request a different output shape
                 // for each batch item, which requires a ragged representation that ordinary array batching lacks.
                 for extent in inputs {
@@ -899,7 +899,7 @@ mod tests {
     use crate::backends::dimensions::DimensionValue;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::constants::ZeroOperation;
+    use crate::operations::constants::{OneOperation, ZeroOperation};
     use crate::operations::dimensions::{
         DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionToScalar,
         DimensionToScalarOperation,
@@ -955,6 +955,22 @@ mod tests {
         assert_eq!(dynamic_zero_output[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(dynamic_zero_output[0].value(), &ArrayProgramValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0])),);
 
+        let extent_value = DimensionValue::constant(3).unwrap();
+        let dynamic_one = ArrayProgramOperation::<Array>::from(OneOperation::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent_value.r#type().variable().clone())]),
+        )));
+        let dynamic_one_output = dynamic_one
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(extent_value))],
+            )
+            .unwrap();
+        assert_eq!(dynamic_one_output.len(), 1);
+        assert_eq!(dynamic_one_output[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(dynamic_one_output[0].value(), &ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0])),);
+
         let mapped_type =
             DimensionType::new(DimensionVariable::new("mapped_extent", DimensionBounds::new(1, Some(5)).unwrap()));
         let mapped_extent = ArrayProgramBatch {
@@ -963,7 +979,11 @@ mod tests {
             r#type: mapped_type.clone().into(),
         };
         assert_eq!(
-            dynamic_zero.batch(&context, &EmptyRegionDriver, &[mapped_extent]),
+            dynamic_zero.batch(&context, &EmptyRegionDriver, &[mapped_extent.clone()]),
+            Err(BatchingError::MappedDimension { r#type: Box::new(mapped_type.clone()), axis: BatchAxis::new(0) }),
+        );
+        assert_eq!(
+            dynamic_one.batch(&context, &EmptyRegionDriver, &[mapped_extent]),
             Err(BatchingError::MappedDimension { r#type: Box::new(mapped_type), axis: BatchAxis::new(0) }),
         );
 

@@ -355,8 +355,8 @@ impl Type for DimensionType {
     type Refinements = ();
 
     #[inline]
-    fn visit_identities(&self, visitor: &mut impl FnMut(TypeIdentityPosition, &Self::Identity)) {
-        visitor(TypeIdentityPosition::Definition, &self.variable);
+    fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
+        std::iter::once((TypeIdentityPosition::Definition, &self.variable))
     }
 
     fn derive_identity_renaming(
@@ -885,8 +885,8 @@ mod tests {
         assert!(declared.is_refined_by(&exact_type));
         assert!(!exact_type.is_refined_by(&declared));
 
-        let mut identities = Vec::new();
-        declared.visit_identities(&mut |position, variable| identities.push((position, variable.clone())));
+        let identities =
+            declared.identities().map(|(position, variable)| (position, variable.clone())).collect::<Vec<_>>();
         assert_eq!(identities, vec![(TypeIdentityPosition::Definition, declared_variable.clone())]);
 
         let renaming =

@@ -14,7 +14,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
-use crate::operations::constants::{Zero, ZeroOperation, infer_dynamic_constructor_output_types};
+use crate::operations::constants::{One, OneOperation, Zero, ZeroOperation, infer_dynamic_constructor_output_types};
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::dimensions::{
     DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
@@ -68,6 +68,10 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// Mixed zero constructor whose stored [`ArrayType`] is the complete output authority and whose dynamic
     /// dimensions are consumed as explicit first-class dimension operands, one per dynamic axis in axis order.
     DynamicZero(ZeroOperation<ArrayType>),
+
+    /// Mixed one constructor whose stored [`ArrayType`] is the complete output authority and whose dynamic dimensions
+    /// are consumed as explicit first-class dimension operands, one per dynamic axis in axis order.
+    DynamicOne(OneOperation<ArrayType>),
 
     /// Homogeneous array operation.
     Array(ArrayOperation<A>),
@@ -234,6 +238,25 @@ impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayProgram
     }
 }
 
+impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayType>> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: OneOperation<ArrayType>) -> Self {
+        // Each one has one canonical encoding: identity-free static ones already belong to the homogeneous array
+        // member family, and only reference-bearing dynamic output types need the mixed dimension-operand variant.
+        if operation
+            .r#type()
+            .shape()
+            .dimensions()
+            .iter()
+            .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+        {
+            Self::DynamicOne(operation)
+        } else {
+            Self::Array(ArrayOperation::One(operation))
+        }
+    }
+}
+
 impl<A: Value<Type = ArrayType>> From<AddOperation> for ArrayProgramOperation<A> {
     #[inline]
     fn from(operation: AddOperation) -> Self {
@@ -286,6 +309,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Zero(operation) => operation.name(),
             Self::DynamicZero(operation) => operation.name(),
+            Self::DynamicOne(operation) => operation.name(),
             Self::Array(operation) => operation.name(),
             Self::Dimension(operation) => operation.name(),
             Self::Compare(operation) => Operation::<ArrayProgramType>::name(operation),
@@ -306,6 +330,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Zero(operation) => operation.region_slots(),
             Self::DynamicZero(operation) => operation.region_slots(),
+            Self::DynamicOne(operation) => operation.region_slots(),
             Self::Array(operation) => operation.region_slots(),
             Self::Dimension(operation) => operation.region_slots(),
             Self::Compare(operation) => Operation::<ArrayProgramType>::region_slots(operation),
@@ -328,7 +353,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
         match self {
             Self::Zero(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::DynamicZero(_) => Ok(vec![None; region_interfaces.len()]),
+            Self::DynamicZero(_) | Self::DynamicOne(_) => Ok(vec![None; region_interfaces.len()]),
             Self::Array(operation) => {
                 let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
                 Ok(operation
@@ -376,6 +401,12 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                 input_types,
                 region_interfaces,
             ),
+            Self::DynamicOne(operation) => infer_dynamic_constructor_output_types(
+                operation.name(),
+                operation.r#type(),
+                input_types,
+                region_interfaces,
+            ),
             Self::Array(operation) => {
                 let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
                 Ok(operation
@@ -410,6 +441,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Zero(operation) => operation.output_region_provenance(output_index),
             Self::DynamicZero(operation) => operation.output_region_provenance(output_index),
+            Self::DynamicOne(operation) => operation.output_region_provenance(output_index),
             Self::Array(operation) => operation.output_region_provenance(output_index),
             Self::Dimension(operation) => operation.output_region_provenance(output_index),
             Self::Compare(operation) => {
@@ -438,6 +470,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Zero(operation) => operation.is_zero(output_index),
             Self::DynamicZero(operation) => operation.is_zero(output_index),
+            Self::DynamicOne(operation) => operation.is_zero(output_index),
             Self::Array(operation) => operation.is_zero(output_index),
             Self::Dimension(operation) => operation.is_zero(output_index),
             Self::Compare(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
@@ -458,6 +491,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Zero(operation) => operation.effects(),
             Self::DynamicZero(operation) => operation.effects(),
+            Self::DynamicOne(operation) => operation.effects(),
             Self::Array(operation) => operation.effects(),
             Self::Dimension(operation) => operation.effects(),
             Self::Compare(operation) => Operation::<ArrayProgramType>::effects(operation),
@@ -477,6 +511,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Zero(operation) => Ok(Self::Zero(operation.rename_type_identities(renaming)?)),
             Self::DynamicZero(operation) => Ok(Self::DynamicZero(operation.rename_type_identities(renaming)?)),
+            Self::DynamicOne(operation) => Ok(Self::DynamicOne(operation.rename_type_identities(renaming)?)),
             Self::Array(operation) => Ok(Self::Array(operation.rename_type_identities(renaming)?)),
             Self::Dimension(operation) => Ok(Self::Dimension(operation.rename_type_identities(renaming)?)),
             Self::Compare(operation) => {
@@ -511,6 +546,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Zero(operation) => operation.render(formatter, indentation),
             Self::DynamicZero(operation) => operation.render(formatter, indentation),
+            Self::DynamicOne(operation) => operation.render(formatter, indentation),
             Self::Array(operation) => operation.render(formatter, indentation),
             Self::Dimension(operation) => operation.render(formatter, indentation),
             Self::Compare(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
@@ -570,6 +606,60 @@ where
     Ok(outputs.into_iter().map(<ArrayProgramValue<A> as ValueProjection<T>>::from_projected).collect())
 }
 
+/// Resolves one mixed constructor's explicit dimension operands into the concrete static output type required by an
+/// eager backend.
+fn materialize_dynamic_constructor_type<A: Value<Type = ArrayType>>(
+    name: &str,
+    r#type: &ArrayType,
+    inputs: &[ArrayProgramValue<A>],
+) -> Result<ArrayType, ProgramError> {
+    let expected = r#type
+        .shape()
+        .dimensions()
+        .iter()
+        .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+        .count();
+    if expected == 0 {
+        return Err(TypeError::invalid(format!(
+            "'{name}' with static output type {type} has no dynamic dimensions; use the homogeneous nullary \
+             constructor instead",
+            r#type = r#type,
+        ))
+        .into());
+    }
+    let mut extents = inputs.iter();
+    let dimensions = r#type
+        .shape()
+        .dimensions()
+        .iter()
+        .map(|dimension| match dimension {
+            Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+            Dimension::Dynamic(variable) => {
+                let extent =
+                    extents.next().ok_or(ProgramError::InvalidInputCount { expected, actual: inputs.len() })?;
+                let extent: &DimensionValue =
+                    <ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected(extent)?;
+                // Eager binds skip inference and intermediate results skip boundary refinement checks, so validate
+                // each runtime extent against the stored output axis's authoritative bounds before allocation.
+                // Identity equality is deliberately not required because interpreted inputs may be alpha-renamed.
+                if !variable.bounds().contains(extent.extent()) {
+                    return Err(DimensionError::BindingOutOfBounds {
+                        variable: variable.to_string(),
+                        value: extent.extent(),
+                        bounds: variable.bounds(),
+                    }
+                    .into());
+                }
+                Ok(Dimension::Static(extent.extent()))
+            }
+        })
+        .collect::<Result<Vec<_>, ProgramError>>()?;
+    if extents.next().is_some() {
+        return Err(ProgramError::InvalidInputCount { expected, actual: inputs.len() });
+    }
+    Ok(r#type.clone().with_shape(Shape::new(dimensions)))
+}
+
 impl<
     A: Broadcast
         + Concatenate
@@ -583,7 +673,7 @@ impl<
 > InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
 where
     DimensionValue: Compare<A> + DimensionToScalar<A>,
-    EagerContext<A, ArrayOperation<A>>: Zero<A>,
+    EagerContext<A, ArrayOperation<A>>: Zero<A> + One<A>,
     ArrayOperation<A>: InterpretableOperation<EagerContext<A, ArrayOperation<A>>>,
     DimensionOperation<DimensionValue>:
         InterpretableOperation<EagerContext<DimensionValue, DimensionOperation<DimensionValue>>>,
@@ -607,50 +697,12 @@ where
                 inputs,
             ),
             Self::DynamicZero(operation) => {
-                // The stored type is the complete output authority: static axes keep their stored extents while each
-                // dynamic axis takes the concrete extent of its corresponding dimension operand, in axis order.
-                let expected = operation
-                    .r#type()
-                    .shape()
-                    .dimensions()
-                    .iter()
-                    .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
-                    .count();
-                let mut extents = inputs.iter();
-                let dimensions = operation
-                    .r#type()
-                    .shape()
-                    .dimensions()
-                    .iter()
-                    .map(|dimension| match dimension {
-                        Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-                        Dimension::Dynamic(variable) => {
-                            let extent = extents
-                                .next()
-                                .ok_or(ProgramError::InvalidInputCount { expected, actual: inputs.len() })?;
-                            let extent: &DimensionValue =
-                                <ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected(extent)?;
-                            // Eager binds skip inference and intermediate results skip boundary refinement checks,
-                            // so each runtime extent must be validated against the stored output axis's authoritative
-                            // bounds here, before allocation. Identity equality is deliberately not required because
-                            // interpreted inputs may be alpha-renamed relative to the stored variable.
-                            if !variable.bounds().contains(extent.extent()) {
-                                return Err(DimensionError::BindingOutOfBounds {
-                                    variable: variable.to_string(),
-                                    value: extent.extent(),
-                                    bounds: variable.bounds(),
-                                }
-                                .into());
-                            }
-                            Ok(Dimension::Static(extent.extent()))
-                        }
-                    })
-                    .collect::<Result<Vec<_>, ProgramError>>()?;
-                if extents.next().is_some() {
-                    return Err(ProgramError::InvalidInputCount { expected, actual: inputs.len() });
-                }
-                let output_type = operation.r#type().clone().with_shape(Shape::new(dimensions));
+                let output_type = materialize_dynamic_constructor_type(operation.name(), operation.r#type(), inputs)?;
                 Ok(vec![ArrayProgramValue::Array(EagerContext::<A, ArrayOperation<A>>::new().zero(&output_type)?)])
+            }
+            Self::DynamicOne(operation) => {
+                let output_type = materialize_dynamic_constructor_type(operation.name(), operation.r#type(), inputs)?;
+                Ok(vec![ArrayProgramValue::Array(EagerContext::<A, ArrayOperation<A>>::new().one(&output_type)?)])
             }
             Self::Array(operation) => interpret_homogeneous_operation(operation, inputs),
             Self::Dimension(operation) => interpret_homogeneous_operation(operation, inputs),
@@ -949,6 +1001,16 @@ where
             };
             return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
         }
+        if let Self::DynamicOne(operation) = self {
+            // A dynamic one is constant with respect to its extent operands, but its zero tangent still needs those
+            // same runtime extents for materialization. Stage the mixed dynamic zero directly while the operands are
+            // available instead of leaving a type-only structural zero for the generic output boundary.
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+            let tangent_operation = ArrayProgramOperation::<A>::from(ZeroOperation::new(operation.r#type().tangent()));
+            let tangent = context.bind(tangent_operation, Vec::new(), primal_inputs.as_slice())?.remove(0);
+            return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?]);
+        }
 
         let Self::Array(operation) = self else {
             // Dimension-only and mixed shape-observation operations carry no differential dependence. Replaying the
@@ -1030,7 +1092,7 @@ where
             }
             .into());
         }
-        if matches!(self, Self::DynamicZero(_)) {
+        if matches!(self, Self::DynamicZero(_) | Self::DynamicOne(_)) {
             check_count!("output", outputs, 1, ProgramError);
             // A shaped constructor depends on its extent operands only as non-differentiable shape authority. Its
             // array value is constant with respect to those operands, so every extent receives a structural-zero
@@ -1542,7 +1604,7 @@ mod tests {
         JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, try_jit,
     };
     use crate::contexts::{Context, StagingContext};
-    use crate::differentiation::DifferentiationTracer;
+    use crate::differentiation::{DifferentiationTracer, ForwardModeDifferentiate};
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::constants::{ConstantOperation, ZeroOperation};
     use crate::operations::control_flow::ConditionOperation;
@@ -1873,6 +1935,38 @@ mod tests {
         };
         assert_eq!(zero.r#type().shape().dimensions(), &[Dimension::Dynamic(target)]);
 
+        // Identity-free ones remain homogeneous, while identity-bearing ones use the explicit mixed constructor.
+        let static_one = ArrayProgramOperation::<Array>::from(OneOperation::new(ArrayType::scalar(DataType::F32)));
+        assert!(matches!(static_one, ArrayProgramOperation::Array(ArrayOperation::One(_))));
+        let dynamic_one_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
+        let dynamic_one = ArrayProgramOperation::<Array>::from(OneOperation::new(dynamic_one_type.clone()));
+        assert!(matches!(dynamic_one, ArrayProgramOperation::DynamicOne(_)));
+        assert_eq!(
+            dynamic_one.infer_output_types(&[DimensionType::new(source.clone()).into()], &[]),
+            Ok(vec![dynamic_one_type.into()]),
+        );
+        assert_eq!(
+            dynamic_one.infer_output_types(&[], &[]),
+            Err(TypeError::invalid(
+                "'one' expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+            )),
+        );
+        let other = DimensionVariable::new("other", bounds);
+        assert_eq!(
+            dynamic_one.infer_output_types(&[DimensionType::new(other).into()], &[]),
+            Err(TypeError::invalid(
+                "'one' operand 0 has type dimension<other \u{2208} [1, 9)> but the output shape requires \
+                 dimension<source: [1, 9)>",
+            )),
+        );
+        assert_eq!(
+            dynamic_one.infer_output_types(
+                &[DimensionType::new(source.clone()).into()],
+                &[RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE)],
+            ),
+            Err(TypeError::invalid("'one' expects no regions but got 1")),
+        );
+
         let renamed_left = DimensionVariable::new("renamed_left", bounds);
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(left_type.variable().clone(), renamed_left.clone()).unwrap();
@@ -2025,6 +2119,31 @@ mod tests {
             .unwrap();
         assert_eq!(zero, vec![ArrayProgramValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))]);
 
+        let extent = DimensionValue::constant(3).unwrap();
+        let one = context
+            .bind(
+                OneOperation::new(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(extent.r#type().variable().clone())]),
+                )),
+                Vec::new(),
+                &[ArrayProgramValue::Dimension(extent)],
+            )
+            .unwrap();
+        assert_eq!(one, vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]))]);
+        assert_eq!(
+            context.bind(
+                ArrayProgramOperation::DynamicOne(OneOperation::new(ArrayType::scalar(DataType::F32))),
+                Vec::new(),
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "'one' with static output type f32[] has no dynamic dimensions; use the homogeneous nullary \
+                 constructor instead",
+            )
+            .into()),
+        );
+
         // A runtime extent outside the stored output axis's authoritative bounds is rejected before allocation,
         // even though eager binds skip inference: the operand's own variable admits the extent, so only the stored
         // axis's bounds can catch it. Identity equality is deliberately not required (inputs may be alpha-renamed).
@@ -2035,6 +2154,21 @@ mod tests {
                     DataType::F32,
                     Shape::new(vec![Dimension::Dynamic(bounded.clone())]),
                 )),
+                Vec::new(),
+                &[ArrayProgramValue::Dimension(DimensionValue::constant(5).unwrap())],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::BindingOutOfBounds {
+                variable: "bounded".to_string(),
+                value: 5,
+                bounds: DimensionBounds::new(1, Some(4)).unwrap(),
+            }),
+        );
+        let error = context
+            .bind(
+                OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(bounded.clone())]))),
                 Vec::new(),
                 &[ArrayProgramValue::Dimension(DimensionValue::constant(5).unwrap())],
             )
@@ -2182,6 +2316,49 @@ mod tests {
             .trim_end(),
         );
 
+        let one_context = TestContext::new();
+        let extent_value = DimensionValue::constant(3).unwrap();
+        let extent = one_context.constant(ArrayProgramValue::Dimension(extent_value.clone()));
+        let extent_atom = extent.atom_id().unwrap();
+        let one_output = one_context
+            .bind(
+                OneOperation::new(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(extent_value.r#type().variable().clone())]),
+                )),
+                Vec::new(),
+                &[extent],
+            )
+            .unwrap()
+            .remove(0);
+        let one_builder = one_context.builder().borrow();
+        let [one_instruction] = one_builder.instructions() else {
+            panic!("expected one dynamic-one instruction");
+        };
+        assert_eq!(one_instruction.inputs(), &[extent_atom]);
+        assert!(matches!(one_instruction.operation(), ArrayProgramOperation::DynamicOne(_)));
+        drop(one_builder);
+        let one_program = one_context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![one_output.atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            one_program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:dimension<3> = const
+                    %1:f32[3] = one [type=f32[3]] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
         let concatenate_context = TestContext::new();
         let left =
             concatenate_context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
@@ -2301,6 +2478,33 @@ mod tests {
     }
 
     #[test]
+    fn test_array_program_dynamic_one_partial_evaluation() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent = ArrayProgramValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
+        let output = ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]));
+        check_operation_partial_evaluation!(
+            backend = (ArrayProgramValue<Array>, ArrayProgramOperation<Array>),
+            operation = OneOperation::new(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+            )),
+            cases = [
+                {
+                    inputs = [(@known, extent.clone())],
+                    outputs = [(@known, output.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = extent_type.into(), replay = extent))],
+                    outputs = [(@residual, output)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_array_program_shaped_zero_differentiation() {
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
@@ -2336,6 +2540,67 @@ mod tests {
             ]),
         );
         assert_eq!(jvp.instructions().iter().filter(|instruction| instruction.operation().is_zero(0)).count(), 1);
+    }
+
+    #[test]
+    fn test_array_program_dynamic_one_differentiation() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let extent = builder.add_input(extent_type.clone().into());
+        let output = builder
+            .add_instruction(
+                OneOperation::new(ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+                )),
+                Vec::new(),
+                vec![extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        let extent = ArrayProgramValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
+        let zero_tangent =
+            ArrayProgramValue::Array(Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
+        assert_eq!(
+            jvp.interpret(vec![extent, zero_tangent]),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0])),
+                ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
+            ]),
+        );
+        assert_eq!(jvp.instructions().len(), 2);
+        assert!(matches!(jvp.instructions()[0].operation(), ArrayProgramOperation::DynamicOne(_)));
+        assert!(matches!(jvp.instructions()[1].operation(), ArrayProgramOperation::DynamicZero(_)));
+        assert_eq!(jvp.instructions()[0].inputs(), jvp.instructions()[1].inputs());
+
+        // The direct transform context must likewise run the explicit rule rather than taking its all-structural-zero
+        // shortcut: a nullary zero cannot recover the dynamic extent after the closure returns.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let context = EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let (primal, tangent) = context
+            .jvp(
+                move |extent| {
+                    let context = extent.context().clone();
+                    Ok(context.bind(OneOperation::new(dynamic_type), Vec::new(), &[extent])?.remove(0))
+                },
+                ArrayProgramValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
+                ArrayProgramValue::Array(Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(primal, ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0])));
+        assert_eq!(tangent, ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])));
     }
 
     #[test]
@@ -2402,31 +2667,73 @@ mod tests {
     }
 
     #[test]
-    fn test_array_program_dynamic_zero_transposition() {
-        // A dynamic zero depends on its extent operands only as non-differentiable shape authority, so every extent
-        // receives a structural-zero cotangent regardless of the output cotangent being live.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
-        let operation = ArrayProgramOperation::<Array>::from(ZeroOperation::new(ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
-        )));
-        let mut context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
-        let output_cotangent = context.input(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())])).into(),
-        );
-        let cotangents = operation
-            .transpose(
-                &mut context,
-                &EmptyRegionDriver,
-                &[PartialValue::Unknown(extent_type.clone().into())],
-                &[MaybeZero::Value(output_cotangent)],
+    fn test_array_program_dynamic_one_identity_instantiation() {
+        let formal = DimensionVariable::new("formal", DimensionBounds::new(1, Some(5)).unwrap());
+        let caller = DimensionVariable::new("caller", DimensionBounds::new(2, Some(4)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let extent = builder.add_input(DimensionType::new(formal.clone()).into());
+        let output = builder
+            .add_instruction(
+                OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(formal)]))),
+                Vec::new(),
+                vec![extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
             )
             .unwrap();
-        let [cotangent] = cotangents.as_slice() else {
-            panic!("expected one cotangent per operation input");
+
+        let caller_input = ArrayProgramType::Dimension(DimensionType::new(caller.clone()));
+        let instantiated = program.with_instantiated_type_identities(std::slice::from_ref(&caller_input)).unwrap();
+        let [instruction] = instantiated.instructions() else {
+            panic!("expected one instantiated instruction");
         };
-        assert!(matches!(cotangent, MaybeZero::Zero(_)));
+        let ArrayProgramOperation::DynamicOne(instantiated_one) = instruction.operation() else {
+            panic!("expected the instantiated operation to remain a dynamic one");
+        };
+        assert_eq!(
+            instantiated_one.r#type(),
+            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(caller.clone())])),
+        );
+        assert_eq!(
+            instantiated.interpret(vec![ArrayProgramValue::Dimension(
+                DimensionValue::new(DimensionType::new(caller), 3).unwrap()
+            )]),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]))]),
+        );
+    }
+
+    #[test]
+    fn test_array_program_dynamic_constructor_transposition() {
+        // Dynamic constructors depend on their extent operands only as non-differentiable shape authority, so every
+        // extent receives a structural-zero cotangent regardless of the output cotangent being live.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        for operation in [
+            ArrayProgramOperation::<Array>::from(ZeroOperation::new(output_type.clone())),
+            ArrayProgramOperation::<Array>::from(OneOperation::new(output_type.clone())),
+        ] {
+            let mut context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+            let output_cotangent = context.input(output_type.clone().into());
+            let cotangents = operation
+                .transpose(
+                    &mut context,
+                    &EmptyRegionDriver,
+                    &[PartialValue::Unknown(extent_type.clone().into())],
+                    &[MaybeZero::Value(output_cotangent)],
+                )
+                .unwrap();
+            let [cotangent] = cotangents.as_slice() else {
+                panic!("expected one cotangent per operation input");
+            };
+            assert!(matches!(cotangent, MaybeZero::Zero(_)));
+        }
     }
 
     #[test]

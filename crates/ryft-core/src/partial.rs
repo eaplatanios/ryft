@@ -863,10 +863,8 @@ impl<C: Context> PartialEvaluationContext<C> {
                     // A folded value that owns a type identity must remain a producer when it crosses into residual
                     // work. Embedding its cheap constant payload does that structurally. Symbolic known values remain
                     // residual inputs because their parent-context producer stays live.
-                    let mut defines_identity = false;
-                    value.r#type().visit_identities(&mut |position, _| {
-                        defines_identity |= position == TypeIdentityPosition::Definition;
-                    });
+                    let defines_identity =
+                        value.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
                     if defines_identity && self.parent.resolve(&value).is_constant() {
                         PartialEvaluationValue::known_constant(value)
                     } else {

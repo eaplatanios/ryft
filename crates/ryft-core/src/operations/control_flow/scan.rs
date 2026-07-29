@@ -560,15 +560,12 @@ where
         )?;
         let mut declared_identities = Vec::new();
         for r#type in region_interfaces[0].input_types() {
-            r#type.visit_identities(&mut |position, identity| {
-                declared_identities.push((position, identity.clone()));
-            });
+            declared_identities.extend(r#type.identities().map(|(position, identity)| (position, identity.clone())));
         }
         let mut instantiated_identities = Vec::new();
         for r#type in &body_input_types {
-            r#type.visit_identities(&mut |position, identity| {
-                instantiated_identities.push((position, identity.clone()));
-            });
+            instantiated_identities
+                .extend(r#type.identities().map(|(position, identity)| (position, identity.clone())));
         }
         if declared_identities == instantiated_identities {
             return Ok(vec![None]);
