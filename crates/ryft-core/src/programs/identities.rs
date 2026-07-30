@@ -65,13 +65,26 @@ impl<I: TypeIdentity> TypeIdentityRenaming<I> {
         if let Some((_, existing)) = self.replacements.iter().find(|(candidate, _)| candidate == &source) {
             if existing != &target {
                 return Err(TypeError::invalid(format!(
-                    "identity {source} is renamed to both {existing} and {target}",
+                    "type identity '{source}' is renamed to both '{existing}' and '{target}'",
                 )));
             }
             return Ok(());
         }
         self.replacements.push((source, target));
         Ok(())
+    }
+
+    /// Adds a fresh replacement for `source`, rejecting a replacement that collides with any unavailable identity.
+    /// Returns the validated replacement so that callers can make it unavailable to subsequent fresh replacements.
+    pub fn insert_fresh(&mut self, source: I, unavailable: &[I]) -> Result<I, TypeError> {
+        let target = source.fresh();
+        if unavailable.contains(&target) {
+            return Err(TypeError::invalid(format!(
+                "fresh replacement for type identity '{source}' collides with an existing type identity",
+            )));
+        }
+        self.insert(source, target.clone())?;
+        Ok(target)
     }
 
     /// Returns the renamed identity, or a clone of `identity` when no replacement was registered.
@@ -219,7 +232,37 @@ mod tests {
         assert!(matches!(
             renaming.insert(first, TestIdentity::new("third")),
             Err(TypeError::Invalid { message })
-                if message == "identity first is renamed to both second and third",
+                if message == "type identity 'first' is renamed to both 'second' and 'third'",
         ));
+    }
+
+    /// Identity with a deliberately invalid freshness implementation.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CollidingIdentity {
+        /// Diagnostic name.
+        name: &'static str,
+    }
+
+    impl Display for CollidingIdentity {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.name)
+        }
+    }
+
+    impl TypeIdentity for CollidingIdentity {
+        fn fresh(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn test_type_identity_renaming_rejects_colliding_fresh_identity() {
+        let identity = CollidingIdentity { name: "identity" };
+        assert_eq!(
+            TypeIdentityRenaming::new().insert_fresh(identity.clone(), std::slice::from_ref(&identity)),
+            Err(TypeError::invalid(
+                "fresh replacement for type identity 'identity' collides with an existing type identity",
+            )),
+        );
     }
 }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -7,7 +8,7 @@ use crate::macros::check_count;
 use crate::parameters::{Parameter, Parameterized};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
-use crate::programs::identities::{TypeIdentity, TypeIdentityRenaming};
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
@@ -193,11 +194,12 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     /// Splices the provided [`Program`]'s [`Instruction`]s and live constants into this [`ProgramBuilder`], remapping
     /// its inputs to the caller-provided `inputs` and returning the builder atoms holding the program's outputs, in
     /// output order. This is a structural relocation and not a re-interpretation or partial evaluation. Boundary
-    /// identities are instantiated from the caller-provided input types, and [`TypeIdentity`]s defined inside the
-    /// source graph are given _fresh_ names (i.e., using [`TypeIdentity::fresh`]) for each splice. Every instruction
-    /// and live constant is otherwise rebuilt verbatim. This is, for example, the reconciliation primitive an
-    /// unknown-predicate `condition` uses to graft each branch's residual [`Program`] into the reconciled branch
-    /// it emits during partial evaluation.
+    /// identities are instantiated from the caller-provided input types, and [`TypeIdentity`](crate::TypeIdentity)s
+    /// defined inside the source graph are replaced with fresh identities for each splice. Every fresh replacement
+    /// is checked against the source graph, the destination builder, and replacements generated earlier in the same
+    /// splice. Every instruction and live constant is otherwise rebuilt verbatim. This is, for example, the
+    /// reconciliation primitive an unknown-predicate `condition` uses to graft each branch's residual [`Program`]
+    /// into the reconciled branch it emits during partial evaluation.
     #[inline]
     pub fn splice_program<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
@@ -216,27 +218,46 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
                     .ok_or(ProgramError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let program = program.with_instantiated_type_identities(input_types.as_slice())?;
-        let mut renaming = TypeIdentityRenaming::new();
+        let mut program = program.with_instantiated_type_identities(input_types.as_slice())?;
+
+        // A fresh target must not alias any identity already live in the destination entry or its sealed regions.
+        let mut unavailable_identities = Vec::new();
+        for atom in &self.atoms {
+            let r#type = atom.r#type();
+            unavailable_identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
+        }
+        for region_index in 0..self.regions.len() {
+            let signature = self
+                .regions
+                .type_identity_signature(RegionId::new(region_index))
+                .expect("iterating a region arena by index must produce valid region identifiers");
+            unavailable_identities.extend(signature.identities().iter().cloned());
+        }
+
+        // Reserve every source type identity before generating targets, while retaining the internally defined subset
+        // that this splice must rename.
+        let mut internal_identities = Vec::new();
         for region_index in 0..program.regions().len() {
             let signature = program
                 .regions()
                 .type_identity_signature(RegionId::new(region_index))
                 .expect("iterating a region arena by index must produce valid region identifiers");
-            for identity in signature.internal_identities() {
-                if renaming.replacements().iter().any(|(source, _)| source == identity) {
-                    continue;
-                }
-                renaming.insert(identity.clone(), identity.fresh())?;
-            }
+            unavailable_identities.extend(signature.identities().iter().cloned());
+            internal_identities.extend(signature.internal_identities().iter().cloned());
         }
-        let renamed;
-        let program = if renaming.is_identity() {
-            program.as_ref()
-        } else {
-            renamed = program.rename_type_identities(&renaming)?;
-            &renamed
-        };
+
+        let mut renaming = TypeIdentityRenaming::new();
+        for identity in internal_identities {
+            if renaming.replacements().iter().any(|(source, _)| source == &identity) {
+                continue;
+            }
+            let target = renaming.insert_fresh(identity, unavailable_identities.as_slice())?;
+            unavailable_identities.push(target);
+        }
+
+        if !renaming.is_identity() {
+            program = Cow::Owned(program.rename_type_identities(&renaming)?);
+        }
 
         // The two closures below never run concurrently, but both need `&mut` access to this builder. A `RefCell` lets
         // each take a short-lived mutable borrow without the borrow checker conservatively rejecting the second one.
