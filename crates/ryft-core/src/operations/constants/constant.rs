@@ -1,15 +1,14 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
-use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{
+    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
+};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{
-    check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
-    impl_nullary_transposable_operation,
-};
+use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::identities::TypeIdentityRenaming;
@@ -23,18 +22,18 @@ use crate::types::ArrayType;
 /// Canonical operation name for [`ConstantOperation`].
 pub const CONSTANT_OPERATION_NAME: &str = "constant";
 
-/// [`Operation`] that has no inputs and produces a single output equal to a captured typed value. [`ConstantOperation`]
-/// is a true literal constant. It carries a `V` [`Value`], and so its output type is exactly the value's type, and
-/// interpreting it simply clones the captured value. Unlike [`FillOperation`](crate::FillOperation), it does not
-/// synthesize a value from a scalar. It instead returns the value the caller already provided when constructing it.
+/// [`Operation`] that has no inputs and produces a single output equal to a stored typed literal. It carries a `V`
+/// [`Value`], so its output type is exactly the literal value's type and interpreting it materializes that value
+/// through the active context. Program capture references are normally represented as constant [`Atom`](crate::Atom)s
+/// instead (they name runtime values in a side table and are not literal operations).
 #[derive(Copy, Clone)]
 pub struct ConstantOperation<V: Value> {
-    /// Captured value produced by this [`Operation`] when interpreted.
+    /// Literal value produced by this [`Operation`] when interpreted.
     value: V,
 }
 
 impl<V: Value> ConstantOperation<V> {
-    /// Creates a new [`ConstantOperation`] capturing the provided typed value.
+    /// Creates a new [`ConstantOperation`] storing the provided typed literal.
     #[inline]
     pub fn new(value: V) -> Self {
         Self { value }
@@ -46,7 +45,7 @@ impl<V: Value> ConstantOperation<V> {
         self.value.r#type()
     }
 
-    /// Returns the captured value produced by this operation.
+    /// Returns the literal value produced by this operation.
     #[inline]
     pub fn value(&self) -> &V {
         &self.value
@@ -118,13 +117,32 @@ impl<V: Value, C: Context<Type = V::Type, Operation: From<ConstantOperation<V>>>
 {
 }
 
-impl_non_differentiable_operation!(ConstantOperation<C::Constant>);
+impl_non_differentiable_operation!(<V> ConstantOperation<V> where V: Value);
 impl_nullary_transposable_operation!(<F> ConstantOperation<F> where F: Value);
-impl_nullary_batchable_operation!(@replicated <Stored> ConstantOperation<Stored> where Stored: Value);
 
-/// Represents the ability to materialize a captured [`ConstantOperation`] payload and is typically implemented by
+impl<Stored: Value<Type = ArrayType>, C: Context<Type = ArrayType, Operation: From<ConstantOperation<Stored>>>>
+    BatchableOperation<C> for ConstantOperation<Stored>
+{
+    #[inline]
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        check_count!("input", inputs, 0, ProgramError);
+        Ok(context
+            .parent()
+            .bind(self.clone(), Vec::new(), &[])?
+            .into_iter()
+            .map(ArrayBatch::replicated)
+            .collect())
+    }
+}
+
+/// Represents the ability to materialize a stored [`ConstantOperation`] payload and is typically implemented by
 /// [`Context`]s. [`Constant`] is the literal value counterpart to [`Zero`](crate::Zero), [`One`](crate::One), and
-/// [`Fill`](crate::Fill). It typically lives on [`Context`]s because producing a runtime value from a captured payload
+/// [`Fill`](crate::Fill). It typically lives on [`Context`]s because producing a runtime value from a stored payload
 /// can be context-dependent. For example, [`EagerContext`]s can return the value directly while [`StagingContext`]s
 /// record a builder constant.
 pub trait Constant<V, C> {
@@ -204,14 +222,14 @@ mod tests {
 
     #[test]
     fn test_constant() {
-        // Verify the operation's captured value, identity, and rendering.
+        // Verify the operation's literal value, identity, and rendering.
         let operation = ConstantOperation::<Scalar>::new(Scalar::from(3.5));
         assert_eq!(operation.name(), CONSTANT_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "constant [value=3.5]");
         assert_eq!(operation.value(), &Scalar::from(3.5));
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![DataType::F64]));
 
-        // Eager interpretation returns the captured value unchanged.
+        // Eager interpretation returns the literal value unchanged.
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,

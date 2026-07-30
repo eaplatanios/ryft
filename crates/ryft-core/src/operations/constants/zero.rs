@@ -105,8 +105,8 @@ impl<T: Type, C: Context<Type = T, Operation: From<ZeroOperation<T>>>> Partially
 {
 }
 
-impl_non_differentiable_operation!(ZeroOperation<C::Type>);
-impl_nullary_transposable_operation!(ZeroOperation<T>);
+impl_non_differentiable_operation!(<T> ZeroOperation<T> where T: Type);
+impl_nullary_transposable_operation!(<T> ZeroOperation<T> where T: Type);
 impl_nullary_batchable_operation!(@replicated ZeroOperation<ArrayType>);
 
 /// Represents the ability to synthesize a _zero_ value for a given [`Type`] in an interpretation context. [`Zero`]

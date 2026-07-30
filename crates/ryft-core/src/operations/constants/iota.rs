@@ -3,12 +3,12 @@ use std::fmt::Display;
 use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
-use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
     impl_nullary_transposable_operation,
 };
+use crate::operations::constants::check_constructor_type_has_no_identity_references;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::identities::TypeIdentityRenaming;
@@ -19,15 +19,17 @@ use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`IotaOperation`].
 pub const IOTA_OPERATION_NAME: &str = "iota";
 
 /// [`Operation`] that has no inputs and that produces a single output of the [`Type`] it holds (i.e., its `r#type`
 /// field) whose elements increase from `0` along a dimension chosen by [`dimension`](Self::dimension). Along that
 /// dimension, the element at index `k` is `k`, and the value is constant along every other dimension. It is the
-/// index-generating counterpart of [`FillOperation`](super::FillOperation). Rather than filling every element with one
-/// captured scalar value, it synthesizes the per-position index through the [`Iota`] trait when interpreted. It mirrors
-/// StableHLO's [`iota`](https://openxla.org/stablehlo/spec#iota).
+/// index-generating counterpart of constructing a scalar literal and broadcasting it. Rather than filling every
+/// element with one scalar value, it synthesizes the per-position index through the [`Iota`] trait when interpreted.
+/// It mirrors StableHLO's [`iota`](https://openxla.org/stablehlo/spec#iota).
 #[derive(Copy, Clone, Debug)]
 pub struct IotaOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
@@ -38,12 +40,6 @@ pub struct IotaOperation<T: Type> {
 }
 
 impl<T: Type> IotaOperation<T> {
-    /// Creates a new [`IotaOperation`] with the provided output type and iota dimension.
-    #[inline]
-    pub fn new(r#type: T, dimension: usize) -> Self {
-        Self { r#type, dimension }
-    }
-
     /// Returns the type of the value produced by this [`IotaOperation`].
     #[inline]
     pub fn r#type(&self) -> &T {
@@ -57,14 +53,41 @@ impl<T: Type> IotaOperation<T> {
     }
 }
 
-impl<T: Type> Display for IotaOperation<T> {
+impl IotaOperation<ArrayType> {
+    /// Creates an [`IotaOperation`] after validating its element type and varying dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if `r#type` does not have a numeric element type or if `dimension` is outside its rank.
+    #[inline]
+    pub fn new(r#type: ArrayType, dimension: usize) -> Result<Self, TypeError> {
+        if !r#type.data_type().is_numeric() {
+            return Err(TypeError::invalid(format!(
+                "'{}' requires a numeric element type but has {}",
+                IOTA_OPERATION_NAME,
+                r#type.data_type(),
+            )));
+        }
+        if dimension >= r#type.rank() {
+            return Err(TypeError::invalid(format!(
+                "'{}' dimension {} is out of bounds for rank {}",
+                IOTA_OPERATION_NAME,
+                dimension,
+                r#type.rank(),
+            )));
+        }
+        Ok(Self { r#type, dimension })
+    }
+}
+
+impl Display for IotaOperation<ArrayType> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl<T: Type> Operation<T> for IotaOperation<T> {
+impl Operation<ArrayType> for IotaOperation<ArrayType> {
     #[inline]
     fn name(&self) -> &'static str {
         IOTA_OPERATION_NAME
@@ -73,16 +96,21 @@ impl<T: Type> Operation<T> for IotaOperation<T> {
     #[inline]
     fn infer_output_types(
         &self,
-        input_types: &[T],
-        _region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError> {
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        check_constructor_type_has_no_identity_references(IOTA_OPERATION_NAME, &self.r#type)?;
         Ok(vec![self.r#type.clone()])
     }
 
     #[inline]
-    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
-        Ok(Self { r#type: self.r#type.rename_identities(renaming)?, dimension: self.dimension })
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Self::new(self.r#type.rename_identities(renaming)?, self.dimension)
     }
 
     #[inline]
@@ -94,7 +122,7 @@ impl<T: Type> Operation<T> for IotaOperation<T> {
     }
 }
 
-impl<T: Type, C: Domain<Type = T> + Iota<C::Value>> InterpretableOperation<C> for IotaOperation<T> {
+impl<C: Domain<Type = ArrayType> + Iota<C::Value>> InterpretableOperation<C> for IotaOperation<ArrayType> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -107,13 +135,13 @@ impl<T: Type, C: Domain<Type = T> + Iota<C::Value>> InterpretableOperation<C> fo
     }
 }
 
-impl<T: Type, C: Context<Type = T>> PartiallyEvaluatableOperation<C> for IotaOperation<T> where
-    C::Operation: From<IotaOperation<T>>
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for IotaOperation<ArrayType> where
+    C::Operation: From<IotaOperation<ArrayType>>
 {
 }
 
-impl_non_differentiable_operation!(IotaOperation<C::Type>);
-impl_nullary_transposable_operation!(IotaOperation<T>);
+impl_non_differentiable_operation!(IotaOperation<ArrayType>);
+impl_nullary_transposable_operation!(IotaOperation<ArrayType>);
 impl_nullary_batchable_operation!(@replicated IotaOperation<ArrayType>);
 
 /// Represents the ability to synthesize a value for a given [`Type`] whose elements increase from `0` along a chosen
@@ -131,36 +159,40 @@ pub trait Iota<V: Typed> {
     fn iota(&self, r#type: &V::Type, dimension: usize) -> Result<V, ProgramError>;
 }
 
-impl<C: Context, T: Type> Iota<<C::Value as ValueProjection<T>>::Projected> for ProjectedContext<C, T>
+impl<C: Context> Iota<<C::Value as ValueProjection<ArrayType>>::Projected> for ProjectedContext<C, ArrayType>
 where
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Operation: OperationProjection<T, Projected: From<IotaOperation<T>>>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: OperationProjection<ArrayType, Projected: From<IotaOperation<ArrayType>>>,
 {
     #[inline]
-    fn iota(&self, r#type: &T, dimension: usize) -> Result<<C::Value as ValueProjection<T>>::Projected, ProgramError> {
-        Ok(self.bind(IotaOperation::new(r#type.clone(), dimension), Vec::new(), &[])?.remove(0))
+    fn iota(
+        &self,
+        r#type: &ArrayType,
+        dimension: usize,
+    ) -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, ProgramError> {
+        Ok(self.bind(IotaOperation::new(r#type.clone(), dimension)?, Vec::new(), &[])?.remove(0))
     }
 }
 
-impl<C: StagingContext<Operation: From<IotaOperation<C::Type>>>> Iota<Tracer<C>> for C {
+impl<C: StagingContext<Type = ArrayType, Operation: From<IotaOperation<ArrayType>>>> Iota<Tracer<C>> for C {
     #[inline]
-    fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<Tracer<C>, ProgramError> {
-        let mut outputs = self.stage_nullary_operation(IotaOperation::new(r#type.clone(), dimension))?;
+    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Tracer<C>, ProgramError> {
+        let mut outputs = self.stage_nullary_operation(IotaOperation::new(r#type.clone(), dimension)?)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<C: Context> Iota<PartialTracer<C>> for PartialEvaluationContext<C>
+impl<C: Context<Type = ArrayType>> Iota<PartialTracer<C>> for PartialEvaluationContext<C>
 where
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<IotaOperation<C::Type>>,
+        + From<IotaOperation<ArrayType>>,
 {
     #[inline]
-    fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<PartialTracer<C>, ProgramError> {
-        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension), Vec::new(), &[])?;
+    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<PartialTracer<C>, ProgramError> {
+        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension)?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -174,11 +206,9 @@ impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<BatchingTracer<C>> for 
     }
 }
 
-impl<C: Context<Type: DifferentiableType> + Iota<C::Value>> Iota<DifferentiationTracer<C>>
-    for DifferentiationContext<C>
-{
+impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<DifferentiationTracer<C>> for DifferentiationContext<C> {
     #[inline]
-    fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<DifferentiationTracer<C>, ProgramError> {
+    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<DifferentiationTracer<C>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().iota(r#type, dimension)?);
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
@@ -197,7 +227,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -206,12 +236,35 @@ mod tests {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let context = EagerContext::<Array, IotaOperation<ArrayType>>::new();
 
-        // Axis zero varies between rows, while an axis outside the rank is rejected.
+        // Axis zero varies between rows, while an axis outside the rank is rejected by both the capability API and
+        // direct operation construction.
         assert_eq!(context.iota(&r#type, 0), Ok(Array::from_f64s(r#type.clone(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0])),);
         assert!(matches!(context.iota(&r#type, 2), Err(ProgramError::Type(_))));
+        assert_eq!(
+            IotaOperation::new(r#type.clone(), 2).unwrap_err(),
+            TypeError::invalid("'iota' dimension 2 is out of bounds for rank 2"),
+        );
+        assert_eq!(
+            IotaOperation::new(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])), 0,)
+                .unwrap_err(),
+            TypeError::invalid("'iota' requires a numeric element type but has bool"),
+        );
+        let complex_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2)]));
+        assert_eq!(
+            IotaOperation::new(complex_type.clone(), 0).unwrap().infer_output_types(&[], &[]),
+            Ok(vec![complex_type]),
+        );
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        assert_eq!(
+            IotaOperation::new(dynamic_type, 0).unwrap().infer_output_types(&[], &[]),
+            Err(TypeError::invalid(format!(
+                "'iota' cannot construct type f64[extent] without operands because it references identity {variable}",
+            ))),
+        );
 
         // Verify the operation's stored type and axis, identity, and rendering.
-        let operation = IotaOperation::new(r#type.clone(), 1);
+        let operation = IotaOperation::new(r#type.clone(), 1).unwrap();
         assert_eq!(operation.name(), IOTA_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "iota [type=f64[2, 3], dimension=1]");
         assert_eq!(operation.r#type(), &r#type);

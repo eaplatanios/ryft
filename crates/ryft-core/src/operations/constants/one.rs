@@ -100,8 +100,8 @@ impl<T: Type, C: Context<Type = T, Operation: From<OneOperation<T>>>> PartiallyE
 {
 }
 
-impl_non_differentiable_operation!(OneOperation<C::Type>);
-impl_nullary_transposable_operation!(OneOperation<T>);
+impl_non_differentiable_operation!(<T> OneOperation<T> where T: Type);
+impl_nullary_transposable_operation!(<T> OneOperation<T> where T: Type);
 impl_nullary_batchable_operation!(@replicated OneOperation<ArrayType>);
 
 /// Represents the ability to synthesize a _one_ value for a given [`Type`] in an interpretation context. [`One`]
