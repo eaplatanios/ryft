@@ -20,7 +20,6 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::control_flow::{Select, SelectOperation};
-use crate::operations::manipulation::conversion::ElementType;
 use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -35,7 +34,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::ArrayType;
+use crate::types::{ArrayProgramType, ArrayType, DataType};
 
 // TODO(eaplatanios): Review this.
 
@@ -87,9 +86,41 @@ impl<F: Value> Default for ConditionOperation<F> {
     }
 }
 
-impl<F: Value<Type: ElementType>> Display for ConditionOperation<F> {
+impl<F: Value<Type: ConditionTypeSemantics>> Display for ConditionOperation<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
+    }
+}
+
+/// Type-family predicate semantics for [`ConditionOperation`].
+///
+/// Conditions always branch on ordinary Boolean data. Scalar data and array programs therefore accept
+/// [`DataType::Boolean`] and rank-zero Boolean [`ArrayType`] predicates respectively, while a composite
+/// [`ArrayProgramType`] accepts only its rank-zero Boolean array member. A first-class dimension is shape authority,
+/// not Boolean data, even when its runtime representation is scalar.
+pub trait ConditionTypeSemantics: Type {
+    /// Returns whether this type is a valid condition predicate.
+    fn is_condition_predicate(&self) -> bool;
+}
+
+impl ConditionTypeSemantics for ArrayType {
+    #[inline]
+    fn is_condition_predicate(&self) -> bool {
+        self.is_scalar() && self.data_type().is_boolean()
+    }
+}
+
+impl ConditionTypeSemantics for DataType {
+    #[inline]
+    fn is_condition_predicate(&self) -> bool {
+        self.is_boolean()
+    }
+}
+
+impl ConditionTypeSemantics for ArrayProgramType {
+    #[inline]
+    fn is_condition_predicate(&self) -> bool {
+        matches!(self, Self::Array(r#type) if r#type.is_condition_predicate())
     }
 }
 
@@ -119,7 +150,7 @@ fn validated_branch_interfaces<'i, T: Type>(
 
 impl<F: Value> Operation<F::Type> for ConditionOperation<F>
 where
-    F::Type: ElementType,
+    F::Type: ConditionTypeSemantics,
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -159,7 +190,7 @@ where
     ) -> Result<Vec<F::Type>, TypeError> {
         let (true_interface, _) = validated_branch_interfaces(region_interfaces)?;
         check_count!("input", input_types, true_interface.input_types().len() + 1, TypeError);
-        if !input_types[0].is_scalar() || !input_types[0].element_type().is_boolean() {
+        if !input_types[0].is_condition_predicate() {
             return Err(TypeError::invalid(format!(
                 "condition predicate type must be a scalar boolean, but got {}",
                 input_types[0]
@@ -183,7 +214,7 @@ where
 impl<F, C> InterpretableOperation<C> for ConditionOperation<F>
 where
     F: Value,
-    F::Type: ElementType,
+    F::Type: ConditionTypeSemantics,
     C: Domain<Type = F::Type, Value: Concretizable<bool>>,
 {
     fn interpret<D: InterpretationDriver<C>>(
@@ -1150,6 +1181,7 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer, batch};
+    use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::jacobian::JacobianDifferentiate;
     use crate::differentiation::{
@@ -1160,10 +1192,11 @@ mod tests {
     use crate::operations::math::{AddOperation, DivOperation, MulOperation, SinOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
+    use crate::programs::effects::Effects;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::DomainTracingContext;
     use crate::tracing::Trace;
-    use crate::types::{DataType, Dimension, Shape};
+    use crate::types::{DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
 
     use super::*;
 
@@ -1270,6 +1303,42 @@ mod tests {
             &[predicate, input],
         )?;
         Ok(outputs.remove(0))
+    }
+
+    #[test]
+    fn test_condition_composite_type_contract() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let dimension_type = ArrayProgramType::Dimension(DimensionType::new(extent.clone()));
+        let array_type =
+            ArrayProgramType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])));
+        let branch_inputs = vec![dimension_type.clone(), array_type.clone()];
+        let branch_outputs = vec![array_type.clone(), dimension_type.clone()];
+        let branch_interface = RegionInterface::new(branch_inputs.clone(), branch_outputs.clone(), Effects::PURE);
+        let operation = ConditionOperation::<CaptureReference<ArrayProgramType>>::new();
+        let mut input_types = vec![ArrayProgramType::Array(ArrayType::scalar(DataType::Boolean))];
+        input_types.extend(branch_inputs);
+
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                input_types.as_slice(),
+                &[branch_interface.clone(), branch_interface],
+            ),
+            Ok(branch_outputs),
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                &[dimension_type],
+                &[
+                    RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE),
+                    RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE),
+                ],
+            ),
+            Err(TypeError::invalid(
+                "condition predicate type must be a scalar boolean, but got dimension<extent ∈ [1, 8)>".to_string(),
+            )),
+        );
     }
 
     #[test]

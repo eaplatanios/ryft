@@ -39,7 +39,7 @@ use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRe
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Dimension, Shape};
+use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -67,8 +67,10 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// the linear form simply flips [`reverse`](Self::reverse), so no array-reversal operation is ever needed.
 ///
 /// The `length` is stored explicitly so that scans without stacked inputs (pure carry loops with stacked outputs)
-/// remain well-defined. All body slice types must be fully static because stacking prepends a static `length`
-/// dimension and per-iteration slice extraction must be provably in bounds.
+/// remain well-defined. Homogeneous [`ArrayType`] scans retain their fully static body-slice contract. Composite
+/// [`ArrayProgramType`](crate::types::ArrayProgramType) scans may instead carry first-class dimensions and use those
+/// identities in the inner axes of stacked arrays; the prepended scan axis remains the static `length`, so
+/// per-iteration extraction is provably in bounds without treating a dimension value itself as stackable.
 ///
 /// The optional [`unroll`](Self::unroll) factor (attached via [`with_unroll`](Self::with_unroll)) is a
 /// **lowering-only** attribute: interpretation and every transform rule (differentiation, transposition, batching)
@@ -317,8 +319,11 @@ pub(crate) fn scalar_scan_output_types(
 /// Type-family semantics for [`ScanOperation`].
 ///
 /// [`ArrayType`] can represent scanned values by prepending a static leading axis to each per-iteration value type,
-/// while [`DataType`] currently has no stack metadata and therefore supports only carry-only scalar scans. This trait
-/// keeps those type rules local to the scan operation so the operation dispatcher itself can be generic over `T`.
+/// while [`DataType`] currently has no stack metadata and therefore supports only carry-only scalar scans.
+/// [`ArrayProgramType`] permits both arrays and first-class dimensions in carry positions, but requires every stacked
+/// input, output, and capture to be an array because the composite domain has no ragged or stacked dimension value.
+/// This trait keeps those type rules local to the scan operation so the operation dispatcher itself can be generic
+/// over `T`.
 pub trait ScanTypeSemantics: Type {
     /// Validates a scan body signature for this type family.
     fn validate_scan_body(
@@ -327,12 +332,6 @@ pub trait ScanTypeSemantics: Type {
         carry_count: usize,
         length: usize,
     ) -> Result<(), TypeError>;
-
-    /// Returns this scan's input types from its body input types.
-    fn scan_input_types(body_input_types: &[Self], carry_count: usize, length: usize) -> Vec<Self>;
-
-    /// Returns this scan's declared output types from its body output types.
-    fn scan_declared_output_types(body_output_types: &[Self], carry_count: usize, length: usize) -> Vec<Self>;
 
     /// Derives the instantiated body input types from this scan's boundary input types.
     fn scan_body_input_types(
@@ -385,20 +384,6 @@ impl ScanTypeSemantics for ArrayType {
             check_static_scan_type("output", index, output_type)?;
         }
         Ok(())
-    }
-
-    fn scan_input_types(body_input_types: &[Self], carry_count: usize, length: usize) -> Vec<Self> {
-        let mut input_types = body_input_types[..carry_count].to_vec();
-        input_types
-            .extend(body_input_types[carry_count..].iter().map(|slice_type| stacked_scan_type(slice_type, length)));
-        input_types
-    }
-
-    fn scan_declared_output_types(body_output_types: &[Self], carry_count: usize, length: usize) -> Vec<Self> {
-        let mut output_types = body_output_types[..carry_count].to_vec();
-        output_types
-            .extend(body_output_types[carry_count..].iter().map(|slice_type| stacked_scan_type(slice_type, length)));
-        output_types
     }
 
     fn scan_body_input_types(
@@ -466,14 +451,6 @@ impl ScanTypeSemantics for DataType {
         Ok(())
     }
 
-    fn scan_input_types(body_input_types: &[Self], _carry_count: usize, _length: usize) -> Vec<Self> {
-        body_input_types.to_vec()
-    }
-
-    fn scan_declared_output_types(body_output_types: &[Self], _carry_count: usize, _length: usize) -> Vec<Self> {
-        body_output_types.to_vec()
-    }
-
     fn scan_body_input_types(
         input_types: &[Self],
         body_input_count: usize,
@@ -509,10 +486,138 @@ impl ScanTypeSemantics for DataType {
     }
 }
 
+/// Builds one composite scan boundary from per-iteration body types, preserving carry entries and stacking every
+/// trailing array entry along the scan's static leading axis.
+fn composite_scan_boundary_types(
+    role: &str,
+    body_types: &[ArrayProgramType],
+    carry_count: usize,
+    length: usize,
+) -> Result<Vec<ArrayProgramType>, TypeError> {
+    if carry_count > body_types.len() {
+        return Err(TypeError::invalid(format!(
+            "scan carry count {} exceeds the body {} count {}",
+            carry_count,
+            role,
+            body_types.len(),
+        )));
+    }
+    let mut boundary_types = body_types[..carry_count].to_vec();
+    for (index, r#type) in body_types[carry_count..].iter().enumerate() {
+        let ArrayProgramType::Array(r#type) = r#type else {
+            return Err(TypeError::invalid(format!(
+                "scan stacked body {} {} must be an array but got {}",
+                role,
+                carry_count + index,
+                r#type,
+            )));
+        };
+        boundary_types.push(ArrayProgramType::Array(stacked_scan_type(r#type, length)));
+    }
+    Ok(boundary_types)
+}
+
+impl ScanTypeSemantics for ArrayProgramType {
+    fn validate_scan_body(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        length: usize,
+    ) -> Result<(), TypeError> {
+        composite_scan_boundary_types("input", body_input_types, carry_count, length)?;
+        composite_scan_boundary_types("output", body_output_types, carry_count, length)?;
+        check_types!(@same, "scan body carry", [
+            &body_input_types[..carry_count],
+            &body_output_types[..carry_count],
+        ]);
+        Ok(())
+    }
+
+    fn scan_body_input_types(
+        input_types: &[Self],
+        body_input_count: usize,
+        carry_count: usize,
+        length: usize,
+    ) -> Result<Vec<Self>, TypeError> {
+        check_count!("input", input_types, body_input_count, TypeError);
+        if carry_count > body_input_count {
+            return Err(TypeError::invalid(format!(
+                "scan carry count {carry_count} exceeds the body input count {body_input_count}",
+            )));
+        }
+        let mut body_input_types = input_types[..carry_count].to_vec();
+        for (index, r#type) in input_types[carry_count..].iter().enumerate() {
+            let Self::Array(r#type) = r#type else {
+                return Err(TypeError::invalid(format!(
+                    "scan stacked input {} must be an array but got {}",
+                    carry_count + index,
+                    r#type,
+                )));
+            };
+            if r#type.rank() == 0 {
+                return Err(TypeError::invalid(format!(
+                    "scan stacked input {} must have rank at least 1",
+                    carry_count + index,
+                )));
+            }
+            let (slice_type, leading_dimension) = r#type.without_dimension(0)?;
+            if leading_dimension != Dimension::Static(length) {
+                return Err(TypeError::invalid(format!(
+                    "scan stacked input {} must have leading dimension {} but has type {}",
+                    carry_count + index,
+                    length,
+                    r#type,
+                )));
+            }
+            body_input_types.push(Self::Array(slice_type));
+        }
+        Ok(body_input_types)
+    }
+
+    fn infer_scan_output_types(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        length: usize,
+        input_types: &[Self],
+    ) -> Result<Vec<Self>, TypeError> {
+        let expected_input_types = composite_scan_boundary_types("input", body_input_types, carry_count, length)?;
+        let output_types = composite_scan_boundary_types("output", body_output_types, carry_count, length)?;
+        check_types!(@same, "scan body carry", [
+            &body_input_types[..carry_count],
+            &body_output_types[..carry_count],
+        ]);
+        check_count!("input", input_types, expected_input_types.len(), TypeError);
+        for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
+            if !expected.is_refined_by(actual) {
+                return Err(TypeError::invalid(format!(
+                    "scan input {index} has type {actual} which is incompatible with the expected type {expected}",
+                )));
+            }
+        }
+        Ok(output_types)
+    }
+
+    fn validate_scan_capture<C: Value<Type = Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError> {
+        let capture_type = capture.r#type();
+        let Self::Array(capture_type) = capture_type.as_ref() else {
+            return Err(TypeError::invalid(format!(
+                "scan capture {index} must be a stacked array but got {capture_type}",
+            )));
+        };
+        if capture_type.rank() == 0 || capture_type.dimension(0) != Dimension::Static(length) {
+            return Err(TypeError::invalid(format!(
+                "scan capture {index} must have leading dimension {length} but has type {capture_type}",
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Validates the scan contract over the single attached body region interface (the `["body"]` slot) and returns
 /// it: the body's first `carry_count` input and output types must agree, every body type must satisfy the type
-/// family's scan rules (fully static for [`ArrayType`]; carry-only for [`DataType`]), and the interface is what the
-/// scan's boundary types derive from.
+/// family's scan rules (fully static for [`ArrayType`], carry-only for [`DataType`], and mixed carries with array-only
+/// stacks for [`ArrayProgramType`]), and the interface is what the scan's boundary types derive from.
 fn validated_scan_interface<'i, T: ScanTypeSemantics>(
     region_interfaces: &'i [RegionInterface<T>],
     carry_count: usize,
@@ -2292,6 +2397,7 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchingTracer, batch};
+    use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::hessian::HessianDifferentiate;
     use crate::differentiation::jacobian::JacobianDifferentiate;
@@ -2300,11 +2406,12 @@ mod tests {
     use crate::operations::constants::ZeroLikeOperation;
     use crate::operations::math::{AddOperation, DivOperation, MulOperation};
     use crate::parameters::Placeholder;
+    use crate::programs::effects::Effects;
     use crate::programs::{Program, ProgramBuilder};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::DomainTracingContext;
     use crate::tracing::Trace;
-    use crate::types::{DataType, DimensionBounds, DimensionVariable, Memory};
+    use crate::types::{DataType, DimensionBounds, DimensionType, DimensionVariable, Memory};
 
     use super::*;
 
@@ -2353,6 +2460,71 @@ mod tests {
             &[initial.clone(), values],
         )?;
         Ok(outputs.remove(0))
+    }
+
+    #[test]
+    fn test_scan_composite_type_contract() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let dimension_type = ArrayProgramType::Dimension(DimensionType::new(extent.clone()));
+        let slice_type = ArrayProgramType::Array(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent.clone())]),
+        ));
+        let stacked_type = ArrayProgramType::Array(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(extent)]),
+        ));
+        let body_input_types = vec![dimension_type.clone(), slice_type.clone()];
+        let body_output_types = vec![dimension_type.clone(), slice_type];
+        let body_interface = RegionInterface::new(body_input_types, body_output_types, Effects::PURE);
+        let operation = ScanOperation::<CaptureReference<ArrayProgramType>>::new(1, 3);
+        let input_types = vec![dimension_type.clone(), stacked_type.clone()];
+
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_region_input_types(
+                &operation,
+                input_types.as_slice(),
+                std::slice::from_ref(&body_interface),
+            ),
+            Ok(vec![None]),
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                input_types.as_slice(),
+                std::slice::from_ref(&body_interface),
+            ),
+            Ok(vec![dimension_type.clone(), stacked_type]),
+        );
+
+        let captured_dimension = ScanOperation::<CaptureReference<ArrayProgramType>>::new(1, 3)
+            .with_captures(vec![CaptureReference::new(0, dimension_type.clone())]);
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &captured_dimension,
+                input_types.as_slice(),
+                std::slice::from_ref(&body_interface),
+            ),
+            Err(TypeError::invalid(
+                "scan capture 0 must be a stacked array but got dimension<extent ∈ [1, 8)>".to_string(),
+            )),
+        );
+
+        let invalid_body_interface = RegionInterface::new(
+            vec![dimension_type.clone(), dimension_type.clone()],
+            vec![dimension_type.clone()],
+            Effects::PURE,
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &ScanOperation::<CaptureReference<ArrayProgramType>>::new(1, 3),
+                &[dimension_type.clone(), dimension_type.clone()],
+                &[invalid_body_interface],
+            ),
+            Err(TypeError::invalid(
+                "scan stacked body input 1 must be an array but got dimension<extent ∈ [1, 8)>".to_string(),
+            )),
+        );
     }
 
     #[test]

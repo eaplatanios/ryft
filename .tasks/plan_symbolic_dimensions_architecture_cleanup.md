@@ -1360,6 +1360,16 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       including low-precision and complex payload bits, and verify representative literals through CPU execution.
 - [x] P4b4c fill memory fidelity: construct fill's rank-zero literal in the requested output memory while preserving
       the canonical constant-plus-broadcast decomposition and broadcast's memory-mismatch validation.
+- [x] P4b5 higher-order prerequisites: generalize `JitCallOperation` over its enclosing program type and give
+      `ShardMapOperation` a composite operation contract that preserves its array-only public boundary with canonical
+      member projection.
+- [x] P4b6 projected compilation facade prototype: retain public `In`/`Out: Parameterized<ArrayType>`, make internal
+      compilation artifacts own `In::To<ArrayProgramType>`/`Out::To<ArrayProgramType>`, and trace directly into the
+      composite domain through checked array-member views. The static and declared-dynamic compile/execute probe
+      passed without a new core hook, second domain, replay bridge, or temporary homogeneous top-level program.
+- [x] P4b7 mixed control-flow prerequisite: add direct composite condition, while, and scan contracts before the
+      production domain flip. Keep predicates Boolean arrays, define variant-aware state/carry/output rules, and do
+      not make `ArrayProgramType` an `ElementType` solely to route mixed regions through homogeneous contracts.
 - [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
       the unrelated `ReshapeParameters`/`ReshapeOperation` permutation builder and carry no ambient extent state.
 - [x] `with_source_array` no longer exists.
@@ -2714,3 +2724,20 @@ place and adds only the independent capture-delegation prerequisite. One regress
 members through projected views of the same parent and verifies their ordered indices, exact projected types, and
 single shared parent table. The core suite passed 1,016 tests; the XLA suite passed 417 tests with one ignored
 timing-sensitive benchmark; `cargo check -p ryft-xla --lib`, formatting, and diff hygiene passed.
+
+### Execution: P4b5–P4b7 production boundary prerequisites
+
+P4b5 generalized the jitted-call region contract over its enclosing program type and gave shard-map a direct
+composite contract with an array-only public boundary. P4b6 then proved in an isolated compile/execute prototype that
+the public XLA facade can retain `In`/`Out: Parameterized<ArrayType>` while its internal compilation artifacts use the
+canonical `In::To<ArrayProgramType>`/`Out::To<ArrayProgramType>` families. The trace enters the composite domain
+directly and uses checked array-member views at the user closure; no second domain, top-level member-program replay, or
+new core compilation hook is required.
+
+P4b7 completed the remaining type-level region prerequisite. Condition accepts a scalar Boolean array predicate and
+mixed branch boundaries. While accepts mixed state under a scalar predicate and rejects first-class dimension state
+under a batched predicate because one extent cannot carry per-item masked values. Scan accepts array/dimension carries
+and array-only stacks; stacked arrays may have dynamic inner axes tied to explicit carried identities. Focused
+composite regressions passed, followed by all 1,019 core tests and all 421 runnable XLA tests. The exact contracts,
+prototype evidence, and residual production-cutover work are recorded in
+`.tasks/plan_p4b_production_composite_xla.md`.

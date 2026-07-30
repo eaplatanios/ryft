@@ -45,7 +45,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::programs::{MaybeZero, Program, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType};
+use crate::types::{ArrayProgramType, ArrayType, DataType};
 
 // TODO(eaplatanios): Review this.
 
@@ -156,9 +156,12 @@ impl Display for WhileOperation {
 /// along its leading axes. This mirrors JAX's batched `while_p` contract, where the batching transform emits a loop
 /// whose condition returns a batched predicate and the loop's consumers implement the masked semantics.
 ///
-/// [`DataType`] conditions must produce a scalar Boolean data type. The loop-carried state rule is otherwise identical
-/// for both type families: the condition and body consume the same state signature, and the body returns the next
-/// state with that same signature.
+/// [`DataType`] conditions must produce a scalar Boolean data type. [`ArrayProgramType`] conditions must produce a
+/// Boolean array member and may carry mixed array/dimension state under a scalar predicate. A batched predicate cannot
+/// carry a first-class dimension because one scalar extent cannot represent independently masked per-item state.
+///
+/// The loop-carried state rule is otherwise identical for every type family: the condition and body consume the same
+/// state signature, and the body returns the next state with that same signature.
 pub trait WhileTypeSemantics: Type {
     /// Validates the condition output type of a while loop against the loop-carried state types.
     ///
@@ -217,6 +220,46 @@ impl WhileTypeSemantics for DataType {
 
     fn is_batched_predicate(_condition_output: &Self) -> bool {
         false
+    }
+}
+
+impl WhileTypeSemantics for ArrayProgramType {
+    fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
+        let Self::Array(condition_output) = condition_output else {
+            return Err(TypeError::invalid(format!(
+                "'while' condition output type must be a Boolean array, but got {condition_output}"
+            )));
+        };
+        if !condition_output.data_type().is_boolean() {
+            return Err(TypeError::invalid(format!(
+                "'while' condition output type must be a Boolean array, but got {condition_output}"
+            )));
+        }
+        let predicate_shape = condition_output.shape();
+        if predicate_shape.rank() == 0 {
+            return Ok(());
+        }
+        for state_type in state_types {
+            let Self::Array(state_type) = state_type else {
+                return Err(TypeError::invalid(format!(
+                    "'while' loop with a batched predicate cannot carry first-class dimension state {state_type}"
+                )));
+            };
+            let state_shape = state_type.shape();
+            let is_prefix = predicate_shape.rank() <= state_shape.rank()
+                && predicate_shape.dimensions().iter().zip(state_shape.dimensions()).all(|(p, s)| p == s);
+            if !is_prefix {
+                return Err(TypeError::invalid(format!(
+                    "'while' condition predicate shape must be a prefix of every array state shape, but predicate \
+                     {condition_output} is not a prefix of state {state_type}",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn is_batched_predicate(condition_output: &Self) -> bool {
+        matches!(condition_output, Self::Array(r#type) if r#type.rank() > 0)
     }
 }
 
@@ -1805,8 +1848,9 @@ mod tests {
     use crate::operations::debugging::PrintOperation;
     use crate::operations::math::{AddOperation, DivOperation, MulOperation, SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::Parameter;
+    use crate::programs::effects::Effects;
     use crate::tracing::DomainTracingContext;
-    use crate::types::{Dimension, Shape};
+    use crate::types::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
 
     use super::*;
 
@@ -1835,6 +1879,49 @@ mod tests {
         program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
     ) -> RegionInterface<ArrayType> {
         program.interface()
+    }
+
+    #[test]
+    fn test_while_composite_type_contract() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let dimension_type = ArrayProgramType::Dimension(DimensionType::new(extent.clone()));
+        let array_type =
+            ArrayProgramType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])));
+        let state_types = vec![dimension_type.clone(), array_type.clone()];
+        let condition_interface = RegionInterface::new(
+            state_types.clone(),
+            vec![ArrayProgramType::Array(ArrayType::scalar(DataType::Boolean))],
+            Effects::PURE,
+        );
+        let body_interface = RegionInterface::new(state_types.clone(), state_types.clone(), Effects::PURE);
+        let operation = WhileOperation::new();
+
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                state_types.as_slice(),
+                &[condition_interface, body_interface.clone()],
+            ),
+            Ok(state_types.clone()),
+        );
+
+        let batched_condition_interface = RegionInterface::new(
+            state_types.clone(),
+            vec![ArrayProgramType::Array(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])))],
+            Effects::PURE,
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                state_types.as_slice(),
+                &[batched_condition_interface, body_interface],
+            ),
+            Err(TypeError::invalid(
+                "'while' loop with a batched predicate cannot carry first-class dimension state \
+                 dimension<extent ∈ [1, 8)>"
+                    .to_string(),
+            )),
+        );
     }
 
     #[test]
