@@ -625,16 +625,6 @@ impl<C: Context<Type = ArrayType, Value: LegacyDynamicBroadcast + Concatenate> +
     }
 }
 
-/// Backend execution contract for materializing a broadcast whose output type is already fully concrete.
-///
-/// This capability does not stage a program operation and does not grant runtime shape authority. Composite eager
-/// interpretation resolves first-class dimension operands and validates the resulting [`ArrayType`] before invoking
-/// this method. Program construction uses [`Broadcast`] instead.
-pub trait BroadcastMaterialize: Sized {
-    /// Materializes a broadcast to `output_type` using `output_axes`.
-    fn materialize_broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError>;
-}
-
 /// Frozen homogeneous broadcast capability used only by the legacy array-only operation and transform language.
 ///
 /// New program construction must use [`Broadcast`], whose output extents are explicit SSA operands. This capability
@@ -881,7 +871,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 /// let output = scalar.broadcast_to(&[extent]).unwrap();
 /// assert_eq!(output.r#type().to_string(), "f32[extent]");
 /// ```
-pub trait Broadcast: Sized {
+pub trait Broadcast: Value<Type = ArrayProgramType> + DimensionSize + Sized {
     /// Broadcasts `self` using an explicit input-to-output axis mapping and one first-class value per output extent.
     ///
     /// # Parameters
@@ -901,16 +891,65 @@ pub trait Broadcast: Sized {
     ) -> Result<Self, ProgramError>;
 
     /// Broadcasts `self` to `output_dimensions` using NumPy-style right alignment.
-    fn broadcast_to(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError>;
+    fn broadcast_to(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError> {
+        let r#type = self.r#type();
+        let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
+        let offset = output_dimensions.len().checked_sub(input_type.rank()).ok_or_else(|| {
+            TypeError::invalid(format!(
+                "cannot broadcast rank-{} input to {} output dimensions",
+                input_type.rank(),
+                output_dimensions.len(),
+            ))
+        })?;
+        let output_axes = (0..input_type.rank()).map(|axis| axis + offset).collect::<Vec<_>>();
+        self.broadcast(output_dimensions, output_axes.as_slice())
+    }
 
     /// Broadcasts `self` by prepending the supplied first-class leading dimensions.
-    fn broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>;
+    fn broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
+    where
+        Self::DispatchDomain: Context<Type = ArrayProgramType>,
+        <Self::DispatchDomain as Domain>::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
+    {
+        let r#type = self.r#type();
+        let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
+        let mut output_dimensions = Vec::with_capacity(leading_dimensions.len() + input_type.rank());
+        output_dimensions.extend_from_slice(leading_dimensions);
+        for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
+            output_dimensions.push(match dimension {
+                Dimension::Static(extent) => lift_exact_broadcast_dimension(self, *extent)?,
+                Dimension::Dynamic(_) => self.dimension_size(axis)?,
+            });
+        }
+        let output_axes = (0..input_type.rank()).map(|axis| axis + leading_dimensions.len()).collect::<Vec<_>>();
+        self.broadcast(output_dimensions.as_slice(), output_axes.as_slice())
+    }
 
     /// Broadcasts `self` to an exact static shape.
-    fn broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>;
+    fn broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
+    where
+        Self::DispatchDomain: Context<Type = ArrayProgramType>,
+        <Self::DispatchDomain as Domain>::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
+    {
+        let output_dimensions = output_sizes
+            .iter()
+            .map(|extent| lift_exact_broadcast_dimension(self, *extent))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.broadcast_to(output_dimensions.as_slice())
+    }
 
     /// Broadcasts `self` by prepending exact static leading dimensions.
-    fn broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>;
+    fn broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
+    where
+        Self::DispatchDomain: Context<Type = ArrayProgramType>,
+        <Self::DispatchDomain as Domain>::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
+    {
+        let leading_dimensions = leading_sizes
+            .iter()
+            .map(|extent| lift_exact_broadcast_dimension(self, *extent))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.broadcast_leading(leading_dimensions.as_slice())
+    }
 }
 
 /// Lifts one exact output extent into the composite context used by `value`.
@@ -966,52 +1005,6 @@ where
         inputs.push(self.clone());
         inputs.extend_from_slice(output_dimensions);
         Ok(self.dispatch_domain().bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
-    }
-
-    #[inline]
-    fn broadcast_to(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError> {
-        let r#type = self.r#type();
-        let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
-        let offset = output_dimensions.len().checked_sub(input_type.rank()).ok_or_else(|| {
-            TypeError::invalid(format!(
-                "cannot broadcast rank-{} input to {} output dimensions",
-                input_type.rank(),
-                output_dimensions.len(),
-            ))
-        })?;
-        let output_axes = (0..input_type.rank()).map(|axis| axis + offset).collect::<Vec<_>>();
-        self.broadcast(output_dimensions, output_axes.as_slice())
-    }
-
-    fn broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError> {
-        let r#type = self.r#type();
-        let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
-        let mut output_dimensions = Vec::with_capacity(leading_dimensions.len() + input_type.rank());
-        output_dimensions.extend_from_slice(leading_dimensions);
-        for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
-            output_dimensions.push(match dimension {
-                Dimension::Static(extent) => lift_exact_broadcast_dimension(self, *extent)?,
-                Dimension::Dynamic(_) => self.dimension_size(axis)?,
-            });
-        }
-        let output_axes = (0..input_type.rank()).map(|axis| axis + leading_dimensions.len()).collect::<Vec<_>>();
-        self.broadcast(output_dimensions.as_slice(), output_axes.as_slice())
-    }
-
-    fn broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError> {
-        let output_dimensions = output_sizes
-            .iter()
-            .map(|extent| lift_exact_broadcast_dimension(self, *extent))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.broadcast_to(output_dimensions.as_slice())
-    }
-
-    fn broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError> {
-        let leading_dimensions = leading_sizes
-            .iter()
-            .map(|extent| lift_exact_broadcast_dimension(self, *extent))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.broadcast_leading(leading_dimensions.as_slice())
     }
 }
 
