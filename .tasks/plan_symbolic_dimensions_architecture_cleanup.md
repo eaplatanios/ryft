@@ -1347,7 +1347,7 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       parent's capture table exactly once and project the returned constant. Keep generic projected binding region-free;
       lift complete owned public bodies once before constructing direct composite higher-order drivers during the
       atomic P4b cutover so replay sharing and callee identity remain native.
-- [ ] P4b4 pre-cutover correctness remediation: execute
+- [x] P4b4 pre-cutover correctness remediation: execute
       `.tasks/plan_p4b4_pre_cutover_correctness.md` before the atomic composite XLA flip. Fix canonical broadcast
       identity elision, exact rank-positive literal lowering, and fill memory fidelity. Keep the complete enclosing
       lowering-state fix assigned to the production dispatcher in P4b rather than extending the standalone composite
@@ -1358,7 +1358,7 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 - [x] P4b4b exact rank-positive literal lowering: replace the lossy `f64` bridge with exact element-type-directed
       dense construction, keep one-element rank-positive literals shaped, preserve all materializable storage families
       including low-precision and complex payload bits, and verify representative literals through CPU execution.
-- [ ] P4b4c fill memory fidelity: construct fill's rank-zero literal in the requested output memory while preserving
+- [x] P4b4c fill memory fidelity: construct fill's rank-zero literal in the requested output memory while preserving
       the canonical constant-plus-broadcast decomposition and broadcast's memory-mismatch validation.
 - [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
       the unrelated `ReshapeParameters`/`ReshapeOperation` permutation builder and carry no ambient extent state.

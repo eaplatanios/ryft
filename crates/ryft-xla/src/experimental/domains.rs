@@ -430,7 +430,8 @@ impl<'c> One<Array<'c>> for XlaDomain<'c> {
 impl<'c> Fill<Scalar, Array<'c>> for XlaDomain<'c> {
     fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array<'c>, ProgramError> {
         let value = value.convert_element_type(r#type.data_type())?;
-        let literal = ReferenceArray::new(ArrayType::scalar(r#type.data_type()), vec![value])?;
+        let literal =
+            ReferenceArray::new(ArrayType::scalar(r#type.data_type()).with_memory(r#type.memory()), vec![value])?;
         let mut outputs = self.bind(ConstantOperation::new(literal), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         outputs.remove(0).legacy_broadcast(r#type.clone(), &[])
@@ -3573,11 +3574,14 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let domain = XlaDomain::new(&client);
 
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
-        let output = domain.fill(&r#type, Scalar::from(2.5f64)).unwrap();
+        for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
+            let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).with_memory(memory);
+            let output = domain.fill(&r#type, Scalar::from(2.5f64)).unwrap();
 
-        assert_eq!(output.shape(), StaticShape::new(vec![3]));
-        assert_eq!(read_f32s(&client, &output), vec![2.5, 2.5, 2.5]);
+            assert_eq!(output.r#type().memory(), memory);
+            assert_eq!(output.shape(), StaticShape::new(vec![3]));
+            assert_eq!(read_f32s(&client, &output), vec![2.5, 2.5, 2.5]);
+        }
 
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let value = Scalar::from(num_complex::Complex::new(1.5f64, -2.0f64));

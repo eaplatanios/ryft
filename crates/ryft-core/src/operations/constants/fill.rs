@@ -17,8 +17,9 @@ use crate::types::{ArrayType, DataType};
 // TODO(eaplatanios): Review this module.
 
 /// Represents the ability to synthesize a value filled with a host scalar. Staged scalar implementations bind a
-/// literal [`ConstantOperation`]. Staged array implementations bind the same rank-zero literal and use ordinary
-/// broadcasting for every rank-positive result, keeping the fill value and output extents explicit in SSA dataflow.
+/// literal [`ConstantOperation`]. Staged array implementations bind the same rank-zero literal in the requested
+/// [`Memory`](crate::Memory) space and use ordinary broadcasting for every rank-positive result, keeping the fill
+/// value and output extents explicit in Static Signal Assignment (SSA) dataflow.
 pub trait Fill<S, V: Typed> {
     /// Returns a value of [`Type`] `type` with every element it holds set to `value`.
     fn fill(&self, r#type: &V::Type, value: S) -> Result<V, ProgramError>;
@@ -49,7 +50,7 @@ impl<
     #[inline]
     fn fill_scalar(&self, r#type: &ArrayType, value: Scalar) -> Result<Self::Value, ProgramError> {
         let value = value.convert_element_type(r#type.data_type())?;
-        let literal = Array::new(ArrayType::scalar(r#type.data_type()), vec![value])?;
+        let literal = Array::new(ArrayType::scalar(r#type.data_type()).with_memory(r#type.memory()), vec![value])?;
         let scalar = self.bind(ConstantOperation::new(literal), Vec::new(), &[])?.remove(0);
         scalar.legacy_broadcast(r#type.clone(), &[])
     }
@@ -114,7 +115,7 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::parameters::Placeholder;
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
+    use crate::types::{ArrayType, DataType, Dimension, Memory, Shape};
 
     use super::*;
 
@@ -141,25 +142,54 @@ mod tests {
 
     #[test]
     fn test_staged_array_fill_is_literal_constant_plus_broadcast() {
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let output = context.fill(&output_type, Scalar::F64(2.5)).unwrap();
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda  .
-                let %0:f32[] = constant [value=[2.5]]
-                    %1:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[]] %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
+        for (memory, expected) in [
+            (
+                Memory::Device,
+                indoc! {"
+                    lambda  .
+                    let %0:f32[] = constant [value=[2.5]]
+                        %1:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[]] %0
+                    in (%1)
+                "}
+                .trim_end(),
+            ),
+            (
+                Memory::Host { pinned: true },
+                indoc! {"
+                    lambda  .
+                    let %0:f32[]@Host[Pinned] = constant [value=[2.5]]
+                        %1:f32[2, 3]@Host[Pinned] = broadcast \
+                            [output_type=f32[2, 3]@Host[Pinned], output_axes=[]] %0
+                    in (%1)
+                "}
+                .trim_end(),
+            ),
+            (
+                Memory::Host { pinned: false },
+                indoc! {"
+                    lambda  .
+                    let %0:f32[]@Host[Unpinned] = constant [value=[2.5]]
+                        %1:f32[2, 3]@Host[Unpinned] = broadcast \
+                            [output_type=f32[2, 3]@Host[Unpinned], output_axes=[]] %0
+                    in (%1)
+                "}
+                .trim_end(),
+            ),
+        ] {
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let output_type =
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+                    .with_memory(memory);
+            let output = context.fill(&output_type, Scalar::F64(2.5)).unwrap();
+            assert_eq!(*output.r#type(), output_type);
+            let program = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .unwrap();
+            assert_eq!(program.to_string(), expected);
+        }
     }
 
     #[test]

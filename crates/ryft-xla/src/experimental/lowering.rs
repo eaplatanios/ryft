@@ -14073,32 +14073,57 @@ mod tests {
 
     #[test]
     fn test_fill_lowers_as_scalar_constant_plus_broadcast() {
-        let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
-        let output_type = test_vector_type(4);
-        let output = context.fill(&output_type, Scalar::F64(2.5)).unwrap();
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
-            .unwrap();
+        for (memory, placement) in [
+            (Memory::Device, None),
+            (Memory::Host { pinned: true }, Some("pinned_host")),
+            (Memory::Host { pinned: false }, Some("unpinned_host")),
+        ] {
+            let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+            let output_type = test_vector_type(4).with_memory(memory);
+            let output = context.fill(&output_type, Scalar::F64(2.5)).unwrap();
+            assert_eq!(*output.r#type(), output_type);
+            let program = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 1, "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.constant dense<2.500000e+00> : tensor<f32>"), "{stablehlo}");
+            let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
+            assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 1, "{stablehlo}");
+            assert!(stablehlo.contains("stablehlo.constant dense<2.500000e+00> : tensor<f32>"), "{stablehlo}");
+            assert_eq!(
+                stablehlo.matches("stablehlo.custom_call @annotate_device_placement").count(),
+                usize::from(placement.is_some()),
+                "{stablehlo}",
+            );
+            if let Some(placement) = placement {
+                assert!(stablehlo.contains(&format!("_xla_buffer_placement = \"{placement}\"")), "{stablehlo}");
+            }
 
-        let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
-        let output = context.fill(&ArrayType::scalar(DataType::F32), Scalar::F64(2.5)).unwrap();
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 0, "{stablehlo}");
+            let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+            let output_type = ArrayType::scalar(DataType::F32).with_memory(memory);
+            let output = context.fill(&output_type, Scalar::F64(2.5)).unwrap();
+            assert_eq!(*output.r#type(), output_type);
+            let program = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .unwrap();
+            let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
+            assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 0, "{stablehlo}");
+            assert_eq!(
+                stablehlo.matches("stablehlo.custom_call @annotate_device_placement").count(),
+                usize::from(placement.is_some()),
+                "{stablehlo}",
+            );
+            if let Some(placement) = placement {
+                assert!(stablehlo.contains(&format!("_xla_buffer_placement = \"{placement}\"")), "{stablehlo}");
+            }
+        }
     }
 
     #[test]
