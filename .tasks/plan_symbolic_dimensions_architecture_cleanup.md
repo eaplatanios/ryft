@@ -1125,6 +1125,14 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 
 ### Phase 3: establish canonical mixed operation signatures
 
+Phase 3's canonical operation-signature slices are complete through P3k, but its integration gate is not closed.
+The remaining unchecked items below are dependency-coupled continuations with explicit Phase 4–6 owners: production
+shard-map reachability is required to finish collective parity, the composite XLA graph is required before deleting
+the frozen homogeneous operation language, and dimension-aware transform residuals are required before deleting
+dynamic zero/one materialization. Phase 4 therefore begins as a prerequisite to those Phase 3 exit gates rather than
+as evidence that Phase 3 is complete. These numbered phases are dependency-ordered workstreams, not a strict
+waterfall; every deferred checkbox names its owner so the open Phase 3 gate remains visible.
+
 - [x] P3a: introduce the production array-program dispatcher.
 - [x] P3b: make `DimensionSizeOperation` the sole canonical `array -> dimension` observation.
 - [x] P3c: keep `DimensionToScalarOperation` as the sole explicit `dimension -> scalar-array` conversion.
@@ -1176,9 +1184,9 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [x] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
       first-class result-dimension operands. After this point, a fresh output reference without an available operand or
       a definition-position occurrence is a closure error.
-- [ ] Delete each frozen homogeneous reshape/broadcast implementation and transform rule as its owning Phase 4–9
-      consumer migrates. Do not attempt the final zero-residual deletion before the composite public capability and
-      transform domains replace the current homogeneous `Reshape`/`Broadcast` implementations.
+- [ ] Phase 4–9 deletion gate: delete each frozen homogeneous reshape/broadcast implementation and transform rule as
+      its owning consumer migrates. Do not attempt the final zero-residual deletion before the composite public
+      capability and transform domains replace the current homogeneous `Reshape`/`Broadcast` implementations.
 - [x] Complete and remove the remaining-operation inventory through P3i's explicit mixed migration or array-only
       classification proof: custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and the
       archived slice-scatter proposal.
@@ -1256,40 +1264,46 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       arithmetic. Mixed inference, eager execution, PE, static matching-axis batching, JVP, identity instantiation,
       import, rendering, and exact Phase 4/5/6 boundaries are recorded in
       `.tasks/plan_p3k_collective_dimensions.md`.
-- [ ] P3k full JAX collective parity: add non-tiled rank-changing modes, validated `axis_index_groups`, the
+- [ ] Phase 4/P3k continuation — full JAX collective parity: add non-tiled rank-changing modes, validated
+      `axis_index_groups`, the
       all-gather variance policy if the canonical sharding model can represent it, and `pshuffle`/`pswapaxes` as
       compositions. Complete this alongside Phase 4 shard-map migration so the composite graph, group-aware native
       StableHLO lowering, and bounded-dynamic multi-device fixtures land as one vertical slice rather than adding
       another temporary homogeneous API. The public semantics, shared native lowerers, direct composite binder
       fixture, and static two-device execution are complete; the checkbox remains open only for production composite
       shard-map reachability and final bounded-dynamic/JAX comparison gates.
-- [ ] Route transform-generated zero/one values through structural zero or `zero_like`/`one_like` whenever an operand
-      supplies geometry.
-- [ ] Migrate transform consumers that stage `ZeroOperation<ArrayType>` with possibly-dynamic types (condition, scan,
-      while, gather, scatter, slice, pad, and differentiation rules) to `zero_like`, structural zeros, or Phase 6
-      extent residuals, with dynamic-shape acceptance tests per consumer. The zero reference guard is not complete
-      until this lands.
-- [ ] Keep `DimensionType` strictly identity plus bounds throughout all later phases. Concrete extents are runtime
-      values and output-refinement observations, never part of `Typed::r#type`, structural equality, hashing,
-      rendering, persistence, or cache identity.
-- [ ] Sweep shape-changing collectives and every other operation whose result metadata references first-class
-      dimension operands.
-- [ ] Give each mixed operation one direct positional operand contract and migrate its inference, eager rule,
-      transforms, and lowering to preserve those same SSA edges.
-- [ ] Delete copied dimension operand identity, bounds, and ordering validation after inference derives result metadata
-      directly from operand types. Centralize only genuinely repeated count/kind projection.
-- [ ] Replace shape-metadata zero/one materialization inside transforms with structural zero or `zero_like`/`one_like`
-      wherever semantics allow.
+- [ ] Phase 6 owner: route transform-generated zero/one values through structural zero or `zero_like`/`one_like`
+      whenever an operand supplies geometry.
+- [ ] Phase 6 owner: migrate transform consumers that stage `ZeroOperation<ArrayType>` with possibly-dynamic types
+      (condition, scan, while, gather, scatter, slice, pad, and differentiation rules) to `zero_like`, structural
+      zeros, or explicit extent residuals, with dynamic-shape acceptance tests per consumer. The zero reference guard
+      is not complete until this lands.
+- [ ] Cross-phase invariant: keep `DimensionType` strictly identity plus bounds throughout all later phases. Concrete
+      extents are runtime values and output-refinement observations, never part of `Typed::r#type`, structural
+      equality, hashing, rendering, persistence, or cache identity.
+- [x] Complete the Phase 3 inventory sweep of shape-changing collectives and every other operation whose result
+      metadata references first-class dimension operands. P3i records the remaining-operation classification and P3k
+      records the collective classification.
+- [x] Give each operation classified as mixed by the Phase 3 inventory one direct positional operand contract and
+      migrate its inference, eager rule, transforms, and lowering to preserve those same SSA edges. Explicit later
+      transform and production-XLA reachability gates remain assigned above.
+- [ ] Phase 4–6 cleanup gate: delete copied dimension operand identity, bounds, and ordering validation after
+      inference derives result metadata directly from operand types. Centralize only genuinely repeated count/kind
+      projection.
+- [ ] Phase 6 owner: replace shape-metadata zero/one materialization inside transforms with structural zero or
+      `zero_like`/`one_like` wherever semantics allow.
 - [x] Static and dynamic reshape/broadcast invocations bind the same canonical payload with exact constants or dynamic
       dimension SSA operands. Constructors intentionally use static homogeneous encoding versus the variant-owned
       dynamic stored-type contract described above.
-- [ ] Add a residual search proving no concrete payload implements materially different operation type contracts.
+- [x] Add a residual search proving no concrete payload in the completed Phase 3 inventory implements materially
+      different operation type contracts. P3k's final residual audit records the zero-result search.
 - [x] Generic constructors have no overlapping array-program-specific payload implementation. `DynamicZero` is a
       composite variant-arm contract, while the temporary `ZeroOperation<ArrayProgramType>` is a different generic
       instantiation restricted to identity-free member types until Phase 6 deletes it.
 - [x] No operation consumer independently calls an ad hoc
       `runtime_dimension_variables` contract.
-- [ ] Gate: every shape dependency in rendered IR is an operand edge or an explicit `dimension_size` instruction.
+- [ ] Phase 4–6 integration gate: every shape dependency in rendered IR is an operand edge or an explicit
+      `dimension_size` instruction.
 
 ### Phase 4: remove implicit-shape replay and the parallel array language
 
@@ -1316,6 +1330,15 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       `BroadcastOperation` with one explicit first-class dimension operand per output axis is now the sole
       runtime-sized broadcast representation. This also removes the final dependency on P1c's fresh-result-reference
       closure fallback.
+- [ ] P4b production composite XLA cutover: execute
+      `.tasks/plan_p4b_production_composite_xla.md` as one semantic review unit. Group homogeneous array and dimension
+      payloads behind their canonical projected member families, keep mixed and XLA-owned higher-order operations as
+      direct backend variants, and switch the existing program/domain/region/lowering cycle in place. Preserve
+      array-only public APIs through projection; do not add a projection-aware derive mode, a stored
+      `ArrayProgramOperation`, a replay bridge, or a parallel production lowerer.
+- [x] P4b1 projected-region foundation: add and verify the lossless `Program` member-to-parent lift specified by the
+      P4b plan. This is a behavior-preserving, core-only prerequisite for importing public array-only regions into the
+      production composite graph without instruction replay.
 - [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
       the unrelated `ReshapeParameters`/`ReshapeOperation` permutation builder and carry no ambient extent state.
 - [x] `with_source_array` no longer exists.
@@ -2617,7 +2640,7 @@ With that producer removed, `Region::type_identity_signature` no longer treats a
 reference-position result identity as an internal definition. Every result reference must now forward an operand
 identity or refer to a definition-position occurrence on a sibling result. The structural closure suite includes the
 corresponding fresh-reference negative regression. The full core gate also exposed and corrected one stale expected
-diagnostic so dynamic constructor messages consistently render `dimension<name: bounds>`.
+diagnostic so dynamic constructor messages consistently use the canonical `dimension<name ∈ bounds>` rendering.
 
 Verification for this review unit:
 
@@ -2627,3 +2650,18 @@ Verification for this review unit:
 - targeted searches find no core/XLA occurrence of `DynamicBroadcastOperation`, `LegacyDynamicBroadcast`,
   `DYNAMIC_BROADCAST_OPERATION_NAME`, or an operation-family `DynamicBroadcast` variant; and
 - `cargo fmt --all -- --check` and `git diff --check` passed.
+
+### Execution: P4b1 lossless projected-region foundation
+
+`Program::into_parent` is now the one structural bridge from an already-built homogeneous member program to its
+parent graph. The consuming conversion lifts constants with `ValueProjection::from_projected`, variable types and
+operations with their canonical `From` contracts, preserves public parameter structure and every atom,
+instruction, and region edge, and then rebuilds the mapped arena once through `Program::new`. It does not interpret,
+trace, or replay instructions and therefore cannot invent dependencies or change SSA identity.
+
+The regression covers a dynamic array identity, a lifted constant, and one imported branch region attached to both
+condition slots. The mapped graph retains exact shared-region topology, effects, type-identity signature, parameter
+structures, operation variants, and constant values. The full core suite passed 1,015 tests; the XLA suite passed 417
+tests with one pre-existing ignored benchmark; `cargo check -p ryft-xla --lib`, formatting, and diff hygiene passed.
+The next P4b increment must consume this lift at the projected region-binding boundary; `ProjectedContext` still
+rejects regions until that driver conversion is atomic.

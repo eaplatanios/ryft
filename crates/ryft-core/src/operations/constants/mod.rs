@@ -58,7 +58,7 @@ pub(crate) fn infer_dynamic_constructor_output_types(
     if variables.is_empty() {
         return Err(TypeError::invalid(format!(
             "'{}' with static output type {} has no dynamic dimensions; use the homogeneous nullary \
-             constructor instead",
+            constructor instead",
             name, r#type,
         )));
     }
@@ -75,13 +75,9 @@ pub(crate) fn infer_dynamic_constructor_output_types(
             TypeError::invalid(format!("'{name}' operand {index} must be a dimension but has type {input_type}"))
         })?;
         if dimension_type.variable() != variable {
+            let required_type = DimensionType::new(variable.clone());
             return Err(TypeError::invalid(format!(
-                "'{}' operand {} has type {} but the output shape requires dimension<{} : {}>",
-                name,
-                index,
-                dimension_type,
-                variable,
-                variable.bounds(),
+                "'{name}' operand {index} has type {dimension_type} but the output shape requires {required_type}",
             )));
         }
     }
@@ -128,8 +124,8 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'zero' operand 0 has type dimension<other \u{2208} [0, 8)> but the output shape requires \
-                 dimension<rows : [0, 8)>",
+                "'zero' operand 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
+                 dimension<rows ∈ [0, 8)>",
             )),
         );
         assert_eq!(

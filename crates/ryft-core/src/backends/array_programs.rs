@@ -2487,8 +2487,8 @@ mod tests {
         assert_eq!(
             dynamic_one.infer_output_types(&[DimensionType::new(other).into()], &[]),
             Err(TypeError::invalid(
-                "'one' operand 0 has type dimension<other \u{2208} [1, 9)> but the output shape requires \
-                 dimension<source: [1, 9)>",
+                "'one' operand 0 has type dimension<other ∈ [1, 9)> but the output shape requires \
+                 dimension<source ∈ [1, 9)>",
             )),
         );
         assert_eq!(
