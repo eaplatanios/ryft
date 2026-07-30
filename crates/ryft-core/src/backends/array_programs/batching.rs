@@ -975,7 +975,9 @@ mod tests {
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation};
+    use crate::operations::collectives::{
+        AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions, PSumScatterOperation,
+    };
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{IotaOperation, OneOperation, ZeroOperation};
     use crate::operations::dimensions::{
@@ -1114,7 +1116,13 @@ mod tests {
         assert_eq!(collective_output[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(collective_output[0].value(), &ArrayProgramValue::Array(Array::scalar(3.0_f32)));
 
-        let all_gather = ArrayProgramOperation::<Array>::from(AllGatherOperation::new("items".to_string(), 2, 0));
+        let all_gather = ArrayProgramOperation::<Array>::from(AllGatherOperation::new(
+            "items".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+            AllGatherOutputVariance::Varying,
+        ));
         let all_gather_input = ArrayProgramBatch::new(
             ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
             BatchAxis::new(0),
@@ -1131,7 +1139,12 @@ mod tests {
             &ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])),
         );
 
-        let psum_scatter = ArrayProgramOperation::<Array>::from(PSumScatterOperation::new("items".to_string(), 2, 0));
+        let psum_scatter = ArrayProgramOperation::<Array>::from(PSumScatterOperation::new(
+            "items".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+        ));
         let psum_scatter_input = ArrayProgramBatch::new(
             ArrayProgramValue::Array(Array::matrix(2, 4, vec![1.0_f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0])),
             BatchAxis::new(0),
@@ -1149,7 +1162,13 @@ mod tests {
             &ArrayProgramValue::Array(Array::matrix(2, 2, vec![11.0_f32, 22.0, 33.0, 44.0])),
         );
 
-        let all_to_all = ArrayProgramOperation::<Array>::from(AllToAllOperation::new("items".to_string(), 2, 0, 0));
+        let all_to_all = ArrayProgramOperation::<Array>::from(AllToAllOperation::new(
+            "items".to_string(),
+            2,
+            0,
+            0,
+            CollectiveOptions::tiled(),
+        ));
         let all_to_all_input = ArrayProgramBatch::new(
             ArrayProgramValue::Array(Array::matrix(2, 4, vec![1.0_f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0])),
             BatchAxis::new(0),

@@ -10,7 +10,7 @@
 //! the binding level, while a name bound to a device mesh axis by a `shard_map` manual region stays in the staged
 //! body and lowers to cross-device collectives over that mesh axis.
 
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::ops::Mul;
 
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
@@ -52,8 +52,8 @@ use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionTy
 /// `jax.lax.{psum, pmean, pmax}` family.
 ///
 /// `PSum`/`PMean`/`PMax` reduce the named axis away, producing a result that is identical across all batch items or
-/// device shards (replicated). `AllGather`-style gather variants are deferred until the machinery for shape-extending
-/// collectives lands.
+/// device shards (replicated). Shape-changing collectives use their dedicated operation payloads below because their
+/// result types also depend on a ranked array axis and on whether the named axis is materialized or tiled.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CollectiveKind {
     /// Sum reduction across the named axis (`jax.lax.psum`).
@@ -64,6 +64,147 @@ pub enum CollectiveKind {
 
     /// Maximum reduction across the named axis (`jax.lax.pmax`).
     PMax,
+}
+
+/// Shape semantics used by collectives that can either materialize a named axis or tile an existing array axis.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CollectiveMode {
+    /// Materializes the named axis as a new ranked array dimension, or consumes one ranked dimension when scattering.
+    #[default]
+    Untiled,
+
+    /// Preserves array rank by multiplying or dividing an existing ranked array dimension.
+    Tiled,
+}
+
+/// Named-axis variance carried by an all-gather result.
+///
+/// This is an operation option rather than parallel type metadata. Type inference maps it onto the canonical
+/// [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes) and
+/// [`Sharding::reduced_axes`](crate::Sharding::reduced_axes) sets.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AllGatherOutputVariance {
+    /// The result continues to vary across the gathered manual mesh axis.
+    #[default]
+    Varying,
+
+    /// The result is invariant across the gathered manual mesh axis.
+    Invariant,
+
+    /// The result records the gathered manual mesh axis as reduced.
+    Reduced,
+}
+
+/// Shared shape and grouping options for all-gather, sum-scatter, and all-to-all.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct CollectiveOptions {
+    /// Rank-changing or rank-preserving shape semantics.
+    mode: CollectiveMode,
+
+    /// Optional ordered partition of logical participant indices.
+    axis_index_groups: Option<Vec<Vec<usize>>>,
+}
+
+impl Debug for CollectiveOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.axis_index_groups {
+            None => Debug::fmt(&self.mode, formatter),
+            Some(axis_index_groups) => formatter
+                .debug_struct("CollectiveOptions")
+                .field("mode", &self.mode)
+                .field("axis_index_groups", axis_index_groups)
+                .finish(),
+        }
+    }
+}
+
+impl CollectiveOptions {
+    /// Creates collective options for `mode` with no participant subgroups.
+    #[inline]
+    pub fn new(mode: CollectiveMode) -> Self {
+        Self { mode, axis_index_groups: None }
+    }
+
+    /// Creates rank-preserving tiled collective options with no participant subgroups.
+    #[inline]
+    pub fn tiled() -> Self {
+        Self::new(CollectiveMode::Tiled)
+    }
+
+    /// Returns these options with the provided ordered participant groups.
+    #[inline]
+    pub fn with_axis_index_groups(mut self, axis_index_groups: Vec<Vec<usize>>) -> Self {
+        self.axis_index_groups = Some(axis_index_groups);
+        self
+    }
+
+    /// Returns the selected shape mode.
+    #[inline]
+    pub fn mode(&self) -> CollectiveMode {
+        self.mode
+    }
+
+    /// Returns the ordered participant groups, if any.
+    #[inline]
+    pub fn axis_index_groups(&self) -> Option<&[Vec<usize>]> {
+        self.axis_index_groups.as_deref()
+    }
+
+    /// Validates these options against the full named-axis size and returns the effective group size used for shape
+    /// arithmetic.
+    fn effective_axis_size(&self, operation_name: &str, axis_size: usize) -> Result<usize, TypeError> {
+        effective_collective_axis_size(operation_name, axis_size, self.axis_index_groups())
+    }
+}
+
+/// Validates an optional ordered participant partition and returns its effective group size without copying it.
+fn effective_collective_axis_size(
+    operation_name: &str,
+    axis_size: usize,
+    groups: Option<&[Vec<usize>]>,
+) -> Result<usize, TypeError> {
+    validate_collective_axis_size(operation_name, axis_size)?;
+    let Some(groups) = groups else {
+        return Ok(axis_size);
+    };
+    let Some(first_group) = groups.first() else {
+        return Err(TypeError::invalid(format!("'{operation_name}' axis index groups must not be empty")));
+    };
+    if first_group.is_empty() {
+        return Err(TypeError::invalid(format!(
+            "'{operation_name}' axis index groups must contain at least one participant",
+        )));
+    }
+    let group_size = first_group.len();
+    let mut seen = vec![false; axis_size];
+    for (group_index, group) in groups.iter().enumerate() {
+        if group.len() != group_size {
+            return Err(TypeError::invalid(format!(
+                "'{operation_name}' axis index group {group_index} has size {} but every group must have size \
+                     {group_size}",
+                group.len(),
+            )));
+        }
+        for &participant in group {
+            let Some(participant_seen) = seen.get_mut(participant) else {
+                return Err(TypeError::invalid(format!(
+                    "'{operation_name}' axis index {participant} is out of bounds for axis size {axis_size}",
+                )));
+            };
+            if *participant_seen {
+                return Err(TypeError::invalid(format!(
+                    "'{operation_name}' axis index groups contain participant {participant} more than once",
+                )));
+            }
+            *participant_seen = true;
+        }
+    }
+    if let Some(missing) = seen.iter().position(|seen| !seen) {
+        return Err(TypeError::invalid(format!(
+            "'{operation_name}' axis index groups do not contain participant {missing}",
+        )));
+    }
+    Ok(group_size)
 }
 
 impl CollectiveKind {
@@ -108,13 +249,31 @@ pub struct CollectiveOperation {
 
     /// Kind of collective.
     kind: CollectiveKind,
+
+    /// Full size of the named axis when participant subgroups are present.
+    axis_size: Option<usize>,
+
+    /// Optional ordered partition of logical participant indices.
+    axis_index_groups: Option<Vec<Vec<usize>>>,
 }
 
 impl CollectiveOperation {
     /// Creates a new [`CollectiveOperation`] with the supplied axis name and kind.
     #[inline]
     pub fn new(axis_name: String, kind: CollectiveKind) -> Self {
-        Self { axis_name, kind }
+        Self { axis_name, kind, axis_size: None, axis_index_groups: None }
+    }
+
+    /// Creates a grouped collective after validating that `axis_index_groups` is an equal-sized exact partition of
+    /// `0..axis_size`.
+    pub fn grouped(
+        axis_name: String,
+        kind: CollectiveKind,
+        axis_size: usize,
+        axis_index_groups: Vec<Vec<usize>>,
+    ) -> Result<Self, TypeError> {
+        effective_collective_axis_size(kind.name(), axis_size, Some(axis_index_groups.as_slice()))?;
+        Ok(Self { axis_name, kind, axis_size: Some(axis_size), axis_index_groups: Some(axis_index_groups) })
     }
 
     /// Returns the axis name referenced by this collective.
@@ -127,6 +286,24 @@ impl CollectiveOperation {
     #[inline]
     pub fn kind(&self) -> CollectiveKind {
         self.kind
+    }
+
+    /// Returns the full named-axis size recorded for a grouped collective.
+    #[inline]
+    pub fn axis_size(&self) -> Option<usize> {
+        self.axis_size
+    }
+
+    /// Returns the ordered participant groups, if any.
+    #[inline]
+    pub fn axis_index_groups(&self) -> Option<&[Vec<usize>]> {
+        self.axis_index_groups.as_deref()
+    }
+
+    /// Returns the number of participants in each group, or `None` for an ungrouped collective whose size is supplied
+    /// by the enclosing binder.
+    pub fn group_size(&self) -> Option<usize> {
+        self.axis_index_groups.as_ref().and_then(|groups| groups.first()).map(Vec::len)
     }
 }
 
@@ -152,14 +329,34 @@ impl Operation<ArrayType> for CollectiveOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
+        match (&self.axis_index_groups, self.axis_size) {
+            (Some(axis_index_groups), Some(axis_size)) => {
+                effective_collective_axis_size(self.name(), axis_size, Some(axis_index_groups.as_slice()))?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(TypeError::invalid(format!(
+                    "'{}' must store both the full axis size and axis index groups, or neither",
+                    self.name(),
+                )));
+            }
+        }
         // The per-item operation is identity; the named axis only exists physically inside an
         // enclosing `BatchingContext` where the batching rule will collapse it.
         Ok(vec![input_types[0].clone()])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("axis_name", format_args!("{:?}", self.axis_name)))
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
+            if let Some(axis_size) = self.axis_size {
+                operation.field("axis_size", axis_size)?;
+            }
+            if let Some(axis_index_groups) = &self.axis_index_groups {
+                operation.field("axis_index_groups", format_args!("{axis_index_groups:?}"))?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -208,8 +405,16 @@ where
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            let parent_operation = C::Operation::from(CollectiveOperation::new(self.axis_name.clone(), self.kind));
+            let parent_operation = C::Operation::from(self.clone());
             return forward_collective_to_parent(context, parent_operation, inputs);
+        }
+        if self.axis_index_groups.is_some() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "'{}' axis index groups are not supported when a batch transform binds the collective axis",
+                    self.name(),
+                ),
+            });
         }
         collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
             // The `1 / N` rank-0 factor binds into the batching context's parent — interpreted eagerly under an eager
@@ -314,15 +519,12 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
-            let primal =
-                stage_collective(context, &operation.axis_name, operation.kind, inputs[0].primal())?;
+            let primal = stage_collective(context, operation, inputs[0].primal())?;
             // A collective of a structural zero stays a structural zero, keeping `collective(zero)` out of the
             // tangent program.
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
-                MaybeZero::Value(tangent) => {
-                    MaybeZero::Value(stage_collective(context, &operation.axis_name, operation.kind, tangent)?)
-                }
+                MaybeZero::Value(tangent) => MaybeZero::Value(stage_collective(context, operation, tangent)?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
@@ -351,7 +553,7 @@ impl_differentiable_operation! {
             }
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
-                    let contribution = stage_collective(context, &operation.axis_name, operation.kind, cotangent)?;
+                    let contribution = stage_collective(context, operation, cotangent)?;
                     Ok(vec![MaybeZero::Value(contribution)])
                 }
                 MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
@@ -366,19 +568,14 @@ impl_differentiable_operation! {
 /// tangent, or the output cotangent), which is exactly one operation with one input and one output.
 fn stage_collective<C>(
     context: &C,
-    axis_name: &str,
-    kind: CollectiveKind,
+    operation: &CollectiveOperation,
     operand: &C::Value,
 ) -> Result<C::Value, ProgramError>
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<CollectiveOperation>,
 {
-    let mut outputs = context.bind(
-        CollectiveOperation::new(axis_name.to_string(), kind),
-        Vec::new(),
-        std::slice::from_ref(operand),
-    )?;
+    let mut outputs = context.bind(operation.clone(), Vec::new(), std::slice::from_ref(operand))?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
 }
@@ -397,6 +594,14 @@ pub trait Collective: Sized {
     /// [`BatchingError::Axis`] riding a [`ProgramError::Custom`] payload) when no
     /// enclosing binder binds `axis_name`.
     fn collective(&self, axis_name: &str, kind: CollectiveKind) -> Result<Self, ProgramError>;
+
+    /// Stages a grouped collective after validating that the groups cover the named axis exactly once.
+    fn collective_with_axis_index_groups(
+        &self,
+        axis_name: &str,
+        kind: CollectiveKind,
+        axis_index_groups: Vec<Vec<usize>>,
+    ) -> Result<Self, ProgramError>;
 }
 
 /// Any context-carrying value applies a collective by validating the axis name against the active [`NamedAxes`]
@@ -416,6 +621,20 @@ where
         }
         let mut outputs =
             context.bind(CollectiveOperation::new(axis_name.to_string(), kind), Vec::new(), &[self.clone()])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+
+    fn collective_with_axis_index_groups(
+        &self,
+        axis_name: &str,
+        kind: CollectiveKind,
+        axis_index_groups: Vec<Vec<usize>>,
+    ) -> Result<Self, ProgramError> {
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let operation = CollectiveOperation::grouped(axis_name.to_string(), kind, axis_size, axis_index_groups)?;
+        let mut outputs = context.bind(operation, Vec::new(), &[self.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -470,8 +689,75 @@ fn shape_changing_collective_output_type(
 ) -> Result<ArrayType, TypeError> {
     let output_sizes = output_dimensions.into_iter().map(Dimension::Static).collect::<Vec<_>>();
     let sharding = resized_output_sharding(input_type, output_sizes.as_slice(), operation_name)?;
-    let mut output_type = ArrayType::new(input_type.data_type(), Shape::new(output_sizes));
+    let mut output_type =
+        ArrayType::new(input_type.data_type(), Shape::new(output_sizes)).with_memory(input_type.memory());
     output_type.sharding = sharding;
+    Ok(output_type)
+}
+
+/// Applies an all-gather's named-axis variance transition to the canonical sharding metadata.
+fn all_gather_output_type(
+    input_type: &ArrayType,
+    mut output_type: ArrayType,
+    operation: &AllGatherOperation,
+) -> Result<ArrayType, TypeError> {
+    let Some(input_sharding) = input_type.sharding() else {
+        if operation.output_variance == AllGatherOutputVariance::Reduced {
+            return Err(TypeError::invalid(
+                "'all_gather' with reduced output variance requires sharding metadata".to_string(),
+            ));
+        }
+        return Ok(output_type);
+    };
+    if input_type.unreduced_axes().contains(operation.axis_name()) {
+        return Err(TypeError::invalid(format!(
+            "'all_gather' does not support an operand that is unreduced over axis '{}'",
+            operation.axis_name(),
+        )));
+    }
+
+    let mut varying_axes = input_sharding.varying_manual_axes().clone();
+    let mut reduced_axes = input_sharding.reduced_axes().clone();
+    match operation.output_variance {
+        AllGatherOutputVariance::Varying => {
+            if reduced_axes.contains(operation.axis_name()) {
+                return Err(TypeError::invalid(format!(
+                    "'all_gather' cannot make axis '{}' varying because the operand records it as reduced",
+                    operation.axis_name(),
+                )));
+            }
+            varying_axes.insert(operation.axis_name.clone());
+        }
+        AllGatherOutputVariance::Invariant => {
+            if reduced_axes.contains(operation.axis_name()) {
+                return Err(TypeError::invalid(format!(
+                    "'all_gather' cannot make axis '{}' invariant because the operand records it as reduced",
+                    operation.axis_name(),
+                )));
+            }
+            varying_axes.remove(operation.axis_name());
+        }
+        AllGatherOutputVariance::Reduced => {
+            if !varying_axes.remove(operation.axis_name()) {
+                return Err(TypeError::invalid(format!(
+                    "'all_gather' with reduced output variance requires an operand varying over axis '{}'",
+                    operation.axis_name(),
+                )));
+            }
+            if !reduced_axes.insert(operation.axis_name.clone()) {
+                return Err(TypeError::invalid(format!(
+                    "'all_gather' operand is already reduced over axis '{}'",
+                    operation.axis_name(),
+                )));
+            }
+        }
+    }
+    let output_sharding = output_type.sharding().expect("shape projection preserves sharding").clone();
+    let output_sharding = output_sharding
+        .with_varying_manual_axes(varying_axes)
+        .and_then(|sharding| sharding.with_reduced_axes(reduced_axes))
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    output_type.sharding = Some(output_sharding);
     Ok(output_type)
 }
 
@@ -512,13 +798,23 @@ fn infer_explicit_shape_changing_collective_output_type(
     Ok(vec![output_type.into()])
 }
 
-/// Infers the composite tiled-all-gather contract `(Array, Dimension) -> Array`.
+/// Infers the composite all-gather contract.
 pub(crate) fn infer_explicit_all_gather_output_types(
     operation: &AllGatherOperation,
     input_types: &[ArrayProgramType],
 ) -> Result<Vec<ArrayProgramType>, TypeError> {
-    validate_collective_axis_size(ALL_GATHER_OPERATION_NAME, operation.axis_size)?;
-    infer_explicit_shape_changing_collective_output_type(
+    let effective_axis_size = operation.effective_axis_size()?;
+    if operation.options.mode == CollectiveMode::Untiled {
+        check_count!("input", input_types, 1, TypeError);
+        let input_type = <&ArrayType>::try_from(&input_types[0])?;
+        if !input_type.unreduced_axes().is_empty() {
+            return Err(TypeError::invalid("'all_gather' does not support unreduced operands".to_string()));
+        }
+        let output_type =
+            input_type.with_inserted_dimension(operation.concat_axis, Dimension::Static(effective_axis_size))?;
+        return Ok(vec![all_gather_output_type(input_type, output_type, operation)?.into()]);
+    }
+    let mut output_types = infer_explicit_shape_changing_collective_output_type(
         ALL_GATHER_OPERATION_NAME,
         input_types,
         &[operation.concat_axis],
@@ -533,28 +829,55 @@ pub(crate) fn infer_explicit_all_gather_output_types(
             if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
                 (input_extent, &output_extents[0])
             {
-                let expected = input_extent.checked_mul(operation.axis_size).ok_or_else(|| {
+                let expected = input_extent.checked_mul(effective_axis_size).ok_or_else(|| {
                     TypeError::invalid("'all_gather' result extent does not fit in usize".to_string())
                 })?;
                 if *output_extent != expected {
                     return Err(TypeError::invalid(format!(
                         "'all_gather' result extent must equal input axis {} extent {input_extent} multiplied by axis \
-                         size {}; expected {expected} but got {output_extent}",
-                        operation.concat_axis, operation.axis_size,
+                         group size {effective_axis_size}; expected {expected} but got {output_extent}",
+                        operation.concat_axis,
                     )));
                 }
             }
             Ok(())
         },
-    )
+    )?;
+    let input_type = <&ArrayType>::try_from(&input_types[0])?;
+    let output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
+    Ok(vec![all_gather_output_type(input_type, output_type, operation)?.into()])
 }
 
-/// Infers the composite tiled-psum-scatter contract `(Array, Dimension) -> Array`.
+/// Infers the composite sum-scatter contract.
 pub(crate) fn infer_explicit_psum_scatter_output_types(
     operation: &PSumScatterOperation,
     input_types: &[ArrayProgramType],
 ) -> Result<Vec<ArrayProgramType>, TypeError> {
-    validate_collective_axis_size(PSUM_SCATTER_OPERATION_NAME, operation.axis_size)?;
+    let effective_axis_size = operation.effective_axis_size()?;
+    if operation.options.mode == CollectiveMode::Untiled {
+        check_count!("input", input_types, 1, TypeError);
+        let input_type = <&ArrayType>::try_from(&input_types[0])?;
+        if !input_type.unreduced_axes().is_empty() {
+            return Err(TypeError::invalid("'psum_scatter' does not support unreduced operands".to_string()));
+        }
+        let Some(input_extent) = input_type.shape().dimensions().get(operation.scatter_axis) else {
+            return Err(TypeError::invalid(format!(
+                "'psum_scatter' scatter axis {} is out of bounds for rank {}",
+                operation.scatter_axis,
+                input_type.rank(),
+            )));
+        };
+        if let Dimension::Static(input_extent) = input_extent
+            && *input_extent != effective_axis_size
+        {
+            return Err(TypeError::invalid(format!(
+                "'psum_scatter' untiled scatter axis {} size {input_extent} must equal group size \
+                 {effective_axis_size}",
+                operation.scatter_axis,
+            )));
+        }
+        return Ok(vec![input_type.without_dimension(operation.scatter_axis)?.0.into()]);
+    }
     infer_explicit_shape_changing_collective_output_type(
         PSUM_SCATTER_OPERATION_NAME,
         input_types,
@@ -570,18 +893,19 @@ pub(crate) fn infer_explicit_psum_scatter_output_types(
             if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
                 (input_extent, &output_extents[0])
             {
-                if *input_extent % operation.axis_size != 0 {
+                if *input_extent % effective_axis_size != 0 {
                     return Err(TypeError::invalid(format!(
-                        "'psum_scatter' scatter axis {} size {input_extent} is not divisible by axis size {}",
-                        operation.scatter_axis, operation.axis_size,
+                        "'psum_scatter' scatter axis {} size {input_extent} is not divisible by group size \
+                         {effective_axis_size}",
+                        operation.scatter_axis,
                     )));
                 }
-                let expected = *input_extent / operation.axis_size;
+                let expected = *input_extent / effective_axis_size;
                 if *output_extent != expected {
                     return Err(TypeError::invalid(format!(
                         "'psum_scatter' result extent must equal input axis {} extent {input_extent} divided by axis \
-                         size {}; expected {expected} but got {output_extent}",
-                        operation.scatter_axis, operation.axis_size,
+                         group size {effective_axis_size}; expected {expected} but got {output_extent}",
+                        operation.scatter_axis,
                     )));
                 }
             }
@@ -590,13 +914,39 @@ pub(crate) fn infer_explicit_psum_scatter_output_types(
     )
 }
 
-/// Infers the composite tiled-all-to-all contract. Equal split/concatenation axes preserve shape and consume no
-/// dimension operands; distinct axes consume their split and concatenation result extents in that order.
+/// Infers the composite all-to-all contract.
 pub(crate) fn infer_explicit_all_to_all_output_types(
     operation: &AllToAllOperation,
     input_types: &[ArrayProgramType],
 ) -> Result<Vec<ArrayProgramType>, TypeError> {
-    validate_collective_axis_size(ALL_TO_ALL_OPERATION_NAME, operation.axis_size)?;
+    let effective_axis_size = operation.effective_axis_size()?;
+    if operation.options.mode == CollectiveMode::Untiled {
+        check_count!("input", input_types, 1, TypeError);
+        let input_type = <&ArrayType>::try_from(&input_types[0])?;
+        if !input_type.unreduced_axes().is_empty() {
+            return Err(TypeError::invalid("'all_to_all' does not support unreduced operands".to_string()));
+        }
+        let Some(input_extent) = input_type.shape().dimensions().get(operation.split_axis) else {
+            return Err(TypeError::invalid(format!(
+                "'all_to_all' split axis {} is out of bounds for rank {}",
+                operation.split_axis,
+                input_type.rank(),
+            )));
+        };
+        if let Dimension::Static(input_extent) = input_extent
+            && *input_extent != effective_axis_size
+        {
+            return Err(TypeError::invalid(format!(
+                "'all_to_all' untiled split axis {} size {input_extent} must equal group size {effective_axis_size}",
+                operation.split_axis,
+            )));
+        }
+        let output_type = input_type
+            .without_dimension(operation.split_axis)?
+            .0
+            .with_inserted_dimension(operation.concat_axis, Dimension::Static(effective_axis_size))?;
+        return Ok(vec![output_type.into()]);
+    }
     if operation.split_axis == operation.concat_axis {
         check_count!("input", input_types, 1, TypeError);
         let input_type = <&ArrayType>::try_from(&input_types[0])?;
@@ -611,11 +961,12 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
             )));
         };
         if let Dimension::Static(input_extent) = input_extent
-            && *input_extent % operation.axis_size != 0
+            && *input_extent % effective_axis_size != 0
         {
             return Err(TypeError::invalid(format!(
-                "'all_to_all' split axis {} size {input_extent} is not divisible by axis size {}",
-                operation.split_axis, operation.axis_size,
+                "'all_to_all' split axis {} size {input_extent} is not divisible by group size \
+                 {effective_axis_size}",
+                operation.split_axis,
             )));
         }
         return Ok(vec![input_type.clone().into()]);
@@ -636,32 +987,33 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
             if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
                 (&input_type.shape().dimensions()[operation.split_axis], &output_extents[0])
             {
-                if *input_extent % operation.axis_size != 0 {
+                if *input_extent % effective_axis_size != 0 {
                     return Err(TypeError::invalid(format!(
-                        "'all_to_all' split axis {} size {input_extent} is not divisible by axis size {}",
-                        operation.split_axis, operation.axis_size,
+                        "'all_to_all' split axis {} size {input_extent} is not divisible by group size \
+                         {effective_axis_size}",
+                        operation.split_axis,
                     )));
                 }
-                let expected = *input_extent / operation.axis_size;
+                let expected = *input_extent / effective_axis_size;
                 if *output_extent != expected {
                     return Err(TypeError::invalid(format!(
                         "'all_to_all' split result extent must equal input axis {} extent {input_extent} divided by \
-                         axis size {}; expected {expected} but got {output_extent}",
-                        operation.split_axis, operation.axis_size,
+                         group size {effective_axis_size}; expected {expected} but got {output_extent}",
+                        operation.split_axis,
                     )));
                 }
             }
             if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
                 (&input_type.shape().dimensions()[operation.concat_axis], &output_extents[1])
             {
-                let expected = input_extent.checked_mul(operation.axis_size).ok_or_else(|| {
+                let expected = input_extent.checked_mul(effective_axis_size).ok_or_else(|| {
                     TypeError::invalid("'all_to_all' concatenation result extent does not fit in usize".to_string())
                 })?;
                 if *output_extent != expected {
                     return Err(TypeError::invalid(format!(
                         "'all_to_all' concat result extent must equal input axis {} extent {input_extent} multiplied \
-                         by axis size {}; expected {expected} but got {output_extent}",
-                        operation.concat_axis, operation.axis_size,
+                         by group size {effective_axis_size}; expected {expected} but got {output_extent}",
+                        operation.concat_axis,
                     )));
                 }
             }
@@ -749,7 +1101,7 @@ macro_rules! shape_changing_collective {
         $(#[$capability_documentation:meta])*
         capability = $capability:ident::$method:ident,
         fields = { $($(#[$field_documentation:meta])* $field:ident: $field_type:ty),* $(,)? },
-        infer = |$infer_self:ident, $dimensions:ident| $infer:block $(,)?
+        infer = |$infer_self:ident, $input_type:ident, $dimensions:ident| $infer:block $(,)?
     ) => {
         /// Canonical operation name for the operation.
         pub const $operation_name: &str = $name_literal;
@@ -808,12 +1160,8 @@ macro_rules! shape_changing_collective {
                 validate_collective_axis_size($name_literal, self.axis_size)?;
                 let $dimensions = shape_changing_collective_dimensions($name_literal, input_types)?;
                 let $infer_self = self;
-                let output_dimensions: Vec<usize> = $infer?;
-                Ok(vec![shape_changing_collective_output_type(
-                    $operation_name,
-                    &input_types[0],
-                    output_dimensions,
-                )?])
+                let $input_type = &input_types[0];
+                Ok(vec![$infer?])
             }
 
             fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -919,18 +1267,34 @@ shape_changing_collective! {
     fields = {
         /// Axis of the operand along which the participants' values are concatenated.
         concat_axis: usize,
+
+        /// Shared rank and participant-group semantics.
+        options: CollectiveOptions,
+
+        /// Named-axis variance of the result.
+        output_variance: AllGatherOutputVariance,
     },
-    infer = |operation, dimensions| {
-        let mut output_dimensions = dimensions;
-        let Some(dimension) = output_dimensions.get_mut(operation.concat_axis) else {
-            return Err(TypeError::invalid(format!(
-                    "'all_gather' concat axis {} is out of bounds for rank {}",
-                    operation.concat_axis,
-                    output_dimensions.len(),
-                )));
+    infer = |operation, input_type, dimensions| {
+        let effective_axis_size = operation.effective_axis_size()?;
+        let output_type = match operation.options.mode {
+            CollectiveMode::Untiled => input_type
+                .with_inserted_dimension(operation.concat_axis, Dimension::Static(effective_axis_size))?,
+            CollectiveMode::Tiled => {
+                let mut output_dimensions = dimensions;
+                let Some(dimension) = output_dimensions.get_mut(operation.concat_axis) else {
+                    return Err(TypeError::invalid(format!(
+                        "'all_gather' concat axis {} is out of bounds for rank {}",
+                        operation.concat_axis,
+                        output_dimensions.len(),
+                    )));
+                };
+                *dimension = dimension.checked_mul(effective_axis_size).ok_or_else(|| {
+                    TypeError::invalid("'all_gather' result extent does not fit in usize".to_string())
+                })?;
+                shape_changing_collective_output_type(ALL_GATHER_OPERATION_NAME, input_type, output_dimensions)?
+            }
         };
-        *dimension *= operation.axis_size;
-        Ok::<_, TypeError>(output_dimensions)
+        all_gather_output_type(input_type, output_type, operation)
     },
 }
 
@@ -939,6 +1303,30 @@ impl AllGatherOperation {
     #[inline]
     pub fn concat_axis(&self) -> usize {
         self.concat_axis
+    }
+
+    /// Returns the shared rank and participant-group semantics.
+    #[inline]
+    pub fn options(&self) -> &CollectiveOptions {
+        &self.options
+    }
+
+    /// Returns the named-axis variance of the result.
+    #[inline]
+    pub fn output_variance(&self) -> AllGatherOutputVariance {
+        self.output_variance
+    }
+
+    /// Returns the participant count used for result-shape arithmetic.
+    #[inline]
+    pub fn effective_axis_size(&self) -> Result<usize, TypeError> {
+        if self.output_variance != AllGatherOutputVariance::Varying && self.options.axis_index_groups.is_some() {
+            return Err(TypeError::invalid(
+                "'all_gather' axis index groups are not supported with invariant or reduced output variance"
+                    .to_string(),
+            ));
+        }
+        self.options.effective_axis_size(ALL_GATHER_OPERATION_NAME, self.axis_size)
     }
 }
 
@@ -959,26 +1347,55 @@ shape_changing_collective! {
     fields = {
         /// Axis of the operand along which the summed result is scattered across the participants.
         scatter_axis: usize,
+
+        /// Shared rank and participant-group semantics.
+        options: CollectiveOptions,
     },
-    infer = |operation, dimensions| {
-        let mut output_dimensions = dimensions;
-        let Some(dimension) = output_dimensions.get_mut(operation.scatter_axis) else {
-            return Err(TypeError::invalid(format!(
-                    "'psum_scatter' scatter axis {} is out of bounds for rank {}",
-                    operation.scatter_axis,
-                    output_dimensions.len(),
-                )));
-        };
-        if *dimension % operation.axis_size != 0 {
-            return Err(TypeError::invalid(format!(
-                    "'psum_scatter' scatter axis {} size {} is not divisible by axis size {}",
-                    operation.scatter_axis,
-                    *dimension,
-                    operation.axis_size,
-                )));
+    infer = |operation, input_type, dimensions| {
+        let effective_axis_size = operation.effective_axis_size()?;
+        match operation.options.mode {
+            CollectiveMode::Untiled => {
+                let Some(dimension) = dimensions.get(operation.scatter_axis) else {
+                    return Err(TypeError::invalid(format!(
+                        "'psum_scatter' scatter axis {} is out of bounds for rank {}",
+                        operation.scatter_axis,
+                        dimensions.len(),
+                    )));
+                };
+                if *dimension != effective_axis_size {
+                    return Err(TypeError::invalid(format!(
+                        "'psum_scatter' untiled scatter axis {} size {dimension} must equal group size \
+                         {effective_axis_size}",
+                        operation.scatter_axis,
+                    )));
+                }
+                Ok::<_, TypeError>(input_type.without_dimension(operation.scatter_axis)?.0)
+            }
+            CollectiveMode::Tiled => {
+                let mut output_dimensions = dimensions;
+                let Some(dimension) = output_dimensions.get_mut(operation.scatter_axis) else {
+                    return Err(TypeError::invalid(format!(
+                        "'psum_scatter' scatter axis {} is out of bounds for rank {}",
+                        operation.scatter_axis,
+                        output_dimensions.len(),
+                    )));
+                };
+                if *dimension % effective_axis_size != 0 {
+                    return Err(TypeError::invalid(format!(
+                        "'psum_scatter' scatter axis {} size {} is not divisible by group size {}",
+                        operation.scatter_axis,
+                        *dimension,
+                        effective_axis_size,
+                    )));
+                }
+                *dimension /= effective_axis_size;
+                shape_changing_collective_output_type(
+                    PSUM_SCATTER_OPERATION_NAME,
+                    input_type,
+                    output_dimensions,
+                )
+            }
         }
-        *dimension /= operation.axis_size;
-        Ok::<_, TypeError>(output_dimensions)
     },
 }
 
@@ -987,6 +1404,18 @@ impl PSumScatterOperation {
     #[inline]
     pub fn scatter_axis(&self) -> usize {
         self.scatter_axis
+    }
+
+    /// Returns the shared rank and participant-group semantics.
+    #[inline]
+    pub fn options(&self) -> &CollectiveOptions {
+        &self.options
+    }
+
+    /// Returns the participant count used for result-shape arithmetic.
+    #[inline]
+    pub fn effective_axis_size(&self) -> Result<usize, TypeError> {
+        self.options.effective_axis_size(PSUM_SCATTER_OPERATION_NAME, self.axis_size)
     }
 }
 
@@ -1008,7 +1437,7 @@ shape_changing_collective! {
         /// participant `target`.
         source_target_pairs: Vec<(usize, usize)>,
     },
-    infer = |operation, dimensions| {
+    infer = |operation, input_type, dimensions| {
         let mut seen_sources = std::collections::BTreeSet::new();
         let mut seen_targets = std::collections::BTreeSet::new();
         for (source, target) in &operation.source_target_pairs {
@@ -1024,7 +1453,7 @@ shape_changing_collective! {
                     )));
             }
         }
-        Ok::<_, TypeError>(dimensions)
+        shape_changing_collective_output_type(PPERMUTE_OPERATION_NAME, input_type, dimensions)
     },
 }
 
@@ -1057,8 +1486,12 @@ shape_changing_collective! {
 
         /// Axis of the output along which the received chunks are concatenated.
         concat_axis: usize,
+
+        /// Shared rank and participant-group semantics.
+        options: CollectiveOptions,
     },
-    infer = |operation, dimensions| {
+    infer = |operation, input_type, dimensions| {
+        let effective_axis_size = operation.effective_axis_size()?;
         let mut output_dimensions = dimensions;
         let rank = output_dimensions.len();
         if operation.split_axis >= rank || operation.concat_axis >= rank {
@@ -1068,17 +1501,36 @@ shape_changing_collective! {
                     operation.concat_axis,
                 )));
         }
-        if output_dimensions[operation.split_axis] % operation.axis_size != 0 {
-            return Err(TypeError::invalid(format!(
-                    "'all_to_all' split axis {} size {} is not divisible by axis size {}",
+        if operation.options.mode == CollectiveMode::Untiled {
+            if output_dimensions[operation.split_axis] != effective_axis_size {
+                return Err(TypeError::invalid(format!(
+                    "'all_to_all' untiled split axis {} size {} must equal group size {}",
                     operation.split_axis,
                     output_dimensions[operation.split_axis],
-                    operation.axis_size,
+                    effective_axis_size,
                 )));
+            }
+            input_type
+                .without_dimension(operation.split_axis)?
+                .0
+                .with_inserted_dimension(operation.concat_axis, Dimension::Static(effective_axis_size))
+        } else {
+            if output_dimensions[operation.split_axis] % effective_axis_size != 0 {
+                return Err(TypeError::invalid(format!(
+                    "'all_to_all' split axis {} size {} is not divisible by group size {}",
+                    operation.split_axis,
+                    output_dimensions[operation.split_axis],
+                    effective_axis_size,
+                )));
+            }
+            output_dimensions[operation.split_axis] /= effective_axis_size;
+            output_dimensions[operation.concat_axis] = output_dimensions[operation.concat_axis]
+                .checked_mul(effective_axis_size)
+                .ok_or_else(|| {
+                    TypeError::invalid("'all_to_all' concatenation result extent does not fit in usize".to_string())
+                })?;
+            shape_changing_collective_output_type(ALL_TO_ALL_OPERATION_NAME, input_type, output_dimensions)
         }
-        output_dimensions[operation.split_axis] /= operation.axis_size;
-        output_dimensions[operation.concat_axis] *= operation.axis_size;
-        Ok::<_, TypeError>(output_dimensions)
     },
 }
 
@@ -1094,14 +1546,26 @@ impl AllToAllOperation {
     pub fn concat_axis(&self) -> usize {
         self.concat_axis
     }
+
+    /// Returns the shared rank and participant-group semantics.
+    #[inline]
+    pub fn options(&self) -> &CollectiveOptions {
+        &self.options
+    }
+
+    /// Returns the participant count used for result-shape arithmetic.
+    #[inline]
+    pub fn effective_axis_size(&self) -> Result<usize, TypeError> {
+        self.options.effective_axis_size(ALL_TO_ALL_OPERATION_NAME, self.axis_size)
+    }
 }
 
-/// Computes one tiled collective result extent by multiplying an input-axis extent by the resolved participant count.
+/// Computes one tiled collective result extent by multiplying an input-axis extent by the effective participant count.
 fn multiplied_collective_extent<V>(
     context: &V::DispatchDomain,
     value: &V,
     axis: usize,
-    axis_size: usize,
+    effective_axis_size: usize,
 ) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayProgramType> + DimensionSize<V> + ValueProjection<DimensionType>,
@@ -1110,18 +1574,18 @@ where
     <V as ValueProjection<DimensionType>>::Projected: DimensionMul,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(value.dimension_size(axis)?)?;
-    let axis_size = context.lift(DimensionValue::constant(axis_size)?.into())?;
-    let axis_size = <V as ValueProjection<DimensionType>>::into_projected(axis_size)?;
-    Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.dimension_mul(&axis_size)?))
+    let effective_axis_size = context.lift(DimensionValue::constant(effective_axis_size)?.into())?;
+    let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
+    Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.dimension_mul(&effective_axis_size)?))
 }
 
 /// Computes one tiled collective result extent by requiring exact divisibility and dividing an input-axis extent by
-/// the resolved participant count.
+/// the effective participant count.
 fn divided_collective_extent<V>(
     context: &V::DispatchDomain,
     value: &V,
     axis: usize,
-    axis_size: usize,
+    effective_axis_size: usize,
 ) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayProgramType> + DimensionSize<V> + ValueProjection<DimensionType>,
@@ -1130,16 +1594,64 @@ where
     <V as ValueProjection<DimensionType>>::Projected: DimensionDivFloor + DimensionRequirement,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(value.dimension_size(axis)?)?;
-    let axis_size = context.lift(DimensionValue::constant(axis_size)?.into())?;
-    let axis_size = <V as ValueProjection<DimensionType>>::into_projected(axis_size)?;
-    input_extent.require_divisible_by(&axis_size)?;
-    Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.dimension_div_floor(&axis_size)?))
+    let effective_axis_size = context.lift(DimensionValue::constant(effective_axis_size)?.into())?;
+    let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
+    input_extent.require_divisible_by(&effective_axis_size)?;
+    Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.dimension_div_floor(&effective_axis_size)?))
 }
 
-/// Stages a tiled all-gather whose changed output extent is ordinary first-class dimension SSA.
+/// Requires an input axis extent to equal the effective participant count used by an untiled collective.
+fn require_collective_axis_extent<V>(
+    context: &V::DispatchDomain,
+    value: &V,
+    axis: usize,
+    effective_axis_size: usize,
+) -> Result<(), ProgramError>
+where
+    V: Value<Type = ArrayProgramType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement,
+{
+    let input_extent = <V as ValueProjection<DimensionType>>::into_projected(value.dimension_size(axis)?)?;
+    let effective_axis_size = context.lift(DimensionValue::constant(effective_axis_size)?.into())?;
+    let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
+    input_extent.require_equal(&effective_axis_size)
+}
+
+/// Stages an all-gather with first-class dynamic tiled extents and rank-changing untiled semantics.
 pub trait AllGather: Sized {
-    /// Gathers participants along `axis_name` and concatenates them into `concat_axis`.
-    fn all_gather(&self, axis_name: &str, concat_axis: usize) -> Result<Self, ProgramError>;
+    /// Stacks participants along a new axis at `concat_axis`, producing an output that varies across `axis_name`.
+    #[inline]
+    fn all_gather(&self, axis_name: &str, concat_axis: usize) -> Result<Self, ProgramError> {
+        self.all_gather_with_options(
+            axis_name,
+            concat_axis,
+            CollectiveOptions::default(),
+            AllGatherOutputVariance::Varying,
+        )
+    }
+
+    /// Concatenates participants into the existing `concat_axis`, producing an output that varies across
+    /// `axis_name`.
+    #[inline]
+    fn all_gather_tiled(&self, axis_name: &str, concat_axis: usize) -> Result<Self, ProgramError> {
+        self.all_gather_with_options(
+            axis_name,
+            concat_axis,
+            CollectiveOptions::new(CollectiveMode::Tiled),
+            AllGatherOutputVariance::Varying,
+        )
+    }
+
+    /// Gathers participants using explicit shape, grouping, and output-variance semantics.
+    fn all_gather_with_options(
+        &self,
+        axis_name: &str,
+        concat_axis: usize,
+        options: CollectiveOptions,
+        output_variance: AllGatherOutputVariance,
+    ) -> Result<Self, ProgramError>;
 }
 
 impl<V> AllGather for V
@@ -1150,24 +1662,56 @@ where
     <V::DispatchDomain as Domain>::Operation: From<AllGatherOperation>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionMul,
 {
-    fn all_gather(&self, axis_name: &str, concat_axis: usize) -> Result<Self, ProgramError> {
+    fn all_gather_with_options(
+        &self,
+        axis_name: &str,
+        concat_axis: usize,
+        options: CollectiveOptions,
+        output_variance: AllGatherOutputVariance,
+    ) -> Result<Self, ProgramError> {
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        let result_extent = multiplied_collective_extent(&context, self, concat_axis, axis_size)?;
-        Ok(context
-            .bind(
-                AllGatherOperation::new(axis_name.to_string(), axis_size, concat_axis),
-                Vec::new(),
-                &[self.clone(), result_extent],
-            )?
-            .remove(0))
+        let effective_axis_size = options.effective_axis_size(ALL_GATHER_OPERATION_NAME, axis_size)?;
+        if output_variance != AllGatherOutputVariance::Varying && options.axis_index_groups.is_some() {
+            return Err(TypeError::invalid(
+                "'all_gather' axis index groups are not supported with invariant or reduced output variance"
+                    .to_string(),
+            )
+            .into());
+        }
+        let operation =
+            AllGatherOperation::new(axis_name.to_string(), axis_size, concat_axis, options.clone(), output_variance);
+        let inputs = match options.mode {
+            CollectiveMode::Untiled => vec![self.clone()],
+            CollectiveMode::Tiled => {
+                vec![self.clone(), multiplied_collective_extent(&context, self, concat_axis, effective_axis_size)?]
+            }
+        };
+        Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
     }
 }
 
-/// Stages a tiled sum-scatter whose changed output extent is ordinary first-class dimension SSA.
+/// Stages a sum-scatter with first-class dynamic tiled extents and rank-changing untiled semantics.
 pub trait PSumScatter: Sized {
-    /// Sums participants along `axis_name` and scatters the result along `scatter_axis`.
-    fn psum_scatter(&self, axis_name: &str, scatter_axis: usize) -> Result<Self, ProgramError>;
+    /// Sums participants and consumes `scatter_axis`, whose extent must equal the effective participant count.
+    #[inline]
+    fn psum_scatter(&self, axis_name: &str, scatter_axis: usize) -> Result<Self, ProgramError> {
+        self.psum_scatter_with_options(axis_name, scatter_axis, CollectiveOptions::default())
+    }
+
+    /// Sums participants and scatters equal chunks along the existing `scatter_axis`.
+    #[inline]
+    fn psum_scatter_tiled(&self, axis_name: &str, scatter_axis: usize) -> Result<Self, ProgramError> {
+        self.psum_scatter_with_options(axis_name, scatter_axis, CollectiveOptions::new(CollectiveMode::Tiled))
+    }
+
+    /// Sums and scatters participants using explicit shape and grouping semantics.
+    fn psum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError>;
 }
 
 impl<V> PSumScatter for V
@@ -1178,24 +1722,51 @@ where
     <V::DispatchDomain as Domain>::Operation: From<PSumScatterOperation>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionDivFloor + DimensionRequirement,
 {
-    fn psum_scatter(&self, axis_name: &str, scatter_axis: usize) -> Result<Self, ProgramError> {
+    fn psum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        let result_extent = divided_collective_extent(&context, self, scatter_axis, axis_size)?;
-        Ok(context
-            .bind(
-                PSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis),
-                Vec::new(),
-                &[self.clone(), result_extent],
-            )?
-            .remove(0))
+        let effective_axis_size = options.effective_axis_size(PSUM_SCATTER_OPERATION_NAME, axis_size)?;
+        let operation = PSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options.clone());
+        let inputs = match options.mode {
+            CollectiveMode::Untiled => {
+                require_collective_axis_extent(&context, self, scatter_axis, effective_axis_size)?;
+                vec![self.clone()]
+            }
+            CollectiveMode::Tiled => {
+                vec![self.clone(), divided_collective_extent(&context, self, scatter_axis, effective_axis_size)?]
+            }
+        };
+        Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
     }
 }
 
-/// Stages a tiled all-to-all whose changed output extents are ordinary first-class dimension SSA.
+/// Stages an all-to-all with first-class dynamic tiled extents and rank-changing untiled semantics.
 pub trait AllToAll: Sized {
-    /// Exchanges chunks split from `split_axis` and concatenates received chunks into `concat_axis`.
-    fn all_to_all(&self, axis_name: &str, split_axis: usize, concat_axis: usize) -> Result<Self, ProgramError>;
+    /// Maps `split_axis` onto the named axis and materializes that named axis at `concat_axis`.
+    #[inline]
+    fn all_to_all(&self, axis_name: &str, split_axis: usize, concat_axis: usize) -> Result<Self, ProgramError> {
+        self.all_to_all_with_options(axis_name, split_axis, concat_axis, CollectiveOptions::default())
+    }
+
+    /// Exchanges equal chunks while preserving rank.
+    #[inline]
+    fn all_to_all_tiled(&self, axis_name: &str, split_axis: usize, concat_axis: usize) -> Result<Self, ProgramError> {
+        self.all_to_all_with_options(axis_name, split_axis, concat_axis, CollectiveOptions::new(CollectiveMode::Tiled))
+    }
+
+    /// Exchanges participants using explicit shape and grouping semantics.
+    fn all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        split_axis: usize,
+        concat_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError>;
 }
 
 impl<V> AllToAll for V
@@ -1206,20 +1777,112 @@ where
     <V::DispatchDomain as Domain>::Operation: From<AllToAllOperation>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionDivFloor + DimensionMul + DimensionRequirement,
 {
-    fn all_to_all(&self, axis_name: &str, split_axis: usize, concat_axis: usize) -> Result<Self, ProgramError> {
+    fn all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        split_axis: usize,
+        concat_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        let operation = AllToAllOperation::new(axis_name.to_string(), axis_size, split_axis, concat_axis);
-        if split_axis == concat_axis {
-            return Ok(context.bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0));
+        let effective_axis_size = options.effective_axis_size(ALL_TO_ALL_OPERATION_NAME, axis_size)?;
+        let operation =
+            AllToAllOperation::new(axis_name.to_string(), axis_size, split_axis, concat_axis, options.clone());
+        let inputs = match options.mode {
+            CollectiveMode::Untiled => {
+                require_collective_axis_extent(&context, self, split_axis, effective_axis_size)?;
+                vec![self.clone()]
+            }
+            CollectiveMode::Tiled if split_axis == concat_axis => vec![self.clone()],
+            CollectiveMode::Tiled => vec![
+                self.clone(),
+                divided_collective_extent(&context, self, split_axis, effective_axis_size)?,
+                multiplied_collective_extent(&context, self, concat_axis, effective_axis_size)?,
+            ],
+        };
+        Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
+    }
+}
+
+/// Convenience permutation encoded as the source participant selected for each output participant.
+pub trait Pshuffle: Sized {
+    /// Permutes a named axis using `permutation[output] = input` encoding.
+    fn pshuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError>;
+}
+
+impl<V> Pshuffle for V
+where
+    V: Value<Type = ArrayProgramType>,
+    V::DispatchDomain: Context<Type = ArrayProgramType> + NamedAxes,
+    <V::DispatchDomain as Domain>::Operation: From<PpermuteOperation>,
+{
+    fn pshuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError> {
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        if permutation.len() != axis_size {
+            return Err(TypeError::invalid(format!(
+                "'pshuffle' permutation length {} must equal axis size {axis_size}",
+                permutation.len(),
+            ))
+            .into());
         }
-        let split_result_extent = divided_collective_extent(&context, self, split_axis, axis_size)?;
-        let concat_result_extent = multiplied_collective_extent(&context, self, concat_axis, axis_size)?;
+        let mut seen = vec![false; axis_size];
+        for &source in permutation {
+            let Some(source_seen) = seen.get_mut(source) else {
+                return Err(TypeError::invalid(format!(
+                    "'pshuffle' source index {source} is out of bounds for axis size {axis_size}",
+                ))
+                .into());
+            };
+            if *source_seen {
+                return Err(TypeError::invalid(format!(
+                    "'pshuffle' permutation contains source index {source} more than once",
+                ))
+                .into());
+            }
+            *source_seen = true;
+        }
         Ok(context
-            .bind(operation, Vec::new(), &[self.clone(), split_result_extent, concat_result_extent])?
+            .bind(
+                PpermuteOperation::new(
+                    axis_name.to_string(),
+                    axis_size,
+                    permutation.iter().copied().zip(0..axis_size).collect(),
+                ),
+                Vec::new(),
+                std::slice::from_ref(self),
+            )?
             .remove(0))
     }
 }
+
+/// Convenience untiled all-to-all that exchanges one ranked array axis with a named axis.
+pub trait PSwapAxes: AllToAll {
+    /// Swaps `axis` with `axis_name` over the full named axis.
+    #[inline]
+    fn pswapaxes(&self, axis_name: &str, axis: usize) -> Result<Self, ProgramError> {
+        self.all_to_all(axis_name, axis, axis)
+    }
+
+    /// Swaps `axis` with `axis_name` within the provided ordered participant groups.
+    #[inline]
+    fn pswapaxes_with_axis_index_groups(
+        &self,
+        axis_name: &str,
+        axis: usize,
+        axis_index_groups: Vec<Vec<usize>>,
+    ) -> Result<Self, ProgramError> {
+        self.all_to_all_with_options(
+            axis_name,
+            axis,
+            axis,
+            CollectiveOptions::default().with_axis_index_groups(axis_index_groups),
+        )
+    }
+}
+
+impl<V: AllToAll> PSwapAxes for V {}
 
 /// Batching rule for [`AllGatherOperation`]. A matching `batch` level consumes the mapped batch axis by
 /// materializing the gather: the batch axis is transposed to sit immediately before the per-item `concat_axis` and
@@ -1241,6 +1904,20 @@ where
         if context.axis_name() != Some(self.axis_name.as_str()) {
             return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
         }
+        if self.options.axis_index_groups.is_some() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "'all_gather' axis index groups are not supported when a batch transform binds the \
+                          collective axis"
+                    .to_string(),
+            });
+        }
+        if self.output_variance == AllGatherOutputVariance::Reduced {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "'all_gather' with reduced output variance is not supported when a batch transform binds \
+                          the collective axis"
+                    .to_string(),
+            });
+        }
         let (value, dimensions) = shape_changing_collective_batch_operand(
             ALL_GATHER_OPERATION_NAME,
             &self.axis_name,
@@ -1248,7 +1925,11 @@ where
             inputs,
         )?;
         let per_item_rank = dimensions.len() - 1;
-        if self.concat_axis >= per_item_rank {
+        let axis_is_out_of_bounds = match self.options.mode {
+            CollectiveMode::Untiled => self.concat_axis > per_item_rank,
+            CollectiveMode::Tiled => self.concat_axis >= per_item_rank,
+        };
+        if axis_is_out_of_bounds {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
                     "'all_gather' concat axis {} is out of bounds for rank {per_item_rank}",
@@ -1256,14 +1937,18 @@ where
                 ),
             });
         }
-        // The physical layout is `[b, d_0, ..., d_{r-1}]`. Moving the leading batch axis to position `concat_axis`
-        // places it immediately before the per-item `concat_axis` dimension (which shifts one position left as the
-        // batch axis moves past it), so the row-major merge of `(b, d_c)` into `b * d_c` concatenates the batch
-        // items item-major along `concat_axis`.
         let moved = value.move_axis(0, self.concat_axis)?;
-        let mut output_dimensions = dimensions[1..].to_vec();
-        output_dimensions[self.concat_axis] *= dimensions[0];
-        let gathered = moved.reshape(Shape::new(output_dimensions.into_iter().map(Dimension::Static).collect()))?;
+        let gathered = match self.options.mode {
+            CollectiveMode::Untiled => moved,
+            CollectiveMode::Tiled => {
+                // The physical layout is `[b, d_0, ..., d_{r-1}]`. Moving the leading batch axis to position
+                // `concat_axis` places it immediately before the per-item `concat_axis` dimension, so the row-major
+                // merge of `(b, d_c)` into `b * d_c` concatenates the batch items item-major.
+                let mut output_dimensions = dimensions[1..].to_vec();
+                output_dimensions[self.concat_axis] *= dimensions[0];
+                moved.reshape(Shape::new(output_dimensions.into_iter().map(Dimension::Static).collect()))?
+            }
+        };
         Ok(vec![ArrayBatch::replicated(gathered)])
     }
 }
@@ -1288,6 +1973,13 @@ where
         if context.axis_name() != Some(self.axis_name.as_str()) {
             return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
         }
+        if self.options.axis_index_groups.is_some() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "'psum_scatter' axis index groups are not supported when a batch transform binds the \
+                          collective axis"
+                    .to_string(),
+            });
+        }
         let (value, dimensions) = shape_changing_collective_batch_operand(
             PSUM_SCATTER_OPERATION_NAME,
             &self.axis_name,
@@ -1305,23 +1997,39 @@ where
             });
         }
         let scatter_dimension = dimensions[self.scatter_axis + 1];
-        if scatter_dimension % batch_size != 0 {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "'psum_scatter' scatter axis {} size {scatter_dimension} is not divisible by axis size \
-                     {batch_size}",
-                    self.scatter_axis,
-                ),
-            });
-        }
-        // Sum over the mapped batch axis, split the per-item `scatter_axis` into `(b, d_s / b)` chunks (the
-        // row-major split makes the leading factor index the chunks), and map the chunk axis at the front.
         let summed = value.reduce(&[0], ReductionKind::Sum);
-        let mut split_dimensions = dimensions[1..].to_vec();
-        split_dimensions[self.scatter_axis] = batch_size;
-        split_dimensions.insert(self.scatter_axis + 1, scatter_dimension / batch_size);
-        let split = summed.reshape(Shape::new(split_dimensions.into_iter().map(Dimension::Static).collect()))?;
-        let scattered = split.move_axis(self.scatter_axis, 0)?;
+        let scattered = match self.options.mode {
+            CollectiveMode::Untiled => {
+                if scatter_dimension != batch_size {
+                    return Err(BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "'psum_scatter' untiled scatter axis {} size {scatter_dimension} must equal axis size \
+                             {batch_size}",
+                            self.scatter_axis,
+                        ),
+                    });
+                }
+                summed.move_axis(self.scatter_axis, 0)?
+            }
+            CollectiveMode::Tiled => {
+                if scatter_dimension % batch_size != 0 {
+                    return Err(BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "'psum_scatter' scatter axis {} size {scatter_dimension} is not divisible by axis size \
+                             {batch_size}",
+                            self.scatter_axis,
+                        ),
+                    });
+                }
+                // Split the per-item `scatter_axis` into `(b, d_s / b)` chunks and map the chunk axis at the front.
+                let mut split_dimensions = dimensions[1..].to_vec();
+                split_dimensions[self.scatter_axis] = batch_size;
+                split_dimensions.insert(self.scatter_axis + 1, scatter_dimension / batch_size);
+                let split =
+                    summed.reshape(Shape::new(split_dimensions.into_iter().map(Dimension::Static).collect()))?;
+                split.move_axis(self.scatter_axis, 0)?
+            }
+        };
         let physical_type = scattered.r#type().into_owned();
         Ok(vec![ArrayBatch::new(physical_type, scattered, Some(0))?])
     }
@@ -1413,6 +2121,13 @@ where
         if context.axis_name() != Some(self.axis_name.as_str()) {
             return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
         }
+        if self.options.axis_index_groups.is_some() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "'all_to_all' axis index groups are not supported when a batch transform binds the \
+                          collective axis"
+                    .to_string(),
+            });
+        }
         let (value, dimensions) = shape_changing_collective_batch_operand(
             ALL_TO_ALL_OPERATION_NAME,
             &self.axis_name,
@@ -1430,13 +2145,24 @@ where
             });
         }
         let split_dimension = dimensions[self.split_axis + 1];
-        if split_dimension % batch_size != 0 {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "'all_to_all' split axis {} size {split_dimension} is not divisible by axis size {batch_size}",
-                    self.split_axis,
-                ),
-            });
+        match self.options.mode {
+            CollectiveMode::Untiled if split_dimension != batch_size => {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "'all_to_all' untiled split axis {} size {split_dimension} must equal axis size {batch_size}",
+                        self.split_axis,
+                    ),
+                });
+            }
+            CollectiveMode::Tiled if split_dimension % batch_size != 0 => {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "'all_to_all' split axis {} size {split_dimension} is not divisible by axis size {batch_size}",
+                        self.split_axis,
+                    ),
+                });
+            }
+            CollectiveMode::Untiled | CollectiveMode::Tiled => {}
         }
         // Split the per-item `split_axis` (physical position `split_axis + 1`) into `(b, d_p / b)` so its leading
         // factor indexes the chunks, then swap the chunk axis with the leading sender axis: afterwards the leading
@@ -1446,22 +2172,33 @@ where
         split_dimensions.insert(self.split_axis + 2, split_dimension / batch_size);
         let split = value.reshape(Shape::new(split_dimensions.into_iter().map(Dimension::Static).collect()))?;
         let exchanged = split.swap_axes(0, self.split_axis + 1)?;
-        // Move the sender axis to sit immediately before the per-item `concat_axis` and merge it in row-major, which
-        // concatenates the received chunks sender-major along `concat_axis`. When `split_axis == concat_axis` the
-        // sender axis already sits immediately before the chunk axis and the merge restores the per-item split-axis
-        // size (shrunk by the split, extended back by the concatenation).
-        let moved = exchanged.move_axis(self.split_axis + 1, self.concat_axis + 1)?;
-        let mut output_dimensions = dimensions;
-        output_dimensions[self.split_axis + 1] /= batch_size;
-        output_dimensions[self.concat_axis + 1] *= batch_size;
-        let received = moved.reshape(Shape::new(output_dimensions.into_iter().map(Dimension::Static).collect()))?;
+        let received = match self.options.mode {
+            CollectiveMode::Untiled => {
+                // The chunk size is one. Remove that singleton, then move the sender axis from the deleted split
+                // position to the requested materialized named-axis position.
+                let mut squeezed_dimensions = dimensions;
+                squeezed_dimensions[self.split_axis + 1] = batch_size;
+                let squeezed =
+                    exchanged.reshape(Shape::new(squeezed_dimensions.into_iter().map(Dimension::Static).collect()))?;
+                squeezed.move_axis(self.split_axis + 1, self.concat_axis + 1)?
+            }
+            CollectiveMode::Tiled => {
+                // Move the sender axis before `concat_axis` and merge it with that existing dimension.
+                let moved = exchanged.move_axis(self.split_axis + 1, self.concat_axis + 1)?;
+                let mut output_dimensions = dimensions;
+                output_dimensions[self.split_axis + 1] /= batch_size;
+                output_dimensions[self.concat_axis + 1] *= batch_size;
+                moved.reshape(Shape::new(output_dimensions.into_iter().map(Dimension::Static).collect()))?
+            }
+        };
         let physical_type = received.r#type().into_owned();
         Ok(vec![ArrayBatch::new(physical_type, received, Some(0))?])
     }
 }
 
-/// Transpose rule for [`AllGatherOperation`]: a tiled all-gather is the adjoint of a sum-scatter over the same axis
-/// and dimension, so the operand cotangent is a [`PSumScatterOperation`] of the output cotangent.
+/// Transpose rule for [`AllGatherOperation`]. A varying all-gather is the adjoint of a sum-scatter with the same
+/// mode, axis, and participant groups, so the operand cotangent is a [`PSumScatterOperation`] of the output
+/// cotangent. Invariant and reduced variance require the Phase 6 residual-aware adjoints.
 impl<V, O> TransposableOperation<V, O> for AllGatherOperation
 where
     V: Value<Type = ArrayType>,
@@ -1474,17 +2211,28 @@ where
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        if self.output_variance != AllGatherOutputVariance::Varying {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "transposing 'all_gather' with {:?} output variance requires the Phase 6 variance-specific \
+                     adjoint",
+                    self.output_variance,
+                ),
+            }
+            .into());
+        }
         transpose_shape_changing_collective(
             context,
             inputs,
             outputs,
-            PSumScatterOperation::new(self.axis_name.clone(), self.axis_size, self.concat_axis),
+            PSumScatterOperation::new(self.axis_name.clone(), self.axis_size, self.concat_axis, self.options.clone()),
         )
     }
 }
 
-/// Transpose rule for [`PSumScatterOperation`]: a sum-scatter is the adjoint of a tiled all-gather over the same
-/// axis and dimension, so the operand cotangent is an [`AllGatherOperation`] of the output cotangent.
+/// Transpose rule for [`PSumScatterOperation`]. A sum-scatter is the adjoint of a varying all-gather with the same
+/// mode, axis, and participant groups, so the operand cotangent is an [`AllGatherOperation`] of the output
+/// cotangent.
 impl<V, O> TransposableOperation<V, O> for PSumScatterOperation
 where
     V: Value<Type = ArrayType>,
@@ -1501,7 +2249,13 @@ where
             context,
             inputs,
             outputs,
-            AllGatherOperation::new(self.axis_name.clone(), self.axis_size, self.scatter_axis),
+            AllGatherOperation::new(
+                self.axis_name.clone(),
+                self.axis_size,
+                self.scatter_axis,
+                self.options.clone(),
+                AllGatherOutputVariance::Varying,
+            ),
         )
     }
 }
@@ -1549,7 +2303,13 @@ where
             context,
             inputs,
             outputs,
-            AllToAllOperation::new(self.axis_name.clone(), self.axis_size, self.concat_axis, self.split_axis),
+            AllToAllOperation::new(
+                self.axis_name.clone(),
+                self.axis_size,
+                self.concat_axis,
+                self.split_axis,
+                self.options.clone(),
+            ),
         )
     }
 }
@@ -1587,6 +2347,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::array_programs::batching::{
+        ArrayProgramBatch, ArrayProgramBatchingContext, ArrayProgramBatchingTracer,
+    };
+    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::batching::{
@@ -1594,6 +2358,7 @@ mod tests {
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::value_and_gradient;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::types::{ArrayProgramType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
 
     use super::*;
@@ -1791,6 +2556,197 @@ mod tests {
     }
 
     #[test]
+    fn test_collective_options_validate_axis_index_groups() {
+        let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+        assert_eq!(options.mode(), CollectiveMode::Tiled);
+        assert_eq!(options.axis_index_groups(), Some([vec![0, 2], vec![3, 1]].as_slice()));
+        assert_eq!(options.effective_axis_size("all_gather", 4), Ok(2));
+
+        assert_eq!(
+            CollectiveOptions::default().with_axis_index_groups(Vec::new()).effective_axis_size("all_gather", 4),
+            Err(TypeError::invalid("'all_gather' axis index groups must not be empty")),
+        );
+        assert_eq!(
+            CollectiveOptions::default()
+                .with_axis_index_groups(vec![vec![0, 1], vec![2]])
+                .effective_axis_size("all_gather", 3),
+            Err(TypeError::invalid("'all_gather' axis index group 1 has size 1 but every group must have size 2",)),
+        );
+        assert_eq!(
+            CollectiveOptions::default()
+                .with_axis_index_groups(vec![vec![0, 1], vec![1, 2]])
+                .effective_axis_size("all_gather", 4),
+            Err(TypeError::invalid("'all_gather' axis index groups contain participant 1 more than once",)),
+        );
+        assert_eq!(
+            CollectiveOptions::default()
+                .with_axis_index_groups(vec![vec![0, 1], vec![2, 4]])
+                .effective_axis_size("all_gather", 4),
+            Err(TypeError::invalid("'all_gather' axis index 4 is out of bounds for axis size 4")),
+        );
+        assert_eq!(
+            CollectiveOptions::default()
+                .with_axis_index_groups(vec![vec![0, 1]])
+                .effective_axis_size("all_gather", 3),
+            Err(TypeError::invalid("'all_gather' axis index groups do not contain participant 2")),
+        );
+    }
+
+    #[test]
+    fn test_grouped_reduction_collective_validates_and_renders_partition() {
+        let operation =
+            CollectiveOperation::grouped("x".to_string(), CollectiveKind::PMean, 4, vec![vec![0, 2], vec![3, 1]])
+                .unwrap();
+        assert_eq!(operation.axis_size(), Some(4));
+        assert_eq!(operation.group_size(), Some(2));
+        assert_eq!(operation.axis_index_groups(), Some([vec![0, 2], vec![3, 1]].as_slice()));
+        assert_eq!(
+            operation.infer_output_types(&[ArrayType::scalar(DataType::F32)], &[]).unwrap(),
+            vec![ArrayType::scalar(DataType::F32)],
+        );
+        assert_eq!(operation.to_string(), "pmean [axis_name=\"x\", axis_size=4, axis_index_groups=[[0, 2], [3, 1]]]",);
+
+        assert!(matches!(
+            CollectiveOperation::grouped("x".to_string(), CollectiveKind::PSum, 4, vec![vec![0, 1], vec![1, 2]]),
+            Err(TypeError::Invalid { .. }),
+        ));
+    }
+
+    #[test]
+    fn test_pshuffle_composes_ppermute_in_the_composite_domain() {
+        type Parent = EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+
+        let context = ArrayProgramBatchingContext::new(Parent::new(), 3).with_axis_name("x".to_string());
+        let input = ArrayProgramValue::Array(Array::matrix(3, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let input = ArrayProgramBatch::new(input, BatchAxis::new(0)).unwrap();
+        let input = ArrayProgramBatchingTracer::new(context, input);
+        let output = input.pshuffle("x", &[2, 0, 1]).unwrap().into_batch();
+
+        assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        let ArrayProgramValue::Array(output) = output.into_value() else {
+            panic!("pshuffle must preserve the array member kind");
+        };
+        assert_eq!(output.to_f64s(), vec![5.0, 6.0, 1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_pswapaxes_composes_untiled_all_to_all_in_the_composite_domain() {
+        type TestContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let (_, program) = TestContext::trace_with_named_axes(
+            |input| input.pswapaxes("x", 0),
+            ArrayProgramType::Array(input_type),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2 })],
+        )
+        .unwrap();
+
+        let all_to_all = program.instructions().last().unwrap();
+        let ArrayProgramOperation::AllToAll(operation) = all_to_all.operation() else {
+            panic!("pswapaxes must compose the canonical all-to-all operation");
+        };
+        assert_eq!(operation.split_axis(), 0);
+        assert_eq!(operation.concat_axis(), 0);
+        assert_eq!(operation.options(), &CollectiveOptions::default());
+        assert_eq!(all_to_all.inputs(), &[program.input_ids()[0]]);
+    }
+
+    #[test]
+    fn test_untiled_collective_type_inference() {
+        let shape = |dimensions| ArrayType::new(DataType::F32, Shape::new(dimensions));
+
+        assert_eq!(
+            infer_explicit_all_gather_output_types(
+                &AllGatherOperation::new(
+                    "x".to_string(),
+                    4,
+                    1,
+                    CollectiveOptions::default(),
+                    AllGatherOutputVariance::Varying,
+                ),
+                &[shape(vec![Dimension::Static(2), Dimension::Static(3)]).into()],
+            ),
+            Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
+        );
+        assert_eq!(
+            infer_explicit_psum_scatter_output_types(
+                &PSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
+                &[shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()],
+            ),
+            Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(3)]).into()]),
+        );
+        assert_eq!(
+            infer_explicit_all_to_all_output_types(
+                &AllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default()),
+                &[shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()],
+            ),
+            Ok(vec![shape(vec![Dimension::Static(4), Dimension::Static(2), Dimension::Static(3)]).into()]),
+        );
+        assert_eq!(
+            infer_explicit_all_to_all_output_types(
+                &AllToAllOperation::new("x".to_string(), 4, 1, 1, CollectiveOptions::default()),
+                &[shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()],
+            ),
+            Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
+        );
+        assert_eq!(
+            infer_explicit_psum_scatter_output_types(
+                &PSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
+                &[shape(vec![Dimension::Static(2), Dimension::Static(5)]).into()],
+            ),
+            Err(TypeError::invalid("'psum_scatter' untiled scatter axis 1 size 5 must equal group size 4",)),
+        );
+    }
+
+    #[test]
+    fn test_grouped_collective_shape_arithmetic_uses_group_size() {
+        let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+        let result_extent = DimensionValue::constant(6).unwrap().r#type().clone();
+        assert_eq!(
+            infer_explicit_all_gather_output_types(
+                &AllGatherOperation::new("x".to_string(), 4, 0, grouped.clone(), AllGatherOutputVariance::Varying,),
+                &[f32_vector(3).into(), result_extent.into()],
+            ),
+            Ok(vec![f32_vector(6).into()]),
+        );
+        assert_eq!(
+            infer_explicit_psum_scatter_output_types(
+                &PSumScatterOperation::new("x".to_string(), 4, 0, grouped),
+                &[f32_vector(6).into(), DimensionValue::constant(3).unwrap().r#type().clone().into()],
+            ),
+            Ok(vec![f32_vector(3).into()]),
+        );
+    }
+
+    #[test]
+    fn test_all_gather_output_variance_updates_canonical_sharding_state() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_sharding = Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap();
+        let input = f32_vector(3).with_sharding(varying_sharding).unwrap();
+
+        let infer = |output_variance| {
+            infer_explicit_all_gather_output_types(
+                &AllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::default(), output_variance),
+                std::slice::from_ref(&ArrayProgramType::Array(input.clone())),
+            )
+        };
+        let varying = infer(AllGatherOutputVariance::Varying).unwrap();
+        let varying = <&ArrayType>::try_from(&varying[0]).unwrap();
+        assert_eq!(varying.sharding().unwrap().varying_manual_axes(), &["x".to_string()].into_iter().collect());
+        assert!(varying.sharding().unwrap().reduced_axes().is_empty());
+
+        let invariant = infer(AllGatherOutputVariance::Invariant).unwrap();
+        let invariant = <&ArrayType>::try_from(&invariant[0]).unwrap();
+        assert!(invariant.sharding().unwrap().varying_manual_axes().is_empty());
+        assert!(invariant.sharding().unwrap().reduced_axes().is_empty());
+
+        let reduced = infer(AllGatherOutputVariance::Reduced).unwrap();
+        let reduced = <&ArrayType>::try_from(&reduced[0]).unwrap();
+        assert!(reduced.sharding().unwrap().varying_manual_axes().is_empty());
+        assert_eq!(reduced.sharding().unwrap().reduced_axes(), &["x".to_string()].into_iter().collect());
+    }
+
+    #[test]
     fn test_explicit_shape_changing_collective_type_inference() {
         let input_axis = DimensionVariable::new("input", DimensionBounds::new(1, Some(17)).unwrap());
         let split_result = DimensionVariable::new("split", DimensionBounds::new(1, Some(9)).unwrap());
@@ -1802,7 +2758,13 @@ mod tests {
 
         assert_eq!(
             infer_explicit_all_gather_output_types(
-                &AllGatherOperation::new("x".to_string(), 2, 0),
+                &AllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::tiled(),
+                    AllGatherOutputVariance::Varying
+                ),
                 &[input_type.clone().into(), ArrayProgramType::Dimension(DimensionType::new(concat_result.clone())),],
             ),
             Ok(vec![
@@ -1815,7 +2777,7 @@ mod tests {
         );
         assert_eq!(
             infer_explicit_psum_scatter_output_types(
-                &PSumScatterOperation::new("x".to_string(), 2, 0),
+                &PSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
                 &[input_type.clone().into(), ArrayProgramType::Dimension(DimensionType::new(split_result.clone())),],
             ),
             Ok(vec![
@@ -1828,7 +2790,7 @@ mod tests {
         );
         assert_eq!(
             infer_explicit_all_to_all_output_types(
-                &AllToAllOperation::new("x".to_string(), 2, 0, 1),
+                &AllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
                 &[
                     input_type.clone().into(),
                     ArrayProgramType::Dimension(DimensionType::new(split_result.clone())),
@@ -1845,7 +2807,7 @@ mod tests {
         );
         assert_eq!(
             infer_explicit_all_to_all_output_types(
-                &AllToAllOperation::new("x".to_string(), 2, 0, 0),
+                &AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
                 std::slice::from_ref(&ArrayProgramType::Array(input_type.clone())),
             ),
             Ok(vec![input_type.into()]),
@@ -1854,7 +2816,13 @@ mod tests {
         let exact_six = DimensionValue::constant(6).unwrap().r#type().clone();
         assert_eq!(
             infer_explicit_all_gather_output_types(
-                &AllGatherOperation::new("x".to_string(), 2, 0),
+                &AllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::tiled(),
+                    AllGatherOutputVariance::Varying
+                ),
                 &[f32_vector(3).into(), exact_six.into()],
             ),
             Ok(vec![f32_vector(6).into()]),
@@ -1862,18 +2830,25 @@ mod tests {
         let exact_five = DimensionValue::constant(5).unwrap().r#type().clone();
         assert_eq!(
             infer_explicit_all_gather_output_types(
-                &AllGatherOperation::new("x".to_string(), 2, 0),
+                &AllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::tiled(),
+                    AllGatherOutputVariance::Varying
+                ),
                 &[f32_vector(3).into(), exact_five.into()],
             ),
             Err(TypeError::invalid(
-                "'all_gather' result extent must equal input axis 0 extent 3 multiplied by axis size 2; expected 6 \
+                "'all_gather' result extent must equal input axis 0 extent 3 multiplied by axis group size 2; \
+                 expected 6 \
                  but got 5"
                     .to_string(),
             )),
         );
         assert_eq!(
             infer_explicit_psum_scatter_output_types(
-                &PSumScatterOperation::new("empty".to_string(), 0, 0),
+                &PSumScatterOperation::new("empty".to_string(), 0, 0, CollectiveOptions::tiled()),
                 &[f32_vector(3).into(), DimensionValue::constant(3).unwrap().r#type().clone().into()],
             ),
             Err(TypeError::invalid("'psum_scatter' axis size must be greater than zero")),
@@ -1884,12 +2859,30 @@ mod tests {
     fn test_all_gather_type_inference() {
         use crate::macros::check_operation_type_inference;
 
-        let operation = AllGatherOperation::new("x".to_string(), 4, 0);
+        let operation = AllGatherOperation::new(
+            "x".to_string(),
+            4,
+            0,
+            CollectiveOptions::tiled(),
+            AllGatherOutputVariance::Varying,
+        );
         assert_eq!(operation.axis_name(), "x");
         assert_eq!(operation.axis_size(), 4);
         assert_eq!(operation.concat_axis(), 0);
         assert_eq!(operation.name(), ALL_GATHER_OPERATION_NAME);
-        assert_eq!(operation.to_string(), "all_gather [axis_name=\"x\", axis_size=4, concat_axis=0]");
+        assert_eq!(
+            operation.to_string(),
+            indoc::indoc! {r#"
+                all_gather [
+                    axis_name="x",
+                    axis_size=4,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                ]
+            "#}
+            .trim_end(),
+        );
         check_operation_type_inference!(
             operation = operation,
             cases = [
@@ -1909,7 +2902,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = AllGatherOperation::new("x".to_string(), 4, 0),
+            operation = AllGatherOperation::new("x".to_string(), 4, 0, CollectiveOptions::tiled(), AllGatherOutputVariance::Varying),
             input_types = [f32_vector(2)],
         );
     }
@@ -1919,7 +2912,7 @@ mod tests {
         use crate::macros::check_operation_type_inference;
 
         check_operation_type_inference!(
-            operation = PSumScatterOperation::new("x".to_string(), 4, 0),
+            operation = PSumScatterOperation::new("x".to_string(), 4, 0, CollectiveOptions::tiled()),
             cases = [
                 {
                     input_types = [f32_vector(8)],
@@ -1927,7 +2920,7 @@ mod tests {
                 },
                 {
                     input_types = [f32_vector(6)],
-                    error = "'psum_scatter' scatter axis 0 size 6 is not divisible by axis size 4",
+                    error = "'psum_scatter' scatter axis 0 size 6 is not divisible by group size 4",
                 },
                 {
                     input_types = [ArrayType::scalar(DataType::F32)],
@@ -1972,7 +2965,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]))
         };
         check_operation_type_inference!(
-            operation = AllToAllOperation::new("x".to_string(), 4, 0, 1),
+            operation = AllToAllOperation::new("x".to_string(), 4, 0, 1, CollectiveOptions::tiled()),
             cases = [
                 {
                     input_types = [matrix(8, 3)],
@@ -1980,7 +2973,7 @@ mod tests {
                 },
                 {
                     input_types = [matrix(6, 3)],
-                    error = "'all_to_all' split axis 0 size 6 is not divisible by axis size 4",
+                    error = "'all_to_all' split axis 0 size 6 is not divisible by group size 4",
                 },
             ],
         );
@@ -1992,24 +2985,36 @@ mod tests {
 
         // A single-participant axis is degenerate: the gather concatenates exactly one operand, so interpretation is
         // the identity.
-        let outputs = AllGatherOperation::new("x".to_string(), 1, 0)
-            .interpret(
-                &EagerContext::<Array, ArrayOperation<Array>>::new(),
-                &crate::EmptyRegionDriver,
-                &[Array::vector(vec![1.0, 2.0])],
-            )
-            .unwrap();
+        let outputs = AllGatherOperation::new(
+            "x".to_string(),
+            1,
+            0,
+            CollectiveOptions::tiled(),
+            AllGatherOutputVariance::Varying,
+        )
+        .interpret(
+            &EagerContext::<Array, ArrayOperation<Array>>::new(),
+            &crate::EmptyRegionDriver,
+            &[Array::vector(vec![1.0, 2.0])],
+        )
+        .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].values(), &[1.0, 2.0]);
 
         // Any larger axis has no per-item semantics: the other participants do not exist outside an enclosing binder.
-        let error = AllGatherOperation::new("x".to_string(), 2, 0)
-            .interpret(
-                &EagerContext::<Array, ArrayOperation<Array>>::new(),
-                &crate::EmptyRegionDriver,
-                &[Array::vector(vec![1.0, 2.0])],
-            )
-            .unwrap_err();
+        let error = AllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+            AllGatherOutputVariance::Varying,
+        )
+        .interpret(
+            &EagerContext::<Array, ArrayOperation<Array>>::new(),
+            &crate::EmptyRegionDriver,
+            &[Array::vector(vec![1.0, 2.0])],
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             ProgramError::UnsupportedOperation { message }
@@ -2025,7 +3030,9 @@ mod tests {
         // Axis-size resolution fails fast at staging time with `AxisError::UnboundAxisName` rather than silently
         // acting as identity.
         let result: Result<Array, BatchingError> = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_gather("x", 0),
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                item.all_gather("x", 0, CollectiveOptions::tiled(), AllGatherOutputVariance::Varying)
+            },
             Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
             BatchAxis::new(0),
             BatchAxis::replicated(),
@@ -2043,7 +3050,9 @@ mod tests {
         // replicated across the batch. With items `[1, 2]` and `[3, 4]` the gathered value is `[1, 2, 3, 4]`,
         // matching the verified cross-device `shard_map` execution semantics of the tiled StableHLO `all_gather`.
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_gather("x", 0),
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                item.all_gather("x", 0, CollectiveOptions::tiled(), AllGatherOutputVariance::Varying)
+            },
             Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
             BatchAxis::new(0),
             BatchAxis::replicated(),
@@ -2060,12 +3069,57 @@ mod tests {
         // the gather degenerates to the item-major concatenation of that many copies of the shared value.
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
-        let outputs = AllGatherOperation::new("x".to_string(), 2, 0)
-            .batch(&context, &crate::EmptyRegionDriver, &[ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]))])
-            .unwrap();
+        let outputs = AllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+            AllGatherOutputVariance::Varying,
+        )
+        .batch(&context, &crate::EmptyRegionDriver, &[ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]))])
+        .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values(), &[1.0, 2.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_untiled_collectives_over_batched_axis_materialize_rank_changes() {
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("x".to_string());
+        let mapped_matrix = || {
+            ArrayBatch::new(
+                Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]).r#type().into_owned(),
+                Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]),
+                Some(0),
+            )
+            .unwrap()
+        };
+
+        let gathered = AllGatherOperation::new(
+            "x".to_string(),
+            2,
+            1,
+            CollectiveOptions::default(),
+            AllGatherOutputVariance::Varying,
+        )
+        .batch(&context, &crate::EmptyRegionDriver, &[mapped_matrix()])
+        .unwrap();
+        assert_eq!(gathered[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(gathered[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]),);
+
+        let scattered = PSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default())
+            .batch(&context, &crate::EmptyRegionDriver, &[mapped_matrix()])
+            .unwrap();
+        assert_eq!(scattered[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(scattered[0].value(), &Array::vector(vec![4.0_f32, 6.0]));
+        assert_eq!(scattered[0].unbatched_type(), ArrayType::scalar(DataType::F32));
+
+        let exchanged = AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::default())
+            .batch(&context, &crate::EmptyRegionDriver, &[mapped_matrix()])
+            .unwrap();
+        assert_eq!(exchanged[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(exchanged[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]),);
     }
 
     #[test]
@@ -2079,7 +3133,9 @@ mod tests {
         // `reduce_scatter`.
         let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.psum_scatter("x", 0),
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                item.psum_scatter("x", 0, CollectiveOptions::tiled())
+            },
             x,
             BatchAxis::new(0),
             BatchAxis::new(0),
@@ -2141,7 +3197,9 @@ mod tests {
         // cross-device `shard_map` execution semantics of StableHLO's `all_to_all`.
         let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_to_all("x", 0, 0),
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                item.all_to_all("x", 0, 0, CollectiveOptions::tiled())
+            },
             x,
             BatchAxis::new(0),
             BatchAxis::new(0),
@@ -2171,7 +3229,9 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_to_all("x", 0, 1),
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                item.all_to_all("x", 0, 1, CollectiveOptions::tiled())
+            },
             x,
             BatchAxis::new(0),
             BatchAxis::new(0),
@@ -2198,7 +3258,17 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(f32_vector(2));
         let output = builder
-            .add_instruction(AllGatherOperation::new("x".to_string(), 2, 0), Vec::new(), vec![input])
+            .add_instruction(
+                AllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::tiled(),
+                    AllGatherOutputVariance::Varying,
+                ),
+                Vec::new(),
+                vec![input],
+            )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
@@ -2206,7 +3276,7 @@ mod tests {
             pullback.to_string(),
             indoc::indoc! {r#"
                 lambda %0:f32[4] .
-                let %1:f32[2] = psum_scatter [axis_name="x", axis_size=2, scatter_axis=0] %0
+                let %1:f32[2] = psum_scatter [axis_name="x", axis_size=2, scatter_axis=0, options=Tiled] %0
                 in (%1)
             "#}
             .trim_end(),

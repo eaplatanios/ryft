@@ -12,7 +12,8 @@ use ryft_core::operations::attention::{
     AttentionMask, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
 };
 use ryft_core::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, CollectiveKind, CollectiveOperation, PSumScatterOperation, PpermuteOperation,
+    AllGatherOperation, AllToAllOperation, CollectiveKind, CollectiveMode, CollectiveOperation, PSumScatterOperation,
+    PpermuteOperation,
 };
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
@@ -2523,12 +2524,16 @@ where
             }
             Self::AllToAll(operation) => {
                 check_count!("input", input_values, 1, ProgramError);
+                check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
                 lower_all_to_all_to_mlir(
                     operation,
                     &collective_state,
                     input_values[0],
+                    &lowerer.input_types[0],
+                    &output_types[0],
                     &mut lowerer.block,
+                    lowerer.context,
                     lowerer.location,
                 )
             }
@@ -4715,12 +4720,16 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             }
             ArrayOperation::AllToAll(operation) => {
                 check_count!("input", input_values, 1, ProgramError);
+                check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
                 lower_all_to_all_to_mlir(
                     operation,
                     &collective_state,
                     input_values[0],
+                    &lowerer.input_types[0],
+                    &output_types[0],
                     &mut lowerer.block,
+                    lowerer.context,
                     lowerer.location,
                 )
             }
@@ -8198,12 +8207,16 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         }
         XlaOperation::AllToAll(operation) => {
             check_count!("input", input_values, 1, ProgramError);
+            check_count!("output", output_types, 1, ProgramError);
             let collective_state = lowerer.collective_state.clone();
             lower_all_to_all_to_mlir(
                 operation,
                 &collective_state,
                 input_values[0],
+                &lowerer.input_types[0],
+                &output_types[0],
                 &mut lowerer.block,
+                lowerer.context,
                 lowerer.location,
             )
         }
@@ -8589,10 +8602,11 @@ fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stab
 /// The replica groups are dense global device-id groups derived from the mesh's row-major device linearization: one
 /// group per combination of the other axes' coordinates, each listing the devices along the named axis. The emitted
 /// operation carries a module-unique channel id with a device-to-device channel type and `use_global_device_ids`, the
-/// standard SPMD emission for cross-partition collectives. `PSum`/`PMean` reduce with `add` (a `PMean` divides the
-/// result by the axis size) and `PMax` reduces with `maximum`, reusing the same scalar combiner regions as
-/// `stablehlo.reduce` lowering. A collective lowered outside any manual region, or naming an axis the innermost
-/// region does not bind as a manual mesh axis, is an error.
+/// standard SPMD emission for cross-partition collectives. Explicit logical participant groups are expanded inside
+/// every fixed coordinate of the mesh's other axes without reordering either groups or their members. `PSum`/`PMean`
+/// reduce with `add` (a `PMean` divides by the effective group size) and `PMax` reduces with `maximum`, reusing the
+/// same scalar combiner regions as `stablehlo.reduce` lowering. A collective lowered outside any manual region, or
+/// naming an axis the innermost region does not bind as a manual mesh axis, is an error.
 /// Resolves the replica groups of one named mesh axis inside the innermost enclosing `shard_map` manual region,
 /// returning the groups together with the axis size. Devices are linearized row-major over the mesh axes, so the
 /// devices along the named axis with all other coordinates fixed form one replica group: the group base ids
@@ -8637,8 +8651,62 @@ fn mesh_axis_replica_groups(
     Ok((replica_groups, axis_size))
 }
 
+/// Resolves the physical replica groups for one collective, expanding each logical subgroup within every fixed
+/// coordinate of the enclosing mesh's other axes.
+fn collective_replica_groups(
+    collective_state: &CollectiveLoweringState,
+    axis_name: &str,
+    axis_size: usize,
+    axis_index_groups: Option<&[Vec<usize>]>,
+) -> Result<(Vec<Vec<usize>>, usize), LoweringError> {
+    let (mesh_groups, mesh_axis_size) = mesh_axis_replica_groups(collective_state, axis_name)?;
+    if axis_size != mesh_axis_size {
+        return Err(ProgramError::MalformedProgram(format!(
+            "collective over axis '{axis_name}' records size {axis_size}, but the enclosing mesh axis has size \
+             {mesh_axis_size}",
+        ))
+        .into());
+    }
+    let Some(axis_index_groups) = axis_index_groups else {
+        return Ok((mesh_groups, mesh_axis_size));
+    };
+    let group_size = axis_index_groups.first().map(Vec::len).unwrap_or(0);
+    let mut replica_groups = Vec::with_capacity(mesh_groups.len() * axis_index_groups.len());
+    for mesh_group in mesh_groups {
+        for axis_index_group in axis_index_groups {
+            replica_groups.push(
+                axis_index_group
+                    .iter()
+                    .map(|&index| {
+                        mesh_group.get(index).copied().ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "collective over axis '{axis_name}' has group member {index} outside axis size \
+                                 {mesh_axis_size}",
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+    }
+    Ok((replica_groups, group_size))
+}
+
+/// Removes one statically singleton tensor axis while preserving every remaining dynamic dimension.
+fn collapse_singleton_axis<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    output_array_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let output_type = lower_tensor_type(output_array_type, context, location)?;
+    let reshape = block.append_operation(stable_hlo::reshape_with_output_type(value, output_type, location)?)?;
+    Ok(reshape.result(0).expect("stablehlo.reshape should return one result").as_ref())
+}
+
 /// Lowers one traced `all_gather` to a channeled `stablehlo.all_gather` over the named mesh axis's replica groups.
-fn lower_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
+pub(super) fn lower_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &AllGatherOperation,
     collective_state: &CollectiveLoweringState,
     input_value: ValueRef<'b, 'c, 't>,
@@ -8647,8 +8715,31 @@ fn lower_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    let (replica_groups, _) = mesh_axis_replica_groups(collective_state, operation.axis_name())?;
+    let (replica_groups, _) = collective_replica_groups(
+        collective_state,
+        operation.axis_name(),
+        operation.axis_size(),
+        operation.options().axis_index_groups(),
+    )?;
     let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
+    let input_value = match operation.options().mode() {
+        CollectiveMode::Tiled => input_value,
+        CollectiveMode::Untiled => {
+            let mut dimensions = output_array_type.shape().dimensions().to_vec();
+            dimensions[operation.concat_axis()] = Dimension::Static(1);
+            let input_type =
+                lower_tensor_type(&output_array_type.clone().with_shape(Shape::new(dimensions)), context, location)?;
+            let broadcast_dimensions =
+                (0..output_array_type.rank()).filter(|&axis| axis != operation.concat_axis()).collect::<Vec<_>>();
+            let broadcast = block.append_operation(stable_hlo::broadcast(
+                input_value,
+                input_type,
+                broadcast_dimensions.as_slice(),
+                location,
+            )?)?;
+            broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()
+        }
+    };
     let output_type = lower_tensor_type(output_array_type, context, location)?;
     let result = block.append_operation(stable_hlo::all_gather(
         &[input_value],
@@ -8665,7 +8756,7 @@ fn lower_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
 
 /// Lowers one traced `psum_scatter` to a channeled `stablehlo.reduce_scatter` with a sum reduction over the named
 /// mesh axis's replica groups.
-fn lower_psum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
+pub(super) fn lower_psum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &PSumScatterOperation,
     collective_state: &CollectiveLoweringState,
     input_value: ValueRef<'b, 'c, 't>,
@@ -8674,10 +8765,21 @@ fn lower_psum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    let (replica_groups, _) = mesh_axis_replica_groups(collective_state, operation.axis_name())?;
+    let (replica_groups, _) = collective_replica_groups(
+        collective_state,
+        operation.axis_name(),
+        operation.axis_size(),
+        operation.options().axis_index_groups(),
+    )?;
     let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
     let computation = build_reduce_body_region(ReductionKind::Sum, output_array_type.data_type(), context, location)?;
-    let output_type = lower_tensor_type(output_array_type, context, location)?;
+    let native_output_type = match operation.options().mode() {
+        CollectiveMode::Tiled => output_array_type.clone(),
+        CollectiveMode::Untiled => output_array_type
+            .with_inserted_dimension(operation.scatter_axis(), Dimension::Static(1))
+            .map_err(ProgramError::from)?,
+    };
+    let output_type = lower_tensor_type(&native_output_type, context, location)?;
     let result = block.append_operation(stable_hlo::reduce_scatter(
         input_value,
         operation.scatter_axis(),
@@ -8689,7 +8791,11 @@ fn lower_psum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
         output_type,
         location,
     )?)?;
-    Ok(vec![result.result(0).expect("stablehlo.reduce_scatter should return one result").as_ref()])
+    let result = result.result(0).expect("stablehlo.reduce_scatter should return one result").as_ref();
+    if operation.options().mode() == CollectiveMode::Tiled {
+        return Ok(vec![result]);
+    }
+    Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
 }
 
 /// Lowers one traced `ppermute` to a channeled `stablehlo.collective_permute`, expanding the axis-local
@@ -8719,27 +8825,71 @@ fn lower_ppermute_to_mlir<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Lowers one traced `all_to_all` to a channeled `stablehlo.all_to_all` over the named mesh axis's replica groups.
-fn lower_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
+pub(super) fn lower_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &AllToAllOperation,
     collective_state: &CollectiveLoweringState,
     input_value: ValueRef<'b, 'c, 't>,
+    input_array_type: &ArrayType,
+    output_array_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    let (replica_groups, axis_size) = mesh_axis_replica_groups(collective_state, operation.axis_name())?;
+    let (replica_groups, axis_size) = collective_replica_groups(
+        collective_state,
+        operation.axis_name(),
+        operation.axis_size(),
+        operation.options().axis_index_groups(),
+    )?;
     let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
+    let (input_value, split_axis, concat_axis) = match operation.options().mode() {
+        CollectiveMode::Tiled => (input_value, operation.split_axis(), operation.concat_axis()),
+        CollectiveMode::Untiled if operation.split_axis() == operation.concat_axis() => {
+            (input_value, operation.split_axis(), operation.concat_axis())
+        }
+        CollectiveMode::Untiled => {
+            let mut split_axis = operation.split_axis();
+            let mut concat_axis = operation.concat_axis();
+            if split_axis < concat_axis {
+                concat_axis += 1;
+            } else {
+                split_axis += 1;
+            }
+            let expanded_type = input_array_type
+                .with_inserted_dimension(concat_axis, Dimension::Static(1))
+                .map_err(ProgramError::from)?;
+            let expanded_type = lower_tensor_type(&expanded_type, context, location)?;
+            let broadcast_dimensions =
+                (0..input_array_type.rank() + 1).filter(|&axis| axis != concat_axis).collect::<Vec<_>>();
+            let expanded = block.append_operation(stable_hlo::broadcast(
+                input_value,
+                expanded_type,
+                broadcast_dimensions.as_slice(),
+                location,
+            )?)?;
+            (
+                expanded.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref(),
+                split_axis,
+                concat_axis,
+            )
+        }
+    };
     let result = block.append_operation(stable_hlo::all_to_all(
         &[input_value],
-        operation.split_axis(),
+        split_axis,
         axis_size,
-        operation.concat_axis(),
+        concat_axis,
         stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
         Some(collective_state.next_channel_id()),
         Some(stable_hlo::ChannelHandleType::DeviceToDevice),
         true,
         location,
     )?)?;
-    Ok(vec![result.result(0).expect("stablehlo.all_to_all should return one result").as_ref()])
+    let result = result.result(0).expect("stablehlo.all_to_all should return one result").as_ref();
+    if operation.options().mode() == CollectiveMode::Tiled || split_axis == concat_axis {
+        return Ok(vec![result]);
+    }
+    Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
 }
 
 fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
@@ -8751,7 +8901,21 @@ fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-    let (replica_groups, axis_size) = mesh_axis_replica_groups(collective_state, operation.axis_name())?;
+    let (replica_groups, effective_axis_size) = match operation.axis_index_groups() {
+        Some(axis_index_groups) => collective_replica_groups(
+            collective_state,
+            operation.axis_name(),
+            operation.axis_size().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "grouped '{}' over axis '{}' does not record the full axis size",
+                    operation.name(),
+                    operation.axis_name(),
+                ))
+            })?,
+            Some(axis_index_groups),
+        )?,
+        None => mesh_axis_replica_groups(collective_state, operation.axis_name())?,
+    };
     let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
 
     let element_type = output_array_type.data_type();
@@ -8769,10 +8933,16 @@ fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
     if !matches!(operation.kind(), CollectiveKind::PMean) {
         return Ok(reduced);
     }
-    // `PMean` is the mean over the named axis: divide the all-reduced sum by the axis size.
+    // `PMean` is the mean over the effective participant group: divide the all-reduced sum by the group size.
     let output_tensor_type = lower_tensor_type(output_array_type, context, location)?;
-    let divisor =
-        lower_f64_constant_splat(axis_size as f64, output_array_type, output_tensor_type, block, context, location)?;
+    let divisor = lower_f64_constant_splat(
+        effective_axis_size as f64,
+        output_array_type,
+        output_tensor_type,
+        block,
+        context,
+        location,
+    )?;
     let mean = block.append_operation(stable_hlo::divide(reduced, divisor, location)?)?;
     Ok(mean.result(0).expect("stablehlo.divide should return one result").as_ref())
 }

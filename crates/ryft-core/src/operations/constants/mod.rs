@@ -129,7 +129,7 @@ mod tests {
             ),
             Err(TypeError::invalid(
                 "'zero' operand 0 has type dimension<other \u{2208} [0, 8)> but the output shape requires \
-                 dimension<rows: [0, 8)>",
+                 dimension<rows : [0, 8)>",
             )),
         );
         assert_eq!(

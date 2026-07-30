@@ -254,20 +254,33 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedReshapeOperation<'c, 't>, Error> {
     let context = location.context();
-    context.load_dialect(DialectHandle::stable_hlo()?)?;
     let element_type = input
         .r#type()?
         .cast::<TensorTypeRef>()
         .ok_or_else(|| Error::invalid_argument("input must have tensor type for `stable_hlo::reshape`"))?
         .element_type()?;
+    let output_type = context.tensor_type(
+        element_type,
+        shape.iter().map(|size| Size::Static(*size)).collect::<Vec<_>>().as_slice(),
+        None,
+        location,
+    )?;
+    reshape_with_output_type(input, output_type, location)
+}
+
+/// Constructs a new detached/owned [`ReshapeOperation`] at the specified [`Location`] and with the specified result
+/// tensor type. Unlike [`reshape`], this constructor preserves dynamic dimensions and tensor type encodings supplied
+/// by the caller. Refer to the documentation of [`ReshapeOperation`] for more information on the operation semantics.
+pub fn reshape_with_output_type<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
+    input: V,
+    output_type: TensorTypeRef<'c, 't>,
+    location: L,
+) -> Result<DetachedReshapeOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.reshape", location)
         .add_operand(input)
-        .add_result(context.tensor_type(
-            element_type,
-            shape.iter().map(|size| Size::Static(*size)).collect::<Vec<_>>().as_slice(),
-            None,
-            location,
-        )?)
+        .add_result(output_type)
         .build()
         .and_then(|operation| unsafe {
             operation

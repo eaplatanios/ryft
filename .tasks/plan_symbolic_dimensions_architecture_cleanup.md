@@ -5,12 +5,13 @@
 Active; repository state was re-audited on 2026-07-29 after the original side-chat history was lost. Phases 0–2,
 P3a–P3j, and the public broadcast consolidation are committed on `u/eaplatanios/dynamic-shapes`; the clean resumption
 point for the current review was `0278adba4617a89fcf9db88c7c27836b3e39d845`. The owner checkout now contains P3k's
-canonical tiled collective slice: all-gather, psum-scatter, and all-to-all carry arithmetic result extents as ordinary
-dimension SSA through mixed inference, eager execution, PE, static matching-axis batching, JVP, identity instantiation,
-import, and rendering. Matching-axis batching is currently complete for static per-item geometry; bounded-dynamic
-physical reshapes and nested-axis forwarding remain Phase 5. Native shard-map lowering and dynamic adjoints remain
-deliberately assigned to Phases 4 and 6. The JAX-parity continuation (non-tiled modes, groups, variance, and convenience
-compositions) remains part of P3k and is not yet complete. Phase 4 has not begun as a complete migration.
+collective parity surface: all-gather, psum-scatter, and all-to-all support tiled and untiled shape semantics, validated
+participant groups, all-gather variance, and the `pshuffle`/`pswapaxes` compositions. Arithmetic tiled extents remain
+ordinary dimension SSA through mixed inference, eager execution, PE, static matching-axis batching, JVP, identity
+instantiation, import, rendering, and direct composite lowering inside an explicit manual binder. All untiled modes
+also execute on two CPU devices. Bounded-dynamic batching, public XLA reachability through a composite shard-map body,
+dynamic adjoints, and final behavioral comparison fixtures remain deliberately assigned to Phases 4–6. Phase 4 has
+not begun as a complete production migration.
 
 This plan remains a containment and simplification follow-up to `.tasks/plan_first_class_dimension_programs.md`. It
 preserves that plan's user-visible capabilities and its decision to represent runtime dimensions as ordinary SSA
@@ -1257,8 +1258,10 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [ ] P3k full JAX collective parity: add non-tiled rank-changing modes, validated `axis_index_groups`, the
       all-gather variance policy if the canonical sharding model can represent it, and `pshuffle`/`pswapaxes` as
       compositions. Complete this alongside Phase 4 shard-map migration so the composite graph, group-aware native
-      StableHLO lowering, and multi-device fixtures land as one vertical slice rather than adding another temporary
-      homogeneous API.
+      StableHLO lowering, and bounded-dynamic multi-device fixtures land as one vertical slice rather than adding
+      another temporary homogeneous API. The public semantics, shared native lowerers, direct composite binder
+      fixture, and static two-device execution are complete; the checkbox remains open only for production composite
+      shard-map reachability and final bounded-dynamic/JAX comparison gates.
 - [ ] Route transform-generated zero/one values through structural zero or `zero_like`/`one_like` whenever an operand
       supplies geometry.
 - [ ] Migrate transform consumers that stage `ZeroOperation<ArrayType>` with possibly-dynamic types (condition, scan,
@@ -1288,6 +1291,24 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [ ] Gate: every shape dependency in rendered IR is an operand edge or an explicit `dimension_size` instruction.
 
 ### Phase 4: remove implicit-shape replay and the parallel array language
+
+Execute the XLA portion as one dependency-ordered migration, not as a second body representation:
+
+1. Change the existing flat `XlaOperation` family, its program constants, and `XlaDomain` values to the composite
+   `ArrayProgramType`/`ArrayProgramValue` contract. Keep the backend enum flat; adapt homogeneous array payloads
+   through the canonical typed projection machinery rather than wrapping a stored `ArrayProgramOperation`.
+2. Retype `ShardMapOperation` and every attached higher-order region to that same composite family while keeping the
+   public shard-map boundary array-only. Boundary projection must reject a dimension-valued argument or result with
+   the canonical wrong-member diagnostic.
+3. Trace the local manual body directly in the composite context so `dimension_size`, dimension arithmetic,
+   requirements, and mixed shape-changing operations are ordinary attached-region SSA.
+4. Route the attached body through the existing composite lowerer with the entered `CollectiveLoweringState`; then
+   delete the homogeneous body replay and the transitional `Legacy*` collective capabilities from production tests.
+5. Migrate eager compilation/execution and transform entry points by projecting array-valued public inputs/outputs at
+   the boundary. No public XLA array API should expose `ArrayProgramValue`; the storage sum is an internal program
+   representation.
+6. Only after all region and transform tests pass, delete duplicated homogeneous lowering dispatch and narrow or
+   remove the old full `ArrayOperation` family according to the remaining consumer ledger.
 
 - [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
       the unrelated `ReshapeParameters`/`ReshapeOperation` permutation builder and carry no ambient extent state.
@@ -2568,8 +2589,10 @@ exact Phase 6 residual error rather than rebuilding geometry from types.
 A golden trace proves `dimension_size -> dimension_mul -> all_gather` survives rendering, alpha-renaming,
 instantiation, and import as ordinary operand edges. The residual audit finds no result extent, identity, bound,
 witness, or transform-residual metadata in any collective payload and no payload with dual operation-type contracts.
-The direct composite XLA dispatcher deliberately reports that these operations require Phase 4 shard-map region
-lowering: only that region owns the mesh-axis-to-replica-group state needed for correct native collectives.
+The direct composite XLA dispatcher accepts the same explicit manual-binder state used by production shard-map
+lowering, and a fixture proves the canonical dimension SSA graph reaches the shared native collective lowerer without
+reconstructing dimensions. The production attached shard-map body is still homogeneous, so Phase 4 must migrate its
+storage and tracing before public dynamic programs can reach that path.
 
 The complete implementation ledger and remaining JAX-parity continuation are in
 `.tasks/plan_p3k_collective_dimensions.md`.

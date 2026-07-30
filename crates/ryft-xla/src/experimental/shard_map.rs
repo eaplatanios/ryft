@@ -3626,6 +3626,43 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_grouped_pmean_preserves_group_order_and_uses_group_divisor() {
+        use ryft_core::operations::collectives::{Collective, CollectiveKind};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| {
+                            local_x
+                                .collective_with_axis_index_groups(
+                                    "x",
+                                    CollectiveKind::PMean,
+                                    vec![vec![0, 2], vec![3, 1]],
+                                )
+                                .unwrap()
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .unwrap()
+                }
+            },
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
+        )
+        .unwrap();
+
+        let module = traced.to_mlir_module("main").unwrap();
+        assert!(module.contains("replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>"), "{module}",);
+        assert!(module.contains("stablehlo.constant dense<2.000000e+00> : tensor<f32>"), "{module}");
+    }
+
+    #[test]
     fn test_batch_inside_shard_map_forwards_mesh_collective_to_all_reduce() {
         use ryft_core::Batch;
         use ryft_core::batching::{BatchAxis, BatchAxisSpecification};
@@ -4070,7 +4107,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_all_gather_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::LegacyAllGather;
+        use ryft_core::operations::collectives::{AllGatherOutputVariance, CollectiveOptions, LegacyAllGather};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4100,7 +4137,11 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.all_gather("x", 0).unwrap(),
+                        |local_x: ShardMapTracer| {
+                            local_x
+                                .all_gather("x", 0, CollectiveOptions::tiled(), AllGatherOutputVariance::Varying)
+                                .unwrap()
+                        },
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -4179,8 +4220,150 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_untiled_all_gather_lowers_rank_insertion() {
+        use ryft_core::operations::collectives::{AllGatherOutputVariance, CollectiveOptions, LegacyAllGather};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .expect("failed to create 2-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let mesh = device_mesh.logical_mesh().clone();
+        let input_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let output_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                .unwrap();
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let input_sharding = input_sharding.clone();
+                let output_sharding = output_sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| {
+                            local_x
+                                .all_gather("x", 0, CollectiveOptions::default(), AllGatherOutputVariance::Varying)
+                                .unwrap()
+                        },
+                        x,
+                        mesh.clone(),
+                        input_sharding.clone(),
+                        output_sharding.clone(),
+                    )
+                    .unwrap()
+                }
+            },
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])),
+        )
+        .unwrap();
+
+        let module = traced.to_mlir_module("main").unwrap();
+        assert!(module.contains("stablehlo.broadcast_in_dim"), "{module}");
+        assert!(
+            module.contains("(tensor<2xf32>) -> tensor<1x2xf32>")
+                && module.contains("(tensor<1x2xf32>) -> tensor<2x2xf32>"),
+            "{module}",
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
+                client
+                    .buffer(
+                        values_to_bytes(values.as_slice()).as_slice(),
+                        BufferType::F32,
+                        [2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(DataType::F32, &[4], input_sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .unwrap();
+        let execution_device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        for output in outputs {
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![1.0, 2.0, 3.0, 4.0]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_grouped_all_gather_preserves_group_order_across_mesh_coordinates() {
+        use ryft_core::operations::collectives::{AllGatherOutputVariance, CollectiveOptions, LegacyAllGather};
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| {
+                            local_x
+                                .all_gather(
+                                    "x",
+                                    0,
+                                    CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
+                                    AllGatherOutputVariance::Varying,
+                                )
+                                .unwrap()
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .unwrap()
+                }
+            },
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
+        )
+        .unwrap();
+
+        let module = traced.to_mlir_module("main").unwrap();
+        assert!(
+            module.contains("replica_groups = dense<[[0, 4], [6, 2], [1, 5], [7, 3]]> : tensor<4x2xi64>"),
+            "{module}",
+        );
+        assert!(module.contains("(tensor<2xf32>) -> tensor<4xf32>"), "{module}");
+    }
+
+    #[test]
     fn test_shard_map_psum_scatter_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::LegacyPSumScatter;
+        use ryft_core::operations::collectives::{CollectiveOptions, LegacyPSumScatter};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4208,7 +4391,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.psum_scatter("x", 0).unwrap(),
+                        |local_x: ShardMapTracer| local_x.psum_scatter("x", 0, CollectiveOptions::tiled()).unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -4290,6 +4473,98 @@ mod tests {
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
             assert_eq!(values, expected_values_by_device[device_index]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_untiled_psum_scatter_lowers_rank_removal() {
+        use ryft_core::operations::collectives::{CollectiveOptions, LegacyPSumScatter};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .expect("failed to create 2-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let mesh = device_mesh.logical_mesh().clone();
+        let input_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                .unwrap();
+        let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let input_sharding = input_sharding.clone();
+                let output_sharding = output_sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.psum_scatter("x", 0, CollectiveOptions::default()).unwrap(),
+                        x,
+                        mesh.clone(),
+                        input_sharding.clone(),
+                        output_sharding.clone(),
+                    )
+                    .unwrap()
+                }
+            },
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(6)])),
+        )
+        .unwrap();
+
+        let module = traced.to_mlir_module("main").unwrap();
+        assert!(module.contains("stablehlo.reduce_scatter"), "{module}");
+        assert!(module.contains("stablehlo.reshape"), "{module}");
+        assert!(module.contains("(tensor<2x3xf32>) -> tensor<1x3xf32>"), "{module}");
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let scale = if device_index == 0 { 1.0_f32 } else { 10.0_f32 };
+                let values = [scale, scale * 2.0, scale * 3.0, scale * 4.0, scale * 5.0, scale * 6.0];
+                client
+                    .buffer(
+                        values_to_bytes(values.as_slice()).as_slice(),
+                        BufferType::F32,
+                        [2u64, 3u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(DataType::F32, &[2, 6], input_sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .unwrap();
+        let execution_device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let expected = [vec![11.0_f32, 22.0, 33.0], vec![44.0_f32, 55.0, 66.0]];
+        for (output, expected) in outputs.into_iter().zip(expected) {
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), expected);
         }
     }
 
@@ -4404,7 +4679,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_all_to_all_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::LegacyAllToAll;
+        use ryft_core::operations::collectives::{CollectiveOptions, LegacyAllToAll};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4432,7 +4707,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.all_to_all("x", 0, 0).unwrap(),
+                        |local_x: ShardMapTracer| local_x.all_to_all("x", 0, 0, CollectiveOptions::tiled()).unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -4514,9 +4789,108 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_untiled_all_to_all_lowers_rank_exchange() {
+        use ryft_core::operations::collectives::{CollectiveOptions, LegacyAllToAll};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .expect("failed to create 2-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let mesh = device_mesh.logical_mesh().clone();
+        let input_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                .unwrap();
+        let output_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap();
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let input_sharding = input_sharding.clone();
+                let output_sharding = output_sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.all_to_all("x", 0, 1, CollectiveOptions::default()).unwrap(),
+                        x,
+                        mesh.clone(),
+                        input_sharding.clone(),
+                        output_sharding.clone(),
+                    )
+                    .unwrap()
+                }
+            },
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(6)])),
+        )
+        .unwrap();
+
+        let module = traced.to_mlir_module("main").unwrap();
+        assert!(module.contains("stablehlo.broadcast_in_dim"), "{module}");
+        assert!(module.contains("stablehlo.all_to_all"), "{module}");
+        assert!(module.contains("stablehlo.reshape"), "{module}");
+        assert!(
+            module.contains("(tensor<2x3xf32>) -> tensor<2x3x1xf32>")
+                && module.contains("(tensor<2x3x1xf32>) -> tensor<1x3x2xf32>"),
+            "{module}",
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let offset = device_index as f32 * 9.0;
+                let values = [offset + 1.0, offset + 2.0, offset + 3.0, offset + 4.0, offset + 5.0, offset + 6.0];
+                client
+                    .buffer(
+                        values_to_bytes(values.as_slice()).as_slice(),
+                        BufferType::F32,
+                        [2u64, 3u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(DataType::F32, &[2, 6], input_sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .unwrap();
+        let execution_device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let expected = [vec![1.0_f32, 10.0, 2.0, 11.0, 3.0, 12.0], vec![4.0_f32, 13.0, 5.0, 14.0, 6.0, 15.0]];
+        for (output, expected) in outputs.into_iter().zip(expected) {
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), expected);
+        }
+    }
+
+    #[test]
     fn test_shard_map_all_gather_gradient_transposes_to_psum_scatter() {
         use ryft_core::differentiation::LinearizationTracer;
-        use ryft_core::operations::collectives::LegacyAllGather;
+        use ryft_core::operations::collectives::{AllGatherOutputVariance, CollectiveOptions, LegacyAllGather};
         use ryft_core::operations::math::{Reduce, ReductionKind};
 
         // Reverse mode wraps the shard_map staging context in a linearization trace, so the values flowing through
@@ -4543,7 +4917,16 @@ mod tests {
                                 let sharding = sharding.clone();
                                 move |y| {
                                     let gathered = shard_map::<_, _, ArrayType, GradientTracer>(
-                                        |local_x: ShardMapTracer| local_x.all_gather("x", 0).unwrap(),
+                                        |local_x: ShardMapTracer| {
+                                            local_x
+                                                .all_gather(
+                                                    "x",
+                                                    0,
+                                                    CollectiveOptions::tiled(),
+                                                    AllGatherOutputVariance::Varying,
+                                                )
+                                                .unwrap()
+                                        },
                                         y,
                                         mesh.clone(),
                                         sharding.clone(),

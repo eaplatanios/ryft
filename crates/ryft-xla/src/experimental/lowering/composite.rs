@@ -2,6 +2,7 @@
 
 use ryft_core::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
 use ryft_core::backends::dimensions::DimensionOperation;
+use ryft_core::operations::collectives::CollectiveMode;
 use ryft_core::operations::manipulation::CONCATENATE_OPERATION_NAME;
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{Operation as CoreOperation, Program, ProgramError, Typed};
@@ -14,11 +15,12 @@ use ryft_mlir::{
 };
 
 use super::{
-    LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode,
-    broadcast_changes_explicit_sharding, lower_compare_to_mlir, lower_constant_elements_attribute,
-    lower_constant_output, lower_custom_call_to_mlir, lower_pad_to_mlir, lower_rng_bit_generator_to_mlir,
-    lower_sharding_constraint, lower_tensor_type, merge_logical_meshes, normalize_function_name,
-    replay_region_ref_into_block, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
+    CollectiveLoweringState, LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer,
+    PlainMlirLoweringMode, broadcast_changes_explicit_sharding, lower_all_gather_to_mlir, lower_all_to_all_to_mlir,
+    lower_compare_to_mlir, lower_constant_elements_attribute, lower_constant_output, lower_custom_call_to_mlir,
+    lower_pad_to_mlir, lower_psum_scatter_to_mlir, lower_rng_bit_generator_to_mlir, lower_sharding_constraint,
+    lower_tensor_type, merge_logical_meshes, normalize_function_name, replay_region_ref_into_block,
+    reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::experimental::ops::XlaConstant;
 use crate::mlir::ToMlir;
@@ -191,6 +193,41 @@ fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     Ok(vec![result])
 }
 
+/// Applies explicit changed-axis dimension operands to one native collective result.
+fn refine_collective_result_axes<'b, 'c: 'b, 't: 'c>(
+    mut result: ValueRef<'b, 'c, 't>,
+    axes: &[usize],
+    extents: &[ValueRef<'b, 'c, 't>],
+    output_type: &ArrayType,
+    block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: ryft_mlir::LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    if axes.len() != extents.len() {
+        return Err(ProgramError::InvalidInputCount { expected: axes.len(), actual: extents.len() }.into());
+    }
+    let i32_scalar_type = context
+        .tensor_type(context.signless_integer_type(32), &[], None, location)
+        .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
+    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    for (&axis, &extent) in axes.iter().zip(extents) {
+        if !matches!(output_type.shape().dimensions()[axis], Dimension::Dynamic(_)) {
+            continue;
+        }
+        let extent = block.append_operation(stable_hlo::convert(extent, i32_scalar_type, location)?)?;
+        let extent = extent.result(0).expect("stablehlo.convert should return one result").as_ref();
+        let refined = block.append_operation(stable_hlo::set_dimension_size(
+            result,
+            extent,
+            output_tensor_type,
+            axis,
+            location,
+        )?)?;
+        result = refined.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+    }
+    Ok(vec![result])
+}
+
 /// Lowers one bounded dynamic integer-valued array constructor from its compact first-class dimension operands.
 fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
     name: &str,
@@ -213,6 +250,7 @@ fn lower_array_program_operation<'b, 'c: 'b, 't: 'c, A>(
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayProgramType],
     output_types: &[ArrayProgramType],
+    collective_state: &CollectiveLoweringState,
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
@@ -688,14 +726,100 @@ where
             }
             lower_rng_bit_generator_to_mlir(operation, input_values, block, context, location)
         }
-        ArrayProgramOperation::AllGather(_)
-        | ArrayProgramOperation::PSumScatter(_)
-        | ArrayProgramOperation::AllToAll(_) => Err(LoweringError::UnsupportedOp {
-            op: format!(
-                "{} with explicit result extents requires Phase 4 composite shard-map region lowering",
-                operation.name(),
-            ),
-        }),
+        ArrayProgramOperation::AllGather(operation) => {
+            let Some(input) = input_values.first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let [output_type] = output_types else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+            };
+            let output_type =
+                <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let result =
+                lower_all_gather_to_mlir(operation, collective_state, *input, output_type, block, context, location)?
+                    .remove(0);
+            let axes = (operation.options().mode() == CollectiveMode::Tiled)
+                .then_some(operation.concat_axis())
+                .into_iter()
+                .collect::<Vec<_>>();
+            refine_collective_result_axes(
+                result,
+                axes.as_slice(),
+                &input_values[1..],
+                output_type,
+                block,
+                context,
+                location,
+            )
+        }
+        ArrayProgramOperation::PSumScatter(operation) => {
+            let Some(input) = input_values.first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let [output_type] = output_types else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+            };
+            let output_type =
+                <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let result =
+                lower_psum_scatter_to_mlir(operation, collective_state, *input, output_type, block, context, location)?
+                    .remove(0);
+            let axes = (operation.options().mode() == CollectiveMode::Tiled)
+                .then_some(operation.scatter_axis())
+                .into_iter()
+                .collect::<Vec<_>>();
+            refine_collective_result_axes(
+                result,
+                axes.as_slice(),
+                &input_values[1..],
+                output_type,
+                block,
+                context,
+                location,
+            )
+        }
+        ArrayProgramOperation::AllToAll(operation) => {
+            let Some(input) = input_values.first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let Some(input_type) = input_types.first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let input_type =
+                <&ArrayType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let [output_type] = output_types else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+            };
+            let output_type =
+                <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let result = lower_all_to_all_to_mlir(
+                operation,
+                collective_state,
+                *input,
+                input_type,
+                output_type,
+                block,
+                context,
+                location,
+            )?
+            .remove(0);
+            let axes = if operation.options().mode() == CollectiveMode::Tiled
+                && operation.split_axis() != operation.concat_axis()
+            {
+                vec![operation.split_axis(), operation.concat_axis()]
+            } else {
+                Vec::new()
+            };
+            refine_collective_result_axes(
+                result,
+                axes.as_slice(),
+                &input_values[1..],
+                output_type,
+                block,
+                context,
+                location,
+            )
+        }
     }
 }
 
@@ -723,6 +847,22 @@ fn to_mlir_module_for_array_program<
 >(
     program: &Program<ArrayProgramValue<A>, ArrayProgramOperation<A>, Input, Output>,
     function_name: &str,
+) -> Result<String, LoweringError>
+where
+    A: MlirLowerableValue,
+{
+    to_mlir_module_for_array_program_with_collective_state(program, function_name, CollectiveLoweringState::new())
+}
+
+/// Generic array-program lowering implementation with an explicit collective binder state.
+fn to_mlir_module_for_array_program_with_collective_state<
+    A,
+    Input: Parameterized<ArrayProgramValue<A>>,
+    Output: Parameterized<ArrayProgramValue<A>>,
+>(
+    program: &Program<ArrayProgramValue<A>, ArrayProgramOperation<A>, Input, Output>,
+    function_name: &str,
+    collective_state: CollectiveLoweringState,
 ) -> Result<String, LoweringError>
 where
     A: MlirLowerableValue,
@@ -802,6 +942,7 @@ where
                         inputs,
                         input_types.as_slice(),
                         output_types.as_slice(),
+                        &collective_state,
                         block,
                         context,
                         location,
@@ -842,8 +983,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use ryft_core::axes::NamedAxis;
     use ryft_core::backends::arrays::{Array as ReferenceArray, ArrayOperation};
     use ryft_core::contexts::{Context, StagingContext};
+    use ryft_core::operations::collectives::AllGather;
     use ryft_core::operations::compare::{Compare, ComparisonDirection};
     use ryft_core::operations::constants::{ConstantOperation, IotaOperation, OneOperation, ZeroOperation};
     use ryft_core::operations::custom_call::CustomCallOperation;
@@ -858,6 +1001,7 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::ProgramBuilder;
     use ryft_core::programs::values::ValueProjection;
+    use ryft_core::sharding::{MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::Tracer;
     use ryft_core::tracing::TracingContext;
     use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
@@ -869,6 +1013,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::experimental::shard_map::ShardMap;
     use crate::tests::{values_from_bytes, values_to_bytes};
 
     /// Returns the ordinary single-device compilation options used by the composite CPU execution tests.
@@ -1589,6 +1734,38 @@ mod tests {
                     .to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_explicit_collective_lowering_uses_dimension_ssa_inside_manual_binder() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let (_, program) = TestContext::trace_with_named_axes(
+            |input| input.all_gather_tiled("x", 0),
+            ArrayProgramType::Array(input_type),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2 })],
+        )
+        .unwrap();
+
+        let shard_map =
+            ShardMap::from_shardings(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()], true);
+        let collective_state = CollectiveLoweringState::new().enter_manual_region(shard_map);
+        let module =
+            to_mlir_module_for_array_program_with_collective_state(&program, "main", collective_state).unwrap();
+
+        assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 0, "{module}");
+        assert_eq!(module.matches("stablehlo.multiply").count(), 1, "{module}");
+        assert_eq!(module.matches("stablehlo.all_gather").count(), 1, "{module}");
+        assert!(module.contains("replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>"), "{module}",);
+        assert!(module.contains("(tensor<3xf32>) -> tensor<6xf32>"), "{module}");
     }
 
     #[test]
