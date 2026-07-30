@@ -98,7 +98,7 @@ case:
 
 - `ZeroOperation<ArrayType>`;
 - `OneOperation<ArrayType>`;
-- rank-positive `FillOperation<ArrayType, V>`; and
+- the former specialized array fill operation; and
 - `IotaOperation<ArrayType>`.
 
 The current branch has removed those four archived array-program-specific implementations. `One`, fill, and `Iota`
@@ -110,8 +110,7 @@ by retaining that generic escape hatch. The canonical destination is:
 - operand-relative `zero_like`/`one_like` for transform-generated values whenever a source array exists;
 - a homogeneous nullary constructor for zero, one, and iota only when its stored output type is identity-free,
   enforced by the blanket `Operation<T>` inference;
-- a rank-zero-only `FillOperation<T, Scalar>` literal materializer, followed by ordinary broadcast for every
-  rank-positive fill; and
+- a typed rank-zero `ConstantOperation` literal, followed by ordinary broadcast for every rank-positive fill; and
 - for identity-bearing zero, one, and iota output types, a mixed `Operation<ArrayProgramType>` contract owned by the
   corresponding flat `ArrayProgramOperation` variant arm. The stored `ArrayType` is the complete output authority and
   the variant consumes one explicit dimension operand per dynamic axis in identity-validated axis order.
@@ -1146,6 +1145,13 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       program preserves dimension arithmetic through eager execution, partial evaluation, batching, JVP, import,
       direct StableHLO lowering, and PJRT compilation/execution. The exact legacy-consumer and deletion manifest is in
       `.tasks/plan_p3g_reshape_broadcast.md`.
+- [x] P3g public broadcast API consolidation: make `Broadcast` the sole public program-construction capability, with
+      exact and computed first-class extents accepted by the same `BroadcastOperation`; remove
+      `BroadcastToDimensions`, the public packed-array `DynamicBroadcast` capability, and all old method names; retain
+      one backend-only `backends::arrays::BroadcastKernel` contract for already-concrete eager output types. The frozen
+      `LegacyBroadcastOperation` and `DynamicBroadcastOperation` payloads remain hidden only for the homogeneous
+      `ArrayOperation` transform language and its XLA lowering/import consumers assigned to Phases 4–9. Exact
+      implementation and verification evidence is recorded in `.tasks/plan_broadcast_api_consolidation.md`.
 - [x] P3h Delivery A: give the existing `ConcatenateOperation` a canonical mixed contract with a trailing explicit
       result-extent operand while retaining its unchanged homogeneous contract on the same axis-only payload. Mixed
       inference, eager validation, tracing, partial evaluation, identity instantiation, and import are complete.
@@ -1231,15 +1237,15 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [x] P3j full-parity fill slice: execute the reviewed `.tasks/plan_p3j_dynamic_fill.md` as the next isolated review
       unit. Match JAX's scalar-SSA `lax.full` and array-broadcasting `jax.numpy.full` behavior by representing every
       rank-positive fill as ordinary broadcast: a rank-zero or broadcast-compatible array SSA value followed by static
-      or first-class-dynamic output extents. Keep `FillOperation<T, Scalar>` only as a rank-zero literal materializer;
-      do not add `DynamicFill`, hide the fill value in a mixed payload, or fold iota into this review unit.
+      or first-class-dynamic output extents. Materialize host scalar literals with `ConstantOperation`; do not add
+      `FillOperation`, `DynamicFill`, hide the fill value in a mixed payload, or fold iota into this review unit.
 - [x] P3j dynamic-iota slice: specify and execute the final constructor review unit after the full-parity fill slice is
       reviewed and committed.
 - [x] Land `One`, full-parity fill, and `Iota` as separate complete vertical slices after corrected `DynamicZero`.
       One and iota use variant-owned mixed constructor contracts through the shared helper. Fill is deliberately
       different: JAX defines it as conversion plus broadcast, so rank-positive static and dynamic fill reuse the
-      canonical broadcast operations and transforms while `FillOperation<T, Scalar>` narrows to rank-zero literal
-      materialization. All three slices must be complete before the Phase 3 gate.
+      canonical constant and broadcast operations and their transforms. All three slices must be complete before the
+      Phase 3 gate.
 - [ ] Route transform-generated zero/one values through structural zero or `zero_like`/`one_like` whenever an operand
       supplies geometry.
 - [ ] Migrate transform consumers that stage `ZeroOperation<ArrayType>` with possibly-dynamic types (condition, scan,
@@ -1816,8 +1822,8 @@ removed the direct-context operation clone from the all-zero fast path by retain
 indices, and added a regression proving DynamicZero reuses its shaped primal SSA value as its tangent. The complete
 core, macro integration, doctest, and serial XLA gates remain green; exact results are recorded in the focused plan.
 
-No `FillOperation` or `IotaOperation` source changed. Dynamic fill is the next review unit after this increment is
-reviewed and committed.
+At that checkpoint, neither the then-existing fill operation nor `IotaOperation` changed; the now-completed dynamic
+fill review followed as the next isolated unit.
 
 ### Plan revision: constructor contracts without a wrapper
 
@@ -2416,10 +2422,15 @@ broadcast paths. Delivery D proves dimension arithmetic feeding both operations 
 execution, partial evaluation, batching, JVP, identity instantiation, import, direct StableHLO lowering, and static
 PJRT execution.
 
-The old expression/homogeneous implementations remain deliberately isolated for the immediately following consumer
-migration and deletion increment. Their exact symbol counts, owning files, `From` bounds, call-site counts, deletion
-order, and required acceptance tests are recorded in `.tasks/plan_p3g_reshape_broadcast.md`; the Phase 3 homogeneous
-deletion items remain open until that residual search reaches zero.
+The public API now exposes only `Broadcast`: exact constants, computed dimensions, right-aligned expansion, and
+leading expansion all bind the same mixed operation. `backends::arrays::BroadcastKernel` is the backend-only eager
+kernel over an already-concrete `ArrayType`; it cannot stage an operation or turn metadata into shape authority. The
+old homogeneous implementations remain hidden and frozen for the immediately following consumer migration and
+deletion increments.
+Their current owners are the homogeneous `ArrayOperation` transform implementations (batching, differentiation,
+control flow, attention, collectives, fill, slicing, dot/reduce, sharding, and sorting) plus `XlaOperation` lowering,
+eager, JIT, and shard-map consumers. Deletion remains gated on those Phase 4–9 domains moving to the composite graph.
+The detailed consolidation and residual evidence is in `.tasks/plan_broadcast_api_consolidation.md`.
 
 ### Execution: P3h Delivery A explicit concatenate result extent
 
@@ -2497,10 +2508,11 @@ measurements, verification, and residual evidence are recorded in `.tasks/plan_p
 
 The constructor gate is complete. Fill deliberately does not add another composite constructor: current JAX source
 defines `lax.full` as scalar conversion plus broadcast and `jax.numpy.full` as scalar `lax.full` or array
-`broadcast_to`. Ryft now uses the same decomposition. `FillOperation` is a rank-zero literal materializer;
-rank-positive static fills bind homogeneous broadcast, while scalar or broadcast-compatible array SSA values with
-first-class extents bind the existing mixed `BroadcastOperation` through `BroadcastToDimensions`. There is no
-`DynamicFill`, captured runtime fill payload, copied extent schema, or geometry recovery.
+`broadcast_to`. Ryft now uses the same decomposition. `Fill` is convenience syntax that converts the host scalar,
+binds a rank-zero `ConstantOperation`, and uses ordinary broadcast for rank-positive outputs. Scalar or
+broadcast-compatible array SSA values with first-class extents bind the existing mixed `BroadcastOperation` through
+`Broadcast`. There is no specialized fill operation, `DynamicFill`, captured runtime fill payload, copied
+extent schema, or geometry recovery.
 
 The general mixed-broadcast JVP materializes identity-bearing structural-zero tangents through one `DynamicZero` fed
 by the original extent operands. Existing broadcast implementations continue to own live JVP, transposition,
@@ -2510,9 +2522,12 @@ without observing input geometry.
 
 Dynamic iota is the final variant-owned mixed constructor. Identity-free outputs remain homogeneous
 `ArrayOperation::Iota`; identity-bearing outputs use `DynamicIota(IotaOperation<ArrayType>)` with compact dynamic
-extent operands. Inference accepts JAX's integer, floating-point, and complex numeric dtypes, validates the axis,
-and reuses the shared constructor signature. Eager execution, PE, batching, JVP, transpose, identity instantiation,
-and import preserve those edges. Lowering emits native `stablehlo.iota` followed by the shared bounded
+extent operands. Its fallible constructor accepts JAX's integer, floating-point, and complex numeric dtypes and
+validates the axis before an operation can enter a program; inference reuses the shared constructor signature. Eager
+execution, PE, batching, JVP, transpose, identity instantiation, and import preserve those edges. The shared
+dynamic-constructor JVP explicitly includes `DynamicZero`, so a future zero-capable dtype with a widened,
+non-zero-space tangent does not depend on primal-reuse eligibility. Lowering emits native `stablehlo.iota` followed by
+the shared bounded
 `set_dimension_size` refinement; a pairwise-distinct `4 x 2 x 3` complex fixture compiles and executes on CPU with no
 `get_dimension_size`.
 
