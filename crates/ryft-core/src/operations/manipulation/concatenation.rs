@@ -13,7 +13,7 @@ use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::Zero;
-use crate::operations::manipulation::{Broadcast, SliceOperation, Transpose};
+use crate::operations::manipulation::{LegacyBroadcast, SliceOperation, Transpose};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
@@ -257,7 +257,7 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchableOperation<C> for ConcatenateOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchableOperation<C> for ConcatenateOperation
 where
     ConcatenateOperation: InterpretableOperation<C>,
 {

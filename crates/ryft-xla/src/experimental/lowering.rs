@@ -4,7 +4,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::axes::AxisIndexOperation;
-#[cfg(any(test, feature = "benchmarking"))]
 use ryft_core::backends::arrays::Array as CpuArray;
 use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::scalars::Scalar;
@@ -17,7 +16,7 @@ use ryft_core::operations::collectives::{
 };
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
-use ryft_core::operations::constants::{ConstantOperation, FillOperation, IotaOperation};
+use ryft_core::operations::constants::{ConstantOperation, IotaOperation};
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
 use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
 use ryft_core::operations::differentiation::CoordinateBasisOperation;
@@ -39,7 +38,7 @@ use ryft_core::operations::sort::{SortDirection, SortOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::{RegionId, RegionRef};
-use ryft_core::programs::types::Typed;
+use ryft_core::programs::types::{Type as RyftType, Typed};
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::types::{ArrayType, DataType, Dimension, Memory, Shape};
@@ -1223,37 +1222,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DotOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for FillOperation<ArrayType, Scalar> {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        check_count!("input", input_values, 0, ProgramError);
-        check_count!("output", output_types, 1, ProgramError);
-        let output_type = &output_types[0];
-        let output_tensor_type = lowerer.lower_tensor_type(output_type)?;
-        let constant_value = lower_scalar_constant_splat(
-            *self.value(),
-            output_type,
-            output_tensor_type,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
-        Ok(vec![annotate_output_memory(
-            constant_value,
-            output_type,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?])
-    }
-}
-
 impl<V: MlirLowerableValue> LowerableXlaOperation<V> for IotaOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1296,7 +1264,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CoordinateBasisOperatio
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<V> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<CpuArray> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1977,14 +1945,6 @@ where
             Self::ConvertElementType(operation) => {
                 operation.lower_to_mlir(input_values, regions, output_types, mode, lowerer)
             }
-            Self::Fill(operation) => <FillOperation<ArrayType, Scalar> as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
             Self::Iota(operation) => <IotaOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -4179,16 +4139,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::ConvertElementType(operation) => {
                 operation.lower_to_mlir(input_values, regions, output_types, mode, lowerer)
             }
-            ArrayOperation::Fill(fill) => {
-                <FillOperation<ArrayType, Scalar> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    fill,
-                    input_values,
-                    regions,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
             ArrayOperation::Iota(iota) => <IotaOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 iota,
                 input_values,
@@ -5575,8 +5525,7 @@ impl MlirLowerableValue for ArrayType {
     }
 }
 
-/// Concrete test/benchmark value lowering used by MLIR snapshot tooling.
-#[cfg(any(test, feature = "benchmarking"))]
+/// Concrete host literal lowering used by [`ConstantOperation`] and MLIR snapshot tooling.
 impl MlirLowerableValue for CpuArray {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
@@ -5619,6 +5568,30 @@ impl MlirLowerableValue for CpuArray {
             return Ok(None);
         }
         Ok(Some(self.to_dense_elements_attribute(tensor_type, context)?))
+    }
+
+    fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
+        &self,
+        _captured_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut B,
+        context: &'c MlirContext<'t>,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+    where
+        B: Block<'b, 'c, 't>,
+        L: Copy + Location<'c, 't>,
+    {
+        let value_type = self.r#type().into_owned();
+        if value_type.is_scalar() {
+            // A scalar array has exactly one value by construction.
+            let value = self.values().first().copied().unwrap();
+            let scalar_type = ArrayType::scalar(value_type.data_type());
+            let scalar_tensor_type = lower_tensor_type(&scalar_type, context, location)?;
+            let constant =
+                lower_scalar_constant_splat(value, &scalar_type, scalar_tensor_type, block, context, location)?;
+            return annotate_output_memory(constant, &value_type, block, context, location);
+        }
+        lower_literal_value(self, block, context, location)
     }
 }
 
@@ -7610,9 +7583,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Constant(constant) => {
             check_count!("input", input_values, 0, ProgramError);
             check_count!("output", output_types, 1, ProgramError);
-            // A typed literal constant captures its value in the enclosing program's capture table; resolve it by
-            // forwarding the corresponding captured runtime value.
-            let constant_value = lower_captured_constant(constant.value(), captured_values)?;
+            let constant_value = constant.value().lower_constant_value(
+                captured_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?;
             Ok(vec![constant_value])
         }
         XlaOperation::ConvertElementType(_) => {
@@ -7994,26 +7970,6 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.location,
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
-        }
-        XlaOperation::Fill(fill) => {
-            check_count!("input", input_values, 0, ProgramError);
-            check_count!("output", output_types, 1, ProgramError);
-            let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-            let constant_value = lower_scalar_constant_splat(
-                *fill.value(),
-                &output_types[0],
-                output_tensor_type,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            Ok(vec![annotate_output_memory(
-                constant_value,
-                &output_types[0],
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?])
         }
         XlaOperation::Iota(iota) => {
             check_count!("input", input_values, 0, ProgramError);
@@ -9288,7 +9244,7 @@ fn lower_element_type<'c, 't>(
 /// Builds the dense-elements attribute for one traced splat constant.
 /// Lowers an arbitrary `f64` factor into a splatted scalar StableHLO constant whose element type
 /// matches `output_type`, then broadcasts that scalar to the full output shape. Used by the
-/// constant-fill and `fill` lowerings.
+/// zero/one synthesis and literal-constant lowering.
 fn lower_f64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
     factor: f64,
     output_type: &ArrayType,
@@ -9319,11 +9275,10 @@ where
     Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
 }
 
-/// Lowers a [`Scalar`] fill value as a splatted constant of `output_type`. Real fill values route through
-/// [`lower_f64_constant_splat`] after an exact widening conversion to `f64`, while complex fill values compose two real
-/// part splats through `stablehlo.complex` (MLIR has no complex scalar attribute to splat) and broadcast the
-/// composed scalar when the output is not rank zero. A complex fill value with a real output data type surfaces the
-/// conversion's promotion error.
+/// Lowers a [`Scalar`] literal after ordinary conversion to `output_type`'s element type. Integer values use exact
+/// integer attributes, floating-point and Boolean values route through [`lower_f64_constant_splat`], and complex
+/// values compose two real scalar constants through `stablehlo.complex` because MLIR has no complex scalar attribute
+/// to splat.
 fn lower_scalar_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
     value: Scalar,
     output_type: &ArrayType,
@@ -9337,6 +9292,7 @@ where
     L: Copy + Location<'c, 't>,
 {
     let data_type = output_type.data_type();
+    let value = value.convert_element_type(data_type)?;
     if data_type.is_zero() {
         if value != Scalar::Zero {
             return Err(LoweringError::UnsupportedDataType { data_type });
@@ -9344,15 +9300,10 @@ where
         return lower_f64_constant_splat(0.0, output_type, output_tensor_type, block, context, location);
     }
     if data_type.is_complex() {
-        let (real, imaginary) = match value {
-            Scalar::C64(value) => (value.re as f64, value.im as f64),
-            Scalar::C128(value) => (value.re, value.im),
-            value => {
-                let Scalar::F64(real) = value.promote_element_type(DataType::F64)? else {
-                    unreachable!("promotion to f64 yields an f64 scalar")
-                };
-                (real, 0.0)
-            }
+        let (real, imaginary) = match (data_type, value) {
+            (DataType::C64, Scalar::C64(value)) => (value.re as f64, value.im as f64),
+            (DataType::C128, Scalar::C128(value)) => (value.re, value.im),
+            _ => unreachable!("conversion to a complex data type yields its matching complex scalar"),
         };
         let part_data_type = if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
         let part_type = ArrayType::scalar(part_data_type);
@@ -9363,12 +9314,29 @@ where
         let imaginary_value =
             lower_f64_constant_splat(imaginary, &part_type, part_tensor_type, block, context, location)?;
         let complex = block.append_operation(stable_hlo::complex(real_value, imaginary_value, location)?)?;
-        let complex = complex.result(0).expect("stablehlo.complex should return one result").as_ref();
-        if output_type.shape().dimensions().is_empty() {
-            return Ok(complex);
+        return Ok(complex.result(0).expect("stablehlo.complex should return one result").as_ref());
+    }
+    let integer_value = match value {
+        Scalar::I8(value) => Some(i64::from(value)),
+        Scalar::I16(value) => Some(i64::from(value)),
+        Scalar::I32(value) => Some(i64::from(value)),
+        Scalar::I64(value) => Some(value),
+        Scalar::U8(value) => Some(i64::from(value)),
+        Scalar::U16(value) => Some(i64::from(value)),
+        Scalar::U32(value) => Some(i64::from(value)),
+        Scalar::U64(value) => {
+            let elements = context
+                .dense_u64_elements_attribute(output_tensor_type, &[value])
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?;
+            let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+            return Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref());
         }
-        let broadcast = block.append_operation(stable_hlo::broadcast(complex, output_tensor_type, &[], location)?)?;
-        return Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref());
+        _ => None,
+    };
+    if let Some(integer_value) = integer_value {
+        let elements = lower_constant_elements_attribute(data_type, output_tensor_type, integer_value, context)?;
+        let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+        return Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref());
     }
     let Scalar::F64(value) = value.promote_element_type(DataType::F64)? else {
         unreachable!("promotion to f64 yields an f64 scalar")
@@ -9517,7 +9485,7 @@ mod tests {
     use ryft_core::differentiation::ReverseModeDifferentiate;
     use ryft_core::operations::compare::CompareOperation;
     use ryft_core::operations::constants::{
-        ConstantOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroOperation,
+        ConstantOperation, Fill, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroOperation,
     };
     use ryft_core::operations::control_flow::SelectOperation;
     use ryft_core::operations::logical::{AndOperation, OrOperation, XorOperation};
@@ -9537,7 +9505,7 @@ mod tests {
     use ryft_core::{EagerContext, TypeError};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
-    use ryft_core::tracing::Trace;
+    use ryft_core::tracing::{Trace, TracingContext};
 
     use super::*;
 
@@ -10437,16 +10405,10 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_operation_form_capture_as_a_hidden_argument() {
+    fn test_to_mlir_module_for_program_lowers_capture_output_as_a_hidden_argument() {
         let array_type = test_vector_type(4);
         let mut builder = XlaProgramBuilder::new();
-        let output = builder
-            .add_instruction(
-                XlaOperation::Constant(ConstantOperation::new(XlaConstant::new(0, array_type.clone()))),
-                Vec::new(),
-                Vec::new(),
-            )
-            .unwrap()[0];
+        let output = builder.add_constant(XlaConstant::new(0, array_type.clone()));
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -10469,17 +10431,11 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_forwards_operation_form_capture_into_nested_regions() {
+    fn test_to_mlir_module_for_program_forwards_capture_into_nested_regions() {
         let array_type = test_vector_type(4);
         let branch = || {
             let mut builder = XlaProgramBuilder::new();
-            let output = builder
-                .add_instruction(
-                    XlaOperation::Constant(ConstantOperation::new(XlaConstant::new(0, array_type.clone()))),
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .unwrap()[0];
+            let output = builder.add_constant(XlaConstant::new(0, array_type.clone()));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
                 .unwrap()
@@ -14169,6 +14125,54 @@ mod tests {
                 assert!(stablehlo.contains(&format!("_xla_buffer_placement = \"{placement}\"")), "{stablehlo}");
             }
         }
+    }
+
+    #[test]
+    fn test_fill_lowers_as_scalar_constant_plus_broadcast() {
+        let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let output_type = test_vector_type(4);
+        let output = context.fill(&output_type, Scalar::F64(2.5)).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 1, "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.constant dense<2.500000e+00> : tensor<f32>"), "{stablehlo}");
+
+        let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let output = context.fill(&ArrayType::scalar(DataType::F32), Scalar::F64(2.5)).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 0, "{stablehlo}");
+    }
+
+    #[test]
+    fn test_rank_positive_literal_constant_preserves_signed_zero_elements() {
+        let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let literal = CpuArray::new(test_vector_type(2), vec![Scalar::from(-0.0_f32), Scalar::from(0.0_f32)]).unwrap();
+        let output = context.bind(ConstantOperation::new(literal), Vec::new(), &[]).unwrap().remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 0, "{stablehlo}");
+        assert!(stablehlo.contains("dense<[0.000000e+00, -0.000000e+00]>"), "{stablehlo}");
     }
 
     #[test]

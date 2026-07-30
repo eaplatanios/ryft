@@ -896,7 +896,7 @@ mod tests {
     use ryft_core::operations::control_flow::{Select, WhileOperation};
     use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
     use ryft_core::operations::differentiation::StopGradient;
-    use ryft_core::operations::manipulation::{Broadcast, DynamicSlice, DynamicUpdateSlice, Reshape};
+    use ryft_core::operations::manipulation::{DynamicSlice, DynamicUpdateSlice, LegacyBroadcast, Reshape};
     use ryft_core::operations::math::{
         Add, Atan2, Cos, Div, Dot, DotDimensionNumbers, Exp, Logistic, Mul, Reduce, ReductionKind, Sin, Sub, Tanh,
     };
@@ -3364,7 +3364,7 @@ mod tests {
             + DynamicSlice
             + DynamicUpdateSlice
             + Reshape
-            + Broadcast
+            + LegacyBroadcast
             + Random
             + CustomCall
             + OneLike
@@ -3411,13 +3411,13 @@ mod tests {
                 let positions_type = tokens.r#type().into_owned();
                 let positions = context.iota(&positions_type, 0)?;
                 let visible = positions
-                    .compare(&position.broadcast(positions_type, &[])?, ComparisonDirection::LessThanOrEqual)?;
+                    .compare(&position.legacy_broadcast(positions_type, &[])?, ComparisonDirection::LessThanOrEqual)?;
                 let masked = V::select(&visible, &scores, &context.fill(&scores_type, Scalar::F32(-1.0e30))?)?;
                 let stabilized =
-                    masked.sub(&masked.reduce(&[0], ReductionKind::Max).broadcast(scores_type.clone(), &[])?)?;
+                    masked.sub(&masked.reduce(&[0], ReductionKind::Max).legacy_broadcast(scores_type.clone(), &[])?)?;
                 let exponentials = stabilized.exp()?;
-                let weights =
-                    exponentials.div(&exponentials.reduce(&[0], ReductionKind::Sum).broadcast(scores_type, &[])?)?;
+                let weights = exponentials
+                    .div(&exponentials.reduce(&[0], ReductionKind::Sum).legacy_broadcast(scores_type, &[])?)?;
                 weights.dot(&cache_values, &DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new()))
             }
             DecodeAttention::CustomCall => {

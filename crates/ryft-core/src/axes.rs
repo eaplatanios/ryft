@@ -502,7 +502,7 @@ impl<C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>> + Fr
             // back to the per-item scalar `u64`.
             let size = context.axis_size();
             let r#type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(size)]));
-            let operation = IotaOperation::new(r#type.clone(), 0);
+            let operation = IotaOperation::new(r#type.clone(), 0)?;
             let mut index = context.parent().bind(operation, Vec::new(), &[])?;
             check_count!("output", index, 1, ProgramError);
             Ok(vec![ArrayBatch::new(r#type, index.remove(0), Some(0))?])

@@ -40,8 +40,8 @@ use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
 };
 use crate::operations::constants::{
-    ConstantOperation, Fill, FillOperation, IOTA_OPERATION_NAME, IotaOperation, One, OneLike, OneLikeOperation,
-    OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, Fill, IOTA_OPERATION_NAME, IotaOperation, One, OneLike, OneLikeOperation, OneOperation, Zero,
+    ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
@@ -51,11 +51,11 @@ use crate::operations::dimensions::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
 use crate::operations::manipulation::conversion::ElementType;
 use crate::operations::manipulation::{
-    Broadcast, Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation, DynamicBroadcast,
-    DynamicBroadcastOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
-    Gather, GatherOperation, GatherScatterMode, LegacyBroadcastOperation, LegacyReshapeOperation, Pad, PadOperation,
-    Permutation, Reshape, ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation,
-    Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation, DynamicBroadcastOperation,
+    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Gather, GatherOperation,
+    GatherScatterMode, LegacyBroadcast, LegacyBroadcastOperation, LegacyDynamicBroadcast, LegacyReshapeOperation, Pad,
+    PadOperation, Permutation, Reshape, ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice,
+    SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::math::dot::dot_general_evaluate;
 use crate::operations::math::reduce::{reduce_abstract, reduce_evaluate};
@@ -88,6 +88,16 @@ use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperati
 use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::{ArrayType, DataType, Dimension, Shape, StaticShape};
 
+/// Backend execution contract for broadcasting to an already-concrete [`ArrayType`].
+///
+/// This kernel does not stage a program operation and does not grant runtime shape authority. Composite eager
+/// interpretation resolves first-class dimension operands and validates the result type before invoking it. Program
+/// construction uses [`Broadcast`](crate::operations::manipulation::Broadcast) instead.
+pub trait BroadcastKernel: Sized {
+    /// Broadcasts `self` to `output_type` using `output_axes`.
+    fn broadcast_to_type(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError>;
+}
+
 /// Reusable [`Operation`] enum for ordinary staged array programs.
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`] the
@@ -105,8 +115,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
     OneLike(OneLikeOperation),
-    Constant(ConstantOperation<V>),
-    Fill(FillOperation<ArrayType, Scalar>),
+    Constant(ConstantOperation<Array>),
     Iota(IotaOperation<ArrayType>),
     CoordinateBasis(CoordinateBasisOperation<ArrayType>),
     Abs(AbsOperation),
@@ -1373,9 +1382,9 @@ impl Reshape for Array {
     }
 }
 
-impl Broadcast for Array {
-    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        let r#type = Broadcast::broadcast(&self.r#type, output_type, output_axes)?;
+impl BroadcastKernel for Array {
+    fn broadcast_to_type(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let r#type = self.r#type.legacy_broadcast(output_type, output_axes)?;
         if r#type == self.r#type && output_axes.iter().copied().eq(0..r#type.rank()) {
             return Ok(self.clone());
         }
@@ -1411,8 +1420,15 @@ impl Broadcast for Array {
     }
 }
 
-impl DynamicBroadcast for Array {
-    fn dynamic_broadcast(
+impl LegacyBroadcast for Array {
+    #[inline]
+    fn legacy_broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        self.broadcast_to_type(output_type, output_axes)
+    }
+}
+
+impl LegacyDynamicBroadcast for Array {
+    fn legacy_dynamic_broadcast(
         &self,
         output_dimensions: &Self,
         output_type: ArrayType,
@@ -1452,7 +1468,7 @@ impl DynamicBroadcast for Array {
             ))
             .into());
         }
-        self.broadcast(output_type.with_shape(shape), output_axes)
+        self.legacy_broadcast(output_type.with_shape(shape), output_axes)
     }
 }
 
@@ -2412,7 +2428,7 @@ mod tests {
     fn test_array_broadcast() {
         let vector = Array::vector(vec![1.0, 2.0]);
         let output_type = array_type(DataType::F64, &[3, 2]);
-        let broadcast = Broadcast::broadcast(&vector, output_type.clone(), &[1]).unwrap();
+        let broadcast = LegacyBroadcast::legacy_broadcast(&vector, output_type.clone(), &[1]).unwrap();
         assert_eq!(broadcast.r#type().into_owned(), output_type);
         assert_eq!(broadcast.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
     }

@@ -377,19 +377,19 @@ macro_rules! define_arithmetic_dimension_operation {
         }
 
         impl<
-            C: $crate::contexts::Domain<
+            __C: $crate::contexts::Domain<
                 Type = $crate::types::DimensionType,
                 Value: $capability,
             >,
-        > $crate::interpretation::InterpretableOperation<C> for $operation
+        > $crate::interpretation::InterpretableOperation<__C> for $operation
         {
             #[inline]
-            fn interpret<D: $crate::interpretation::InterpretationDriver<C>>(
+            fn interpret<__D: $crate::interpretation::InterpretationDriver<__C>>(
                 &self,
-                _context: &C,
-                _driver: &D,
-                inputs: &[C::Value],
-            ) -> Result<Vec<C::Value>, $crate::programs::ProgramError> {
+                _context: &__C,
+                _driver: &__D,
+                inputs: &[__C::Value],
+            ) -> Result<Vec<__C::Value>, $crate::programs::ProgramError> {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::programs::operations::Operation::infer_output_types(
                     self,
@@ -404,11 +404,11 @@ macro_rules! define_arithmetic_dimension_operation {
         }
 
         impl<
-            C: $crate::contexts::Context<
+            __C: $crate::contexts::Context<
                 Type = $crate::types::DimensionType,
                 Operation: ::std::convert::From<Self>,
             >,
-        > $crate::partial::PartiallyEvaluatableOperation<C> for $operation
+        > $crate::partial::PartiallyEvaluatableOperation<__C> for $operation
         {
         }
     };
@@ -458,10 +458,10 @@ macro_rules! define_arithmetic_dimension_capability {
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::programs::ProgramError>;
         }
 
-        impl<V: $crate::programs::values::Value<Type = $crate::types::DimensionType>> $capability for V
+        impl<__V: $crate::programs::values::Value<Type = $crate::types::DimensionType>> $capability for __V
         where
-            V::DispatchDomain: $crate::contexts::Context<Type = $crate::types::DimensionType>,
-            <V::DispatchDomain as $crate::contexts::Domain>::Operation: ::std::convert::From<$operation>,
+            __V::DispatchDomain: $crate::contexts::Context<Type = $crate::types::DimensionType>,
+            <__V::DispatchDomain as $crate::contexts::Domain>::Operation: ::std::convert::From<$operation>,
         {
             #[inline]
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::programs::ProgramError> {
@@ -632,24 +632,24 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<C> for $operation
+        impl<__C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<__C> for $operation
         where
-            Self: $crate::Operation<C::Type>,
+            Self: $crate::Operation<__C::Type>,
         {
             #[inline]
-            fn interpret<D: $crate::InterpretationDriver<C>>(
+            fn interpret<__D: $crate::InterpretationDriver<__C>>(
                 &self,
-                _context: &C,
-                _driver: &D,
-                inputs: &[C::Value],
-            ) -> Result<Vec<C::Value>, $crate::ProgramError> {
+                _context: &__C,
+                _driver: &__D,
+                inputs: &[__C::Value],
+            ) -> Result<Vec<__C::Value>, $crate::ProgramError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].$method()?])
             }
         }
 
-        impl<C: $crate::Context> $crate::PartiallyEvaluatableOperation<C> for $operation where
-            C::Operation: ::std::convert::From<$operation>
+        impl<__C: $crate::Context> $crate::PartiallyEvaluatableOperation<__C> for $operation where
+            __C::Operation: ::std::convert::From<$operation>
         {
         }
     };
@@ -744,24 +744,24 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<C> for $operation
+        impl<__C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<__C> for $operation
         where
-            Self: $crate::Operation<C::Type>,
+            Self: $crate::Operation<__C::Type>,
         {
             #[inline]
-            fn interpret<D: $crate::InterpretationDriver<C>>(
+            fn interpret<__D: $crate::InterpretationDriver<__C>>(
                 &self,
-                _context: &C,
-                _driver: &D,
-                inputs: &[C::Value],
-            ) -> Result<Vec<C::Value>, $crate::ProgramError> {
+                _context: &__C,
+                _driver: &__D,
+                inputs: &[__C::Value],
+            ) -> Result<Vec<__C::Value>, $crate::ProgramError> {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].$method(&inputs[1])?])
             }
         }
 
-        impl<C: $crate::Context> $crate::PartiallyEvaluatableOperation<C> for $operation where
-            C::Operation: ::std::convert::From<$operation>
+        impl<__C: $crate::Context> $crate::PartiallyEvaluatableOperation<__C> for $operation where
+            __C::Operation: ::std::convert::From<$operation>
         {
         }
     };
@@ -889,8 +889,8 @@ macro_rules! define_elementwise_capability {
             fn $method(&self) -> Result<Self, $crate::ProgramError>;
         }
 
-        impl<V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
-            $capability for V
+        impl<__V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
+            $capability for __V
         {
             #[inline]
             fn $method(&self) -> Result<Self, $crate::ProgramError> {
@@ -920,8 +920,8 @@ macro_rules! define_elementwise_capability {
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError>;
         }
 
-        impl<V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
-            $capability for V
+        impl<__V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
+            $capability for __V
         {
             #[inline]
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError> {
@@ -957,7 +957,7 @@ macro_rules! define_elementwise_capability {
 /// ```rust,ignore
 /// impl_differentiable_operation! {
 ///     LegacyBroadcastOperation,
-///     jvp<C> where C: Context<Type = ArrayType, Value: Broadcast> {
+///     jvp<C> where C: Context<Type = ArrayType, Value: LegacyBroadcast> {
 ///         |operation, _context, _driver, inputs| {
 ///             broadcast_jvp(operation, inputs)
 ///         }
@@ -1163,10 +1163,10 @@ macro_rules! impl_differentiable_operation {
             $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
             $($bounds)*
         {
-            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+            fn jvp<__D: $crate::DifferentiationDriver<$context>>(
                 &self,
                 $jvp_context: &$context,
-                $jvp_driver: &D,
+                $jvp_driver: &__D,
                 $inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
             ) -> Result<
                 Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
@@ -1193,10 +1193,10 @@ macro_rules! impl_differentiable_operation {
             $operation: $crate::Operation<<$value as $crate::Typed>::Type>,
             $($bounds)*
         {
-            fn transpose<D: $crate::TranspositionDriver<$value, $operations>>(
+            fn transpose<__D: $crate::TranspositionDriver<$value, $operations>>(
                 &self,
                 $context: &mut $crate::TracingContext<$value, $operations>,
-                $driver: &D,
+                $driver: &__D,
                 $inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
                 $outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
             ) -> Result<
@@ -1347,19 +1347,19 @@ macro_rules! impl_differentiable_elementwise_operation {
     (@constant $operation:ty $(,)?) => {
         $crate::impl_non_differentiable_operation!($operation);
 
-        impl<T: $crate::DifferentiableType, V: $crate::Value<Type = T>, O: $crate::Operation<T>>
-            $crate::TransposableOperation<V, O> for $operation
+        impl<__T: $crate::DifferentiableType, __V: $crate::Value<Type = __T>, __O: $crate::Operation<__T>>
+            $crate::TransposableOperation<__V, __O> for $operation
         where
-            $operation: $crate::Operation<T>,
+            $operation: $crate::Operation<__T>,
         {
-            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+            fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<V, O>,
-                _driver: &D,
-                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
-                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                _context: &mut $crate::TracingContext<__V, __O>,
+                _driver: &__D,
+                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
+                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
             ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
                 $crate::DifferentiationError,
             > {
                 $crate::check_count!("input", inputs, 1, ProgramError);
@@ -1705,21 +1705,21 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
 
         impl<
-            T: $($transpose_type_bound)+,
-            V: $crate::Value<Type = T>,
-            O: $crate::Operation<T> $($transpose_operation_bounds)*,
-        > $crate::TransposableOperation<V, O> for $operation
+            __T: $($transpose_type_bound)+,
+            __V: $crate::Value<Type = __T>,
+            __O: $crate::Operation<__T> $($transpose_operation_bounds)*,
+        > $crate::TransposableOperation<__V, __O> for $operation
         where
-            $operation: $crate::Operation<T>,
+            $operation: $crate::Operation<__T>,
         {
-            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+            fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<V, O>,
-                _driver: &D,
-                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
-                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                _context: &mut $crate::TracingContext<__V, __O>,
+                _driver: &__D,
+                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
+                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
             ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
                 $crate::DifferentiationError,
             > {
                 $crate::check_count!("input", inputs, 1, ProgramError);
@@ -1807,22 +1807,22 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
 
         impl<
-            T: $crate::DifferentiableType,
-            V: $crate::Value<Type = T>,
-            O: $crate::Operation<T> $($transpose_operation_bounds)*,
-        > $crate::TransposableOperation<V, O> for $operation
+            __T: $crate::DifferentiableType,
+            __V: $crate::Value<Type = __T>,
+            __O: $crate::Operation<__T> $($transpose_operation_bounds)*,
+        > $crate::TransposableOperation<__V, __O> for $operation
         where
-            $crate::Tracer<$crate::TracingContext<V, O>>: $crate::ElementwiseDerivativeAlignment<T>,
-            $operation: $crate::Operation<T>,
+            $crate::Tracer<$crate::TracingContext<__V, __O>>: $crate::ElementwiseDerivativeAlignment<__T>,
+            $operation: $crate::Operation<__T>,
         {
-            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+            fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<V, O>,
-                _driver: &D,
-                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
-                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                _context: &mut $crate::TracingContext<__V, __O>,
+                _driver: &__D,
+                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
+                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
             ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
                 $crate::DifferentiationError,
             > {
                 $crate::check_count!("input", inputs, 2, ProgramError);
@@ -1838,7 +1838,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                             })
                             .collect()),
                     $crate::MaybeZero::Value(cotangent) => {
-                        let operation_name = $crate::Operation::<T>::name(self);
+                        let operation_name = $crate::Operation::<__T>::name(self);
                         Ok(vec![
                             $crate::impl_differentiable_elementwise_operation!(
                         @linear_transpose_contribution $left_sign, operation_name, &inputs[0], cotangent
@@ -2281,20 +2281,20 @@ macro_rules! impl_non_differentiable_operation {
 
     // This internal helper emits the implementation shared by every public invocation form.
     (@impl [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
-        impl<C: $crate::Context $(, $generic)*> $crate::DifferentiableOperation<C> for $operation
+        impl<__C: $crate::Context $(, $generic)*> $crate::DifferentiableOperation<__C> for $operation
         where
-            C::Type: $crate::DifferentiableType,
-            C::Operation: ::std::convert::From<$operation>,
-            $operation: $crate::Operation<C::Type>,
+            __C::Type: $crate::DifferentiableType,
+            __C::Operation: ::std::convert::From<$operation>,
+            $operation: $crate::Operation<__C::Type>,
             $($bounds)*
         {
             #[inline]
-            fn jvp<D: $crate::DifferentiationDriver<C>>(
+            fn jvp<__D: $crate::DifferentiationDriver<__C>>(
                 &self,
-                context: &C,
-                _driver: &D,
-                inputs: &[$crate::DifferentiationDual<C::Value>],
-            ) -> Result<Vec<$crate::DifferentiationDual<C::Value>>, $crate::DifferentiationError> {
+                context: &__C,
+                _driver: &__D,
+                inputs: &[$crate::DifferentiationDual<__C::Value>],
+            ) -> Result<Vec<$crate::DifferentiationDual<__C::Value>>, $crate::DifferentiationError> {
                 // The outputs carry no tangent. We replay the primal operation on the input primals and pair each
                 // output with a structural zero tangent, which stays symbolic and stages nothing.
                 Ok($crate::Context::bind(
@@ -2327,24 +2327,24 @@ macro_rules! impl_non_differentiable_operation {
 macro_rules! impl_non_transposable_operation {
     // This branch generates the standard unsupported-transposition diagnostic for the selected operation.
     ($operation:ty $(,)?) => {
-        impl<T: $crate::Type, V: $crate::Value<Type = T>, O: $crate::Operation<T>> $crate::TransposableOperation<V, O>
-            for $operation
+        impl<__T: $crate::Type, __V: $crate::Value<Type = __T>, __O: $crate::Operation<__T>>
+            $crate::TransposableOperation<__V, __O> for $operation
         where
-            $operation: $crate::Operation<T>,
+            $operation: $crate::Operation<__T>,
         {
             #[inline]
-            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+            fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<V, O>,
-                _driver: &D,
-                _inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
-                _outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                _context: &mut $crate::TracingContext<__V, __O>,
+                _driver: &__D,
+                _inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
+                _outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
             ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
                 $crate::DifferentiationError,
             > {
                 Err($crate::ProgramError::UnsupportedOperation {
-                    message: format!("operation `{}` is not transposable", $crate::Operation::<T>::name(self)),
+                    message: format!("operation `{}` is not transposable", $crate::Operation::<__T>::name(self)),
                 }
                 .into())
             }
@@ -2355,9 +2355,9 @@ macro_rules! impl_non_transposable_operation {
 /// Implements the [`TransposableOperation`](crate::TransposableOperation) trait for a [`Region`](crate::Region)-less
 /// nullary [`Operation`](crate::Operation). The generated implementation validates that the operation application has
 /// no inputs, infers and validates its output count, and returns no operand cotangents. The optional leading generic
-/// list declares operation-specific type parameters; the macro supplies the standard `T`, `V`, and `O` transposition
-/// parameters and derives behavioral bounds from [`Operation<T>`](crate::Operation). An optional `where` clause can
-/// provide bounds required to make the operation type itself well-formed.
+/// list declares operation-specific type parameters; the macro supplies its internal transposition type, value,
+/// operation-family, and driver parameters and derives behavioral bounds from [`Operation`](crate::Operation). An
+/// optional `where` clause can provide bounds required to make the operation type itself well-formed.
 ///
 /// # Parameters
 ///
@@ -2388,25 +2388,25 @@ macro_rules! impl_nullary_transposable_operation {
 
     // This internal helper emits the transposition implementation shared by every public invocation form.
     (@impl [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
-        impl<T: $crate::Type, V: $crate::Value<Type = T>, O: $crate::Operation<T> $(, $generic)*>
-            $crate::TransposableOperation<V, O> for $operation
+        impl<__T: $crate::Type, __V: $crate::Value<Type = __T>, __O: $crate::Operation<__T> $(, $generic)*>
+            $crate::TransposableOperation<__V, __O> for $operation
         where
-            $operation: $crate::Operation<T>,
+            $operation: $crate::Operation<__T>,
             $($bounds)*
         {
             #[inline]
-            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+            fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<V, O>,
-                _driver: &D,
-                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
-                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                _context: &mut $crate::TracingContext<__V, __O>,
+                _driver: &__D,
+                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
+                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
             ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
                 $crate::DifferentiationError,
             > {
                 $crate::check_count!("input", inputs, 0, ProgramError);
-                let output_count = $crate::Operation::<T>::infer_output_types(self, &[], &[])?.len();
+                let output_count = $crate::Operation::<__T>::infer_output_types(self, &[], &[])?.len();
                 $crate::check_count!("output", outputs, output_count, ProgramError);
                 Ok(Vec::new())
             }
@@ -2453,18 +2453,19 @@ macro_rules! impl_nullary_batchable_operation {
 
     // This internal helper emits the replicated batching implementation shared by every public invocation form.
     (@impl_replicated [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
-        impl<C: $crate::Context<Type = $crate::ArrayType> $(, $generic)*> $crate::BatchableOperation<C> for $operation
+        impl<__C: $crate::Context<Type = $crate::ArrayType> $(, $generic)*> $crate::BatchableOperation<__C>
+            for $operation
         where
-            $operation: $crate::InterpretableOperation<C>,
+            $operation: $crate::InterpretableOperation<__C>,
             $($bounds)*
         {
             #[inline]
-            fn batch<D: $crate::BatchingDriver<C>>(
+            fn batch<__D: $crate::BatchingDriver<__C>>(
                 &self,
-                context: &$crate::BatchingContext<C>,
-                _driver: &D,
-                inputs: &[$crate::ArrayBatch<C::Value>],
-            ) -> Result<Vec<$crate::ArrayBatch<C::Value>>, $crate::BatchingError> {
+                context: &$crate::BatchingContext<__C>,
+                _driver: &__D,
+                inputs: &[$crate::ArrayBatch<__C::Value>],
+            ) -> Result<Vec<$crate::ArrayBatch<__C::Value>>, $crate::BatchingError> {
                 $crate::check_count!("input", inputs, 0, ProgramError);
                 Ok($crate::InterpretableOperation::interpret(
                     self,
@@ -2519,12 +2520,12 @@ macro_rules! impl_nullary_batchable_operation {
 macro_rules! define_tracer_operator {
     // This branch implements receiver-only operator syntax for every transform tracer family.
     (@unary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
-        impl<T: $crate::Type, V> $trait for $crate::ProjectedValue<T, V>
+        impl<__T: $crate::Type, __V> $trait for $crate::ProjectedValue<__T, __V>
         where
-            $crate::ProjectedValue<T, V>: $crate::Value<Type = T>,
-            <$crate::ProjectedValue<T, V> as $crate::Value>::DispatchDomain: $crate::Context<
-                    Type = T,
-                    Value = $crate::ProjectedValue<T, V>,
+            $crate::ProjectedValue<__T, __V>: $crate::Value<Type = __T>,
+            <$crate::ProjectedValue<__T, __V> as $crate::Value>::DispatchDomain: $crate::Context<
+                    Type = __T,
+                    Value = $crate::ProjectedValue<__T, __V>,
                     Operation: ::std::convert::From<$operation>,
                 >,
         {
@@ -2543,7 +2544,9 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait for $crate::Tracer<C> {
+        impl<__C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait
+            for $crate::Tracer<__C>
+        {
             type Output = Self;
 
             #[inline]
@@ -2552,10 +2555,10 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::Context> $trait for $crate::PartialTracer<C>
+        impl<__C: $crate::Context> $trait for $crate::PartialTracer<__C>
         where
-            $crate::PartialEvaluationContext<C>:
-                $crate::Context<Value = $crate::PartialTracer<C>, Operation: ::std::convert::From<$operation>>,
+            $crate::PartialEvaluationContext<__C>:
+                $crate::Context<Value = $crate::PartialTracer<__C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
 
@@ -2567,10 +2570,10 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<C>
+        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C>
         where
-            $crate::BatchingContext<C>:
-                $crate::Context<Value = $crate::BatchingTracer<C>, Operation: ::std::convert::From<$operation>>,
+            $crate::BatchingContext<__C>:
+                $crate::Context<Value = $crate::BatchingTracer<__C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
 
@@ -2582,10 +2585,12 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::Context> $trait for $crate::DifferentiationTracer<C>
+        impl<__C: $crate::Context> $trait for $crate::DifferentiationTracer<__C>
         where
-            $crate::DifferentiationContext<C>:
-                $crate::Context<Value = $crate::DifferentiationTracer<C>, Operation: ::std::convert::From<$operation>>,
+            $crate::DifferentiationContext<__C>: $crate::Context<
+                    Value = $crate::DifferentiationTracer<__C>,
+                    Operation: ::std::convert::From<$operation>,
+                >,
         {
             type Output = Self;
 
@@ -2600,13 +2605,13 @@ macro_rules! define_tracer_operator {
 
     // This binary form statically selects and constructs a type-family-specific operation through a provider.
     (@binary $trait:path, $method:ident, provider = $provider:path, $message:literal $(,)?) => {
-        impl<T: $crate::Type + $provider, V> $trait for $crate::ProjectedValue<T, V>
+        impl<__T: $crate::Type + $provider, __V> $trait for $crate::ProjectedValue<__T, __V>
         where
-            $crate::ProjectedValue<T, V>: $crate::Value<Type = T>,
-            <$crate::ProjectedValue<T, V> as $crate::Value>::DispatchDomain: $crate::Context<
-                    Type = T,
-                    Value = $crate::ProjectedValue<T, V>,
-                    Operation: ::std::convert::From<<T as $provider>::Operation>,
+            $crate::ProjectedValue<__T, __V>: $crate::Value<Type = __T>,
+            <$crate::ProjectedValue<__T, __V> as $crate::Value>::DispatchDomain: $crate::Context<
+                    Type = __T,
+                    Value = $crate::ProjectedValue<__T, __V>,
+                    Operation: ::std::convert::From<<__T as $provider>::Operation>,
                 >,
         {
             type Output = Self;
@@ -2615,7 +2620,7 @@ macro_rules! define_tracer_operator {
             fn $method(self, right: Self) -> Self {
                 let left_type = $crate::Typed::r#type(&self);
                 let right_type = $crate::Typed::r#type(&right);
-                let operation = <T as $provider>::operation(left_type.as_ref(), right_type.as_ref())
+                let operation = <__T as $provider>::operation(left_type.as_ref(), right_type.as_ref())
                     .unwrap_or_else(|error| panic!("{error}"));
                 $crate::Context::bind(
                     &$crate::Value::dispatch_domain(&self),
@@ -2628,10 +2633,10 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::StagingContext> $trait for $crate::Tracer<C>
+        impl<__C: $crate::StagingContext> $trait for $crate::Tracer<__C>
         where
-            C::Type: $provider,
-            C::Operation: ::std::convert::From<<C::Type as $provider>::Operation>,
+            __C::Type: $provider,
+            __C::Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
         {
             type Output = Self;
 
@@ -2639,7 +2644,7 @@ macro_rules! define_tracer_operator {
             fn $method(self, right: Self) -> Self {
                 let left_type = $crate::Typed::r#type(&self);
                 let right_type = $crate::Typed::r#type(&right);
-                match <C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref()) {
+                match <__C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref()) {
                     Ok(operation) => self.binary(&right, operation),
                     Err(error) => {
                         $crate::StagingContext::error(self.context(), error);
@@ -2649,12 +2654,12 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::Context> $trait for $crate::PartialTracer<C>
+        impl<__C: $crate::Context> $trait for $crate::PartialTracer<__C>
         where
-            C::Type: $provider,
-            $crate::PartialEvaluationContext<C>: $crate::Context<
-                    Value = $crate::PartialTracer<C>,
-                    Operation: ::std::convert::From<<C::Type as $provider>::Operation>,
+            __C::Type: $provider,
+            $crate::PartialEvaluationContext<__C>: $crate::Context<
+                    Value = $crate::PartialTracer<__C>,
+                    Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
                 >,
         {
             type Output = Self;
@@ -2663,7 +2668,7 @@ macro_rules! define_tracer_operator {
             fn $method(self, right: Self) -> Self {
                 let left_type = $crate::Typed::r#type(&self);
                 let right_type = $crate::Typed::r#type(&right);
-                let operation = <C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
+                let operation = <__C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
                     .unwrap_or_else(|error| panic!("{error}"));
                 $crate::Context::bind(self.context(), operation, Vec::new(), &[self.clone(), right.clone()])
                     .expect($message)
@@ -2671,12 +2676,12 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<C>
+        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C>
         where
-            C::Type: $provider,
-            $crate::BatchingContext<C>: $crate::Context<
-                    Value = $crate::BatchingTracer<C>,
-                    Operation: ::std::convert::From<<C::Type as $provider>::Operation>,
+            __C::Type: $provider,
+            $crate::BatchingContext<__C>: $crate::Context<
+                    Value = $crate::BatchingTracer<__C>,
+                    Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
                 >,
         {
             type Output = Self;
@@ -2685,7 +2690,7 @@ macro_rules! define_tracer_operator {
             fn $method(self, right: Self) -> Self {
                 let left_type = $crate::Typed::r#type(&self);
                 let right_type = $crate::Typed::r#type(&right);
-                let operation = <C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
+                let operation = <__C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
                     .unwrap_or_else(|error| panic!("{error}"));
                 $crate::Context::bind(self.context(), operation, Vec::new(), &[self.clone(), right.clone()])
                     .expect($message)
@@ -2693,12 +2698,12 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::Context> $trait for $crate::DifferentiationTracer<C>
+        impl<__C: $crate::Context> $trait for $crate::DifferentiationTracer<__C>
         where
-            C::Type: $provider,
-            $crate::DifferentiationContext<C>: $crate::Context<
-                    Value = $crate::DifferentiationTracer<C>,
-                    Operation: ::std::convert::From<<C::Type as $provider>::Operation>,
+            __C::Type: $provider,
+            $crate::DifferentiationContext<__C>: $crate::Context<
+                    Value = $crate::DifferentiationTracer<__C>,
+                    Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
                 >,
         {
             type Output = Self;
@@ -2707,7 +2712,7 @@ macro_rules! define_tracer_operator {
             fn $method(self, right: Self) -> Self {
                 let left_type = $crate::Typed::r#type(&self);
                 let right_type = $crate::Typed::r#type(&right);
-                let operation = <C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
+                let operation = <__C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
                     .unwrap_or_else(|error| panic!("{error}"));
                 $crate::Context::bind(self.context(), operation, Vec::new(), &[self.clone(), right.clone()])
                     .expect($message)
@@ -2718,12 +2723,12 @@ macro_rules! define_tracer_operator {
 
     // This branch implements two-operand operator syntax for every transform tracer family.
     (@binary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
-        impl<T: $crate::Type, V> $trait for $crate::ProjectedValue<T, V>
+        impl<__T: $crate::Type, __V> $trait for $crate::ProjectedValue<__T, __V>
         where
-            $crate::ProjectedValue<T, V>: $crate::Value<Type = T>,
-            <$crate::ProjectedValue<T, V> as $crate::Value>::DispatchDomain: $crate::Context<
-                    Type = T,
-                    Value = $crate::ProjectedValue<T, V>,
+            $crate::ProjectedValue<__T, __V>: $crate::Value<Type = __T>,
+            <$crate::ProjectedValue<__T, __V> as $crate::Value>::DispatchDomain: $crate::Context<
+                    Type = __T,
+                    Value = $crate::ProjectedValue<__T, __V>,
                     Operation: ::std::convert::From<$operation>,
                 >,
         {
@@ -2742,7 +2747,9 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait for $crate::Tracer<C> {
+        impl<__C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait
+            for $crate::Tracer<__C>
+        {
             type Output = Self;
 
             #[inline]
@@ -2751,10 +2758,10 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::Context> $trait for $crate::PartialTracer<C>
+        impl<__C: $crate::Context> $trait for $crate::PartialTracer<__C>
         where
-            $crate::PartialEvaluationContext<C>:
-                $crate::Context<Value = $crate::PartialTracer<C>, Operation: ::std::convert::From<$operation>>,
+            $crate::PartialEvaluationContext<__C>:
+                $crate::Context<Value = $crate::PartialTracer<__C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
 
@@ -2766,10 +2773,10 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<C>
+        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C>
         where
-            $crate::BatchingContext<C>:
-                $crate::Context<Value = $crate::BatchingTracer<C>, Operation: ::std::convert::From<$operation>>,
+            $crate::BatchingContext<__C>:
+                $crate::Context<Value = $crate::BatchingTracer<__C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
 
@@ -2781,10 +2788,12 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<C: $crate::Context> $trait for $crate::DifferentiationTracer<C>
+        impl<__C: $crate::Context> $trait for $crate::DifferentiationTracer<__C>
         where
-            $crate::DifferentiationContext<C>:
-                $crate::Context<Value = $crate::DifferentiationTracer<C>, Operation: ::std::convert::From<$operation>>,
+            $crate::DifferentiationContext<__C>: $crate::Context<
+                    Value = $crate::DifferentiationTracer<__C>,
+                    Operation: ::std::convert::From<$operation>,
+                >,
         {
             type Output = Self;
 
@@ -4113,16 +4122,19 @@ macro_rules! check_gradient {
         // an infallible function.
 
         fn pin_traced<
-            F: Fn(
+            __F: Fn(
                 $crate::differentiation::LinearizationTracer<$crate::contexts::EagerContext<$value, $operation>>,
-            ) -> Output,
-            Output,
-        >(function: F) -> F {
+            ) -> __Output,
+            __Output,
+        >(function: __F) -> __F {
             function
         }
 
-        fn pin_eager<F: Fn($value) -> Output, Output: $crate::MaybeFallible<$value, $crate::ProgramError>>(
-            function: F,
+        fn pin_eager<
+            __F: Fn($value) -> __Output,
+            __Output: $crate::MaybeFallible<$value, $crate::ProgramError>,
+        >(
+            function: __F,
         ) -> impl Fn($value) -> $value {
             move |input| {
                 $crate::MaybeFallible::into_result(function(input)).unwrap_or_else(|error| panic!("{error}"))
@@ -4769,9 +4781,9 @@ mod tests {
         }
     }
 
-    impl_non_differentiable_operation!(<Marker> TestGenericNullaryOperation<Marker>);
-    impl_nullary_transposable_operation!(<Marker> TestGenericNullaryOperation<Marker>);
-    impl_nullary_batchable_operation!(@replicated <Marker> TestGenericNullaryOperation<Marker>);
+    impl_non_differentiable_operation!(<C> TestGenericNullaryOperation<C>);
+    impl_nullary_transposable_operation!(<T> TestGenericNullaryOperation<T>);
+    impl_nullary_batchable_operation!(@replicated <D> TestGenericNullaryOperation<D>);
 
     /// Generic nullary operation used to instantiate generic-plus-`where` macro forms.
     struct TestBoundedNullaryOperation<Marker>(PhantomData<fn() -> Marker>);
@@ -4821,9 +4833,9 @@ mod tests {
         }
     }
 
-    impl_non_differentiable_operation!(<Marker> TestBoundedNullaryOperation<Marker> where Marker: Clone);
-    impl_nullary_transposable_operation!(<Marker> TestBoundedNullaryOperation<Marker> where Marker: Clone);
-    impl_nullary_batchable_operation!(@replicated <Marker> TestBoundedNullaryOperation<Marker> where Marker: Clone);
+    impl_non_differentiable_operation!(<V> TestBoundedNullaryOperation<V> where V: Clone);
+    impl_nullary_transposable_operation!(<O> TestBoundedNullaryOperation<O> where O: Clone);
+    impl_nullary_batchable_operation!(@replicated <C> TestBoundedNullaryOperation<C> where C: Clone);
 
     #[test]
     fn test_check_count() {
@@ -5407,7 +5419,7 @@ mod tests {
     fn test_check_operation_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            backend = (Array, crate::backends::arrays::ArrayOperation<Array>),
+            backend = (Array, ArrayOperation<Array>),
             operation = MulOperation,
             cases = [
                 {
@@ -5438,7 +5450,7 @@ mod tests {
     fn test_check_operation_transposition() {
         check_operation_transposition!(
             @exact,
-            backend = (Array, crate::backends::arrays::ArrayOperation<Array>),
+            backend = (Array, ArrayOperation<Array>),
             operation = MulOperation,
             cases = [{
                 inputs = [

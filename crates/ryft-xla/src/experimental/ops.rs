@@ -18,8 +18,7 @@ use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, Dot
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{
-    ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, Zero, ZeroLikeOperation,
-    ZeroOperation,
+    ConstantOperation, IotaOperation, OneLikeOperation, OneOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
 use ryft_core::operations::custom_call::CustomCallOperation;
@@ -49,8 +48,7 @@ use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, Pro
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::axes::AxisIndexOperation;
-use ryft_core::backends::arrays::ArrayOperation;
-use ryft_core::backends::scalars::Scalar;
+use ryft_core::backends::arrays::{Array as ReferenceArray, ArrayOperation};
 use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::operations::collectives::{
     AllGatherOperation, AllToAllOperation, CollectiveOperation, PSumScatterOperation, PpermuteOperation,
@@ -82,9 +80,8 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
     OneLike(OneLikeOperation),
-    Constant(ConstantOperation<V>),
+    Constant(ConstantOperation<ReferenceArray>),
     ConvertElementType(ConvertElementTypeOperation),
-    Fill(FillOperation<ArrayType, Scalar>),
     Iota(IotaOperation<ArrayType>),
     CoordinateBasis(CoordinateBasisOperation<ArrayType>),
     Neg(NegOperation),
@@ -194,7 +191,6 @@ where
             ArrayOperation::OneLike(operation) => Self::OneLike(operation),
             ArrayOperation::Constant(operation) => Self::Constant(operation),
             ArrayOperation::ConvertElementType(operation) => Self::ConvertElementType(operation),
-            ArrayOperation::Fill(operation) => Self::Fill(operation),
             ArrayOperation::Iota(operation) => Self::Iota(operation),
             ArrayOperation::CoordinateBasis(operation) => Self::CoordinateBasis(operation),
             ArrayOperation::Neg(operation) => Self::Neg(operation),

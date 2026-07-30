@@ -21,7 +21,7 @@ use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::control_flow::{Select, SelectOperation};
 use crate::operations::manipulation::conversion::ElementType;
-use crate::operations::manipulation::{Broadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
@@ -800,7 +800,7 @@ fn reconcile_branch<C: Context>(
 impl<C, O> BatchableOperation<C> for ConditionOperation<C::Constant>
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: Concretizable<bool> + Broadcast + Transpose + Select,
+    <C as Domain>::Value: Concretizable<bool> + LegacyBroadcast + Transpose + Select,
     O: Operation<ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
@@ -913,7 +913,7 @@ pub(crate) fn batch_condition_with_interpreter<C, F>(
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
-    C::Value: Broadcast + Transpose + Select,
+    C::Value: LegacyBroadcast + Transpose + Select,
     C::Operation: From<LegacyBroadcastOperation> + From<SelectOperation> + From<TransposeOperation>,
     F: FnMut(usize, Vec<ArrayBatch<C::Value>>) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>,
 {

@@ -13,7 +13,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroOperation};
-use crate::operations::manipulation::{Broadcast, Reshape, Slice, Transpose, UpdateSlice};
+use crate::operations::manipulation::{LegacyBroadcast, Reshape, Slice, Transpose, UpdateSlice};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
@@ -388,7 +388,7 @@ where
 impl<C> BatchableOperation<C> for GatherOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
+    C::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     GatherOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C>>(

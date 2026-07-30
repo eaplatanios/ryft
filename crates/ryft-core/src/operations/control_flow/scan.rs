@@ -21,7 +21,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::manipulation::{
-    Broadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Reshape, Slice, SliceOperation, Transpose,
+    LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Reshape, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::parameters::Placeholder;
@@ -1395,7 +1395,7 @@ where
 impl<C> BatchableOperation<C> for ScanOperation<C::Constant>
 where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
-    <C as Domain>::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    <C as Domain>::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape,
     C::Operation: From<ZeroOperation<ArrayType>>
         + From<LegacyBroadcastOperation>
         + From<TransposeOperation>

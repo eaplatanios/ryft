@@ -3855,7 +3855,7 @@ mod tests {
     #[test]
     fn test_shard_map_axis_index_lowers_to_partition_id_coordinate_and_executes_on_cpu() {
         use ryft_core::axes::AxisIndex;
-        use ryft_core::operations::manipulation::Broadcast;
+        use ryft_core::operations::manipulation::LegacyBroadcast;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -3887,7 +3887,7 @@ mod tests {
                             // shape-congruent operands (StableHLO has no implicit broadcasting).
                             let local_type = local_x.r#type().into_owned();
                             let index = local_x.context().axis_index("x").unwrap();
-                            let index = index.broadcast(local_type, &[]).unwrap();
+                            let index = index.legacy_broadcast(local_type, &[]).unwrap();
                             local_x + index
                         },
                         x,
@@ -3970,7 +3970,7 @@ mod tests {
     #[test]
     fn test_shard_map_axis_index_of_major_mesh_axis_lowers_to_divide_and_remainder() {
         use ryft_core::axes::AxisIndex;
-        use ryft_core::operations::manipulation::Broadcast;
+        use ryft_core::operations::manipulation::LegacyBroadcast;
 
         // A 2x2 mesh: `axis_index("x")` addresses the major axis (row-major stride 2, size 2), so the device
         // coordinate is `(partition_id / 2) % 2` — exercising both the divide and the remainder that a single-axis
@@ -3992,7 +3992,7 @@ mod tests {
                         |local_x: ShardMapTracer| {
                             let local_type = local_x.r#type().into_owned();
                             let index = local_x.context().axis_index("x").unwrap();
-                            index.broadcast(local_type, &[]).unwrap()
+                            index.legacy_broadcast(local_type, &[]).unwrap()
                         },
                         x,
                         mesh.clone(),

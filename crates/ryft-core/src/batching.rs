@@ -82,7 +82,7 @@ use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolu
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::ElementwiseOperation;
-use crate::operations::manipulation::{Broadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
@@ -432,7 +432,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
     where
-        V: Broadcast,
+        V: LegacyBroadcast,
     {
         if !self.batch_axis().is_replicated() {
             return Err(BatchingError::MisalignedBatchAxes {
@@ -459,7 +459,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         let output_axes = (0..per_item_type.rank())
             .map(|dimension| if dimension < position { dimension } else { dimension + 1 })
             .collect::<Vec<_>>();
-        let broadcasted = self.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
+        let broadcasted = self.value().clone().legacy_broadcast(physical_type.clone(), output_axes.as_slice())?;
         ArrayBatch::new(physical_type, broadcasted, axis)
     }
 
@@ -514,7 +514,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
     where
-        V: Broadcast + Transpose,
+        V: LegacyBroadcast + Transpose,
     {
         let axis = axis.into();
         if self.batch_axis().is_replicated() {
@@ -544,7 +544,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
     where
-        V: Broadcast + Transpose,
+        V: LegacyBroadcast + Transpose,
     {
         // Signed declaration normalization is owned by the delegates: `move_axis` normalizes against the (unchanged)
         // physical rank and `broadcast` against the physical output rank gaining the batch dimension.
@@ -907,8 +907,10 @@ pub trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType>
 // temporarily realigned to leading physical axis `0`. Every input is then broadcast to the common per-item shape with
 // the batch axis inserted there. Operands whose per-item shapes are not broadcast-compatible are left at their
 // batch-axis-inserted shapes so the operation surfaces its own shape error.
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseOperation + InterpretableOperation<C>>
-    BatchableOperation<C> for O
+impl<
+    C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>,
+    O: ElementwiseOperation + InterpretableOperation<C>,
+> BatchableOperation<C> for O
 {
     fn batch<D: BatchingDriver<C>>(
         &self,
@@ -1005,7 +1007,8 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseO
                         if position < batch_axis_position { position } else { position + 1 }
                     })
                     .collect::<Vec<_>>();
-                let broadcasted = input.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
+                let broadcasted =
+                    input.value().clone().legacy_broadcast(physical_type.clone(), output_axes.as_slice())?;
                 ArrayBatch::new(physical_type, broadcasted, batch_axis)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1520,7 +1523,7 @@ impl<
 /// documentation of the [`batch`] function for information on what the batching transform does and how to use it. This
 /// trait serves the call sites that must name the [`Context`] explicitly (most notably inputs with no values to recover
 /// a context from).
-pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
+pub trait Batch: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose> {
     /// Batches `function` over the mapped axes of `input`, with this [`Context`] executing (or staging) the batched
     /// operations. Refer to the documentation of the [`batch`] function for information on the batching transform and
     /// its arguments. Unlike that function, this method also serves inputs with no leaf values (i.e., that are empty),
@@ -1547,7 +1550,7 @@ pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
             return Err(BatchingError::EmptyBatch);
         }
 
-        // Broadcast the caller's `input_batch_axes` into the input parameter structure. A single `BatchAxis` leaf fills
+        // LegacyBroadcast the caller's `input_batch_axes` into the input parameter structure. A single `BatchAxis` leaf fills
         // every input leaf, a matching structure gives one axis per leaf, and a smaller compatible structure broadcasts
         // based on its prefixes. A structure that cannot fill the input surfaces as a `ParameterError`.
         let input_batch_axes = input_batch_axes
@@ -1623,7 +1626,8 @@ pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
                     // Use an identity-shaped value broadcast instead of changing only `ArrayBatch`'s stored type. The
                     // value capability can therefore realize or stage the placement transition for the active backend.
                     let output_axes = (0..batch.r#type().rank()).collect::<Vec<_>>();
-                    let value = batch.value.clone().broadcast(normalized_type.clone(), output_axes.as_slice())?;
+                    let value =
+                        batch.value.clone().legacy_broadcast(normalized_type.clone(), output_axes.as_slice())?;
                     ArrayBatch::new(normalized_type, value, batch.batch_axis)?
                 } else {
                     batch
@@ -1634,7 +1638,7 @@ pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
         let input = I::To::<BatchingTracer<Self>>::from_parameters(input_structure, inputs)?;
         let output = function(input)?;
 
-        // Broadcast the caller's `output_batch_axes` into the output parameter structure, mirroring the
+        // LegacyBroadcast the caller's `output_batch_axes` into the output parameter structure, mirroring the
         // `input_batch_axes` handling above. A single `BatchAxis` leaf applies to every output, and a matching
         // structure gives one axis per leaf.
         let output_structure = output.parameter_structure();
@@ -1663,7 +1667,7 @@ pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> Batch for C {}
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> Batch for C {}
 
 /// Batches the provided `function` over the mapped axes of `input`, running it once over whole batches instead of once
 /// per batch item. This is the batching (i.e., vectorization) transform and the analogue of
@@ -1707,7 +1711,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> Batch for C {}
 ///     batch axis name.
 #[inline]
 pub fn batch<
-    V: Value<Type = ArrayType, ExecutionDomain: Context> + Broadcast + Transpose,
+    V: Value<Type = ArrayType, ExecutionDomain: Context> + LegacyBroadcast + Transpose,
     F: FnOnce(I::To<BatchingTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
     I: Parameterized<V, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<V::ExecutionDomain>>>,
     O: Parameterized<BatchingTracer<V::ExecutionDomain>, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>>,
@@ -2543,7 +2547,7 @@ mod tests {
 
     #[test]
     fn test_value_and_gradient_flow_through_batch_staged_broadcast() {
-        // The scalar input is replicated inside the batch, so the elementwise batching rule stages a `Broadcast` on
+        // The scalar input is replicated inside the batch, so the elementwise batching rule stages a `LegacyBroadcast` on
         // the differentiated value; the gradient must flow back through the broadcast's transpose rule (a sum-reduction
         // over the batch axis).
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()

@@ -2,7 +2,7 @@ use ryft_core::contexts::Context;
 use ryft_core::macros::check_count;
 use ryft_core::operations::control_flow::{Select, WhilePredicate};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
-use ryft_core::operations::manipulation::Broadcast;
+use ryft_core::operations::manipulation::LegacyBroadcast;
 use ryft_core::operations::manipulation::conversion::ElementType;
 use ryft_core::operations::math::{Add, Div, Mul, Neg, Sub};
 use ryft_core::programs::types::Typed;
@@ -126,7 +126,7 @@ impl WhilePredicate for Array<'_> {
         } else {
             let output_type = on_true.r#type().with_element_type(DataType::Boolean);
             let output_axes = (0..self.r#type().rank()).collect::<Vec<_>>();
-            self.broadcast(output_type, output_axes.as_slice())?
+            self.legacy_broadcast(output_type, output_axes.as_slice())?
         };
         Select::select(&condition, on_true, on_false)
     }
@@ -1622,7 +1622,7 @@ mod tests {
 
         // Broadcasting maps the input axis onto the trailing output axis.
         let broadcast_type = replicated_type(&mesh, DataType::F32, &[2, 6]);
-        let broadcast = concatenated.broadcast(broadcast_type, &[1]).unwrap();
+        let broadcast = concatenated.legacy_broadcast(broadcast_type, &[1]).unwrap();
         assert_eq!(broadcast.shape(), StaticShape::new(vec![2, 6]));
         assert_eq!(read_f32s(&broadcast), vec![1.0, 2.0, 3.0, 4.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 2.0, 3.0],);
 

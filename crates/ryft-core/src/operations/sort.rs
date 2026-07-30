@@ -9,7 +9,7 @@ use crate::differentiation::{DifferentiableType, DifferentiationDual, Differenti
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::impl_differentiable_operation;
 use crate::operations::constants::IotaOperation;
-use crate::operations::manipulation::{Broadcast, Reshape, Slice, Transpose};
+use crate::operations::manipulation::{LegacyBroadcast, Reshape, Slice, Transpose};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
@@ -246,7 +246,7 @@ impl_differentiable_operation! {
 /// Batching rule for [`SortOperation`]: every mapped operand's batch axis moves to the leading physical position,
 /// replicated operands broadcast to the batched physical shape (all sort operands must agree on shape), and the
 /// sort axis lifts past the inserted leading batch dimension while the `key_count` carries through unchanged.
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchableOperation<C> for SortOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchableOperation<C> for SortOperation
 where
     SortOperation: InterpretableOperation<C>,
 {
@@ -276,7 +276,8 @@ where
                     );
                 }
                 let output_axes = (1..physical_type.rank()).collect::<Vec<_>>();
-                let broadcasted = input.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
+                let broadcasted =
+                    input.value().clone().legacy_broadcast(physical_type.clone(), output_axes.as_slice())?;
                 ArrayBatch::new(physical_type, broadcasted, 0)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -547,7 +548,7 @@ where
             .with_sharding(sharding.clone())
             .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
     }
-    let indices = value.dispatch_domain().bind(IotaOperation::new(iota_type, axis), Vec::new(), &[])?.remove(0);
+    let indices = value.dispatch_domain().bind(IotaOperation::new(iota_type, axis)?, Vec::new(), &[])?.remove(0);
     Ok((indices, dimensions))
 }
 

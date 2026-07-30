@@ -21,8 +21,8 @@ use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::dimensions::{DimensionSizeOperation, DimensionToScalarOperation};
 use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, PadOperation, ReshapeOperation,
-    Transpose,
+    BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, LegacyBroadcast, PadOperation,
+    ReshapeOperation, Transpose,
 };
 use crate::operations::random::RngBitGeneratorOperation;
 use crate::parameters::Parameter;
@@ -330,7 +330,7 @@ where
 // TODO(eaplatanios): Move this to the module where `ConcatenateOperation` is defined.
 impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for ConcatenateOperation
 where
-    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<ConcatenateOperation>,
 {
     fn batch<D: RegionDriver<C::Constant, C::Operation>>(
@@ -436,7 +436,7 @@ impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for 
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
-    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<BroadcastOperation>
         + From<PadOperation>
         + OperationProjection<
@@ -609,7 +609,7 @@ where
             Constant: ValueProjection<ArrayType, Projected = A>
                           + ValueProjection<DimensionType, Projected = DimensionValue>,
         >,
-    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>
+    C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     C::Operation: From<ArrayProgramOperation<A>>
         + From<BroadcastOperation>
@@ -972,13 +972,16 @@ mod tests {
         assert_eq!(dynamic_one_output[0].value(), &ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0])),);
 
         let extent_value = DimensionValue::constant(3).unwrap();
-        let dynamic_iota = ArrayProgramOperation::<Array>::from(IotaOperation::new(
-            ArrayType::new(
-                DataType::I32,
-                Shape::new(vec![Dimension::Dynamic(extent_value.r#type().variable().clone())]),
-            ),
-            0,
-        ));
+        let dynamic_iota = ArrayProgramOperation::<Array>::from(
+            IotaOperation::new(
+                ArrayType::new(
+                    DataType::I32,
+                    Shape::new(vec![Dimension::Dynamic(extent_value.r#type().variable().clone())]),
+                ),
+                0,
+            )
+            .unwrap(),
+        );
         let dynamic_iota_output = dynamic_iota
             .batch(
                 &context,

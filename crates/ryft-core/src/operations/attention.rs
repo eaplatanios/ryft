@@ -13,7 +13,7 @@ use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{Fill, Iota, Zero, ZeroOperation};
 use crate::operations::control_flow::Select;
 use crate::operations::logical::And;
-use crate::operations::manipulation::{Broadcast, ConvertElementType, Reshape, Transpose};
+use crate::operations::manipulation::{ConvertElementType, LegacyBroadcast, Reshape, Transpose};
 use crate::operations::math::{Add, Div, Dot, DotDimensionNumbers, Exp, Log, Mul, Reduce, ReductionKind, Sub};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::operations::{Operation, OperationFormatter};
@@ -925,7 +925,7 @@ fn batch_attention_merge_reshape<C, O>(
     bias_cotangent_index: Option<usize>,
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
-    C: Context<Type = ArrayType, Value: Broadcast + Reduce + Reshape + Transpose>,
+    C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>,
     O: Operation<ArrayType> + InterpretableBatchableOperation<C>,
 {
     let output_count = |input_types: &[ArrayType]| -> Result<usize, BatchingError> {
@@ -969,7 +969,7 @@ where
                 let materialized_type =
                     ArrayType::new(aligned.r#type().data_type(), static_shape(materialized_dimensions.as_slice()));
                 let identity_axes = (0..dimensions.len()).collect::<Vec<_>>();
-                value = value.broadcast(materialized_type, identity_axes.as_slice())?;
+                value = value.legacy_broadcast(materialized_type, identity_axes.as_slice())?;
                 dimensions = materialized_dimensions;
                 materialized_bias_batch = true;
             }
@@ -1011,7 +1011,7 @@ where
 
 /// Batching rule for [`DotProductAttentionOperation`]: one mapped batch level folds into the operation's own batch
 /// dimension via the shared merge-reshape rule; refer to [`batch_attention_merge_reshape`].
-impl<C: Context<Type = ArrayType, Value: Broadcast + Reduce + Reshape + Transpose>> BatchableOperation<C>
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>> BatchableOperation<C>
     for DotProductAttentionOperation
 where
     DotProductAttentionOperation: InterpretableOperation<C>,
@@ -1030,7 +1030,7 @@ where
 /// Batching rule for [`DotProductAttentionBackwardOperation`]: the same merge-reshape rule as the forward
 /// operation, additionally restoring a broadcast bias-cotangent batch dimension; refer to
 /// [`batch_attention_merge_reshape`].
-impl<C: Context<Type = ArrayType, Value: Broadcast + Reduce + Reshape + Transpose>> BatchableOperation<C>
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>> BatchableOperation<C>
     for DotProductAttentionBackwardOperation
 where
     DotProductAttentionBackwardOperation: InterpretableOperation<C>,
@@ -1411,7 +1411,7 @@ where
 /// already carry one key/value head per query head are returned unchanged.
 fn expand_key_value_heads<V>(operand: &V, dimensions: &AttentionDimensions) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + Broadcast + Reshape,
+    V: Value<Type = ArrayType> + LegacyBroadcast + Reshape,
 {
     if dimensions.key_value_heads == dimensions.query_heads {
         return Ok(operand.clone());
@@ -1427,7 +1427,7 @@ where
             dimensions.head_dimension,
         ]),
     );
-    operand.broadcast(expanded_type, &[0, 1, 2, 4])?.reshape(static_shape(&[
+    operand.legacy_broadcast(expanded_type, &[0, 1, 2, 4])?.reshape(static_shape(&[
         dimensions.batch,
         dimensions.key_value_sequence,
         dimensions.query_heads,
@@ -1452,7 +1452,7 @@ fn apply_attention_masks<C, V>(
     masked_fill: &V,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + And + Broadcast + Compare<V> + Select + Sub,
+    V: Value<Type = ArrayType> + And + LegacyBroadcast + Compare<V> + Select + Sub,
     C: Fill<Scalar, V> + Iota<V>,
 {
     if mask == AttentionMask::None && key_value_sequence_lengths.is_none() {
@@ -1474,7 +1474,7 @@ where
     }
     if let Some(lengths) = key_value_sequence_lengths {
         // The `[batch]` lengths broadcast against the `[batch, heads, q_seq, kv_seq]` column indices.
-        let bounds = lengths.broadcast(index_type, &[0])?;
+        let bounds = lengths.legacy_broadcast(index_type, &[0])?;
         let in_range = columns.compare(&bounds, ComparisonDirection::LessThan)?;
         visible = Some(match visible {
             None => in_range,
@@ -1501,7 +1501,16 @@ fn attention_logits<C, V>(
     sliding_window: Option<usize>,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + Add + And + Broadcast + Compare<V> + ConvertElementType + Dot + Mul + Select + Sub,
+    V: Value<Type = ArrayType>
+        + Add
+        + And
+        + LegacyBroadcast
+        + Compare<V>
+        + ConvertElementType
+        + Dot
+        + Mul
+        + Select
+        + Sub,
     C: Fill<Scalar, V> + Iota<V>,
 {
     let data_type = query.r#type().data_type();
@@ -1519,7 +1528,7 @@ where
             } else {
                 bias.convert_element_type(softmax_type)?
             };
-            scores.add(&bias.broadcast(scores_type.clone(), &[0, 1, 2, 3])?)?
+            scores.add(&bias.legacy_broadcast(scores_type.clone(), &[0, 1, 2, 3])?)?
         }
     };
     apply_attention_masks(
@@ -1545,13 +1554,13 @@ fn zero_out_of_range_query_rows<C, V>(
     row_axis: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + Broadcast + Compare<V> + Select,
+    V: Value<Type = ArrayType> + LegacyBroadcast + Compare<V> + Select,
     C: Fill<Scalar, V> + Iota<V>,
 {
     let value_type = value.r#type().into_owned();
     let index_type = ArrayType::new(DataType::I32, value_type.shape().clone());
     let rows = context.iota(&index_type, row_axis)?;
-    let bounds = query_sequence_lengths.broadcast(index_type, &[0])?;
+    let bounds = query_sequence_lengths.legacy_broadcast(index_type, &[0])?;
     let in_range = rows.compare(&bounds, ComparisonDirection::LessThan)?;
     V::select(&in_range, &value, &attention_fill(context, &value_type, 0.0)?)
 }
@@ -1587,7 +1596,7 @@ where
     V: Value<Type = ArrayType>
         + Add
         + And
-        + Broadcast
+        + LegacyBroadcast
         + Compare<V>
         + ConvertElementType
         + Div
@@ -1644,9 +1653,9 @@ where
     // Max-stabilized softmax over the key/value sequence (last) axis.
     let logit_axes = &[0, 1, 2];
     let maxima = logits.reduce(&[3], ReductionKind::Max);
-    let exponentials = logits.sub(&maxima.broadcast(logits_type.clone(), logit_axes)?)?.exp()?;
+    let exponentials = logits.sub(&maxima.legacy_broadcast(logits_type.clone(), logit_axes)?)?.exp()?;
     let sums = exponentials.reduce(&[3], ReductionKind::Sum);
-    let weights = exponentials.div(&sums.broadcast(logits_type, logit_axes)?)?;
+    let weights = exponentials.div(&sums.legacy_broadcast(logits_type, logit_axes)?)?;
     let weights = if data_type == softmax_type { weights } else { weights.convert_element_type(data_type)? };
     // Context values: `weights [b, n, qs, ks] · value [b, ks, n, d]` contracting `ks` -> `[b, n, qs, d]`, then
     // transposed back to the `BTNH` output layout `[b, qs, n, d]`.
@@ -1720,7 +1729,7 @@ where
     V: Value<Type = ArrayType>
         + Add
         + And
-        + Broadcast
+        + LegacyBroadcast
         + Compare<V>
         + ConvertElementType
         + Dot
@@ -1781,7 +1790,7 @@ where
     } else {
         activation.convert_element_type(softmax_type)?
     };
-    let weights = logits.sub(&statistic.broadcast(logits_type.clone(), logit_axes)?)?.exp()?;
+    let weights = logits.sub(&statistic.legacy_broadcast(logits_type.clone(), logit_axes)?)?.exp()?;
     // Out-of-range query rows of the incoming output cotangent are zeroed before any contraction so the key/value
     // cotangents receive no contribution from them (the forward memzeroes those output rows, so their recovered
     // weights are unreliable).
@@ -1808,7 +1817,8 @@ where
         .reduce(&[3], ReductionKind::Sum)
         .transpose([0, 2, 1])?;
     // `dS = P ∘ (dP - delta)` with `delta` broadcast over the kv axis.
-    let logit_cotangents = weights.mul(&weight_cotangents.sub(&delta.broadcast(logits_type.clone(), logit_axes)?)?)?;
+    let logit_cotangents =
+        weights.mul(&weight_cotangents.sub(&delta.legacy_broadcast(logits_type.clone(), logit_axes)?)?)?;
     // The logits are `scale · (Q·Kᵀ) + bias`, so the query/key cotangents carry one extra `scale` factor while the
     // bias cotangent reads `dS` unscaled.
     let scaled_logit_cotangents = logit_cotangents.mul(&attention_fill(context, &logits_type, scale)?)?;

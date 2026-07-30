@@ -6,7 +6,7 @@ use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain};
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
@@ -15,8 +15,8 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
-use crate::operations::constants::FillOperation;
-use crate::operations::manipulation::{Broadcast, LegacyBroadcastOperation};
+use crate::operations::constants::{ConstantOperation, Fill};
+use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation};
 use crate::operations::math::{DivOperation, MulOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
@@ -453,7 +453,7 @@ where
         + From<DivOperation>
         + From<MulOperation>,
     C::Value: Reduce
-        + Broadcast
+        + LegacyBroadcast
         + Compare<C::Value>
         + Div<Output = C::Value>
         + ElementwiseDerivativeAlignment<ArrayType>
@@ -489,7 +489,7 @@ where
                 let primal = primal_input.reduce(self.axes(), kind);
                 let input_type = primal_input.r#type().into_owned();
                 let output_axes = output_to_input_axis_map(input_type.rank(), self.axes());
-                let broadcast_primal = primal.broadcast(input_type, output_axes.as_slice())?;
+                let broadcast_primal = primal.legacy_broadcast(input_type, output_axes.as_slice())?;
                 let mask = primal_input.compare(&broadcast_primal, ComparisonDirection::Equal)?;
                 let tangent = match inputs[0].tangent() {
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
@@ -525,7 +525,7 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperat
 where
     O: Operation<ArrayType>
         + From<LegacyBroadcastOperation>
-        + From<FillOperation<ArrayType, Scalar>>
+        + From<ConstantOperation<crate::backends::arrays::Array>>
         + From<MulOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -545,7 +545,7 @@ where
                 ReductionKind::Sum | ReductionKind::Mean => {
                     let output_type = input_type.cotangent();
                     let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
-                    let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
+                    let broadcasted = cotangent.legacy_broadcast(output_type, output_axes.as_slice())?;
                     let cotangent_input = match self.kind {
                         ReductionKind::Sum => broadcasted,
                         ReductionKind::Mean => {
@@ -572,18 +572,10 @@ where
                                 })?
                             };
                             let inverse_count = 1.0 / element_count as f64;
-                            // Stage a nullary rank-0 fill holding `1 / N` and rely on implicit rank-0 broadcasting in
+                            // Stage a rank-zero literal holding `1 / N` and rely on implicit rank-zero broadcasting in
                             // the subsequent multiplication to scale the broadcast-back cotangent to the input shape.
                             let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
-                            let factor = context
-                                .stage_operation::<_, _, &Tracer<TracingContext<V, O>>>(
-                                    FillOperation::new(factor_type, Scalar::from(inverse_count)),
-                                    Vec::new(),
-                                    &[],
-                                )?
-                                .into_iter()
-                                .next()
-                                .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })?;
+                            let factor = context.fill(&factor_type, Scalar::from(inverse_count))?;
                             factor * broadcasted
                         }
                         _ => unreachable!("outer match handled the only two supported kinds"),
@@ -747,6 +739,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::contexts::StagingContext;
     use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::check_operation_batching;
     use crate::programs::types::Typed;

@@ -11,7 +11,7 @@
 
 use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::macros::check_count;
-use crate::operations::manipulation::{Broadcast, ConvertElementType, Reshape, Transpose};
+use crate::operations::manipulation::{ConvertElementType, LegacyBroadcast, Reshape, Transpose};
 use crate::operations::math::{Reduce, ReductionKind};
 use crate::operations::sharding::Reshard;
 use crate::programs::ProgramError;
@@ -49,7 +49,7 @@ impl<V: Value<Type = DataType> + ConvertElementType> ElementwiseDerivativeAlignm
     }
 }
 
-impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Transpose + Reshard + Reduce>
+impl<V: Value<Type = ArrayType> + LegacyBroadcast + ConvertElementType + Reshape + Transpose + Reshard + Reduce>
     ElementwiseDerivativeAlignment<ArrayType> for V
 {
     fn align_tangent(&self, target: &ArrayType) -> Result<Self, DifferentiationError> {
@@ -77,7 +77,7 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
 
         let offset = target.rank() - rank;
         let output_axes = (0..rank).map(|axis| axis + offset).collect::<Vec<_>>();
-        value = value.broadcast(target.clone(), output_axes.as_slice())?;
+        value = value.legacy_broadcast(target.clone(), output_axes.as_slice())?;
 
         // The broadcasting operation carries the requested output type, but changing an explicit/manual sharding is a
         // semantic redistribution rather than a metadata-only broadcast. Here we stage that transition explicitly so
@@ -104,7 +104,7 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
 }
 
 /// [`ArrayType`]-typed [`Value`] whose cotangents can additionally be _unaligned_ through the adjoint of an *explicit*
-/// broadcast (e.g., using [`Broadcast`]) that placed the operand's axes at arbitrary result positions. This extends
+/// broadcast (e.g., using [`LegacyBroadcast`]) that placed the operand's axes at arbitrary result positions. This extends
 /// [`ElementwiseDerivativeAlignment`] as a separate trait because axis placement is a concept that is specific to
 /// [`ArrayType`]-typed values. Scalar types have no axes and participate only in implicit suffix-aligned alignment
 /// maps.
@@ -118,7 +118,7 @@ pub trait BroadcastDerivativeAlignment: ElementwiseDerivativeAlignment<ArrayType
     fn unalign_cotangent_along(&self, target: &ArrayType, output_axes: &[usize]) -> Result<Self, DifferentiationError>;
 }
 
-impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Transpose + Reshard + Reduce>
+impl<V: Value<Type = ArrayType> + LegacyBroadcast + ConvertElementType + Reshape + Transpose + Reshard + Reduce>
     BroadcastDerivativeAlignment for V
 {
     fn unalign_cotangent_along(&self, target: &ArrayType, output_axes: &[usize]) -> Result<Self, DifferentiationError> {
@@ -200,7 +200,7 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
         // axis-identity broadcast, which carries its full requested output type.
         if contribution.r#type().as_ref() != target {
             let output_axes = (0..target.rank()).collect::<Vec<_>>();
-            contribution = contribution.broadcast(target.clone(), output_axes.as_slice())?;
+            contribution = contribution.legacy_broadcast(target.clone(), output_axes.as_slice())?;
         }
 
         // As a defensive final check, report a mismatch instead of returning a mistyped cotangent, because a wrong

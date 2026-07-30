@@ -112,16 +112,12 @@ fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
     Ok(shape.result(0).expect("stablehlo.concatenate should return one result").as_ref())
 }
 
-/// Lowers one bounded dynamic integer-valued array constructor from its compact first-class dimension operands.
-fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
+/// Derives the declared and statically bounded physical types shared by dynamic array constructors.
+fn dynamic_constructor_types(
     name: &str,
-    integer_value: i64,
-    input_values: &[ValueRef<'b, 'c, 't>],
+    input_count: usize,
     output_types: &[ArrayProgramType],
-    block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: ryft_mlir::LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<(ArrayType, ArrayType), LoweringError> {
     let [output_type] = output_types else {
         return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
     };
@@ -132,12 +128,10 @@ fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
         .iter()
         .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
         .count();
-    if input_values.len() != dynamic_count {
-        return Err(ProgramError::InvalidInputCount { expected: dynamic_count, actual: input_values.len() }.into());
+    if input_count != dynamic_count {
+        return Err(ProgramError::InvalidInputCount { expected: dynamic_count, actual: input_count }.into());
     }
 
-    // XLA materializes one statically bounded physical buffer. Each explicit dynamic extent then narrows the
-    // corresponding logical axis without recovering geometry from another array value.
     let physical_dimensions = output_type
         .shape()
         .dimensions()
@@ -155,12 +149,22 @@ fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let physical_type = output_type.clone().with_shape(Shape::new(physical_dimensions));
-    let mut result =
-        lower_constant_output(std::slice::from_ref(&physical_type), integer_value, block, context, location)?.remove(0);
+    Ok((output_type.clone(), physical_type))
+}
+
+/// Refines one statically bounded constructor result from its compact first-class dimension operands.
+fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
+    mut result: ValueRef<'b, 'c, 't>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_type: &ArrayType,
+    mut refined_type: ArrayType,
+    block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: ryft_mlir::LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     let i32_scalar_type = context
         .tensor_type(context.signless_integer_type(32), &[], None, location)
         .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
-    let mut refined_type = physical_type;
     // The dimension operands are compact (one per dynamic axis, in axis order), so advance the operand iterator only
     // when a dynamic axis is encountered rather than indexing by the physical axis number.
     let mut operands = input_values.iter();
@@ -185,6 +189,22 @@ fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
         result = operation.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
     }
     Ok(vec![result])
+}
+
+/// Lowers one bounded dynamic integer-valued array constructor from its compact first-class dimension operands.
+fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
+    name: &str,
+    integer_value: i64,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayProgramType],
+    block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: ryft_mlir::LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    let (output_type, physical_type) = dynamic_constructor_types(name, input_values.len(), output_types)?;
+    let result =
+        lower_constant_output(std::slice::from_ref(&physical_type), integer_value, block, context, location)?.remove(0);
+    refine_dynamic_constructor_result(result, input_values, &output_type, physical_type, block, context, location)
 }
 
 /// Lowers one array-program instruction.
@@ -215,6 +235,22 @@ where
         }
         ArrayProgramOperation::DynamicOne(operation) => {
             lower_dynamic_constructor(operation.name(), 1, input_values, output_types, block, context, location)
+        }
+        ArrayProgramOperation::DynamicIota(operation) => {
+            let (output_type, physical_type) =
+                dynamic_constructor_types(operation.name(), input_values.len(), output_types)?;
+            let tensor_type = lower_tensor_type(&physical_type, context, location)?;
+            let iota = block.append_operation(stable_hlo::iota(tensor_type, operation.dimension(), location)?)?;
+            let result = iota.result(0).expect("stablehlo.iota should return one result").as_ref();
+            refine_dynamic_constructor_result(
+                result,
+                input_values,
+                &output_type,
+                physical_type,
+                block,
+                context,
+                location,
+            )
         }
         ArrayProgramOperation::Array(operation) => {
             let input_types = input_types
@@ -408,6 +444,37 @@ where
                     location,
                 )?)?;
                 broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()
+            } else if input_type.static_shape().is_some() {
+                // A statically shaped input can be broadcast to the finite physical upper-bound shape and then
+                // refined directly from the explicit extent operands. This avoids dynamic_broadcast_in_dim, which
+                // some XLA importers cannot legalize, without recovering geometry from array data.
+                let dynamic_extents = output_type
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .zip(output_extents)
+                    .filter_map(|(dimension, extent)| matches!(dimension, Dimension::Dynamic(_)).then_some(*extent))
+                    .collect::<Vec<_>>();
+                let (declared_type, physical_type) =
+                    dynamic_constructor_types(operation.name(), dynamic_extents.len(), output_types)?;
+                let output_tensor_type = lower_tensor_type(&physical_type, context, location)?;
+                let broadcast = block.append_operation(stable_hlo::broadcast(
+                    *input,
+                    output_tensor_type,
+                    operation.output_axes(),
+                    location,
+                )?)?;
+                let result = broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
+                refine_dynamic_constructor_result(
+                    result,
+                    dynamic_extents.as_slice(),
+                    &declared_type,
+                    physical_type,
+                    block,
+                    context,
+                    location,
+                )?
+                .remove(0)
             } else {
                 let shape = lower_explicit_shape(output_extents, block, context, location)?;
                 let broadcast = block.append_operation(stable_hlo::dynamic_broadcast(
@@ -767,9 +834,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use ryft_core::backends::arrays::{Array as ReferenceArray, ArrayOperation};
     use ryft_core::contexts::{Context, StagingContext};
     use ryft_core::operations::compare::{Compare, ComparisonDirection};
-    use ryft_core::operations::constants::{OneOperation, ZeroOperation};
+    use ryft_core::operations::constants::{ConstantOperation, IotaOperation, OneOperation, ZeroOperation};
     use ryft_core::operations::custom_call::CustomCallOperation;
     use ryft_core::operations::dimensions::{
         DimensionAddOperation, DimensionFromScalar, DimensionMulOperation, DimensionSize, DimensionSizeOperation,
@@ -912,6 +980,43 @@ mod tests {
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<i64>(output_bytes.as_slice()), vec![7]);
+    }
+
+    #[test]
+    fn test_dynamic_fill_lowers_as_literal_constant_plus_bounded_broadcast() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        let extent_variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let extent_type = DimensionType::new(extent_variable);
+        let context = TestContext::new();
+        let extent = context.input(extent_type.into());
+        let literal = context
+            .bind(
+                ArrayOperation::<XlaConstant>::Constant(ConstantOperation::new(ReferenceArray::scalar(2.5_f32))),
+                Vec::new(),
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        let output =
+            context.bind(BroadcastOperation::new(Vec::new()), Vec::new(), &[literal, extent]).unwrap().remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.constant").count(), 1, "{module}");
+        assert_eq!(module.matches("stablehlo.broadcast_in_dim").count(), 1, "{module}");
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 1, "{module}");
+        assert_eq!(module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 0, "{module}");
+        assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 0, "{module}");
     }
 
     #[test]
@@ -1273,14 +1378,9 @@ mod tests {
 
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let context = TestContext::new();
-        let input = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into());
-        let first_extent = context.input(DimensionType::new(variable).into());
-        let second_extent =
-            context.constant(ArrayProgramValue::Dimension(ryft_core::DimensionValue::constant(1).unwrap()));
-        let output = context
-            .bind(BroadcastOperation::new(vec![1]), Vec::new(), &[input, first_extent, second_extent])
-            .unwrap()
-            .remove(0);
+        let input = context.input(ArrayType::scalar(DataType::F32).into());
+        let extent = context.input(DimensionType::new(variable).into());
+        let output = context.bind(BroadcastOperation::new(Vec::new()), Vec::new(), &[input, extent]).unwrap().remove(0);
         let program = context
             .builder()
             .borrow()
@@ -1292,10 +1392,41 @@ mod tests {
             )
             .unwrap();
         let dynamic_module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
-        assert_eq!(dynamic_module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 1);
-        assert_eq!(dynamic_module.matches("stablehlo.concatenate").count(), 1);
+        assert_eq!(dynamic_module.matches("stablehlo.broadcast_in_dim").count(), 1);
+        assert_eq!(dynamic_module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 0);
+        assert_eq!(dynamic_module.matches("stablehlo.set_dimension_size").count(), 1);
         assert_eq!(dynamic_module.matches("stablehlo.get_dimension_size").count(), 0);
         assert_eq!(dynamic_module.matches("dimension_to_scalar").count(), 0);
+
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: dynamic_module.into_bytes() }, &cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let value_bytes = values_to_bytes(&[2.5_f32]);
+        let extent_bytes = values_to_bytes(&[3_i64]);
+        let inputs = ExecutionDeviceInputs {
+            inputs: &[
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(value_bytes.as_slice(), BufferType::F32, &[], None, device.clone(), None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(extent_bytes.as_slice(), BufferType::I64, &[], None, device, None).unwrap(),
+                    ),
+                    donatable: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+        let mut outputs = execution.block_until_ready().unwrap().remove(0);
+        let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![2.5_f32, 2.5, 2.5]);
     }
 
     #[test]
@@ -1634,6 +1765,83 @@ mod tests {
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_dynamic_iota_lowering() {
+        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+
+        let rows_type = DimensionType::new(DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap()));
+        let columns_type =
+            DimensionType::new(DimensionVariable::new("columns", DimensionBounds::new(1, Some(4)).unwrap()));
+        let context = TestContext::new();
+        let rows = context.input(rows_type.clone().into());
+        let columns = context.input(columns_type.clone().into());
+        let output = context
+            .bind(
+                IotaOperation::new(
+                    ArrayType::new(
+                        DataType::C64,
+                        Shape::new(vec![
+                            Dimension::Dynamic(rows_type.variable().clone()),
+                            Dimension::Static(2),
+                            Dimension::Dynamic(columns_type.variable().clone()),
+                        ]),
+                    ),
+                    2,
+                )
+                .unwrap(),
+                Vec::new(),
+                &[rows, columns],
+            )
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let module = lower_array_program_to_stable_hlo(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.iota").count(), 1);
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 2);
+        assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 0);
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let rows_bytes = values_to_bytes(&[4_i64]);
+        let columns_bytes = values_to_bytes(&[3_i64]);
+        let inputs = ExecutionDeviceInputs {
+            inputs: &[
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(rows_bytes.as_slice(), BufferType::I64, &[], None, device.clone(), None).unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(columns_bytes.as_slice(), BufferType::I64, &[], None, device, None).unwrap(),
+                    ),
+                    donatable: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+        let mut outputs = execution.block_until_ready().unwrap().remove(0);
+        assert_eq!(outputs.outputs.len(), 1);
+        let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![0.0_f32, 0.0, 1.0, 0.0, 2.0, 0.0].repeat(8),);
     }
 
     #[test]

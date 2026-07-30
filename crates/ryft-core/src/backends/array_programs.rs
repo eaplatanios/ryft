@@ -3,7 +3,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::backends::arrays::{Array, ArrayOperation};
+use crate::backends::arrays::{Array, ArrayOperation, BroadcastKernel};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -434,15 +434,12 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                 input_types,
                 region_interfaces,
             ),
-            Self::DynamicIota(operation) => {
-                operation.validate_output_type()?;
-                infer_dynamic_constructor_output_types(
-                    operation.name(),
-                    operation.r#type(),
-                    input_types,
-                    region_interfaces,
-                )
-            }
+            Self::DynamicIota(operation) => infer_dynamic_constructor_output_types(
+                operation.name(),
+                operation.r#type(),
+                input_types,
+                region_interfaces,
+            ),
             Self::Array(operation) => {
                 let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
                 Ok(operation
@@ -702,7 +699,7 @@ fn materialize_dynamic_constructor_type<A: Value<Type = ArrayType>>(
 }
 
 impl<
-    A: Broadcast
+    A: BroadcastKernel
         + Concatenate
         + CustomCall
         + DimensionFromScalar<DimensionValue>
@@ -810,7 +807,7 @@ where
                 );
                 let output_type =
                     infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, operation)?;
-                Ok(vec![ArrayProgramValue::Array(input.broadcast(output_type, operation.output_axes())?)])
+                Ok(vec![ArrayProgramValue::Array(input.broadcast_to_type(output_type, operation.output_axes())?)])
             }
             Self::Concatenate(operation) => {
                 let Some((result_extent, inputs)) = inputs.split_last() else {
@@ -1069,14 +1066,15 @@ where
             return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
         }
         let dynamic_constant_type = match self {
+            Self::DynamicZero(operation) => Some(operation.r#type()),
             Self::DynamicOne(operation) => Some(operation.r#type()),
             Self::DynamicIota(operation) => Some(operation.r#type()),
             _ => None,
         };
         if let Some(output_type) = dynamic_constant_type {
-            // Dynamic one and iota are constant with respect to their extent operands, but their zero tangents still
-            // need those runtime extents for materialization. Stage dynamic zero while the operands remain available
-            // instead of leaving a type-only structural zero for the generic output boundary.
+            // Dynamic zero, one, and iota are constant with respect to their extent operands, but their zero tangents
+            // still need those runtime extents for materialization. Stage dynamic zero while the operands remain
+            // available instead of leaving a type-only structural zero for the generic output boundary.
             let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
             let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
             let tangent_operation = ArrayProgramOperation::<A>::from(ZeroOperation::new(output_type.tangent()));
@@ -1496,6 +1494,27 @@ impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayP
     }
 }
 
+impl<A: BroadcastKernel + DimensionSize<usize> + Value<Type = ArrayType>> Broadcast for ArrayProgramValue<A> {
+    fn broadcast_with_output_sharding(
+        &self,
+        output_dimensions: &[Self],
+        output_axes: &[usize],
+        output_sharding: Option<Sharding>,
+    ) -> Result<Self, ProgramError> {
+        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let output_shape = Shape::new(
+            output_dimensions
+                .iter()
+                .map(<Self as ValueProjection<DimensionType>>::projected)
+                .map(|result| result.map(|dimension| Dimension::Static(dimension.extent())))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let operation = BroadcastOperation::new(output_axes.to_vec()).with_output_sharding(output_sharding);
+        let output_type = infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, &operation)?;
+        Ok(Self::Array(input.broadcast_to_type(output_type, output_axes)?))
+    }
+}
+
 impl Compare<Array> for DimensionValue {
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Array, ProgramError> {
         let result = match direction {
@@ -1684,7 +1703,7 @@ mod tests {
         DimensionAddOperation, DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation,
     };
     use crate::operations::manipulation::{
-        BroadcastOperation, BroadcastToDimensions, ConcatenateOperation, PadOperation, ReshapeOperation,
+        Broadcast, BroadcastOperation, ConcatenateOperation, PadOperation, ReshapeOperation,
     };
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
@@ -2043,23 +2062,22 @@ mod tests {
         );
 
         // Iota follows the same static-versus-dynamic routing while retaining and validating its varying axis.
-        let static_iota = ArrayProgramOperation::<Array>::from(IotaOperation::new(
-            ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])),
-            0,
-        ));
+        let static_iota = ArrayProgramOperation::<Array>::from(
+            IotaOperation::new(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])), 0).unwrap(),
+        );
         assert!(matches!(static_iota, ArrayProgramOperation::Array(ArrayOperation::Iota(_))));
         let dynamic_iota_type =
             ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(source.clone()), Dimension::Static(2)]));
-        let dynamic_iota = ArrayProgramOperation::<Array>::from(IotaOperation::new(dynamic_iota_type.clone(), 0));
+        let dynamic_iota =
+            ArrayProgramOperation::<Array>::from(IotaOperation::new(dynamic_iota_type.clone(), 0).unwrap());
         assert!(matches!(dynamic_iota, ArrayProgramOperation::DynamicIota(_)));
         assert_eq!(
             dynamic_iota.infer_output_types(&[DimensionType::new(source.clone()).into()], &[]),
             Ok(vec![dynamic_iota_type.clone().into()]),
         );
         assert_eq!(
-            ArrayProgramOperation::<Array>::from(IotaOperation::new(dynamic_iota_type, 2))
-                .infer_output_types(&[DimensionType::new(source.clone()).into()], &[]),
-            Err(TypeError::invalid("'iota' dimension 2 is out of bounds for rank 2")),
+            IotaOperation::new(dynamic_iota_type, 2).unwrap_err(),
+            TypeError::invalid("'iota' dimension 2 is out of bounds for rank 2"),
         );
 
         let renamed_left = DimensionVariable::new("renamed_left", bounds);
@@ -2248,7 +2266,8 @@ mod tests {
                         Shape::new(vec![Dimension::Dynamic(rows.r#type().variable().clone()), Dimension::Static(3)]),
                     ),
                     0,
-                ),
+                )
+                .unwrap(),
                 Vec::new(),
                 &[ArrayProgramValue::Dimension(rows)],
             )
@@ -2289,7 +2308,8 @@ mod tests {
                     Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
                 ),
                 0,
-            )),
+            )
+            .unwrap()),
             cases = [
                 {
                     inputs = [(@known, extent.clone())],
@@ -2343,7 +2363,8 @@ mod tests {
         );
         let error = context
             .bind(
-                IotaOperation::new(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(bounded)])), 0),
+                IotaOperation::new(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(bounded)])), 0)
+                    .unwrap(),
                 Vec::new(),
                 &[ArrayProgramValue::Dimension(DimensionValue::constant(5).unwrap())],
             )
@@ -2546,7 +2567,8 @@ mod tests {
                         Shape::new(vec![Dimension::Dynamic(extent_value.r#type().variable().clone())]),
                     ),
                     0,
-                ),
+                )
+                .unwrap(),
                 Vec::new(),
                 &[extent],
             )
@@ -2860,7 +2882,8 @@ mod tests {
                 IotaOperation::new(
                     ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())])),
                     0,
-                ),
+                )
+                .unwrap(),
                 Vec::new(),
                 vec![extent],
             )
@@ -3002,7 +3025,8 @@ mod tests {
         let extent = builder.add_input(DimensionType::new(formal.clone()).into());
         let output = builder
             .add_instruction(
-                IotaOperation::new(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(formal)])), 0),
+                IotaOperation::new(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(formal)])), 0)
+                    .unwrap(),
                 Vec::new(),
                 vec![extent],
             )
@@ -3052,7 +3076,7 @@ mod tests {
         for operation in [
             ArrayProgramOperation::<Array>::from(ZeroOperation::new(output_type.clone())),
             ArrayProgramOperation::<Array>::from(OneOperation::new(output_type.clone())),
-            ArrayProgramOperation::<Array>::from(IotaOperation::new(output_type.clone(), 0)),
+            ArrayProgramOperation::<Array>::from(IotaOperation::new(output_type.clone(), 0).unwrap()),
         ] {
             let mut context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
             let output_cotangent = context.input(output_type.clone().into());
@@ -3466,12 +3490,24 @@ mod tests {
     fn test_array_program_broadcast_to_first_class_dimensions() {
         type TestContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
 
+        let eager = ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));
+        assert_eq!(
+            eager.broadcast_leading_sizes(&[2]),
+            Ok(ArrayProgramValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0],))),
+        );
+
+        let context = TestContext::new();
+        let value = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).into());
+        let extent = context.constant(ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()));
+        assert_eq!(value.broadcast(&[extent], &[0]).unwrap().atom_id(), value.atom_id());
+        assert!(context.builder().borrow().instructions().is_empty());
+
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
         let context = TestContext::new();
         let scalar = context.input(ArrayType::scalar(DataType::F64).into());
         let extent = context.input(extent_type.clone().into());
-        let output = scalar.broadcast_to_dimensions(std::slice::from_ref(&extent)).unwrap();
+        let output = scalar.broadcast_to(std::slice::from_ref(&extent)).unwrap();
         let program = context
             .builder()
             .borrow()
@@ -3511,7 +3547,7 @@ mod tests {
         let value = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
         let rows = context.constant(ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()));
         let columns = context.constant(ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()));
-        let output = value.broadcast_to_dimensions(&[rows, columns]).unwrap();
+        let output = value.broadcast_to(&[rows, columns]).unwrap();
         let program = context
             .builder()
             .borrow()
@@ -3526,6 +3562,34 @@ mod tests {
             program.interpret(vec![ArrayProgramValue::Array(Array::vector(vec![7.0_f64]))]),
             Ok(vec![ArrayProgramValue::Array(Array::matrix(2, 3, vec![7.0_f64; 6]))]),
         );
+
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let context = TestContext::new();
+        let value = context.input(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]))
+                .into(),
+        );
+        let output = value.broadcast_leading_sizes(&[2]).unwrap();
+        assert_eq!(
+            output.r#type().as_ref(),
+            &ArrayProgramType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(batch), Dimension::Static(3)]),
+            )),
+        );
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let rendered = program.to_string();
+        assert_eq!(rendered.matches("dimension_size").count(), 1);
+        assert!(rendered.contains("broadcast [output_axes=[1, 2]]"));
     }
 
     #[test]
@@ -3536,10 +3600,7 @@ mod tests {
         let extent = builder.add_input(extent_type.clone().into());
         let scalar = builder
             .add_instruction(
-                ArrayOperation::from(crate::FillOperation::new(
-                    ArrayType::scalar(DataType::F64),
-                    Scalar::from(2.5_f64),
-                )),
+                ArrayOperation::from(crate::ConstantOperation::new(Array::scalar(2.5_f64))),
                 Vec::new(),
                 vec![],
             )

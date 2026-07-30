@@ -28,7 +28,8 @@ use crate::operations::control_flow::scan::stacked_scan_type;
 use crate::operations::control_flow::{ScanOperation, Select, SelectOperation};
 use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
-    Broadcast, DynamicUpdateSlice, DynamicUpdateSliceOperation, LegacyBroadcastOperation, Transpose, TransposeOperation,
+    DynamicUpdateSlice, DynamicUpdateSliceOperation, LegacyBroadcast, LegacyBroadcastOperation, Transpose,
+    TransposeOperation,
 };
 use crate::operations::math::{Add, AddOperation, Reduce, ReduceOperation, ReductionKind};
 use crate::parameters::Placeholder;
@@ -873,7 +874,7 @@ where
 impl<C, O> BatchableOperation<C> for WhileOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: Broadcast + Transpose,
+    <C as Domain>::Value: LegacyBroadcast + Transpose,
     O: Operation<ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
@@ -1226,7 +1227,7 @@ where
         let element_has_tangent =
             state_types.iter().map(|state_type| !state_type.tangent().is_zero_space()).collect::<Vec<_>>();
 
-        // Broadcast the Boolean `[B]` mask stack to a shape-congruent `[B, ...state_shape]` stack per tangent-carrying
+        // LegacyBroadcast the Boolean `[B]` mask stack to a shape-congruent `[B, ...state_shape]` stack per tangent-carrying
         // state element, so each per-iteration select reads a mask slice that matches that element's shape (select
         // requires a shape-congruent condition). Scalar state elements reuse the `[B]` mask stack directly.
         let mut mask_stacks = Vec::new();
@@ -1604,7 +1605,7 @@ where
             {
                 let batch_item_type = stacked_scan_type(residual_type, 1);
                 let output_axes = (1..=residual_type.rank()).collect::<Vec<_>>();
-                let expanded = residual_output.broadcast(batch_item_type, output_axes.as_slice())?;
+                let expanded = residual_output.legacy_broadcast(batch_item_type, output_axes.as_slice())?;
                 let mut start_indices = vec![counter_input.clone()];
                 if let Some(zero_index) = &zero_index {
                     start_indices.extend((0..residual_type.rank()).map(|_| zero_index.clone()));
@@ -1613,7 +1614,7 @@ where
             }
             let true_scalar = context.one(&boolean_scalar_type)?;
             let true_item_type = stacked_scan_type(&boolean_scalar_type, 1);
-            let true_item = true_scalar.broadcast(true_item_type, &[])?;
+            let true_item = true_scalar.legacy_broadcast(true_item_type, &[])?;
             let next_mask = mask_input.dynamic_update_slice(&true_item, std::slice::from_ref(&counter_input))?;
             let one_i64 = context.one(&counter_type)?;
             let next_counter = Add::add(&counter_input, &one_i64)?;
@@ -1699,7 +1700,7 @@ where
                 let element_mask = if element_mask_type == mask_type {
                     mask.clone()
                 } else {
-                    mask.broadcast(element_mask_type, mask_axes.as_slice())?
+                    mask.legacy_broadcast(element_mask_type, mask_axes.as_slice())?
                 };
                 next_state.push(Select::select(&element_mask, candidate, carried)?);
             }

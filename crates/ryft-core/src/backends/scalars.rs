@@ -25,8 +25,8 @@ use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
 };
 use crate::operations::constants::{
-    ConstantOperation, Fill, FillOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, Fill, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation,
+    ZeroOperation,
 };
 use crate::operations::control_flow::{Select, SelectOperation, WhileOperation, WhilePredicate};
 use crate::operations::debugging::PrintOperation;
@@ -62,7 +62,6 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     One(OneOperation<DataType>),
     OneLike(OneLikeOperation),
     Constant(ConstantOperation<V>),
-    Fill(FillOperation<DataType, Scalar>),
     Abs(AbsOperation),
     Neg(NegOperation),
     Add(AddOperation),

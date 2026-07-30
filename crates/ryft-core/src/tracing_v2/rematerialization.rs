@@ -52,7 +52,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
-use crate::operations::manipulation::{Broadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::operations::math::AddOperation;
 use crate::operations::math::DotOperation;
 use crate::operations::memory::TransferToMemoryOperation;
@@ -345,7 +345,7 @@ crate::impl_non_transposable_operation!(RematerializeOperation);
 impl<C, O> BatchableOperation<C> for RematerializeOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: Broadcast + Transpose,
+    <C as Domain>::Value: LegacyBroadcast + Transpose,
     O: Operation<ArrayType> + From<TransposeOperation> + From<LegacyBroadcastOperation> + From<RematerializeOperation>,
 {
     fn batch<D: BatchingDriver<C>>(

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use ryft_core::InterpretationDriver;
+use ryft_core::backends::arrays::Array as ReferenceArray;
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::batching::BatchingError;
 use ryft_core::compilation::{
@@ -26,9 +27,10 @@ use ryft_core::differentiation::DifferentiationError;
 use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::{
-    Constant, Fill, FillOperation, Iota, IotaOperation, ONE_OPERATION_NAME, One, OneOperation, ZERO_OPERATION_NAME,
+    Constant, ConstantOperation, Fill, Iota, IotaOperation, ONE_OPERATION_NAME, One, OneOperation, ZERO_OPERATION_NAME,
     Zero, ZeroOperation,
 };
+use ryft_core::operations::manipulation::{ConvertElementType, LegacyBroadcast};
 use ryft_core::parameters::{Parameterized, Placeholder};
 use ryft_core::programs::ProgramError;
 use ryft_core::programs::operations::Operation;
@@ -427,16 +429,18 @@ impl<'c> One<Array<'c>> for XlaDomain<'c> {
 /// Refer to the documentation of this domain's [`Zero`] implementation for more information.
 impl<'c> Fill<Scalar, Array<'c>> for XlaDomain<'c> {
     fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array<'c>, ProgramError> {
-        let mut outputs = self.bind(FillOperation::new(r#type.clone(), value), Vec::new(), &[])?;
+        let value = value.convert_element_type(r#type.data_type())?;
+        let literal = ReferenceArray::new(ArrayType::scalar(r#type.data_type()), vec![value])?;
+        let mut outputs = self.bind(ConstantOperation::new(literal), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
+        outputs.remove(0).legacy_broadcast(r#type.clone(), &[])
     }
 }
 
 /// Refer to the documentation of this domain's [`Zero`] implementation for more information.
 impl<'c> Iota<Array<'c>> for XlaDomain<'c> {
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array<'c>, ProgramError> {
-        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension), Vec::new(), &[])?;
+        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension)?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -2816,7 +2820,7 @@ mod tests {
     use ryft_core::Sharding;
     use ryft_core::compilation::stage_function;
     use ryft_core::operations::compare::{CompareOperation, ComparisonDirection};
-    use ryft_core::operations::constants::{FillOperation, OneOperation};
+    use ryft_core::operations::constants::{ConstantOperation, OneOperation};
     use ryft_core::operations::control_flow::{ConditionOperation, SelectOperation, WhileOperation};
     use ryft_core::operations::logical::AndOperation;
     use ryft_core::operations::math::{AddOperation, Atan2Operation, DivOperation, MulOperation, NegOperation};
@@ -2908,6 +2912,20 @@ mod tests {
             .r#await()
             .unwrap();
         values_from_bytes::<f64>(bytes.as_slice())
+    }
+
+    fn read_u64s(client: &Client<'_>, array: &Array<'_>) -> Vec<u64> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<u64>(bytes.as_slice())
     }
 
     fn read_booleans(client: &Client<'_>, array: &Array<'_>) -> Vec<bool> {
@@ -3550,27 +3568,37 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_bind_materializes_nullary_fill_over_a_default_mesh() {
+    fn test_eager_fill_materializes_scalar_literal_then_broadcasts_over_a_default_mesh() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let domain = XlaDomain::new(&client);
 
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
-        let outputs = domain.bind(FillOperation::new(r#type, Scalar::from(2.5f64)), Vec::new(), &[]).unwrap();
+        let output = domain.fill(&r#type, Scalar::from(2.5f64)).unwrap();
 
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].shape(), StaticShape::new(vec![3]));
-        assert_eq!(read_f32s(&client, &outputs[0]), vec![2.5, 2.5, 2.5]);
+        assert_eq!(output.shape(), StaticShape::new(vec![3]));
+        assert_eq!(read_f32s(&client, &output), vec![2.5, 2.5, 2.5]);
+
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let value = Scalar::from(num_complex::Complex::new(1.5f64, -2.0f64));
+        let output = domain.fill(&r#type, value).unwrap();
+        assert_eq!(read_f32s(&client, &output), vec![1.5, 1.5]);
 
         // A complex fill value lowers as two real part splats composed through `stablehlo.complex`, and a `c64`
         // buffer's bytes are the interleaved `f32` real and imaginary parts of its elements.
         let r#type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2)]));
         let value = Scalar::from(num_complex::Complex::new(1.5f32, -2.0f32));
-        let outputs = domain.bind(FillOperation::new(r#type, value), Vec::new(), &[]).unwrap();
+        let output = domain.fill(&r#type, value).unwrap();
 
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].shape(), StaticShape::new(vec![2]));
-        assert_eq!(read_f32s(&client, &outputs[0]), vec![1.5, -2.0, 1.5, -2.0]);
+        assert_eq!(output.shape(), StaticShape::new(vec![2]));
+        assert_eq!(read_f32s(&client, &output), vec![1.5, -2.0, 1.5, -2.0]);
+
+        // Integer literals remain exact through conversion and scalar constant lowering, including values that
+        // cannot be represented exactly by the floating-point intermediary used for floating-point constants.
+        let r#type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
+        let value = u64::MAX - 1;
+        let output = domain.fill(&r#type, Scalar::U64(value)).unwrap();
+        assert_eq!(read_u64s(&client, &output), vec![value, value]);
     }
 
     #[test]
@@ -3679,9 +3707,8 @@ mod tests {
         let condition = {
             let mut builder = XlaProgramBuilder::new();
             let state = builder.add_input(scalar_type.clone());
-            let limit = builder
-                .add_instruction(FillOperation::new(scalar_type.clone(), Scalar::from(3.0f64)), Vec::new(), vec![])
-                .unwrap()[0];
+            let literal = ReferenceArray::new(scalar_type.clone(), vec![Scalar::from(3.0f32)]).unwrap();
+            let limit = builder.add_instruction(ConstantOperation::new(literal), Vec::new(), vec![]).unwrap()[0];
             let predicate = builder
                 .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![state, limit])
                 .unwrap()[0];

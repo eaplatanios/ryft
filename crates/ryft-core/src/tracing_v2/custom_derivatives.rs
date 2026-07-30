@@ -16,7 +16,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
-use crate::operations::manipulation::{Broadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::Operation;
@@ -214,7 +214,7 @@ pub(crate) fn stage_rewrapped_custom_call<C, MakeOperationFn>(
 ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
-    <C as Domain>::Value: Broadcast + Transpose,
+    <C as Domain>::Value: LegacyBroadcast + Transpose,
     MakeOperationFn: FnOnce(
         Option<usize>,
     ) -> Result<
@@ -278,7 +278,7 @@ pub(crate) fn batch_rewrapped_program<C: Context<Type = ArrayType>, D: BatchingD
 impl<C, O> BatchableOperation<C> for CustomJvpOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: Broadcast + Transpose,
+    <C as Domain>::Value: LegacyBroadcast + Transpose,
     O: Operation<ArrayType> + From<TransposeOperation> + From<LegacyBroadcastOperation> + From<CustomJvpOperation>,
 {
     fn batch<D: BatchingDriver<C>>(
@@ -473,7 +473,7 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 impl<C, O> BatchableOperation<C> for CustomVjpOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: Broadcast + Transpose,
+    <C as Domain>::Value: LegacyBroadcast + Transpose,
     O: Operation<ArrayType> + From<TransposeOperation> + From<LegacyBroadcastOperation> + From<CustomVjpOperation>,
 {
     fn batch<D: BatchingDriver<C>>(

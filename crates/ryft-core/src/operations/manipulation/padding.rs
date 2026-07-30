@@ -15,7 +15,7 @@ use crate::macros::check_count;
 use crate::operations::constants::{One, OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::{Select, SelectOperation};
 use crate::operations::dimensions::DimensionSize;
-use crate::operations::manipulation::{Broadcast, SliceOperation, Transpose};
+use crate::operations::manipulation::{LegacyBroadcast, SliceOperation, Transpose};
 use crate::operations::math::{ReduceOperation, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
@@ -536,7 +536,7 @@ where
 impl<C> BatchableOperation<C> for PadOperation
 where
     C: Context<Type = ArrayType> + One<C::Value> + Zero<C::Value>,
-    C::Value: Broadcast + Pad + Select + Transpose,
+    C::Value: LegacyBroadcast + Pad + Select + Transpose,
     PadOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C>>(
@@ -588,7 +588,7 @@ where
             edge_padding_high.as_slice(),
             interior_padding.as_slice(),
         )?;
-        let broadcasted_padding = inputs[1].value().broadcast(padded.r#type().into_owned(), &[batch_axis])?;
+        let broadcasted_padding = inputs[1].value().legacy_broadcast(padded.r#type().into_owned(), &[batch_axis])?;
         let output = C::Value::select(&mask, &padded, &broadcasted_padding)?;
         let output_type = output.r#type().into_owned();
         Ok(vec![ArrayBatch::new(output_type, output, BatchAxis::from_position(batch_axis))?])

@@ -30,9 +30,7 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
     match r#type.identities().find(|(position, _)| *position == TypeIdentityPosition::Reference) {
         Some((_, reference)) => Err(TypeError::invalid(format!(
             "'{}' cannot construct type {} without operands because it references identity {}",
-            name,
-            r#type,
-            reference,
+            name, r#type, reference,
         ))),
         None => Ok(()),
     }
@@ -54,19 +52,20 @@ pub(crate) fn infer_dynamic_constructor_output_types(
     region_interfaces: &[RegionInterface<ArrayProgramType>],
 ) -> Result<Vec<ArrayProgramType>, TypeError> {
     if !region_interfaces.is_empty() {
-        return Err(TypeError::invalid(format!("'{name}' expects no regions but got {}", region_interfaces.len())));
+        return Err(TypeError::invalid(format!("'{}' expects no regions but got {}", name, region_interfaces.len())));
     }
     let variables = r#type.shape().dimensions().iter().filter_map(Dimension::variable).collect::<Vec<_>>();
     if variables.is_empty() {
         return Err(TypeError::invalid(format!(
-            "'{name}' with static output type {type} has no dynamic dimensions; use the homogeneous nullary \
+            "'{}' with static output type {} has no dynamic dimensions; use the homogeneous nullary \
              constructor instead",
-            r#type = r#type,
+            name, r#type,
         )));
     }
     if input_types.len() != variables.len() {
         return Err(TypeError::invalid(format!(
-            "'{name}' expects one dimension operand per dynamic output dimension ({}) but got {} operands",
+            "'{}' expects one dimension operand per dynamic output dimension ({}) but got {} operands",
+            name,
             variables.len(),
             input_types.len(),
         )));
@@ -77,7 +76,10 @@ pub(crate) fn infer_dynamic_constructor_output_types(
         })?;
         if dimension_type.variable() != variable {
             return Err(TypeError::invalid(format!(
-                "'{name}' operand {index} has type {dimension_type} but the output shape requires dimension<{}: {}>",
+                "'{}' operand {} has type {} but the output shape requires dimension<{} : {}>",
+                name,
+                index,
+                dimension_type,
                 variable,
                 variable.bounds(),
             )));

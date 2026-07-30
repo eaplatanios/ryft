@@ -4,7 +4,7 @@ use crate::differentiation::{DerivativeTransform, DifferentiationError, Differen
 use crate::macros::check_count;
 use crate::operations::differentiation::CoordinateBasisOperation;
 use crate::operations::manipulation::{
-    Broadcast, LegacyBroadcastOperation, Reshape, Slice, Transpose, TransposeOperation,
+    LegacyBroadcast, LegacyBroadcastOperation, Reshape, Slice, Transpose, TransposeOperation,
 };
 use crate::parameters::ParameterPath;
 use crate::programs::ProgramError;
@@ -339,7 +339,7 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
 
 impl<C: Context<Type = ArrayType>> DenseDifferentiableType<C> for ArrayType
 where
-    C::Value: Broadcast + Reshape + Slice + Transpose,
+    C::Value: LegacyBroadcast + Reshape + Slice + Transpose,
     C::Operation: BatchableOperation<C>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>>
         + From<CoordinateBasisOperation<ArrayType>>
@@ -604,7 +604,7 @@ fn validate_array_derivative_block_type(
 ///   - `coordinate_offset`: Index of the first packed direction belonging to the value being extracted.
 ///   - `coordinate_shape`: Static logical shape whose flattened coordinates occupy the selected direction range.
 ///   - `expected_value_type`: Expected type of each unpacked derivative value, excluding the packed direction axis.
-fn unpack_coordinate_range<V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose>(
+fn unpack_coordinate_range<V: Value<Type = ArrayType> + LegacyBroadcast + Reshape + Slice + Transpose>(
     packed_output: &ArrayBatch<V>,
     packed_direction_count: usize,
     coordinate_offset: usize,

@@ -23,9 +23,9 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::constants::{FillOperation, ZeroLike};
+use crate::operations::constants::{Fill, ZeroLike};
 use crate::operations::manipulation::slicing::resized_output_sharding;
-use crate::operations::manipulation::{Broadcast, Concatenate, Reshape, Slice, Transpose};
+use crate::operations::manipulation::{Concatenate, LegacyBroadcast, Reshape, Slice, Transpose};
 use crate::operations::math::{Reduce, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
@@ -194,8 +194,8 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Collecti
 /// trace under a staging parent — so one rule serves eager and staged batching alike.
 impl<C> BatchableOperation<C> for CollectiveOperation
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, Scalar>>,
+    C: Context<Type = ArrayType> + Fill<Scalar, C::Value>,
+    C::Operation: From<CollectiveOperation>,
     <C as Domain>::Value: Reduce + Mul<Output = <C as Domain>::Value>,
 {
     fn batch<D: BatchingDriver<C>>(
@@ -211,12 +211,7 @@ where
         collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
             // The `1 / N` rank-0 factor binds into the batching context's parent — interpreted eagerly under an eager
             // parent, staged into the enclosing trace under a staging parent.
-            context
-                .parent()
-                .bind(FillOperation::new(factor_type, Scalar::from(inverse_axis_size)), Vec::new(), &[])?
-                .into_iter()
-                .next()
-                .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })
+            context.parent().fill(&factor_type, Scalar::from(inverse_axis_size))
         })
     }
 }
@@ -502,7 +497,7 @@ fn shape_changing_collective_batch_operand<V>(
     inputs: &[ArrayBatch<V>],
 ) -> Result<(V, Vec<usize>), BatchingError>
 where
-    V: Value<Type = ArrayType> + Broadcast + Transpose,
+    V: Value<Type = ArrayType> + LegacyBroadcast + Transpose,
 {
     check_count!("input", inputs, 1, ProgramError);
     let input = if inputs[0].batch_axis().is_replicated() {
@@ -898,7 +893,7 @@ impl<C> BatchableOperation<C> for AllGatherOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<AllGatherOperation>,
-    <C as Domain>::Value: Broadcast + Reshape + Transpose,
+    <C as Domain>::Value: LegacyBroadcast + Reshape + Transpose,
 {
     fn batch<D: BatchingDriver<C>>(
         &self,
@@ -945,7 +940,7 @@ impl<C> BatchableOperation<C> for PSumScatterOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<PSumScatterOperation>,
-    <C as Domain>::Value: Broadcast + Reduce + Reshape + Transpose,
+    <C as Domain>::Value: LegacyBroadcast + Reduce + Reshape + Transpose,
 {
     fn batch<D: BatchingDriver<C>>(
         &self,
@@ -1003,7 +998,7 @@ impl<C> BatchableOperation<C> for PpermuteOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<PpermuteOperation>,
-    <C as Domain>::Value: Broadcast + Concatenate + Slice + Transpose + ZeroLike,
+    <C as Domain>::Value: LegacyBroadcast + Concatenate + Slice + Transpose + ZeroLike,
 {
     fn batch<D: BatchingDriver<C>>(
         &self,
@@ -1070,7 +1065,7 @@ impl<C> BatchableOperation<C> for AllToAllOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<AllToAllOperation>,
-    <C as Domain>::Value: Broadcast + Reshape + Transpose,
+    <C as Domain>::Value: LegacyBroadcast + Reshape + Transpose,
 {
     fn batch<D: BatchingDriver<C>>(
         &self,
@@ -1266,7 +1261,7 @@ mod tests {
     use super::*;
 
     /// Creates an active batching frame binding the named axis `"i"` over an eager parent whose operation family
-    /// contains every operation the collective batching rule may bind (notably `FillOperation` for `PMean`).
+    /// contains every operation the collective batching rule may bind (notably constants and broadcasts for `PMean`).
     fn batching_context(axis_size: usize) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>> {
         BatchingContext::new(EagerContext::new(), axis_size).with_axis_name("i".to_string())
     }
