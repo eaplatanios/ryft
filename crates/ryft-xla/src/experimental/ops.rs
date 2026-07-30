@@ -56,7 +56,7 @@ use ryft_core::operations::collectives::{
 use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::memory::TransferToMemoryOperation;
 use ryft_core::operations::tag::TagOperation;
-use ryft_core::programs::types::{TypeError, Typed};
+use ryft_core::programs::types::{Type, TypeError, Typed};
 use ryft_core::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::types::ArrayType;
@@ -66,6 +66,7 @@ use crate::experimental::operations::ShardMapOperation;
 /// Lifetime-free reference to an array member captured by an XLA program.
 pub type XlaArrayConstant = CaptureReference<ArrayType>;
 
+// TODO(eaplatanios): Delete this temporary alias in the atomic P4b production composite XLA cutover.
 /// Production XLA program constant.
 ///
 /// This remains an alias of [`XlaArrayConstant`] until the atomic composite-domain cutover. Keeping the names distinct
@@ -319,10 +320,10 @@ fn batch_axis_position(axis: &BatchAxis) -> Option<usize> {
         .map(|axis| usize::try_from(axis.value()).expect("program batching returns canonical nonnegative axes"))
 }
 
-fn ensure_call_input_types(
+fn ensure_call_input_types<T: Type>(
     operation_name: &'static str,
-    expected_types: &[ArrayType],
-    input_types: &[ArrayType],
+    expected_types: &[T],
+    input_types: &[T],
 ) -> Result<(), TypeError> {
     if expected_types.len() != input_types.len() {
         return Err(TypeError::invalid(format!(
@@ -341,7 +342,7 @@ fn ensure_call_input_types(
     Ok(())
 }
 
-impl Operation<ArrayType> for JitCallOperation {
+impl<T: Type> Operation<T> for JitCallOperation {
     #[inline]
     fn name(&self) -> &'static str {
         "jit_call"
@@ -354,9 +355,9 @@ impl Operation<ArrayType> for JitCallOperation {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayType],
-        region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         if region_interfaces.len() != 1 {
             return Err(TypeError::invalid(format!(
                 "jit_call expects 1 attached callee region but got {}",
@@ -364,7 +365,7 @@ impl Operation<ArrayType> for JitCallOperation {
             )));
         }
         let callee_interface = &region_interfaces[0];
-        ensure_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
+        ensure_call_input_types(<Self as Operation<T>>::name(self), callee_interface.input_types(), input_types)?;
         Ok(callee_interface.output_types().to_vec())
     }
 }
@@ -703,11 +704,15 @@ mod tests {
     use ryft_core::partial::PartialValue;
     use ryft_core::programs::MaybeZero;
     use ryft_core::programs::ProgramBuilder;
-    use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef};
+    use ryft_core::programs::effects::Effects;
+    use ryft_core::programs::operations::Operation;
+    use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionInterface, RegionRef};
     use ryft_core::programs::types::Typed;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::TracingContext;
-    use ryft_core::types::{ArrayType, DataType, Dimension, Shape};
+    use ryft_core::types::{
+        ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+    };
 
     use super::{
         JitCallOperation, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder, transpose_primal_jit_call,
@@ -744,6 +749,31 @@ mod tests {
 
     fn vector_type() -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
+    }
+
+    #[test]
+    fn test_jit_call_supports_composite_region_boundaries() {
+        let dimension_type = ArrayProgramType::Dimension(DimensionType::new(DimensionVariable::new(
+            "size",
+            DimensionBounds::positive(Some(9)).unwrap(),
+        )));
+        let array_type = ArrayProgramType::Array(vector_type());
+        let interface = RegionInterface::new(
+            vec![dimension_type.clone()],
+            vec![array_type.clone(), dimension_type.clone()],
+            Effects::PURE,
+        );
+        let operation = JitCallOperation::new();
+
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                std::slice::from_ref(&dimension_type),
+                std::slice::from_ref(&interface),
+            )
+            .unwrap(),
+            vec![array_type, dimension_type],
+        );
     }
 
     #[test]
