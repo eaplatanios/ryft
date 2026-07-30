@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use ryft_core::Typed;
-use ryft_core::compilation::{CompilationDomain, StagedFunction, stage_function};
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::types::ArrayType;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
@@ -143,23 +142,17 @@ fn try_same_mesh<'o>(
         feedback_directed_profile: None,
     };
 
-    let staged: StagedFunction<XlaDomain<'o>, ArrayType, ArrayType> =
-        stage_function(engine, |input| input, bare_input_type, xla_options).map_err(|error| {
+    let staged: crate::jit::StagedXlaFunction<'_, ArrayType, ArrayType> =
+        crate::jit::stage(|input| input, bare_input_type, engine, xla_options).map_err(|error| {
             ArrayError::CompiledReshardInternalError { message: format!("tracing failed: {error}") }
         })?;
-    let lowered = engine.lower(staged).map_err(|error| match error {
-        XlaDomainError::Array(array_error) => array_error,
-        other => ArrayError::CompiledReshardInternalError { message: format!("lowering failed: {other}") },
-    })?;
-    let compiled = engine.compile(lowered).map_err(|error| match error {
+    let compiled = engine.compile_staged_function(staged).map_err(|error| match error {
         XlaDomainError::Array(array_error) => array_error,
         other => ArrayError::CompiledReshardInternalError { message: format!("compilation failed: {other}") },
     })?;
-    ryft_core::compilation::call_function(engine, compiled.executable_program(), source.clone()).map_err(|error| {
-        match error {
-            XlaDomainError::Array(array_error) => array_error,
-            other => ArrayError::CompiledReshardInternalError { message: format!("execute failed: {other}") },
-        }
+    engine.interpret(&compiled.executable_program(), source.clone()).map_err(|error| match error {
+        XlaDomainError::Array(array_error) => array_error,
+        other => ArrayError::CompiledReshardInternalError { message: format!("execute failed: {other}") },
     })
 }
 

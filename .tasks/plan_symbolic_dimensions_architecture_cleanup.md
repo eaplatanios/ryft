@@ -1330,7 +1330,7 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       `BroadcastOperation` with one explicit first-class dimension operand per output axis is now the sole
       runtime-sized broadcast representation. This also removes the final dependency on P1c's fresh-result-reference
       closure fallback.
-- [ ] P4b production composite XLA cutover: execute
+- [x] P4b production composite XLA cutover: execute
       `.tasks/plan_p4b_production_composite_xla.md` as one semantic review unit. Group homogeneous array and dimension
       payloads behind their canonical projected member families, keep mixed and XLA-owned higher-order operations as
       direct backend variants, and switch the existing program/domain/region/lowering cycle in place. Preserve
@@ -1380,22 +1380,22 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 - [x] `with_source_array` no longer exists.
 - [x] `bind_replayed` and its operation-classification match no longer exist.
 - [x] Ambient dimension and source-array context-view fields no longer exist.
-- [ ] Delete temporary homogeneous program construction used only to replay shape-carrying rules.
-- [ ] Narrow the homogeneous operation family to array-only primitives.
+- [x] Delete temporary homogeneous program construction used only to replay shape-carrying rules.
+- [x] Narrow the homogeneous operation family to array-only primitives.
 - [ ] Migrate public/reference `EagerContext<Array, ArrayOperation<Array>>` consumers to the canonical array-program
       domain where they need shape, control-flow, or transform functionality.
-- [ ] Replace production tests that rely on the complete homogeneous backend with canonical array-program tests;
+- [x] Replace production tests that rely on the complete homogeneous backend with canonical array-program tests;
       retain small local homogeneous enums only for focused generic tests.
-- [ ] Migrate XLA operation conversion and compilation entry points to the sole stored array-program operation family.
-- [ ] Carry explicit dimension operands through condition, while, scan, custom derivatives, rematerialization, region
+- [x] Migrate XLA operation conversion and compilation entry points to the sole stored array-program operation family.
+- [x] Carry explicit dimension operandWhys through condition, while, scan, custom derivatives, rematerialization, region
       capture/import, and caller/callee requirement composition.
-- [ ] Make partial evaluation project known dimension integers and retain unknown dimension SSA without reconstruction;
+- [x] Make partial evaluation project known dimension integers and retain unknown dimension SSA without reconstruction;
       erase proven requirements, reject disproven requirements with exact diagnostics, and retain inconclusive ordered
       assertions.
 - [ ] Verify conditional and loop-carried extents, gateway compaction, region forwarding, and alpha-equivalent imports.
 - [ ] Rename the narrowed primitive family only after the old full family is deleted and all residual references are
       classified.
-- [ ] Gate: targeted searches find no `with_dimensions`, `with_source_array`, `bind_replayed`, ambient replay
+- [x] Gate: targeted searches find no `with_dimensions`, `with_source_array`, `bind_replayed`, ambient replay
       environment, or full homogeneous implicit-shape graph.
 
 ### Phase 5: simplify batching around value-kind policy
@@ -2759,3 +2759,32 @@ dimension constants into eager mixed-operation SSA before lowering only array in
 As an independent prerequisite, concrete XLA arrays now recover exact global axis extents from complete shard
 descriptors without device work and convert checked rank-zero integer arrays into `DimensionValue`s through one
 explicit host readback. The focused CPU gateway regression, XLA library check, formatting, and diff hygiene passed.
+
+### Execution: P4b atomic production composite XLA cutover
+
+The XLA backend now has one stored graph and one production lowering path. `XlaDomain` uses
+`ArrayProgramType`, `ArrayProgramValue<Array>`, the composite `XlaConstant`, and the flat composite `XlaOperation`;
+all public array APIs preserve their existing `ArrayType`/`Array` contracts through checked projection. Complete
+owned member regions are lifted structurally once, while replay and callee regions remain natively composite and
+retain their identity-sharing semantics. No projection-aware derive mode, second production domain, replay bridge, or
+stored `ArrayProgramOperation` was introduced.
+
+Eager execution separates host-owned dimension work from cached array kernels, and mixed eager operations specialize
+their concrete dimension operands into internal scalar SSA constants. Production StableHLO lowering consumes
+first-class dimension operands directly and recursively lowers every higher-order region through the same dispatcher
+with shared capture, collective, nested-function, and ordered-effect state. The standalone composite driver and
+duplicate test suite were deleted. The retained diff removes more code than it adds.
+
+Production coverage executes dimension-size arithmetic followed by dynamic broadcast and reshape, pins eager cache
+behavior, retains the static eager/JIT/reshard/sharding/cache/profile-guided suites, and keeps exact Phase 5/6
+diagnostics where composite higher-order batching or reverse differentiation remains deliberately deferred.
+Inconclusive compiled requirement assertions remain Phase 7. Public bounded-dynamic shard-map execution and
+plugin-specific `PadToStatic` validation remain the named P3k/P5 continuation; static/manual shard-map production
+reachability is complete.
+
+Verification passed all 1,019 core library tests, all 396 runnable XLA library tests (one timing benchmark ignored),
+the benchmark-feature all-target compile gate, focused benchmark-feature tests, the compilation benchmark smoke run,
+XLA doctests, formatting, and diff hygiene. The residual scan found one composite `XlaProgram` alias, no standalone
+composite lowerer, no retired dynamic-broadcast path, no disabled `cfg(any())` fixtures, and no public array API
+exposing `ArrayProgramValue`. The complete implementation ledger and exact evidence are recorded in
+`.tasks/plan_p4b_production_composite_xla.md`.

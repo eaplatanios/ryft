@@ -1,3 +1,4 @@
+use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::dimensions::DimensionValue;
 use ryft_core::contexts::Context;
 use ryft_core::macros::check_count;
@@ -13,7 +14,7 @@ use ryft_core::programs::types::Typed;
 use ryft_core::programs::{Concretizable, Operation, ProgramError, Value};
 use ryft_core::types::{ArrayProgramType, DataType, DimensionType, DimensionVariable};
 
-use crate::experimental::ops::XlaOperation;
+use crate::experimental::ops::XlaArrayConstant;
 use crate::{Array, ArrayShard};
 
 /// Eagerly executes one `operation` over `inputs` through the first input's recovered
@@ -29,7 +30,7 @@ use crate::{Array, ArrayShard};
 /// at least one input,
 /// and the first input determines the domain (and thereby the client and compile cache) the operation executes
 /// against.
-fn bind_single_output<'o, P: Into<XlaOperation>>(
+fn bind_single_output<'o, P: Into<ArrayOperation<XlaArrayConstant>>>(
     operation: P,
     inputs: &[Array<'o>],
 ) -> Result<Array<'o>, ProgramError> {
@@ -292,6 +293,7 @@ mod tests {
     use ryft_core::backends::arrays::Array as CpuArray;
     use ryft_core::backends::scalars::Scalar;
     use ryft_core::batching::{BatchAxis, batch};
+    use ryft_core::contexts::ProjectedContext;
     use ryft_core::differentiation::hessian::HessianDifferentiate;
     use ryft_core::differentiation::jacobian::{JacobianDifferentiate, jacobian_reverse};
     use ryft_core::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -694,16 +696,18 @@ mod tests {
         let output_type = replicated_type(&mesh, DataType::F32, &[2]);
         let domain = input.execution_domain();
 
-        let add_one = move |x: &DomainTracer<XlaDomain<'_>>| {
+        type ArrayXlaDomain<'c> = ProjectedContext<XlaDomain<'c>, ArrayType>;
+
+        let add_one = move |x: &DomainTracer<ArrayXlaDomain<'_>>| {
             let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![output_type.clone()]);
             Ok(CustomCall::custom_call(&operation, std::slice::from_ref(x))?.remove(0))
         };
-        let function = custom_vjp::<XlaDomain<'_>, _, _, _, _, _, _>(
+        let function = custom_vjp::<ArrayXlaDomain<'_>, _, _, _, _, _, _>(
             {
                 let add_one = add_one.clone();
-                move |x: DomainTracer<XlaDomain<'_>>| add_one(&x)
+                move |x: DomainTracer<ArrayXlaDomain<'_>>| add_one(&x)
             },
-            move |x: DomainTracer<XlaDomain<'_>>| Ok((add_one(&x)?, ())),
+            move |x: DomainTracer<ArrayXlaDomain<'_>>| Ok((add_one(&x)?, ())),
             // d(x + 1)/dx is the identity, so the backward rule passes the cotangent through.
             |(), cotangent| Ok(cotangent),
         );
@@ -1546,6 +1550,7 @@ mod tests {
     /// replays the staged backward operation).
     #[test]
     fn test_eager_differentiable_dot_product_attention_gradient() {
+        use ryft_core::contexts::ProjectedContext;
         use ryft_core::operations::attention::{AttentionMask, differentiable_dot_product_attention};
 
         use crate::XlaDomain;
@@ -1575,7 +1580,8 @@ mod tests {
         let key = device(&key_values, &key_value_dimensions);
         let value = device(&value_values, &key_value_dimensions);
         let domain = query.execution_domain();
-        let function = differentiable_dot_product_attention::<XlaDomain<'_>>(scale, mask, None, None);
+        type ArrayXlaDomain<'c> = ProjectedContext<XlaDomain<'c>, ArrayType>;
+        let function = differentiable_dot_product_attention::<ArrayXlaDomain<'_>>(scale, mask, None, None);
         let (loss, (query_gradient, key_gradient, value_gradient)) = domain
             .value_and_gradient(
                 |(query, key, value)| {
@@ -1816,7 +1822,7 @@ mod tests {
         // operations, and it shares the producing domain's compile cache.
         let sum = a.add(&b).unwrap();
         assert!(std::ptr::eq(sum.client().unwrap(), &client));
-        assert_eq!(sum.execution_domain().cache_size(), 1);
+        assert_eq!(sum.execution_domain().parent().cache_size(), 1);
 
         let product = sum.mul(&b).unwrap();
         assert_eq!(read_f32s(&product), vec![12.0, 24.0]);
@@ -1824,11 +1830,11 @@ mod tests {
 
         // All values derived from `a` share one dispatch cache: `add` and `mul` each compiled once, and repeating
         // `add` at the same input signature is a cache hit.
-        assert_eq!(product.execution_domain().cache_size(), 2);
-        assert_eq!(a.execution_domain().cache_size(), 2);
+        assert_eq!(product.execution_domain().parent().cache_size(), 2);
+        assert_eq!(a.execution_domain().parent().cache_size(), 2);
         let repeated = a.add(&b).unwrap();
         assert_eq!(read_f32s(&repeated), vec![4.0, 6.0]);
-        assert_eq!(a.execution_domain().cache_size(), 2);
+        assert_eq!(a.execution_domain().parent().cache_size(), 2);
     }
 
     #[test]
@@ -1840,7 +1846,7 @@ mod tests {
         // Arrays with an attached client recover a client-backed domain.
         let array = f32_vector(&client, &mesh, &[1.0, 2.0]);
         let domain = array.execution_domain();
-        assert!(std::ptr::eq(domain.client().unwrap(), &client));
+        assert!(std::ptr::eq(domain.parent().client().unwrap(), &client));
 
         // Arrays constructed without a client recover a clientless domain whose eager binds error clearly, which
         // also surfaces through the fallible value capabilities.

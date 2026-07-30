@@ -10,13 +10,15 @@ use ryft_core::compilation::{
 };
 use ryft_core::operations::math::Sin;
 use ryft_core::{
-    ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+    ArrayProgramType, ArrayProgramValue, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis,
+    MeshAxisType, Shape, Sharding, ValueProjection,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, jitted};
 use serde_json::{Value, json};
 
-type BenchmarkCompiledFunction<'c> = CompiledFunction<XlaDomain<'c>, ArrayType, ArrayType>;
+type BenchmarkStagedFunction<'c> = StagedFunction<XlaDomain<'c>, ArrayProgramType, ArrayProgramType>;
+type BenchmarkCompiledFunction<'c> = CompiledFunction<XlaDomain<'c>, ArrayProgramType, ArrayProgramType>;
 
 #[derive(Debug)]
 struct Arguments {
@@ -174,13 +176,28 @@ fn stage_workload<'c>(
     domain: &XlaDomain<'c>,
     mesh: &DeviceMesh,
     r#type: ArrayType,
-) -> Result<StagedFunction<XlaDomain<'c>, ArrayType, ArrayType>, Box<dyn std::error::Error>> {
+) -> Result<BenchmarkStagedFunction<'c>, Box<dyn std::error::Error>> {
     Ok(stage_function(
         domain,
-        |input| (input.clone() * input.clone() + input).sin().unwrap(),
-        r#type,
+        |input| {
+            let input = ValueProjection::<ArrayType>::into_projected(input).unwrap();
+            (input.clone() * input.clone() + input).sin().unwrap().into_value()
+        },
+        ArrayProgramType::Array(r#type),
         XlaOptions::new(mesh.clone()),
     )?)
+}
+
+fn call_workload<'c>(
+    domain: &XlaDomain<'c>,
+    compiled: &BenchmarkCompiledFunction<'c>,
+    input: Array<'c>,
+) -> Result<Array<'c>, Box<dyn std::error::Error>> {
+    match ryft_core::compilation::call_function(domain, compiled.executable_program(), ArrayProgramValue::Array(input))?
+    {
+        ArrayProgramValue::Array(output) => Ok(output),
+        ArrayProgramValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
+    }
 }
 
 fn persistent_restore(
@@ -240,18 +257,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compiled: BenchmarkCompiledFunction<'_> = domain.compile(lowered)?;
     let cold_compile_ns = duration_nanoseconds(start);
 
-    let warmup = ryft_core::compilation::call_function(&domain, compiled.executable_program(), input.clone())?;
+    let warmup = call_workload(&domain, &compiled, input.clone())?;
     warmup.block_until_ready()?;
 
     let mut enqueue_samples = Vec::with_capacity(arguments.iterations);
     let mut pending_outputs = Vec::with_capacity(arguments.iterations);
     for _ in 0..arguments.iterations {
         let start = Instant::now();
-        pending_outputs.push(ryft_core::compilation::call_function(
-            &domain,
-            compiled.executable_program(),
-            input.clone(),
-        )?);
+        pending_outputs.push(call_workload(&domain, &compiled, input.clone())?);
         enqueue_samples.push(duration_nanoseconds(start));
     }
     for output in pending_outputs {
@@ -261,8 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut synchronized_samples = Vec::with_capacity(arguments.iterations);
     for _ in 0..arguments.iterations {
         let start = Instant::now();
-        ryft_core::compilation::call_function(&domain, compiled.executable_program(), input.clone())?
-            .block_until_ready()?;
+        call_workload(&domain, &compiled, input.clone())?.block_until_ready()?;
         synchronized_samples.push(duration_nanoseconds(start));
     }
 

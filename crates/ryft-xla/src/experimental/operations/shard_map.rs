@@ -16,7 +16,7 @@ use ryft_core::partial::{
 };
 use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::{RegionInterface, RegionRef, RegionSlot};
-use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramError, Value};
+use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramError, ProjectedValue, Value, ValueProjection};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::{Tracer, TracingContext};
 
@@ -230,7 +230,7 @@ impl<V: Value<Type = ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
     }
 }
 
-impl<V: Value<Type = ArrayType>> Operation<ArrayProgramType> for ShardMapOperation<V> {
+impl<V: Clone> Operation<ArrayProgramType> for ShardMapOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
         "shard_map"
@@ -305,8 +305,11 @@ where
 /// the surviving unknown boundary inputs plus those residual edges and emitted into the residual program.
 impl<V, C> PartiallyEvaluatableOperation<C> for ShardMapOperation<V>
 where
-    V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>,
-    C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
+    V: PartialEq
+        + Value<Type = ArrayProgramType>
+        + ryft_core::ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + Concretizable<bool>,
+    C: Context<Type = ArrayProgramType, Constant = V, Operation = XlaOperation<V>>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -347,7 +350,10 @@ where
             .iter()
             .zip(partition.residual_program().input_types())
             .filter_map(|(source, edge_type)| source.is_known().then_some(edge_type))
-            .map(|edge_type| residual_boundary(&edge_type, mesh).map_err(trace_error_from_shard_map))
+            .map(|edge_type| {
+                let edge_type = <&ArrayType>::try_from(&edge_type).map_err(ProgramError::from)?;
+                residual_boundary(edge_type, mesh).map_err(trace_error_from_shard_map)
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         // Gather the known-side boundary metadata: shardings and global types per original index, with the residual
@@ -447,13 +453,13 @@ where
 /// Returns a concrete atom for `cotangent`, staging a typed `Zero` op when the cotangent is
 /// structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
-fn materialize_cotangent<V: Value<Type = ArrayType>, O>(
+fn materialize_cotangent<T: Type, V: Value<Type = T>, O>(
     context: &TracingContext<V, O>,
     cotangent: &MaybeZero<Tracer<TracingContext<V, O>>>,
-    output_type: &ArrayType,
+    output_type: &T,
 ) -> Tracer<TracingContext<V, O>>
 where
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>>,
+    O: Operation<T> + From<ZeroOperation<T>>,
 {
     match cotangent {
         MaybeZero::Value(cotangent) => return cotangent.clone(),
@@ -520,7 +526,12 @@ fn tangent_boundary_type(r#type: &ArrayType) -> ArrayType {
 ///   - `operation`: Boundary metadata of the primal shard-map being linearized.
 ///   - `program`: Borrowed `body` region of that shard-map.
 #[allow(clippy::type_complexity)]
-fn shard_map_bodies<V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>>(
+fn shard_map_bodies<
+    V: PartialEq
+        + Value<Type = ArrayProgramType>
+        + ryft_core::ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + Concretizable<bool>,
+>(
     operation: &ShardMapOperation<V>,
     program: RegionRef<'_, V, XlaOperation<V>>,
 ) -> Result<
@@ -545,6 +556,7 @@ fn shard_map_bodies<V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>
     let mut residual_global_types = Vec::with_capacity(residual_count);
     let mut residual_shardings = Vec::with_capacity(residual_count);
     for residual_local_type in residual_local_types {
+        let residual_local_type = <&ArrayType>::try_from(residual_local_type).map_err(ProgramError::from)?;
         let (residual_global_type, residual_sharding) = residual_boundary(residual_local_type, mesh)?;
         residual_global_types.push(residual_global_type);
         residual_shardings.push(residual_sharding);
@@ -619,8 +631,11 @@ fn shard_map_bodies<V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>
 ///   - `inputs`: Primal and tangent values for the shard-map operands.
 impl<C, V> DifferentiableOperation<C> for ShardMapOperation<V>
 where
-    C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
-    V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>,
+    C: Context<Type = ArrayProgramType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
+    V: PartialEq
+        + Value<Type = ArrayProgramType>
+        + ryft_core::ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + Concretizable<bool>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -655,8 +670,12 @@ where
         // tangent element representation.
         let tangent_output_types = primal_outputs
             .iter()
-            .map(|output| tangent_boundary_type(output.r#type().as_ref()))
-            .collect::<Vec<_>>();
+            .map(|output| {
+                <&ArrayType>::try_from(output.r#type().as_ref())
+                    .map(tangent_boundary_type)
+                    .map_err(ProgramError::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let tangent_operation = tangent_operation
             .with_global_output_types(tangent_output_types)
             .map_err(trace_error_from_shard_map)?;
@@ -717,7 +736,10 @@ where
 ///     [`Unknown`](PartialValue::Unknown) entries are the input tangents; the [`Known`](PartialValue::Known) entries
 ///     carry the residual tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the tangent `shard_map`'s outputs.
-pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>, D: TranspositionDriver<V, XlaOperation<V>>>(
+pub fn transpose_primal_shard_map<
+    V: Value<Type = ArrayProgramType> + ryft_core::ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    D: TranspositionDriver<V, XlaOperation<V>>,
+>(
     operation: &ShardMapOperation<V>,
     context: &mut TracingContext<V, XlaOperation<V>>,
     driver: &D,
@@ -754,7 +776,8 @@ pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>, D: TranspositionDr
     check_count!("output", outputs, output_types.len(), ProgramError);
     let mut operands = Vec::with_capacity(output_types.len() + known_values.len());
     for (cotangent, output_type) in outputs.iter().zip(output_types.iter()) {
-        operands.push(materialize_cotangent(context, cotangent, &output_type.cotangent()));
+        let output_type = ArrayProgramType::Array(output_type.cotangent());
+        operands.push(materialize_cotangent(context, cotangent, &output_type));
     }
     operands.extend(known_values);
     let transposed_operation = XlaOperation::ShardMap(Box::new(transposed_operation));
@@ -782,7 +805,10 @@ pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>, D: TranspositionDr
 /// transposition happens on the body's flat [`XlaConstant`]-keyed program, so the recursion is resolved once at
 /// definition time and instantiating this implementation introduces no recursive
 /// [`TransposableOperation`] obligation on [`XlaOperation`].
-impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for ShardMapOperation<V> {
+impl<V> TransposableOperation<V, XlaOperation<V>> for ShardMapOperation<V>
+where
+    V: Value<Type = ArrayProgramType> + ryft_core::ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
     fn transpose<D: TranspositionDriver<V, XlaOperation<V>>>(
         &self,
         context: &mut TracingContext<V, XlaOperation<V>>,
@@ -810,7 +836,10 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for S
 ///   - `driver`: Instruction-scoped access to the attached body region and its recursive transposition machinery.
 ///   - `input_linearity`: Per-input linearity flags over the tangent boundary's global inputs.
 #[allow(clippy::type_complexity)]
-fn transpose_shard_map_body<V: Value<Type = ArrayType>, D: TranspositionDriver<V, XlaOperation<V>>>(
+fn transpose_shard_map_body<
+    V: Value<Type = ArrayProgramType> + ryft_core::ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    D: TranspositionDriver<V, XlaOperation<V>>,
+>(
     operation: &ShardMapOperation<V>,
     driver: &D,
     input_linearity: &[bool],
@@ -886,10 +915,12 @@ fn trace_flat_shard_map<
 where
     Input::Family: ParameterizedFamily<Sharding>
         + ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
         + ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
@@ -904,20 +935,16 @@ where
     Ok(FlatTracedShardMap::from_traced(&shard_map.trace::<F, Input, Output>(function, global_input_types)?))
 }
 
-fn apply_traced_shard_map<C, Output>(
+fn apply_traced_shard_map<C>(
     context: C,
     traced: FlatTracedShardMap,
     traced_inputs: Vec<C::Value>,
-    output_structure: Output::ParameterStructure,
-) -> Result<Output, ShardMapTraceError>
+) -> Result<Vec<C::Value>, ShardMapTraceError>
 where
-    C: Context<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
-    Output: Parameterized<C::Value>,
+    C: Context<Type = ArrayProgramType, Constant = XlaConstant, Operation = XlaOperation>,
 {
     let (operation, body_program) = ShardMapOperation::from_body(traced);
-    let staged_outputs =
-        context.bind(XlaOperation::ShardMap(Box::new(operation)), vec![body_program], traced_inputs.as_slice())?;
-    Ok(Output::from_parameters(output_structure, staged_outputs)?)
+    Ok(context.bind(XlaOperation::ShardMap(Box::new(operation)), vec![body_program], traced_inputs.as_slice())?)
 }
 
 fn global_input_types_from_traced_inputs<V, Input>(
@@ -946,11 +973,13 @@ impl ShardMapInvocationLeaf for ArrayType {
         = TracedShardMap<Input, Output>
     where
         Input::Family: ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>;
@@ -967,12 +996,14 @@ impl ShardMapInvocationLeaf for ArrayType {
     where
         Input: Parameterized<Self>,
         Input::Family: ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
@@ -999,36 +1030,27 @@ impl ShardMapInvocationLeaf for ArrayType {
     }
 }
 
-/// Implements [`ShardMapInvocationLeaf`] for a tracer-shaped value type whose dispatch domain operates in the XLA
-/// operation universe: the traced shard map binds through the value's own dispatch domain, so one body serves the
-/// plain staged form (a [`Tracer`] records the operation) and transform-context forms (e.g., a
-/// [`DifferentiationTracer`](ryft_core::DifferentiationTracer) dual dispatches the operation's rules). A blanket
-/// implementation over every [`Value`] is not possible because [`ArrayType`] itself is a [`Value`] and carries its
-/// own dedicated implementation above.
-macro_rules! implement_shard_map_invocation_leaf {
-    ($value:ty, [$($parameters:tt)*], [$($bounds:tt)*]) => {
-        impl<$($parameters)*> ShardMapInvocationLeaf for $value
-        where
-            $value: Value<Type = ArrayType>,
-            <$value as Value>::DispatchDomain: Context<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
-            $($bounds)*
-        {
-            implement_shard_map_invocation_leaf!(@body $value);
-        }
-    };
-    (@body $value:ty) => {
+/// Invokes a traced shard map through the composite value behind one public array projection.
+impl<V> ShardMapInvocationLeaf for ProjectedValue<ArrayType, V>
+where
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+    ProjectedValue<ArrayType, V>: Value<Type = ArrayType>,
+    V::DispatchDomain: Context<Type = ArrayProgramType, Constant = XlaConstant, Operation = XlaOperation>,
+{
     type Return<Input: Parameterized<Self>, Output: Parameterized<ArrayType>>
-        = Output::To<$value>
+        = Output::To<Self>
     where
         Input::Family: ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
-            + ParameterizedFamily<$value>,
+            + ParameterizedFamily<Self>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>;
 
     fn invoke<F, Input, Output>(
@@ -1043,29 +1065,31 @@ macro_rules! implement_shard_map_invocation_leaf {
     where
         Input: Parameterized<Self>,
         Input::Family: ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
-            + ParameterizedFamily<$value>,
+            + ParameterizedFamily<Self>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
         F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,
     {
         let output_structure = out_specs.parameter_structure();
-        let global_input_types = global_input_types_from_traced_inputs::<$value, _>(&inputs)?;
+        let global_input_types = global_input_types_from_traced_inputs::<Self, _>(&inputs)?;
         let global_in_specs = reparameterize_shardings::<
             Input::To<Sharding>,
             <Input::To<ArrayType> as Parameterized<ArrayType>>::To<Sharding>,
         >(in_specs, global_input_types.parameter_structure())?;
-        let traced_inputs = inputs.into_parameters().collect::<Vec<_>>();
+        let traced_inputs = inputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
         let context = match traced_inputs.first() {
             Some(input) => input.dispatch_domain(),
             None if output_structure.parameter_count() == 0 => {
-                return Ok(Output::To::<$value>::from_parameters(output_structure, Vec::new())?);
+                return Ok(Output::To::<Self>::from_parameters(output_structure, Vec::new())?);
             }
             None => return Err(ShardMapTraceError::MissingTracedInvocationDomain),
         };
@@ -1078,27 +1102,29 @@ macro_rules! implement_shard_map_invocation_leaf {
             manual_axes,
             check_vma,
         )?;
-        apply_traced_shard_map(context, traced, traced_inputs, output_structure)
+        let outputs = apply_traced_shard_map(context, traced, traced_inputs)?
+            .into_iter()
+            .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Output::To::<Self>::from_parameters(output_structure, outputs)?)
     }
-    };
 }
-
-implement_shard_map_invocation_leaf!(Tracer<C>, [C], [C: ryft_core::StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>]);
-implement_shard_map_invocation_leaf!(ryft_core::DifferentiationTracer<C>, [C], [C: Context]);
 
 #[cfg(test)]
 mod tests {
+    use std::ops::{Deref, DerefMut};
+
     use ryft_core::contexts::{Context, StagingContext};
     use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};
     use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
     use ryft_core::programs::MaybeZero;
+    use ryft_core::programs::Program;
     use ryft_core::programs::effects::Effects;
     use ryft_core::programs::operations::Operation;
     use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionInterface, RegionRef};
     use ryft_core::programs::types::{TypeError, Typed};
-    use ryft_core::programs::{Program, ProgramBuilder};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::{DomainTracingContext, TracingContext};
     use ryft_core::types::{
@@ -1106,10 +1132,49 @@ mod tests {
     };
 
     use crate::experimental::domains::XlaDomain;
-    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder};
+    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};
     use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap};
 
     use super::{ShardMapOperation, transpose_primal_shard_map, transpose_shard_map_body};
+
+    /// Array-oriented facade over the production composite XLA program builder.
+    struct XlaProgramBuilder(crate::experimental::ops::XlaProgramBuilder);
+
+    impl XlaProgramBuilder {
+        /// Creates an empty composite builder.
+        fn new() -> Self {
+            Self(crate::experimental::ops::XlaProgramBuilder::new())
+        }
+
+        /// Adds an array input to the composite builder.
+        fn add_input(&mut self, r#type: ArrayType) -> ryft_core::AtomId {
+            self.0.add_input(ArrayProgramType::Array(r#type))
+        }
+
+        /// Finalizes the composite program.
+        fn build<Input: ryft_core::Parameterized<XlaConstant>, Output: ryft_core::Parameterized<XlaConstant>>(
+            self,
+            output_ids: Vec<ryft_core::AtomId>,
+            input_structure: Input::ParameterStructure,
+            output_structure: Output::ParameterStructure,
+        ) -> Result<XlaProgram<Input, Output>, ryft_core::ProgramError> {
+            self.0.build(output_ids, input_structure, output_structure)
+        }
+    }
+
+    impl Deref for XlaProgramBuilder {
+        type Target = crate::experimental::ops::XlaProgramBuilder;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl DerefMut for XlaProgramBuilder {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
 
     /// Test-only driver that returns a predetermined transpose for its one attached source region.
     struct TestTranspositionDriver {
@@ -1247,7 +1312,7 @@ mod tests {
         );
         let operation =
             ShardMapOperation::from_boundary(shard_map, vec![boundary_type.clone()], vec![boundary_type.clone()]);
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(ambient_input_type);
         let body_region = builder.import_program(body);
         let output = builder
@@ -1277,12 +1342,12 @@ mod tests {
 
         let primal_body = fused.region_ref(primal_instruction.regions()[0]).unwrap().to_program();
         let tangent_body = fused.region_ref(tangent_instruction.regions()[0]).unwrap().to_program();
-        assert_eq!(primal_body.input_types(), vec![boundary_type]);
-        assert_eq!(tangent_body.input_types()[0], boundary_tangent_type);
+        assert_eq!(primal_body.input_types(), vec![ArrayProgramType::Array(boundary_type)]);
+        assert_eq!(tangent_body.input_types()[0], ArrayProgramType::Array(boundary_tangent_type));
         assert_eq!(&tangent_body.input_types()[1..], &primal_body.output_types()[1..]);
         assert_eq!(
             tangent_body.output_types(),
-            vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))]
+            vec![ArrayProgramType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]),))]
         );
     }
 
@@ -1345,16 +1410,18 @@ mod tests {
         let operation =
             ShardMapOperation::from_boundary(shard_map, vec![tangent_type.clone()], vec![tangent_type.clone()]);
         let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
-        let known = context.input(tangent_type.clone());
+        let known = context.input(ArrayProgramType::Array(tangent_type.clone()));
         let cotangents = transpose_primal_shard_map(
             &operation,
             &mut context,
             &EmptyRegionDriver,
             &[PartialValue::Known(known)],
-            &[MaybeZero::Zero(tangent_type)],
+            &[MaybeZero::Zero(ArrayProgramType::Array(tangent_type))],
         )
         .unwrap();
-        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &cotangent_type));
+        assert!(
+            matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &ArrayProgramType::Array(cotangent_type))
+        );
     }
 
     #[test]
@@ -1370,7 +1437,7 @@ mod tests {
         let source = {
             let mut builder = XlaProgramBuilder::new();
             let value = builder.add_input(value_type.clone());
-            let predicate = builder.add_constant(XlaConstant::new(0, predicate_type.clone()));
+            let predicate = builder.add_constant(XlaConstant::new(0, ArrayProgramType::Array(predicate_type.clone())));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![value, predicate],
@@ -1400,18 +1467,19 @@ mod tests {
             vec![value_type.clone(), predicate_type.clone()],
         );
         let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
-        let value_cotangent = context.input(value_type.clone());
+        let value_cotangent = context.input(ArrayProgramType::Array(value_type.clone()));
 
         let contributions = transpose_primal_shard_map(
             &operation,
             &mut context,
             &driver,
-            &[PartialValue::Unknown(value_type.clone())],
-            &[MaybeZero::Value(value_cotangent), MaybeZero::Zero(predicate_type.cotangent())],
+            &[PartialValue::Unknown(ArrayProgramType::Array(value_type.clone()))],
+            &[MaybeZero::Value(value_cotangent), MaybeZero::Zero(ArrayProgramType::Array(predicate_type.cotangent()))],
         )
         .unwrap();
 
-        assert!(matches!(&contributions[..], [MaybeZero::Value(value)] if value.r#type().as_ref() == &value_type));
+        assert!(matches!(&contributions[..], [MaybeZero::Value(value)]
+                if value.r#type().as_ref() == &ArrayProgramType::Array(value_type)));
     }
 
     /// Builds a one-input, one-output identity shard-map body whose global boundary carries no sharding, so its
@@ -1473,7 +1541,7 @@ mod tests {
         // The input tracer already belongs to a trace; binding the shard_map through that trace's context composes
         // the staging onto the same builder, attaching the local body as the instruction's `body` region.
         let context = DomainTracingContext::<XlaDomain<'static>>::new();
-        let input = context.input(test_array_type());
+        let input = context.input(ArrayProgramType::Array(test_array_type()));
 
         let (operation, body_program) = ShardMapOperation::from_body(body);
         let outputs = context
@@ -1481,7 +1549,7 @@ mod tests {
             .expect("traced shard_map staging should compose onto the input tracer's trace");
 
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].r#type().into_owned(), test_array_type());
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayProgramType::Array(test_array_type()));
 
         let builder = context.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
@@ -1497,15 +1565,14 @@ mod tests {
     #[test]
     fn test_shard_map_online_partial_evaluation_splits_body_against_a_live_outer_trace() {
         use ryft_core::partial::{PartialEvaluationInput, PartialEvaluationOutput};
-        use ryft_core::programs::ProgramBuilder;
         use ryft_core::tracing::TracingContext;
 
         let array_type = test_array_type();
         let (operation, body_program) =
-            ShardMapOperation::<XlaArrayConstant>::from_body(mixed_known_unknown_traced_shard_map_body());
+            ShardMapOperation::<XlaConstant>::from_body(mixed_known_unknown_traced_shard_map_body());
 
         // Enclosing program staging one `shard_map` over `[a, x]`, with the local body attached as its region.
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let mut builder = XlaProgramBuilder::new();
         let known_input = builder.add_input(array_type.clone());
         let runtime_input = builder.add_input(array_type.clone());
         let body_region = builder.import_program(body_program);
@@ -1522,11 +1589,11 @@ mod tests {
             .unwrap();
 
         let outer = TracingContext::<XlaConstant, XlaOperation>::new();
-        let known = outer.input(array_type.clone());
+        let known = outer.input(ArrayProgramType::Array(array_type.clone()));
         let evaluation = program
             .partially_evaluate_in_context(
                 &outer,
-                &[PartialValue::Known(known), PartialValue::Unknown(array_type.clone())],
+                &[PartialValue::Known(known), PartialValue::Unknown(ArrayProgramType::Array(array_type.clone()))],
             )
             .unwrap();
 

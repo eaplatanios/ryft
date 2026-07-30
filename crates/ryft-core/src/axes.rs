@@ -6,7 +6,7 @@ use thiserror::Error;
 use ryft_macros::Parameter;
 
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain, EagerContext};
+use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -18,10 +18,10 @@ use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::ProgramError;
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::TypeError;
-use crate::programs::values::Value;
+use crate::programs::types::{Type, TypeError};
+use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{NestedTracingContext, TracingContext};
 use crate::types::{ArrayType, DataType, Dimension, Shape};
 
@@ -249,6 +249,20 @@ impl<V: Value, O: Operation<V::Type> + InterpretableOperation<EagerContext<V, O>
     fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
         // An eager context binds no named axes as it is a leaf of the resolution stack. So every lookup returns `None`.
         None
+    }
+}
+
+impl<C: NamedAxes, T: Type> NamedAxes for ProjectedContext<C, T>
+where
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Operation: OperationProjection<T>,
+{
+    #[inline]
+    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        // Projection changes only the visible type/value/operation member. Named-axis scope belongs to the parent
+        // context stack and therefore passes through unchanged.
+        self.parent().named_axis(name)
     }
 }
 

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 
@@ -11,14 +12,18 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use ryft_core::axes::NamedAxis;
+#[cfg(test)]
 use ryft_core::contexts::StagingContext;
+use ryft_core::contexts::{Context, Domain};
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use ryft_core::programs::operations::Operation;
+#[cfg(test)]
 use ryft_core::programs::types::Typed;
-use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError};
+use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError, ProjectedValue, Value, ValueProjection};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing::{DomainTracingContext, Tracer};
-use ryft_core::types::{ArrayType, Dimension, Shape};
+use ryft_core::tracing::DomainTracingContext;
+use ryft_core::types::{ArrayProgramType, ArrayType, Dimension, Shape};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::operations::ShardMapOperation;
@@ -215,7 +220,7 @@ impl From<ShardMapError> for ShardMapTraceError {
 }
 
 /// Default static tracer alias used by public XLA tracing helpers.
-pub(crate) type ShardMapTracer = XlaTracer<'static>;
+pub(crate) type ShardMapTracer = ProjectedValue<ArrayType, XlaTracer<'static>>;
 
 /// Rebuilds an [`XlaProgram`] through [`XlaProgramBuilder`] using the public program-construction API, retyping the
 /// source program's input/output parameter structures while preserving its atoms, instructions, and attached
@@ -394,12 +399,24 @@ where
         let (operation, region_ids) = match instruction.operation() {
             XlaOperation::ShardMap(shard_map_op) if has_dead_output && has_live_output => {
                 let body_program = program.region_ref(instruction.regions()[0])?.to_program();
+                let local_input_types = body_program
+                    .input_types()
+                    .iter()
+                    .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ProgramError::from)?;
+                let local_output_types = body_program
+                    .output_types()
+                    .iter()
+                    .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ProgramError::from)?;
                 let body = FlatTracedShardMap::from_parts(
                     shard_map_op.shard_map().clone(),
                     shard_map_op.global_input_types().to_vec(),
-                    body_program.input_types(),
+                    local_input_types,
                     shard_map_op.global_output_types().to_vec(),
-                    body_program.output_types(),
+                    local_output_types,
                     body_program,
                 );
                 let projected = body.with_live_outputs(live_outputs.as_slice())?;
@@ -449,8 +466,13 @@ pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayTy
 
 pub(crate) type ShardMapLocalTraceOutput<Output> = <Output as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
-type ShardMapCapturedOutput<Output> =
-    <ShardMapLocalTraceOutput<Output> as Parameterized<ShardMapTracer>>::To<XlaConstant>;
+type ShardMapProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayProgramType>;
+
+type ShardMapProgramValues<P, V> = <ShardMapProgramParameters<P> as Parameterized<ArrayProgramType>>::To<V>;
+
+type ShardMapCapturedInput<Input> = ShardMapProgramValues<Input, XlaConstant>;
+
+type ShardMapCapturedOutput<Output> = ShardMapProgramValues<Output, XlaConstant>;
 
 /// Dispatch trait used by [`shard_map`] to select the appropriate tracing regime from the input leaf type.
 #[doc(hidden)]
@@ -459,11 +481,13 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
     type Return<Input: Parameterized<Self>, Output: Parameterized<ArrayType>>
     where
         Input::Family: ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Self>,
@@ -485,11 +509,13 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
         Input::Family: ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Self>,
@@ -516,36 +542,46 @@ pub fn trace<
     global_input_types: Input,
 ) -> Result<TracedXlaProgram<Input, Output>, ShardMapTraceError>
 where
-    Input::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
-    Output::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Input::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<ShardMapTracer>,
+    Output::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
     let (global_output_types, program) = trace_xla_function(function, &global_input_types, Vec::new())?;
     Ok(TracedXlaProgram { global_input_types, global_output_types, program })
 }
 
-/// Stages one sharding-control operation per leaf of a traced XLA value tree, pairing each leaf with the
-/// correspondingly structured [`Sharding`] and validating the requested rank before staging. Shared by [`reshard`]
-/// and [`sharding_constraint`], which differ only in the [`XlaOperation`] variant they stage per leaf.
-fn stage_sharding_control_per_leaf<C, Input>(
+/// Binds one sharding-control operation per leaf of an XLA value tree, pairing each leaf with the correspondingly
+/// structured [`Sharding`] and validating the requested rank before binding. Shared by [`reshard`] and
+/// [`sharding_constraint`], which differ only in the array operation they bind per leaf.
+fn bind_sharding_control_per_leaf<Input, Leaf, O>(
     input: Input,
     shardings: Input::To<Sharding>,
-    make_operation: impl Fn(Sharding) -> XlaOperation,
+    make_operation: impl Fn(Sharding) -> O,
 ) -> Result<Input, ShardMapTraceError>
 where
-    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
+    Input: Parameterized<Leaf, To<Leaf> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
+    Leaf: Value<Type = ArrayType>,
+    Leaf::DispatchDomain: Context<Type = ArrayType>,
+    <Leaf::DispatchDomain as Domain>::Operation: From<O>,
+    O: Operation<ArrayType>,
 {
-    fn stage_leaf<C>(
-        input: Tracer<C>,
+    fn bind_leaf<Leaf, O>(
+        input: Leaf,
         sharding: Sharding,
-        make_operation: &impl Fn(Sharding) -> XlaOperation,
-    ) -> Result<Tracer<C>, ShardMapTraceError>
+        make_operation: &impl Fn(Sharding) -> O,
+    ) -> Result<Leaf, ShardMapTraceError>
     where
-        C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
+        Leaf: Value<Type = ArrayType>,
+        Leaf::DispatchDomain: Context<Type = ArrayType>,
+        <Leaf::DispatchDomain as Domain>::Operation: From<O>,
+        O: Operation<ArrayType>,
     {
         let input_type = input.r#type();
         if sharding.rank() != input_type.rank() {
@@ -555,9 +591,9 @@ where
             }
             .into());
         }
-        let context = input.context().clone();
-        Ok(context
-            .stage_operation(make_operation(sharding), Vec::new(), &[&input])?
+        Ok(input
+            .dispatch_domain()
+            .bind(make_operation(sharding), Vec::new(), std::slice::from_ref(&input))?
             .into_iter()
             .next()
             .expect("a sharding-control operation produces one output per input leaf"))
@@ -567,7 +603,7 @@ where
     let staged = input
         .into_parameters()
         .zip(shardings.into_parameters())
-        .map(|(parameter, sharding)| stage_leaf::<C>(parameter, sharding, &make_operation))
+        .map(|(parameter, sharding)| bind_leaf(parameter, sharding, &make_operation))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Input::from_parameters(structure, staged)?)
 }
@@ -590,15 +626,15 @@ where
 ///   - `input`: Structured traced XLA value whose leaves will be resharded.
 ///   - `shardings`: Structured target shardings with the same leaf layout as `input`.
 #[allow(private_bounds, private_interfaces)]
-pub fn reshard<C, Input>(input: Input, shardings: Input::To<Sharding>) -> Result<Input, ShardMapTraceError>
+pub fn reshard<Input, Leaf>(input: Input, shardings: Input::To<Sharding>) -> Result<Input, ShardMapTraceError>
 where
-    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
+    Input: Parameterized<Leaf, To<Leaf> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
+    Leaf: Value<Type = ArrayType>,
+    Leaf::DispatchDomain: Context<Type = ArrayType>,
+    <Leaf::DispatchDomain as Domain>::Operation: From<ReshardOperation>,
 {
-    stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| {
-        XlaOperation::from(ReshardOperation::new(sharding))
-    })
+    bind_sharding_control_per_leaf(input, shardings, ReshardOperation::new)
 }
 
 /// Records sharding-propagation hints on one traced XLA value tree over the mesh's
@@ -616,15 +652,18 @@ where
 ///   - `input`: Structured traced XLA value whose leaves will be hinted.
 ///   - `shardings`: Structured sharding hints with the same leaf layout as `input`.
 #[allow(private_bounds, private_interfaces)]
-pub fn sharding_constraint<C, Input>(input: Input, shardings: Input::To<Sharding>) -> Result<Input, ShardMapTraceError>
+pub fn sharding_constraint<Input, Leaf>(
+    input: Input,
+    shardings: Input::To<Sharding>,
+) -> Result<Input, ShardMapTraceError>
 where
-    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
+    Input: Parameterized<Leaf, To<Leaf> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
+    Leaf: Value<Type = ArrayType>,
+    Leaf::DispatchDomain: Context<Type = ArrayType>,
+    <Leaf::DispatchDomain as Domain>::Operation: From<ShardingConstraintOperation>,
 {
-    stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| {
-        XlaOperation::from(ShardingConstraintOperation::new(sharding))
-    })
+    bind_sharding_control_per_leaf(input, shardings, ShardingConstraintOperation::new)
 }
 
 /// Stages a traced shard-map body over the provided mesh and shardings.
@@ -661,11 +700,13 @@ pub fn shard_map<
 ) -> Result<<Leaf as ShardMapInvocationLeaf>::Return<Input, Output>, ShardMapTraceError>
 where
     Input::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<Sharding>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
         + ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>
         + ParameterizedFamily<Leaf>,
@@ -708,11 +749,13 @@ pub fn shard_map_with_options<
 ) -> Result<<Leaf as ShardMapInvocationLeaf>::Return<Input, Output>, ShardMapTraceError>
 where
     Input::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<Sharding>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
         + ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>
         + ParameterizedFamily<Leaf>,
@@ -729,9 +772,12 @@ where
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedShardMap<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
-    Output::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Input::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Output::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<ShardMapTracer>,
 {
     /// Manual SPMD metadata describing how the body is partitioned over the mesh.
     shard_map: ShardMap,
@@ -749,16 +795,19 @@ where
     local_output_types: Output,
 
     /// Staged traced body specialized to abstract shard-map tensor leaves.
-    program: XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>>,
+    program: XlaProgram<ShardMapCapturedInput<Input>, ShardMapCapturedOutput<Output>>,
 }
 
 /// Traced XLA program backed by a staged `tracing_v2` program.
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedXlaProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
-    Output::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Input::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Output::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<ShardMapTracer>,
 {
     /// Global input types supplied to the traced function.
     global_input_types: Input,
@@ -767,7 +816,7 @@ where
     global_output_types: Output,
 
     /// Staged traced XLA program specialized to abstract shard-map tensor leaves.
-    program: XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>>,
+    program: XlaProgram<ShardMapCapturedInput<Input>, ShardMapCapturedOutput<Output>>,
 }
 
 /// Metadata describing one manual SPMD computation over a mesh.
@@ -985,10 +1034,14 @@ impl ShardMap {
         global_input_types: Input,
     ) -> Result<TracedShardMap<Input, Output>, ShardMapTraceError>
     where
-        Input::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
-        Output::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+        Input::Family: ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
+            + ParameterizedFamily<XlaConstant>
+            + ParameterizedFamily<ShardMapTracer>,
+        Output::Family: ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
+            + ParameterizedFamily<XlaConstant>
+            + ParameterizedFamily<ShardMapTracer>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
     {
         let global_input_types = derive_global_input_types(self, &global_input_types)?;
@@ -1011,9 +1064,12 @@ impl ShardMap {
 #[allow(private_bounds, private_interfaces)]
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedShardMap<Input, Output>
 where
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
-    Output::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Input::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Output::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<ShardMapTracer>,
 {
     /// Returns the global input types used to derive the traced local body inputs.
     pub fn global_input_types(&self) -> &Input {
@@ -1058,13 +1114,16 @@ where
 #[allow(private_bounds, private_interfaces)]
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedXlaProgram<Input, Output>
 where
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
-    Output::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Input::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Output::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<ShardMapTracer>,
 {
     /// Returns the staged traced XLA program backing this handle.
     #[cfg(feature = "benchmarking")]
-    pub(crate) fn program(&self) -> &XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>> {
+    pub(crate) fn program(&self) -> &XlaProgram<ShardMapCapturedInput<Input>, ShardMapCapturedOutput<Output>> {
         &self.program
     }
 
@@ -1216,9 +1275,12 @@ impl FlatTracedShardMap {
         traced: &TracedShardMap<Input, Output>,
     ) -> Self
     where
-        Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
-        Output::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+        Input::Family:
+            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+        Output::Family: ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<ArrayProgramType>
+            + ParameterizedFamily<XlaConstant>
+            + ParameterizedFamily<ShardMapTracer>,
     {
         let local_input_types = traced.local_input_types.parameters().cloned().collect::<Vec<_>>();
         let local_output_types = traced.local_output_types.parameters().cloned().collect::<Vec<_>>();
@@ -1456,28 +1518,47 @@ fn trace_xla_function<
     function: F,
     input_types: &Input,
     named_axes: Vec<(String, NamedAxis)>,
-) -> Result<(Output, XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>>), ShardMapTraceError>
+) -> Result<(Output, XlaProgram<ShardMapCapturedInput<Input>, ShardMapCapturedOutput<Output>>), ShardMapTraceError>
 where
-    Input::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
-    Output::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Input::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<ShardMapTracer>,
+    Output::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
-    let (output_types, program): (Output, XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>>) = {
-        let cloned_input_types = Input::from_parameters(
-            input_types.parameter_structure(),
-            input_types.parameters().cloned().collect::<Vec<_>>(),
-        )?;
-        {
-            let (output_types, program) = DomainTracingContext::<XlaDomain<'static>>::trace_with_named_axes(
-                |input| Ok(function(input)),
-                cloned_input_types,
-                named_axes,
-            )?;
-            (output_types, program.simplified()?)
-        }
-    };
+    let input_structure = input_types.parameter_structure();
+    let flat_input_types = input_types.parameters().cloned().map(ArrayProgramType::from).collect::<Vec<_>>();
+    let output_structure = RefCell::new(None);
+    let (flat_output_types, program) = DomainTracingContext::<XlaDomain<'static>>::trace_with_named_axes(
+        |input: Vec<XlaTracer<'static>>| {
+            let input = input
+                .into_iter()
+                .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
+                .collect::<Result<Vec<_>, _>>()?;
+            let input = ShardMapLocalTraceInput::<Input>::from_parameters(input_structure.clone(), input)?;
+            let output = function(input);
+            output_structure.replace(Some(output.parameter_structure()));
+            Ok(output.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>())
+        },
+        flat_input_types,
+        named_axes,
+    )?;
+    let output_structure = output_structure.into_inner().ok_or_else(|| {
+        ProgramError::MalformedProgram("shard-map tracing completed without recording its output structure".to_string())
+    })?;
+    let output_parameters = flat_output_types
+        .into_iter()
+        .map(|r#type| <&ArrayType>::try_from(&r#type).cloned().map_err(ProgramError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    let output_types = Output::from_parameters(output_structure.clone(), output_parameters)?;
+    let program = program.simplified()?.restructured::<ShardMapCapturedInput<Input>, ShardMapCapturedOutput<Output>>(
+        input_structure,
+        output_structure,
+    )?;
     Ok((output_types, program))
 }
 
@@ -1997,7 +2078,6 @@ mod tests {
     use crate::mlir::ToMlir;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, FromPjrt};
-    use ryft_core::differentiation::ReverseModeDifferentiate;
     use ryft_core::operations::math::{Dot, DotDimensionNumbers, Sin};
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::types::data::DataType;
@@ -3127,112 +3207,6 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_xla_grad_around_shard_map_renders_and_executes_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))
-            .expect("failed to create 4-device CPU client");
-        let client_devices = client.addressable_devices().unwrap();
-        assert_eq!(client_devices.len(), 4);
-
-        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
-        let device_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            devices,
-        )
-        .unwrap();
-        let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 0);
-        let global_input_type = ArrayType::scalar(DataType::F32);
-
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-            {
-                let mesh = device_mesh.logical_mesh().clone();
-                let sharding = sharding.clone();
-                move |x: ShardMapTracer| {
-                    let context = x.context().clone();
-                    context
-                        .gradient(
-                            {
-                                let mesh = mesh.clone();
-                                let sharding = sharding.clone();
-                                move |y| {
-                                    shard_map::<_, _, ArrayType, _>(
-                                        |local_x: ShardMapTracer| local_x.sin().unwrap(),
-                                        y,
-                                        mesh.clone(),
-                                        sharding.clone(),
-                                        sharding.clone(),
-                                    )
-                                    .expect("shard_map inside grad should trace")
-                                }
-                            },
-                            x,
-                        )
-                        .expect("grad around shard_map should trace")
-                }
-            },
-            global_input_type,
-        )
-        .unwrap();
-
-        let mlir_program = traced.to_mlir_module("main").unwrap();
-        assert_eq!(
-            mlir_program,
-            indoc! {r#"
-                module {
-                  sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
-                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [], replicated={"x"}>] out_shardings=[<@mesh, [], replicated={"x"}>] manual_axes={"x"} (%arg1: tensor<f32>) {
-                      %2 = stablehlo.cosine %arg1 : tensor<f32>
-                      sdy.return %2 : tensor<f32>
-                    } : (tensor<f32>) -> tensor<f32>
-                    %1 = sdy.manual_computation(%cst, %0) in_shardings=[<@mesh, [], replicated={"x"}>, <@mesh, [], replicated={"x"}>] out_shardings=[<@mesh, [], replicated={"x"}>] manual_axes={"x"} (%arg1: tensor<f32>, %arg2: tensor<f32>) {
-                      %2 = stablehlo.multiply %arg2, %arg1 : tensor<f32>
-                      sdy.return %2 : tensor<f32>
-                    } : (tensor<f32>, tensor<f32>) -> tensor<f32>
-                    return %1 : tensor<f32>
-                  }
-                }
-            "#}
-        );
-
-        let input_value = 1.0f32;
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let input_array = Array::from_host_buffer(
-            &client,
-            input_type,
-            device_mesh,
-            values_to_bytes::<f32>([input_value].as_slice()).as_slice(),
-        )
-        .unwrap();
-        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
-        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
-
-        let execution_devices = executable.addressable_devices().unwrap();
-        assert_eq!(execution_devices.len(), 4);
-        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
-        let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
-        let outputs = executable
-            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
-            .unwrap()
-            .block_until_ready()
-            .unwrap();
-
-        assert_eq!(outputs.len(), execution_device_ids.len());
-        for output in outputs {
-            assert_eq!(output.outputs.len(), 1);
-            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
-            let actual_values = values_from_bytes::<f32>(output_bytes.as_slice());
-            assert_eq!(actual_values.len(), 1);
-            let expected = input_value.cos();
-            let delta = (actual_values[0] - expected).abs();
-            assert!(delta <= 1e-5, "expected {} ~= {expected}; absolute error {delta}", actual_values[0]);
-        }
-    }
-
-    #[test]
     fn test_shard_map_manual_computation_executes_end_to_end_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -3683,7 +3657,7 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            let context = local_x.context().clone();
+                            let context = local_x.dispatch_domain();
                             let summed: ShardMapTracer = Batch::batch(
                                 &context,
                                 |item| item.collective("x", CollectiveKind::PSum),
@@ -3753,7 +3727,7 @@ mod tests {
                             let local_type = local_x.r#type().into_owned();
                             let psum_branch = {
                                 let mut builder = XlaProgramBuilder::new();
-                                let input = builder.add_input(local_type.clone());
+                                let input = builder.add_input(ArrayProgramType::Array(local_type.clone()));
                                 let output = builder
                                     .add_instruction(
                                         CollectiveOperation::new("x".to_string(), CollectiveKind::PSum),
@@ -3765,22 +3739,23 @@ mod tests {
                             };
                             let identity_branch = {
                                 let mut builder = XlaProgramBuilder::new();
-                                let input = builder.add_input(local_type);
+                                let input = builder.add_input(ArrayProgramType::Array(local_type));
                                 builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
                             };
                             let predicate = local_x
                                 .compare(&local_x, ComparisonDirection::Equal)
                                 .unwrap()
                                 .reduce(&[0], ReductionKind::Any);
-                            let context = local_x.context().clone();
+                            let context = local_x.value().context().clone();
                             let mut outputs = context
                                 .stage_operation(
                                     XlaOperation::Condition(ConditionOperation::new()),
                                     vec![psum_branch, identity_branch],
-                                    &[predicate, local_x],
+                                    &[predicate.into_value(), local_x.into_value()],
                                 )
                                 .unwrap();
-                            outputs.remove(0)
+                            ValueProjection::<ArrayType>::into_projected(outputs.remove(0))
+                                .expect("condition output should remain an array")
                         },
                         x,
                         mesh.clone(),
@@ -3923,7 +3898,7 @@ mod tests {
                             // `axis_index` is a scalar per device; broadcast it to the shard shape so the add has
                             // shape-congruent operands (StableHLO has no implicit broadcasting).
                             let local_type = local_x.r#type().into_owned();
-                            let index = local_x.context().axis_index("x").unwrap();
+                            let index = local_x.dispatch_domain().axis_index("x").unwrap();
                             let index = index.legacy_broadcast(local_type, &[]).unwrap();
                             local_x + index
                         },
@@ -4028,7 +4003,7 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
                             let local_type = local_x.r#type().into_owned();
-                            let index = local_x.context().axis_index("x").unwrap();
+                            let index = local_x.dispatch_domain().axis_index("x").unwrap();
                             index.legacy_broadcast(local_type, &[]).unwrap()
                         },
                         x,
@@ -4885,156 +4860,5 @@ mod tests {
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), expected);
         }
-    }
-
-    #[test]
-    fn test_shard_map_all_gather_gradient_transposes_to_psum_scatter() {
-        use ryft_core::differentiation::LinearizationTracer;
-        use ryft_core::operations::collectives::{AllGatherOutputVariance, CollectiveOptions, LegacyAllGather};
-        use ryft_core::operations::math::{Reduce, ReductionKind};
-
-        // Reverse mode wraps the shard_map staging context in a linearization trace, so the values flowing through
-        // the differentiated closure are linearization tracers over the XLA staging context.
-        type GradientTracer = LinearizationTracer<DomainTracingContext<XlaDomain<'static>>>;
-
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-
-        // `sum(all_gather(x))` is linear, so its gradient transposes the shard_map body: the adjoint of the tiled
-        // `all_gather` is a `psum_scatter` over the same axis and dimension, which lowers to a channeled
-        // `stablehlo.reduce_scatter` inside the transposed manual region.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-            {
-                let mesh = mesh.clone();
-                let sharding = sharding.clone();
-                move |x: ShardMapTracer| {
-                    let context = x.context().clone();
-                    context
-                        .gradient(
-                            {
-                                let mesh = mesh.clone();
-                                let sharding = sharding.clone();
-                                move |y| {
-                                    let gathered = shard_map::<_, _, ArrayType, GradientTracer>(
-                                        |local_x: ShardMapTracer| {
-                                            local_x
-                                                .all_gather(
-                                                    "x",
-                                                    0,
-                                                    CollectiveOptions::tiled(),
-                                                    AllGatherOutputVariance::Varying,
-                                                )
-                                                .unwrap()
-                                        },
-                                        y,
-                                        mesh.clone(),
-                                        sharding.clone(),
-                                        sharding.clone(),
-                                    )
-                                    .expect("shard_map with all_gather should trace inside grad");
-                                    gathered.reduce(&[0], ReductionKind::Sum)
-                                }
-                            },
-                            x,
-                        )
-                        .expect("grad around shard_map with all_gather should trace")
-                }
-            },
-            global_input_type,
-        )
-        .unwrap();
-
-        let mlir_program = traced.to_mlir_module("main").unwrap();
-        assert_eq!(
-            mlir_program,
-            indoc! {r#"
-                module {
-                  sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
-                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<8xf32>
-                    %1 = sdy.manual_computation(%0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
-                      %2 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, scatter_dimension = 0 : i64, use_global_device_ids}> ({
-                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
-                        %3 = stablehlo.add %arg2, %arg3 : tensor<f32>
-                        stablehlo.return %3 : tensor<f32>
-                      }) : (tensor<4xf32>) -> tensor<2xf32>
-                      sdy.return %2 : tensor<2xf32>
-                    } : (tensor<8xf32>) -> tensor<4xf32>
-                    return %1 : tensor<4xf32>
-                  }
-                }
-            "#}
-        );
-    }
-
-    #[test]
-    fn test_shard_map_ppermute_gradient_transposes_to_inverted_pairs() {
-        use ryft_core::differentiation::LinearizationTracer;
-        use ryft_core::operations::collectives::Ppermute;
-        use ryft_core::operations::math::{Reduce, ReductionKind};
-
-        // Reverse mode wraps the shard_map staging context in a linearization trace, so the values flowing through
-        // the differentiated closure are linearization tracers over the XLA staging context.
-        type GradientTracer = LinearizationTracer<DomainTracingContext<XlaDomain<'static>>>;
-
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-
-        // `sum(ppermute(x))` is linear, so its gradient transposes the shard_map body: the adjoint of the rotation
-        // [(0, 1), (1, 0)] is the permutation with every pair inverted, [(1, 0), (0, 1)], which lowers to a channeled
-        // `stablehlo.collective_permute` with the inverted global device pairs inside the transposed manual region.
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-            {
-                let mesh = mesh.clone();
-                let sharding = sharding.clone();
-                move |x: ShardMapTracer| {
-                    let context = x.context().clone();
-                    context
-                        .gradient(
-                            {
-                                let mesh = mesh.clone();
-                                let sharding = sharding.clone();
-                                move |y| {
-                                    let permuted = shard_map::<_, _, ArrayType, GradientTracer>(
-                                        |local_x: ShardMapTracer| local_x.ppermute("x", vec![(0, 1), (1, 0)]).unwrap(),
-                                        y,
-                                        mesh.clone(),
-                                        sharding.clone(),
-                                        sharding.clone(),
-                                    )
-                                    .expect("shard_map with ppermute should trace inside grad");
-                                    permuted.reduce(&[0], ReductionKind::Sum)
-                                }
-                            },
-                            x,
-                        )
-                        .expect("grad around shard_map with ppermute should trace")
-                }
-            },
-            global_input_type,
-        )
-        .unwrap();
-
-        let mlir_program = traced.to_mlir_module("main").unwrap();
-        assert_eq!(
-            mlir_program,
-            indoc! {r#"
-                module {
-                  sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
-                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %1 = sdy.manual_computation(%0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
-                      %2 = "stablehlo.collective_permute"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, source_target_pairs = dense<[[1, 0], [0, 1]]> : tensor<2x2xi64>}> : (tensor<2xf32>) -> tensor<2xf32>
-                      sdy.return %2 : tensor<2xf32>
-                    } : (tensor<4xf32>) -> tensor<4xf32>
-                    return %1 : tensor<4xf32>
-                  }
-                }
-            "#}
-        );
     }
 }

@@ -8,9 +8,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use ryft_core::backends::array_programs::ArrayProgramValue;
 use ryft_core::compilation::CompilationCacheDomain;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
-use ryft_core::types::ArrayType;
+use ryft_core::types::{ArrayProgramType, ArrayType};
 use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile;
 use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 
@@ -18,6 +19,7 @@ use crate::Array;
 use crate::experimental::domains::{
     XlaDomain, XlaDomainError, XlaFeedbackDirectedProfile, XlaLoweredProgram, XlaOptions,
 };
+use crate::experimental::ops::XlaConstant;
 use crate::jit::ExecutableXlaProgram;
 
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
@@ -362,11 +364,19 @@ fn adaptive_profile_sidecar_key<'c>(
 /// trace is complete. Concurrent calls copy the currently active executable handle and execute without holding the
 /// state or dispatch locks. Recompilation is single-flight and terminal: it either installs one compatible executable
 /// or records a permanent failure while continuing to serve the baseline.
-pub struct AdaptiveProfileGuidedXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> {
+pub struct AdaptiveProfileGuidedXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+where
+    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+{
     inner: Arc<AdaptiveProfileGuidedXlaFunctionInner<'c, In, Out>>,
 }
 
-struct AdaptiveProfileGuidedXlaFunctionInner<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> {
+struct AdaptiveProfileGuidedXlaFunctionInner<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+where
+    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+{
     domain: XlaDomain<'c>,
     baseline: ExecutableXlaProgram<'c, In, Out>,
     active: RwLock<ExecutableXlaProgram<'c, In, Out>>,
@@ -379,6 +389,9 @@ struct AdaptiveProfileGuidedXlaFunctionInner<'c, In: Parameterized<ArrayType>, O
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone
     for AdaptiveProfileGuidedXlaFunction<'c, In, Out>
+where
+    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -386,7 +399,11 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptiveProfileGuidedXlaFunction<'c, In, Out> {
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptiveProfileGuidedXlaFunction<'c, In, Out>
+where
+    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+{
     pub(crate) fn new(
         domain: XlaDomain<'c>,
         baseline: ExecutableXlaProgram<'c, In, Out>,
@@ -454,8 +471,8 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptivePr
     /// Executes with the active executable and advances adaptive profiling when this call wins ownership.
     pub fn interpret(&self, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
-        In::Family: ParameterizedFamily<Array<'c>>,
-        Out::Family: ParameterizedFamily<Array<'c>>,
+        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayProgramValue<Array<'c>>>,
+        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayProgramValue<Array<'c>>>,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
@@ -490,8 +507,8 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptivePr
         inputs: In::To<Array<'c>>,
     ) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
-        In::Family: ParameterizedFamily<Array<'c>>,
-        Out::Family: ParameterizedFamily<Array<'c>>,
+        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayProgramValue<Array<'c>>>,
+        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayProgramValue<Array<'c>>>,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {

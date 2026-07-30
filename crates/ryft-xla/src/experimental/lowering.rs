@@ -7,6 +7,7 @@ use ryft_core::axes::AxisIndexOperation;
 use ryft_core::backends::arrays::Array as CpuArray;
 use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::scalars::Scalar;
+use ryft_core::captures::CaptureReference;
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{
     AttentionMask, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
@@ -18,7 +19,9 @@ use ryft_core::operations::collectives::{
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{ConstantOperation, IotaOperation};
-use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
+#[cfg(test)]
+use ryft_core::operations::control_flow::ConditionOperation;
+use ryft_core::operations::control_flow::{ScanOperation, WhileOperation};
 use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
 use ryft_core::operations::differentiation::CoordinateBasisOperation;
 #[cfg(test)]
@@ -42,7 +45,7 @@ use ryft_core::programs::regions::{RegionId, RegionRef};
 use ryft_core::programs::types::{Type as RyftType, Typed};
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::types::{ArrayType, DataType, Dimension, Memory, Shape};
+use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, Memory, Shape};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
 use ryft_mlir::{
@@ -52,15 +55,12 @@ use ryft_mlir::{
 };
 
 use crate::experimental::debugging::{PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE};
-#[cfg(test)]
-use crate::experimental::ops::XlaProgramBuilder;
 use crate::experimental::ops::{FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};
 use crate::mlir::ToMlir;
 
 use super::shard_map::{ShardMap, ShardMapError};
 
 mod composite;
-pub use composite::{ArrayProgramLoweringError, lower_array_program_to_stable_hlo};
 
 /// Error type for StableHLO/Shardy lowering.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -252,13 +252,6 @@ pub(crate) struct PlainMlirLowerer<'b, 'c: 'b, 't: 'c> {
     /// Declared input types of the instruction currently being lowered, in operand order.
     input_types: Vec<ArrayType>,
 
-    /// Shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call` lowering sites.
-    /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
-    nested_functions: Option<Rc<JitCallFunctionMap>>,
-
-    /// Hidden capture arguments of the function currently being lowered, in capture-table order.
-    captured_values: Vec<ValueRef<'b, 'c, 't>>,
-
     /// Current StableHLO effect token of the lowering scope this lowerer emits into, or `None` when the scope has
     /// not lowered an effectful instruction yet. Lowerers are constructed per instruction by the instruction replay
     /// loops, which copy the scope-level token in through [`Self::with_token`] and read the updated token back out
@@ -282,8 +275,6 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
             context,
             location,
             input_types: Vec::new(),
-            nested_functions: None,
-            captured_values: Vec::new(),
             token: None,
             collective_state: CollectiveLoweringState::new(),
         }
@@ -292,18 +283,6 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     /// Attaches the declared input types of the instruction currently being lowered.
     pub(crate) fn with_input_types(mut self, input_types: Vec<ArrayType>) -> Self {
         self.input_types = input_types;
-        self
-    }
-
-    /// Attaches the shared deduplicated `jit_call` functions consulted while lowering.
-    pub(crate) fn with_nested_functions(mut self, nested_functions: Option<Rc<JitCallFunctionMap>>) -> Self {
-        self.nested_functions = nested_functions;
-        self
-    }
-
-    /// Attaches the hidden capture arguments of the function currently being lowered.
-    pub(crate) fn with_captured_values(mut self, captured_values: &[ValueRef<'b, 'c, 't>]) -> Self {
-        self.captured_values = captured_values.to_vec();
         self
     }
 
@@ -326,78 +305,6 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     ) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, LoweringError> {
         lower_tensor_type(array_type, self.context, self.location)
     }
-
-    /// Lowers one nested condition operation inside this lowering context.
-    pub(crate) fn lower_condition<V: MlirLowerableValue>(
-        &mut self,
-        branch_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_condition_to_if(
-            branch_regions,
-            input_values,
-            &mut self.block,
-            self.context,
-            self.location,
-            self.captured_values.as_slice(),
-            self.nested_functions.as_ref(),
-            &self.collective_state,
-            &mut self.token,
-        )
-    }
-
-    /// Lowers one nested while operation inside this lowering context.
-    pub(crate) fn lower_while<V: MlirLowerableValue>(
-        &mut self,
-        while_op: &WhileOperation,
-        loop_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_while_to_while(
-            while_op,
-            loop_regions,
-            input_values,
-            &mut self.block,
-            self.context,
-            self.location,
-            self.captured_values.as_slice(),
-            self.nested_functions.as_ref(),
-            &self.collective_state,
-            &mut self.token,
-        )
-    }
-
-    /// Lowers one nested scan operation inside this lowering context.
-    pub(crate) fn lower_scan<V: MlirLowerableValue, Capture>(
-        &mut self,
-        scan_op: &ScanOperation<Capture>,
-        scan_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        Capture: Value<Type = ArrayType>,
-    {
-        let [body] = scan_regions else {
-            return Err(LoweringError::UnsupportedOp {
-                op: format!("scan expected 1 attached region but got {}", scan_regions.len()),
-            });
-        };
-        lower_scan_to_while(
-            body,
-            scan_op.carry_count(),
-            scan_op.length(),
-            scan_op.reverse(),
-            scan_op.unroll(),
-            input_values,
-            &mut self.block,
-            self.context,
-            self.location,
-            self.captured_values.as_slice(),
-            self.nested_functions.as_ref(),
-            &self.collective_state,
-            &mut self.token,
-        )
-    }
 }
 
 /// Operations that can be lowered to StableHLO for XLA compilation.
@@ -411,7 +318,6 @@ pub(crate) trait LowerableXlaOperation<V: MlirLowerableValue>: Operation<ArrayTy
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -422,7 +328,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOpera
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -537,7 +442,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AddOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -558,7 +462,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SubOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -579,7 +482,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MulOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -600,7 +502,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DivOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -621,7 +522,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for NegOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -756,7 +656,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SinOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -783,7 +682,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CosOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -811,7 +709,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Atan2Operation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -832,7 +729,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ExpOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -850,7 +746,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -867,7 +762,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SqrtOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -884,7 +778,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RsqrtOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -901,7 +794,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TanhOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -918,7 +810,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogisticOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -938,7 +829,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ErfOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -952,7 +842,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for PowOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -973,7 +862,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SignOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -987,7 +875,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for FloorOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1001,7 +888,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CeilOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1015,7 +901,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RoundOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1031,7 +916,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MaxOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1052,7 +936,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MinOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1073,7 +956,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RemOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1094,7 +976,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AbsOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1108,7 +989,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ComplexOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1127,7 +1007,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConjugateOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1151,7 +1030,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RealOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1165,7 +1043,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ImaginaryOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1179,7 +1056,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TransposeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1197,7 +1073,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DotOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1227,7 +1102,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for IotaOperation<ArrayType
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1255,7 +1129,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CoordinateBasisOperatio
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1269,19 +1142,14 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<CpuAr
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         check_count!("input", input_values, 0, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let constant_value = self.value().lower_constant_value(
-            lowerer.captured_values.as_slice(),
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
+        let constant_value =
+            self.value().lower_constant_value(&[], &mut lowerer.block, lowerer.context, lowerer.location)?;
         Ok(vec![constant_value])
     }
 }
@@ -1290,7 +1158,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LegacyReshapeOperation 
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1449,7 +1316,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for PadOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1497,7 +1363,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LegacyBroadcastOperatio
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -1790,782 +1655,6 @@ fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + 
     Ok(vec![operation.result(0).expect("stablehlo.custom_call should return one result").as_ref()])
 }
 
-impl<V> LowerableXlaOperation<V> for XlaOperation<V>
-where
-    V: MlirLowerableValue,
-{
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        match self {
-            Self::Zero(_) => {
-                check_count!("input", input_values, 0, ProgramError);
-                lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
-            }
-            Self::ZeroLike(_) => lower_like_constant(
-                input_values,
-                output_types,
-                0,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            Self::One(_) => {
-                check_count!("input", input_values, 0, ProgramError);
-                lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
-            }
-            Self::OneLike(_) => lower_like_constant(
-                input_values,
-                output_types,
-                1,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            Self::Constant(operation) => operation.lower_to_mlir(input_values, regions, output_types, mode, lowerer),
-            Self::ConvertElementType(operation) => {
-                operation.lower_to_mlir(input_values, regions, output_types, mode, lowerer)
-            }
-            Self::Iota(operation) => <IotaOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::CoordinateBasis(operation) => {
-                <CoordinateBasisOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    operation,
-                    input_values,
-                    regions,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
-            Self::Neg(operation) => <NegOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Add(operation) => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Sub(operation) => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Mul(operation) => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Div(operation) => <DivOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Sin(operation) => <SinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Cos(operation) => <CosOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Atan2(operation) => <Atan2Operation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Exp(operation) => <ExpOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Log(operation) => <LogOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Sqrt(operation) => <SqrtOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Rsqrt(operation) => <RsqrtOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Tanh(operation) => <TanhOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Logistic(operation) => <LogisticOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Erf(operation) => <ErfOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Pow(operation) => <PowOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Sign(operation) => <SignOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Floor(operation) => <FloorOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Ceil(operation) => <CeilOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Round(operation) => <RoundOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Max(operation) => <MaxOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Min(operation) => <MinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Rem(operation) => <RemOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Abs(operation) => <AbsOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Complex(operation) => <ComplexOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Conjugate(operation) => <ConjugateOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Real(operation) => <RealOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Imaginary(operation) => <ImaginaryOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::StopGradient(_) => {
-                check_count!("input", input_values, 1, ProgramError);
-                Ok(vec![input_values[0]])
-            }
-            Self::Tag(_) => {
-                check_count!("input", input_values, 1, ProgramError);
-                Ok(vec![input_values[0]])
-            }
-            // `print` is the identity on its dataflow output; its observable effect lowers to a host-callback
-            // custom call that consumes and produces a StableHLO token, so the effect ordering rides the scope's
-            // token chain instead of the value dataflow.
-            Self::Print(operation) => {
-                check_count!("input", input_values, 1, ProgramError);
-                lower_print_to_custom_call(
-                    operation.label(),
-                    input_values[0],
-                    &mut lowerer.token,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                Ok(vec![input_values[0]])
-            }
-            Self::CustomCall(operation) => lower_custom_call_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            Self::TransferToMemory(operation) => lower_transfer_to_memory(
-                operation.destination(),
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            Self::Dot(operation) => <DotOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Transpose(operation) => <TransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Reshape(operation) => <LegacyReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Reshard(operation) => {
-                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
-            }
-            Self::ShardingConstraint(operation) => {
-                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
-            }
-            Self::Broadcast(operation) => <LegacyBroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                regions,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            Self::Slice(operation) => lower_slice_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            Self::UpdateSlice(operation) => {
-                let index_values = lower_static_index_constants(
-                    operation.start_indices(),
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
-                    input_values[0],
-                    input_values[1],
-                    index_values.as_slice(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
-            }
-            Self::DynamicSlice(operation) => {
-                let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
-                    input_values[0],
-                    &input_values[1..],
-                    operation.sizes(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
-            }
-            Self::DynamicUpdateSlice(_) => {
-                let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
-                    input_values[0],
-                    input_values[1],
-                    &input_values[2..],
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
-            }
-            Self::Pad(operation) => lower_pad_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            Self::Concatenate(operation) => {
-                let result = lowerer.block.append_operation(stable_hlo::concatenate(
-                    input_values,
-                    operation.axis(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
-            }
-            Self::Gather(operation) => lower_gather_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            Self::Scatter(operation) => lower_scatter_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            Self::Reduce(operation) => {
-                check_count!("output", output_types, 1, ProgramError);
-                let value = lower_reduce_to_mlir(
-                    operation.kind(),
-                    operation.axes(),
-                    input_values[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                Ok(vec![value])
-            }
-            Self::Sort(operation) => lower_sort_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            Self::RngBitGenerator(operation) => lower_rng_bit_generator_to_mlir(
-                operation,
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            Self::ScaledDot(operation) => {
-                let collective_state = lowerer.collective_state.clone();
-                lower_scaled_dot_to_mlir(
-                    operation,
-                    &collective_state,
-                    input_values,
-                    &lowerer.input_types,
-                    output_types,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
-            }
-            Self::DotProductAttention(operation) => {
-                let collective_state = lowerer.collective_state.clone();
-                lower_dot_product_attention_to_mlir(
-                    operation,
-                    &collective_state,
-                    input_values,
-                    &lowerer.input_types,
-                    output_types,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
-            }
-            Self::DotProductAttentionBackward(operation) => {
-                let collective_state = lowerer.collective_state.clone();
-                lower_dot_product_attention_backward_to_mlir(
-                    operation,
-                    &collective_state,
-                    input_values,
-                    &lowerer.input_types,
-                    output_types,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
-            }
-            Self::Compare(operation) => {
-                let operand_type = comparison_operand_type(&lowerer.input_types, output_types)?;
-                let [left, right] = normalize_binary_elementwise_operands(
-                    input_values,
-                    &[operand_type],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                let value =
-                    lower_compare_to_mlir(operation.direction(), left, right, &mut lowerer.block, lowerer.location)?;
-                Ok(vec![value])
-            }
-            Self::Not(_) => {
-                let result = lowerer.block.append_operation(stable_hlo::not(input_values[0], lowerer.location)?)?;
-                Ok(vec![result.result(0).expect("stablehlo.not should return one result").as_ref()])
-            }
-            Self::And(_) => {
-                let [left, right] = normalize_binary_elementwise_operands(
-                    input_values,
-                    output_types,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                let result = lowerer.block.append_operation(stable_hlo::and(left, right, lowerer.location)?)?;
-                Ok(vec![result.result(0).expect("stablehlo.and should return one result").as_ref()])
-            }
-            Self::Or(_) => {
-                let [left, right] = normalize_binary_elementwise_operands(
-                    input_values,
-                    output_types,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                let result = lowerer.block.append_operation(stable_hlo::or(left, right, lowerer.location)?)?;
-                Ok(vec![result.result(0).expect("stablehlo.or should return one result").as_ref()])
-            }
-            Self::Xor(_) => {
-                let [left, right] = normalize_binary_elementwise_operands(
-                    input_values,
-                    output_types,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                let result = lowerer.block.append_operation(stable_hlo::xor(left, right, lowerer.location)?)?;
-                Ok(vec![result.result(0).expect("stablehlo.xor should return one result").as_ref()])
-            }
-            Self::Collective(operation) => {
-                // This plain dispatch serves nested programs (control-flow bodies, inlined custom-derivative and
-                // rematerialized primals), which can sit inside a shard_map manual region: the threaded
-                // `CollectiveLoweringState` resolves the collective's mesh axis there and errors outside manual
-                // regions (a batched axis would have been consumed into a `Reduce` at trace time).
-                check_count!("input", input_values, 1, ProgramError);
-                check_count!("output", output_types, 1, ProgramError);
-                let collective_state = lowerer.collective_state.clone();
-                let result = lower_collective_to_all_reduce(
-                    operation,
-                    &collective_state,
-                    input_values[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                Ok(vec![result])
-            }
-            Self::AllGather(operation) => {
-                check_count!("input", input_values, 1, ProgramError);
-                check_count!("output", output_types, 1, ProgramError);
-                let collective_state = lowerer.collective_state.clone();
-                lower_all_gather_to_mlir(
-                    operation,
-                    &collective_state,
-                    input_values[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
-            }
-            Self::PSumScatter(operation) => {
-                check_count!("input", input_values, 1, ProgramError);
-                check_count!("output", output_types, 1, ProgramError);
-                let collective_state = lowerer.collective_state.clone();
-                lower_psum_scatter_to_mlir(
-                    operation,
-                    &collective_state,
-                    input_values[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
-            }
-            Self::Ppermute(operation) => {
-                check_count!("input", input_values, 1, ProgramError);
-                let collective_state = lowerer.collective_state.clone();
-                lower_ppermute_to_mlir(
-                    operation,
-                    &collective_state,
-                    input_values[0],
-                    &mut lowerer.block,
-                    lowerer.location,
-                )
-            }
-            Self::AllToAll(operation) => {
-                check_count!("input", input_values, 1, ProgramError);
-                check_count!("output", output_types, 1, ProgramError);
-                let collective_state = lowerer.collective_state.clone();
-                lower_all_to_all_to_mlir(
-                    operation,
-                    &collective_state,
-                    input_values[0],
-                    &lowerer.input_types[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
-            }
-            Self::AxisIndex(operation) => {
-                check_count!("input", input_values, 0, ProgramError);
-                check_count!("output", output_types, 1, ProgramError);
-                let collective_state = lowerer.collective_state.clone();
-                let result = lower_axis_index_to_coordinate(
-                    operation,
-                    &collective_state,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                Ok(vec![result])
-            }
-            Self::Select(_) => {
-                let [condition, on_true, on_false] = normalize_select_operands(
-                    input_values,
-                    output_types,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                let result = lowerer.block.append_operation(stable_hlo::select(
-                    condition,
-                    on_true,
-                    on_false,
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
-            }
-            Self::Condition(condition) => condition.lower_to_mlir(input_values, regions, output_types, mode, lowerer),
-            Self::While(while_operation) => {
-                while_operation.lower_to_mlir(input_values, regions, output_types, mode, lowerer)
-            }
-            Self::Scan(scan) => scan.lower_to_mlir(input_values, regions, output_types, mode, lowerer),
-            Self::CustomJvp(_) => lower_nested_program_inline(
-                &regions[0],
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-                lowerer.captured_values.as_slice(),
-                false,
-                lowerer.nested_functions.as_ref(),
-                &lowerer.collective_state,
-                &mut lowerer.token,
-            ),
-            Self::CustomVjp(_) => lower_nested_program_inline(
-                &regions[0],
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-                lowerer.captured_values.as_slice(),
-                false,
-                lowerer.nested_functions.as_ref(),
-                &lowerer.collective_state,
-                &mut lowerer.token,
-            ),
-            // The opaque custom-VJP tangent carrier is a forward-mode tangent map that reverse mode transposes away
-            // before lowering, so it never reaches the backend; reaching here means a forward-mode use of `custom_vjp`
-            // slipped through, which is reverse-mode-only.
-            Self::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
-                message: format!("operation `{}` cannot be lowered to StableHLO", operation.name(),),
-            }
-            .into()),
-            Self::Rematerialize(_) => lower_nested_program_inline(
-                &regions[0],
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-                lowerer.captured_values.as_slice(),
-                false,
-                lowerer.nested_functions.as_ref(),
-                &lowerer.collective_state,
-                &mut lowerer.token,
-            ),
-            Self::JitCall(_) => lower_jit_call(
-                &regions[0],
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-                lowerer.nested_functions.as_ref(),
-                &lowerer.collective_state,
-                &mut lowerer.token,
-            ),
-            Self::ShardMap(shard_map_op) => {
-                let simplified_body = regions[0]
-                    .simplified()
-                    .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
-                lower_manual_computation_inline(
-                    &mut lowerer.block,
-                    input_values,
-                    shard_map_op.shard_map(),
-                    &simplified_body,
-                    shard_map_op.global_output_types(),
-                    lowerer.context,
-                    lowerer.location,
-                    &lowerer.collective_state,
-                )
-            }
-        }
-    }
-}
-
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConditionOperation<V> {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lowerer.lower_condition(regions, input_values)
-    }
-}
-
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for WhileOperation {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lowerer.lower_while(self, regions, input_values)
-    }
-}
-
-impl<V: MlirLowerableValue, Capture> LowerableXlaOperation<V> for ScanOperation<Capture>
-where
-    Capture: Value<Type = ArrayType>,
-{
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lowerer.lower_scan(self, regions, input_values)
-    }
-}
-
-/// Lowers a sharding-control operation to the Shardy
-/// [`sdy.sharding_constraint`](https://openxla.org/shardy/sdy_dialect#sdysharding_constraint-sdyshardingconstraintop)
-/// operation. Both the tracked [`ArrayOperation::Reshard`](ryft_core::operations::ReshardOperation) sharding
-/// transition and the [`ArrayOperation::ShardingConstraint`](ryft_core::operations::ShardingConstraintOperation)
-/// auto-axis propagation hint emit this single operation; they differ only in their `ryft` type-level semantics
-/// (which mesh axes they govern and how they transpose), not in the emitted MLIR.
 fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     sharding: &Sharding,
@@ -3995,7 +3084,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         output_types: &[ArrayType],
         mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
@@ -4014,15 +3102,22 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             ArrayOperation::Constant(constant) => {
-                constant.lower_to_mlir(input_values, regions, output_types, mode, lowerer)
+                <ConstantOperation<CpuArray> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    constant,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
-            ArrayOperation::ConvertElementType(operation) => {
-                operation.lower_to_mlir(input_values, regions, output_types, mode, lowerer)
-            }
+            ArrayOperation::ConvertElementType(operation) => <ConvertElementTypeOperation as LowerableXlaOperation<
+                V,
+            >>::lower_to_mlir(
+                operation, input_values, output_types, mode, lowerer
+            ),
             ArrayOperation::Iota(iota) => <IotaOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 iota,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4031,7 +3126,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 <CoordinateBasisOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                     operation,
                     input_values,
-                    regions,
                     output_types,
                     mode,
                     lowerer,
@@ -4040,7 +3134,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Add(operation) => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4048,7 +3141,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Sub(operation) => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4056,7 +3148,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Mul(operation) => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4064,7 +3155,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Div(operation) => <DivOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4072,7 +3162,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Neg(operation) => <NegOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4080,7 +3169,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Sin(operation) => <SinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4088,7 +3176,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Cos(operation) => <CosOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4096,7 +3183,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Atan2(operation) => <Atan2Operation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4104,7 +3190,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Exp(operation) => <ExpOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4112,7 +3197,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Log(operation) => <LogOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4120,7 +3204,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Sqrt(operation) => <SqrtOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4128,7 +3211,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Rsqrt(operation) => <RsqrtOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4136,7 +3218,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Tanh(operation) => <TanhOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4144,7 +3225,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Logistic(operation) => <LogisticOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4152,7 +3232,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Erf(operation) => <ErfOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4160,7 +3239,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Pow(operation) => <PowOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4168,7 +3246,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Sign(operation) => <SignOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4176,7 +3253,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Floor(operation) => <FloorOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4184,7 +3260,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Ceil(operation) => <CeilOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4192,7 +3267,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Round(operation) => <RoundOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4200,7 +3274,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Max(operation) => <MaxOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4208,7 +3281,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Min(operation) => <MinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4216,7 +3288,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Rem(operation) => <RemOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4224,7 +3295,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Abs(operation) => <AbsOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4232,7 +3302,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Complex(operation) => <ComplexOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4240,7 +3309,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Conjugate(operation) => <ConjugateOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4248,7 +3316,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Real(operation) => <RealOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4256,7 +3323,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Imaginary(operation) => <ImaginaryOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4307,51 +3373,20 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 lowerer.context,
                 lowerer.location,
             ),
-            // Custom-derivative calls lower as their primal program: the derivative programs only exist for the
-            // benefit of transforms and never reach the backend.
-            ArrayOperation::CustomJvp(_) => lower_nested_program_inline(
-                &regions[0],
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-                lowerer.captured_values.as_slice(),
-                false,
-                lowerer.nested_functions.as_ref(),
-                &lowerer.collective_state,
-                &mut lowerer.token,
-            ),
-            ArrayOperation::CustomVjp(_) => lower_nested_program_inline(
-                &regions[0],
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-                lowerer.captured_values.as_slice(),
-                false,
-                lowerer.nested_functions.as_ref(),
-                &lowerer.collective_state,
-                &mut lowerer.token,
-            ),
-            // The opaque custom-VJP tangent carrier is a forward-mode tangent map that reverse mode transposes away
-            // before lowering, so it never reaches the backend; reaching here means a forward-mode use of `custom_vjp`
-            // slipped through, which is reverse-mode-only.
+            ArrayOperation::CustomJvp(_) | ArrayOperation::CustomVjp(_) | ArrayOperation::Rematerialize(_) => {
+                Err(ProgramError::UnsupportedOperation {
+                    message: "higher-order operation must be stored directly in the enclosing backend operation family"
+                        .to_string(),
+                }
+                .into())
+            }
             ArrayOperation::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
-                message: format!("operation `{}` cannot be lowered to StableHLO", operation.name(),),
+                message: format!(
+                    "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
+                    operation.name(),
+                ),
             }
             .into()),
-            ArrayOperation::Rematerialize(_) => lower_nested_program_inline(
-                &regions[0],
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-                lowerer.captured_values.as_slice(),
-                false,
-                lowerer.nested_functions.as_ref(),
-                &lowerer.collective_state,
-                &mut lowerer.token,
-            ),
             ArrayOperation::ZeroLike(_) => lower_like_constant(
                 input_values,
                 output_types,
@@ -4371,7 +3406,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Transpose(operation) => <TransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4379,7 +3413,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Dot(operation) => <DotOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4387,7 +3420,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Reshape(operation) => <LegacyReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
-                regions,
                 output_types,
                 mode,
                 lowerer,
@@ -4402,7 +3434,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 <LegacyBroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                     operation,
                     input_values,
-                    regions,
                     output_types,
                     mode,
                     lowerer,
@@ -4700,13 +3731,27 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 lowerer.context,
                 lowerer.location,
             ),
-            ArrayOperation::Condition(condition) => {
-                condition.lower_to_mlir(input_values, regions, output_types, mode, lowerer)
+            ArrayOperation::Condition(operation) => Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
+                    operation.name(),
+                ),
             }
-            ArrayOperation::While(while_operation) => {
-                while_operation.lower_to_mlir(input_values, regions, output_types, mode, lowerer)
+            .into()),
+            ArrayOperation::While(operation) => Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
+                    Operation::<ArrayType>::name(operation),
+                ),
             }
-            ArrayOperation::Scan(scan) => scan.lower_to_mlir(input_values, regions, output_types, mode, lowerer),
+            .into()),
+            ArrayOperation::Scan(operation) => Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
+                    operation.name(),
+                ),
+            }
+            .into()),
         }
     }
 }
@@ -4786,7 +3831,7 @@ pub(crate) struct ShardMapMlirLowerer<'b, 'c: 'b, 't: 'c> {
     location: LocationRef<'c, 't>,
 
     /// Declared input types of the instruction currently being lowered, in operand order.
-    input_types: Vec<ArrayType>,
+    input_types: Vec<ArrayProgramType>,
 
     /// Shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call` lowering sites.
     /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
@@ -4825,7 +3870,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Attaches the declared input types of the instruction currently being lowered.
-    pub(crate) fn with_input_types(mut self, input_types: Vec<ArrayType>) -> Self {
+    pub(crate) fn with_input_types(mut self, input_types: Vec<ArrayProgramType>) -> Self {
         self.input_types = input_types;
         self
     }
@@ -4854,18 +3899,10 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         self
     }
 
-    /// Lowers one tensor type inside this lowering context.
-    pub(crate) fn lower_tensor_type(
-        &self,
-        array_type: &ArrayType,
-    ) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, LoweringError> {
-        lower_tensor_type(array_type, self.context, self.location)
-    }
-
     /// Lowers one nested condition operation inside this lowering context.
-    pub(crate) fn lower_condition<V: MlirLowerableValue>(
+    pub(crate) fn lower_condition(
         &mut self,
-        branch_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
+        branch_regions: &[FlatXlaProgram],
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_condition_to_if(
@@ -4882,10 +3919,10 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested while operation inside this lowering context.
-    pub(crate) fn lower_while<V: MlirLowerableValue>(
+    pub(crate) fn lower_while(
         &mut self,
         while_op: &WhileOperation,
-        loop_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
+        loop_regions: &[FlatXlaProgram],
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_while_to_while(
@@ -4903,15 +3940,12 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested scan operation inside this lowering context.
-    pub(crate) fn lower_scan<V: MlirLowerableValue, Capture>(
+    pub(crate) fn lower_scan(
         &mut self,
-        scan_op: &ScanOperation<Capture>,
-        scan_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
+        scan_op: &ScanOperation<XlaConstant>,
+        scan_regions: &[FlatXlaProgram],
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        Capture: Value<Type = ArrayType>,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let [body] = scan_regions else {
             return Err(LoweringError::UnsupportedOp {
                 op: format!("scan expected 1 attached region but got {}", scan_regions.len()),
@@ -5315,12 +4349,6 @@ pub(crate) trait MlirLowerableValue: Value<Type = ArrayType> + 'static {
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError>;
 
-    /// Returns this value's capture-table index when it is a captured-constant reference.
-    #[inline]
-    fn capture_index(&self) -> Option<usize> {
-        None
-    }
-
     /// Lowers this program constant inside a function body.
     #[inline]
     fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
@@ -5355,11 +4383,6 @@ impl MlirLowerableValue for XlaArrayConstant {
         _context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
         Err(LoweringError::MissingCapturedConstant { index: self.index() })
-    }
-
-    #[inline]
-    fn capture_index(&self) -> Option<usize> {
-        Some(self.index())
     }
 
     #[inline]
@@ -5540,10 +4563,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
 >(
     program: &Program<V, O, Input, Output>,
     function_name: S,
-) -> Result<String, LoweringError>
-where
-    XlaOperation<V>: From<O>,
-{
+) -> Result<String, LoweringError> {
     let function_name = normalize_function_name(function_name.as_ref())?;
     let context = MlirContext::new();
     let location = context.unknown_location();
@@ -5641,26 +4661,47 @@ where
                         None => shard_map_op.shard_map().mesh().clone(),
                     });
                 }
-                XlaOperation::Reshard(operation) => {
+                XlaOperation::Array(ArrayOperation::Reshard(operation)) => {
                     mesh = Some(match mesh.take() {
                         Some(existing_mesh) => merge_logical_meshes(&existing_mesh, operation.sharding().mesh())?,
                         None => operation.sharding().mesh().clone(),
                     });
                 }
-                XlaOperation::ShardingConstraint(operation) => {
+                XlaOperation::Array(ArrayOperation::ShardingConstraint(operation)) => {
                     mesh = Some(match mesh.take() {
                         Some(existing_mesh) => merge_logical_meshes(&existing_mesh, operation.sharding().mesh())?,
                         None => operation.sharding().mesh().clone(),
                     });
                 }
                 XlaOperation::Broadcast(operation)
-                    if broadcast_changes_explicit_sharding(
-                        region.atoms()[instruction.inputs()[0].index()].r#type().as_ref(),
-                        operation.output_type(),
-                        operation.output_axes(),
-                    ) =>
+                    if {
+                        let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
+                        let input_type = <&ArrayType>::try_from(input_type.as_ref()).map_err(ProgramError::from)?;
+                        let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
+                        let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
+                        broadcast_changes_explicit_sharding(input_type, output_type, operation.output_axes())
+                    } =>
                 {
-                    let output_sharding = operation.output_type().sharding().unwrap();
+                    let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
+                    let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
+                    let output_sharding = output_type.sharding().unwrap();
+                    mesh = Some(match mesh.take() {
+                        Some(existing_mesh) => merge_logical_meshes(&existing_mesh, output_sharding.mesh())?,
+                        None => output_sharding.mesh().clone(),
+                    });
+                }
+                XlaOperation::Array(ArrayOperation::Broadcast(operation))
+                    if {
+                        let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
+                        let input_type = <&ArrayType>::try_from(input_type.as_ref()).map_err(ProgramError::from)?;
+                        let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
+                        let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
+                        broadcast_changes_explicit_sharding(input_type, output_type, operation.output_axes())
+                    } =>
+                {
+                    let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
+                    let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
+                    let output_sharding = output_type.sharding().unwrap();
                     mesh = Some(match mesh.take() {
                         Some(existing_mesh) => merge_logical_meshes(&existing_mesh, output_sharding.mesh())?,
                         None => output_sharding.mesh().clone(),
@@ -5707,8 +4748,8 @@ fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError
 /// `return_final_token` is set, the region's `stablehlo.return` yields the branch's final effect token as one extra
 /// trailing output — the entry token unchanged for a pure branch — so the enclosing operation can expose it as an
 /// extra result.
-fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, V, O>(
-    program: &Program<V, O, Vec<V>, Vec<V>>,
+fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
+    program: &FlatXlaProgram,
     input_values: &[ValueRef<'b, 'c, 't>],
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -5717,12 +4758,7 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, V, O>(
     collective_state: &CollectiveLoweringState,
     entry_token: Option<ValueRef<'b, 'c, 't>>,
     return_final_token: bool,
-) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError>
-where
-    V: MlirLowerableValue,
-    O: LowerableXlaOperation<V>,
-    XlaOperation<V>: From<O>,
-{
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
     let mut region = context.region();
     let block = context.block_with_no_arguments();
     {
@@ -5749,8 +4785,8 @@ where
     Ok(region)
 }
 
-fn lower_condition_to_if<'b, 'c: 'b, 't: 'c, V>(
-    branch_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
+fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
+    branch_regions: &[FlatXlaProgram],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -5759,10 +4795,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c, V>(
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     token: &mut Option<ValueRef<'b, 'c, 't>>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    V: MlirLowerableValue,
-{
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     let [true_branch, false_branch] = branch_regions else {
         return Err(LoweringError::UnsupportedOp {
             op: format!("condition expected 2 attached regions but got {}", branch_regions.len()),
@@ -5823,9 +4856,9 @@ where
         .collect())
 }
 
-fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V>(
+fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
     while_op: &WhileOperation,
-    loop_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
+    loop_regions: &[FlatXlaProgram],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -5834,10 +4867,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V>(
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     token: &mut Option<ValueRef<'b, 'c, 't>>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    V: MlirLowerableValue,
-{
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     let [condition, body] = loop_regions else {
         return Err(LoweringError::UnsupportedOp {
             op: format!("while expected 2 attached regions but got {}", loop_regions.len()),
@@ -5860,7 +4890,8 @@ where
     // never twice. A batched-predicate loop is always pure (`WhileOperation::new` rejects effects in a
     // batched-predicate loop, since observable effects cannot be masked for finished items), so predicate threading
     // and token threading never coexist.
-    let predicate_type = condition.output_types()[0].clone();
+    let condition_output_types = condition.output_types();
+    let predicate_type = <&ArrayType>::try_from(&condition_output_types[0]).map_err(ProgramError::from)?.clone();
     let batched_predicate = predicate_type.rank() > 0;
     let predicate_dimensions = (0..predicate_type.rank()).collect::<Vec<_>>();
     let predicate_offset = if batched_predicate { 1 } else { 0 };
@@ -5882,15 +4913,17 @@ where
     let token_index = counter_offset + state_count + predicate_offset;
     let mut full_state_types = Vec::with_capacity(counter_offset + state_count + predicate_offset);
     if iteration_bound.is_some() {
-        full_state_types.push(ArrayType::scalar(DataType::I64));
+        full_state_types.push(ArrayType::scalar(DataType::I64).into());
     }
     full_state_types.extend(state_types.iter().cloned());
     if batched_predicate {
-        full_state_types.push(predicate_type.clone());
+        full_state_types.push(predicate_type.clone().into());
     }
     let mut lowered_state_types = full_state_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location).map(|tensor_type| tensor_type.as_ref()))
+        .map(|r#type| {
+            composite::lower_array_program_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref())
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if threads_token {
         lowered_state_types.push(context.stable_hlo_token_type()?.as_ref());
@@ -6058,6 +5091,7 @@ where
                 .zip(body_inputs.iter())
                 .zip(state_types.iter())
                 .map(|((candidate, carried), state_type)| {
+                    let state_type = <&ArrayType>::try_from(state_type).map_err(ProgramError::from)?;
                     // The predicate broadcasts to each state element's shape along its leading (prefix) axes; a
                     // state element already shaped like the predicate reuses it directly.
                     let element_mask = if state_type.shape() == predicate_type.shape() {
@@ -6164,8 +5198,8 @@ where
 /// inline as straight-line operations at static iteration indices. The provided `input_values` must align with the body
 /// program's input signature: the first `carry_count` values are the carries and every remaining body input
 /// receives one stacked operand.
-fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, V, O>(
-    body_program: &Program<V, O, Vec<V>, Vec<V>>,
+fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
+    body_program: &FlatXlaProgram,
     carry_count: usize,
     length: usize,
     reverse: bool,
@@ -6178,12 +5212,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, V, O>(
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     token: &mut Option<ValueRef<'b, 'c, 't>>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    V: MlirLowerableValue,
-    O: LowerableXlaOperation<V>,
-    XlaOperation<V>: From<O>,
-{
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     // When the scan body is effectful, the enclosing scope's effect token is carried through the loop as one extra
     // trailing state element that each body copy threads through its effectful instructions (mirroring the while
     // lowering); the fully unrolled form needs no extra state because its body copies inline directly into the
@@ -6202,8 +5231,16 @@ where
         });
     }
     let carry_types = &body_input_types[..carry_count];
-    let x_slice_types = &body_input_types[carry_count..];
-    let y_slice_types = &body_output_types[carry_count..];
+    let x_slice_types = body_input_types[carry_count..]
+        .iter()
+        .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ProgramError::from)?;
+    let y_slice_types = body_output_types[carry_count..]
+        .iter()
+        .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ProgramError::from)?;
     let stacked = |slice_type: &ArrayType| -> Result<ArrayType, LoweringError> {
         let mut dimensions = vec![length];
         dimensions.extend(static_dimensions(slice_type)?);
@@ -6220,7 +5257,7 @@ where
         let mut carries = input_values[..carry_count].to_vec();
         let x_stacks = input_values[carry_count..].to_vec();
         let mut y_accumulators = Vec::with_capacity(y_slice_types.len());
-        for y_slice_type in y_slice_types {
+        for y_slice_type in &y_slice_types {
             let stacked_type = stacked(y_slice_type)?;
             let accumulators = lower_constant_output(std::slice::from_ref(&stacked_type), 0, block, context, location)?;
             y_accumulators.push(accumulators[0]);
@@ -6234,8 +5271,8 @@ where
             let index_value = lower_static_index_constants(&[iteration], block, context, location)?[0];
             (carries, y_accumulators) = lower_scan_iteration(
                 body_program,
-                x_slice_types,
-                y_slice_types,
+                x_slice_types.as_slice(),
+                y_slice_types.as_slice(),
                 index_value,
                 zero_index,
                 carries,
@@ -6257,26 +5294,28 @@ where
     // Assemble the loop state `[counter, carries..., stacks..., ys...]`, preallocating one zero accumulator per
     // stacked output.
     let mut state_types = Vec::with_capacity(1 + body_input_types.len() + y_slice_types.len());
-    state_types.push(ArrayType::scalar(DataType::I64));
+    state_types.push(ArrayType::scalar(DataType::I64).into());
     state_types.extend(carry_types.iter().cloned());
-    for x_slice_type in x_slice_types {
-        state_types.push(stacked(x_slice_type)?);
+    for x_slice_type in &x_slice_types {
+        state_types.push(stacked(x_slice_type)?.into());
     }
     let mut state_values = Vec::with_capacity(state_types.len() + y_slice_types.len());
     state_values.push(lower_static_index_constants(&[0], block, context, location)?[0]);
     state_values.extend_from_slice(input_values);
-    for y_slice_type in y_slice_types {
+    for y_slice_type in &y_slice_types {
         let stacked_type = stacked(y_slice_type)?;
         let accumulators = lower_constant_output(std::slice::from_ref(&stacked_type), 0, block, context, location)?;
         state_values.push(accumulators[0]);
-        state_types.push(stacked_type);
+        state_types.push(stacked_type.into());
     }
     // The effect token rides at the very end of the loop state, so all counter/carry/stack/accumulator index math
     // stays untouched.
     let token_index = state_types.len();
     let mut lowered_state_types = state_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location).map(|tensor_type| tensor_type.as_ref()))
+        .map(|r#type| {
+            composite::lower_array_program_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref())
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if threads_token {
         lowered_state_types.push(context.stable_hlo_token_type()?.as_ref());
@@ -6352,8 +5391,8 @@ where
             };
             (carries, y_accumulators) = lower_scan_iteration(
                 body_program,
-                x_slice_types,
-                y_slice_types,
+                x_slice_types.as_slice(),
+                y_slice_types.as_slice(),
                 index_value,
                 zero_index,
                 carries,
@@ -6412,8 +5451,8 @@ where
 /// per-iteration output into its stacked accumulator at `index_value`, and returns the new carries and accumulators.
 /// This is the per-iteration building block shared by the looped and fully unrolled scan lowerings in
 /// [`lower_scan_to_while`].
-fn lower_scan_iteration<'b, 'c: 'b, 't: 'c, V, O>(
-    body_program: &Program<V, O, Vec<V>, Vec<V>>,
+fn lower_scan_iteration<'b, 'c: 'b, 't: 'c>(
+    body_program: &FlatXlaProgram,
     x_slice_types: &[ArrayType],
     y_slice_types: &[ArrayType],
     index_value: ValueRef<'b, 'c, 't>,
@@ -6428,12 +5467,7 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c, V, O>(
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     token: &mut Option<ValueRef<'b, 'c, 't>>,
-) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), LoweringError>
-where
-    V: MlirLowerableValue,
-    O: LowerableXlaOperation<V>,
-    XlaOperation<V>: From<O>,
-{
+) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), LoweringError> {
     // Read one slice of every stacked input and drop the unit iteration axis.
     let carry_count = carries.len();
     let mut iteration_inputs = carries;
@@ -6515,12 +5549,12 @@ struct JitCallProgramKey {
     /// Canonical [`Program`] rendering (operation names, all bracketed attributes, and attached region bodies).
     rendered: String,
 
-    /// Flat input [`ArrayType`]s, which together with the rendering pin the full callee signature.
-    input_types: Vec<ArrayType>,
+    /// Flat input types, which together with the rendering pin the full callee signature.
+    input_types: Vec<ArrayProgramType>,
 
-    /// Flat output [`ArrayType`]s, completing the callee signature when output-only placement metadata is not visible
+    /// Flat output types, completing the callee signature when output-only placement metadata is not visible
     /// in the rendered body.
-    output_types: Vec<ArrayType>,
+    output_types: Vec<ArrayProgramType>,
 }
 
 /// Returns whether `program` may be deduplicated by structural identity.
@@ -6530,7 +5564,7 @@ struct JitCallProgramKey {
 /// ineligible; otherwise two callees that differ only by capture reference or literal payload could merge incorrectly.
 /// `shard_map` is also ineligible because its operation payload still owns additional body metadata that is not fully
 /// represented by the rendered instruction line.
-fn supports_structural_dedup<V: MlirLowerableValue>(program: &Program<V, XlaOperation<V>, Vec<V>, Vec<V>>) -> bool {
+fn supports_structural_dedup(program: &FlatXlaProgram) -> bool {
     program.regions().iter().all(|region| {
         region.atoms().iter().all(|atom| !atom.is_constant())
             && region
@@ -6541,8 +5575,8 @@ fn supports_structural_dedup<V: MlirLowerableValue>(program: &Program<V, XlaOper
 }
 
 /// Returns whether a borrowed rooted region may be deduplicated by structural identity.
-fn supports_structural_dedup_region<V: MlirLowerableValue>(region: RegionRef<'_, V, XlaOperation<V>>) -> bool {
-    fn walk<V: MlirLowerableValue>(region: RegionRef<'_, V, XlaOperation<V>>, visited: &mut HashSet<RegionId>) -> bool {
+fn supports_structural_dedup_region(region: RegionRef<'_, XlaConstant, XlaOperation>) -> bool {
+    fn walk(region: RegionRef<'_, XlaConstant, XlaOperation>, visited: &mut HashSet<RegionId>) -> bool {
         if !visited.insert(region.id()) {
             return true;
         }
@@ -6564,9 +5598,7 @@ fn supports_structural_dedup_region<V: MlirLowerableValue>(region: RegionRef<'_,
 /// structural deduplication (see [`supports_structural_dedup`]) and therefore always inline. The key is generic over
 /// the program's constant universe so that lookups from the value-generic lowering path type-check; the map itself is
 /// only ever populated from the staged [`XlaConstant`]-keyed pipeline.
-fn jit_call_program_key<V: MlirLowerableValue>(
-    program: &Program<V, XlaOperation<V>, Vec<V>, Vec<V>>,
-) -> Option<JitCallProgramKey> {
+fn jit_call_program_key(program: &FlatXlaProgram) -> Option<JitCallProgramKey> {
     supports_structural_dedup(program).then(|| JitCallProgramKey {
         rendered: program.to_string(),
         input_types: program.input_types(),
@@ -6575,7 +5607,7 @@ fn jit_call_program_key<V: MlirLowerableValue>(
 }
 
 /// Computes the deduplication key for a borrowed callee region, materializing only after borrowed eligibility checks.
-fn jit_call_region_key<V: MlirLowerableValue>(region: RegionRef<'_, V, XlaOperation<V>>) -> Option<JitCallProgramKey> {
+fn jit_call_region_key(region: RegionRef<'_, XlaConstant, XlaOperation>) -> Option<JitCallProgramKey> {
     supports_structural_dedup_region(region).then(|| {
         let program = region.to_program();
         JitCallProgramKey {
@@ -6587,18 +5619,15 @@ fn jit_call_region_key<V: MlirLowerableValue>(region: RegionRef<'_, V, XlaOperat
 }
 
 /// Returns the leading lowered input values that correspond to the capture table referenced by `program`.
-fn captured_prefix_values<'b, 'c: 'b, 't: 'c, V>(
-    program: &Program<V, XlaOperation<V>, Vec<V>, Vec<V>>,
+fn captured_prefix_values<'b, 'c: 'b, 't: 'c>(
+    program: &FlatXlaProgram,
     input_values: &[ValueRef<'b, 'c, 't>],
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    V: MlirLowerableValue,
-{
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     let capture_count = program
         .regions()
         .iter()
         .flat_map(|region| region.atoms())
-        .filter_map(|atom| atom.as_constant().and_then(MlirLowerableValue::capture_index))
+        .filter_map(|atom| atom.as_constant().map(XlaConstant::index))
         .max()
         .map(|index| index + 1)
         .unwrap_or(0);
@@ -6617,11 +5646,11 @@ struct JitCallFunction {
     /// function body.
     program: FlatXlaProgram,
 
-    /// Flat input [`ArrayType`]s of the callee, also the emitted function's argument types.
-    input_types: Vec<ArrayType>,
+    /// Flat input types of the callee, also the emitted function's argument types.
+    input_types: Vec<ArrayProgramType>,
 
-    /// Flat output [`ArrayType`]s of the callee, also the emitted function's result types.
-    output_types: Vec<ArrayType>,
+    /// Flat output types of the callee, also the emitted function's result types.
+    output_types: Vec<ArrayProgramType>,
 }
 
 /// Shared private functions emitted for `jit_call` callees that occur more than once in a module.
@@ -6640,10 +5669,7 @@ pub(crate) struct JitCallFunctionMap {
 
 impl JitCallFunctionMap {
     /// Returns the shared function for `program`, if one was emitted for its identity.
-    fn get<V: MlirLowerableValue>(
-        &self,
-        program: &Program<V, XlaOperation<V>, Vec<V>, Vec<V>>,
-    ) -> Option<&JitCallFunction> {
+    fn get(&self, program: &FlatXlaProgram) -> Option<&JitCallFunction> {
         self.functions.get(&jit_call_program_key(program)?)
     }
 }
@@ -6772,12 +5798,12 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
     let argument_tensor_types = function
         .input_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location))
+        .map(|r#type| composite::lower_array_program_type(r#type, context, location))
         .collect::<Result<Vec<_>, _>>()?;
     let result_tensor_types = function
         .output_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location))
+        .map(|r#type| composite::lower_array_program_type(r#type, context, location))
         .collect::<Result<Vec<_>, _>>()?;
 
     let function_block = context.block(
@@ -6836,8 +5862,8 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
 ///
 /// `input_values` are the lowered call operands in callee-input order; for a `linear_jit_call` they are the lowered
 /// captured prefix followed by the lowered linear inputs.
-fn lower_jit_call<'b, 'c: 'b, 't: 'c, V: MlirLowerableValue>(
-    program: &Program<V, XlaOperation<V>, Vec<V>, Vec<V>>,
+fn lower_jit_call<'b, 'c: 'b, 't: 'c>(
+    program: &FlatXlaProgram,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -6857,7 +5883,7 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c, V: MlirLowerableValue>(
                 let result_tensor_types = function
                     .output_types
                     .iter()
-                    .map(|array_type| lower_tensor_type(array_type, context, location))
+                    .map(|r#type| composite::lower_array_program_type(r#type, context, location))
                     .collect::<Result<Vec<_>, _>>()?;
                 let operation = block.append_operation(func::call(
                     function.symbol.as_str(),
@@ -6905,8 +5931,8 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c, V: MlirLowerableValue>(
 /// lowerer and the updated token is read back out after the instruction lowers, so effectful instructions chain in
 /// program order and the caller observes the program's final token.
 #[allow(clippy::too_many_arguments)]
-fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O, V>(
-    program: &Program<V, O, Vec<V>, Vec<V>>,
+fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c>(
+    program: &FlatXlaProgram,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -6916,12 +5942,7 @@ fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O, V>(
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     token: &mut Option<ValueRef<'b, 'c, 't>>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    V: MlirLowerableValue,
-    O: LowerableXlaOperation<V>,
-    XlaOperation<V>: From<O>,
-{
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     lower_nested_region_inline(
         program.entry_region_ref(),
         input_values,
@@ -6938,8 +5959,8 @@ where
 
 /// Inlines a borrowed nested region into the given block without materializing the region itself.
 #[allow(clippy::too_many_arguments)]
-fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O, V>(
-    region: RegionRef<'_, V, O>,
+fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c>(
+    region: RegionRef<'_, XlaConstant, XlaOperation>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -6949,19 +5970,14 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O, V>(
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     token: &mut Option<ValueRef<'b, 'c, 't>>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    V: MlirLowerableValue,
-    O: LowerableXlaOperation<V>,
-    XlaOperation<V>: From<O>,
-{
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     let outputs = replay_region_ref_into_block(
         region,
         input_values.to_vec(),
         block,
         context,
         location,
-        |_, value, block, context, location| value.lower_constant_value(captured_values, block, context, location),
+        |_, value, _block, _context, _location| lower_captured_constant(value, captured_values),
         |instruction, inputs, block, context, location| {
             let input_types = instruction
                 .inputs()
@@ -6973,29 +5989,23 @@ where
                 .iter()
                 .map(|output| region.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            // Region programs lower through the trait's canonical `XlaOperation` surface, so embed the enclosing
-            // operation type into it while materializing each attached region. The operation hook still takes owned
-            // nested programs, so this remains a genuine operation-family mapping boundary.
             let regions = instruction
                 .regions()
                 .iter()
-                .map(|attached| {
-                    RegionRef::new(region.arena(), *attached)?
-                        .to_program()
-                        .map_operations(|operation| Ok(XlaOperation::from(operation.clone())))
-                })
+                .map(|attached| RegionRef::new(region.arena(), *attached).map(RegionRef::to_program))
                 .collect::<Result<Vec<_>, ProgramError>>()?;
-            let mut lowerer = PlainMlirLowerer::new(*block, context, location)
+            let mut lowerer = ShardMapMlirLowerer::new(*block, context, location)
                 .with_input_types(input_types)
                 .with_nested_functions(nested_functions.cloned())
                 .with_captured_values(captured_values)
                 .with_token(*token)
                 .with_collective_state(collective_state.clone());
-            let outputs = instruction.operation().lower_to_mlir(
+            let outputs = dispatch_lower_shard_map_mlir(
+                instruction.operation(),
+                captured_values,
                 inputs,
                 regions.as_slice(),
                 output_types.as_slice(),
-                PlainMlirLoweringMode::Unpacked,
                 &mut lowerer,
             )?;
             *token = lowerer.token;
@@ -7021,7 +6031,18 @@ where
 /// The two callbacks plug in lowering policies for [`Atom::Constant`]s and [`Instruction`]s respectively while the
 /// generic interpreter handles use-count tracking and atom bookkeeping. Each callback receives a mutable [`BlockRef`]
 /// because [`BlockRef`] is `Copy` and the helper hands each closure its own copy backed by the same MLIR block.
-fn replay_program_into_block<'b, 'c: 'b, 't: 'c, O, V: Value<Type = ArrayType>, Input, Output, LiftConstant, ApplyOp>(
+fn replay_program_into_block<
+    'b,
+    'c: 'b,
+    't: 'c,
+    T: RyftType,
+    O,
+    V: Value<Type = T>,
+    Input,
+    Output,
+    LiftConstant,
+    ApplyOp,
+>(
     program: &Program<V, O, Input, Output>,
     input_values: Vec<ValueRef<'b, 'c, 't>>,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -7031,7 +6052,7 @@ fn replay_program_into_block<'b, 'c: 'b, 't: 'c, O, V: Value<Type = ArrayType>, 
     mut apply_op: ApplyOp,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    O: Operation<ArrayType>,
+    O: Operation<T>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     LiftConstant: FnMut(
@@ -7106,7 +6127,6 @@ fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 where
     V: MlirLowerableValue,
     O: LowerableXlaOperation<V>,
-    XlaOperation<V>: From<O>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -7136,25 +6156,21 @@ where
                 .iter()
                 .map(|output| program.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            // Region programs lower through the trait's canonical `XlaOperation` surface, so embed the enclosing
-            // program's operation type into it while materializing each attached region.
-            let regions = instruction
-                .regions()
-                .iter()
-                .map(|region| {
-                    program
-                        .region_ref(*region)?
-                        .to_program()
-                        .map_operations(|operation| Ok(XlaOperation::from(operation.clone())))
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
+            if !instruction.regions().is_empty() {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "plain-program lowering does not support attached regions for '{}'; use the production \
+                         composite XLA lowerer",
+                        instruction.operation().name(),
+                    ),
+                });
+            }
             let mut lowerer = PlainMlirLowerer::new(*block, context, location)
                 .with_input_types(input_types)
                 .with_token(token)
                 .with_collective_state(collective_state.clone());
             let outputs = instruction.operation().lower_to_mlir(
                 inputs,
-                regions.as_slice(),
                 output_types.as_slice(),
                 PlainMlirLoweringMode::Unpacked,
                 &mut lowerer,
@@ -7337,83 +6353,6 @@ where
         .collect()
 }
 
-/// Lowers one `sdy.manual_computation` operation for the value-generic plain pipeline, replaying the attached
-/// local body region through the same inline machinery as every other region-carrying operation (constants lower as
-/// literals through [`MlirLowerableValue`], and nested `jit_call`s always inline because manual bodies use
-/// shard-local types).
-#[allow(clippy::too_many_arguments)]
-fn lower_manual_computation_inline<'b, 'c: 'b, 't: 'c, V>(
-    block: &mut BlockRef<'b, 'c, 't>,
-    outer_inputs: &[ValueRef<'b, 'c, 't>],
-    shard_map: &ShardMap,
-    program: &Program<V, XlaOperation<V>, Vec<V>, Vec<V>>,
-    global_output_types: &[ArrayType],
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    collective_state: &CollectiveLoweringState,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    V: MlirLowerableValue,
-{
-    let local_input_tensor_types = program
-        .input_types()
-        .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location))
-        .collect::<Result<Vec<_>, _>>()?;
-    let global_output_tensor_types = global_output_types
-        .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut body_region = context.region();
-    let body_block = context.block(
-        local_input_tensor_types
-            .iter()
-            .map(|tensor_type| (*tensor_type, location))
-            .collect::<Vec<_>>()
-            .as_slice(),
-    );
-    {
-        let mut body_block_ref = body_block.as_ref();
-        let input_values = (0..program.input_types().len())
-            .map(|index| body_block.argument(index).expect("body block arguments should exist").as_ref())
-            .collect::<Vec<_>>();
-        // Manual bodies lower with shard-local types, so their `jit_call`s always inline; do not thread the
-        // module's deduplicated functions (which are typed against global shapes) into them. The body is also its
-        // own effect scope, mirroring the captured manual-computation lowering.
-        let body_collective_state = collective_state.enter_manual_region(shard_map.clone());
-        let mut token = None;
-        let body_outputs = lower_nested_program_inline(
-            program,
-            input_values.as_slice(),
-            &mut body_block_ref,
-            context,
-            location,
-            &[],
-            false,
-            None,
-            &body_collective_state,
-            &mut token,
-        )?;
-        body_block_ref.append_operation(shardy::r#return(body_outputs.as_slice(), location)?)?;
-    }
-    body_region.append_block(body_block)?;
-
-    let manual_computation = block.append_operation(shardy::manual_computation(
-        outer_inputs,
-        global_output_tensor_types.as_slice(),
-        shard_map.to_shardy_in_shardings(context)?,
-        shard_map.to_shardy_out_shardings(context)?,
-        shard_map.to_shardy_manual_axes(context)?,
-        body_region,
-        location,
-    )?)?;
-    manual_computation
-        .results()
-        .map(|result| result.map(|result| result.as_ref()).map_err(LoweringError::from))
-        .collect()
-}
-
 /// Lowers one concrete traced value to a StableHLO constant operation and applies its declared memory placement.
 fn lower_literal_value<'b, 'c: 'b, 't: 'c, B, V, L>(
     value: &V,
@@ -7453,8 +6392,8 @@ where
 }
 
 /// Lowers one captured constant reference by forwarding its runtime captured value.
-fn lower_captured_constant<'b, 'c: 'b, 't: 'c>(
-    value: &XlaConstant,
+fn lower_captured_constant<'b, 'c: 'b, 't: 'c, T: RyftType>(
+    value: &CaptureReference<T>,
     captured_values: &[ValueRef<'b, 'c, 't>],
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
     captured_values
@@ -7479,775 +6418,135 @@ where
     lower_captured_constant(value, captured_values)
 }
 
-/// Dispatches shard-map StableHLO lowering for one traced operation by matching on primitive variants.
+/// Lowers one production composite XLA operation while preserving the enclosing lowering state.
 fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
-    op: &XlaOperation,
+    operation: &XlaOperation,
     captured_values: &[ValueRef<'b, 'c, 't>],
     input_values: &[ValueRef<'b, 'c, 't>],
     regions: &[FlatXlaProgram],
-    output_types: &[ArrayType],
+    output_types: &[ArrayProgramType],
     lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    match op {
-        XlaOperation::Zero(_) => {
-            if !input_values.is_empty() {
-                return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
-            }
-            lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
-        }
-        XlaOperation::One(_) => {
-            if !input_values.is_empty() {
-                return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
-            }
-            lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
-        }
-        XlaOperation::Constant(constant) => {
-            check_count!("input", input_values, 0, ProgramError);
-            check_count!("output", output_types, 1, ProgramError);
-            let constant_value = constant.value().lower_constant_value(
-                captured_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            Ok(vec![constant_value])
-        }
-        XlaOperation::ConvertElementType(_) => {
-            check_count!("input", input_values, 1, ProgramError);
-            check_count!("output", output_types, 1, ProgramError);
-            let output_type = lower_tensor_type(&output_types[0], lowerer.context, lowerer.location)?;
-            let result =
-                lowerer
-                    .block
-                    .append_operation(stable_hlo::convert(input_values[0], output_type, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.convert should return one result").as_ref()])
-        }
-        XlaOperation::Add(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::add(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
-        }
-        XlaOperation::Sub(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::subtract(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.subtract should return one result").as_ref()])
-        }
-        XlaOperation::Mul(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::multiply(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
-        }
-        XlaOperation::Div(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::divide(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.divide should return one result").as_ref()])
-        }
-        XlaOperation::Neg(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
-        }
-        XlaOperation::Sin(_) => {
-            if output_types[0].data_type().is_complex() {
-                return Ok(vec![lower_complex_sine_or_cosine(
-                    input_values[0],
-                    &output_types[0],
-                    true,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?]);
-            }
-            let result = lowerer.block.append_operation(stable_hlo::sine(
-                input_values[0],
-                Accuracy::Default,
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
-        }
-        XlaOperation::Cos(_) => {
-            if output_types[0].data_type().is_complex() {
-                return Ok(vec![lower_complex_sine_or_cosine(
-                    input_values[0],
-                    &output_types[0],
-                    false,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?]);
-            }
-            let result = lowerer.block.append_operation(stable_hlo::cosine(
-                input_values[0],
-                Accuracy::Default,
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
-        }
-        XlaOperation::Atan2(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::atan2(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.atan2 should return one result").as_ref()])
-        }
-        XlaOperation::Exp(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::exponential(
-                input_values[0],
-                Accuracy::Default,
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.exponential should return one result").as_ref()])
-        }
-        XlaOperation::Log(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::log(
-                input_values[0],
-                Accuracy::Default,
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.log should return one result").as_ref()])
-        }
-        XlaOperation::Sqrt(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::sqrt(
-                input_values[0],
-                Accuracy::Default,
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.sqrt should return one result").as_ref()])
-        }
-        XlaOperation::Rsqrt(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::rsqrt(
-                input_values[0],
-                Accuracy::Default,
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.rsqrt should return one result").as_ref()])
-        }
-        XlaOperation::Tanh(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::tanh(
-                input_values[0],
-                Accuracy::Default,
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.tanh should return one result").as_ref()])
-        }
-        XlaOperation::Logistic(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::logistic(
-                input_values[0],
-                Accuracy::Default,
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.logistic should return one result").as_ref()])
-        }
-        XlaOperation::Erf(_) => {
-            let result = lowerer.block.append_operation(chlo::erf(input_values[0], lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("chlo.erf should return one result").as_ref()])
-        }
-        XlaOperation::Pow(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::power(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.power should return one result").as_ref()])
-        }
-        XlaOperation::Sign(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::sign(input_values[0], lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.sign should return one result").as_ref()])
-        }
-        XlaOperation::Floor(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::floor(input_values[0], lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.floor should return one result").as_ref()])
-        }
-        XlaOperation::Ceil(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::ceil(input_values[0], lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.ceil should return one result").as_ref()])
-        }
-        XlaOperation::Round(_) => {
-            let result = lowerer
-                .block
-                .append_operation(stable_hlo::round_with_nearest_even_tie_break(input_values[0], lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.round_nearest_even should return one result").as_ref()])
-        }
-        XlaOperation::Max(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::maximum(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.maximum should return one result").as_ref()])
-        }
-        XlaOperation::Min(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::minimum(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.minimum should return one result").as_ref()])
-        }
-        XlaOperation::Rem(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::remainder(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.remainder should return one result").as_ref()])
-        }
-        XlaOperation::Abs(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::abs(input_values[0], lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.abs should return one result").as_ref()])
-        }
-        XlaOperation::Complex(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::complex(
-                input_values[0],
-                input_values[1],
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.complex should return one result").as_ref()])
-        }
-        // StableHLO has no conjugation operation, so `conjugate` lowers to the `complex(real(z), negate(imag(z)))`
-        // composition (the same decomposition JAX's `conj` lowering uses).
-        XlaOperation::Conjugate(_) => {
-            let real = lowerer.block.append_operation(stable_hlo::real(input_values[0], lowerer.location)?)?;
-            let imaginary = lowerer.block.append_operation(stable_hlo::imag(input_values[0], lowerer.location)?)?;
-            let negated = lowerer.block.append_operation(stable_hlo::negate(
-                imaginary.result(0).expect("stablehlo.imag should return one result").as_ref(),
-                lowerer.location,
-            )?)?;
-            let result = lowerer.block.append_operation(stable_hlo::complex(
-                real.result(0).expect("stablehlo.real should return one result").as_ref(),
-                negated.result(0).expect("stablehlo.negate should return one result").as_ref(),
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.complex should return one result").as_ref()])
-        }
-        XlaOperation::Real(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::real(input_values[0], lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.real should return one result").as_ref()])
-        }
-        XlaOperation::Imaginary(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::imag(input_values[0], lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.imag should return one result").as_ref()])
-        }
-        // `stop_gradient` only affects differentiation; by lowering time it is the identity, so
-        // forward the operand without emitting any MLIR operation (matching JAX's lowering).
-        XlaOperation::StopGradient(_) => {
-            if input_values.len() != 1 {
-                return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
-            }
-            Ok(vec![input_values[0]])
-        }
-        // `tag` only affects rematerialization policies; by lowering time it is the identity, so
-        // forward the operand without emitting any MLIR operation.
-        XlaOperation::Tag(_) => {
-            if input_values.len() != 1 {
-                return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
-            }
-            Ok(vec![input_values[0]])
-        }
-        // `print` is the identity on its dataflow output; its observable effect lowers to a host-callback custom
-        // call that consumes and produces a StableHLO token, so the effect ordering rides the scope's token chain
-        // instead of the value dataflow.
-        XlaOperation::Print(operation) => {
-            check_count!("input", input_values, 1, ProgramError);
-            lower_print_to_custom_call(
-                operation.label(),
-                input_values[0],
-                &mut lowerer.token,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            Ok(vec![input_values[0]])
-        }
-        XlaOperation::CustomCall(operation) => lower_custom_call_to_mlir(
-            operation,
+    if let Some(operation) = operation.to_core_operation() {
+        return composite::lower_array_program_operation(
+            &operation,
             input_values,
+            lowerer.input_types.as_slice(),
             output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        XlaOperation::TransferToMemory(operation) => lower_transfer_to_memory(
-            operation.destination(),
-            input_values,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        // Custom-derivative calls lower as their primal program; the derivative programs never reach the backend.
-        XlaOperation::CustomJvp(_) => lower_nested_program_inline(
-            &regions[0],
-            input_values,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-            lowerer.captured_values.as_slice(),
-            false,
-            lowerer.nested_functions.as_ref(),
             &lowerer.collective_state,
             &mut lowerer.token,
-        ),
-        XlaOperation::CustomVjp(_) => lower_nested_program_inline(
-            &regions[0],
-            input_values,
             &mut lowerer.block,
             lowerer.context,
             lowerer.location,
-            lowerer.captured_values.as_slice(),
-            false,
-            lowerer.nested_functions.as_ref(),
-            &lowerer.collective_state,
-            &mut lowerer.token,
-        ),
-        // The opaque custom-VJP tangent carrier is a forward-mode tangent map that reverse mode transposes away before
-        // lowering, so it never reaches the backend; reaching here means a forward-mode use of `custom_vjp` slipped
-        // through, which is reverse-mode-only.
+        );
+    }
+
+    match operation {
+        XlaOperation::Condition(_) => lowerer.lower_condition(regions, input_values),
+        XlaOperation::While(operation) => lowerer.lower_while(operation, regions, input_values),
+        XlaOperation::Scan(operation) => lowerer.lower_scan(operation, regions, input_values),
+        XlaOperation::CustomJvp(_) => {
+            let [primal, _jvp] = regions else {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!("custom_jvp expected 2 attached regions but got {}", regions.len()),
+                });
+            };
+            lower_nested_program_inline(
+                primal,
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                captured_values,
+                false,
+                lowerer.nested_functions.as_ref(),
+                &lowerer.collective_state,
+                &mut lowerer.token,
+            )
+        }
+        XlaOperation::CustomVjp(_) => {
+            let [primal, _forward, _backward] = regions else {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!("custom_vjp expected 3 attached regions but got {}", regions.len()),
+                });
+            };
+            lower_nested_program_inline(
+                primal,
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                captured_values,
+                false,
+                lowerer.nested_functions.as_ref(),
+                &lowerer.collective_state,
+                &mut lowerer.token,
+            )
+        }
+        XlaOperation::Rematerialize(_) => {
+            let [primal, _forward, _backward, _tangent] = regions else {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!("rematerialize expected 4 attached regions but got {}", regions.len()),
+                });
+            };
+            lower_nested_program_inline(
+                primal,
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                captured_values,
+                false,
+                lowerer.nested_functions.as_ref(),
+                &lowerer.collective_state,
+                &mut lowerer.token,
+            )
+        }
         XlaOperation::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` cannot be lowered to StableHLO", operation.name()),
         }
         .into()),
-        XlaOperation::Rematerialize(_) => lower_nested_program_inline(
-            &regions[0],
-            input_values,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-            lowerer.captured_values.as_slice(),
-            false,
-            lowerer.nested_functions.as_ref(),
-            &lowerer.collective_state,
-            &mut lowerer.token,
-        ),
-        XlaOperation::ZeroLike(_) => {
-            lower_like_constant(input_values, output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
-        }
-        XlaOperation::OneLike(_) => {
-            lower_like_constant(input_values, output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
-        }
-        XlaOperation::Dot(operation) => {
-            // The requested output sharding has already been folded into `output_types[0]` by type inference.
-            let dimensions = operation.dimensions();
-            let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-            let dimensions_attribute = lowerer.context.stable_hlo_dot_dimensions(
-                dimensions.lhs_batching_dimensions(),
-                dimensions.rhs_batching_dimensions(),
-                dimensions.lhs_contracting_dimensions(),
-                dimensions.rhs_contracting_dimensions(),
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::dot_general(
-                input_values[0],
-                input_values[1],
-                dimensions_attribute,
-                Some((Precision::Default, Precision::Default)),
-                None,
-                output_tensor_type,
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
-        }
-        XlaOperation::Transpose(operation) => {
-            let result = lowerer.block.append_operation(stable_hlo::transpose(
-                input_values[0],
-                operation.permutation().as_slice(),
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
-        }
-        XlaOperation::Iota(iota) => {
-            check_count!("input", input_values, 0, ProgramError);
-            check_count!("output", output_types, 1, ProgramError);
-            let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-            let result = lowerer.block.append_operation(stable_hlo::iota(
-                output_tensor_type,
-                iota.dimension(),
-                lowerer.location,
-            )?)?;
-            let result = result.result(0).expect("stablehlo.iota should return one result").as_ref();
-            Ok(vec![annotate_output_memory(
-                result,
-                &output_types[0],
+        XlaOperation::JitCall(_) => {
+            let [callee] = regions else {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!("jit_call expected 1 attached region but got {}", regions.len()),
+                });
+            };
+            lower_jit_call(
+                callee,
+                input_values,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
-            )?])
-        }
-        XlaOperation::CoordinateBasis(operation) => {
-            check_count!("input", input_values, 0, ProgramError);
-            lower_coordinate_basis_to_mlir(
-                operation,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
+                lowerer.nested_functions.as_ref(),
+                &lowerer.collective_state,
+                &mut lowerer.token,
             )
         }
-        XlaOperation::Reshape(operation) => lower_reshape_to_mlir(
-            operation,
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        XlaOperation::Reshard(operation) => {
-            lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
-        }
-        XlaOperation::ShardingConstraint(operation) => {
-            lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
-        }
-        XlaOperation::Broadcast(operation) => lower_broadcast_to_mlir(
-            operation,
-            input_values,
-            lowerer.input_types.as_slice(),
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        XlaOperation::Reduce(operation) => {
-            check_count!("output", output_types, 1, ProgramError);
-            let value = lower_reduce_to_mlir(
-                operation.kind(),
-                operation.axes(),
-                input_values[0],
-                &output_types[0],
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            Ok(vec![value])
-        }
-        XlaOperation::Sort(operation) => lower_sort_to_mlir(
-            operation,
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        XlaOperation::RngBitGenerator(operation) => lower_rng_bit_generator_to_mlir(
-            operation,
-            input_values,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        XlaOperation::ScaledDot(operation) => {
-            let collective_state = lowerer.collective_state.clone();
-            lower_scaled_dot_to_mlir(
-                operation,
-                &collective_state,
-                input_values,
-                &lowerer.input_types,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )
-        }
-        XlaOperation::DotProductAttention(operation) => {
-            let collective_state = lowerer.collective_state.clone();
-            lower_dot_product_attention_to_mlir(
-                operation,
-                &collective_state,
-                input_values,
-                &lowerer.input_types,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )
-        }
-        XlaOperation::DotProductAttentionBackward(operation) => {
-            let collective_state = lowerer.collective_state.clone();
-            lower_dot_product_attention_backward_to_mlir(
-                operation,
-                &collective_state,
-                input_values,
-                &lowerer.input_types,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )
-        }
-        XlaOperation::Compare(operation) => {
-            let operand_type = comparison_operand_type(&lowerer.input_types, output_types)?;
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                &[operand_type],
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let value =
-                lower_compare_to_mlir(operation.direction(), left, right, &mut lowerer.block, lowerer.location)?;
-            Ok(vec![value])
-        }
-        XlaOperation::Not(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::not(input_values[0], lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.not should return one result").as_ref()])
-        }
-        XlaOperation::And(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::and(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.and should return one result").as_ref()])
-        }
-        XlaOperation::Or(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::or(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.or should return one result").as_ref()])
-        }
-        XlaOperation::Xor(_) => {
-            let [left, right] = normalize_binary_elementwise_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::xor(left, right, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.xor should return one result").as_ref()])
-        }
-        XlaOperation::Collective(operation) => {
-            check_count!("input", input_values, 1, ProgramError);
-            check_count!("output", output_types, 1, ProgramError);
-            let collective_state = lowerer.collective_state.clone();
-            let result = lower_collective_to_all_reduce(
-                operation,
-                &collective_state,
-                input_values[0],
-                &output_types[0],
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            Ok(vec![result])
-        }
-        XlaOperation::AllGather(operation) => {
-            check_count!("input", input_values, 1, ProgramError);
-            check_count!("output", output_types, 1, ProgramError);
-            let collective_state = lowerer.collective_state.clone();
-            lower_all_gather_to_mlir(
-                operation,
-                &collective_state,
-                input_values[0],
-                &output_types[0],
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )
-        }
-        XlaOperation::PSumScatter(operation) => {
-            check_count!("input", input_values, 1, ProgramError);
-            check_count!("output", output_types, 1, ProgramError);
-            let collective_state = lowerer.collective_state.clone();
-            lower_psum_scatter_to_mlir(
-                operation,
-                &collective_state,
-                input_values[0],
-                &output_types[0],
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )
-        }
-        XlaOperation::Ppermute(operation) => {
-            check_count!("input", input_values, 1, ProgramError);
-            let collective_state = lowerer.collective_state.clone();
-            lower_ppermute_to_mlir(operation, &collective_state, input_values[0], &mut lowerer.block, lowerer.location)
-        }
-        XlaOperation::AllToAll(operation) => {
-            check_count!("input", input_values, 1, ProgramError);
-            check_count!("output", output_types, 1, ProgramError);
-            let collective_state = lowerer.collective_state.clone();
-            lower_all_to_all_to_mlir(
-                operation,
-                &collective_state,
-                input_values[0],
-                &lowerer.input_types[0],
-                &output_types[0],
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )
-        }
-        XlaOperation::AxisIndex(operation) => {
-            check_count!("input", input_values, 0, ProgramError);
-            check_count!("output", output_types, 1, ProgramError);
-            let collective_state = lowerer.collective_state.clone();
-            let result = lower_axis_index_to_coordinate(
-                operation,
-                &collective_state,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            Ok(vec![result])
-        }
-        XlaOperation::Select(_) => {
-            let [condition, on_true, on_false] = normalize_select_operands(
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result =
-                lowerer
-                    .block
-                    .append_operation(stable_hlo::select(condition, on_true, on_false, lowerer.location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
-        }
-        XlaOperation::Slice(operation) => lower_slice_to_mlir(
-            operation,
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        XlaOperation::UpdateSlice(operation) => {
-            let index_values = lower_static_index_constants(
-                operation.start_indices(),
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
-                input_values[0],
-                input_values[1],
-                index_values.as_slice(),
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
-        }
-        XlaOperation::DynamicSlice(operation) => {
-            let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
-                input_values[0],
-                &input_values[1..],
-                operation.sizes(),
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
-        }
-        XlaOperation::DynamicUpdateSlice(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
-                input_values[0],
-                input_values[1],
-                &input_values[2..],
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
-        }
-        XlaOperation::Pad(operation) => lower_pad_to_mlir(
-            operation,
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        XlaOperation::Concatenate(operation) => {
-            let result = lowerer.block.append_operation(stable_hlo::concatenate(
-                input_values,
-                operation.axis(),
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
-        }
-        XlaOperation::Gather(operation) => lower_gather_to_mlir(
-            operation,
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        XlaOperation::Scatter(operation) => lower_scatter_to_mlir(
-            operation,
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        XlaOperation::Condition(_) => lowerer.lower_condition(regions, input_values),
-        XlaOperation::While(while_op) => lowerer.lower_while(while_op, regions, input_values),
-        XlaOperation::Scan(scan_op) => lowerer.lower_scan(scan_op, regions, input_values),
-        XlaOperation::JitCall(_) => lower_jit_call(
-            &regions[0],
-            input_values,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-            lowerer.nested_functions.as_ref(),
-            &lowerer.collective_state,
-            &mut lowerer.token,
-        ),
-        XlaOperation::ShardMap(shard_map_op) => {
-            let simplified_body = regions[0]
+        XlaOperation::ShardMap(operation) => {
+            let [body] = regions else {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!("shard_map expected 1 attached region but got {}", regions.len()),
+                });
+            };
+            let simplified_body = body
                 .simplified()
                 .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
+            let local_input_types = simplified_body
+                .input_types()
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ProgramError::from)?;
             lowerer.lower_manual_computation(
                 input_values,
-                shard_map_op.shard_map(),
+                operation.shard_map(),
                 &simplified_body,
-                simplified_body.input_types().as_slice(),
-                shard_map_op.global_output_types(),
+                local_input_types.as_slice(),
+                operation.global_output_types(),
             )
         }
+        _ => unreachable!("member and mixed operations are handled by the canonical core operation family"),
     }
 }
 
@@ -9549,6 +7848,8 @@ fn unsigned_integer_width(data_type: DataType) -> Result<usize, LoweringError> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::{Deref, DerefMut};
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -9585,6 +7886,52 @@ mod tests {
 
     use super::*;
 
+    /// Homogeneous builder retained only for tests of the test-only plain-program lowering helper.
+    type XlaProgramBuilder = ProgramBuilder<XlaArrayConstant, ArrayOperation<XlaArrayConstant>>;
+
+    /// Homogeneous program retained only for tests of the test-only plain-program lowering helper.
+    type PlainXlaProgram =
+        Program<XlaArrayConstant, ArrayOperation<XlaArrayConstant>, Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>;
+
+    /// Array-oriented facade over the production composite program builder.
+    struct CompositeXlaProgramBuilder(crate::experimental::ops::XlaProgramBuilder);
+
+    impl CompositeXlaProgramBuilder {
+        /// Creates an empty production composite program builder.
+        fn new() -> Self {
+            Self(crate::experimental::ops::XlaProgramBuilder::new())
+        }
+
+        /// Adds an array input while lifting its descriptor into the composite type universe.
+        fn add_input(&mut self, r#type: ArrayType) -> AtomId {
+            self.0.add_input(ArrayProgramType::Array(r#type))
+        }
+
+        /// Finalizes the composite program.
+        fn build<Input: Parameterized<XlaConstant>, Output: Parameterized<XlaConstant>>(
+            self,
+            output_ids: Vec<AtomId>,
+            input_structure: Input::ParameterStructure,
+            output_structure: Output::ParameterStructure,
+        ) -> Result<XlaProgram<Input, Output>, ProgramError> {
+            self.0.build(output_ids, input_structure, output_structure)
+        }
+    }
+
+    impl Deref for CompositeXlaProgramBuilder {
+        type Target = crate::experimental::ops::XlaProgramBuilder;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl DerefMut for CompositeXlaProgramBuilder {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
         LogicalMesh::new(vec![MeshAxis::new(axis_name, axis_size, MeshAxisType::Manual).unwrap()]).unwrap()
     }
@@ -9616,17 +7963,22 @@ mod tests {
         DimensionVariable::new(name, DimensionBounds::non_negative(exclusive_upper_bound).unwrap()).into()
     }
 
-    fn xla_identity_branch(input_type: ArrayType) -> FlatXlaProgram {
+    fn xla_identity_branch(input_type: ArrayType) -> PlainXlaProgram {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn xla_neg_branch(input_type: ArrayType) -> FlatXlaProgram {
+    fn xla_neg_branch(input_type: ArrayType) -> PlainXlaProgram {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Lifts an array-only test fixture into the production composite XLA program representation.
+    fn unproject_plain_program(program: PlainXlaProgram) -> FlatXlaProgram {
+        program.into_unprojected::<XlaConstant, XlaOperation>().unwrap()
     }
 
     fn lower_traced_module(
@@ -9636,7 +7988,7 @@ mod tests {
         traced.to_mlir_module(function_name)
     }
 
-    fn xla_elementwise_normalization_program() -> FlatXlaProgram {
+    fn xla_elementwise_normalization_program() -> PlainXlaProgram {
         let mut builder = XlaProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
         let left = builder
@@ -9656,7 +8008,7 @@ mod tests {
         let or = builder.add_instruction(OrOperation, Vec::new(), vec![boolean_vector, condition]).unwrap()[0];
         let xor = builder.add_instruction(XorOperation, Vec::new(), vec![condition, boolean_vector]).unwrap()[0];
         builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![divide, atan2, compare, select, and, or, xor],
                 vec![Placeholder; 5],
                 vec![Placeholder; 7],
@@ -10091,7 +8443,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -10196,7 +8548,9 @@ mod tests {
             .add_instruction(LegacyBroadcastOperation::new(output_type.clone(), vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .into_unprojected::<XlaConstant, XlaOperation>()
             .unwrap();
 
         let stablehlo = to_mlir_module_for_program(
@@ -10257,7 +8611,9 @@ mod tests {
             .add_instruction(LegacyBroadcastOperation::new(output_type.clone(), vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .into_unprojected::<XlaConstant, XlaOperation>()
             .unwrap();
         let module = to_mlir_module_for_program(
             &program,
@@ -10320,9 +8676,9 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_lowers_captures_as_hidden_arguments() {
         let array_type = test_vector_type(4);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
-        let capture = builder.add_constant(XlaConstant::new(0, array_type.clone()));
+        let capture = builder.add_constant(XlaConstant::new(0, array_type.clone().into()));
         let output = builder.add_instruction(AddOperation, Vec::new(), vec![input, capture]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -10351,8 +8707,8 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_lowers_capture_output_as_a_hidden_argument() {
         let array_type = test_vector_type(4);
-        let mut builder = XlaProgramBuilder::new();
-        let output = builder.add_constant(XlaConstant::new(0, array_type.clone()));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let output = builder.add_constant(XlaConstant::new(0, array_type.clone().into()));
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -10378,13 +8734,13 @@ mod tests {
     fn test_to_mlir_module_for_program_forwards_capture_into_nested_regions() {
         let array_type = test_vector_type(4);
         let branch = || {
-            let mut builder = XlaProgramBuilder::new();
-            let output = builder.add_constant(XlaConstant::new(0, array_type.clone()));
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let output = builder.add_constant(XlaConstant::new(0, array_type.clone().into()));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let true_region = builder.import_program(branch());
         let false_region = builder.import_program(branch());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
@@ -10427,9 +8783,10 @@ mod tests {
 
     #[test]
     fn test_traced_elementwise_lowering_normalizes_all_implicit_operands() {
-        let program = xla_elementwise_normalization_program();
-        let input_types = program.input_types();
-        let output_types = program.output_types();
+        let plain_program = xla_elementwise_normalization_program();
+        let input_types = plain_program.input_types();
+        let output_types = plain_program.output_types();
+        let program = plain_program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
         assert_elementwise_operands_are_normalized(&stablehlo);
@@ -10442,7 +8799,7 @@ mod tests {
         let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])));
         let output = builder.add_instruction(DivOperation, Vec::new(), vec![scalar, empty]).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -10459,7 +8816,7 @@ mod tests {
     /// Builds the flat callee `f(x) = x + x` over a vector type, returned behind an [`Rc`] so callers control
     /// whether `jit_call` sites share one program (pointer identity) or use structurally-identical distinct programs.
     fn xla_add_self_callee(input_type: ArrayType) -> std::rc::Rc<FlatXlaProgram> {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder.add_instruction(AddOperation, Vec::new(), vec![input, input]).unwrap()[0];
         std::rc::Rc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
@@ -10467,14 +8824,10 @@ mod tests {
 
     /// Builds a nullary callee that materializes one scalar leaf's fragment of a packed coordinate basis.
     fn xla_coordinate_basis_callee(coordinate_offset: usize) -> std::rc::Rc<FlatXlaProgram> {
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let output = builder
             .add_instruction(
-                XlaOperation::CoordinateBasis(CoordinateBasisOperation::new(
-                    ArrayType::scalar(DataType::F32),
-                    coordinate_offset,
-                    2,
-                )),
+                CoordinateBasisOperation::new(ArrayType::scalar(DataType::F32), coordinate_offset, 2),
                 Vec::new(),
                 Vec::new(),
             )
@@ -10484,7 +8837,7 @@ mod tests {
 
     /// Stages one `jit_call` to `callee` (interned as a shared callee root region) over `inputs` in `builder`.
     fn add_xla_jit_call(
-        builder: &mut XlaProgramBuilder,
+        builder: &mut CompositeXlaProgramBuilder,
         callee: &std::rc::Rc<FlatXlaProgram>,
         inputs: Vec<AtomId>,
     ) -> AtomId {
@@ -10502,7 +8855,7 @@ mod tests {
     /// module text. Each callee is `f(x) = x + x`; the outer function is `g(x) = sum_i callee_i(x)`.
     fn lower_two_jit_call_module(callees: Vec<std::rc::Rc<FlatXlaProgram>>) -> String {
         let array_type = test_vector_type(4);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
         let mut accumulator: Option<AtomId> = None;
         for callee in callees {
@@ -10586,7 +8939,7 @@ mod tests {
         let second_callee = xla_coordinate_basis_callee(1);
         assert!(jit_call_program_key(&first_callee) != jit_call_program_key(&second_callee));
 
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let first = add_xla_jit_call(&mut builder, &first_callee, Vec::new());
         let second = add_xla_jit_call(&mut builder, &second_callee, Vec::new());
         let output = builder.add_instruction(AddOperation, Vec::new(), vec![first, second]).unwrap()[0];
@@ -10634,7 +8987,7 @@ mod tests {
         let vector_type = test_vector_type(4);
         let callee = xla_add_self_callee(vector_type.clone());
         let body_program = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone());
             let first = add_xla_jit_call(&mut builder, &callee, vec![input]);
             let second = add_xla_jit_call(&mut builder, &callee, vec![input]);
@@ -10653,7 +9006,7 @@ mod tests {
             vec![vector_type.clone()],
             body_program,
         );
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(vector_type.clone());
         let (shard_map_operation, shard_map_body) = ShardMapOperation::from_body(body);
         let body_region = builder.import_program(shard_map_body);
@@ -10696,7 +9049,7 @@ mod tests {
         // tangent side) reaches the emitted module.
         let vector_type = test_vector_type(4);
         let primal = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone());
             let output = builder.add_instruction(AddOperation, Vec::new(), vec![input, input]).unwrap()[0];
             builder
@@ -10704,7 +9057,7 @@ mod tests {
                 .unwrap()
         };
         let jvp = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone());
             let tangent = builder.add_input(vector_type.clone());
             let output = builder.add_instruction(AddOperation, Vec::new(), vec![input, input]).unwrap()[0];
@@ -10718,7 +9071,7 @@ mod tests {
                 .unwrap()
         };
         let operation = CustomJvpOperation::new();
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let primal_region = builder.import_region(primal.entry_region_ref());
         let jvp_region = builder.import_region(jvp.entry_region_ref());
         let input = builder.add_input(vector_type.clone());
@@ -10754,7 +9107,7 @@ mod tests {
         // carrier is reverse-mode-only and must be transposed away before lowering, so lowering it is rejected.
         let vector_type = test_vector_type(4);
         let backward = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = CompositeXlaProgramBuilder::new();
             let residual = builder.add_input(vector_type.clone());
             let cotangent = builder.add_input(vector_type.clone());
             let output = builder.add_instruction(MulOperation, Vec::new(), vec![residual, cotangent]).unwrap()[0];
@@ -10766,8 +9119,13 @@ mod tests {
                 )
                 .unwrap()
         };
-        let operation = CustomVjpTangentOperation::new(1, false, vec![vector_type.clone()], vec![vector_type.clone()]);
-        let mut builder = XlaProgramBuilder::new();
+        let operation = CustomVjpTangentOperation::new(
+            1,
+            false,
+            vec![ArrayProgramType::Array(vector_type.clone())],
+            vec![ArrayProgramType::Array(vector_type.clone())],
+        );
+        let mut builder = CompositeXlaProgramBuilder::new();
         let backward_region = builder.import_region(backward.entry_region_ref());
         let tangent = builder.add_input(vector_type.clone());
         let residual = builder.add_input(vector_type.clone());
@@ -10796,9 +9154,9 @@ mod tests {
     /// into the callee's canonical program text.
     fn xla_condition_callee() -> std::rc::Rc<FlatXlaProgram> {
         let vector_type = test_vector_type(4);
-        let mut builder = XlaProgramBuilder::new();
-        let true_region = builder.import_region(xla_neg_branch(vector_type.clone()).entry_region_ref());
-        let false_region = builder.import_region(xla_identity_branch(vector_type.clone()).entry_region_ref());
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(vector_type.clone())));
+        let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(vector_type.clone())));
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let input = builder.add_input(vector_type);
         let output = builder
@@ -10821,7 +9179,7 @@ mod tests {
         let first = xla_condition_callee();
         let second = xla_condition_callee();
         let vector_type = test_vector_type(4);
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let input = builder.add_input(vector_type.clone());
         let mut accumulator: Option<AtomId> = None;
@@ -10954,13 +9312,13 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let output = builder
             .add_instruction(
-                XlaOperation::CoordinateBasis(CoordinateBasisOperation::new(test_matrix_type(2, 3), 1, 8)),
+                ArrayOperation::CoordinateBasis(CoordinateBasisOperation::new(test_matrix_type(2, 3), 1, 8)),
                 Vec::new(),
                 Vec::new(),
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -10977,10 +9335,10 @@ mod tests {
         let complex_type = ArrayType::scalar(DataType::C64);
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(complex_type);
-        let sine = builder.add_instruction(XlaOperation::Sin(SinOperation), Vec::new(), vec![input]).unwrap()[0];
-        let cosine = builder.add_instruction(XlaOperation::Cos(CosOperation), Vec::new(), vec![input]).unwrap()[0];
+        let sine = builder.add_instruction(ArrayOperation::Sin(SinOperation), Vec::new(), vec![input]).unwrap()[0];
+        let cosine = builder.add_instruction(ArrayOperation::Cos(CosOperation), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![sine, cosine],
                 vec![Placeholder],
                 vec![Placeholder, Placeholder],
@@ -11007,10 +9365,10 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
-            .add_instruction(XlaOperation::Reduce(ReduceOperation::new(axes, kind)), Vec::new(), vec![input])
+            .add_instruction(ArrayOperation::Reduce(ReduceOperation::new(axes, kind)), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         to_mlir_module_for_plain_program(&program, "main")
     }
@@ -11056,13 +9414,13 @@ mod tests {
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                XlaOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Sum)),
+                ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Sum)),
                 Vec::new(),
                 vec![input],
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert!(stablehlo.contains("tensor<?x3xf32, #stablehlo.bounds<4, ?>>"), "{stablehlo}");
@@ -11078,13 +9436,13 @@ mod tests {
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                XlaOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Mean)),
+                ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Mean)),
                 Vec::new(),
                 vec![input],
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main"),
@@ -11309,13 +9667,13 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let output = builder
             .add_instruction(
-                XlaOperation::CoordinateBasis(CoordinateBasisOperation::new(leaf_type, 0, 0)),
+                ArrayOperation::CoordinateBasis(CoordinateBasisOperation::new(leaf_type, 0, 0)),
                 Vec::new(),
                 Vec::new(),
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -11329,14 +9687,14 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_condition_to_stablehlo_if() {
+    fn test_to_mlir_module_for_program_lowers_condition_to_stablehlo_if() {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
-        let mut builder = XlaProgramBuilder::new();
-        let true_region = builder.import_region(xla_neg_branch(input_type.clone()).entry_region_ref());
-        let false_region = builder.import_region(xla_identity_branch(input_type.clone()).entry_region_ref());
-        let predicate = builder.add_input(predicate_type);
-        let input = builder.add_input(input_type);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(input_type.clone())));
+        let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
+        let predicate = builder.add_input(predicate_type.clone());
+        let input = builder.add_input(input_type.clone());
         let output = builder
             .add_instruction(
                 XlaOperation::Condition(ConditionOperation::new()),
@@ -11351,7 +9709,16 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            &[],
+            &(predicate_type, input_type.clone()),
+            &input_type,
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
@@ -11372,10 +9739,10 @@ mod tests {
         let operand = builder.add_input(operand_type);
         let indices = builder.add_input(indices_type);
         let output = builder
-            .add_instruction(XlaOperation::Gather(operation), Vec::new(), vec![operand, indices])
+            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -11401,10 +9768,10 @@ mod tests {
             .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])));
         let indices = builder.add_input(indices_type);
         let output = builder
-            .add_instruction(XlaOperation::Gather(operation), Vec::new(), vec![operand, indices])
+            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -11431,10 +9798,10 @@ mod tests {
         let operand = builder.add_input(operand_type);
         let indices = builder.add_input(indices_type);
         let output = builder
-            .add_instruction(XlaOperation::Gather(operation), Vec::new(), vec![operand, indices])
+            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -11463,10 +9830,10 @@ mod tests {
         let indices = builder.add_input(indices_type);
         let updates = builder.add_input(updates_type);
         let output = builder
-            .add_instruction(XlaOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates])
+            .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![output],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder],
@@ -11481,16 +9848,16 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_constant_predicate_condition_to_stablehlo_if() {
+    fn test_to_mlir_module_for_program_lowers_constant_predicate_condition_to_stablehlo_if() {
         // A condition whose predicate input is fed by a staged constant still lowers to `stablehlo.if`; folding the
         // constant predicate away is the backend's job (StableHLO canonicalization and XLA's conditional
         // simplification), not ryft's.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
-        let mut builder = XlaProgramBuilder::new();
-        let true_region = builder.import_region(xla_neg_branch(input_type.clone()).entry_region_ref());
-        let false_region = builder.import_region(xla_identity_branch(input_type.clone()).entry_region_ref());
-        let input = builder.add_input(input_type);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(input_type.clone())));
+        let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
+        let input = builder.add_input(input_type.clone());
         let predicate = builder.add_instruction(OneOperation::new(predicate_type), Vec::new(), vec![]).unwrap()[0];
         let output = builder
             .add_instruction(
@@ -11502,7 +9869,8 @@ mod tests {
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo =
+            to_mlir_module_for_program(&program, &[], &input_type, &input_type, "main", None, None).unwrap();
 
         assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.constant"), "{stablehlo}");
@@ -11510,12 +9878,12 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_while_to_stablehlo_while() {
+    fn test_to_mlir_module_for_program_lowers_while_to_stablehlo_while() {
         let state_type = ArrayType::scalar(DataType::Boolean);
-        let mut builder = XlaProgramBuilder::new();
-        let condition_region = builder.import_region(xla_identity_branch(state_type.clone()).entry_region_ref());
-        let body_region = builder.import_region(xla_identity_branch(state_type.clone()).entry_region_ref());
-        let state = builder.add_input(state_type);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let condition_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
+        let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
+        let state = builder.add_input(state_type.clone());
         let output = builder
             .add_instruction(
                 XlaOperation::While(WhileOperation::new()),
@@ -11526,7 +9894,8 @@ mod tests {
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo =
+            to_mlir_module_for_program(&program, &[], &state_type, &state_type, "main", None, None).unwrap();
 
         assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
@@ -11536,24 +9905,25 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_bounded_while_with_fused_counter_condition() {
+    fn test_to_mlir_module_for_program_lowers_bounded_while_with_fused_counter_condition() {
         // A semantic iteration bound threads an internal i64 counter through the `stablehlo.while` state: the
         // condition region conjoins `counter < bound` into the original predicate via `stablehlo.compare` plus
         // `stablehlo.and`, and the body region increments the counter via `stablehlo.add`. The operation's outputs
         // remain the original state elements.
         let state_type = ArrayType::scalar(DataType::Boolean);
         let while_operation = WhileOperation::new().with_iteration_bound(3).unwrap();
-        let mut builder = XlaProgramBuilder::new();
-        let condition_region = builder.import_region(xla_identity_branch(state_type.clone()).entry_region_ref());
-        let body_region = builder.import_region(xla_identity_branch(state_type.clone()).entry_region_ref());
-        let state = builder.add_input(state_type);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let condition_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
+        let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
+        let state = builder.add_input(state_type.clone());
         let output = builder
             .add_instruction(XlaOperation::While(while_operation), vec![condition_region, body_region], vec![state])
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo =
+            to_mlir_module_for_program(&program, &[], &state_type, &state_type, "main", None, None).unwrap();
 
         assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
@@ -11563,7 +9933,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_batched_predicate_while_with_masked_state_updates() {
+    fn test_to_mlir_module_for_program_lowers_batched_predicate_while_with_masked_state_updates() {
         // A batched (per-item) predicate lowers with the masked semantics owned by the while lowering: the condition
         // region reduces the `tensor<3xi1>` predicate to the scalar loop-continuation decision with a Boolean `or`
         // reduction, and the body region recomputes the per-item predicate on the incoming state and selects per
@@ -11573,27 +9943,33 @@ mod tests {
         use ryft_core::operations::constants::{OneLikeOperation, ZeroLikeOperation};
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
             let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![state]).unwrap()[0];
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![state, zero])
+                .add_instruction(
+                    XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(
+                        ComparisonDirection::GreaterThan,
+                    ))),
+                    Vec::new(),
+                    vec![state, zero],
+                )
                 .unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
         let body = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
             let one = builder.add_instruction(OneLikeOperation, Vec::new(), vec![state]).unwrap()[0];
             let next = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
-        let state = builder.add_input(state_type);
+        let state = builder.add_input(state_type.clone());
         let output = builder
             .add_instruction(
                 XlaOperation::While(WhileOperation::new()),
@@ -11604,7 +9980,8 @@ mod tests {
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo =
+            to_mlir_module_for_program(&program, &[], &state_type, &state_type, "main", None, None).unwrap();
 
         assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
         // Condition region: `or`-reduce the per-item predicate into the scalar continuation decision.
@@ -11616,7 +9993,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_scan_to_while() {
+    fn test_to_mlir_module_for_program_lowers_scan_to_while() {
         // A primal scan lowers to a `stablehlo.while` over `[counter, carries..., xs..., ys...]`: each iteration
         // reads one slice of the stacked inputs with `stablehlo.dynamic_slice`, inlines the body, and writes the
         // per-iteration outputs into preallocated zero accumulators with `stablehlo.dynamic_update_slice` (the
@@ -11624,7 +10001,7 @@ mod tests {
         use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
-        let mut body_builder = XlaProgramBuilder::new();
+        let mut body_builder = CompositeXlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f32.clone());
         let x = body_builder.add_input(scalar_f32.clone());
         let product = body_builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
@@ -11635,12 +10012,13 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let scan = CoreScanOperation::<XlaArrayConstant>::new(1, 3);
+        let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
 
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let init = builder.add_input(scalar_f32);
-        let stacked_inputs = builder.add_input(test_vector_type(3));
+        let init = builder.add_input(scalar_f32.clone());
+        let stacked_type = test_vector_type(3);
+        let stacked_inputs = builder.add_input(stacked_type.clone());
         let outputs = builder
             .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![init, stacked_inputs])
             .unwrap()
@@ -11652,7 +10030,10 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let output_types = (scalar_f32.clone(), stacked_type.clone());
+        let stablehlo =
+            to_mlir_module_for_program(&program, &[], &(scalar_f32, stacked_type), &output_types, "main", None, None)
+                .unwrap();
 
         assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
@@ -11662,13 +10043,13 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_fully_unrolled_scan_without_while() {
+    fn test_to_mlir_module_for_program_lowers_fully_unrolled_scan_without_while() {
         // A scan whose unroll factor equals its length lowers to straight-line operations: no `stablehlo.while` is
         // emitted at all and the body inlines once per iteration (three `stablehlo.multiply` copies for `length = 3`).
         use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
-        let mut body_builder = XlaProgramBuilder::new();
+        let mut body_builder = CompositeXlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f32.clone());
         let x = body_builder.add_input(scalar_f32.clone());
         let product = body_builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
@@ -11679,12 +10060,13 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let scan = CoreScanOperation::<XlaArrayConstant>::new(1, 3).with_unroll(3).unwrap();
+        let scan = CoreScanOperation::<XlaConstant>::new(1, 3).with_unroll(3).unwrap();
 
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let init = builder.add_input(scalar_f32);
-        let stacked_inputs = builder.add_input(test_vector_type(3));
+        let init = builder.add_input(scalar_f32.clone());
+        let stacked_type = test_vector_type(3);
+        let stacked_inputs = builder.add_input(stacked_type.clone());
         let outputs = builder
             .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![init, stacked_inputs])
             .unwrap()
@@ -11696,7 +10078,10 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let output_types = (scalar_f32.clone(), stacked_type.clone());
+        let stablehlo =
+            to_mlir_module_for_program(&program, &[], &(scalar_f32, stacked_type), &output_types, "main", None, None)
+                .unwrap();
 
         assert!(!stablehlo.contains("stablehlo.while"), "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 3, "{stablehlo}");
@@ -11705,14 +10090,14 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_partially_unrolled_scan() {
+    fn test_to_mlir_module_for_program_lowers_partially_unrolled_scan() {
         // A scan with `unroll = 2` over `length = 4` keeps the `stablehlo.while` skeleton but runs two body copies
         // per loop trip: the body region contains two `stablehlo.multiply` copies (and one iteration read/write pair
         // per copy) while the counter advances by the unroll factor.
         use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
-        let mut body_builder = XlaProgramBuilder::new();
+        let mut body_builder = CompositeXlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f32.clone());
         let x = body_builder.add_input(scalar_f32.clone());
         let product = body_builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
@@ -11723,12 +10108,13 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let scan = CoreScanOperation::<XlaArrayConstant>::new(1, 4).with_unroll(2).unwrap();
+        let scan = CoreScanOperation::<XlaConstant>::new(1, 4).with_unroll(2).unwrap();
 
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let init = builder.add_input(scalar_f32);
-        let stacked_inputs = builder.add_input(test_vector_type(4));
+        let init = builder.add_input(scalar_f32.clone());
+        let stacked_type = test_vector_type(4);
+        let stacked_inputs = builder.add_input(stacked_type.clone());
         let outputs = builder
             .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![init, stacked_inputs])
             .unwrap()
@@ -11740,7 +10126,10 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let output_types = (scalar_f32.clone(), stacked_type.clone());
+        let stablehlo =
+            to_mlir_module_for_program(&program, &[], &(scalar_f32, stacked_type), &output_types, "main", None, None)
+                .unwrap();
 
         assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 2, "{stablehlo}");
@@ -11768,8 +10157,9 @@ mod tests {
         let second = builder.add_instruction(PrintOperation::new("second"), Vec::new(), vec![doubled]).unwrap()[0];
         let output = builder.add_instruction(AddOperation, Vec::new(), vec![first, second]).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
+        let program = unproject_plain_program(program);
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type];
         let module =
@@ -11814,8 +10204,13 @@ mod tests {
         let pure = CustomCallOperation::new("ryft.test.add_one", vec![array_type.clone()]);
         let output = builder.add_instruction(pure, Vec::new(), vec![scaled]).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
             .unwrap();
+        let program = unproject_plain_program(program);
         let input_types = vec![array_type.clone(), array_type.clone()];
         let output_types = vec![array_type];
         let module =
@@ -11851,8 +10246,9 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
+        let program = unproject_plain_program(program);
         let input_types = vec![key_type.clone(), index_type.clone()];
         let output_types = vec![key_type, index_type];
         let module =
@@ -11897,8 +10293,9 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
             .unwrap();
+        let program = unproject_plain_program(program);
         let input_types = vec![primary_type.clone(), secondary_type.clone(), passenger_type.clone()];
         let output_types = vec![primary_type, secondary_type, passenger_type];
         let module =
@@ -11940,8 +10337,13 @@ mod tests {
         let operation = DotOperation::new(DotDimensionNumbers::matmul()).with_accumulation_type(DataType::F32);
         let output = builder.add_instruction(operation, Vec::new(), vec![lhs, rhs]).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
             .unwrap();
+        let program = unproject_plain_program(program);
         let input_types = vec![operand_type.clone(), operand_type];
         let output_types = vec![output_type];
         let module =
@@ -11981,10 +10383,14 @@ mod tests {
         let output =
             builder.add_instruction(ScaledDotOperation::new(16, DataType::F32), Vec::new(), inputs).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder; 4],
+                vec![Placeholder],
+            )
             .unwrap();
         let input_types = vec![element_type.clone(), scale_type.clone(), element_type, scale_type];
-        (program, input_types, vec![output_type])
+        (unproject_plain_program(program), input_types, vec![output_type])
     }
 
     #[test]
@@ -12069,10 +10475,14 @@ mod tests {
         let output =
             builder.add_instruction(ScaledDotOperation::new(16, DataType::F32), Vec::new(), inputs).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 5], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder; 5],
+                vec![Placeholder],
+            )
             .unwrap();
         let input_types = vec![element_type.clone(), scale_type.clone(), element_type, scale_type, global_scale_type];
-        (program, input_types, vec![output_type])
+        (unproject_plain_program(program), input_types, vec![output_type])
     }
 
     #[test]
@@ -12150,11 +10560,11 @@ mod tests {
         let callee_output = callee_builder
             .add_instruction(ScaledDotOperation::new(16, DataType::F32), Vec::new(), callee_inputs)
             .unwrap()[0];
-        let callee: std::rc::Rc<FlatXlaProgram> = std::rc::Rc::new(
+        let callee = std::rc::Rc::new(unproject_plain_program(
             callee_builder.build(vec![callee_output], vec![Placeholder; 4], vec![Placeholder]).unwrap(),
-        );
+        ));
 
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let inputs = vec![
             builder.add_input(element_type.clone()),
             builder.add_input(scale_type.clone()),
@@ -12217,10 +10627,14 @@ mod tests {
         let output =
             builder.add_instruction(DotProductAttentionOperation::new(0.125, mask), Vec::new(), inputs).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
             .unwrap();
         let input_types = vec![operand_type.clone(), operand_type.clone(), operand_type.clone()];
-        (program, input_types, vec![operand_type])
+        (unproject_plain_program(program), input_types, vec![operand_type])
     }
 
     #[test]
@@ -12400,13 +10814,13 @@ mod tests {
         let output_count = outputs.len();
         let output_types = builder_output_types(&builder, outputs.as_slice());
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 outputs,
                 vec![Placeholder; input_types.len()],
                 vec![Placeholder; output_count],
             )
             .unwrap();
-        (program, input_types, output_types)
+        (unproject_plain_program(program), input_types, output_types)
     }
 
     /// Builds the matching backward fixture program for [`dot_product_attention_extended_fixture_program`]'s
@@ -12465,13 +10879,13 @@ mod tests {
         let output_count = outputs.len();
         let output_types = builder_output_types(&builder, outputs.as_slice());
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 outputs,
                 vec![Placeholder; input_types.len()],
                 vec![Placeholder; output_count],
             )
             .unwrap();
-        (program, input_types, output_types)
+        (unproject_plain_program(program), input_types, output_types)
     }
 
     #[test]
@@ -12822,8 +11236,9 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
+        let program = unproject_plain_program(program);
         let input_types = vec![state_type.clone()];
         let output_types = vec![state_type, bits_type];
         let module =
@@ -12852,7 +11267,7 @@ mod tests {
         // block argument, the body threads it through the print custom call, and the loop's trailing result
         // continues the chain (unused here because the program ends right after the scan).
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut body_builder = XlaProgramBuilder::new();
+        let mut body_builder = CompositeXlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f64.clone());
         let x = body_builder.add_input(scalar_f64.clone());
         let printed = body_builder.add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![x]).unwrap()[0];
@@ -12860,10 +11275,10 @@ mod tests {
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let scan = CoreScanOperation::<XlaArrayConstant>::new(1, 3);
+        let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
 
         let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let init = builder.add_input(scalar_f64.clone());
         let stacked_inputs = builder.add_input(stacked_type.clone());
@@ -12920,7 +11335,7 @@ mod tests {
         // returns its print custom call's token, and the pure branch returns the entry token unchanged.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F64);
-        let mut true_builder = XlaProgramBuilder::new();
+        let mut true_builder = CompositeXlaProgramBuilder::new();
         let true_input = true_builder.add_input(input_type.clone());
         let printed =
             true_builder.add_instruction(PrintOperation::new("taken"), Vec::new(), vec![true_input]).unwrap()[0];
@@ -12929,9 +11344,9 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![negated], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
-        let false_region = builder.import_region(xla_identity_branch(input_type.clone()).entry_region_ref());
+        let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
         let predicate = builder.add_input(predicate_type.clone());
         let input = builder.add_input(input_type.clone());
         let output = builder
@@ -12988,8 +11403,9 @@ mod tests {
             .unwrap()[0];
         let callee_output =
             callee_builder.add_instruction(AddOperation, Vec::new(), vec![printed, printed]).unwrap()[0];
-        let callee =
-            std::rc::Rc::new(callee_builder.build(vec![callee_output], vec![Placeholder], vec![Placeholder]).unwrap());
+        let callee = std::rc::Rc::new(unproject_plain_program(
+            callee_builder.build(vec![callee_output], vec![Placeholder], vec![Placeholder]).unwrap(),
+        ));
         let module = lower_two_jit_call_module(vec![callee.clone(), callee]);
 
         assert_eq!(
@@ -13089,7 +11505,7 @@ mod tests {
         // `stablehlo.while` carry and each iteration's print custom call consumes and produces it, so this pins that
         // XLA accepts and runs token-carrying loops (not just the flat token chain).
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut body_builder = XlaProgramBuilder::new();
+        let mut body_builder = CompositeXlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f64.clone());
         let x = body_builder.add_input(scalar_f64.clone());
         let printed = body_builder.add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![x]).unwrap()[0];
@@ -13097,10 +11513,10 @@ mod tests {
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let scan = CoreScanOperation::<XlaArrayConstant>::new(1, 3);
+        let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
 
         let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let init = builder.add_input(scalar_f64.clone());
         let stacked_inputs = builder.add_input(stacked_type.clone());
@@ -13201,24 +11617,30 @@ mod tests {
         // rejoining finished item) would leave nonzero or negative entries.
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
             let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![state]).unwrap()[0];
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![state, zero])
+                .add_instruction(
+                    XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(
+                        ComparisonDirection::GreaterThan,
+                    ))),
+                    Vec::new(),
+                    vec![state, zero],
+                )
                 .unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
         let body = {
-            let mut builder = XlaProgramBuilder::new();
+            let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
             let one = builder.add_instruction(OneLikeOperation, Vec::new(), vec![state]).unwrap()[0];
             let next = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let state = builder.add_input(state_type.clone());
@@ -13273,58 +11695,6 @@ mod tests {
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), vec![0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn test_grad_of_jitted_print_function_prints_once_on_cpu() {
-        use ryft_core::operations::debugging::Print;
-        use ryft_core::sharding::{Device, DeviceMesh};
-        use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
-
-        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
-        use crate::experimental::domains::XlaDomain;
-        use crate::tests::{values_from_bytes, values_to_bytes};
-        use crate::{Array, CompiledXlaFunction, FromPjrt, compile};
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        ensure_print_handler_registered(&client).unwrap();
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
-            vec![device],
-        )
-        .unwrap();
-        let engine = XlaDomain::new(&client);
-
-        let input_type = ArrayType::new(DataType::F64, Shape::new(Vec::new()))
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
-            .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
-            compile(|x| (x.clone() * x).print("y"), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = compiled.gradient(&engine).unwrap();
-
-        let input =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f64>(&[3.0]).as_slice())
-                .unwrap();
-        let (output, lines) = with_captured_prints(|| engine.interpret(&gradient.executable_program(), input).unwrap());
-
-        // The print fires exactly once, during the forward pass of the differentiated program; transposition is the
-        // identity on the cotangent and re-prints nothing.
-        assert_eq!(lines, vec!["y: 9.0".to_string()]);
-
-        // The gradient of `x * x` at `x = 3` is `6`.
-        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-        let output_bytes = output
-            .device_shard(device_id)
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), vec![6.0]);
     }
 
     // ---------------------------------------------------------------------------
@@ -13442,7 +11812,7 @@ mod tests {
             .add_instruction(DynamicUpdateSliceOperation, Vec::new(), vec![input, update, index_0, index_1])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![sliced, updated, dynamic_sliced, dynamic_updated],
                 vec![Placeholder, Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder, Placeholder, Placeholder],
@@ -13481,7 +11851,11 @@ mod tests {
             .add_instruction(DynamicSliceOperation::new(vec![1, 2]), Vec::new(), vec![input, index_0, index_1])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
@@ -13501,7 +11875,7 @@ mod tests {
             .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![first, second])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, XlaConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<XlaArrayConstant>, XlaArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(
@@ -13542,7 +11916,7 @@ mod tests {
             .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![left, right])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, XlaConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<XlaArrayConstant>, XlaArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert_eq!(
             program.transpose().unwrap_err().to_string(),
@@ -13574,7 +11948,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![strided, padded],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -13618,7 +11992,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![trimmed, mixed],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -13919,7 +12293,7 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let output = builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new()).unwrap()[0];
             let program = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
                 .unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -13940,7 +12314,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let output = builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new()).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -13957,7 +12331,7 @@ mod tests {
         let input = builder.add_input(input_type);
         let output = builder.add_instruction(OneLikeOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -13986,7 +12360,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_erases_static_zero_space_boundary() {
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone());
         let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -14011,7 +12385,7 @@ mod tests {
         use ryft_core::operations::debugging::PrintOperation;
 
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone());
         let output = builder.add_instruction(PrintOperation::new("zero"), Vec::new(), vec![input]).unwrap()[0];
         let program: FlatXlaProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -14026,7 +12400,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_preserves_dynamic_zero_space_shape_carrier() {
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("zero", Some(3))]));
-        let mut builder = XlaProgramBuilder::new();
+        let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone());
         let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 

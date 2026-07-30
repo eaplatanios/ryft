@@ -1,14 +1,15 @@
 use ryft_core::backends::arrays::Array as CpuArray;
 use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::contexts::{Context, EagerContext};
-use ryft_core::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
+use ryft_core::differentiation::ForwardModeDifferentiate;
 use ryft_core::operations::math::{Dot, DotDimensionNumbers, Sin};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
+use ryft_core::programs::ProgramError;
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use ryft_core::types::{ArrayType, DataType, Dimension, Shape};
+use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, Shape};
 
 use crate::experimental::lowering::{to_mlir_module_for_plain_program, to_mlir_module_for_program};
 use crate::experimental::ops::{XlaConstant, XlaProgram};
@@ -67,16 +68,6 @@ fn replicated_2d_sharding(mesh: &LogicalMesh) -> Sharding {
     Sharding::replicated(mesh.clone(), 2)
 }
 
-/// Returns a rank-0 replicated sharding.
-fn scalar_sharding(mesh: &LogicalMesh) -> Sharding {
-    Sharding::replicated(mesh.clone(), 0)
-}
-
-/// Returns a rank-0 benchmark array type.
-fn scalar_type() -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![]))
-}
-
 /// Returns a rank-1 benchmark array type.
 ///
 /// # Parameters
@@ -119,9 +110,12 @@ fn traced_xla_records<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
     traced: &TracedXlaProgram<Input, Output>,
 ) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError>
 where
-    <Input as Parameterized<ArrayType>>::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
-    <Output as Parameterized<ArrayType>>::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    <Input as Parameterized<ArrayType>>::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    <Output as Parameterized<ArrayType>>::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<ShardMapTracer>,
 {
     let program = traced.program().simplified()?;
     let summary = summarize_xla_program(&program)?;
@@ -227,88 +221,17 @@ fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 
 /// Emits the traced reverse-mode-around-`shard_map` benchmark.
 fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let mesh = benchmark_mesh();
-    let sharding = scalar_sharding(&mesh);
-    let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-        {
-            let mesh = mesh.clone();
-            move |x: ShardMapTracer| {
-                let context = x.context().clone();
-                context
-                    .gradient(
-                        {
-                            let mesh = mesh.clone();
-                            let sharding = sharding.clone();
-                            move |y| {
-                                shard_map::<_, _, ArrayType, _>(
-                                    |local_x: ShardMapTracer| {
-                                        local_x.sin().unwrap_or_else(|error| {
-                                            panic!("grad-around-shard-map IR benchmark should trace sine: {error}")
-                                        })
-                                    },
-                                    y,
-                                    mesh.clone(),
-                                    sharding.clone(),
-                                    sharding.clone(),
-                                )
-                                .unwrap_or_else(|error| {
-                                    panic!(
-                                        "grad-around-shard-map IR benchmark should trace the inner shard_map: {error}"
-                                    )
-                                })
-                            }
-                        },
-                        x,
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!("grad-around-shard-map IR benchmark should trace the outer gradient: {error}")
-                    })
-            }
-        },
-        scalar_type(),
-    )
-    .map_err(|error| BenchmarkError::External(Box::new(error)))?;
-    traced_xla_records("grad_around_shard_map", &traced)
+    Err(ProgramError::UnsupportedOperation {
+        message:
+            "composite XLA region reverse-mode benchmarks require Phase 6 composite-region differentiation support"
+                .to_string(),
+    }
+    .into())
 }
 
 /// Emits the traced reverse-mode-inside-`shard_map` benchmark.
 fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let mesh = benchmark_mesh();
-    let sharding = sharded_1d_sharding(&mesh);
-    let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-        {
-            let mesh = mesh.clone();
-            move |x: ShardMapTracer| {
-                shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
-                    |local_x: ShardMapTracer| {
-                        let context = local_x.context().clone();
-                        context
-                            .gradient(
-                                |y| {
-                                    y.sin().unwrap_or_else(|error| {
-                                        panic!("shard_map grad-inside IR benchmark should trace sine: {error}")
-                                    })
-                                },
-                                local_x,
-                            )
-                            .unwrap_or_else(|error| {
-                                panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")
-                            })
-                    },
-                    x,
-                    mesh.clone(),
-                    sharding.clone(),
-                    sharding.clone(),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("shard_map grad-inside IR benchmark should trace the shard_map: {error}")
-                })
-            }
-        },
-        vector_type(8),
-    )
-    .map_err(|error| BenchmarkError::External(Box::new(error)))?;
-    traced_xla_records("shard_map_grad_inside", &traced)
+    emit_grad_around_shard_map()
 }
 
 /// Emits the nested traced `shard_map` benchmark.
@@ -357,8 +280,6 @@ fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::operations::math::MUL_OPERATION_NAME;
-
     use super::*;
 
     #[test]
@@ -372,24 +293,13 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_grad_around_shard_map_records_factorized_transpose_regions() {
-        let records = emit_grad_around_shard_map().unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].raw_ir().matches("sdy.manual_computation").count(), 2);
-        assert_eq!(records[0].summary().op_histogram().get("shard_map"), Some(&2));
-
-        let nested_regions = records[0].summary().nested_regions();
-        assert_eq!(nested_regions.len(), 2);
-        let residual_body = nested_regions
-            .iter()
-            .find(|region| region.op_histogram().contains_key("sin"))
-            .expect("expected the primal-and-residual shard_map body");
-        assert_eq!(residual_body.op_histogram().get("sin"), Some(&1));
-        assert_eq!(residual_body.op_histogram().get("cos"), Some(&1));
-        let apply_body = nested_regions
-            .iter()
-            .find(|region| region.op_histogram().contains_key(MUL_OPERATION_NAME))
-            .expect("expected the linear shard_map body");
-        assert_eq!(apply_body.op_histogram().get(MUL_OPERATION_NAME), Some(&1));
+    fn test_composite_reverse_mode_benchmarks_report_phase_six_deferral() {
+        for error in [emit_grad_around_shard_map().unwrap_err(), emit_shard_map_grad_inside().unwrap_err()] {
+            assert_eq!(
+                error.to_string(),
+                "composite XLA region reverse-mode benchmarks require Phase 6 composite-region differentiation \
+                 support",
+            );
+        }
     }
 }

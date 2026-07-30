@@ -7,8 +7,8 @@ use std::sync::{Arc, OnceLock};
 use ryft_core::compilation::CompilationContext;
 use ryft_core::programs::Value;
 use ryft_core::{
-    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Parameterized, Sharding, ShardingDimension,
-    ShardingError, StaticShape, Typed, check_sharding,
+    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Parameterized, ProjectedContext, Sharding,
+    ShardingDimension, ShardingError, StaticShape, Typed, check_sharding,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
@@ -690,10 +690,10 @@ impl<'o> Value for Array<'o> {
     // `ConstantOperation: From<...>` impls upstream (E0119), so for XLA the rich dispatch domain *is* the eager
     // capability surface and only capabilities without operation-binding blankets (`Concretizable<bool>`,
     // `WhilePredicate`, and the foreign `std::ops` sugar) get direct implementations in `crate::eager`.
-    type DispatchDomain = XlaDomain<'o>;
-    type ExecutionDomain = XlaDomain<'o>;
+    type DispatchDomain = ProjectedContext<XlaDomain<'o>, ArrayType>;
+    type ExecutionDomain = ProjectedContext<XlaDomain<'o>, ArrayType>;
 
-    fn dispatch_domain(&self) -> XlaDomain<'o> {
+    fn dispatch_domain(&self) -> Self::DispatchDomain {
         self.execution_domain()
     }
 
@@ -703,14 +703,14 @@ impl<'o> Value for Array<'o> {
     /// derived from it — keep hitting one dispatch cache). Arrays without an attached client recover a clientless
     /// domain that carries the XLA staged operation universe but rejects eager binds with a clear
     /// "requires a PJRT client" error; attach a client via [`Array::with_client`] to make such arrays executable.
-    fn execution_domain(&self) -> XlaDomain<'o> {
-        match self.client {
+    fn execution_domain(&self) -> Self::ExecutionDomain {
+        ProjectedContext::new(match self.client {
             Some(client) => {
                 let cache = Arc::clone(self.compilation_cache.get_or_init(|| Arc::new(CompilationContext::new())));
                 XlaDomain::with_shared_cache(client, cache)
             }
             None => XlaDomain::clientless(),
-        }
+        })
     }
 }
 

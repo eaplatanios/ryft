@@ -1,6 +1,5 @@
+use std::fmt::Display;
 use std::rc::Rc;
-
-use ryft_macros::Operation;
 
 use ryft_core::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
@@ -17,17 +16,21 @@ use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
-use ryft_core::operations::constants::{
-    ConstantOperation, IotaOperation, OneLikeOperation, OneOperation, Zero, ZeroLikeOperation, ZeroOperation,
-};
-use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
+use ryft_core::operations::constants::{ConstantOperation, OneLikeOperation, ZeroLikeOperation};
+use ryft_core::operations::constants::{IotaOperation, OneOperation, Zero, ZeroOperation};
+use ryft_core::operations::control_flow::SelectOperation;
+use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
+use ryft_core::operations::dimensions::{
+    DimensionFromScalarOperation, DimensionSizeOperation, DimensionToScalarOperation,
+};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
+use ryft_core::operations::manipulation::{BroadcastOperation, ConcatenateOperation, PadOperation, ReshapeOperation};
 use ryft_core::operations::manipulation::{
-    ConcatenateOperation, ConvertElementTypeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    GatherOperation, LegacyBroadcastOperation, LegacyReshapeOperation, PadOperation, Reshape, ScatterOperation, Slice,
-    SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    ConvertElementTypeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
+    LegacyBroadcastOperation, LegacyReshapeOperation, ScatterOperation, SliceOperation, TransposeOperation,
+    UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
@@ -42,37 +45,35 @@ use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use ryft_core::programs::operations::Operation;
-use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface, RegionSlot};
-use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
+use ryft_core::programs::effects::Effects;
+use ryft_core::programs::identities::TypeIdentityRenaming;
+use ryft_core::programs::operations::{Operation, OperationProjection};
+use ryft_core::programs::regions::{CalleeRegionDriver, OutputRegionProvenance, RegionInterface, RegionSlot};
+use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, ProgramError, Value, ValueProjection};
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::axes::AxisIndexOperation;
+use ryft_core::backends::array_programs::ArrayProgramOperation;
 use ryft_core::backends::arrays::{Array as ReferenceArray, ArrayOperation};
+use ryft_core::backends::dimensions::{DimensionOperation, DimensionValue};
 use ryft_core::differentiation::DifferentiationDual;
-use ryft_core::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, CollectiveOperation, PSumScatterOperation, PpermuteOperation,
-};
+use ryft_core::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation};
+use ryft_core::operations::collectives::{CollectiveOperation, PpermuteOperation};
 use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::memory::TransferToMemoryOperation;
 use ryft_core::operations::tag::TagOperation;
 use ryft_core::programs::types::{Type, TypeError, Typed};
 use ryft_core::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
-use ryft_core::types::ArrayType;
+use ryft_core::types::{ArrayProgramType, ArrayType, DimensionType, DimensionVariable};
 
 use crate::experimental::operations::ShardMapOperation;
 
 /// Lifetime-free reference to an array member captured by an XLA program.
 pub type XlaArrayConstant = CaptureReference<ArrayType>;
 
-// TODO(eaplatanios): Delete this temporary alias in the atomic P4b production composite XLA cutover.
 /// Production XLA program constant.
-///
-/// This remains an alias of [`XlaArrayConstant`] until the atomic composite-domain cutover. Keeping the names distinct
-/// now prevents array-member payloads from being retyped when this alias changes to
-/// `CaptureReference<ArrayProgramType>`.
-pub type XlaConstant = XlaArrayConstant;
+pub type XlaConstant = CaptureReference<ArrayProgramType>;
 
 /// Ordinary staged-operation universe owned by the XLA backend.
 ///
@@ -80,91 +81,76 @@ pub type XlaConstant = XlaArrayConstant;
 /// instructions attach their nested computations as regions of the containing XLA program, so those regions can
 /// contain backend-specific operations such as [`jit_call`](JitCallOperation) and
 /// [`shard_map`](ShardMapOperation).
-#[derive(Clone, Debug, Operation)]
-#[ryft(crate = "ryft_core")]
-#[ryft(dispatch(batching, differentiation, transposition))]
-pub enum XlaOperation<V: Value<Type = ArrayType> = XlaArrayConstant> {
-    Zero(ZeroOperation<ArrayType>),
-    ZeroLike(ZeroLikeOperation),
-    One(OneOperation<ArrayType>),
-    OneLike(OneLikeOperation),
-    Constant(ConstantOperation<ReferenceArray>),
-    ConvertElementType(ConvertElementTypeOperation),
-    Iota(IotaOperation<ArrayType>),
-    CoordinateBasis(CoordinateBasisOperation<ArrayType>),
-    Neg(NegOperation),
-    Add(AddOperation),
-    Sub(SubOperation),
-    Mul(MulOperation),
-    Div(DivOperation),
-    Sin(SinOperation),
-    Cos(CosOperation),
-    Atan2(Atan2Operation),
-    Exp(ExpOperation),
-    Log(LogOperation),
-    Sqrt(SqrtOperation),
-    Rsqrt(RsqrtOperation),
-    Tanh(TanhOperation),
-    Logistic(LogisticOperation),
-    Erf(ErfOperation),
-    Pow(PowOperation),
-    Sign(SignOperation),
-    Floor(FloorOperation),
-    Ceil(CeilOperation),
-    Round(RoundOperation),
-    Max(MaxOperation),
-    Min(MinOperation),
-    Rem(RemOperation),
-    Abs(AbsOperation),
-    Complex(ComplexOperation),
-    Conjugate(ConjugateOperation),
-    Real(RealOperation),
-    Imaginary(ImaginaryOperation),
-    StopGradient(StopGradientOperation),
-    Tag(TagOperation),
-    Print(PrintOperation),
-    CustomCall(CustomCallOperation),
-    TransferToMemory(TransferToMemoryOperation),
-    Dot(DotOperation),
-    ScaledDot(ScaledDotOperation),
-    DotProductAttention(DotProductAttentionOperation),
-    DotProductAttentionBackward(DotProductAttentionBackwardOperation),
-    Transpose(TransposeOperation),
-    Reshape(LegacyReshapeOperation),
-    Reshard(ReshardOperation),
-    ShardingConstraint(ShardingConstraintOperation),
-    Broadcast(LegacyBroadcastOperation),
-    Slice(SliceOperation),
-    UpdateSlice(UpdateSliceOperation),
-    DynamicSlice(DynamicSliceOperation),
-    DynamicUpdateSlice(DynamicUpdateSliceOperation),
-    Pad(PadOperation),
-    Concatenate(ConcatenateOperation),
-    Gather(GatherOperation),
-    Scatter(ScatterOperation),
-    Reduce(ReduceOperation),
-    Sort(SortOperation),
-    RngBitGenerator(RngBitGeneratorOperation),
+#[derive(Clone, Debug)]
+pub enum XlaOperation<C = XlaConstant>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    /// Generic composite zero used by transform machinery.
+    Zero(ZeroOperation<ArrayProgramType>),
+
+    /// Mixed zero constructor with explicit dynamic-extent operands.
+    DynamicZero(ZeroOperation<ArrayType>),
+
+    /// Mixed one constructor with explicit dynamic-extent operands.
+    DynamicOne(OneOperation<ArrayType>),
+
+    /// Mixed iota constructor with explicit dynamic-extent operands.
+    DynamicIota(IotaOperation<ArrayType>),
+
+    /// Homogeneous array operation.
+    Array(ArrayOperation<C::Projected>),
+
+    /// Homogeneous first-class-dimension operation.
+    Dimension(DimensionOperation<DimensionValue>),
+
+    /// Mixed comparison of two dimensions producing Boolean array data.
     Compare(CompareOperation),
-    Not(NotOperation),
-    And(AndOperation),
-    Or(OrOperation),
-    Xor(XorOperation),
-    Collective(CollectiveOperation),
+
+    /// Reads an array extent as a first-class dimension.
+    DimensionSize(DimensionSizeOperation),
+
+    /// Converts scalar array data into a checked first-class dimension.
+    DimensionFromScalar(DimensionFromScalarOperation),
+
+    /// Converts a first-class dimension into scalar array data.
+    DimensionToScalar(DimensionToScalarOperation),
+
+    /// Reshapes an array using explicit dimension operands.
+    Reshape(ReshapeOperation),
+
+    /// Broadcasts an array using explicit dimension operands.
+    Broadcast(BroadcastOperation),
+
+    /// Concatenates arrays with an explicit result extent.
+    Concatenate(ConcatenateOperation),
+
+    /// Calls a foreign kernel with explicit dynamic result extents.
+    CustomCall(CustomCallOperation),
+
+    /// Pads an array with explicit result extents.
+    Pad(PadOperation),
+
+    /// Generates random bits with explicit dynamic result extents.
+    RngBitGenerator(RngBitGeneratorOperation),
+
+    /// Gathers values with an explicit dynamic result extent.
     AllGather(AllGatherOperation),
+
+    /// Scatters values with an explicit dynamic result extent.
     PSumScatter(PSumScatterOperation),
-    Ppermute(PpermuteOperation),
+
+    /// Exchanges values with explicit dynamic result extents.
     AllToAll(AllToAllOperation),
-    AxisIndex(AxisIndexOperation),
-    Select(SelectOperation),
+
     /// Backend-owned condition whose attached branch regions can contain XLA operations.
-    Condition(ConditionOperation<V>),
+    Condition(ConditionOperation<C>),
 
     /// Backend-owned loop whose attached condition and body regions can contain XLA operations.
     While(WhileOperation),
 
     /// Backend-owned scan whose attached body region can contain XLA operations.
-    Scan(ScanOperation<V>),
+    Scan(ScanOperation<C>),
 
     /// Backend-owned custom JVP call whose attached regions can contain XLA operations.
     CustomJvp(CustomJvpOperation),
@@ -174,7 +160,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaArrayConstant> {
 
     /// Backend-owned opaque custom-VJP tangent carrier, staged by the capture-free forward of a
     /// [`CustomVjp`](Self::CustomVjp) call. Its attached backward region can contain XLA operations.
-    CustomVjpTangent(CustomVjpTangentOperation<ArrayType>),
+    CustomVjpTangent(CustomVjpTangentOperation<ArrayProgramType>),
 
     /// Backend-owned rematerialized call whose attached regions can contain XLA operations.
     Rematerialize(RematerializeOperation),
@@ -183,96 +169,556 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaArrayConstant> {
     JitCall(JitCallOperation),
 
     /// XLA-specific `shard_map`.
-    ShardMap(Box<ShardMapOperation<V>>),
+    ShardMap(Box<ShardMapOperation<C>>),
 }
 
-impl<V> From<ArrayOperation<V>> for XlaOperation<V>
+impl<C> From<ArrayOperation<C::Projected>> for XlaOperation<C>
 where
-    V: Value<Type = ArrayType> + Slice + UpdateSlice + Reshape,
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    fn from(operation: ArrayOperation<V>) -> Self {
+    #[inline]
+    fn from(operation: ArrayOperation<C::Projected>) -> Self {
+        Self::Array(operation)
+    }
+}
+
+impl<C> From<ArrayProgramOperation<C::Projected>> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    fn from(operation: ArrayProgramOperation<C::Projected>) -> Self {
         match operation {
-            ArrayOperation::Zero(operation) => Self::Zero(operation),
-            ArrayOperation::ZeroLike(operation) => Self::ZeroLike(operation),
-            ArrayOperation::One(operation) => Self::One(operation),
-            ArrayOperation::OneLike(operation) => Self::OneLike(operation),
-            ArrayOperation::Constant(operation) => Self::Constant(operation),
-            ArrayOperation::ConvertElementType(operation) => Self::ConvertElementType(operation),
-            ArrayOperation::Iota(operation) => Self::Iota(operation),
-            ArrayOperation::CoordinateBasis(operation) => Self::CoordinateBasis(operation),
-            ArrayOperation::Neg(operation) => Self::Neg(operation),
-            ArrayOperation::Add(operation) => Self::Add(operation),
-            ArrayOperation::Sub(operation) => Self::Sub(operation),
-            ArrayOperation::Mul(operation) => Self::Mul(operation),
-            ArrayOperation::Div(operation) => Self::Div(operation),
-            ArrayOperation::Sin(operation) => Self::Sin(operation),
-            ArrayOperation::Cos(operation) => Self::Cos(operation),
-            ArrayOperation::Atan2(operation) => Self::Atan2(operation),
-            ArrayOperation::Exp(operation) => Self::Exp(operation),
-            ArrayOperation::Log(operation) => Self::Log(operation),
-            ArrayOperation::Sqrt(operation) => Self::Sqrt(operation),
-            ArrayOperation::Rsqrt(operation) => Self::Rsqrt(operation),
-            ArrayOperation::Tanh(operation) => Self::Tanh(operation),
-            ArrayOperation::Logistic(operation) => Self::Logistic(operation),
-            ArrayOperation::Erf(operation) => Self::Erf(operation),
-            ArrayOperation::Pow(operation) => Self::Pow(operation),
-            ArrayOperation::Sign(operation) => Self::Sign(operation),
-            ArrayOperation::Floor(operation) => Self::Floor(operation),
-            ArrayOperation::Ceil(operation) => Self::Ceil(operation),
-            ArrayOperation::Round(operation) => Self::Round(operation),
-            ArrayOperation::Max(operation) => Self::Max(operation),
-            ArrayOperation::Min(operation) => Self::Min(operation),
-            ArrayOperation::Rem(operation) => Self::Rem(operation),
-            ArrayOperation::Abs(operation) => Self::Abs(operation),
-            ArrayOperation::Complex(operation) => Self::Complex(operation),
-            ArrayOperation::Conjugate(operation) => Self::Conjugate(operation),
-            ArrayOperation::Real(operation) => Self::Real(operation),
-            ArrayOperation::Imaginary(operation) => Self::Imaginary(operation),
-            ArrayOperation::StopGradient(operation) => Self::StopGradient(operation),
-            ArrayOperation::Tag(operation) => Self::Tag(operation),
-            ArrayOperation::Print(operation) => Self::Print(operation),
-            ArrayOperation::CustomCall(operation) => Self::CustomCall(operation),
-            ArrayOperation::TransferToMemory(operation) => Self::TransferToMemory(operation),
-            ArrayOperation::Dot(operation) => Self::Dot(operation),
-            ArrayOperation::ScaledDot(operation) => Self::ScaledDot(operation),
-            ArrayOperation::DotProductAttention(operation) => Self::DotProductAttention(operation),
-            ArrayOperation::DotProductAttentionBackward(operation) => Self::DotProductAttentionBackward(operation),
-            ArrayOperation::Transpose(operation) => Self::Transpose(operation),
-            ArrayOperation::Reshape(operation) => Self::Reshape(operation),
-            ArrayOperation::Reshard(operation) => Self::Reshard(operation),
-            ArrayOperation::ShardingConstraint(operation) => Self::ShardingConstraint(operation),
-            ArrayOperation::Broadcast(operation) => Self::Broadcast(operation),
-            ArrayOperation::Slice(operation) => Self::Slice(operation),
-            ArrayOperation::UpdateSlice(operation) => Self::UpdateSlice(operation),
-            ArrayOperation::DynamicSlice(operation) => Self::DynamicSlice(operation),
-            ArrayOperation::DynamicUpdateSlice(operation) => Self::DynamicUpdateSlice(operation),
-            ArrayOperation::Pad(operation) => Self::Pad(operation),
-            ArrayOperation::Concatenate(operation) => Self::Concatenate(operation),
-            ArrayOperation::Gather(operation) => Self::Gather(operation),
-            ArrayOperation::Scatter(operation) => Self::Scatter(operation),
-            ArrayOperation::Reduce(operation) => Self::Reduce(operation),
-            ArrayOperation::Sort(operation) => Self::Sort(operation),
-            ArrayOperation::RngBitGenerator(operation) => Self::RngBitGenerator(operation),
-            ArrayOperation::Compare(operation) => Self::Compare(operation),
-            ArrayOperation::Not(operation) => Self::Not(operation),
-            ArrayOperation::And(operation) => Self::And(operation),
-            ArrayOperation::Or(operation) => Self::Or(operation),
-            ArrayOperation::Xor(operation) => Self::Xor(operation),
-            ArrayOperation::Collective(operation) => Self::Collective(operation),
-            ArrayOperation::AllGather(operation) => Self::AllGather(operation),
-            ArrayOperation::PSumScatter(operation) => Self::PSumScatter(operation),
-            ArrayOperation::Ppermute(operation) => Self::Ppermute(operation),
-            ArrayOperation::AllToAll(operation) => Self::AllToAll(operation),
-            ArrayOperation::AxisIndex(operation) => Self::AxisIndex(operation),
-            ArrayOperation::Select(operation) => Self::Select(operation),
-            ArrayOperation::Condition(operation) => XlaOperation::from(operation),
-            ArrayOperation::While(operation) => Self::While(operation),
-            ArrayOperation::Scan(operation) => Self::Scan(operation),
-            ArrayOperation::CustomJvp(operation) => Self::CustomJvp(operation),
-            ArrayOperation::CustomVjp(operation) => Self::CustomVjp(operation),
-            ArrayOperation::CustomVjpTangent(operation) => Self::CustomVjpTangent(operation),
-            ArrayOperation::Rematerialize(operation) => Self::Rematerialize(operation),
+            ArrayProgramOperation::Zero(operation) => Self::Zero(operation),
+            ArrayProgramOperation::DynamicZero(operation) => Self::DynamicZero(operation),
+            ArrayProgramOperation::DynamicOne(operation) => Self::DynamicOne(operation),
+            ArrayProgramOperation::DynamicIota(operation) => Self::DynamicIota(operation),
+            ArrayProgramOperation::Array(operation) => Self::Array(operation),
+            ArrayProgramOperation::Dimension(operation) => Self::Dimension(operation),
+            ArrayProgramOperation::Compare(operation) => Self::Compare(operation),
+            ArrayProgramOperation::DimensionSize(operation) => Self::DimensionSize(operation),
+            ArrayProgramOperation::DimensionFromScalar(operation) => Self::DimensionFromScalar(operation),
+            ArrayProgramOperation::DimensionToScalar(operation) => Self::DimensionToScalar(operation),
+            ArrayProgramOperation::Reshape(operation) => Self::Reshape(operation),
+            ArrayProgramOperation::Broadcast(operation) => Self::Broadcast(operation),
+            ArrayProgramOperation::Concatenate(operation) => Self::Concatenate(operation),
+            ArrayProgramOperation::CustomCall(operation) => Self::CustomCall(operation),
+            ArrayProgramOperation::Pad(operation) => Self::Pad(operation),
+            ArrayProgramOperation::RngBitGenerator(operation) => Self::RngBitGenerator(operation),
+            ArrayProgramOperation::AllGather(operation) => Self::AllGather(operation),
+            ArrayProgramOperation::PSumScatter(operation) => Self::PSumScatter(operation),
+            ArrayProgramOperation::AllToAll(operation) => Self::AllToAll(operation),
         }
+    }
+}
+
+impl<C> From<DimensionOperation<DimensionValue>> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: DimensionOperation<DimensionValue>) -> Self {
+        Self::Dimension(operation)
+    }
+}
+
+impl<C> From<JitCallOperation> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: JitCallOperation) -> Self {
+        Self::JitCall(operation)
+    }
+}
+
+impl<C> From<ConditionOperation<C>> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: ConditionOperation<C>) -> Self {
+        Self::Condition(operation)
+    }
+}
+
+impl<C> From<WhileOperation> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: WhileOperation) -> Self {
+        Self::While(operation)
+    }
+}
+
+impl<C> From<ScanOperation<C>> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: ScanOperation<C>) -> Self {
+        Self::Scan(operation)
+    }
+}
+
+impl<C> From<CustomJvpOperation> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: CustomJvpOperation) -> Self {
+        Self::CustomJvp(operation)
+    }
+}
+
+impl<C> From<CustomVjpOperation> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: CustomVjpOperation) -> Self {
+        Self::CustomVjp(operation)
+    }
+}
+
+impl<C> From<CustomVjpTangentOperation<ArrayProgramType>> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: CustomVjpTangentOperation<ArrayProgramType>) -> Self {
+        Self::CustomVjpTangent(operation)
+    }
+}
+
+impl<C> From<RematerializeOperation> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: RematerializeOperation) -> Self {
+        Self::Rematerialize(operation)
+    }
+}
+
+impl<C> From<ShardMapOperation<C>> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: ShardMapOperation<C>) -> Self {
+        Self::ShardMap(Box::new(operation))
+    }
+}
+
+macro_rules! impl_composite_operation_conversion {
+    // Generates direct composite-operation conversions through the canonical core operation family.
+    ($($operation:ty),+ $(,)?) => {
+        $(
+            impl<C> From<$operation> for XlaOperation<C>
+            where
+                C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+            {
+                #[inline]
+                fn from(operation: $operation) -> Self {
+                    ArrayProgramOperation::<C::Projected>::from(operation).into()
+                }
+            }
+        )+
+    };
+}
+
+impl_composite_operation_conversion!(
+    ZeroOperation<ArrayProgramType>,
+    ZeroOperation<ArrayType>,
+    OneOperation<ArrayType>,
+    IotaOperation<ArrayType>,
+    CompareOperation,
+    DimensionSizeOperation,
+    DimensionFromScalarOperation,
+    DimensionToScalarOperation,
+    ReshapeOperation,
+    BroadcastOperation,
+    ConcatenateOperation,
+    CustomCallOperation,
+    PadOperation,
+    RngBitGeneratorOperation,
+    AllGatherOperation,
+    PSumScatterOperation,
+    AllToAllOperation,
+);
+
+macro_rules! impl_array_operation_conversion {
+    // Generates homogeneous array-operation conversions through the canonical projected member family.
+    ($($operation:ty),+ $(,)?) => {
+        $(
+            impl<C> From<$operation> for XlaOperation<C>
+            where
+                C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+            {
+                #[inline]
+                fn from(operation: $operation) -> Self {
+                    ArrayOperation::<C::Projected>::from(operation).into()
+                }
+            }
+        )+
+    };
+}
+
+impl_array_operation_conversion!(
+    ZeroLikeOperation,
+    OneLikeOperation,
+    ConstantOperation<ReferenceArray>,
+    CoordinateBasisOperation<ArrayType>,
+    AbsOperation,
+    NegOperation,
+    AddOperation,
+    SubOperation,
+    MulOperation,
+    DivOperation,
+    SinOperation,
+    CosOperation,
+    Atan2Operation,
+    ExpOperation,
+    LogOperation,
+    SqrtOperation,
+    RsqrtOperation,
+    TanhOperation,
+    LogisticOperation,
+    ErfOperation,
+    PowOperation,
+    SignOperation,
+    FloorOperation,
+    CeilOperation,
+    RoundOperation,
+    MaxOperation,
+    MinOperation,
+    RemOperation,
+    NotOperation,
+    AndOperation,
+    OrOperation,
+    XorOperation,
+    ComplexOperation,
+    ConjugateOperation,
+    RealOperation,
+    ImaginaryOperation,
+    DotOperation,
+    ScaledDotOperation,
+    DotProductAttentionOperation,
+    DotProductAttentionBackwardOperation,
+    ReduceOperation,
+    SortOperation,
+    CollectiveOperation,
+    PpermuteOperation,
+    AxisIndexOperation,
+    TransposeOperation,
+    LegacyReshapeOperation,
+    LegacyBroadcastOperation,
+    GatherOperation,
+    ScatterOperation,
+    SliceOperation,
+    UpdateSliceOperation,
+    DynamicSliceOperation,
+    DynamicUpdateSliceOperation,
+    SelectOperation,
+    ConvertElementTypeOperation,
+    TransferToMemoryOperation,
+    ReshardOperation,
+    ShardingConstraintOperation,
+    StopGradientOperation,
+    TagOperation,
+    PrintOperation,
+);
+
+impl<C> OperationProjection<ArrayType> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    type Projected = ArrayOperation<C::Projected>;
+}
+
+impl<C> OperationProjection<DimensionType> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    type Projected = DimensionOperation<DimensionValue>;
+}
+
+impl<C> XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    /// Returns the canonical core operation for a member or mixed primitive, or `None` for an XLA-owned
+    /// higher-order operation.
+    pub(crate) fn to_core_operation(&self) -> Option<ArrayProgramOperation<C::Projected>> {
+        Some(match self {
+            Self::Zero(operation) => ArrayProgramOperation::Zero(operation.clone()),
+            Self::DynamicZero(operation) => ArrayProgramOperation::DynamicZero(operation.clone()),
+            Self::DynamicOne(operation) => ArrayProgramOperation::DynamicOne(operation.clone()),
+            Self::DynamicIota(operation) => ArrayProgramOperation::DynamicIota(operation.clone()),
+            Self::Array(operation) => ArrayProgramOperation::Array(operation.clone()),
+            Self::Dimension(operation) => ArrayProgramOperation::Dimension(operation.clone()),
+            Self::Compare(operation) => ArrayProgramOperation::Compare(operation.clone()),
+            Self::DimensionSize(operation) => ArrayProgramOperation::DimensionSize(operation.clone()),
+            Self::DimensionFromScalar(operation) => ArrayProgramOperation::DimensionFromScalar(operation.clone()),
+            Self::DimensionToScalar(operation) => ArrayProgramOperation::DimensionToScalar(*operation),
+            Self::Reshape(operation) => ArrayProgramOperation::Reshape(operation.clone()),
+            Self::Broadcast(operation) => ArrayProgramOperation::Broadcast(operation.clone()),
+            Self::Concatenate(operation) => ArrayProgramOperation::Concatenate(operation.clone()),
+            Self::CustomCall(operation) => ArrayProgramOperation::CustomCall(operation.clone()),
+            Self::Pad(operation) => ArrayProgramOperation::Pad(operation.clone()),
+            Self::RngBitGenerator(operation) => ArrayProgramOperation::RngBitGenerator(operation.clone()),
+            Self::AllGather(operation) => ArrayProgramOperation::AllGather(operation.clone()),
+            Self::PSumScatter(operation) => ArrayProgramOperation::PSumScatter(operation.clone()),
+            Self::AllToAll(operation) => ArrayProgramOperation::AllToAll(operation.clone()),
+            Self::Condition(_)
+            | Self::While(_)
+            | Self::Scan(_)
+            | Self::CustomJvp(_)
+            | Self::CustomVjp(_)
+            | Self::CustomVjpTangent(_)
+            | Self::Rematerialize(_)
+            | Self::JitCall(_)
+            | Self::ShardMap(_) => return None,
+        })
+    }
+}
+
+macro_rules! dispatch_higher_operation {
+    // Delegates one `Operation<ArrayProgramType>` method to the active XLA-owned higher-order payload.
+    ($operation:expr, $method:ident $(, $argument:expr)* $(,)?) => {
+        match $operation {
+            XlaOperation::Condition(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::While(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::Scan(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::CustomJvp(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::CustomVjp(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::CustomVjpTangent(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::Rematerialize(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::JitCall(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::ShardMap(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            _ => unreachable!("member and mixed operations are handled by the canonical core operation family"),
+        }
+    };
+}
+
+impl<C> Display for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<C> Operation<ArrayProgramType> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    fn name(&self) -> &'static str {
+        match self.to_core_operation() {
+            Some(operation) => operation.name(),
+            None => dispatch_higher_operation!(self, name),
+        }
+    }
+
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        match self.to_core_operation() {
+            Some(operation) => operation.region_slots(),
+            None => dispatch_higher_operation!(self, region_slots),
+        }
+    }
+
+    fn infer_region_input_types(
+        &self,
+        input_types: &[ArrayProgramType],
+        region_interfaces: &[RegionInterface<ArrayProgramType>],
+    ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
+        match self.to_core_operation() {
+            Some(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            None => dispatch_higher_operation!(self, infer_region_input_types, input_types, region_interfaces),
+        }
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayProgramType],
+        region_interfaces: &[RegionInterface<ArrayProgramType>],
+    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        match self.to_core_operation() {
+            Some(operation) => operation.infer_output_types(input_types, region_interfaces),
+            None => dispatch_higher_operation!(self, infer_output_types, input_types, region_interfaces),
+        }
+    }
+
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        match self.to_core_operation() {
+            Some(operation) => operation.output_region_provenance(output_index),
+            None => dispatch_higher_operation!(self, output_region_provenance, output_index),
+        }
+    }
+
+    fn is_zero(&self, output_index: usize) -> bool {
+        match self.to_core_operation() {
+            Some(operation) => operation.is_zero(output_index),
+            None => dispatch_higher_operation!(self, is_zero, output_index),
+        }
+    }
+
+    fn effects(&self) -> Effects {
+        match self.to_core_operation() {
+            Some(operation) => operation.effects(),
+            None => dispatch_higher_operation!(self, effects),
+        }
+    }
+
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
+        if let Some(operation) = self.to_core_operation() {
+            return Ok(operation.rename_type_identities(renaming)?.into());
+        }
+        match self {
+            Self::Condition(operation) => {
+                Ok(Self::Condition(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            Self::While(operation) => {
+                Ok(Self::While(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            Self::Scan(operation) => {
+                Ok(Self::Scan(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            Self::CustomJvp(operation) => {
+                Ok(Self::CustomJvp(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            Self::CustomVjp(operation) => {
+                Ok(Self::CustomVjp(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            Self::CustomVjpTangent(operation) => {
+                Ok(Self::CustomVjpTangent(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            Self::Rematerialize(operation) => {
+                Ok(Self::Rematerialize(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            Self::JitCall(operation) => {
+                Ok(Self::JitCall(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            Self::ShardMap(operation) => {
+                Ok(Self::ShardMap(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            }
+            _ => unreachable!("member and mixed operations are handled by the canonical core operation family"),
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self.to_core_operation() {
+            Some(operation) => operation.render(formatter, indentation),
+            None => dispatch_higher_operation!(self, render, formatter, indentation),
+        }
+    }
+}
+
+impl<Constant, C> PartiallyEvaluatableOperation<C> for XlaOperation<Constant>
+where
+    Constant: PartialEq
+        + Value<Type = ArrayProgramType>
+        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + Concretizable<bool>,
+    C: Context<Type = ArrayProgramType, Constant = Constant, Operation = XlaOperation<Constant>>,
+    ArrayProgramOperation<Constant::Projected>: PartiallyEvaluatableOperation<C>,
+{
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        if let Some(operation) = self.to_core_operation() {
+            return operation.partially_evaluate(context, driver, inputs);
+        }
+        match self {
+            Self::JitCall(operation) => operation.partially_evaluate(context, driver, inputs),
+            Self::ShardMap(operation) => operation.partially_evaluate(context, driver, inputs),
+            _ => context.fold_or_residualize(
+                self.clone(),
+                driver.regions().map(|region| region.to_program()).collect(),
+                inputs,
+            ),
+        }
+    }
+}
+
+impl<Constant, C> DifferentiableOperation<C> for XlaOperation<Constant>
+where
+    Constant: PartialEq
+        + Value<Type = ArrayProgramType>
+        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + Concretizable<bool>,
+    C: Context<Type = ArrayProgramType, Constant = Constant, Operation = XlaOperation<Constant>> + Zero<C::Value>,
+    ArrayProgramOperation<Constant::Projected>: DifferentiableOperation<C>,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        if let Some(operation) = self.to_core_operation() {
+            return operation.jvp(context, driver, inputs);
+        }
+        match self {
+            Self::JitCall(operation) => operation.jvp(context, driver, inputs),
+            Self::ShardMap(operation) => operation.jvp(context, driver, inputs),
+            _ => Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "differentiation of composite XLA region operation '{}' requires Phase 6 composite-region support",
+                    self.name(),
+                ),
+            }
+            .into()),
+        }
+    }
+}
+
+impl<V> TransposableOperation<V, XlaOperation<V>> for XlaOperation<V>
+where
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    ArrayProgramOperation<V::Projected>: TransposableOperation<V, XlaOperation<V>>,
+{
+    fn transpose<D: TranspositionDriver<V, XlaOperation<V>>>(
+        &self,
+        context: &mut TracingContext<V, XlaOperation<V>>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
+        if let Some(operation) = self.to_core_operation() {
+            return operation.transpose(context, driver, inputs, outputs);
+        }
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "transposition of composite XLA region operation '{}' requires Phase 6 composite-region support",
+                self.name(),
+            ),
+        }
+        .into())
     }
 }
 
@@ -386,8 +832,11 @@ impl<T: Type> Operation<T> for JitCallOperation {
 /// residual `jit_call` over the surviving unknown call inputs plus the known-side call's residual-edge outputs.
 impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation
 where
-    V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>,
-    C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
+    V: PartialEq
+        + Value<Type = ArrayProgramType>
+        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + Concretizable<bool>,
+    C: Context<Type = ArrayProgramType, Constant = V, Operation = XlaOperation<V>>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -513,8 +962,11 @@ where
 ///   - `inputs`: Primal and tangent values for the call operands.
 impl<C, V> DifferentiableOperation<C> for JitCallOperation
 where
-    C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
-    V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>,
+    C: Context<Type = ArrayProgramType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
+    V: PartialEq
+        + Value<Type = ArrayProgramType>
+        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + Concretizable<bool>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -610,7 +1062,10 @@ where
 ///     [`Unknown`](PartialValue::Unknown) entries are the input tangents; the [`Known`](PartialValue::Known) entries
 ///     carry the residual and captured-constant-tangent tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the tangent call's outputs.
-pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDriver<V, XlaOperation<V>>>(
+pub fn transpose_primal_jit_call<
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    D: TranspositionDriver<V, XlaOperation<V>>,
+>(
     _operation: &JitCallOperation,
     context: &mut TracingContext<V, XlaOperation<V>>,
     driver: &D,
@@ -681,7 +1136,10 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDri
 /// transposition happens on the concretely [`XlaConstant`]-keyed [`FlatXlaProgram`], so the recursion is resolved once
 /// at definition time and instantiating this implementation introduces no recursive [`TransposableOperation`]
 /// obligation on [`XlaOperation`].
-impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for JitCallOperation {
+impl<V> TransposableOperation<V, XlaOperation<V>> for JitCallOperation
+where
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
     fn transpose<D: TranspositionDriver<V, XlaOperation<V>>>(
         &self,
         context: &mut TracingContext<V, XlaOperation<V>>,
@@ -697,6 +1155,7 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for J
 mod tests {
     use std::rc::Rc;
 
+    use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};
     use ryft_core::operations::math::{AddOperation, MulOperation};
@@ -715,7 +1174,8 @@ mod tests {
     };
 
     use super::{
-        JitCallOperation, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder, transpose_primal_jit_call,
+        JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder,
+        transpose_primal_jit_call,
     };
 
     /// Test-only driver that exposes one source callee and returns a predetermined transpose for it.
@@ -787,7 +1247,8 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let expected = tangent_type.cotangent();
+        let expected = ArrayProgramType::Array(tangent_type.cotangent());
+        let tangent_type = ArrayProgramType::Array(tangent_type);
         let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
         let cotangents = transpose_primal_jit_call(
             &JitCallOperation::new(),
@@ -815,10 +1276,12 @@ mod tests {
     fn test_jit_call_mixed_output_transpose_materializes_zero_space_values() {
         let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]));
+        let value_program_type = ArrayProgramType::Array(value_type.clone());
+        let predicate_program_type = ArrayProgramType::Array(predicate_type.clone());
         let source = {
             let mut builder = XlaProgramBuilder::new();
-            let value = builder.add_input(value_type.clone());
-            let predicate = builder.add_constant(XlaConstant::new(0, predicate_type.clone()));
+            let value = builder.add_input(value_program_type.clone());
+            let predicate = builder.add_constant(XlaConstant::new(0, predicate_program_type.clone()));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![value, predicate],
@@ -829,8 +1292,8 @@ mod tests {
         };
         let transposed = {
             let mut builder = XlaProgramBuilder::new();
-            let value_cotangent = builder.add_input(value_type.clone());
-            let _predicate_cotangent = builder.add_input(predicate_type.cotangent());
+            let value_cotangent = builder.add_input(value_program_type.clone());
+            let _predicate_cotangent = builder.add_input(ArrayProgramType::Array(predicate_type.cotangent()));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![value_cotangent],
@@ -841,18 +1304,20 @@ mod tests {
         };
         let driver = TestTranspositionDriver { source, transposed };
         let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
-        let value_cotangent = context.input(value_type.clone());
+        let value_cotangent = context.input(value_program_type.clone());
 
         let contributions = transpose_primal_jit_call(
             &JitCallOperation::new(),
             &mut context,
             &driver,
-            &[PartialValue::Unknown(value_type.clone())],
-            &[MaybeZero::Value(value_cotangent), MaybeZero::Zero(predicate_type.cotangent())],
+            &[PartialValue::Unknown(value_program_type.clone())],
+            &[MaybeZero::Value(value_cotangent), MaybeZero::Zero(ArrayProgramType::Array(predicate_type.cotangent()))],
         )
         .unwrap();
 
-        assert!(matches!(&contributions[..], [MaybeZero::Value(value)] if value.r#type().as_ref() == &value_type));
+        assert!(
+            matches!(&contributions[..], [MaybeZero::Value(value)] if value.r#type().as_ref() == &value_program_type)
+        );
     }
 
     /// Online partial evaluation of a mixed `jit_call` against a live outer trace — the second recorded consumer of
@@ -866,7 +1331,7 @@ mod tests {
         use ryft_core::partial::{PartialEvaluationInput, PartialEvaluationOutput};
         use ryft_core::tracing::TracingContext;
 
-        let r#type = vector_type();
+        let r#type = ArrayProgramType::Array(vector_type());
 
         // Callee `f(a, x) = (a + c, x * c, (a + c) * x)` over a known `a`, an unknown `x`, and a literal `c`.
         let callee = {
@@ -920,7 +1385,7 @@ mod tests {
             assert_eq!(known_callee.input_ids().len(), 1);
             assert_eq!(known_callee.output_ids().len(), 2);
             assert_eq!(known_callee.instructions().len(), 1);
-            assert!(matches!(known_callee.instructions()[0].operation(), XlaOperation::Add(_)));
+            assert!(matches!(known_callee.instructions()[0].operation(), XlaOperation::Array(ArrayOperation::Add(_)),));
             assert!(known_callee.atoms().iter().any(|atom| atom.is_constant()));
         }
 
@@ -958,9 +1423,9 @@ mod tests {
 
         // The built-in rematerialization policies — including the projection-bounded dot and tag policies and the
         // transfer-bounded offloading policies — are available for `XlaOperation` through the derive-generated
-        // variant projections and its `TransferToMemoryOperation` conversion. This is a compile-time capability
+        // array projection and its `TransferToMemoryOperation` conversion. This is a compile-time capability
         // check: the assertions below fail to compile if any projection or conversion bound is unsatisfied.
-        fn assert_policy<P: RematerializationPolicy<ArrayType, XlaOperation>>(_policy: P) {}
+        fn assert_policy<P: RematerializationPolicy<ArrayType, ArrayOperation<XlaArrayConstant>>>(_policy: P) {}
         assert_policy(NothingSaveable);
         assert_policy(EverythingSaveable);
         assert_policy(DotsSaveable);

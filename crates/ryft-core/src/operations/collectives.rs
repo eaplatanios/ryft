@@ -5,7 +5,7 @@
 //! `jax.lax.pmean`, and `jax.lax.pmax`.
 //!
 //! Collectives reference an enclosing named-axis binder by name, validated against the active
-//! [`NamedAxes`](crate::axes::NamedAxes) environment at staging time. A name bound by an enclosing `batch` level is
+//! [`NamedAxes`] environment at staging time. A name bound by an enclosing `batch` level is
 //! resolved at trace time by the operations' batching rules, which collapse or materialize the mapped batch axis at
 //! the binding level, while a name bound to a device mesh axis by a `shard_map` manual region stays in the staged
 //! body and lowers to cross-device collectives over that mesh axis.
@@ -33,7 +33,7 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::ValueProjection;
+use crate::programs::values::{ProjectedValue, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::ShardingDimension;
 use crate::tracing::{Tracer, TracingContext};
@@ -1691,6 +1691,24 @@ where
     }
 }
 
+impl<V> AllGather for ProjectedValue<ArrayType, V>
+where
+    V: AllGather + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+{
+    fn all_gather_with_options(
+        &self,
+        axis_name: &str,
+        concat_axis: usize,
+        options: CollectiveOptions,
+        output_variance: AllGatherOutputVariance,
+    ) -> Result<Self, ProgramError> {
+        self.value()
+            .all_gather_with_options(axis_name, concat_axis, options, output_variance)?
+            .into_projected()
+            .map_err(Into::into)
+    }
+}
+
 /// Stages a sum-scatter with first-class dynamic tiled extents and rank-changing untiled semantics.
 pub trait PSumScatter: Sized {
     /// Sums participants and consumes `scatter_axis`, whose extent must equal the effective participant count.
@@ -1742,6 +1760,23 @@ where
             }
         };
         Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
+    }
+}
+
+impl<V> PSumScatter for ProjectedValue<ArrayType, V>
+where
+    V: PSumScatter + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+{
+    fn psum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        self.value()
+            .psum_scatter_with_options(axis_name, scatter_axis, options)?
+            .into_projected()
+            .map_err(Into::into)
     }
 }
 
@@ -1802,6 +1837,24 @@ where
             ],
         };
         Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
+    }
+}
+
+impl<V> AllToAll for ProjectedValue<ArrayType, V>
+where
+    V: AllToAll + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+{
+    fn all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        split_axis: usize,
+        concat_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        self.value()
+            .all_to_all_with_options(axis_name, split_axis, concat_axis, options)?
+            .into_projected()
+            .map_err(Into::into)
     }
 }
 
