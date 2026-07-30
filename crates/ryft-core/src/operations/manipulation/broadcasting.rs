@@ -24,7 +24,7 @@ use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::values::Value;
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
 
@@ -909,7 +909,7 @@ pub trait Broadcast: Value<Type = ArrayProgramType> + DimensionSize + Sized {
     fn broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
         Self::DispatchDomain: Context<Type = ArrayProgramType>,
-        <Self::DispatchDomain as Domain>::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
+        <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     {
         let r#type = self.r#type();
         let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
@@ -917,7 +917,7 @@ pub trait Broadcast: Value<Type = ArrayProgramType> + DimensionSize + Sized {
         output_dimensions.extend_from_slice(leading_dimensions);
         for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
             output_dimensions.push(match dimension {
-                Dimension::Static(extent) => lift_exact_broadcast_dimension(self, *extent)?,
+                Dimension::Static(extent) => self.dispatch_domain().lift(DimensionValue::constant(*extent)?.into())?,
                 Dimension::Dynamic(_) => self.dimension_size(axis)?,
             });
         }
@@ -929,11 +929,11 @@ pub trait Broadcast: Value<Type = ArrayProgramType> + DimensionSize + Sized {
     fn broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
         Self::DispatchDomain: Context<Type = ArrayProgramType>,
-        <Self::DispatchDomain as Domain>::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
+        <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     {
         let output_dimensions = output_sizes
             .iter()
-            .map(|extent| lift_exact_broadcast_dimension(self, *extent))
+            .map(|extent| self.dispatch_domain().lift(DimensionValue::constant(*extent)?.into()))
             .collect::<Result<Vec<_>, _>>()?;
         self.broadcast_to(output_dimensions.as_slice())
     }
@@ -942,29 +942,15 @@ pub trait Broadcast: Value<Type = ArrayProgramType> + DimensionSize + Sized {
     fn broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
     where
         Self::DispatchDomain: Context<Type = ArrayProgramType>,
-        <Self::DispatchDomain as Domain>::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
+        <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     {
+        let context = self.dispatch_domain();
         let leading_dimensions = leading_sizes
             .iter()
-            .map(|extent| lift_exact_broadcast_dimension(self, *extent))
+            .map(|extent| context.lift(DimensionValue::constant(*extent)?.into()))
             .collect::<Result<Vec<_>, _>>()?;
         self.broadcast_leading(leading_dimensions.as_slice())
     }
-}
-
-/// Lifts one exact output extent into the composite context used by `value`.
-fn lift_exact_broadcast_dimension<V: Value<Type = ArrayProgramType>>(
-    value: &V,
-    extent: usize,
-) -> Result<V, ProgramError>
-where
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
-    <V::DispatchDomain as Domain>::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
-{
-    let dimension = DimensionValue::constant(extent).map_err(ProgramError::from)?;
-    let constant =
-        <<V::DispatchDomain as Domain>::Constant as ValueProjection<DimensionType>>::from_projected(dimension);
-    value.dispatch_domain().lift(constant)
 }
 
 impl<
@@ -977,7 +963,7 @@ impl<
         >,
 > Broadcast for V
 where
-    <V::DispatchDomain as Domain>::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
+    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
 {
     #[inline]
     fn broadcast_with_output_sharding(

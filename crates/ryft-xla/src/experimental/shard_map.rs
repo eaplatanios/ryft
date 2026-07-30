@@ -4070,7 +4070,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_all_gather_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::AllGather;
+        use ryft_core::operations::collectives::LegacyAllGather;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4180,7 +4180,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_psum_scatter_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::PSumScatter;
+        use ryft_core::operations::collectives::LegacyPSumScatter;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4404,7 +4404,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_all_to_all_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::AllToAll;
+        use ryft_core::operations::collectives::LegacyAllToAll;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4516,7 +4516,7 @@ mod tests {
     #[test]
     fn test_shard_map_all_gather_gradient_transposes_to_psum_scatter() {
         use ryft_core::differentiation::LinearizationTracer;
-        use ryft_core::operations::collectives::AllGather;
+        use ryft_core::operations::collectives::LegacyAllGather;
         use ryft_core::operations::math::{Reduce, ReductionKind};
 
         // Reverse mode wraps the shard_map staging context in a linearization trace, so the values flowing through

@@ -2,13 +2,15 @@
 
 ## Status
 
-Active; repository state was re-audited on 2026-07-28 after the original side-chat history was lost. Phases 0–2,
-P3a–P3i, and the corrected P3j dynamic-zero slice are committed on `u/eaplatanios/dynamic-shapes` at
-`6d47d6996209b99a512f18471bc441e65c1d722b`. The owner checkout now contains the complete unstaged P3j dynamic-one
-review unit plus this plan revision. It adds the canonical explicit-extent `DynamicOne` contract, shares only the
-constructor mechanisms that are genuinely identical to dynamic zero, and closes eager, tracing, PE, batching,
-differentiation, transposition, import, direct StableHLO, and CPU execution coverage. `Fill` and `Iota` remain separate
-review units. Phase 4 has not begun as a complete migration.
+Active; repository state was re-audited on 2026-07-29 after the original side-chat history was lost. Phases 0–2,
+P3a–P3j, and the public broadcast consolidation are committed on `u/eaplatanios/dynamic-shapes`; the clean resumption
+point for the current review was `0278adba4617a89fcf9db88c7c27836b3e39d845`. The owner checkout now contains P3k's
+canonical tiled collective slice: all-gather, psum-scatter, and all-to-all carry arithmetic result extents as ordinary
+dimension SSA through mixed inference, eager execution, PE, static matching-axis batching, JVP, identity instantiation,
+import, and rendering. Matching-axis batching is currently complete for static per-item geometry; bounded-dynamic
+physical reshapes and nested-axis forwarding remain Phase 5. Native shard-map lowering and dynamic adjoints remain
+deliberately assigned to Phases 4 and 6. The JAX-parity continuation (non-tiled modes, groups, variance, and convenience
+compositions) remains part of P3k and is not yet complete. Phase 4 has not begun as a complete migration.
 
 This plan remains a containment and simplification follow-up to `.tasks/plan_first_class_dimension_programs.md`. It
 preserves that plan's user-visible capabilities and its decision to represent runtime dimensions as ordinary SSA
@@ -1246,6 +1248,17 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       different: JAX defines it as conversion plus broadcast, so rank-positive static and dynamic fill reuse the
       canonical constant and broadcast operations and their transforms. All three slices must be complete before the
       Phase 3 gate.
+- [x] P3k canonical tiled collectives: retain the existing all-gather, psum-scatter, and all-to-all payloads on one
+      homogeneous semantic contract while giving their flat composite variants positional result-extent operands.
+      Public composite capabilities derive those operands with `dimension_size` and ordinary checked dimension
+      arithmetic. Mixed inference, eager execution, PE, static matching-axis batching, JVP, identity instantiation,
+      import, rendering, and exact Phase 4/5/6 boundaries are recorded in
+      `.tasks/plan_p3k_collective_dimensions.md`.
+- [ ] P3k full JAX collective parity: add non-tiled rank-changing modes, validated `axis_index_groups`, the
+      all-gather variance policy if the canonical sharding model can represent it, and `pshuffle`/`pswapaxes` as
+      compositions. Complete this alongside Phase 4 shard-map migration so the composite graph, group-aware native
+      StableHLO lowering, and multi-device fixtures land as one vertical slice rather than adding another temporary
+      homogeneous API.
 - [ ] Route transform-generated zero/one values through structural zero or `zero_like`/`one_like` whenever an operand
       supplies geometry.
 - [ ] Migrate transform consumers that stage `ZeroOperation<ArrayType>` with possibly-dynamic types (condition, scan,
@@ -2535,3 +2548,28 @@ Final verification passed 1,002 core unit tests, 410 runnable XLA unit tests (on
 macro integration tests, and 58 runnable core doctests (16 ignored examples), plus formatting and diff checks. Exact
 implementation and review records are in `.tasks/plan_p3j_dynamic_fill.md` and
 `.tasks/plan_p3j_dynamic_iota.md`.
+
+### Execution: P3k canonical tiled collectives
+
+P3k's first review unit moves the arithmetic result geometry of tiled all-gather, psum-scatter, and all-to-all into
+ordinary dimension SSA without duplicating their semantic operation payloads. The payloads remain homogeneous
+`Operation<ArrayType>` implementations; the flat `ArrayProgramOperation` variant arms own the mixed positional
+contracts. Changed axes come exclusively from trailing dimension operands, unchanged axes retain their input
+identities, and exact extents are checked against participant-count multiplication or division during inference.
+
+The public composite capabilities trace `dimension_size`, lift one exact participant-count constant, apply ordinary
+dimension multiplication or checked division, and bind the collective against the resulting atom. Eager execution
+validates observed geometry and supports only the binder-free one-participant identity. PE folds or residualizes the
+same explicit graph. JVP gives primal and live tangent collectives the same extent SSA. Matching-axis composite
+batching reuses the established homogeneous materializations for static per-item geometry after rejecting mapped
+dimension authority. Bounded-dynamic reshapes and nested-axis forwarding remain Phase 5. Dynamic transpose retains one
+exact Phase 6 residual error rather than rebuilding geometry from types.
+
+A golden trace proves `dimension_size -> dimension_mul -> all_gather` survives rendering, alpha-renaming,
+instantiation, and import as ordinary operand edges. The residual audit finds no result extent, identity, bound,
+witness, or transform-residual metadata in any collective payload and no payload with dual operation-type contracts.
+The direct composite XLA dispatcher deliberately reports that these operations require Phase 4 shard-map region
+lowering: only that region owns the mesh-axis-to-replica-group state needed for correct native collectives.
+
+The complete implementation ledger and remaining JAX-parity continuation are in
+`.tasks/plan_p3k_collective_dimensions.md`.

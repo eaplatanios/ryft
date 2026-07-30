@@ -688,6 +688,14 @@ where
             }
             lower_rng_bit_generator_to_mlir(operation, input_values, block, context, location)
         }
+        ArrayProgramOperation::AllGather(_)
+        | ArrayProgramOperation::PSumScatter(_)
+        | ArrayProgramOperation::AllToAll(_) => Err(LoweringError::UnsupportedOp {
+            op: format!(
+                "{} with explicit result extents requires Phase 4 composite shard-map region lowering",
+                operation.name(),
+            ),
+        }),
     }
 }
 
