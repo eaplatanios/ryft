@@ -14,7 +14,7 @@ use std::fmt::{Debug, Display};
 use ryft_macros::Parameter;
 
 use crate::batching::{BatchableOperation, BatchingContext};
-use crate::contexts::{Context, EagerContext};
+use crate::contexts::{Context, EagerContext, ProjectedContext};
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
@@ -26,7 +26,7 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::programs::Program;
 use crate::programs::regions::RegionArena;
 use crate::programs::types::{Type, TypeError, Typed};
@@ -158,6 +158,24 @@ pub trait CapturingContext: Context {
     /// Appends `value` to the current captures table of this [`CapturingContext`] and returns the constant payload
     /// that refers to it.
     fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError>;
+}
+
+impl<C: CapturingContext, T: Type> CapturingContext for ProjectedContext<C, T>
+where
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Operation: OperationProjection<T>,
+    C::Capture: ValueProjection<T, Projected: Value<Type = T>>,
+{
+    type Capture = <C::Capture as ValueProjection<T>>::Projected;
+
+    #[inline]
+    fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
+        self.parent()
+            .capture(<C::Capture as ValueProjection<T>>::from_projected(value))?
+            .into_projected()
+            .map_err(Into::into)
+    }
 }
 
 impl<T: Type, O: Operation<T>, C: Value<Type = T>> CapturingContext for TracingContext<CaptureReference<T>, O, C> {
@@ -495,6 +513,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::interpretation::InterpretableOperation;
@@ -553,6 +573,29 @@ mod tests {
         assert_eq!(
             <CaptureReference<ArrayProgramType> as ValueProjection<DimensionType>>::projected(&lifted),
             Err(TypeError::invalid("expected dimension type but got array type")),
+        );
+    }
+
+    #[test]
+    fn test_projected_context_capture_delegates_to_parent_capture_table() {
+        let parent = TracingContext::<
+            CaptureReference<ArrayProgramType>,
+            ArrayProgramOperation<Array>,
+            ArrayProgramValue<Array>,
+        >::new();
+        let array_context = ProjectedContext::<_, ArrayType>::new(parent.clone());
+        let array = Array::scalar(3.0_f32);
+        let array_reference = array_context.capture(array.clone()).unwrap();
+        assert_eq!(array_reference.index(), 0);
+        assert_eq!(array_reference.r#type(), array.r#type());
+        let dimension_context = ProjectedContext::<_, DimensionType>::new(parent.clone());
+        let dimension = crate::DimensionValue::constant(7).unwrap();
+        let dimension_reference = dimension_context.capture(dimension.clone()).unwrap();
+        assert_eq!(dimension_reference.index(), 1);
+        assert_eq!(dimension_reference.r#type().as_ref(), dimension.r#type());
+        assert_eq!(
+            parent.captures().borrow().as_slice(),
+            &[ArrayProgramValue::Array(array), ArrayProgramValue::Dimension(dimension),],
         );
     }
 

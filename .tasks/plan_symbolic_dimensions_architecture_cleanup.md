@@ -1343,6 +1343,10 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       migrate array-member payload, lowering, and fixture uses while keeping `XlaConstant` as the temporary production
       alias. This compile-safe naming boundary prevents the atomic composite constant flip from retyping homogeneous
       array payloads accidentally.
+- [x] P4b3 projected capture delegation: make `ProjectedContext` register member runtime values in its composite
+      parent's capture table exactly once and project the returned constant. Keep generic projected binding region-free;
+      lift complete owned public bodies once before constructing direct composite higher-order drivers during the
+      atomic P4b cutover so replay sharing and callee identity remain native.
 - [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
       the unrelated `ReshapeParameters`/`ReshapeOperation` permutation builder and carry no ambient extent state.
 - [x] `with_source_array` no longer exists.
@@ -2685,3 +2689,15 @@ preserve current behavior and exact deferred diagnostics.
 
 `cargo check -p ryft-xla --lib` passed without warnings. The complete XLA library suite passed 417 tests with one
 timing-sensitive benchmark ignored; formatting and diff hygiene passed.
+
+### Execution: P4b3 projected capture delegation
+
+The region-driver audit established that generic driver unprojection is neither lossless nor minimal. Per-root
+materialization would discard `ReplayRegionDriver`'s cross-application mappings and `CalleeRegionDriver`'s `Rc`
+identity, while a generic cache spanning different value/operation families would add disproportionate machinery.
+The atomic P4b cutover will instead lift complete owned public bodies once into ordinary composite drivers and keep
+all subsequent replay natively composite. This review unit therefore leaves `ProjectedContext`'s region rejection in
+place and adds only the independent capture-delegation prerequisite. One regression captures array and dimension
+members through projected views of the same parent and verifies their ordered indices, exact projected types, and
+single shared parent table. The core suite passed 1,016 tests; the XLA suite passed 417 tests with one ignored
+timing-sensitive benchmark; `cargo check -p ryft-xla --lib`, formatting, and diff hygiene passed.
