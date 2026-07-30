@@ -1154,6 +1154,7 @@ pub struct OutputRegionProvenance {
 mod tests {
     use std::borrow::Cow;
     use std::fmt::Display;
+    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
@@ -1175,23 +1176,41 @@ mod tests {
     type TestProgram = Program<Scalar, TestRegionOperation, Vec<Scalar>, Vec<Scalar>>;
 
     /// Nominal identity used by the structural closure prototype.
-    #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
-    struct StructuralIdentity(&'static str);
+    #[derive(Clone, Debug, Parameter)]
+    struct StructuralIdentity {
+        /// Diagnostic name.
+        name: &'static str,
+
+        /// Nominal identity token.
+        token: Arc<()>,
+    }
 
     impl StructuralIdentity {
         /// Creates a structural test identity.
         fn new(name: &'static str) -> Self {
-            Self(name)
+            Self { name, token: Arc::new(()) }
         }
     }
 
     impl Display for StructuralIdentity {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(self.0)
+            formatter.write_str(self.name)
         }
     }
 
-    impl TypeIdentity for StructuralIdentity {}
+    impl PartialEq for StructuralIdentity {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.token, &other.token)
+        }
+    }
+
+    impl Eq for StructuralIdentity {}
+
+    impl TypeIdentity for StructuralIdentity {
+        fn fresh(&self) -> Self {
+            Self::new(self.name)
+        }
+    }
 
     /// Test type that exposes definition and reference occurrences independently.
     #[derive(Clone, Debug, PartialEq, Eq, Parameter)]

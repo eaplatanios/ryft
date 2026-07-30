@@ -255,7 +255,12 @@ impl Hash for DimensionVariable {
     }
 }
 
-impl TypeIdentity for DimensionVariable {}
+impl TypeIdentity for DimensionVariable {
+    #[inline]
+    fn fresh(&self) -> Self {
+        Self::new(self.name(), self.bounds())
+    }
+}
 
 /// [`Type`] of a [`DimensionValue`](crate::DimensionValue). A value with this type defines `variable` as an ordinary
 /// Single Static Assignment (SSA) value. Array axes may refer to that same [`DimensionVariable`], while arithmetic

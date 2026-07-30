@@ -415,7 +415,8 @@ mod tests {
         let ArrayProgramOperation::DimensionFromScalar(relocated_operation) = relocated_instruction.operation() else {
             panic!("expected a relocated dimension-from-scalar operation");
         };
-        assert_eq!(relocated_operation.result_type().variable(), &variable);
+        assert_ne!(relocated_operation.result_type().variable(), &variable);
+        assert_eq!(relocated_operation.result_type().variable().name(), variable.name());
         assert_eq!(relocated_operation.result_type().bounds(), bounds);
 
         let projected_context = TestContext::new();

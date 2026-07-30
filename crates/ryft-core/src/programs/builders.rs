@@ -7,6 +7,7 @@ use crate::macros::check_count;
 use crate::parameters::{Parameter, Parameterized};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
+use crate::programs::identities::{TypeIdentity, TypeIdentityRenaming};
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
@@ -191,10 +192,12 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
 
     /// Splices the provided [`Program`]'s [`Instruction`]s and live constants into this [`ProgramBuilder`], remapping
     /// its inputs to the caller-provided `inputs` and returning the builder atoms holding the program's outputs, in
-    /// output order. This is a plain relocation and not a re-interpretation or partial evaluation. Every instruction
-    /// and live constant of the provided program is rebuilt verbatim into this builder. It is, for example,
-    /// the reconciliation primitive an unknown-predicate `condition` uses to graft each branch's residual program
-    /// into the reconciled branch it emits during partial evaluation.
+    /// output order. This is a structural relocation and not a re-interpretation or partial evaluation. Boundary
+    /// identities are instantiated from the caller-provided input types, and [`TypeIdentity`]s defined inside the
+    /// source graph are given _fresh_ names (i.e., using [`TypeIdentity::fresh`]) for each splice. Every instruction
+    /// and live constant is otherwise rebuilt verbatim. This is, for example, the reconciliation primitive an
+    /// unknown-predicate `condition` uses to graft each branch's residual [`Program`] into the reconciled branch
+    /// it emits during partial evaluation.
     #[inline]
     pub fn splice_program<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
@@ -204,6 +207,37 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     where
         O: Clone,
     {
+        let input_types = inputs
+            .iter()
+            .map(|input| {
+                self.atoms
+                    .get(input.index())
+                    .map(|atom| atom.r#type().into_owned())
+                    .ok_or(ProgramError::UnboundAtomId { id: *input })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let program = program.with_instantiated_type_identities(input_types.as_slice())?;
+        let mut renaming = TypeIdentityRenaming::new();
+        for region_index in 0..program.regions().len() {
+            let signature = program
+                .regions()
+                .type_identity_signature(RegionId::new(region_index))
+                .expect("iterating a region arena by index must produce valid region identifiers");
+            for identity in signature.internal_identities() {
+                if renaming.replacements().iter().any(|(source, _)| source == identity) {
+                    continue;
+                }
+                renaming.insert(identity.clone(), identity.fresh())?;
+            }
+        }
+        let renamed;
+        let program = if renaming.is_identity() {
+            program.as_ref()
+        } else {
+            renamed = program.rename_type_identities(&renaming)?;
+            &renamed
+        };
+
         // The two closures below never run concurrently, but both need `&mut` access to this builder. A `RefCell` lets
         // each take a short-lived mutable borrow without the borrow checker conservatively rejecting the second one.
         // Regions referenced by the relocated instructions are imported through one call-scoped remapping so that a

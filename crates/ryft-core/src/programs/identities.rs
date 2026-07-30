@@ -6,7 +6,12 @@ use crate::programs::types::TypeError;
 /// that repeated metadata occurrences denote the same unknown runtime quantity. It is distinct from a Single Static
 /// Assignment (SSA) atom identity in that types retain it before any value-producing instruction exists, while
 /// [`Region`](crate::Region) closure determines where the identity becomes available in the program graph.
-pub trait TypeIdentity: Clone + Debug + Display + PartialEq + Eq {}
+pub trait TypeIdentity: Clone + Debug + Display + PartialEq + Eq {
+    /// Returns a fresh [`TypeIdentity`] with the same user-facing metadata as `self`. [`Program`](crate::Program)
+    /// relocation uses this function to rename [`TypeIdentity`]s defined inside an imported graph while preserving
+    /// their metadata. The returned [`TypeIdentity`] must compare unequal to every existing identity, including `self`.
+    fn fresh(&self) -> Self;
+}
 
 /// [`TypeIdentity`] used by [`Type`](crate::Type) families that carry no identity-bearing metadata.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -20,7 +25,14 @@ impl Display for NoIdentity {
     }
 }
 
-impl TypeIdentity for NoIdentity {}
+impl TypeIdentity for NoIdentity {
+    #[inline]
+    fn fresh(&self) -> Self {
+        // `NoIdentity` has no variants, so no value can ever reach this method. Exhaustively matching that impossible
+        // value lets Rust produce the required return type without fabricating an identity for an identity-free type.
+        match *self {}
+    }
+}
 
 /// Positional role of a [`TypeIdentity`] occurrence in [`Program`](crate::Program) [`Type`](crate::Type) metadata.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -150,33 +162,62 @@ impl<I: TypeIdentity> TypeIdentitySignature<I> {
 #[cfg(test)]
 mod tests {
     use std::fmt::Display;
+    use std::sync::Arc;
 
     use super::*;
 
     /// Minimal nominal identity used to exercise simultaneous renaming.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct TestIdentity(&'static str);
+    #[derive(Clone, Debug)]
+    struct TestIdentity {
+        /// Diagnostic name.
+        name: &'static str,
 
-    impl Display for TestIdentity {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(self.0)
+        /// Nominal identity token.
+        token: Arc<()>,
+    }
+
+    impl TestIdentity {
+        /// Creates a fresh test identity with `name`.
+        fn new(name: &'static str) -> Self {
+            Self { name, token: Arc::new(()) }
         }
     }
 
-    impl TypeIdentity for TestIdentity {}
+    impl Display for TestIdentity {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.name)
+        }
+    }
+
+    impl PartialEq for TestIdentity {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.token, &other.token)
+        }
+    }
+
+    impl Eq for TestIdentity {}
+
+    impl TypeIdentity for TestIdentity {
+        fn fresh(&self) -> Self {
+            Self::new(self.name)
+        }
+    }
 
     #[test]
     fn test_type_identity_renaming() {
         // Check that the type identity renaming is simultaneous.
-        let first = TestIdentity("first");
-        let second = TestIdentity("second");
+        let first = TestIdentity::new("first");
+        let second = TestIdentity::new("second");
+        let fresh_first = first.fresh();
+        assert_eq!(fresh_first.to_string(), first.to_string());
+        assert_ne!(fresh_first, first);
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(first.clone(), second.clone()).unwrap();
         renaming.insert(second.clone(), first.clone()).unwrap();
         assert_eq!(renaming.rename(&first), second);
         assert_eq!(renaming.rename(&second), first);
         assert!(matches!(
-            renaming.insert(TestIdentity("first"), TestIdentity("third")),
+            renaming.insert(first, TestIdentity::new("third")),
             Err(TypeError::Invalid { message })
                 if message == "identity first is renamed to both second and third",
         ));
