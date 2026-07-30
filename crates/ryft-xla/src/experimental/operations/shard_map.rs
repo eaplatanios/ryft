@@ -21,8 +21,8 @@ use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::differentiation::DifferentiationDual;
-use ryft_core::programs::types::{TypeError, Typed};
-use ryft_core::types::ArrayType;
+use ryft_core::programs::types::{Type, TypeError, Typed};
+use ryft_core::types::{ArrayProgramType, ArrayType};
 
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram};
 use crate::experimental::shard_map::{
@@ -105,9 +105,9 @@ impl<V> ShardMapOperation<V> {
     }
 }
 
-impl<V: Value<Type = ArrayType>> Display for ShardMapOperation<V> {
+impl<V> Display for ShardMapOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
+        formatter.write_str("shard_map")
     }
 }
 
@@ -191,6 +191,19 @@ fn infer_shard_map_output_types(
         .collect::<Vec<_>>())
 }
 
+/// Validates the single attached shard-map body boundary and returns its interface.
+fn shard_map_body_interface<T: Type>(
+    region_interfaces: &[RegionInterface<T>],
+    input_count: usize,
+    output_count: usize,
+) -> Result<&RegionInterface<T>, TypeError> {
+    check_count!("region", region_interfaces, 1, TypeError);
+    let interface = &region_interfaces[0];
+    check_count!("body input", interface.input_types(), input_count, TypeError);
+    check_count!("body output", interface.output_types(), output_count, TypeError);
+    Ok(interface)
+}
+
 impl<V: Value<Type = ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
@@ -205,14 +218,52 @@ impl<V: Value<Type = ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
+        region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
+        shard_map_body_interface(region_interfaces, self.input_types.len(), self.output_types.len())?;
         infer_shard_map_output_types(
-            self.name(),
+            <Self as Operation<ArrayType>>::name(self),
             self.input_types.as_slice(),
             self.output_types.as_slice(),
             input_types,
         )
+    }
+}
+
+impl<V: Value<Type = ArrayType>> Operation<ArrayProgramType> for ShardMapOperation<V> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        "shard_map"
+    }
+
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::computation("body")] }
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayProgramType],
+        region_interfaces: &[RegionInterface<ArrayProgramType>],
+    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        let body_interface =
+            shard_map_body_interface(region_interfaces, self.input_types.len(), self.output_types.len())?;
+        let input_types = input_types
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+            .collect::<Result<Vec<_>, TypeError>>()?;
+        for r#type in body_interface.input_types().iter().chain(body_interface.output_types()) {
+            <&ArrayType>::try_from(r#type)?;
+        }
+        Ok(infer_shard_map_output_types(
+            <Self as Operation<ArrayProgramType>>::name(self),
+            self.input_types.as_slice(),
+            self.output_types.as_slice(),
+            input_types.as_slice(),
+        )?
+        .into_iter()
+        .map(Into::into)
+        .collect())
     }
 }
 
@@ -231,7 +282,7 @@ where
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         Err(BatchingError::UnsupportedOperation {
-            message: format!("missing batching rule for operation '{}'", self.name()),
+            message: "missing batching rule for operation 'shard_map'".to_string(),
         }
         .into())
     }
@@ -1043,12 +1094,16 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
     use ryft_core::programs::MaybeZero;
-    use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef};
-    use ryft_core::programs::types::Typed;
+    use ryft_core::programs::effects::Effects;
+    use ryft_core::programs::operations::Operation;
+    use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionInterface, RegionRef};
+    use ryft_core::programs::types::{TypeError, Typed};
     use ryft_core::programs::{Program, ProgramBuilder};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::{DomainTracingContext, TracingContext};
-    use ryft_core::types::{ArrayType, DataType, Dimension, Shape};
+    use ryft_core::types::{
+        ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+    };
 
     use crate::experimental::domains::XlaDomain;
     use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder};
@@ -1099,6 +1154,71 @@ mod tests {
             vec!["x".to_string()],
             true,
         )
+    }
+
+    #[test]
+    fn test_shard_map_composite_boundary_is_array_only() {
+        let array_type = ArrayType::scalar(DataType::F32);
+        let composite_array_type = ArrayProgramType::Array(array_type.clone());
+        let operation = ShardMapOperation::<XlaArrayConstant>::from_boundary(
+            single_input_test_shard_map(),
+            vec![array_type.clone()],
+            vec![array_type],
+        );
+        let array_body =
+            RegionInterface::new(vec![composite_array_type.clone()], vec![composite_array_type.clone()], Effects::PURE);
+
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                std::slice::from_ref(&composite_array_type),
+                std::slice::from_ref(&array_body),
+            ),
+            Ok(vec![composite_array_type.clone()]),
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                std::slice::from_ref(&composite_array_type),
+                &[],
+            ),
+            Err(TypeError::invalid("expected 1 region but got 0")),
+        );
+
+        let dimension_type = ArrayProgramType::Dimension(DimensionType::new(DimensionVariable::new(
+            "size",
+            DimensionBounds::positive(Some(8)).unwrap(),
+        )));
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                std::slice::from_ref(&dimension_type),
+                std::slice::from_ref(&array_body),
+            ),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+
+        let dimension_input_body =
+            RegionInterface::new(vec![dimension_type.clone()], vec![composite_array_type.clone()], Effects::PURE);
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                std::slice::from_ref(&composite_array_type),
+                std::slice::from_ref(&dimension_input_body),
+            ),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+
+        let dimension_output_body =
+            RegionInterface::new(vec![composite_array_type.clone()], vec![dimension_type], Effects::PURE);
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &operation,
+                std::slice::from_ref(&composite_array_type),
+                std::slice::from_ref(&dimension_output_body),
+            ),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
     }
 
     #[test]
