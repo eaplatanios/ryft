@@ -75,7 +75,7 @@ impl BroadcastOperation {
 impl Display for BroadcastOperation {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        <Self as Operation<ArrayProgramType>>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
@@ -682,7 +682,7 @@ where
         );
         let operation = BroadcastOperation::new(output_axes.to_vec()).with_output_sharding(output_sharding);
         let output_type = infer_explicit_broadcast_output_type(input_type, output_shape, &operation)?;
-        if input_type == &output_type {
+        if input_type == &output_type && output_axes.iter().copied().eq(0..input_type.rank()) {
             return Ok(self.clone());
         }
 

@@ -1384,15 +1384,15 @@ impl Reshape for Array {
 impl BroadcastKernel for Array {
     fn broadcast_to_type(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let r#type = self.r#type.legacy_broadcast(output_type, output_axes)?;
-        if r#type == self.r#type && output_axes.iter().copied().eq(0..r#type.rank()) {
-            return Ok(self.clone());
-        }
-        let input_shape = self.r#type.static_shape().unwrap();
         let Some(target_shape) = r#type.static_shape() else {
             return Err(
                 TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
             );
         };
+        if r#type == self.r#type && output_axes.iter().copied().eq(0..r#type.rank()) {
+            return Ok(self.clone());
+        }
+        let input_shape = self.r#type.static_shape().unwrap();
         let input_rank = input_shape.rank();
         let target_rank = target_shape.rank();
         let input_strides = input_shape.row_major_strides();
@@ -2385,6 +2385,25 @@ mod tests {
         let broadcast = LegacyBroadcast::legacy_broadcast(&vector, output_type.clone(), &[1]).unwrap();
         assert_eq!(broadcast.r#type().into_owned(), output_type);
         assert_eq!(broadcast.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+
+        // Deliberately malformed concrete values with dynamic types fail through the structured materialization
+        // diagnostic before either the identity fast path or static-shape payload logic can accept or panic on them.
+        let dynamic = DimensionVariable::new("dynamic", DimensionBounds::unbounded());
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(dynamic.clone()), Dimension::Dynamic(dynamic)]),
+        );
+        let dynamic = Array::with_unchecked_type(
+            dynamic_type.clone(),
+            vec![Scalar::F64(1.0), Scalar::F64(2.0), Scalar::F64(3.0), Scalar::F64(4.0)],
+        );
+        for output_axes in [vec![0, 1], vec![1, 0]] {
+            assert!(matches!(
+                dynamic.broadcast_to_type(dynamic_type.clone(), output_axes.as_slice()),
+                Err(ProgramError::Type(TypeError::Invalid { message }))
+                    if message == "cannot materialize a value of dynamically sized type f64[dynamic, dynamic]",
+            ));
+        }
     }
 
     #[test]

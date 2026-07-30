@@ -3940,6 +3940,40 @@ mod tests {
         assert_eq!(value.broadcast(&[extent], &[0]).unwrap().atom_id(), value.atom_id());
         assert!(context.builder().borrow().instructions().is_empty());
 
+        // A shape-preserving axis permutation is still a real broadcast. Eager execution transposes the payload and
+        // tracing retains the operation even though its input and output types are equal.
+        let square_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+        let square = ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]));
+        let two = ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap());
+        let expected = ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f64, 3.0, 2.0, 4.0]));
+        assert_eq!(square.broadcast(&[two.clone(), two.clone()], &[1, 0]), Ok(expected.clone()));
+
+        let context = TestContext::new();
+        let value = context.input(square_type.into());
+        let extent = context.constant(two);
+        let output = value.broadcast(&[extent.clone(), extent], &[1, 0]).unwrap();
+        {
+            let builder = context.builder().borrow();
+            let [instruction] = builder.instructions() else {
+                panic!("expected one shape-preserving broadcast instruction");
+            };
+            let ArrayProgramOperation::Broadcast(operation) = instruction.operation() else {
+                panic!("expected a broadcast instruction");
+            };
+            assert_eq!(operation.output_axes(), &[1, 0]);
+        }
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.interpret(vec![square]), Ok(vec![expected]));
+
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
         let context = TestContext::new();
