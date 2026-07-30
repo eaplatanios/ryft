@@ -1339,6 +1339,10 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 - [x] P4b1 projected-region foundation: add and verify lossless `Program` member-program unprojection specified by the
       P4b plan. This is a behavior-preserving, core-only prerequisite for importing public array-only regions into the
       production composite graph without instruction replay.
+- [x] P4b2 projected capture-leaf classification: introduce `XlaArrayConstant = CaptureReference<ArrayType>` and
+      migrate array-member payload, lowering, and fixture uses while keeping `XlaConstant` as the temporary production
+      alias. This compile-safe naming boundary prevents the atomic composite constant flip from retyping homogeneous
+      array payloads accidentally.
 - [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
       the unrelated `ReshapeParameters`/`ReshapeOperation` permutation builder and carry no ambient extent state.
 - [x] `with_source_array` no longer exists.
@@ -2665,3 +2669,19 @@ structures, operation variants, and constant values. The full core suite passed 
 tests with one pre-existing ignored benchmark; `cargo check -p ryft-xla --lib`, formatting, and diff hygiene passed.
 The next P4b increment must consume this lift at the projected region-binding boundary; `ProjectedContext` still
 rejects regions until that driver conversion is atomic.
+
+### Execution: P4b2 projected array capture-leaf classification
+
+`XlaArrayConstant` now names every capture reference whose semantic role is an `ArrayType` member payload.
+`XlaConstant` deliberately remains a temporary alias until the atomic production-domain cutover, so current
+`XlaProgram` and compilation artifacts remain unchanged while standalone composite lowering, array-member operation
+payloads, `MlirLowerableValue`, and array-typed scan/shard-map markers are already insulated from the upcoming type
+flip.
+
+The dependency audit confirmed that persistent-cache V3 stores lowered StableHLO and the public physical array ABI,
+not the internal Ryft program, so no schema bump is justified unless those persisted artifacts become incompatible.
+It also assigns new composite higher-order batching and differentiation policies to P5/P6 while requiring P4b to
+preserve current behavior and exact deferred diagnostics.
+
+`cargo check -p ryft-xla --lib` passed without warnings. The complete XLA library suite passed 417 tests with one
+timing-sensitive benchmark ignored; formatting and diff hygiene passed.

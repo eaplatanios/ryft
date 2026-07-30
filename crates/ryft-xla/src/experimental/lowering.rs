@@ -54,7 +54,7 @@ use ryft_mlir::{
 use crate::experimental::debugging::{PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE};
 #[cfg(test)]
 use crate::experimental::ops::XlaProgramBuilder;
-use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgram};
+use crate::experimental::ops::{FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};
 use crate::mlir::ToMlir;
 
 use super::shard_map::{ShardMap, ShardMapError};
@@ -5348,7 +5348,7 @@ pub(crate) trait MlirLowerableValue: Value<Type = ArrayType> + 'static {
     }
 }
 
-impl MlirLowerableValue for XlaConstant {
+impl MlirLowerableValue for XlaArrayConstant {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
         _tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -11556,7 +11556,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
+        let scan = CoreScanOperation::<XlaArrayConstant>::new(1, 3);
 
         let mut builder = XlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
@@ -11600,7 +11600,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let scan = CoreScanOperation::<XlaConstant>::new(1, 3).with_unroll(3).unwrap();
+        let scan = CoreScanOperation::<XlaArrayConstant>::new(1, 3).with_unroll(3).unwrap();
 
         let mut builder = XlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
@@ -11644,7 +11644,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let scan = CoreScanOperation::<XlaConstant>::new(1, 4).with_unroll(2).unwrap();
+        let scan = CoreScanOperation::<XlaArrayConstant>::new(1, 4).with_unroll(2).unwrap();
 
         let mut builder = XlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
@@ -12781,7 +12781,7 @@ mod tests {
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
+        let scan = CoreScanOperation::<XlaArrayConstant>::new(1, 3);
 
         let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
@@ -13018,7 +13018,7 @@ mod tests {
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
+        let scan = CoreScanOperation::<XlaArrayConstant>::new(1, 3);
 
         let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();

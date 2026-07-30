@@ -47,7 +47,7 @@ use ryft_core::types::{
 
 use super::lowering::XlaExecutableSignature;
 use super::operations::ShardMapOperation;
-use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
+use super::ops::{FlatXlaProgram, JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgramBuilder};
 use super::shard_map::ShardMapTraceError;
 use crate::arrays_v0::{ArrayError, ShardDescriptor, ShardLayout};
 use crate::{Array, Error, FromPjrt, ToPjrt};
@@ -486,7 +486,7 @@ impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation {
 //  `shard_map` through this rule, extend `InterpretationDriver` with a whole-rebind request instead of
 //  interpreting the local body over global values (phase 7 or later of
 //  `.tasks/plan_first_class_program_regions.md`).
-impl<'c> InterpretableOperation<XlaDomain<'c>> for ShardMapOperation<XlaConstant> {
+impl<'c> InterpretableOperation<XlaDomain<'c>> for ShardMapOperation<XlaArrayConstant> {
     fn interpret<D: InterpretationDriver<XlaDomain<'c>>>(
         &self,
         _context: &XlaDomain<'c>,
@@ -3799,7 +3799,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let scan = ScanOperation::<XlaConstant>::new(1, 4);
+        let scan = ScanOperation::<XlaArrayConstant>::new(1, 4);
 
         let outputs = domain.bind(XlaOperation::Scan(scan), [body], &[f32_scalar(&client, &mesh, 0.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
@@ -3831,7 +3831,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let scan = ScanOperation::<XlaConstant>::new(1, 4);
+        let scan = ScanOperation::<XlaArrayConstant>::new(1, 4);
 
         let carry = f32_scalar(&client, &mesh, 0.0);
         let xs = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
@@ -3864,7 +3864,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let scan = ScanOperation::<XlaConstant>::new(1, 4);
+        let scan = ScanOperation::<XlaArrayConstant>::new(1, 4);
 
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let xs_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))

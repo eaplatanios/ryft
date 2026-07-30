@@ -63,8 +63,15 @@ use ryft_core::types::ArrayType;
 
 use crate::experimental::operations::ShardMapOperation;
 
-/// Lifetime-free reference to a concrete XLA value captured by a compiled program.
-pub type XlaConstant = CaptureReference<ArrayType>;
+/// Lifetime-free reference to an array member captured by an XLA program.
+pub type XlaArrayConstant = CaptureReference<ArrayType>;
+
+/// Production XLA program constant.
+///
+/// This remains an alias of [`XlaArrayConstant`] until the atomic composite-domain cutover. Keeping the names distinct
+/// now prevents array-member payloads from being retyped when this alias changes to
+/// `CaptureReference<ArrayProgramType>`.
+pub type XlaConstant = XlaArrayConstant;
 
 /// Ordinary staged-operation universe owned by the XLA backend.
 ///
@@ -75,7 +82,7 @@ pub type XlaConstant = CaptureReference<ArrayType>;
 #[derive(Clone, Debug, Operation)]
 #[ryft(crate = "ryft_core")]
 #[ryft(dispatch(batching, differentiation, transposition))]
-pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
+pub enum XlaOperation<V: Value<Type = ArrayType> = XlaArrayConstant> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),

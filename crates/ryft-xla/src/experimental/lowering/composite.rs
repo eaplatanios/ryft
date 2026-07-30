@@ -22,7 +22,7 @@ use super::{
     lower_tensor_type, merge_logical_meshes, normalize_function_name, replay_region_ref_into_block,
     reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
-use crate::experimental::ops::XlaConstant;
+use crate::experimental::ops::XlaArrayConstant;
 use crate::mlir::ToMlir;
 
 /// Error returned while lowering a stored program that mixes arrays and first-class dimensions.
@@ -830,10 +830,10 @@ where
 /// [`DimensionToScalarOperation`](ryft_core::DimensionToScalarOperation) lowers to the identity because both sides of
 /// that logical boundary use the same physical scalar representation.
 pub fn lower_array_program_to_stable_hlo<
-    Input: Parameterized<ArrayProgramValue<XlaConstant>>,
-    Output: Parameterized<ArrayProgramValue<XlaConstant>>,
+    Input: Parameterized<ArrayProgramValue<XlaArrayConstant>>,
+    Output: Parameterized<ArrayProgramValue<XlaArrayConstant>>,
 >(
-    program: &Program<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>, Input, Output>,
+    program: &Program<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>, Input, Output>,
     function_name: &str,
 ) -> Result<String, ArrayProgramLoweringError> {
     to_mlir_module_for_array_program(program, function_name).map_err(Into::into)
@@ -1042,16 +1042,17 @@ mod tests {
         left_type: ArrayType,
         right_type: ArrayType,
     ) -> Program<
-        ArrayProgramValue<XlaConstant>,
-        ArrayProgramOperation<XlaConstant>,
-        Vec<ArrayProgramValue<XlaConstant>>,
-        Vec<ArrayProgramValue<XlaConstant>>,
+        ArrayProgramValue<XlaArrayConstant>,
+        ArrayProgramOperation<XlaArrayConstant>,
+        Vec<ArrayProgramValue<XlaArrayConstant>>,
+        Vec<ArrayProgramValue<XlaArrayConstant>>,
     > {
         let left_size_operation = DimensionSizeOperation::new(&left_type, 0).unwrap();
         let right_size_operation = DimensionSizeOperation::new(&right_type, 0).unwrap();
         let add_operation =
             DimensionAddOperation::new(left_size_operation.result_type(), right_size_operation.result_type()).unwrap();
-        let mut builder = ProgramBuilder::<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>::new();
+        let mut builder =
+            ProgramBuilder::<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>::new();
         let left = builder.add_input(left_type.into());
         let right = builder.add_input(right_type.into());
         let left_extent = builder.add_instruction(left_size_operation, Vec::new(), vec![left]).unwrap()[0];
@@ -1067,7 +1068,7 @@ mod tests {
 
     #[test]
     fn test_array_program_lowering() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(17)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
@@ -1078,7 +1079,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1097,7 +1098,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1137,7 +1138,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_fill_lowers_as_literal_constant_plus_bounded_broadcast() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let extent_variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let extent_type = DimensionType::new(extent_variable);
@@ -1145,7 +1146,7 @@ mod tests {
         let extent = context.input(extent_type.into());
         let literal = context
             .bind(
-                ArrayOperation::<XlaConstant>::Constant(ConstantOperation::new(ReferenceArray::scalar(2.5_f32))),
+                ArrayOperation::<XlaArrayConstant>::Constant(ConstantOperation::new(ReferenceArray::scalar(2.5_f32))),
                 Vec::new(),
                 &[],
             )
@@ -1157,7 +1158,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1174,7 +1175,7 @@ mod tests {
 
     #[test]
     fn test_explicit_custom_call_lowering() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
@@ -1189,7 +1190,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1218,7 +1219,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1241,7 +1242,8 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(input_variable)]));
         let padding_value_type = ArrayType::scalar(DataType::F32);
         let output_extent_type = DimensionType::new(output_variable);
-        let mut builder = ProgramBuilder::<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>::new();
+        let mut builder =
+            ProgramBuilder::<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>::new();
         let input = builder.add_input(input_type.into());
         let padding_value = builder.add_input(padding_value_type.into());
         let output_extent = builder.add_input(output_extent_type.into());
@@ -1253,7 +1255,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output],
                 vec![Placeholder; 3],
                 vec![Placeholder],
@@ -1267,7 +1269,8 @@ mod tests {
 
     #[test]
     fn test_explicit_rng_bit_generator_lowering() {
-        let mut builder = ProgramBuilder::<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>::new();
+        let mut builder =
+            ProgramBuilder::<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>::new();
         let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
         let outputs = builder
             .add_instruction(
@@ -1281,7 +1284,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 outputs,
                 vec![Placeholder],
                 vec![Placeholder; 2],
@@ -1293,7 +1296,8 @@ mod tests {
 
         let output_variable = DimensionVariable::new("count", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(output_variable.clone())]));
-        let mut builder = ProgramBuilder::<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>::new();
+        let mut builder =
+            ProgramBuilder::<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>::new();
         let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
         let output_extent = builder.add_input(DimensionType::new(output_variable).into());
         let outputs = builder
@@ -1305,7 +1309,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 outputs,
                 vec![Placeholder; 2],
                 vec![Placeholder; 2],
@@ -1397,7 +1401,7 @@ mod tests {
 
     #[test]
     fn test_explicit_reshape_lowering() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let context = TestContext::new();
         let input = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(6)])).into());
@@ -1413,7 +1417,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1464,7 +1468,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1479,7 +1483,7 @@ mod tests {
 
     #[test]
     fn test_explicit_broadcast_lowering() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let context = TestContext::new();
         let input = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
@@ -1495,7 +1499,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1538,7 +1542,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -1588,7 +1592,7 @@ mod tests {
 
     #[test]
     fn test_explicit_shape_vertical_slice_lowering() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         // The static program uses the same computed dimension SSA value as a reshape and broadcast operand.
         let context = TestContext::new();
@@ -1613,7 +1617,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1690,7 +1694,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -1724,7 +1728,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -1742,7 +1746,7 @@ mod tests {
 
     #[test]
     fn test_explicit_collective_lowering_uses_dimension_ssa_inside_manual_binder() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
@@ -1774,7 +1778,7 @@ mod tests {
 
     #[test]
     fn test_dimension_comparison_lowering() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1794,7 +1798,7 @@ mod tests {
                 .builder()
                 .borrow()
                 .clone()
-                .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+                .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                     vec![output.atom_id().unwrap()],
                     vec![Placeholder, Placeholder],
                     vec![Placeholder],
@@ -1844,7 +1848,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_zero_lowering() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
@@ -1865,7 +1869,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1901,7 +1905,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_one_lowering() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
@@ -1922,7 +1926,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -1958,7 +1962,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_iota_lowering() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let rows_type = DimensionType::new(DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap()));
         let columns_type =
@@ -1989,7 +1993,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -2035,7 +2039,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_zero_lowering_with_mixed_static_and_dynamic_axes() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         // The dimension operands are compact: the rank-three output has one dynamic leading axis, one static middle
         // axis, and one dynamic trailing axis, so the constructor consumes exactly two operands and lowering must
@@ -2065,7 +2069,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -2111,7 +2115,7 @@ mod tests {
 
     #[test]
     fn test_dimension_from_scalar_lowering_is_deferred() {
-        type TestContext = TracingContext<ArrayProgramValue<XlaConstant>, ArrayProgramOperation<XlaConstant>>;
+        type TestContext = TracingContext<ArrayProgramValue<XlaArrayConstant>, ArrayProgramOperation<XlaArrayConstant>>;
 
         let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(17)).unwrap());
         let context = TestContext::new();
@@ -2121,7 +2125,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<XlaConstant>>, Vec<ArrayProgramValue<XlaConstant>>>(
+            .build::<Vec<ArrayProgramValue<XlaArrayConstant>>, Vec<ArrayProgramValue<XlaArrayConstant>>>(
                 vec![output.atom_id().unwrap()],
                 vec![Placeholder],
                 vec![Placeholder],

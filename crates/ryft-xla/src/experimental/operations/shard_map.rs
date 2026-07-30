@@ -1051,7 +1051,7 @@ mod tests {
     use ryft_core::types::{ArrayType, DataType, Dimension, Shape};
 
     use crate::experimental::domains::XlaDomain;
-    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder};
+    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder};
     use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap};
 
     use super::{ShardMapOperation, transpose_primal_shard_map, transpose_shard_map_body};
@@ -1382,7 +1382,7 @@ mod tests {
 
         let array_type = test_array_type();
         let (operation, body_program) =
-            ShardMapOperation::<XlaConstant>::from_body(mixed_known_unknown_traced_shard_map_body());
+            ShardMapOperation::<XlaArrayConstant>::from_body(mixed_known_unknown_traced_shard_map_body());
 
         // Enclosing program staging one `shard_map` over `[a, x]`, with the local body attached as its region.
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
