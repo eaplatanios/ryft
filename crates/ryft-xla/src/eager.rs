@@ -1,13 +1,17 @@
+use ryft_core::backends::dimensions::DimensionValue;
 use ryft_core::contexts::Context;
 use ryft_core::macros::check_count;
 use ryft_core::operations::control_flow::{Select, WhilePredicate};
+use ryft_core::operations::dimensions::{
+    DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation,
+};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::LegacyBroadcast;
 use ryft_core::operations::manipulation::conversion::ElementType;
 use ryft_core::operations::math::{Add, Div, Mul, Neg, Sub};
 use ryft_core::programs::types::Typed;
-use ryft_core::programs::{Concretizable, ProgramError, Value};
-use ryft_core::types::DataType;
+use ryft_core::programs::{Concretizable, Operation, ProgramError, Value};
+use ryft_core::types::{ArrayProgramType, DataType, DimensionType, DimensionVariable};
 
 use crate::experimental::ops::XlaOperation;
 use crate::{Array, ArrayShard};
@@ -70,6 +74,77 @@ impl Concretizable<bool> for Array<'_> {
                 self.r#type(),
             ),
         })
+    }
+}
+
+impl DimensionSize<usize> for Array<'_> {
+    /// Returns the concrete global extent of `axis` from this array's complete shard metadata.
+    ///
+    /// The descriptor list includes remote shards, so taking the greatest exclusive slice end recovers the global
+    /// extent without synchronizing a device buffer. Constructing a [`DimensionValue`] validates that extent against
+    /// the selected declared axis's identity and bounds before the host integer is returned.
+    fn dimension_size<AxisValue: Into<ryft_core::Axis>>(&self, axis: AxisValue) -> Result<usize, ProgramError> {
+        let operation = DimensionSizeOperation::new(self.r#type().as_ref(), axis)?;
+        let extent = self.shards().iter().map(|shard| shard.slice()[operation.axis()].end).max().ok_or_else(|| {
+            ProgramError::Concretization {
+                message: format!("cannot read the extent of an array of type {} with no shard metadata", self.r#type()),
+            }
+        })?;
+        DimensionValue::new(operation.result_type().clone(), extent)?;
+        Ok(extent)
+    }
+}
+
+impl DimensionFromScalar<DimensionValue> for Array<'_> {
+    /// Copies this rank-zero integer array to the host and grants its checked value first-class dimension authority.
+    fn to_dimension(&self, result: DimensionVariable) -> Result<DimensionValue, ProgramError> {
+        let operation = DimensionFromScalarOperation::new(result);
+        let mut output_types =
+            operation.infer_output_types(&[ArrayProgramType::Array(self.r#type().into_owned())], &[])?;
+        let output_type = <&DimensionType>::try_from(&output_types.remove(0))?.clone();
+        let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
+            message: format!(
+                "cannot convert an array of type {} with no addressable shards to a dimension",
+                self.r#type(),
+            ),
+        })?;
+        let bytes = shard_host_bytes(shard)?;
+        let invalid_extent = |value: String| ProgramError::InvalidArgument {
+            message: format!(
+                "'{}' scalar input must be a nonnegative host-representable extent but is {value}",
+                operation.name(),
+            ),
+        };
+        let extent = match self.data_type() {
+            DataType::I8 => {
+                let value = i8::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::I16 => {
+                let value = i16::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::I32 => {
+                let value = i32::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::I64 => {
+                let value = i64::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::U8 => usize::from(u8::from_ne_bytes(bytes.as_slice().try_into().unwrap())),
+            DataType::U16 => usize::from(u16::from_ne_bytes(bytes.as_slice().try_into().unwrap())),
+            DataType::U32 => {
+                let value = u32::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::U64 => {
+                let value = u64::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            _ => unreachable!("dimension_from_scalar input type is validated before reading its payload"),
+        };
+        Ok(DimensionValue::new(output_type, extent)?)
     }
 }
 
@@ -214,7 +289,6 @@ mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
-    use ryft_core::Sharding;
     use ryft_core::backends::arrays::Array as CpuArray;
     use ryft_core::backends::scalars::Scalar;
     use ryft_core::batching::{BatchAxis, batch};
@@ -233,7 +307,8 @@ mod tests {
     };
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
-    use ryft_core::types::{ArrayType, Dimension, Shape, StaticShape};
+    use ryft_core::types::{ArrayType, Dimension, DimensionBounds, Shape, StaticShape};
+    use ryft_core::{Sharding, TypeError};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::tests::{
@@ -1670,6 +1745,43 @@ mod tests {
         // Rank-one predicates cannot collapse to a single Boolean.
         let vector_predicate = boolean_vector(&client, &mesh, &[true, false]);
         assert!(matches!(vector_predicate.concretize(), Err(ProgramError::Concretization { .. })));
+    }
+
+    #[test]
+    fn test_eager_dimension_gateways() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = cpu_mesh_with_axis_size(&client, 2);
+
+        let matrix = f32_matrix(&client, &mesh, 2, 3, &[0.0; 6]);
+        assert_eq!(matrix.dimension_size(0), Ok(2));
+        assert_eq!(matrix.dimension_size(-1), Ok(3));
+        assert!(matches!(
+            matrix.dimension_size(2),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "'dimension_size' axis 2 is out of bounds for rank 2",
+        ));
+
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let sharded_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(5)]))
+            .with_sharding(sharding)
+            .unwrap();
+        let sharded =
+            Array::from_host_buffer(&client, sharded_type, mesh.clone(), values_to_bytes::<f32>(&[0.0; 5])).unwrap();
+        assert_eq!(sharded.dimension_size(0), Ok(5));
+
+        let scalar_type = replicated_type(&mesh, DataType::I32, &[]);
+        let scalar = Array::from_host_buffer(&client, scalar_type.clone(), mesh.clone(), 5_i32.to_ne_bytes()).unwrap();
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        assert_eq!(scalar.to_dimension(variable.clone()).unwrap().extent(), 5);
+
+        let negative = Array::from_host_buffer(&client, scalar_type, mesh, (-1_i32).to_ne_bytes()).unwrap();
+        assert!(matches!(
+            negative.to_dimension(variable),
+            Err(ProgramError::InvalidArgument { message })
+                if message
+                    == "'dimension_from_scalar' scalar input must be a nonnegative host-representable extent but is -1",
+        ));
     }
 
     #[test]

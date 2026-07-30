@@ -1370,6 +1370,11 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 - [x] P4b7 mixed control-flow prerequisite: add direct composite condition, while, and scan contracts before the
       production domain flip. Keep predicates Boolean arrays, define variant-aware state/carry/output rules, and do
       not make `ArrayProgramType` an `ElementType` solely to route mixed regions through homogeneous contracts.
+- [x] P4b8 eager gateway prerequisite and final cutover audit: give concrete XLA arrays checked host
+      `dimension_size` and `dimension_from_scalar` capabilities, derive global extents from complete shard metadata,
+      and record the domain-owned eager dispatch split required by the atomic cutover. Keep array members on cached
+      compilation, dimension members on checked host arithmetic, and `dimension_to_scalar` placement in the active
+      domain; do not attach backend state to `DimensionValue` or interpret array members recursively.
 - [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
       the unrelated `ReshapeParameters`/`ReshapeOperation` permutation builder and carry no ambient extent state.
 - [x] `with_source_array` no longer exists.
@@ -2741,3 +2746,16 @@ and array-only stacks; stacked arrays may have dynamic inner axes tied to explic
 composite regressions passed, followed by all 1,019 core tests and all 421 runnable XLA tests. The exact contracts,
 prototype evidence, and residual production-cutover work are recorded in
 `.tasks/plan_p4b_production_composite_xla.md`.
+
+### Execution: P4b8 concrete eager dimension gateways
+
+The final production type-cycle probe validated the intended generic operation relationship—one composite constant
+family whose array payload is derived through `ValueProjection<ArrayType>`—and found one missing runtime contract:
+the public-facade prototype did not exercise eager mixed operation dispatch. The incomplete representation edit was
+reversed. The production plan now specifies the nonrecursive split explicitly: compile array members, interpret
+dimension members on the host, let the active XLA domain materialize dimension-to-scalar values, and insert concrete
+dimension constants into eager mixed-operation SSA before lowering only array inputs.
+
+As an independent prerequisite, concrete XLA arrays now recover exact global axis extents from complete shard
+descriptors without device work and convert checked rank-zero integer arrays into `DimensionValue`s through one
+explicit host readback. The focused CPU gateway regression, XLA library check, formatting, and diff hygiene passed.
