@@ -5406,42 +5406,102 @@ impl MlirLowerableValue for CpuArray {
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-        // The snapshot tooling views real-valued payloads through `f64` and converts integer-typed payloads (e.g.,
-        // dynamic slicing start indices) through integer dense attributes matching the lowered integer tensor type.
         let data_type = self.r#type().data_type();
-        let values = self.to_f64s();
-        let attribute = match data_type {
-            DataType::I32 => {
-                let values = values.iter().map(|value| *value as i32).collect::<Vec<_>>();
+        macro_rules! typed_elements {
+            // Extract one natively supported scalar family and construct its matching typed MLIR dense attribute.
+            ($method:ident, $variant:ident, $element:ty) => {{
+                let values = self
+                    .values()
+                    .iter()
+                    .map(|value| match value {
+                        Scalar::$variant(value) => *value,
+                        _ => unreachable!("array payload types are validated during construction"),
+                    })
+                    .collect::<Vec<$element>>();
                 context
-                    .dense_i32_elements_attribute(tensor_type, values.as_slice())
+                    .$method(tensor_type, values.as_slice())
                     .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
                     .cast::<DenseElementsAttributeRef>()
-            }
-            DataType::I64 => {
-                let values = values.iter().map(|value| *value as i64).collect::<Vec<_>>();
-                context
-                    .dense_i64_elements_attribute(tensor_type, values.as_slice())
-                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
-                    .cast::<DenseElementsAttributeRef>()
-            }
-            _ => context
-                .dense_f64_elements_attribute(tensor_type, values.as_slice())
-                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
-                .cast::<DenseElementsAttributeRef>(),
-        };
-        attribute.ok_or(LoweringError::InvalidDenseElementsAttribute { data_type })
-    }
-
-    fn to_scalar_dense_elements_attribute<'c, 't>(
-        &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
-    ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, LoweringError> {
-        if self.values().len() != 1 {
-            return Ok(None);
+                    .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type })
+            }};
         }
-        Ok(Some(self.to_dense_elements_attribute(tensor_type, context)?))
+        macro_rules! raw_elements {
+            // Preserve an unsupported-by-typed-MLIR scalar family's native storage bits through the raw constructor.
+            ($variant:ident, $element:ty) => {{
+                let values = self
+                    .values()
+                    .iter()
+                    .map(|value| match value {
+                        Scalar::$variant(value) => *value,
+                        _ => unreachable!("array payload types are validated during construction"),
+                    })
+                    .collect::<Vec<$element>>();
+                context
+                    .dense_elements_attribute_from_raw_buffer(tensor_type, values.as_slice())
+                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+            }};
+        }
+
+        match data_type {
+            DataType::Boolean => typed_elements!(dense_bool_elements_attribute, Bool, bool),
+            DataType::I8 => typed_elements!(dense_i8_elements_attribute, I8, i8),
+            DataType::I16 => typed_elements!(dense_i16_elements_attribute, I16, i16),
+            DataType::I32 => typed_elements!(dense_i32_elements_attribute, I32, i32),
+            DataType::I64 => typed_elements!(dense_i64_elements_attribute, I64, i64),
+            DataType::U8 => typed_elements!(dense_u8_elements_attribute, U8, u8),
+            DataType::U16 => typed_elements!(dense_u16_elements_attribute, U16, u16),
+            DataType::U32 => typed_elements!(dense_u32_elements_attribute, U32, u32),
+            DataType::U64 => typed_elements!(dense_u64_elements_attribute, U64, u64),
+            DataType::F4E2M1FN => raw_elements!(F4E2M1FN, u8),
+            DataType::F6E2M3FN => raw_elements!(F6E2M3FN, u8),
+            DataType::F6E3M2FN => raw_elements!(F6E3M2FN, u8),
+            DataType::F8E3M4 => raw_elements!(F8E3M4, u8),
+            DataType::F8E4M3 => raw_elements!(F8E4M3, u8),
+            DataType::F8E4M3FN => raw_elements!(F8E4M3FN, u8),
+            DataType::F8E4M3FNUZ => raw_elements!(F8E4M3FNUZ, u8),
+            DataType::F8E4M3B11FNUZ => raw_elements!(F8E4M3B11FNUZ, u8),
+            DataType::F8E5M2 => raw_elements!(F8E5M2, u8),
+            DataType::F8E5M2FNUZ => raw_elements!(F8E5M2FNUZ, u8),
+            DataType::F8E8M0FNU => raw_elements!(F8E8M0FNU, u8),
+            DataType::BF16 => typed_elements!(dense_bf16_elements_attribute, BF16, half::bf16),
+            DataType::F16 => typed_elements!(dense_f16_elements_attribute, F16, half::f16),
+            DataType::F32 => typed_elements!(dense_f32_elements_attribute, F32, f32),
+            DataType::F64 => typed_elements!(dense_f64_elements_attribute, F64, f64),
+            DataType::C64 => {
+                let values = self
+                    .values()
+                    .iter()
+                    .flat_map(|value| match value {
+                        Scalar::C64(value) => [value.re, value.im],
+                        _ => unreachable!("array payload types are validated during construction"),
+                    })
+                    .collect::<Vec<_>>();
+                context
+                    .dense_elements_attribute_from_raw_buffer(tensor_type, values.as_slice())
+                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+            }
+            DataType::C128 => {
+                let values = self
+                    .values()
+                    .iter()
+                    .flat_map(|value| match value {
+                        Scalar::C128(value) => [value.re, value.im],
+                        _ => unreachable!("array payload types are validated during construction"),
+                    })
+                    .collect::<Vec<_>>();
+                context
+                    .dense_elements_attribute_from_raw_buffer(tensor_type, values.as_slice())
+                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+            }
+            DataType::Token
+            | DataType::Zero
+            | DataType::I1
+            | DataType::I2
+            | DataType::I4
+            | DataType::U1
+            | DataType::U2
+            | DataType::U4 => return Err(LoweringError::UnsupportedDataType { data_type }),
+        }
     }
 
     fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
@@ -9492,6 +9552,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
+
     use ryft_core::backends::arrays::Array as CpuArray;
     use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::contexts::Context;
@@ -9519,6 +9581,8 @@ mod tests {
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use ryft_core::tracing::{Trace, TracingContext};
 
+    use crate::tests::values_to_bytes;
+
     use super::*;
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
@@ -9531,6 +9595,21 @@ mod tests {
 
     fn test_matrix_type(rows: usize, cols: usize) -> ArrayType {
         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(cols)]))
+    }
+
+    /// Creates a rank-one literal whose element type is inferred from its homogeneous scalar payload.
+    fn test_literal(values: Vec<Scalar>) -> CpuArray {
+        let data_type = values.first().unwrap().r#type().into_owned();
+        CpuArray::new(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(values.len())])), values).unwrap()
+    }
+
+    /// Copies the exact raw storage bytes from the MLIR dense attribute built for `literal`.
+    fn test_literal_dense_bytes(literal: &CpuArray, byte_count: usize) -> Vec<u8> {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = lower_tensor_type(literal.r#type().as_ref(), &context, location).unwrap();
+        let attribute = literal.to_dense_elements_attribute(tensor_type, &context).unwrap();
+        unsafe { std::slice::from_raw_parts(attribute.raw_data().cast::<u8>(), byte_count).to_vec() }
     }
 
     fn dynamic_dimension(name: &str, exclusive_upper_bound: Option<usize>) -> Dimension {
@@ -14037,7 +14116,247 @@ mod tests {
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 0, "{stablehlo}");
-        assert!(stablehlo.contains("dense<[0.000000e+00, -0.000000e+00]>"), "{stablehlo}");
+        assert!(stablehlo.contains("dense<[-0.000000e+00, 0.000000e+00]>"), "{stablehlo}");
+
+        // A rank-positive one-element literal remains an ordinary shaped dense constant rather than being rewritten
+        // as a rank-zero constant plus broadcast.
+        let literal = CpuArray::new(test_vector_type(1), vec![Scalar::from(2.5_f32)]).unwrap();
+        let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let output = builder
+            .add_instruction(ArrayOperation::Constant(ConstantOperation::new(literal)), Vec::new(), Vec::new())
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 0, "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.constant dense<2.500000e+00> : tensor<1xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_rank_positive_literal_dense_attributes_preserve_exact_payloads() {
+        // Boolean values retain their logical order through MLIR's bit-packed dense representation.
+        let boolean = test_literal(vec![Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)]);
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = lower_tensor_type(boolean.r#type().as_ref(), &context, location).unwrap();
+        let attribute = boolean.to_dense_elements_attribute(tensor_type, &context).unwrap();
+        assert_eq!(
+            unsafe { attribute.bool_elements().collect::<Result<Vec<_>, _>>().unwrap() },
+            vec![true, false, true],
+        );
+
+        // Every byte-aligned integer family preserves signedness, magnitude, and source order without floating-point
+        // conversion. The `u64` case deliberately exceeds f64's exact-integer range.
+        let integer_cases = vec![
+            (test_literal(vec![Scalar::I8(-127), Scalar::I8(126)]), values_to_bytes(&[-127_i8, 126])),
+            (test_literal(vec![Scalar::I16(-0x1234), Scalar::I16(0x2345)]), values_to_bytes(&[-0x1234_i16, 0x2345])),
+            (
+                test_literal(vec![Scalar::I32(-0x1234_567), Scalar::I32(0x2345_678)]),
+                values_to_bytes(&[-0x1234_567_i32, 0x2345_678]),
+            ),
+            (
+                test_literal(vec![Scalar::I64(-0x1234_5678_9abc_def), Scalar::I64(0x2345_6789_abcd_ef0)]),
+                values_to_bytes(&[-0x1234_5678_9abc_def_i64, 0x2345_6789_abcd_ef0]),
+            ),
+            (test_literal(vec![Scalar::U8(0x12), Scalar::U8(0xfe)]), values_to_bytes(&[0x12_u8, 0xfe])),
+            (test_literal(vec![Scalar::U16(0x1234), Scalar::U16(0xfedc)]), values_to_bytes(&[0x1234_u16, 0xfedc])),
+            (
+                test_literal(vec![Scalar::U32(0x1234_5678), Scalar::U32(0xfedc_ba98)]),
+                values_to_bytes(&[0x1234_5678_u32, 0xfedc_ba98]),
+            ),
+            (
+                test_literal(vec![Scalar::U64((1_u64 << 53) + 1), Scalar::U64(u64::MAX - 1)]),
+                values_to_bytes(&[(1_u64 << 53) + 1, u64::MAX - 1]),
+            ),
+        ];
+        for (literal, expected) in integer_cases {
+            assert_eq!(
+                test_literal_dense_bytes(&literal, expected.len()),
+                expected,
+                "integer literal type {}",
+                literal.r#type(),
+            );
+        }
+
+        // Sub-byte and eight-bit floating-point formats retain their exact encodings, including NaN payloads.
+        for (data_type, bits) in [
+            (DataType::F4E2M1FN, [0x01, 0x0f]),
+            (DataType::F6E2M3FN, [0x01, 0x3f]),
+            (DataType::F6E3M2FN, [0x02, 0x3e]),
+            (DataType::F8E3M4, [0x01, 0xff]),
+            (DataType::F8E4M3, [0x02, 0xfe]),
+            (DataType::F8E4M3FN, [0x03, 0x7f]),
+            (DataType::F8E4M3FNUZ, [0x04, 0x80]),
+            (DataType::F8E4M3B11FNUZ, [0x05, 0x80]),
+            (DataType::F8E5M2, [0x06, 0x7f]),
+            (DataType::F8E5M2FNUZ, [0x07, 0x80]),
+            (DataType::F8E8M0FNU, [0x08, 0xff]),
+        ] {
+            let literal = test_literal(
+                bits.into_iter()
+                    .map(|bits| Scalar::from_low_precision_float_bits(data_type, bits).unwrap())
+                    .collect(),
+            );
+            assert_eq!(test_literal_dense_bytes(&literal, bits.len()), bits, "low-precision literal type {data_type}");
+            let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+            let output = builder
+                .add_instruction(ArrayOperation::Constant(ConstantOperation::new(literal)), Vec::new(), Vec::new())
+                .unwrap()[0];
+            let program =
+                builder.build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+            assert!(to_mlir_module_for_plain_program(&program, "main").is_ok(), "low-precision literal {data_type}");
+        }
+
+        // Standard floating-point families preserve signed zero, infinities, and NaN payload bits.
+        let bf16_values = [half::bf16::from_bits(0x8000), half::bf16::from_bits(0x7fc1)];
+        let f16_values = [half::f16::from_bits(0x8000), half::f16::from_bits(0x7e01)];
+        let f32_values = [f32::from_bits(0x8000_0000), f32::INFINITY, f32::from_bits(0x7fc0_1234)];
+        let f64_values =
+            [f64::from_bits(0x8000_0000_0000_0000), f64::NEG_INFINITY, f64::from_bits(0x7ff8_0000_0000_1234)];
+        for (literal, expected) in [
+            (test_literal(bf16_values.into_iter().map(Scalar::BF16).collect()), values_to_bytes(&bf16_values)),
+            (test_literal(f16_values.into_iter().map(Scalar::F16).collect()), values_to_bytes(&f16_values)),
+            (test_literal(f32_values.into_iter().map(Scalar::F32).collect()), values_to_bytes(&f32_values)),
+            (test_literal(f64_values.into_iter().map(Scalar::F64).collect()), values_to_bytes(&f64_values)),
+        ] {
+            assert_eq!(
+                test_literal_dense_bytes(&literal, expected.len()),
+                expected,
+                "floating-point literal type {}",
+                literal.r#type(),
+            );
+        }
+
+        // Complex storage interleaves independently exact real and imaginary components in source order.
+        let c64_components =
+            [f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_1234), f32::INFINITY, f32::NEG_INFINITY];
+        let c64 = test_literal(vec![
+            Scalar::C64(num_complex::Complex::new(c64_components[0], c64_components[1])),
+            Scalar::C64(num_complex::Complex::new(c64_components[2], c64_components[3])),
+        ]);
+        assert_eq!(test_literal_dense_bytes(&c64, size_of_val(&c64_components)), values_to_bytes(&c64_components),);
+        let c128_components = [
+            f64::from_bits(0x8000_0000_0000_0000),
+            f64::from_bits(0x7ff8_0000_0000_1234),
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let c128 = test_literal(vec![
+            Scalar::C128(num_complex::Complex::new(c128_components[0], c128_components[1])),
+            Scalar::C128(num_complex::Complex::new(c128_components[2], c128_components[3])),
+        ]);
+        assert_eq!(test_literal_dense_bytes(&c128, size_of_val(&c128_components)), values_to_bytes(&c128_components),);
+
+        // Payload-free logical types never enter raw construction and report the standard structured lowering error.
+        let tensor_type = context
+            .tensor_type(context.signless_integer_type(1), &[MlirSize::Static(2)], None, location)
+            .unwrap();
+        for (data_type, values) in
+            [(DataType::Zero, vec![Scalar::Zero, Scalar::Zero]), (DataType::Token, vec![Scalar::Token, Scalar::Token])]
+        {
+            let literal =
+                CpuArray::new(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)])), values).unwrap();
+            assert_eq!(
+                literal.to_dense_elements_attribute(tensor_type, &context),
+                Err(LoweringError::UnsupportedDataType { data_type }),
+            );
+        }
+    }
+
+    #[test]
+    fn test_rank_positive_literal_constants_execute_exactly_on_cpu() {
+        use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
+        use ryft_pjrt::{
+            ClientOptions, CpuClientOptions, ExecutionDeviceInputs, Program as PjrtProgram, load_cpu_plugin,
+        };
+
+        let bf16_values = [half::bf16::from_bits(0x3f80), half::bf16::from_bits(0xc000)];
+        let f16_values = [half::f16::from_bits(0x3c00), half::f16::from_bits(0xc000)];
+        let f32_values = [f32::from_bits(0x8000_0000), f32::INFINITY];
+        let f64_values = [f64::from_bits(0x8000_0000_0000_0000), f64::NEG_INFINITY];
+        let c64_components = [1.5_f32, -2.0, f32::from_bits(0x8000_0000), f32::INFINITY];
+        let c128_components = [1.5_f64, -2.0, f64::from_bits(0x8000_0000_0000_0000), f64::NEG_INFINITY];
+        let cases = vec![
+            (test_literal(vec![Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)]), vec![1_u8, 0, 1]),
+            (test_literal(vec![Scalar::I16(-0x1234), Scalar::I16(0x2345)]), values_to_bytes(&[-0x1234_i16, 0x2345])),
+            (
+                test_literal(vec![Scalar::U64((1_u64 << 53) + 1), Scalar::U64(u64::MAX - 1)]),
+                values_to_bytes(&[(1_u64 << 53) + 1, u64::MAX - 1]),
+            ),
+            (test_literal(bf16_values.into_iter().map(Scalar::BF16).collect()), values_to_bytes(&bf16_values)),
+            (test_literal(f16_values.into_iter().map(Scalar::F16).collect()), values_to_bytes(&f16_values)),
+            (test_literal(f32_values.into_iter().map(Scalar::F32).collect()), values_to_bytes(&f32_values)),
+            (test_literal(f64_values.into_iter().map(Scalar::F64).collect()), values_to_bytes(&f64_values)),
+            (
+                test_literal(vec![
+                    Scalar::C64(num_complex::Complex::new(c64_components[0], c64_components[1])),
+                    Scalar::C64(num_complex::Complex::new(c64_components[2], c64_components[3])),
+                ]),
+                values_to_bytes(&c64_components),
+            ),
+            (
+                test_literal(vec![
+                    Scalar::C128(num_complex::Complex::new(c128_components[0], c128_components[1])),
+                    Scalar::C128(num_complex::Complex::new(c128_components[2], c128_components[3])),
+                ]),
+                values_to_bytes(&c128_components),
+            ),
+        ];
+
+        let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let outputs = cases
+            .iter()
+            .map(|(literal, _)| {
+                builder
+                    .add_instruction(
+                        ArrayOperation::Constant(ConstantOperation::new(literal.clone())),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .unwrap()[0]
+            })
+            .collect::<Vec<_>>();
+        let program = builder
+            .build::<Vec<CpuArray>, Vec<CpuArray>>(outputs, Vec::new(), vec![Placeholder; cases.len()])
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let executable = client
+            .compile(
+                &PjrtProgram::Mlir { bytecode: module.into_bytes() },
+                &CompilationOptions {
+                    argument_layouts: Vec::new(),
+                    parameter_is_tupled_arguments: false,
+                    executable_build_options: Some(ExecutableCompilationOptions {
+                        device_ordinal: -1,
+                        replica_count: 1,
+                        partition_count: 1,
+                        ..Default::default()
+                    }),
+                    compile_portable_executable: false,
+                    profile_version: 0,
+                    serialized_multi_slice_configuration: Vec::new(),
+                    environment_option_overrides: std::collections::HashMap::new(),
+                    target_config: None,
+                    allow_in_place_mlir_modification: false,
+                    matrix_unit_operand_precision: Precision::Default as i32,
+                },
+            )
+            .unwrap();
+        let mut executions = executable
+            .execute(vec![ExecutionDeviceInputs::default()], Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let outputs = executions.remove(0).outputs;
+        assert_eq!(outputs.len(), cases.len());
+        for (output, (literal, expected)) in outputs.into_iter().zip(cases) {
+            let actual = output.copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(actual, expected, "executed literal type {}", literal.r#type());
+        }
     }
 
     #[test]

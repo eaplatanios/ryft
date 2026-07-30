@@ -261,6 +261,8 @@ impl<'c, 't> DenseElementsAttributeRef<'c, 't> {
     mlir_dense_elements_attribute_elements!(mlir_type = Index, rust_type = usize);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt8, rust_type = u8);
     mlir_dense_elements_attribute_elements!(mlir_type = Int8, rust_type = i8);
+    mlir_dense_elements_attribute_elements!(mlir_type = UInt16, rust_type = u16);
+    mlir_dense_elements_attribute_elements!(mlir_type = Int16, rust_type = i16);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt32, rust_type = u32);
     mlir_dense_elements_attribute_elements!(mlir_type = Int32, rust_type = i32);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt64, rust_type = u64);
@@ -273,6 +275,8 @@ impl<'c, 't> DenseElementsAttributeRef<'c, 't> {
     mlir_dense_elements_attribute_element!(mlir_type = Index, rust_type = usize);
     mlir_dense_elements_attribute_element!(mlir_type = UInt8, rust_type = u8);
     mlir_dense_elements_attribute_element!(mlir_type = Int8, rust_type = i8);
+    mlir_dense_elements_attribute_element!(mlir_type = UInt16, rust_type = u16);
+    mlir_dense_elements_attribute_element!(mlir_type = Int16, rust_type = i16);
     mlir_dense_elements_attribute_element!(mlir_type = UInt32, rust_type = u32);
     mlir_dense_elements_attribute_element!(mlir_type = Int32, rust_type = i32);
     mlir_dense_elements_attribute_element!(mlir_type = UInt64, rust_type = u64);
@@ -566,6 +570,8 @@ impl<'c, 't> DenseIntegerElementsAttributeRef<'c, 't> {
     mlir_dense_elements_attribute_elements!(mlir_type = Index, rust_type = usize);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt8, rust_type = u8);
     mlir_dense_elements_attribute_elements!(mlir_type = Int8, rust_type = i8);
+    mlir_dense_elements_attribute_elements!(mlir_type = UInt16, rust_type = u16);
+    mlir_dense_elements_attribute_elements!(mlir_type = Int16, rust_type = i16);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt32, rust_type = u32);
     mlir_dense_elements_attribute_elements!(mlir_type = Int32, rust_type = i32);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt64, rust_type = u64);
@@ -575,6 +581,8 @@ impl<'c, 't> DenseIntegerElementsAttributeRef<'c, 't> {
     mlir_dense_elements_attribute_element!(mlir_type = Index, rust_type = usize);
     mlir_dense_elements_attribute_element!(mlir_type = UInt8, rust_type = u8);
     mlir_dense_elements_attribute_element!(mlir_type = Int8, rust_type = i8);
+    mlir_dense_elements_attribute_element!(mlir_type = UInt16, rust_type = u16);
+    mlir_dense_elements_attribute_element!(mlir_type = Int16, rust_type = i16);
     mlir_dense_elements_attribute_element!(mlir_type = UInt32, rust_type = u32);
     mlir_dense_elements_attribute_element!(mlir_type = Int32, rust_type = i32);
     mlir_dense_elements_attribute_element!(mlir_type = UInt64, rust_type = u64);
@@ -610,6 +618,8 @@ mlir_dense_elements_attribute_from_element!(DenseIntegerElementsAttributeRef, ml
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = Bool, rust_type = bool);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = UInt8, rust_type = u8);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = Int8, rust_type = i8);
+mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = UInt16, rust_type = u16);
+mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = Int16, rust_type = i16);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = UInt32, rust_type = u32);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = Int32, rust_type = i32);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = UInt64, rust_type = u64);
@@ -1218,8 +1228,18 @@ mod tests {
     #[test]
     fn test_dense_integer_elements_attribute() {
         let context = Context::new();
+        let i16_type = context.signless_integer_type(16);
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
+        let u16_type = context.unsigned_integer_type(16);
+
+        let tensor_type = context.tensor_type(i16_type, &[Size::Static(2)], None, context.unknown_location()).unwrap();
+        let attribute = context.dense_i16_elements_attribute(tensor_type, &[-0x1234, 0x2345]).unwrap();
+        assert_eq!(unsafe { attribute.i16_elements().collect::<Result<Vec<_>, _>>().unwrap() }, vec![-0x1234, 0x2345]);
+
+        let tensor_type = context.tensor_type(u16_type, &[Size::Static(2)], None, context.unknown_location()).unwrap();
+        let attribute = context.dense_u16_elements_attribute(tensor_type, &[0x1234, 0xfedc]).unwrap();
+        assert_eq!(unsafe { attribute.u16_elements().collect::<Result<Vec<_>, _>>().unwrap() }, vec![0x1234, 0xfedc]);
 
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(3)], None, context.unknown_location()).unwrap();
         let attribute = context.dense_i64_elements_attribute(tensor_type, &[10, 20, 30]).unwrap();

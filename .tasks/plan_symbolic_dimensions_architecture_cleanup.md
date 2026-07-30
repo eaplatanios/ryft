@@ -1355,6 +1355,11 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 - [x] P4b4a broadcast correctness: require an identity axis mapping for canonical traced no-op elimination, preserve
       the true identity zero-instruction path, reject dynamically typed concrete targets before eager materialization,
       and cover equal-shape axis permutation in eager and traced execution.
+- [x] P4b4b exact rank-positive literal lowering: replace the lossy `f64` bridge with exact element-type-directed
+      dense construction, keep one-element rank-positive literals shaped, preserve all materializable storage families
+      including low-precision and complex payload bits, and verify representative literals through CPU execution.
+- [ ] P4b4c fill memory fidelity: construct fill's rank-zero literal in the requested output memory while preserving
+      the canonical constant-plus-broadcast decomposition and broadcast's memory-mismatch validation.
 - [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
       the unrelated `ReshapeParameters`/`ReshapeOperation` permutation builder and carry no ambient extent state.
 - [x] `with_source_array` no longer exists.
