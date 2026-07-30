@@ -9,8 +9,7 @@ pub mod slicing;
 pub mod transposition;
 
 pub use broadcasting::{
-    BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation, DYNAMIC_BROADCAST_OPERATION_NAME,
-    DynamicBroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation, LegacyDynamicBroadcast,
+    BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation,
 };
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation};
 pub use conversion::{

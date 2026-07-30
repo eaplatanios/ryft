@@ -24,9 +24,9 @@ use ryft_core::operations::differentiation::CoordinateBasisOperation;
 #[cfg(test)]
 use ryft_core::operations::manipulation::ReshapeParameters;
 use ryft_core::operations::manipulation::{
-    ConvertElementType, ConvertElementTypeOperation, DynamicBroadcastOperation, GatherOperation, GatherScatterMode,
-    LegacyBroadcastOperation, LegacyReshapeOperation, PadOperation, ReshapeDimensionExpression, ScatterOperation,
-    ScatterReductionKind, SliceOperation, TransposeOperation,
+    ConvertElementType, ConvertElementTypeOperation, GatherOperation, GatherScatterMode, LegacyBroadcastOperation,
+    LegacyReshapeOperation, PadOperation, ReshapeDimensionExpression, ScatterOperation, ScatterReductionKind,
+    SliceOperation, TransposeOperation,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
@@ -1514,27 +1514,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LegacyBroadcastOperatio
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DynamicBroadcastOperation {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_dynamic_broadcast_to_mlir(
-            self,
-            input_values,
-            lowerer.input_types.as_slice(),
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )
-    }
-}
-
 /// Returns whether a broadcast requires an explicit output-placement constraint.
 fn broadcast_changes_explicit_sharding(input_type: &ArrayType, output_type: &ArrayType, output_axes: &[usize]) -> bool {
     let Some(output_sharding) = output_type.sharding() else {
@@ -1603,100 +1582,6 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     let result = broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
-    if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], operation.output_axes()) {
-        lower_sharding_constraint(&[result], output_types[0].sharding().unwrap(), block, location)
-    } else {
-        Ok(vec![result])
-    }
-}
-
-/// Lowers a runtime-sized broadcast and constrains any explicit output placement transition.
-#[allow(clippy::too_many_arguments)]
-fn lower_dynamic_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &DynamicBroadcastOperation,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    check_count!("input", input_values, 2, ProgramError);
-    check_count!("input", input_types, 2, ProgramError);
-    check_count!("output", output_types, 1, ProgramError);
-    let output_type = &output_types[0];
-
-    // XLA's StableHLO translator does not accept `dynamic_broadcast_in_dim`. Bounded dynamic outputs have an
-    // equivalent XLA-native representation: broadcast to the static upper-bound shape, then use
-    // `set_dimension_size` to attach each runtime logical extent. This requires every mapped input dimension to be
-    // statically broadcast-compatible with that upper bound; truly unbounded dimensions and runtime-dependent mapped
-    // input dimensions cannot be represented by the pinned XLA backend.
-    let upper_bound_dimensions = output_type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| match dimension {
-            Dimension::Static(size) => Ok(Dimension::Static(*size)),
-            Dimension::Dynamic(variable) => variable.bounds().upper().map(Dimension::Static).ok_or_else(|| {
-                LoweringError::UnsupportedOp { op: "dynamic broadcast with an unbounded output dimension".to_string() }
-            }),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for (input_axis, output_axis) in operation.output_axes().iter().copied().enumerate() {
-        let Dimension::Static(input_size) = input_types[0].dimension(input_axis as isize) else {
-            return Err(LoweringError::UnsupportedOp {
-                op: "dynamic broadcast with a runtime-dependent mapped input dimension".to_string(),
-            });
-        };
-        let Dimension::Static(output_bound) = upper_bound_dimensions[output_axis] else {
-            unreachable!("upper-bound dimensions are static by construction")
-        };
-        if input_size != 1 && input_size != output_bound {
-            return Err(LoweringError::UnsupportedOp {
-                op: format!(
-                    "dynamic broadcast maps input dimension {input_axis} of size {input_size} to output dimension \
-                     {output_axis} with upper bound {output_bound}",
-                ),
-            });
-        }
-    }
-
-    let upper_bound_type = output_type.clone().with_shape(Shape::new(upper_bound_dimensions));
-    let upper_bound_tensor_type = lower_tensor_type(&upper_bound_type, context, location)?;
-    let broadcast = block.append_operation(stable_hlo::broadcast(
-        input_values[0],
-        upper_bound_tensor_type,
-        operation.output_axes(),
-        location,
-    )?)?;
-    let mut result = broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
-    let i32_scalar_type = context
-        .tensor_type(context.signless_integer_type(32), &[], None, location)
-        .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
-    let mut refined_type = upper_bound_type;
-    for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
-        if !matches!(dimension, Dimension::Dynamic(_)) {
-            continue;
-        }
-        let size = block.append_operation(stable_hlo::slice(input_values[1], &[axis], &[axis + 1], &[1], location)?)?;
-        let size = size.result(0).expect("stablehlo.slice should return one result").as_ref();
-        let size = block.append_operation(stable_hlo::reshape(size, &[], location)?)?;
-        let size = size.result(0).expect("stablehlo.reshape should return one result").as_ref();
-        let size = block.append_operation(stable_hlo::convert(size, i32_scalar_type, location)?)?;
-        let size = size.result(0).expect("stablehlo.convert should return one result").as_ref();
-        let mut dimensions = refined_type.shape().dimensions().to_vec();
-        dimensions[axis] = dimension;
-        refined_type = refined_type.with_shape(Shape::new(dimensions));
-        let refined_tensor_type = lower_tensor_type(&refined_type, context, location)?;
-        let set_size = block.append_operation(stable_hlo::set_dimension_size(
-            result,
-            size,
-            refined_tensor_type,
-            axis,
-            location,
-        )?)?;
-        result = set_size.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
-    }
     if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], operation.output_axes()) {
         lower_sharding_constraint(&[result], output_types[0].sharding().unwrap(), block, location)
     } else {
@@ -2264,16 +2149,6 @@ where
                 mode,
                 lowerer,
             ),
-            Self::DynamicBroadcast(operation) => {
-                <DynamicBroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    operation,
-                    input_values,
-                    regions,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
             Self::Slice(operation) => lower_slice_to_mlir(
                 operation,
                 input_values,
@@ -4533,16 +4408,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     lowerer,
                 )
             }
-            ArrayOperation::DynamicBroadcast(operation) => {
-                <DynamicBroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    operation,
-                    input_values,
-                    regions,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
             ArrayOperation::Reduce(operation) => {
                 check_count!("output", output_types, 1, ProgramError);
                 let value = lower_reduce_to_mlir(
@@ -5729,19 +5594,6 @@ where
                     });
                 }
                 XlaOperation::Broadcast(operation)
-                    if broadcast_changes_explicit_sharding(
-                        region.atoms()[instruction.inputs()[0].index()].r#type().as_ref(),
-                        operation.output_type(),
-                        operation.output_axes(),
-                    ) =>
-                {
-                    let output_sharding = operation.output_type().sharding().unwrap();
-                    mesh = Some(match mesh.take() {
-                        Some(existing_mesh) => merge_logical_meshes(&existing_mesh, output_sharding.mesh())?,
-                        None => output_sharding.mesh().clone(),
-                    });
-                }
-                XlaOperation::DynamicBroadcast(operation)
                     if broadcast_changes_explicit_sharding(
                         region.atoms()[instruction.inputs()[0].index()].r#type().as_ref(),
                         operation.output_type(),
@@ -8031,15 +7883,6 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.context,
             lowerer.location,
         ),
-        XlaOperation::DynamicBroadcast(operation) => lower_dynamic_broadcast_to_mlir(
-            operation,
-            input_values,
-            lowerer.input_types.as_slice(),
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
         XlaOperation::Reduce(operation) => {
             check_count!("output", output_types, 1, ProgramError);
             let value = lower_reduce_to_mlir(
@@ -9660,9 +9503,8 @@ mod tests {
     use ryft_core::operations::control_flow::SelectOperation;
     use ryft_core::operations::logical::{AndOperation, OrOperation, XorOperation};
     use ryft_core::operations::manipulation::{
-        ConcatenateOperation, DynamicBroadcastOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-        LegacyBroadcastOperation, LegacyReshapeOperation, PadOperation, SliceOperation, Transpose,
-        UpdateSliceOperation,
+        ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, LegacyBroadcastOperation,
+        LegacyReshapeOperation, PadOperation, SliceOperation, Transpose, UpdateSliceOperation,
     };
     use ryft_core::operations::math::{
         Atan2Operation, Cos, DivOperation, Dot, DotDimensionNumbers, ReduceOperation, Sin,
@@ -10225,153 +10067,6 @@ mod tests {
                 }
             "#},
         );
-    }
-
-    #[test]
-    fn test_plain_dynamic_broadcast_lowers_to_bounded_runtime_shape() {
-        let input_type = test_matrix_type(1, 3);
-        let dimensions_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
-        let output_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![
-                dynamic_dimension("batch", Some(2)),
-                Dimension::Static(3),
-                dynamic_dimension("width", Some(4)),
-            ]),
-        );
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, DynamicBroadcastOperation>::new();
-        let input = builder.add_input(input_type);
-        let dimensions = builder.add_input(dimensions_type);
-        let output = builder
-            .add_instruction(
-                DynamicBroadcastOperation::new(output_type, vec![2, 1]),
-                Vec::new(),
-                vec![input, dimensions],
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-
-        assert_eq!(
-            stablehlo,
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<1x3xf32>, %arg1: tensor<3xi64>) -> tensor<?x3x?xf32, #stablehlo.bounds<1, ?, 3>> {
-                    %0 = stablehlo.broadcast_in_dim %arg0, dims = [2, 1] : (tensor<1x3xf32>) -> tensor<2x3x4xf32>
-                    %1 = stablehlo.slice %arg1 [0:1] : (tensor<3xi64>) -> tensor<1xi64>
-                    %2 = stablehlo.reshape %1 : (tensor<1xi64>) -> tensor<i64>
-                    %3 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
-                    %4 = stablehlo.set_dimension_size %0, %3, dim = 0 : (tensor<2x3x4xf32>, tensor<i32>) -> tensor<?x3x4xf32, #stablehlo.bounds<1, ?, ?>>
-                    %5 = stablehlo.slice %arg1 [2:3] : (tensor<3xi64>) -> tensor<1xi64>
-                    %6 = stablehlo.reshape %5 : (tensor<1xi64>) -> tensor<i64>
-                    %7 = stablehlo.convert %6 : (tensor<i64>) -> tensor<i32>
-                    %8 = stablehlo.set_dimension_size %4, %7, dim = 2 : (tensor<?x3x4xf32, #stablehlo.bounds<1, ?, ?>>, tensor<i32>) -> tensor<?x3x?xf32, #stablehlo.bounds<1, ?, 3>>
-                    return %8 : tensor<?x3x?xf32, #stablehlo.bounds<1, ?, 3>>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_dynamic_broadcast_executes_with_runtime_varying_shapes_on_cpu() {
-        use std::sync::Arc;
-
-        use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
-        use ryft_pjrt::{
-            BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
-            load_cpu_plugin,
-        };
-
-        use crate::tests::{values_from_bytes, values_to_bytes};
-
-        let input_type = test_matrix_type(1, 3);
-        let dimensions_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
-        let output_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![
-                dynamic_dimension("batch", Some(2)),
-                Dimension::Static(3),
-                dynamic_dimension("width", Some(4)),
-            ]),
-        );
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, DynamicBroadcastOperation>::new();
-        let input = builder.add_input(input_type);
-        let dimensions = builder.add_input(dimensions_type);
-        let output = builder
-            .add_instruction(
-                DynamicBroadcastOperation::new(output_type, vec![2, 1]),
-                Vec::new(),
-                vec![input, dimensions],
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let executable = client
-            .compile(
-                &PjrtProgram::Mlir { bytecode: module.into_bytes() },
-                &CompilationOptions {
-                    argument_layouts: Vec::new(),
-                    parameter_is_tupled_arguments: false,
-                    executable_build_options: Some(ExecutableCompilationOptions {
-                        device_ordinal: -1,
-                        replica_count: 1,
-                        partition_count: 1,
-                        ..Default::default()
-                    }),
-                    compile_portable_executable: false,
-                    profile_version: 0,
-                    serialized_multi_slice_configuration: Vec::new(),
-                    environment_option_overrides: std::collections::HashMap::new(),
-                    target_config: None,
-                    allow_in_place_mlir_modification: false,
-                    matrix_unit_operand_precision: Precision::Default as i32,
-                },
-            )
-            .unwrap();
-        let device = executable.addressable_devices().unwrap()[0].clone();
-        let input_bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0]);
-
-        for (dimensions, expected) in [
-            ([2i64, 3, 2], vec![1.0f32, 1.0, 2.0, 2.0, 3.0, 3.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]),
-            ([1i64, 3, 4], vec![1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0]),
-        ] {
-            let dimensions_bytes = values_to_bytes::<i64>(&dimensions);
-            let inputs = ExecutionDeviceInputs {
-                inputs: &[
-                    ExecutionInput {
-                        buffer: Arc::new(
-                            client
-                                .buffer(input_bytes.as_slice(), BufferType::F32, &[1, 3], None, device.clone(), None)
-                                .unwrap(),
-                        ),
-                        donatable: false,
-                    },
-                    ExecutionInput {
-                        buffer: Arc::new(
-                            client
-                                .buffer(dimensions_bytes.as_slice(), BufferType::I64, &[3], None, device.clone(), None)
-                                .unwrap(),
-                        ),
-                        donatable: false,
-                    },
-                ],
-                ..Default::default()
-            };
-            let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
-            let mut outputs = execution.block_until_ready().unwrap().remove(0);
-            assert_eq!(outputs.outputs.len(), 1);
-            let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
-            assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), expected);
-        }
     }
 
     #[test]

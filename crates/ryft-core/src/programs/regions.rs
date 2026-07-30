@@ -173,10 +173,8 @@ impl<V: Typed, O> Region<V, O> {
     /// Derives this [`Region`]'s closed [`TypeIdentitySignature`]. A definition-position constant establishes one
     /// immutable internal identity. A result definition whose [`TypeIdentity`](crate::TypeIdentity) occurs on an
     /// input/operand forwards that available identity, while any other result definition establishes one fresh internal
-    /// identity. During the staged migration to explicit dimension inputs/operands, a fresh identity whose first
-    /// occurrence is a result reference also establishes an internal identity. That fallback keeps existing
-    /// [`Shape`](crate::Shape)-producing array [`Operation`]s closed until their first-class
-    /// [`Dimension`](crate::Dimension) producer operands make the reference available before the result.
+    /// identity. Every result reference must either forward an operand identity or refer to a definition-position
+    /// occurrence on a sibling result.
     pub(crate) fn type_identity_signature(
         &self,
     ) -> Result<TypeIdentitySignature<<V::Type as Type>::Identity>, TypeError>
@@ -282,18 +280,11 @@ impl<V: Typed, O> Region<V, O> {
             })?;
 
             // Validate reference-position result occurrences after all sibling definitions are known. A reference must
-            // either be forwarded from an operand or refer to an identity defined by this instruction. The fallback
-            // below temporarily treats a previously unseen result reference as its definition for shape-producing
-            // operations whose explicit dimension producer operands have not yet replaced that legacy representation.
+            // either be forwarded from an operand or refer to an identity defined by this instruction.
             instruction.outputs().iter().try_for_each(|output| {
                 let r#type = self.atoms[output.index()].r#type();
                 r#type.identities().try_for_each(|(position, identity)| {
                     if position != TypeIdentityPosition::Reference {
-                        return Ok(());
-                    }
-                    if !identities.contains(identity) {
-                        identities.push(identity.clone());
-                        defined_identities.push(identity.clone());
                         return Ok(());
                     }
                     if !operand_identities.contains(identity) && !defined_identities.contains(identity) {
@@ -1536,6 +1527,19 @@ mod tests {
             Err(TypeError::Invalid { message })
                 if message
                     == "operation `structural` output type references identity boundary without consuming or defining it",
+        ));
+
+        let fresh_reference = structural_region(
+            vec![StructuralType::reference(boundary.clone())],
+            Vec::new(),
+            vec![(Vec::new(), vec![StructuralType::reference(fresh.clone())])],
+        );
+
+        assert!(matches!(
+            fresh_reference.type_identity_signature(),
+            Err(TypeError::Invalid { message })
+                if message
+                    == "operation `structural` output type references identity fresh without consuming or defining it",
         ));
 
         let duplicate_constant_definition: Region<StructuralType, StructuralOperation> = Region {

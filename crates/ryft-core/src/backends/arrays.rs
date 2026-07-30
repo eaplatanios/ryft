@@ -51,11 +51,11 @@ use crate::operations::dimensions::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
 use crate::operations::manipulation::conversion::ElementType;
 use crate::operations::manipulation::{
-    Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation, DynamicBroadcastOperation,
-    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Gather, GatherOperation,
-    GatherScatterMode, LegacyBroadcast, LegacyBroadcastOperation, LegacyDynamicBroadcast, LegacyReshapeOperation, Pad,
-    PadOperation, Permutation, Reshape, ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice,
-    SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation, DynamicSlice,
+    DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Gather, GatherOperation, GatherScatterMode,
+    LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Pad, PadOperation, Permutation, Reshape,
+    ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation, Transpose,
+    TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::math::dot::dot_general_evaluate;
 use crate::operations::math::reduce::{reduce_abstract, reduce_evaluate};
@@ -166,7 +166,6 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Transpose(TransposeOperation),
     Reshape(LegacyReshapeOperation),
     Broadcast(LegacyBroadcastOperation),
-    DynamicBroadcast(DynamicBroadcastOperation),
     Pad(PadOperation),
     Concatenate(ConcatenateOperation),
     Gather(GatherOperation),
@@ -1424,51 +1423,6 @@ impl LegacyBroadcast for Array {
     #[inline]
     fn legacy_broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         self.broadcast_to_type(output_type, output_axes)
-    }
-}
-
-impl LegacyDynamicBroadcast for Array {
-    fn legacy_dynamic_broadcast(
-        &self,
-        output_dimensions: &Self,
-        output_type: ArrayType,
-        output_axes: &[usize],
-    ) -> Result<Self, ProgramError> {
-        DynamicBroadcastOperation::new(output_type.clone(), output_axes.to_vec())
-            .infer_output_types(&[self.r#type.clone(), output_dimensions.r#type.clone()], &[])?;
-        let dimensions = output_dimensions
-            .values()
-            .iter()
-            .enumerate()
-            .map(|(index, dimension)| {
-                let value = match dimension {
-                    Scalar::I8(value) => usize::try_from(*value),
-                    Scalar::I16(value) => usize::try_from(*value),
-                    Scalar::I32(value) => usize::try_from(*value),
-                    Scalar::I64(value) => usize::try_from(*value),
-                    Scalar::U8(value) => Ok(usize::from(*value)),
-                    Scalar::U16(value) => Ok(usize::from(*value)),
-                    Scalar::U32(value) => usize::try_from(*value),
-                    Scalar::U64(value) => usize::try_from(*value),
-                    _ => unreachable!("dynamic broadcast output dimension types are validated before interpretation"),
-                };
-                value.map_err(|_| {
-                    TypeError::invalid(format!(
-                        "dynamic broadcast output dimension {index} has invalid value {dimension}",
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let shape = Shape::new(dimensions.into_iter().map(Dimension::Static).collect());
-        if !output_type.shape().is_refined_by(&shape) {
-            return Err(TypeError::invalid(format!(
-                "dynamic broadcast runtime shape {} does not refine declared output shape {}",
-                shape,
-                output_type.shape(),
-            ))
-            .into());
-        }
-        self.legacy_broadcast(output_type.with_shape(shape), output_axes)
     }
 }
 

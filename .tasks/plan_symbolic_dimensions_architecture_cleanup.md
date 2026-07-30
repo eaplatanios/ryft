@@ -11,7 +11,8 @@ ordinary dimension SSA through mixed inference, eager execution, PE, static matc
 instantiation, import, rendering, and direct composite lowering inside an explicit manual binder. All untiled modes
 also execute on two CPU devices. Bounded-dynamic batching, public XLA reachability through a composite shard-map body,
 dynamic adjoints, and final behavioral comparison fixtures remain deliberately assigned to Phases 4–6. Phase 4 has
-not begun as a complete production migration.
+begun with deletion of the obsolete packed-array dynamic-broadcast language and the temporary structural-closure
+fallback it was blocking; the complete production XLA/composite migration has not begun.
 
 This plan remains a containment and simplification follow-up to `.tasks/plan_first_class_dimension_programs.md`. It
 preserves that plan's user-visible capabilities and its decision to represent runtime dimensions as ordinary SSA
@@ -1152,9 +1153,11 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       exact and computed first-class extents accepted by the same `BroadcastOperation`; remove
       `BroadcastToDimensions`, the public packed-array `DynamicBroadcast` capability, and all old method names; retain
       one backend-only `backends::arrays::BroadcastKernel` contract for already-concrete eager output types. The frozen
-      `LegacyBroadcastOperation` and `DynamicBroadcastOperation` payloads remain hidden only for the homogeneous
-      `ArrayOperation` transform language and its XLA lowering/import consumers assigned to Phases 4–9. Exact
-      implementation and verification evidence is recorded in `.tasks/plan_broadcast_api_consolidation.md`.
+      `LegacyBroadcastOperation` remains hidden only for the homogeneous `ArrayOperation` transform language and its
+      XLA lowering/import consumers assigned to Phases 4–9. Phase 4 deleted the obsolete packed-array
+      `DynamicBroadcastOperation` after proving the canonical explicit-dimension broadcast superseded it. Exact
+      implementation and verification evidence is recorded here and in
+      `.tasks/plan_broadcast_api_consolidation.md`.
 - [x] P3h Delivery A: give the existing `ConcatenateOperation` a canonical mixed contract with a trailing explicit
       result-extent operand while retaining its unchanged homogeneous contract on the same axis-only payload. Mixed
       inference, eager validation, tracing, partial evaluation, identity instantiation, and import are complete.
@@ -1170,7 +1173,7 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       three genuinely mixed contracts; retain dynamic slice, JAX-compatible gather, ordinary slice, and reduce as
       array-only operations; and do not introduce the archived slice-scatter payload. The complete classification,
       migration, and deletion gates are specified in `.tasks/plan_p3i_remaining_shape_operations.md`.
-- [ ] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
+- [x] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
       first-class result-dimension operands. After this point, a fresh output reference without an available operand or
       a definition-position occurrence is a closure error.
 - [ ] Delete each frozen homogeneous reshape/broadcast implementation and transform rule as its owning Phase 4–9
@@ -1194,17 +1197,15 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
 - [x] Let a concrete output establish the first refinement for any identity already established by the formal input
       signature as well as for an identity defined internally. This is sound without inspecting runtime payloads:
       structural region closure already rejects an instruction result reference unless that instruction consumes or
-      defines the identity (or is temporarily classified as an internal definition by P1c's fresh-reference fallback),
-      and each mixed eager rule validates or constructs its concrete output from those explicit operands. The
-      allocation-free one-vector/input-split representation is implemented.
+      defines the identity, and each mixed eager rule validates or constructs its concrete output from those explicit
+      operands. The allocation-free one-vector/input-split representation is implemented.
       `TypeRefinements::validate` is parameterized by the complete identity *slice* (`&[T::Identity]`) rather than the
       `TypeIdentitySignature` container; refinement validation needs authority membership but not the signature's
       input/internal partition.
 - [x] Add focused negative tests proving that an already-established output identity without a consumed/defined edge
-      fails closure and that two concrete outputs for one input-owned identity must agree. Preserve the temporary
-      fresh-result-reference fallback until the explicit-operand migration item above deletes it; do not add a test
-      that contradicts that documented transitional behavior. Positive non-exact eager/refinement coverage exists for
-      reshape, broadcast, and `DynamicZero`.
+      fails closure, that a fresh output reference without a consumed/defined edge fails closure, and that two concrete
+      outputs for one input-owned identity must agree. Positive non-exact eager/refinement coverage exists for reshape,
+      broadcast, and `DynamicZero`.
 - [x] Validate every concrete `DynamicZero` extent against the corresponding stored dynamic variable's bounds inside
       the eager rule before allocating the output. Program interpretation does not validate intermediate instruction
       result types, and `EagerContext::bind` does not run inference, so final-boundary refinement alone is insufficient
@@ -1310,6 +1311,11 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 6. Only after all region and transform tests pass, delete duplicated homogeneous lowering dispatch and narrow or
    remove the old full `ArrayOperation` family according to the remaining consumer ledger.
 
+- [x] P4a delete the obsolete packed integer-array `DynamicBroadcastOperation`/`LegacyDynamicBroadcast` path from the
+      core operation and reference-backend families, XLA conversion/lowering, and tests. Canonical
+      `BroadcastOperation` with one explicit first-class dimension operand per output axis is now the sole
+      runtime-sized broadcast representation. This also removes the final dependency on P1c's fresh-result-reference
+      closure fallback.
 - [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
       the unrelated `ReshapeParameters`/`ReshapeOperation` permutation builder and carry no ambient extent state.
 - [x] `with_source_array` no longer exists.
@@ -2458,13 +2464,11 @@ PJRT execution.
 
 The public API now exposes only `Broadcast`: exact constants, computed dimensions, right-aligned expansion, and
 leading expansion all bind the same mixed operation. `backends::arrays::BroadcastKernel` is the backend-only eager
-kernel over an already-concrete `ArrayType`; it cannot stage an operation or turn metadata into shape authority. The
-old homogeneous implementations remain hidden and frozen for the immediately following consumer migration and
-deletion increments.
-Their current owners are the homogeneous `ArrayOperation` transform implementations (batching, differentiation,
-control flow, attention, collectives, fill, slicing, dot/reduce, sharding, and sorting) plus `XlaOperation` lowering,
-eager, JIT, and shard-map consumers. Deletion remains gated on those Phase 4–9 domains moving to the composite graph.
-The detailed consolidation and residual evidence is in `.tasks/plan_broadcast_api_consolidation.md`.
+kernel over an already-concrete `ArrayType`; it cannot stage an operation or turn metadata into shape authority.
+Phase 4 removed the packed integer-array `DynamicBroadcastOperation` representation and its backend capability,
+transform rules, XLA lowering, and tests. The static-metadata `LegacyBroadcastOperation` remains hidden and frozen
+until its homogeneous `ArrayOperation` transform and XLA consumers migrate to the composite graph. The detailed
+consolidation and residual evidence is in `.tasks/plan_broadcast_api_consolidation.md` and the P4a review below.
 
 ### Execution: P3h Delivery A explicit concatenate result extent
 
@@ -2596,3 +2600,30 @@ storage and tracing before public dynamic programs can reach that path.
 
 The complete implementation ledger and remaining JAX-parity continuation are in
 `.tasks/plan_p3k_collective_dimensions.md`.
+
+### Execution: P4a packed dynamic-broadcast deletion and structural-closure completion
+
+The first Phase 4 review unit deleted the obsolete homogeneous runtime broadcast representation rather than carrying
+it through the production XLA migration. `DynamicBroadcastOperation` encoded output extents as a rank-one integer
+array, duplicated the canonical mixed broadcast's inference, eager, batching, differentiation, and lowering behavior,
+and was the only remaining operation whose result type introduced a fresh dynamic identity without an explicit
+dimension producer edge. The operation, `LegacyDynamicBroadcast` capability, `ArrayOperation` and `XlaOperation`
+variants, reference-backend implementation, XLA lowering, and dedicated tests are gone. StableHLO's
+`dynamic_broadcast_in_dim` wrapper is unrelated backend IR and remains available. The surviving canonical composite
+broadcast test now executes one compiled bounded-dynamic program at multiple extents, so deleting the packed
+representation does not reduce runtime-varying-shape coverage.
+
+With that producer removed, `Region::type_identity_signature` no longer treats a previously unseen
+reference-position result identity as an internal definition. Every result reference must now forward an operand
+identity or refer to a definition-position occurrence on a sibling result. The structural closure suite includes the
+corresponding fresh-reference negative regression. The full core gate also exposed and corrected one stale expected
+diagnostic so dynamic constructor messages consistently render `dimension<name: bounds>`.
+
+Verification for this review unit:
+
+- `cargo test -p ryft-core --lib`: 1,014 passed;
+- `cargo test -p ryft-xla --lib`: 417 passed and one pre-existing benchmark ignored;
+- `cargo test -p ryft-macros-tests`: both 17-test integration suites passed, including all compile-fail fixtures;
+- targeted searches find no core/XLA occurrence of `DynamicBroadcastOperation`, `LegacyDynamicBroadcast`,
+  `DYNAMIC_BROADCAST_OPERATION_NAME`, or an operation-family `DynamicBroadcast` variant; and
+- `cargo fmt --all -- --check` and `git diff --check` passed.

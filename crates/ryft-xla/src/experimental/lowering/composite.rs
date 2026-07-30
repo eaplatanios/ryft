@@ -1556,30 +1556,34 @@ mod tests {
             .unwrap();
         let device = executable.addressable_devices().unwrap()[0].clone();
         let value_bytes = values_to_bytes(&[2.5_f32]);
-        let extent_bytes = values_to_bytes(&[3_i64]);
-        let inputs = ExecutionDeviceInputs {
-            inputs: &[
-                ExecutionInput {
-                    buffer: Arc::new(
-                        client
-                            .buffer(value_bytes.as_slice(), BufferType::F32, &[], None, device.clone(), None)
-                            .unwrap(),
-                    ),
-                    donatable: false,
-                },
-                ExecutionInput {
-                    buffer: Arc::new(
-                        client.buffer(extent_bytes.as_slice(), BufferType::I64, &[], None, device, None).unwrap(),
-                    ),
-                    donatable: false,
-                },
-            ],
-            ..Default::default()
-        };
-        let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
-        let mut outputs = execution.block_until_ready().unwrap().remove(0);
-        let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
-        assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![2.5_f32, 2.5, 2.5]);
+        for extent in [3_i64, 5] {
+            let extent_bytes = values_to_bytes(&[extent]);
+            let inputs = ExecutionDeviceInputs {
+                inputs: &[
+                    ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(value_bytes.as_slice(), BufferType::F32, &[], None, device.clone(), None)
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    },
+                    ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(extent_bytes.as_slice(), BufferType::I64, &[], None, device.clone(), None)
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    },
+                ],
+                ..Default::default()
+            };
+            let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+            let mut outputs = execution.block_until_ready().unwrap().remove(0);
+            let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), vec![2.5_f32; extent as usize]);
+        }
     }
 
     #[test]
