@@ -4095,6 +4095,67 @@ mod tests {
     }
 
     #[test]
+    fn test_eager_bind_condition_branches_consume_forwarded_dimension_authority() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let extent = DimensionValue::constant(3).unwrap();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+
+        let branch = |negate: bool| {
+            let mut builder = XlaProgramBuilder::new();
+            let extent = builder.add_input(extent.r#type().clone().into());
+            let scalar = builder.add_input(scalar_type.clone().into());
+            let scalar = if negate {
+                builder.add_instruction(NegOperation, Vec::new(), vec![scalar]).unwrap()[0]
+            } else {
+                scalar
+            };
+            let output = builder
+                .add_instruction(BroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let operation = XlaOperation::Condition(ConditionOperation::new());
+        let scalar = f32_scalar(&client, &mesh, 2.0);
+
+        let true_outputs = domain
+            .bind(
+                operation.clone(),
+                [branch(false), branch(true)],
+                &[
+                    ArrayProgramValue::Array(boolean_scalar(&client, &mesh, true)),
+                    ArrayProgramValue::Dimension(extent.clone()),
+                    ArrayProgramValue::Array(scalar.clone()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(program_array(&true_outputs[0]).shape(), StaticShape::new(vec![3]));
+        assert_eq!(read_f32s(&client, program_array(&true_outputs[0])), vec![2.0; 3]);
+
+        let false_outputs = domain
+            .bind(
+                operation,
+                [branch(false), branch(true)],
+                &[
+                    ArrayProgramValue::Array(boolean_scalar(&client, &mesh, false)),
+                    ArrayProgramValue::Dimension(extent),
+                    ArrayProgramValue::Array(scalar),
+                ],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, program_array(&false_outputs[0])), vec![-2.0; 3]);
+        assert_eq!(domain.cache_size(), 1, "both branch selections must share one compiled executable");
+    }
+
+    #[test]
     fn test_eager_bind_executes_bounded_while() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();

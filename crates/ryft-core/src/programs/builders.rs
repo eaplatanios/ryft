@@ -220,39 +220,39 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             .collect::<Result<Vec<_>, _>>()?;
         let mut program = program.with_instantiated_type_identities(input_types.as_slice())?;
 
-        // A fresh target must not alias any identity already live in the destination entry or its sealed regions.
-        let mut unavailable_identities = Vec::new();
+        // A fresh target must not alias any type identity already live in the destination entry or its sealed regions.
+        let mut unavailable_type_identities = Vec::new();
         for atom in &self.atoms {
             let r#type = atom.r#type();
-            unavailable_identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
+            unavailable_type_identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
         }
         for region_index in 0..self.regions.len() {
             let signature = self
                 .regions
                 .type_identity_signature(RegionId::new(region_index))
                 .expect("iterating a region arena by index must produce valid region identifiers");
-            unavailable_identities.extend(signature.identities().iter().cloned());
+            unavailable_type_identities.extend(signature.identities().iter().cloned());
         }
 
         // Reserve every source type identity before generating targets, while retaining the internally defined subset
         // that this splice must rename.
-        let mut internal_identities = Vec::new();
+        let mut internal_type_identities = Vec::new();
         for region_index in 0..program.regions().len() {
             let signature = program
                 .regions()
                 .type_identity_signature(RegionId::new(region_index))
                 .expect("iterating a region arena by index must produce valid region identifiers");
-            unavailable_identities.extend(signature.identities().iter().cloned());
-            internal_identities.extend(signature.internal_identities().iter().cloned());
+            unavailable_type_identities.extend(signature.identities().iter().cloned());
+            internal_type_identities.extend(signature.internal_identities().iter().cloned());
         }
 
         let mut renaming = TypeIdentityRenaming::new();
-        for identity in internal_identities {
+        for identity in internal_type_identities {
             if renaming.replacements().iter().any(|(source, _)| source == &identity) {
                 continue;
             }
-            let target = renaming.insert_fresh(identity, unavailable_identities.as_slice())?;
-            unavailable_identities.push(target);
+            let target = renaming.insert_fresh(identity, unavailable_type_identities.as_slice())?;
+            unavailable_type_identities.push(target);
         }
 
         if !renaming.is_identity() {

@@ -1158,6 +1158,9 @@ mod tests {
     use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};
+    use ryft_core::operations::control_flow::ConditionOperation;
+    use ryft_core::operations::dimensions::DimensionFromScalarOperation;
+    use ryft_core::operations::manipulation::BroadcastOperation;
     use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
@@ -1234,6 +1237,97 @@ mod tests {
             .unwrap(),
             vec![array_type, dimension_type],
         );
+    }
+
+    #[test]
+    fn test_gateway_region_program_imports_with_fresh_alpha_equivalent_identities() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let extent_type = DimensionType::new(extent.clone());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+
+        let branch = || {
+            let mut builder = XlaProgramBuilder::new();
+            let extent = builder.add_input(extent_type.clone().into());
+            let scalar = builder.add_input(scalar_type.clone().into());
+            let output = builder
+                .add_instruction(BroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+
+        let integer_type = ArrayType::scalar(DataType::I32);
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let mut source_builder = XlaProgramBuilder::new();
+        let true_region = source_builder.import_region(branch().entry_region_ref());
+        let false_region = source_builder.import_region(branch().entry_region_ref());
+        let integer = source_builder.add_input(integer_type.clone().into());
+        let predicate = source_builder.add_input(predicate_type.clone().into());
+        let scalar = source_builder.add_input(scalar_type.clone().into());
+        let gateway = source_builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![integer])
+            .unwrap()[0];
+        let output = source_builder
+            .add_instruction(
+                XlaOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, gateway, scalar],
+            )
+            .unwrap()[0];
+        let source = source_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(source.output_types(), vec![ArrayProgramType::Array(output_type)]);
+
+        let mut destination = XlaProgramBuilder::new();
+        let integer = destination.add_input(integer_type.into());
+        let predicate = destination.add_input(predicate_type.into());
+        let scalar = destination.add_input(scalar_type.into());
+        let first = destination.splice_program(&source, &[integer, predicate, scalar]).unwrap()[0];
+        let second = destination.splice_program(&source, &[integer, predicate, scalar]).unwrap()[0];
+
+        let [first_gateway, first_condition, second_gateway, second_condition] = destination.instructions() else {
+            panic!("expected two imported gateway-condition pairs");
+        };
+        assert_eq!(first_condition.inputs(), &[predicate, first_gateway.outputs()[0], scalar]);
+        assert_eq!(second_condition.inputs(), &[predicate, second_gateway.outputs()[0], scalar]);
+        assert_eq!(first_condition.outputs(), &[first]);
+        assert_eq!(second_condition.outputs(), &[second]);
+        assert_eq!(first_condition.regions().len(), 2);
+        assert_eq!(second_condition.regions().len(), 2);
+
+        let first_type = destination.atoms()[first_gateway.outputs()[0].index()].r#type().into_owned();
+        let second_type = destination.atoms()[second_gateway.outputs()[0].index()].r#type().into_owned();
+        let first_dimension = <&DimensionType>::try_from(&first_type).unwrap();
+        let second_dimension = <&DimensionType>::try_from(&second_type).unwrap();
+        assert_ne!(first_dimension.variable(), second_dimension.variable());
+        assert_eq!(first_dimension.bounds(), second_dimension.bounds());
+        for (condition, dimension) in [(first_condition, first_dimension), (second_condition, second_dimension)] {
+            for region in condition.regions() {
+                let interface = destination.region_ref(*region).unwrap().interface();
+                assert_eq!(interface.input_types()[0], ArrayProgramType::Dimension(dimension.clone()));
+                let output = <&ArrayType>::try_from(&interface.output_types()[0]).unwrap();
+                assert_eq!(output.shape().dimensions(), &[Dimension::Dynamic(dimension.variable().clone())],);
+            }
+        }
+
+        destination
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![first, second],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
     }
 
     #[test]

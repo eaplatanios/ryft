@@ -4,15 +4,14 @@
 
 Active; repository state was re-audited on 2026-07-29 after the original side-chat history was lost. Phases 0–2,
 P3a–P3j, and the public broadcast consolidation are committed on `u/eaplatanios/dynamic-shapes`; the clean resumption
-point for the current review was `0278adba4617a89fcf9db88c7c27836b3e39d845`. The owner checkout now contains P3k's
-collective parity surface: all-gather, psum-scatter, and all-to-all support tiled and untiled shape semantics, validated
-participant groups, all-gather variance, and the `pshuffle`/`pswapaxes` compositions. Arithmetic tiled extents remain
-ordinary dimension SSA through mixed inference, eager execution, PE, static matching-axis batching, JVP, identity
-instantiation, import, rendering, and direct composite lowering inside an explicit manual binder. All untiled modes
-also execute on two CPU devices. Bounded-dynamic batching, public XLA reachability through a composite shard-map body,
-dynamic adjoints, and final behavioral comparison fixtures remain deliberately assigned to Phases 4–6. Phase 4 has
-begun with deletion of the obsolete packed-array dynamic-broadcast language and the temporary structural-closure
-fallback it was blocking; the complete production XLA/composite migration has not begun.
+point for the current review was `0278adba4617a89fcf9db88c7c27836b3e39d845`. P3k's collective parity surface now
+supports tiled and untiled shape semantics, validated participant groups, all-gather variance, and the
+`pshuffle`/`pswapaxes` compositions. Phase 4 has completed the production XLA/composite cutover and verified explicit
+dimension authority through condition, while, scan, eager branch execution, nested-region import, and repeated
+alpha-equivalent program splicing. Arithmetic extents remain ordinary dimension SSA through inference, eager
+execution, PE, JVP, import, rendering, and native lowering. Bounded-dynamic batching remains Phase 5, dynamic adjoints
+remain Phase 6, and checked gateway/public bounded-dynamic shard-map execution remains Phase 7 because it requires
+ordered assertion and `PadToStatic` lowering. The final current-JAX comparison fixtures remain an explicit P3k gate.
 
 This plan remains a containment and simplification follow-up to `.tasks/plan_first_class_dimension_programs.md`. It
 preserves that plan's user-visible capabilities and its decision to represent runtime dimensions as ordinary SSA
@@ -1270,8 +1269,9 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
       compositions. Complete this alongside Phase 4 shard-map migration so the composite graph, group-aware native
       StableHLO lowering, and bounded-dynamic multi-device fixtures land as one vertical slice rather than adding
       another temporary homogeneous API. The public semantics, shared native lowerers, direct composite binder
-      fixture, and static two-device execution are complete; the checkbox remains open only for production composite
-      shard-map reachability and final bounded-dynamic/JAX comparison gates.
+      fixture, production composite shard-map reachability, and static two-device execution are complete. The
+      checkbox remains open for Phase 5 bounded-dynamic batching, Phase 7 bounded-dynamic execution, and the final
+      current-JAX behavioral/StableHLO comparisons.
 - [ ] Phase 6 owner: route transform-generated zero/one values through structural zero or `zero_like`/`one_like`
       whenever an operand supplies geometry.
 - [ ] Phase 6 owner: migrate transform consumers that stage `ZeroOperation<ArrayType>` with possibly-dynamic types
@@ -1387,12 +1387,12 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 - [x] Replace production tests that rely on the complete homogeneous backend with canonical array-program tests;
       retain small local homogeneous enums only for focused generic tests.
 - [x] Migrate XLA operation conversion and compilation entry points to the sole stored array-program operation family.
-- [x] Carry explicit dimension operandWhys through condition, while, scan, custom derivatives, rematerialization, region
+- [x] Carry explicit dimension operands through condition, while, scan, custom derivatives, rematerialization, region
       capture/import, and caller/callee requirement composition.
 - [x] Make partial evaluation project known dimension integers and retain unknown dimension SSA without reconstruction;
       erase proven requirements, reject disproven requirements with exact diagnostics, and retain inconclusive ordered
       assertions.
-- [ ] Verify conditional and loop-carried extents, gateway compaction, region forwarding, and alpha-equivalent imports.
+- [x] Verify conditional and loop-carried extents, gateway compaction, region forwarding, and alpha-equivalent imports.
 - [ ] Rename the narrowed primitive family only after the old full family is deleted and all residual references are
       classified.
 - [x] Gate: targeted searches find no `with_dimensions`, `with_source_array`, `bind_replayed`, ambient replay
@@ -2654,8 +2654,8 @@ instantiation, and import as ordinary operand edges. The residual audit finds no
 witness, or transform-residual metadata in any collective payload and no payload with dual operation-type contracts.
 The direct composite XLA dispatcher accepts the same explicit manual-binder state used by production shard-map
 lowering, and a fixture proves the canonical dimension SSA graph reaches the shared native collective lowerer without
-reconstructing dimensions. The production attached shard-map body is still homogeneous, so Phase 4 must migrate its
-storage and tracing before public dynamic programs can reach that path.
+reconstructing dimensions. Phase 4 subsequently migrated production attached-region storage and tracing to that
+composite graph. Checked bounded-dynamic public execution remains Phase 7 boundary-materialization work.
 
 The complete implementation ledger and remaining JAX-parity continuation are in
 `.tasks/plan_p3k_collective_dimensions.md`.
@@ -2779,7 +2779,7 @@ Production coverage executes dimension-size arithmetic followed by dynamic broad
 behavior, retains the static eager/JIT/reshard/sharding/cache/profile-guided suites, and keeps exact Phase 5/6
 diagnostics where composite higher-order batching or reverse differentiation remains deliberately deferred.
 Inconclusive compiled requirement assertions remain Phase 7. Public bounded-dynamic shard-map execution and
-plugin-specific `PadToStatic` validation remain the named P3k/P5 continuation; static/manual shard-map production
+plugin-specific `PadToStatic` validation remain the named P3k/P7 continuation; static/manual shard-map production
 reachability is complete.
 
 Verification passed all 1,019 core library tests, all 396 runnable XLA library tests (one timing benchmark ignored),
@@ -2788,3 +2788,26 @@ XLA doctests, formatting, and diff hygiene. The residual scan found one composit
 composite lowerer, no retired dynamic-broadcast path, no disabled `cfg(any())` fixtures, and no public array API
 exposing `ArrayProgramValue`. The complete implementation ledger and exact evidence are recorded in
 `.tasks/plan_p4b_production_composite_xla.md`.
+
+### Execution: P4c composite region and identity verification
+
+Focused production fixtures now prove that condition branches, while state, and scan carries preserve first-class
+dimension SSA and use that authority directly to shape downstream array results. A CPU eager condition fixture
+executes both branch choices while sharing one compiled specialization.
+
+Repeatedly splicing a gateway-producing region graph exposed one generic ownership defect: identities defined inside
+the imported program were copied literally. `TypeIdentity::fresh` now gives program relocation the nominal primitive
+it needs, and `ProgramBuilder::splice_program` instantiates boundary identities before alpha-renaming all internal
+identities across the complete imported region arena. Fresh replacements are checked against all source and
+destination identities and all replacements generated earlier in the same splice. The regressions pin both collision
+rejection and distinct imported identities with the same diagnostic names and bounds, exact gateway-to-condition
+operand edges, and matching nested-region interfaces.
+
+Compiled `dimension_from_scalar` and public bounded-dynamic shard-map execution remain Phase 7 work because their
+range checks must lower as ordered assertions and their physical boundary requires the checked `PadToStatic` path.
+P4c did not weaken those contracts or add an unchecked temporary lowering.
+
+Verification passed all 1,020 core library tests, all 57 runnable core doctests (16 examples ignored), all 401
+runnable XLA library tests (one timing benchmark ignored), both macro integration suites, the XLA all-target check,
+formatting, and diff hygiene. The complete fixture and implementation ledger is recorded in
+`.tasks/plan_p4c_composite_region_verification.md`.

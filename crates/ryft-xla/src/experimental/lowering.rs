@@ -7864,10 +7864,12 @@ mod tests {
         ConstantOperation, Fill, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroOperation,
     };
     use ryft_core::operations::control_flow::SelectOperation;
+    use ryft_core::operations::dimensions::DimensionSizeOperation;
     use ryft_core::operations::logical::{AndOperation, OrOperation, XorOperation};
     use ryft_core::operations::manipulation::{
-        ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, LegacyBroadcastOperation,
-        LegacyReshapeOperation, PadOperation, SliceOperation, Transpose, UpdateSliceOperation,
+        BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+        LegacyBroadcastOperation, LegacyReshapeOperation, PadOperation, SliceOperation, Transpose,
+        UpdateSliceOperation,
     };
     use ryft_core::operations::math::{
         Atan2Operation, Cos, DivOperation, Dot, DotDimensionNumbers, ReduceOperation, Sin,
@@ -7875,7 +7877,7 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::builders::ProgramBuilder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
+    use ryft_core::types::dimensions::{DimensionBounds, DimensionType, DimensionVariable};
     use ryft_core::types::{Dimension, Shape};
     use ryft_core::{EagerContext, TypeError};
 
@@ -9878,6 +9880,76 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_forwards_dimension_extent_through_condition() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let extent_type = DimensionType::new(extent.clone());
+        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let output_type = dynamic_vector_type.clone();
+
+        let branch = |negate: bool| {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let branch_extent = builder.0.add_input(extent_type.clone().into());
+            let scalar = builder.add_input(scalar_type.clone());
+            let scalar = if negate {
+                builder.add_instruction(NegOperation, Vec::new(), vec![scalar]).unwrap()[0]
+            } else {
+                scalar
+            };
+            let output = builder
+                .add_instruction(BroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, branch_extent])
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_region = builder.import_region(branch(false).entry_region_ref());
+        let false_region = builder.import_region(branch(true).entry_region_ref());
+        let vector = builder.add_input(dynamic_vector_type.clone());
+        let predicate = builder.add_input(predicate_type.clone());
+        let scalar = builder.add_input(scalar_type.clone());
+        let extent = builder
+            .add_instruction(DimensionSizeOperation::new(&dynamic_vector_type, 0).unwrap(), Vec::new(), vec![vector])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                XlaOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, extent, scalar],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![dynamic_vector_type, predicate_type, scalar_type],
+            &vec![output_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(stablehlo.contains("stablehlo.get_dimension_size"), "{stablehlo}");
+        assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.set_dimension_size").count(), 2, "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
+    }
+
+    #[test]
     fn test_to_mlir_module_for_program_lowers_while_to_stablehlo_while() {
         let state_type = ArrayType::scalar(DataType::Boolean);
         let mut builder = CompositeXlaProgramBuilder::new();
@@ -9902,6 +9974,77 @@ mod tests {
         // An unbounded while emits no iteration-counter machinery.
         assert!(!stablehlo.contains("stablehlo.and"), "{stablehlo}");
         assert!(!stablehlo.contains("stablehlo.add"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_forwards_loop_carried_dimension_extent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let extent_type = DimensionType::new(extent.clone());
+        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+
+        let condition = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let extent = builder.0.add_input(extent_type.clone().into());
+            let predicate = builder
+                .add_instruction(
+                    XlaOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                    Vec::new(),
+                    vec![extent, extent],
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let extent = builder.0.add_input(extent_type.into());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![extent], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let vector = builder.add_input(dynamic_vector_type.clone());
+        let scalar = builder.add_input(scalar_type.clone());
+        let extent = builder
+            .add_instruction(DimensionSizeOperation::new(&dynamic_vector_type, 0).unwrap(), Vec::new(), vec![vector])
+            .unwrap()[0];
+        let carried_extent = builder
+            .add_instruction(
+                XlaOperation::While(WhileOperation::new()),
+                vec![condition_region, body_region],
+                vec![extent],
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(BroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, carried_extent])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![dynamic_vector_type.clone(), scalar_type],
+            &vec![dynamic_vector_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(stablehlo.contains("stablehlo.get_dimension_size"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.set_dimension_size"), "{stablehlo}");
     }
 
     #[test]
@@ -10040,6 +10183,54 @@ mod tests {
         assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_forwards_scan_carried_dimension_extent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let extent_type = DimensionType::new(extent.clone());
+        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let extent = builder.0.add_input(extent_type.into());
+            let value = builder.add_input(dynamic_vector_type.clone());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![extent, value],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder, Placeholder],
+                )
+                .unwrap()
+        };
+
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let body_region = builder.import_region(body.entry_region_ref());
+        let values = builder.add_input(dynamic_vector_type.clone());
+        let extent = builder
+            .add_instruction(DimensionSizeOperation::new(&dynamic_vector_type, 0).unwrap(), Vec::new(), vec![values])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(XlaOperation::Scan(ScanOperation::new(2, 3)), vec![body_region], vec![extent, values])
+            .unwrap()[1];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![dynamic_vector_type.clone()],
+            &vec![dynamic_vector_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(stablehlo.contains("stablehlo.get_dimension_size"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("tensor<?xf32, #stablehlo.bounds<8>>"), "{stablehlo}");
+        assert!(!stablehlo.contains("dimension_from_scalar"), "{stablehlo}");
     }
 
     #[test]
