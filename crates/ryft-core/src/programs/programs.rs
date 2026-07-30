@@ -14,7 +14,7 @@ use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
 use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef};
 use crate::programs::types::{Type, Typed};
-use crate::programs::values::{Value, ValueId};
+use crate::programs::values::{Value, ValueId, ValueProjection};
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend.
 /// A program owns a flat arena of [`Region`]s. One region implements its public entry point, and every other region
@@ -522,6 +522,60 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         check_count!("input", self.input_ids(), input_structure.parameter_count(), ProgramError);
         check_count!("output", self.output_ids(), output_structure.parameter_count(), ProgramError);
         Ok(Program { input_structure, output_structure, regions: self.regions, entry: self.entry, marker: PhantomData })
+    }
+
+    /// Consumes this [`Program`] over projected values and operations and embeds it in its unprojected value and
+    /// operation families. The conversion changes only the stored value, type, and operation representations. It
+    /// preserves every [`AtomId`], [`RegionId`], instruction edge, attached-region edge, shared region, and public
+    /// parameter structure. Constants are lifted through [`ValueProjection::from_projected`], variable types through
+    /// `From<V::Type>`, and operations through `From<O>`. The mapped region arena is then rebuilt through
+    /// [`Program::new`], which revalidates structural closure and derives effects and type-identity metadata
+    /// from the converted graph exactly once.
+    ///
+    /// This is the canonical bridge for unprojecting an already-built member program into its containing program
+    /// family. It does not interpret or replay any instruction and therefore cannot lose Single Static Assignment
+    /// (SSA) identity or reconstruct dependencies outside the source graph.
+    pub fn into_unprojected<UnprojectedValue, UnprojectedOperation>(
+        self,
+    ) -> Result<
+        Program<UnprojectedValue, UnprojectedOperation, Input::To<UnprojectedValue>, Output::To<UnprojectedValue>>,
+        ProgramError,
+    >
+    where
+        UnprojectedValue: Value + ValueProjection<V::Type, Projected = V>,
+        UnprojectedValue::Type: From<V::Type>,
+        UnprojectedOperation: Operation<UnprojectedValue::Type> + From<O>,
+        Input::Family: ParameterizedFamily<UnprojectedValue>,
+        Output::Family: ParameterizedFamily<UnprojectedValue>,
+    {
+        let Program { input_structure, output_structure, regions, entry, .. } = self;
+        let regions = regions
+            .into_regions()
+            .into_iter()
+            .map(|region| Region {
+                atoms: region
+                    .atoms
+                    .into_iter()
+                    .map(|atom| match atom {
+                        Atom::Constant(value) => {
+                            Atom::Constant(<UnprojectedValue as ValueProjection<V::Type>>::from_projected(value))
+                        }
+                        Atom::Variable(r#type) => Atom::Variable(r#type.into()),
+                    })
+                    .collect(),
+                input_ids: region.input_ids,
+                output_ids: region.output_ids,
+                instructions: region
+                    .instructions
+                    .into_iter()
+                    .map(|instruction| {
+                        let (operation, inputs, outputs, regions) = instruction.into_parts();
+                        Instruction::new(operation.into(), inputs, outputs, regions)
+                    })
+                    .collect(),
+            })
+            .collect();
+        Program::new(input_structure, output_structure, regions, entry)
     }
 
     /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
@@ -1550,9 +1604,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::macros::check_count;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::control_flow::ConditionOperation;
     use crate::operations::debugging::PrintOperation;
     use crate::operations::math::{AddOperation, MulOperation, NegOperation};
     use crate::parameters::Placeholder;
@@ -1562,7 +1619,7 @@ mod tests {
     use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
     use crate::tests::TestRegionOperation;
-    use crate::types::DataType;
+    use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -2039,6 +2096,76 @@ mod tests {
             ),
             Err(ProgramError::MalformedProgram(message))
                 if message == "region ^0 is not reachable from the program entry region",
+        ));
+    }
+
+    #[test]
+    fn test_program_into_unprojected() {
+        let dynamic_dimension = DimensionVariable::new("elements", DimensionBounds::new(1, Some(8)).unwrap());
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dynamic_dimension)]));
+
+        // Build one branch and attach the same imported region to both condition slots. The branch's dynamic type
+        // exercises identity preservation, while the otherwise-unused entry constant exercises value lifting.
+        let mut branch_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let branch_input = branch_builder.add_input(array_type.clone());
+        let branch_output = branch_builder.add_instruction(NegOperation, Vec::new(), vec![branch_input]).unwrap()[0];
+        let branch = branch_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![branch_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let operand = builder.add_input(array_type.clone());
+        let constant = builder.add_constant(Array::scalar(2.0_f64));
+        let shared_branch = builder.import_program(branch);
+        let output = builder
+            .add_instruction(
+                ConditionOperation::<Array>::new(),
+                vec![shared_branch, shared_branch],
+                vec![predicate, operand],
+            )
+            .unwrap()[0];
+        let source = builder
+            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let source_signature = source.type_identity_signature().clone();
+        let source_effects = source.effects();
+
+        let composite: Program<
+            ArrayProgramValue<Array>,
+            ArrayProgramOperation<Array>,
+            (ArrayProgramValue<Array>, ArrayProgramValue<Array>),
+            ArrayProgramValue<Array>,
+        > = source.into_unprojected().unwrap();
+
+        assert_eq!(
+            composite.input_types(),
+            vec![
+                ArrayProgramType::Array(ArrayType::scalar(DataType::Boolean)),
+                ArrayProgramType::Array(array_type.clone()),
+            ],
+        );
+        assert_eq!(composite.output_types(), vec![ArrayProgramType::Array(array_type)]);
+        assert_eq!(composite.input_structure(), &(Placeholder, Placeholder));
+        assert_eq!(composite.output_structure(), &Placeholder);
+        assert_eq!(composite.effects(), source_effects);
+        assert_eq!(composite.type_identity_signature(), &source_signature);
+        assert_eq!(composite.regions().len(), 2);
+
+        let entry = composite.entry_region();
+        assert_eq!(entry.instructions().len(), 1);
+        assert_eq!(entry.instructions()[0].regions(), &[RegionId::new(0), RegionId::new(0)]);
+        assert!(matches!(
+            entry.instructions()[0].operation(),
+            ArrayProgramOperation::Array(ArrayOperation::Condition(_)),
+        ));
+        assert!(matches!(
+            &entry.atoms()[constant.index()],
+            Atom::Constant(ArrayProgramValue::Array(value)) if value == &Array::scalar(2.0_f64),
+        ));
+        assert!(matches!(
+            composite.region(RegionId::new(0)).unwrap().instructions()[0].operation(),
+            ArrayProgramOperation::Array(ArrayOperation::Neg(_)),
         ));
     }
 

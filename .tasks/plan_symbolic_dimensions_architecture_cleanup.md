@@ -1336,7 +1336,7 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       direct backend variants, and switch the existing program/domain/region/lowering cycle in place. Preserve
       array-only public APIs through projection; do not add a projection-aware derive mode, a stored
       `ArrayProgramOperation`, a replay bridge, or a parallel production lowerer.
-- [x] P4b1 projected-region foundation: add and verify the lossless `Program` member-to-parent lift specified by the
+- [x] P4b1 projected-region foundation: add and verify lossless `Program` member-program unprojection specified by the
       P4b plan. This is a behavior-preserving, core-only prerequisite for importing public array-only regions into the
       production composite graph without instruction replay.
 - [x] `ArrayContextView` and `DimensionContextView` no longer exist. The remaining `with_dimensions` occurrences are
@@ -2653,8 +2653,8 @@ Verification for this review unit:
 
 ### Execution: P4b1 lossless projected-region foundation
 
-`Program::into_parent` is now the one structural bridge from an already-built homogeneous member program to its
-parent graph. The consuming conversion lifts constants with `ValueProjection::from_projected`, variable types and
+`Program::into_unprojected` is now the one structural bridge from an already-built homogeneous member program to its
+unprojected graph. The consuming conversion lifts constants with `ValueProjection::from_projected`, variable types and
 operations with their canonical `From` contracts, preserves public parameter structure and every atom,
 instruction, and region edge, and then rebuilds the mapped arena once through `Program::new`. It does not interpret,
 trace, or replay instructions and therefore cannot invent dependencies or change SSA identity.
