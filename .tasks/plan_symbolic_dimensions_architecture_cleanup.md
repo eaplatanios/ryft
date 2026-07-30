@@ -1382,8 +1382,10 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 - [x] Ambient dimension and source-array context-view fields no longer exist.
 - [x] Delete temporary homogeneous program construction used only to replay shape-carrying rules.
 - [x] Narrow the homogeneous operation family to array-only primitives.
-- [ ] Migrate public/reference `EagerContext<Array, ArrayOperation<Array>>` consumers to the canonical array-program
-      domain where they need shape, control-flow, or transform functionality.
+- [ ] Phase 5/6 owner: migrate public/reference `EagerContext<Array, ArrayOperation<Array>>` consumers to the canonical
+      array-program domain where they need dynamic shape, mixed control-flow, or composite transform functionality.
+      Retain the homogeneous reference backend and focused transform fixtures until their composite replacements land;
+      they are comparison baselines, not unfinished production-XLA migration.
 - [x] Replace production tests that rely on the complete homogeneous backend with canonical array-program tests;
       retain small local homogeneous enums only for focused generic tests.
 - [x] Migrate XLA operation conversion and compilation entry points to the sole stored array-program operation family.
@@ -1393,8 +1395,8 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       erase proven requirements, reject disproven requirements with exact diagnostics, and retain inconclusive ordered
       assertions.
 - [x] Verify conditional and loop-carried extents, gateway compaction, region forwarding, and alpha-equivalent imports.
-- [ ] Rename the narrowed primitive family only after the old full family is deleted and all residual references are
-      classified.
+- [ ] Phase 8/9 owner: rename the narrowed primitive family only after the old full family is deleted and all residual
+      references are classified.
 - [x] Gate: targeted searches find no `with_dimensions`, `with_source_array`, `bind_replayed`, ambient replay
       environment, or full homogeneous implicit-shape graph.
 
@@ -1408,9 +1410,10 @@ the final architecture. A projected-array wrapper alone cannot represent dimensi
 region recursion, or a first-class dynamic batching extent, and so merely adding a public `ProjectedArrayBatch` would
 rename only part of the problem while introducing another carrier.
 
-- [ ] Before expanding the composite operation sweep, inventory the duplicated responsibilities across `ArrayBatch`,
+- [x] Before expanding the composite operation sweep, inventory the duplicated responsibilities across `ArrayBatch`,
       `BatchingContext`, `BatchingTracer`, `BatchableOperation`, and their P3c array-program counterparts. Classify
-      each responsibility as value-kind-neutral, array-specific, or genuinely composite.
+      each responsibility as value-kind-neutral, array-specific, or genuinely composite. The exact ledger and
+      prototype gate are recorded in `.tasks/plan_p5a_batching_policy_prototype.md`.
 - [ ] Prototype a transform-owned batching-policy abstraction that can select the batch carrier and batching-extent
       representation for a parent context. The concrete shape is deliberately open, but evaluate a design equivalent
       in power to `BatchingPolicy<C> { type Batch; type AxisExtent; ... }` before committing to the parallel composite
