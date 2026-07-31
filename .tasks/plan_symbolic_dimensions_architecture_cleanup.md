@@ -1632,6 +1632,20 @@ review unit and remains intentionally open.
 
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
 - [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.
+- [ ] Make `#[derive(Operation)]` with `#[ryft(dispatch(batching, differentiation, transposition))]` the mechanical
+      dispatch surface for `ArrayProgramOperation`, matching the homogeneous families instead of introducing a second
+      generator syntax. Prerequisites, both scheduled elsewhere: every semantic rule has moved off the enum match onto
+      a colocated payload implementation (the P6 differentiation relocation plus the existing composite-`jvp` TODO),
+      and each dual-contract variant wraps a dedicated newtype payload (e.g. `DynamicZero(DynamicZeroOperation)` over
+      `ZeroOperation<ArrayType>`) so one payload never carries two semantic contracts. Extend the derive itself in
+      exactly two ways: a variant-level member marker (e.g. `#[ryft(member(ArrayType))]`) that emits the
+      project-delegate-lift arm by calling the existing projection helpers rather than inlining boundary logic, and
+      batching-policy selection through `<PrimaryType as BatchableType>::Policy` instead of the hard-coded homogeneous
+      `ArrayBatching<P>` family, so the same attribute serves both universes with no new syntax. The variant member
+      markers and newtyped mixed payloads are irreducible declaration content, not ceremony: which universe a
+      variant's payload speaks must be declared exactly once, on the declaration. Sequence this after P5d and P6 so
+      the transform rules the derive delegates to have stopped moving, and land it with the associated-type
+      `Operation` prototype so the one-contract compile-fail gates and the dispatch generation are one review unit.
 - [ ] Make each mixed operation's inference contract the authoritative source for dimension operand positions,
       member kinds, ordering, and result metadata.
 - [ ] Extend the typed mixed projection vocabulary only for repeated fixed/optional/segmented patterns found in the
