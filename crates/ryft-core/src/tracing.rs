@@ -1464,12 +1464,12 @@ mod tests {
         let (_, program) = NestedTracingContext::trace_with_named_axes(
             EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
             |inputs: Vec<Tracer<_>>| {
-                assert_eq!(inputs[0].context().named_axis("model"), Some(NamedAxis::Batched { size: 4 }));
+                assert_eq!(inputs[0].context().named_axis("model"), Some(NamedAxis::Batched { size: Some(4) }));
                 assert_eq!(inputs[0].context().named_axis("unbound"), None);
                 Ok(inputs)
             },
             vec![DataType::F64],
-            vec![("model".to_string(), NamedAxis::Batched { size: 4 })],
+            vec![("model".to_string(), NamedAxis::Batched { size: Some(4) })],
         )
         .unwrap();
         assert_eq!(program.interpret(vec![Scalar::from(3.0)]), Ok(vec![Scalar::from(3.0)]));

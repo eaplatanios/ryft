@@ -5,7 +5,9 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
-use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{
+    ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
 use crate::differentiation::types::DifferentiableType;
@@ -208,16 +210,17 @@ impl_axis_conversions!(usize);
 
 /// A named axis resolved by a [`NamedAxes`] context specifying what an axis name is currently bound to, and by which
 /// kind of transform, at a given trace level. This carries only the *value-free* facts about a binding (i.e., its kind
-/// and size) not which physical dimension of any particular value carries the axis. That per--alue mapping is partial
-/// (a replicated operand has no such dimension even though a collective over it is still meaningful) and is supplied at
-/// consumption time by the owning transform's rule dispatch (e.g., for batching, an [`ArrayBatch`](crate::ArrayBatch)'s
-/// [`batch_axis`](crate::ArrayBatch::batch_axis)).
+/// and any statically known size), not which physical dimension of any particular value carries the axis. That
+/// per-value mapping is partial (a replicated operand has no such dimension even though a collective over it is still
+/// meaningful) and is supplied at consumption time by the owning transform's rule dispatch (e.g., for batching, an
+/// [`ArrayBatch`](crate::ArrayBatch)'s [`batch_axis`](crate::ArrayBatch::batch_axis)).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NamedAxis {
     /// Axis bound by an enclosing batching (i.e., vectorization) level.
     Batched {
-        /// Number of batch items along this axis.
-        size: usize,
+        /// Number of batch items along this axis when statically known, or `None` when its extent is dynamic
+        /// (i.e., not known statically at tracing time).
+        size: Option<usize>,
     },
 
     /// Axis bound to a device mesh axis by an enclosing manual sharding region.
@@ -234,10 +237,10 @@ pub enum NamedAxis {
 /// by transforms (e.g., a batching level names the axis it introduces, and a manual sharding region names its mesh
 /// axes) and read by named-axis primitives such as collective operations. Resolution walks the enclosing context stack
 /// innermost-first, and so a nearer binder shadows a farther one. This capability answers only whether a name is
-/// currently bound and, if so, what kind of axis it is and how large: the "is this name in scope" lookup used for
-/// bind-time validation and scalar queries. It is deliberately *not* the evaluator. Specifying how a use site consumes
-/// the axis (and against which physical dimension of a given operand) is the owning transform's per-operation rule's
-/// responsibility, which already receives that per-value position at dispatch time.
+/// currently bound and, if so, what kind of axis it is and any statically known size: the "is this name in scope"
+/// lookup used for bind-time validation and scalar queries. It is deliberately *not* the evaluator. Specifying how a
+/// use site consumes the axis (and against which physical dimension of a given operand) is the owning transform's
+/// per-operation rule's responsibility, which already receives that per-value position at dispatch time.
 pub trait NamedAxes: Context {
     /// Resolves `name` against this context, returning the [`NamedAxis`] it is bound to,
     /// or `None` when no enclosing binder binds it.
@@ -306,8 +309,8 @@ where
 
 impl<C: NamedAxes<Type = ArrayType>> NamedAxes for BatchingContext<C>
 where
-    C::Operation: BatchableOperation<C>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+    C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>,
 {
@@ -318,7 +321,7 @@ where
         // Because nested batching composes by context wrapping, the delegation chain naturally shadows outer
         // bindings with inner ones.
         if self.axis_name() == Some(name) {
-            Some(NamedAxis::Batched { size: self.axis_size() })
+            Some(NamedAxis::Batched { size: Some(*self.axis_extent()) })
         } else {
             self.parent().named_axis(name)
         }
@@ -502,9 +505,9 @@ impl_non_differentiable_operation!(AxisIndexOperation);
 impl_nullary_transposable_operation!(AxisIndexOperation);
 
 impl<C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>> + From<AxisIndexOperation>>>
-    BatchableOperation<C> for AxisIndexOperation
+    BatchableOperation<C, ArrayBatchingPolicy> for AxisIndexOperation
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
@@ -514,7 +517,7 @@ impl<C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>> + Fr
             // This level binds the axis. The per-item index is the length-`size` `iota(0)`, bound into the parent and
             // mapped on this level's batch axis (position 0). The mapped physical `[size]` dimension is then stripped
             // back to the per-item scalar `u64`.
-            let size = context.axis_size();
+            let size = *context.axis_extent();
             let r#type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(size)]));
             let operation = IotaOperation::new(r#type.clone(), 0)?;
             let mut index = context.parent().bind(operation, Vec::new(), &[])?;
@@ -585,18 +588,19 @@ mod tests {
 
     #[test]
     fn test_named_axis_equality_and_hashing() {
-        assert_eq!(NamedAxis::Batched { size: 3 }, NamedAxis::Batched { size: 3 });
-        assert_ne!(NamedAxis::Batched { size: 3 }, NamedAxis::Batched { size: 4 });
+        assert_eq!(NamedAxis::Batched { size: Some(3) }, NamedAxis::Batched { size: Some(3) });
+        assert_ne!(NamedAxis::Batched { size: Some(3) }, NamedAxis::Batched { size: Some(4) });
+        assert_ne!(NamedAxis::Batched { size: Some(3) }, NamedAxis::Batched { size: None });
         assert_eq!(NamedAxis::Mesh { axis: 1, size: 2 }, NamedAxis::Mesh { axis: 1, size: 2 });
         assert_ne!(NamedAxis::Mesh { axis: 0, size: 2 }, NamedAxis::Mesh { axis: 1, size: 2 });
 
         // A batched axis never equals a mesh axis, even when their sizes match.
-        assert_ne!(NamedAxis::Batched { size: 2 }, NamedAxis::Mesh { axis: 0, size: 2 });
+        assert_ne!(NamedAxis::Batched { size: Some(2) }, NamedAxis::Mesh { axis: 0, size: 2 });
 
-        let axes = HashSet::from([NamedAxis::Batched { size: 3 }, NamedAxis::Mesh { axis: 1, size: 2 }]);
-        assert!(axes.contains(&NamedAxis::Batched { size: 3 }));
+        let axes = HashSet::from([NamedAxis::Batched { size: Some(3) }, NamedAxis::Mesh { axis: 1, size: 2 }]);
+        assert!(axes.contains(&NamedAxis::Batched { size: Some(3) }));
         assert!(axes.contains(&NamedAxis::Mesh { axis: 1, size: 2 }));
-        assert!(!axes.contains(&NamedAxis::Batched { size: 2 }));
+        assert!(!axes.contains(&NamedAxis::Batched { size: Some(2) }));
     }
 
     #[test]

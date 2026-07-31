@@ -648,12 +648,12 @@ where
 /// depend on it while [`Operation::infer_output_types`] only sees input types.
 fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str) -> Result<usize, ProgramError> {
     match context.named_axis(axis_name) {
-        Some(NamedAxis::Batched { size } | NamedAxis::Mesh { size, .. }) if size > 0 => Ok(size),
-        Some(NamedAxis::Batched { .. } | NamedAxis::Mesh { .. }) => {
+        Some(NamedAxis::Batched { size: Some(size) } | NamedAxis::Mesh { size, .. }) if size > 0 => Ok(size),
+        Some(NamedAxis::Batched { size: Some(_) } | NamedAxis::Mesh { .. }) => {
             Err(TypeError::invalid(format!("collective axis '{axis_name}' must contain at least one participant",))
                 .into())
         }
-        Some(NamedAxis::BatchedDynamic) => Err(BatchingError::UnsupportedOperation {
+        Some(NamedAxis::Batched { size: None }) => Err(BatchingError::UnsupportedOperation {
             message: format!(
                 "collective axis '{axis_name}' has a dynamic extent that must remain a first-class operand"
             ),
