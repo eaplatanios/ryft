@@ -2,10 +2,9 @@ use std::fmt::Display;
 use std::ops::{Div, Mul};
 
 use crate::backends::scalars::Scalar;
-use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
@@ -380,13 +379,14 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReduceOp
 /// rule lifts them past the inserted batch dimension with `lift_reduce_axes` and re-interprets the lifted reduction
 /// over the physical batched value, with a requested output sharding gaining the mapped axis's sharding at the new
 /// output batch axis position (mirroring the dot batching rule).
-impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for ReduceOperation
+impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for ReduceOperation
 where
     ReduceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

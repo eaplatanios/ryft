@@ -1,10 +1,10 @@
 use std::fmt::Display;
 
+use crate::axes::Axis;
 use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
-use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::{
@@ -534,20 +534,19 @@ where
 /// padding value is vectorized with a constant-size mask construction: pad the operand with zero, pad an all-true
 /// input mask with false, broadcast the per-item padding values over the padded result, and select those values at
 /// padding positions.
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for PadOperation
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for PadOperation
 where
     C: Context<Type = ArrayType> + One<C::Value> + Zero<C::Value>,
     C::Value: LegacyBroadcast + Pad + Select + Transpose,
     PadOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
-        let axis_size = ArrayBatch::common_batch_size(inputs)?;
         if inputs[1].batch_axis_position().is_none() {
             let Some(batch_axis) = inputs[0].batch_axis_position() else {
                 return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
@@ -561,9 +560,8 @@ where
             let lifted = PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?;
             return lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)]);
         }
-        let axis_size = axis_size.expect("a mapped input pins the batch size");
         let batch_axis = inputs[0].batch_axis_position().unwrap_or(0);
-        let operand = inputs[0].match_axis(batch_axis, axis_size, context.axis_sharding().clone())?;
+        let operand = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
         let mut edge_padding_low = self.edge_padding_low().to_vec();
         edge_padding_low.insert(batch_axis, 0);
         let mut edge_padding_high = self.edge_padding_high().to_vec();

@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
-use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
@@ -704,14 +703,15 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for LegacyReshapeOperation
+impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for LegacyReshapeOperation
 where
     C::Value: Transpose,
     LegacyReshapeOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

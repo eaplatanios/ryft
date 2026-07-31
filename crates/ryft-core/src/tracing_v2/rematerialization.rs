@@ -43,8 +43,9 @@ use std::marker::PhantomData;
 
 use thiserror::Error;
 
-use crate::batching::ArrayBatching;
-use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
@@ -343,7 +344,7 @@ crate::impl_non_transposable_operation!(RematerializeOperation);
 /// Batching rule for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
 /// programs so the rematerialization boundary survives `batch` under eager and staging parents alike; see
 /// `stage_rewrapped_custom_call`.
-impl<C, O, P: crate::ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for RematerializeOperation
+impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for RematerializeOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,

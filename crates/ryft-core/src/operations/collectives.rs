@@ -17,7 +17,8 @@ use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::backends::dimensions::DimensionValue;
 use crate::backends::scalars::Scalar;
 use crate::batching::{
-    ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -394,15 +395,15 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Collecti
 /// The consuming arm collapses the mapped axis through `collective_reduce_batch` and binds a `PMean`'s `1 / N`
 /// rank-0 fill into the parent context — interpreted eagerly under an eager parent and staged into the enclosing
 /// trace under a staging parent — so one rule serves eager and staged batching alike.
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for CollectiveOperation
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for CollectiveOperation
 where
     C: Context<Type = ArrayType> + Fill<Scalar, C::Value>,
     C::Operation: From<CollectiveOperation>,
     <C as Domain>::Value: Reduce + Mul<Output = <C as Domain>::Value>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -435,8 +436,8 @@ where
 /// [`BatchingContext`] — whose own rule dispatch repeats this name
 /// resolution at the next level — or an ordinary tracing context. Batching rules for custom collective-like
 /// operations should use this helper for their "not my axis" arm.
-pub fn forward_collective_to_parent<C>(
-    context: &BatchingContext<C, ArrayBatchingPolicy>,
+pub fn forward_collective_to_parent<C, P: ArrayBatchingPolicy<C>>(
+    context: &BatchingContext<C, ArrayBatching<P>>,
     parent_operation: C::Operation,
     inputs: &[ArrayBatch<<C as Domain>::Value>],
 ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
@@ -1950,15 +1951,15 @@ impl<V: AllToAll> PSwapAxes for V {}
 /// merged into it, laying the gathered chunks out item-major (item 0's chunk first), which matches the tiled
 /// StableHLO `all_gather` ordering. Every batch item sees the same gathered value, so the output is replicated. A
 /// non-matching level forwards the collective untouched to the parent context via [`forward_collective_to_parent`].
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for AllGatherOperation
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllGatherOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<AllGatherOperation>,
     <C as Domain>::Value: LegacyBroadcast + Reshape + Transpose,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -2019,15 +2020,15 @@ where
 /// `(b, d_s / b)` chunks and the new chunk axis becomes the output batch axis, so batch item `i` receives chunk `i`
 /// of the sum. A non-matching level forwards the collective untouched to the parent context via
 /// [`forward_collective_to_parent`].
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for PSumScatterOperation
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for PSumScatterOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<PSumScatterOperation>,
     <C as Domain>::Value: LegacyBroadcast + Reduce + Reshape + Transpose,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -2100,15 +2101,15 @@ where
 /// it in target order: for each position `t` along the batch axis, the output receives the slice of the source item
 /// that sends to `t`, or a zero slice when no pair targets `t`. A non-matching level forwards the collective
 /// untouched to the parent context via [`forward_collective_to_parent`].
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for PpermuteOperation
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for PpermuteOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<PpermuteOperation>,
     <C as Domain>::Value: LegacyBroadcast + Concatenate + Slice + Transpose + ZeroLike,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -2167,15 +2168,15 @@ where
 /// then merged item-major into the per-item `concat_axis` — batch item `i` receives every item's chunk `i`,
 /// concatenated along `concat_axis`. A non-matching level forwards the collective untouched to the parent context
 /// via [`forward_collective_to_parent`].
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for AllToAllOperation
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllToAllOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<AllToAllOperation>,
     <C as Domain>::Value: LegacyBroadcast + Reshape + Transpose,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -2408,7 +2409,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatchingPolicy};
+    use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
     use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
@@ -2427,7 +2428,7 @@ mod tests {
     /// contains every operation the collective batching rule may bind (notably constants and broadcasts for `PMean`).
     fn batching_context(
         axis_size: usize,
-    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy> {
+    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching> {
         BatchingContext::new(EagerContext::new(), axis_size).with_axis_name("i".to_string())
     }
 
@@ -2511,7 +2512,7 @@ mod tests {
         // rides the `ProgramError::Custom` channel as a `BatchingError::Axis` and is re-typed at the public `batch`
         // boundary, so the surfaced error is exactly that variant.
         let result: Result<Array, BatchingError> = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
                 item.collective("j", CollectiveKind::PSum)
             },
             Array::vector(vec![1.0, 2.0, 3.0]),
@@ -2678,7 +2679,7 @@ mod tests {
     fn test_pshuffle_composes_ppermute_in_the_composite_domain() {
         type Parent = EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
 
-        let context = BatchingContext::<_, ArrayProgramBatchingPolicy>::new(
+        let context = BatchingContext::<_, ArrayProgramBatching>::new(
             Parent::new(),
             ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()),
         )
@@ -3096,7 +3097,7 @@ mod tests {
         // Axis-size resolution fails fast at staging time with `AxisError::UnboundAxisName` rather than silently
         // acting as identity.
         let result: Result<Array, BatchingError> = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
                 item.all_gather("x", 0, CollectiveOptions::tiled(), AllGatherOutputVariance::Varying)
             },
             Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
@@ -3116,7 +3117,7 @@ mod tests {
         // replicated across the batch. With items `[1, 2]` and `[3, 4]` the gathered value is `[1, 2, 3, 4]`,
         // matching the verified cross-device `shard_map` execution semantics of the tiled StableHLO `all_gather`.
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
                 item.all_gather("x", 0, CollectiveOptions::tiled(), AllGatherOutputVariance::Varying)
             },
             Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
@@ -3199,7 +3200,7 @@ mod tests {
         // `reduce_scatter`.
         let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
                 item.psum_scatter("x", 0, CollectiveOptions::tiled())
             },
             x,
@@ -3222,7 +3223,7 @@ mod tests {
         // The rotation `[(0, 1), (1, 0)]` swaps the two batch items: item 0 receives item 1's `[3, 4]` and item 1
         // receives item 0's `[1, 2]`.
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
                 item.ppermute("x", vec![(0, 1), (1, 0)])
             },
             Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
@@ -3245,7 +3246,7 @@ mod tests {
         // With the single pair `(0, 1)`, item 1 receives item 0's `[1, 2]` while no pair targets item 0, so it
         // receives zeros, matching JAX's `ppermute` semantics for untargeted participants.
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
                 item.ppermute("x", vec![(0, 1)])
             },
             Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
@@ -3267,7 +3268,7 @@ mod tests {
         // cross-device `shard_map` execution semantics of StableHLO's `all_to_all`.
         let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
                 item.all_to_all("x", 0, 0, CollectiveOptions::tiled())
             },
             x,
@@ -3299,7 +3300,7 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
                 item.all_to_all("x", 0, 1, CollectiveOptions::tiled())
             },
             x,

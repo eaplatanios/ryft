@@ -8,10 +8,9 @@
 
 use std::fmt::{Debug, Display};
 
-use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    ProgramBatchingOutputAxesPolicy,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
@@ -1498,7 +1497,7 @@ where
 /// rules against the same active context. This is the operational path eager batched scans execute either way, and
 /// its physical stacked accumulators retain per-item placement metadata exactly. Constants lift and stacked-output
 /// accumulators seed (via the parent's [`Zero`]) through `context.parent()`.
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for ScanOperation<C::Constant>
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ScanOperation<C::Constant>
 where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
     <C as Domain>::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape,
@@ -1510,9 +1509,9 @@ where
         + From<LegacyReshapeOperation>
         + From<ScanOperation<C::Constant>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -1588,7 +1587,7 @@ where
             // a staged broadcast) and stage one batched scan over the batched body.
             for (carry, carry_axis) in carries.iter_mut().zip(carry_axes.iter()) {
                 if !carry_axis.is_replicated() && carry.batch_axis().is_replicated() {
-                    *carry = carry.broadcast(0, *context.axis_extent(), context.axis_sharding().clone())?;
+                    *carry = carry.broadcast(0, P::axis_size(context)?, context.axis_sharding().clone())?;
                 }
             }
             let batched_scan = ScanOperation::<C::Constant>::new(carry_count, self.length())
@@ -3461,7 +3460,7 @@ mod tests {
 
     /// Batches `scan` through the public [`BatchingContext::bind`] path with `body` as an owned attached region.
     fn batch_scan(
-        context: &BatchingContext<TestEagerContext, ArrayBatchingPolicy>,
+        context: &BatchingContext<TestEagerContext, ArrayBatching>,
         scan: ScanOperation<Array>,
         body: Program<Array, TestOperation, Vec<Array>, Vec<Array>>,
         inputs: Vec<ArrayBatch<Array>>,

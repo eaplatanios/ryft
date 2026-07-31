@@ -3,8 +3,8 @@ use std::fmt::{Debug, Display};
 
 use crate::backends::scalars::Scalar;
 use crate::batching::{
-    ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
@@ -628,13 +628,14 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast>> BatchableOperation<C, ArrayBatchingPolicy> for DotOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast>, P: ArrayBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatching<P>> for DotOperation
 where
     DotOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1347,14 +1348,14 @@ where
 /// from the lifted operation and multiplied into the `[b, m, n]` result per batch item instead. The rank-3 form has
 /// no rank-4 analogue, so batching an already-batched `scaled_dot` reports an error directing users to batch an
 /// explicit dequantization composition instead.
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Mul + Transpose>> BatchableOperation<C, ArrayBatchingPolicy>
-    for ScaledDotOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Mul + Transpose>, P: ArrayBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatching<P>> for ScaledDotOperation
 where
     ScaledDotOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

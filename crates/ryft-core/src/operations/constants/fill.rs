@@ -1,6 +1,6 @@
 use crate::backends::arrays::Array;
 use crate::backends::scalars::Scalar;
-use crate::batching::{ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{ArrayBatch, ArrayBatching, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
@@ -88,11 +88,11 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType> + Fill<Scalar, C::Value>> Fill<Scalar, BatchingTracer<C, ArrayBatchingPolicy>>
-    for BatchingContext<C, ArrayBatchingPolicy>
+impl<C: Context<Type = ArrayType> + Fill<Scalar, C::Value>> Fill<Scalar, BatchingTracer<C, ArrayBatching>>
+    for BatchingContext<C, ArrayBatching>
 {
     #[inline]
-    fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
+    fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().fill(r#type, value)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }

@@ -120,7 +120,7 @@ impl Operation<ArrayProgramType> for CompareOperation {
         check_count!("input", input_types, 2, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         input_types.iter().try_for_each(|r#type| <&DimensionType>::try_from(r#type).map(|_| ()))?;
-        // Comparing shape authority produces ordinary predicate data rather than another first-class dimension.
+        // Comparing first-class dimensions produces ordinary predicate data rather than another dimension value.
         Ok(vec![ArrayType::scalar(DataType::Boolean).into()])
     }
 
@@ -173,7 +173,7 @@ impl_differentiable_elementwise_operation!(@non_differentiable CompareOperation)
 /// and the broadcasted shape of the two input arrays.
 ///
 /// First-class dimensions use the same comparison operation but return ordinary rank-zero Boolean array data. This
-/// keeps the predicate available to selection and control-flow operations without granting the result shape authority:
+/// keeps the predicate available to selection and control-flow operations without making the result a dimension:
 ///
 /// ```rust
 /// # use ryft_core::{ArrayProgramValue, Compare, DimensionValue, ProgramError};
@@ -192,7 +192,7 @@ impl_differentiable_elementwise_operation!(@non_differentiable CompareOperation)
 /// The `Output` type parameter lets the comparison result use a different value carrier when the input carrier cannot
 /// represent Boolean data. Scalar and array backends use the default `Output = Self` and return honestly
 /// Boolean-typed values. [`DimensionValue`](crate::DimensionValue), by contrast, uses an array output because a
-/// first-class dimension is shape authority rather than a general scalar-data carrier.
+/// first-class dimension describes an array extent rather than serving as a general scalar-data carrier.
 pub trait Compare<Output = Self>: Sized {
     /// Compares `self` and `rhs` using a predicate determined by the provided `direction`.
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Output, ProgramError>;

@@ -7,10 +7,9 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    ProgramBatchingOutputAxesPolicy,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -97,8 +96,8 @@ impl<F: Value<Type: ConditionTypeSemantics>> Display for ConditionOperation<F> {
 ///
 /// Conditions always branch on ordinary Boolean data. Scalar data and array programs therefore accept
 /// [`DataType::Boolean`] and rank-zero Boolean [`ArrayType`] predicates respectively, while a composite
-/// [`ArrayProgramType`] accepts only its rank-zero Boolean array member. A first-class dimension is shape authority,
-/// not Boolean data, even when its runtime representation is scalar.
+/// [`ArrayProgramType`] accepts only its rank-zero Boolean array member. A first-class dimension describes an array
+/// extent rather than Boolean data, even when its runtime representation is scalar.
 pub trait ConditionTypeSemantics: Type {
     /// Returns whether this type is a valid condition predicate.
     fn is_condition_predicate(&self) -> bool;
@@ -829,7 +828,7 @@ fn reconcile_branch<C: Context>(
 ///     family's batching rules against the same active context, so the multi-operation rewrite composes for eager
 ///     and staging parents alike. Effectful branches are rejected because evaluating both branches would perform
 ///     effects that the per-item selection cannot mask.
-impl<C, O> BatchableOperation<C, ArrayBatchingPolicy> for ConditionOperation<C::Constant>
+impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ConditionOperation<C::Constant>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: Concretizable<bool> + LegacyBroadcast + Transpose + Select,
@@ -839,9 +838,9 @@ where
         + From<SelectOperation>
         + From<ConditionOperation<C::Constant>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -937,8 +936,8 @@ where
 /// branch output with the predicate's mapped axis, broadcasts replicated branch outputs across the batch, and expands
 /// the per-item scalar predicate across non-scalar branch output shapes. The predicate must carry a mapped batch axis;
 /// the replicated case is the caller's structural staging path.
-pub(crate) fn batch_condition_with_interpreter<C, F>(
-    context: &BatchingContext<C, ArrayBatchingPolicy>,
+pub(crate) fn batch_condition_with_interpreter<C, P: ArrayBatchingPolicy<C>, F>(
+    context: &BatchingContext<C, ArrayBatching<P>>,
     predicate_batch: &ArrayBatch<C::Value>,
     operand_inputs: &[ArrayBatch<C::Value>],
     mut batch_branch: F,

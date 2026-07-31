@@ -2,10 +2,9 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::axes::Axis;
-use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
@@ -258,14 +257,14 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchableOperation<C, ArrayBatchingPolicy>
-    for ConcatenateOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>, P: ArrayBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatching<P>> for ConcatenateOperation
 where
     ConcatenateOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -282,10 +281,9 @@ where
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
-        let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
         let materialized = inputs
             .iter()
-            .map(|input| input.match_axis(batch_axis, axis_size, context.axis_sharding().clone()))
+            .map(|input| P::match_axis(context, input, Axis::from(batch_axis)))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
         ConcatenateOperation::new(lifted_axis, materialized[0].r#type().rank())?.interpret_with_batch_axes(

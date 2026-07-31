@@ -27,10 +27,10 @@ pub const DIMENSION_TO_SCALAR_OPERATION_NAME: &str = "dimension_to_scalar";
 
 /// Converts a first-class dimension into ordinary rank-zero signed 64-bit array data.
 ///
-/// This is the explicit boundary from shape authority to numerical data. Composite program values produce an array
-/// member in their parent carrier, while concrete dimension backends can select a concrete array representation
-/// through `Output`. The returned scalar has no shape authority; converting data back into a first-class dimension
-/// requires a separate checked gateway.
+/// This is the explicit boundary from a first-class dimension to numerical data. Composite program values produce an
+/// array member in their parent carrier, while concrete dimension backends can select a concrete array representation
+/// through `Output`. The returned scalar cannot define an array extent; converting it back into a first-class
+/// dimension requires a separate checked gateway.
 ///
 /// # Example
 ///

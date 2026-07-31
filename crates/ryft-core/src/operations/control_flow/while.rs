@@ -11,10 +11,9 @@
 
 use std::fmt::{Debug, Display};
 
-use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
-    ProgramBatchingOutputAxesPolicy,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, BatchingTracer, ProgramBatchingOutputAxesPolicy,
 };
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain};
@@ -915,7 +914,7 @@ where
 ///      lowering reduces the predicate with `or` and masks carry updates with a broadcast select. The iteration
 ///      bound is preserved (batch items share masked iterations, so capping the loop matches per-item truncation
 ///      exactly).
-impl<C, O> BatchableOperation<C, ArrayBatchingPolicy> for WhileOperation
+impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for WhileOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
@@ -927,16 +926,16 @@ where
         + From<AndOperation>
         + From<WhileOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         // The rule requests all nested-computation work through its region access (region 0 is the condition and
         // region 1 the body), which keeps its bounds free of the operation family's own semantic traits.
         let state_count = inputs.len();
-        let axis_size = *context.axis_extent();
+        let axis_size = P::axis_size(context)?;
         let condition_region = driver.region(0)?;
         let body_region = driver.region(1)?;
 
@@ -1821,7 +1820,7 @@ impl<C: Context> WhilePredicate for Tracer<C> {}
 
 impl WhilePredicate for CaptureReference<ArrayType> {}
 
-impl<C: Context<Type = ArrayType>> WhilePredicate for BatchingTracer<C, ArrayBatchingPolicy> where
+impl<C: Context<Type = ArrayType>> WhilePredicate for BatchingTracer<C, ArrayBatching> where
     C::Value: Concretizable<bool>
 {
 }
@@ -3456,20 +3455,20 @@ mod tests {
         where
             V: Value<Type = ArrayType> + crate::operations::manipulation::Transpose,
             V::DispatchDomain: Context<Type = ArrayType, Value = V, Constant = Array, Operation = TestDomainOperation>,
-            TestDomainOperation: BatchableOperation<V::DispatchDomain, ArrayBatchingPolicy>
+            TestDomainOperation: BatchableOperation<V::DispatchDomain, ArrayBatching>
                 + crate::batching::BatchableOperation<
                     crate::TracingContext<
                         <V::DispatchDomain as crate::Domain>::Constant,
                         <V::DispatchDomain as crate::Domain>::Operation,
                     >,
-                    ArrayBatchingPolicy,
+                    ArrayBatching,
                 > + From<crate::operations::manipulation::TransposeOperation>
                 + From<crate::operations::manipulation::LegacyBroadcastOperation>,
         {
             let context = x.dispatch_domain();
             let mapped = Batch::batch(
                 &context,
-                |item: BatchingTracer<V::DispatchDomain, ArrayBatchingPolicy>| {
+                |item: BatchingTracer<V::DispatchDomain, ArrayBatching>| {
                     let batching_context = item.context().clone();
                     let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
                     let mut outputs = batching_context.bind(while_operation, while_regions, &[item])?;

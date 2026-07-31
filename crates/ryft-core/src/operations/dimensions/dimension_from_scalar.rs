@@ -1,4 +1,4 @@
-//! Checked conversion from ordinary scalar-array data into first-class dimension authority.
+//! Checked conversion from ordinary scalar-array data into a first-class dimension value.
 //!
 //! The user-facing semantics and example live on [`DimensionFromScalar`]. The operation records the produced
 //! [`DimensionType`] directly so its identity and authoritative bounds remain one structural SSA definition.
@@ -25,7 +25,7 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 
 /// Converts ordinary rank-zero integer array data into a checked first-class dimension.
 ///
-/// This is the explicit boundary that grants shape authority to numerical data. `result` declares the fresh
+/// This is the explicit boundary that converts numerical data into a dimension value. `result` declares the fresh
 /// [`DimensionVariable`] and authoritative bounds of the produced dimension. Eager execution rejects negative,
 /// out-of-bounds, host-unrepresentable, and backend-width-incompatible values before returning the dimension.
 ///

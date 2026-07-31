@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{ArrayBatch, ArrayBatching, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
@@ -148,11 +148,11 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType> + One<C::Value>> One<BatchingTracer<C, ArrayBatchingPolicy>>
-    for BatchingContext<C, ArrayBatchingPolicy>
+impl<C: Context<Type = ArrayType> + One<C::Value>> One<BatchingTracer<C, ArrayBatching>>
+    for BatchingContext<C, ArrayBatching>
 {
     #[inline]
-    fn one(&self, r#type: &ArrayType) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
+    fn one(&self, r#type: &ArrayType) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().one(r#type)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }

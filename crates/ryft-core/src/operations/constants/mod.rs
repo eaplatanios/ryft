@@ -37,7 +37,7 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 }
 
 /// Infers the output type of one mixed [`ArrayProgramType`] constructor whose stored [`ArrayType`] is the
-/// complete output authority. The constructor consumes one first-class dimension operand per *dynamic* dimension
+/// complete output type. The constructor consumes one first-class dimension operand per *dynamic* dimension
 /// of its stored shape, in axis order, and each operand's [`DimensionType`] must define exactly the
 /// [`DimensionVariable`](crate::DimensionVariable) named by the corresponding output axis. Static axes remain ordinary
 /// stored type metadata and consume no operands, This is deliberately narrower than the mixed reshape/broadcast

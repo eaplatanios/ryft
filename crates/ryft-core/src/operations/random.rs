@@ -2,8 +2,9 @@ use std::fmt::Display;
 
 use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
 use crate::backends::scalars::Scalar;
-use crate::batching::ArrayBatchingPolicy;
-use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+};
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
@@ -323,14 +324,15 @@ impl_non_transposable_operation!(RngBitGeneratorOperation);
 ///
 /// A *replicated* state is rejected: every batch item would see the same state and silently draw identical,
 /// correlated bits, so callers derive one state per batch item with [`split_key`] and map over the states instead.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for RngBitGeneratorOperation
+impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for RngBitGeneratorOperation
 where
     C::Value: Transpose,
     C::Operation: From<RngBitGeneratorOperation> + From<ScanOperation<C::Constant>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -360,7 +362,7 @@ where
 
         // Stage one carry-free scan over the per-item states; its stacked outputs are the mapped advanced states
         // and the mapped bits, both at batch axis 0.
-        let scan = ScanOperation::<C::Constant>::new(0, *context.axis_extent());
+        let scan = ScanOperation::<C::Constant>::new(0, P::axis_size(context)?);
         let mut outputs = context.parent().bind(scan, vec![body], std::slice::from_ref(states.value()))?;
         check_count!("output", outputs, 2, ProgramError);
         let bits = outputs.remove(1);
@@ -975,7 +977,7 @@ mod tests {
     /// Returns an active batching frame over an eager reference-backend parent for direct batching-rule tests.
     fn batching_context(
         axis_size: usize,
-    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy> {
+    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching> {
         BatchingContext::new(EagerContext::new(), axis_size)
     }
 

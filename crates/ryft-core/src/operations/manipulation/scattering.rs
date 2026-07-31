@@ -1,10 +1,9 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
-use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
@@ -524,15 +523,15 @@ where
 /// leading batch axis. This stages `O(axis_size)` scatters but is correct for every combiner and dimension-number
 /// configuration; dimension-number lifting is a performance optimization left as a follow-up. When no input is mapped
 /// the scatter applies once, unbatched.
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for ScatterOperation
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ScatterOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     ScatterOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

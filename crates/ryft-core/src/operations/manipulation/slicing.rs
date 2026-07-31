@@ -1,9 +1,9 @@
 use std::fmt::Display;
 
-use crate::batching::ArrayBatchingPolicy;
+use crate::axes::Axis;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
@@ -324,13 +324,13 @@ where
 
 /// Batching rule for [`SliceOperation`]: a batched operand keeps its batch axis by slicing it fully, so the lifted
 /// operation inserts start index `0`, limit `axis_size`, and stride `1` at the batch axis position.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for SliceOperation
+impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for SliceOperation
 where
     SliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -730,14 +730,15 @@ where
 /// Batching rule for [`UpdateSliceOperation`]: the input and update operands are aligned on one physical batch axis
 /// (replicated operands are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
 /// so each batch item updates its own block.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for UpdateSliceOperation
+impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for UpdateSliceOperation
 where
     C::Value: LegacyBroadcast + Transpose,
     UpdateSliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -745,9 +746,8 @@ where
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
-        let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
-        let input = inputs[0].match_axis(batch_axis, axis_size, context.axis_sharding().clone())?;
-        let update = inputs[1].match_axis(batch_axis, axis_size, context.axis_sharding().clone())?;
+        let input = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
+        let update = P::match_axis(context, &inputs[1], Axis::from(batch_axis))?;
         let mut start_indices = self.start_indices().to_vec();
         start_indices.insert(batch_axis, 0);
         UpdateSliceOperation::new(start_indices).interpret_with_batch_axes(
@@ -1006,15 +1006,15 @@ where
 /// batch axis is `0` even when the operand carried its batch axis elsewhere). The expansion stages `O(batch_size)`
 /// operations — a gather-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts
 /// because it only goes through the value capability traits.
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for DynamicSliceOperation
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for DynamicSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: ZeroLike + LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     DynamicSliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1290,15 +1290,15 @@ where
 /// even when the operands carried their batch axes elsewhere). The expansion stages `O(batch_size)` operations — a
 /// scatter-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts because it
 /// only goes through the value capability traits.
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for DynamicUpdateSliceOperation
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for DynamicUpdateSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: ZeroLike + LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     DynamicUpdateSliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1322,9 +1322,8 @@ where
         if inputs.len() == 2 {
             return Ok(vec![inputs[1].clone()]);
         }
-        let axis_size = axis_size.expect("a mapped input pins the batch size");
-        let input = inputs[0].match_axis(batch_axis, axis_size, context.axis_sharding().clone())?;
-        let update = inputs[1].match_axis(batch_axis, axis_size, context.axis_sharding().clone())?;
+        let input = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
+        let update = P::match_axis(context, &inputs[1], Axis::from(batch_axis))?;
         let zero_index = ArrayBatch::replicated(inputs[2].value().clone().zero_like());
         let mut lifted_inputs = vec![input, update];
         lifted_inputs.extend(inputs[2..].iter().cloned());
@@ -2031,8 +2030,8 @@ where
 /// item. Nonempty explicitly sharded mapped inputs are resharded to replicated placement before item extraction, and
 /// the completed replicated accumulator is resharded once to the context's mapped placement. This avoids assigning a
 /// nontrivial sharding to the extent-one slices used internally by the expansion.
-pub(crate) fn batch_by_item_expansion<C, O>(
-    context: &BatchingContext<C, ArrayBatchingPolicy>,
+pub(crate) fn batch_by_item_expansion<C, O, P: ArrayBatchingPolicy<C>>(
+    context: &BatchingContext<C, ArrayBatching<P>>,
     operation_name: &'static str,
     operation: &O,
     inputs: &[ArrayBatch<C::Value>],

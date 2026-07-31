@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
 use crate::batching::{
-    ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    BatchingTracer,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, BatchingTracer,
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
@@ -121,13 +121,16 @@ impl<V: Value, C: Context<Type = V::Type, Operation: From<ConstantOperation<V>>>
 impl_non_differentiable_operation!(<V> ConstantOperation<V> where V: Value);
 impl_nullary_transposable_operation!(<V> ConstantOperation<V> where V: Value);
 
-impl<Stored: Value<Type = ArrayType>, C: Context<Type = ArrayType, Operation: From<ConstantOperation<Stored>>>>
-    BatchableOperation<C, ArrayBatchingPolicy> for ConstantOperation<Stored>
+impl<
+    Stored: Value<Type = ArrayType>,
+    C: Context<Type = ArrayType, Operation: From<ConstantOperation<Stored>>>,
+    P: ArrayBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatching<P>> for ConstantOperation<Stored>
 {
     #[inline]
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -183,9 +186,9 @@ impl<C: StagingContext> Constant<Tracer<C>, C::Constant> for C {
 }
 
 impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored>, Stored>
-    Constant<BatchingTracer<C, ArrayBatchingPolicy>, Stored> for BatchingContext<C, ArrayBatchingPolicy>
+    Constant<BatchingTracer<C, ArrayBatching>, Stored> for BatchingContext<C, ArrayBatching>
 {
-    fn constant(&self, value: Stored) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
+    fn constant(&self, value: Stored) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
         let value = self.parent().constant(value)?;
         let r#type = value.r#type().into_owned();
         let batch = ArrayBatch::new(r#type, value, BatchAxis::replicated())?;

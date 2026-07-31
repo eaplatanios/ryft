@@ -31,10 +31,9 @@
 
 use std::fmt::Display;
 
-use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
@@ -261,13 +260,14 @@ impl_differentiable_operation! {
 
 /// Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
 /// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for ReshardOperation
+impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for ReshardOperation
 where
     ReshardOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -467,13 +467,14 @@ impl_differentiable_operation! {
 /// entry at the new batch dimension: the hint governs only the compiler-propagated auto axes, so the new dimension
 /// is left open for the backend to fill rather than pinned to a derived or replicated entry (matching JAX's
 /// `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
-impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for ShardingConstraintOperation
+impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for ShardingConstraintOperation
 where
     ShardingConstraintOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

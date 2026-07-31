@@ -2,8 +2,9 @@ use std::fmt::{Display, Formatter};
 use std::ops::{Add, Mul};
 
 use crate::backends::scalars::Scalar;
-use crate::batching::ArrayBatchingPolicy;
-use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -240,14 +241,14 @@ where
 
 // Keep the dedicated operation intact when batching into a staging parent so that backends can lower the packed basis
 // directly. The generic replicated-nullary rule interprets its operation and would expand this primitive instead.
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for CoordinateBasisOperation<ArrayType>
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for CoordinateBasisOperation<ArrayType>
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<CoordinateBasisOperation<ArrayType>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

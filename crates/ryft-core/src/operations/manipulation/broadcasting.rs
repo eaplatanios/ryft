@@ -1,8 +1,10 @@
 use std::fmt::Display;
 
 use crate::DimensionValue;
-use crate::batching::ArrayBatchingPolicy;
-use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError,
+};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::elementwise::BroadcastDerivativeAlignment;
 use crate::differentiation::forward::DifferentiationDual;
@@ -270,12 +272,12 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast>> BatchableOperation<C, ArrayBatchingPolicy>
-    for LegacyBroadcastOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast>, P: ArrayBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatching<P>> for LegacyBroadcastOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        _context: &BatchingContext<C, ArrayBatchingPolicy>,
+        _context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
