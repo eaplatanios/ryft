@@ -7,7 +7,7 @@ pub mod arrays;
 pub mod dimensions;
 pub mod scalars;
 
-pub use array_programs::batching::{ArrayProgramBatch, ArrayProgramBatchingPolicy};
+pub use array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
 pub use array_programs::{ArrayProgramOperation, ArrayProgramValue};
 pub use arrays::{Array, ArrayOperation, ArrayTracingContext};
 pub use dimensions::{DimensionOperation, DimensionTracingContext, DimensionValue};

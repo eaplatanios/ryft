@@ -1445,7 +1445,7 @@ rename only part of the problem while introducing another carrier.
       dispatch tests become their second consumer. Do not duplicate a synthetic composite universe; the promoted
       fixture is also the vehicle for Phase 6's dispatch tests and the verification matrix's toy third-kind gate.
 - [x] Represent a dynamic batching extent with its first-class dimension value, not metadata alone.
-- [ ] Make the generic outer dispatcher project array primitives, invoke their existing homogeneous batching rule
+- [x] Make the generic outer dispatcher project array primitives, invoke their existing homogeneous batching rule
       through the zero-state context, and lift results. Test the generic projection/lift path against the promoted
       toy composite fixture in addition to the production array-program universe, so the dispatch machinery is proven
       member-kind-agnostic rather than array-specific.
@@ -1455,21 +1455,23 @@ rename only part of the problem while introducing another carrier.
       Composite invocation infers first-class mapped extent authority through `dimension_size`, checks additional or
       explicit extents with ordered requirements, and dynamically materializes requested output axes. Reuse the
       canonical move-or-broadcast helper in composite concatenate as the first operation-rule consumer.
-- [ ] Keep dedicated rules only for genuinely mixed shape-changing and region-carrying operations.
+- [x] Keep dedicated rules only for genuinely mixed shape-changing and region-carrying operations. Homogeneous array
+      operations now use generated generic projection/delegation/lifting; the remaining explicit rules were audited
+      and are mixed, region-carrying, RNG, or custom-call contracts.
 - [ ] Move mapped-state RNG batching's carry-free `scan` into the composite region contract and thread every dynamic
       bits-output extent through that body as replicated first-class shape authority. Delete P3i's exact
       `"requires Phase 5 composite scan-region support"` boundary only after the resulting program remains
       size-independent in the mapped-axis extent and preserves the existing replicated-state diagnostic.
-- [ ] Centralize explicit dynamic alignment/broadcasting so elementwise rules do not rediscover extents.
+- [x] Centralize explicit dynamic alignment/broadcasting so elementwise rules do not rediscover extents.
       Public output materialization, input-sharding normalization, and concatenate now share the first-class dynamic
       boundary helper. Keep this item open until the generic array-primitive dispatcher and all internal elementwise
       alignment stop using the localized static bridge.
-- [ ] Remove repeated outer-enum matches that only project/lift batches.
+- [x] Remove repeated outer-enum matches that only project/lift batches.
 - [ ] Delete dimension/source-array reconstruction in dynamic slice, concatenate, reduce, collectives, RNG, and
       constructors.
 - [ ] Verify nested `vmap`, mapped arrays with dynamic logical extents, replicated dimension residuals, control flow,
       and all mapped-authority rejection paths.
-- [ ] Gate: adding an array-only primitive with a standard batching rule requires no handwritten change in composite
+- [x] Gate: adding an array-only primitive with a standard batching rule requires no handwritten change in composite
       batching dispatch.
 
 P5a adopted the transform-owned policy design and completed the shared-frame migration. `BatchingContext`,
@@ -1482,10 +1484,15 @@ baseline versus `12.28-12.31s` repeated current measurements; one `13.24s` curre
 was `0.17s` versus `0.16s`. Full measurements and the deletion ledger are recorded in
 `.tasks/plan_p5a_batching_policy_prototype.md`.
 
-The remaining open Phase 5 items are intentionally production work, not P5a misses: eliminate the localized
-`static_axis_extent` bridge by centralizing first-class dynamic alignment/broadcasting; prove the generic
-projection/lift dispatcher with the promoted fixture; migrate composite region operations and RNG scan; and run the
-complete nested/dynamic/JAX-parity matrix before the final Phase 5 gate.
+At the close of P5a, the remaining Phase 5 items were intentionally production work rather than P5a misses:
+eliminate the localized `static_axis_extent` bridge, prove the generic projection/lift dispatcher, migrate composite
+region operations and RNG scan, and run the complete nested/dynamic/JAX-parity matrix before the final Phase 5 gate.
+
+P5b completed the first two items in `.tasks/plan_p5b_dynamic_batch_alignment.md`. Homogeneous array operations now
+use one generated policy-generic projection/delegation/lifting path, and static and first-class dynamic batching share
+one structural alignment algorithm with mode-selected broadcast materialization. The static bridge, duplicated
+composite alignment, and per-primitive outer dispatch are deleted. Focused parity, import/render, macro, core, and XLA
+tests pass. Composite region operations and RNG scan remain deliberately separate Phase 5 units.
 
 ### Phase 6: simplify differentiation and transposition
 
@@ -1680,7 +1687,7 @@ complete nested/dynamic/JAX-parity matrix before the final Phase 5 gate.
 - [ ] Dimension tangents/cotangents remain absent or structural zero.
 - [ ] Required primal dimension values travel as ordinary differentiation residual SSA values.
 - [ ] No primal operation payload contains `transpose_dimension_variables` or an equivalent residual manifest.
-- [ ] Dynamic batching alignment consumes an explicit dimension value.
+- [x] Dynamic batching alignment consumes an explicit dimension value.
 - [ ] Requirement effects survive every transform and lower in deterministic order.
 - [ ] Nested condition, while, scan, custom derivative, and rematerialization regions carry dimensions correctly.
 - [ ] Repeated boundary readers do not become duplicate producers.

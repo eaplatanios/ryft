@@ -71,14 +71,14 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// Array-member zero constructor used for structural tangent and cotangent materialization.
     ///
     /// Its composite type parameter lets generic differentiation code request a zero, while outer inference rejects
-    /// dimension-member result types so a zero constructor can never grant first-class shape authority.
+    /// dimension-member result types so a zero constructor can never create a first-class dimension value.
     Zero(ZeroOperation<ArrayProgramType>),
 
-    /// Mixed zero constructor whose stored [`ArrayType`] is the complete output authority and whose dynamic
+    /// Mixed zero constructor whose stored [`ArrayType`] fully defines the output type and whose dynamic
     /// dimensions are consumed as explicit first-class dimension operands, one per dynamic axis in axis order.
     DynamicZero(ZeroOperation<ArrayType>),
 
-    /// Mixed one constructor whose stored [`ArrayType`] is the complete output authority and whose dynamic dimensions
+    /// Mixed one constructor whose stored [`ArrayType`] fully defines the output type and whose dynamic dimensions
     /// are consumed as explicit first-class dimension operands, one per dynamic axis in axis order.
     DynamicOne(OneOperation<ArrayType>),
 
@@ -97,8 +97,8 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// This variant has the precise composite member signature
     /// `(Dimension, Dimension) -> Array(Boolean scalar)`. It lives directly in [`ArrayProgramOperation`] because
     /// [`DimensionOperation`] is intentionally homogeneous: its inputs and outputs are all first-class dimensions.
-    /// Storing comparison there would break that invariant because a predicate is ordinary data rather than shape
-    /// authority.
+    /// Storing comparison there would break that invariant because a predicate is ordinary data rather than a
+    /// first-class dimension.
     ///
     /// Homogeneous array comparison remains [`ArrayProgramOperation::Array`] wrapping
     /// [`ArrayOperation::Compare`]. This variant does not permit array-dimension or dimension-array comparisons; it
@@ -473,7 +473,8 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         match self {
             Self::Zero(operation) => {
                 // Differential zeros always use the ordinary array member. Rejecting a dimension result here prevents
-                // this generic constructor from bypassing the checked gateways that alone may create shape authority.
+                // this generic constructor from bypassing the checked gateways that alone may create first-class
+                // dimensions.
                 <&ArrayType>::try_from(operation.r#type())?;
                 operation.infer_output_types(input_types, region_interfaces)
             }
@@ -1180,7 +1181,7 @@ where
                 MaybeZero::Zero(primal.r#type().tangent())
             } else {
                 // Concatenation is linear in its array operands. Materialize only the structural zero array tangents
-                // needed beside live tangents, and replay the primal result extent as unchanged shape authority.
+                // needed beside live tangents, and replay the primal result extent as an unchanged shape input.
                 let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
                 let mut tangent_inputs = array_inputs
                     .iter()
@@ -1231,7 +1232,7 @@ where
                     }
                 }
                 MaybeZero::Value(array_tangent) => {
-                    // Output extents are structural shape authority: replay their primal values unchanged while
+                    // Output extents are non-differentiable shape inputs: replay their primal values unchanged while
                     // applying the same shape operation to the live array tangent.
                     let mut tangent_inputs = Vec::with_capacity(inputs.len());
                     tangent_inputs.push(array_tangent.clone());
@@ -1278,7 +1279,7 @@ where
         let Self::Array(operation) = self else {
             // Dimension-only and mixed shape-observation operations carry no differential dependence. Replaying the
             // primal through the composite context preserves their explicit SSA dependencies while structural zeros
-            // prevent dimension authority from entering the tangent program.
+            // prevent first-class dimensions from entering the tangent program.
             return Ok(context
                 .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>())?
                 .into_iter()
@@ -1355,7 +1356,7 @@ where
         }
         if matches!(self, Self::DynamicZero(_) | Self::DynamicOne(_) | Self::DynamicIota(_)) {
             check_count!("output", outputs, 1, ProgramError);
-            // A shaped constructor depends on its extent operands only as non-differentiable shape authority. Its
+            // A shaped constructor depends on its extent operands only as non-differentiable shape inputs. Its
             // array value is constant with respect to those operands, so every extent receives a structural-zero
             // cotangent regardless of the array output cotangent.
             return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
@@ -1390,7 +1391,7 @@ where
 
             // Exact extents make the mixed instruction identical to the established homogeneous pad map. Delegate
             // that pullback for the two differentiable array operands and assign structural-zero cotangents to the
-            // trailing extent authority values.
+            // trailing extent values.
             let array_operation = Self::Array(ArrayOperation::from(operation.clone()));
             let mut cotangents = array_operation.transpose(context, driver, array_inputs, outputs)?;
             cotangents.extend(output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())));
@@ -1433,8 +1434,8 @@ where
             }
 
             // Static concatenation uses the established homogeneous pullback, which slices the output cotangent at
-            // cumulative input offsets. The explicit result extent is shape authority and has a structural-zero
-            // cotangent.
+            // cumulative input offsets. The explicit result extent is a non-differentiable shape input and has a
+            // structural-zero cotangent.
             let array_operation = Self::Array(ArrayOperation::from(operation.clone()));
             let mut cotangents = array_operation.transpose(context, driver, array_inputs, outputs)?;
             cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()));
@@ -1883,7 +1884,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::axes::NamedAxis;
-    use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatchingPolicy};
+    use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
     use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
@@ -3503,7 +3504,7 @@ mod tests {
 
     #[test]
     fn test_array_program_dynamic_constructor_transposition() {
-        // Dynamic constructors depend on their extent operands only as non-differentiable shape authority, so every
+        // Dynamic constructors depend on their extent operands only as non-differentiable shape inputs, so every
         // extent receives a structural-zero cotangent regardless of the output cotangent being live.
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
@@ -4266,7 +4267,7 @@ mod tests {
         );
 
         type Parent = EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
-        let batching_context = BatchingContext::<_, ArrayProgramBatchingPolicy>::new(
+        let batching_context = BatchingContext::<_, ArrayProgramBatching>::new(
             Parent::new(),
             ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()),
         )
@@ -4519,8 +4520,8 @@ mod tests {
             Ok(vec![expected.clone(), expected_tangent]),
         );
 
-        // Batching inserts one physical leading axis while the extent remains replicated shared shape authority.
-        let batching_context = BatchingContext::<_, ArrayProgramBatchingPolicy>::new(
+        // Batching inserts one physical leading axis while the extent remains a replicated shape value.
+        let batching_context = BatchingContext::<_, ArrayProgramBatching>::new(
             EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new(),
             ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()),
         );

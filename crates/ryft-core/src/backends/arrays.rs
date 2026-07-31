@@ -90,7 +90,7 @@ use crate::types::{ArrayType, DataType, Dimension, Shape, StaticShape};
 
 /// Backend execution contract for broadcasting to an already-concrete [`ArrayType`].
 ///
-/// This kernel does not stage a program operation and does not grant runtime shape authority. Composite eager
+/// This kernel does not stage a program operation or create first-class dimension values. Composite eager
 /// interpretation resolves first-class dimension operands and validates the result type before invoking it. Program
 /// construction uses [`Broadcast`](crate::operations::manipulation::Broadcast) instead.
 pub trait BroadcastKernel: Sized {
