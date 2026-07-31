@@ -1455,7 +1455,6 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
     }
 }
 
-// TODO(eaplatanios): Should this be limited to `ArrayType` or can we generalize it using a generic policy?
 impl<
     V: Value<Type = ArrayType>,
     O: Operation<ArrayType>
@@ -1464,13 +1463,19 @@ impl<
         + From<LegacyBroadcastOperation>,
 > RegionRef<'_, V, O>
 {
-    /// Batches this borrowed [`Region`](crate::Region) so that the resulting program operates over batched inputs
-    /// along the specified [`BatchAxis`]s. Staged higher-order [`BatchableOperation`] implementations use this function
-    /// to batch captured programs *without* concretizing any batch-item values, so that batched control-flow and
-    /// custom-derivative structure can be staged back into the enclosing trace. This function works by replying this
-    /// program through a [`BatchingContext`] over a fresh [`TracingContext`], lifting every instruction through its
-    /// [`BatchableOperation`] rule, and the resulting staged program is extracted together with the requested
-    /// [`ProgramBatchingOutputAxesPolicy`].
+    /// Structurally batches this borrowed homogeneous-array [`Region`](crate::Region) so that the resulting program
+    /// operates over inputs batched along the specified [`BatchAxis`]s. Staged higher-order [`BatchableOperation`]
+    /// implementations use this function to batch captured programs *without* concretizing any batch-item values, so
+    /// that batched control-flow and custom-derivative structure can be staged back into the enclosing trace. This
+    /// function replays the region through an [`ArrayBatchingPolicy`] [`BatchingContext`] over a fresh
+    /// [`TracingContext`], lifts every instruction through its [`BatchableOperation`] rule, and extracts the resulting
+    /// staged program together with the requested [`ProgramBatchingOutputAxesPolicy`].
+    ///
+    /// This method is intentionally specific to [`ArrayType`]. It constructs physical mapped input types by inserting
+    /// static [`Dimension`]s, rewrites array sharding metadata, and materializes output axes through [`ArrayBatch`].
+    /// Composite program families with first-class dynamic dimension extent values instead own structural recursion
+    /// through [`RecursiveBatchingPolicy::batch_program`], where the [`RecursiveBatchingPolicy`] can define how extent
+    /// Single Static Assignment (SSA) values cross a rewritten region boundary.
     ///
     /// Inputs whose `input_batch_axes[i]` is mapped at position `k` consume the original unbatched input [`ArrayType`]
     /// with a mapped batch axis of size `axis_size` inserted at `k`, while replicated inputs enter at their original
@@ -1605,7 +1610,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Should this be limited to `ArrayType` or can we generalize it using a generic policy?
 impl<
     V: Value<Type = ArrayType>,
     O: Operation<ArrayType>
@@ -1614,8 +1618,9 @@ impl<
         + From<LegacyBroadcastOperation>,
 > Program<V, O, Vec<V>, Vec<V>>
 {
-    /// Batches this [`Program`] over the provided input axes. Refer to [`RegionRef::batched`] for the complete
-    /// transformation semantics.
+    /// Structurally batches this homogeneous-array [`Program`] over the provided input axes. Refer to
+    /// [`RegionRef::batched`] for the complete transformation semantics and for the reason that this helper
+    /// is intentionally specific to [`ArrayType`].
     ///
     /// # Parameters
     ///
@@ -1790,7 +1795,6 @@ pub trait Batch: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose> {
     }
 }
 
-// TODO(eaplatanios): Should this be limited to `ArrayType` or can we generalize it using a generic policy?
 impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> Batch for C {}
 
 // TODO(eaplatanios): Should this be limited to `ArrayType` or can we generalize it using a generic policy?
@@ -1829,7 +1833,7 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> Batch for
 /// # Parameters
 ///
 ///   - `function`: Function that represents the computation that needs to be batched/vectorized.
-///   - `input`: Input (potentially structured) that the ought to be batched/vectorized.
+///   - `input`: Input (potentially structured) that should be batched/vectorized.
 ///   - `input_batch_axes`: [`BatchAxis`] selection for the input leaves, broadcast into the input's structure.
 ///   - `output_batch_axes`: [`BatchAxis`] selection for the output leaves, broadcast into the output's structure.
 ///   - `batch_axis`: [`BatchAxisSpecification`] to use carrying an optional explicit batch size and an optional
