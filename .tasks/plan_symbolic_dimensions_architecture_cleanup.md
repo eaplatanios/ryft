@@ -1414,49 +1414,56 @@ rename only part of the problem while introducing another carrier.
       `BatchingContext`, `BatchingTracer`, `BatchableOperation`, and their P3c array-program counterparts. Classify
       each responsibility as value-kind-neutral, array-specific, or genuinely composite. The exact ledger and
       prototype gate are recorded in `.tasks/plan_p5a_batching_policy_prototype.md`.
-- [ ] Prototype a transform-owned batching-policy abstraction that can select the batch carrier and batching-extent
+- [x] Prototype a transform-owned batching-policy abstraction that can select the batch carrier and batching-extent
       representation for a parent context. The concrete shape is deliberately open, but evaluate a design equivalent
-      in power to `BatchingPolicy<C> { type Batch; type AxisExtent; ... }` before committing to the parallel composite
+      in power to `BatchingPolicy<C> { type Batch; type Extent; ... }` before committing to the parallel composite
       context/tracer tower. Keep this policy in batching machinery; do not add batching hooks to [`Type`].
-- [ ] Exercise the prototype with one homogeneous array operation, one dimension operation, `dimension_size`,
+- [x] Exercise the prototype with one homogeneous array operation, one dimension operation, `dimension_size`,
       `dimension_to_scalar`, the promoted toy third member kind, and one nested-region operation. Prove that array
       members reuse ordinary `ArrayBatch` semantics, dimension members remain replicated-only, and genuinely mixed
       operations retain explicit rules.
-- [ ] Reuse [`ValueProjection`] for borrowed and consuming member access. Do not add a separate public
+- [x] Reuse [`ValueProjection`] for borrowed and consuming member access. Do not add a separate public
       `ProjectedArrayBatch` unless a concrete residual need remains after the policy prototype, and reject any design
       that clones or allocates eager array payloads merely to project a batch.
-- [ ] Prefer one generic batching context/tracer over the P3c parallel array-program context/tracer when the prototype
+- [x] Prefer one generic batching context/tracer over the P3c parallel array-program context/tracer when the prototype
       removes more code than it adds, keeps existing array batching rules unchanged or mechanically adaptable, and
       has neutral trait-solver, compile-time, and allocation behavior. If the policy parameter spreads equivalent or
       greater ceremony through ordinary batching, retain a localized composite adapter, document the evidence, and
       reduce it to the smallest value-kind policy layer rather than forcing the abstraction.
-- [ ] Generalize the operation batching contract alongside the carrier, context, and driver so that one
+- [x] Generalize the operation batching contract alongside the carrier, context, and driver so that one
       `BatchableOperation` can serve homogeneous and composite batching, then delete
       `ArrayProgramBatchableOperation`. Do not generalize the operation trait in isolation: its inputs, outputs,
       active context, and recursive driver must all come from the same transform-owned batching policy. If the
       prototype gate rejects the generic policy because it adds more ceremony than it removes, retain the localized
       composite trait and record that evidence explicitly.
-- [ ] Gate: the final design has one canonical representation for each necessary batching concept, no wrapper that
+- [x] Gate: the final design has one canonical representation for each necessary batching concept, no wrapper that
       merely renames `ArrayProgramBatch`, and no parallel context/tracer tower unless the rejected-policy evidence
       demonstrates that the localized duplication is the simpler implementation.
-- [ ] Promote the toy composite projection fixtures from the `contexts.rs` unit tests (`ProjectedMemberType`,
+- [x] Promote the toy composite projection fixtures from the `contexts.rs` unit tests (`ProjectedMemberType`,
       `ProjectedMemberValue`, `ProjectedProgramType`, `ProjectedProgramValue`, `ProjectedProgramOperation`, and the
       `impl_projected_test_member!` macro) into a `pub(crate)` shared test fixture the moment this phase's generic
       dispatch tests become their second consumer. Do not duplicate a synthetic composite universe; the promoted
       fixture is also the vehicle for Phase 6's dispatch tests and the verification matrix's toy third-kind gate.
-- [ ] Represent a dynamic batching extent with its first-class dimension value, not metadata alone.
+- [x] Represent a dynamic batching extent with its first-class dimension value, not metadata alone.
 - [ ] Make the generic outer dispatcher project array primitives, invoke their existing homogeneous batching rule
       through the zero-state context, and lift results. Test the generic projection/lift path against the promoted
       toy composite fixture in addition to the production array-program universe, so the dispatch machinery is proven
       member-kind-agnostic rather than array-specific.
-- [ ] Handle dimension-only operations with the replicated-only dimension batching policy.
-- [ ] Reject mapped dimension authority at the boundary with the existing typed diagnostic.
+- [x] Handle dimension-only operations with the replicated-only dimension batching policy.
+- [x] Reject mapped dimension authority at the boundary with the existing typed diagnostic.
+- [x] Generalize the public `Batch` and free `batch` entrypoints over the program type's selected batching policy.
+      Composite invocation infers first-class mapped extent authority through `dimension_size`, checks additional or
+      explicit extents with ordered requirements, and dynamically materializes requested output axes. Reuse the
+      canonical move-or-broadcast helper in composite concatenate as the first operation-rule consumer.
 - [ ] Keep dedicated rules only for genuinely mixed shape-changing and region-carrying operations.
 - [ ] Move mapped-state RNG batching's carry-free `scan` into the composite region contract and thread every dynamic
       bits-output extent through that body as replicated first-class shape authority. Delete P3i's exact
       `"requires Phase 5 composite scan-region support"` boundary only after the resulting program remains
       size-independent in the mapped-axis extent and preserves the existing replicated-state diagnostic.
 - [ ] Centralize explicit dynamic alignment/broadcasting so elementwise rules do not rediscover extents.
+      Public output materialization, input-sharding normalization, and concatenate now share the first-class dynamic
+      boundary helper. Keep this item open until the generic array-primitive dispatcher and all internal elementwise
+      alignment stop using the localized static bridge.
 - [ ] Remove repeated outer-enum matches that only project/lift batches.
 - [ ] Delete dimension/source-array reconstruction in dynamic slice, concatenate, reduce, collectives, RNG, and
       constructors.
@@ -1464,6 +1471,21 @@ rename only part of the problem while introducing another carrier.
       and all mapped-authority rejection paths.
 - [ ] Gate: adding an array-only primitive with a standard batching rule requires no handwritten change in composite
       batching dispatch.
+
+P5a adopted the transform-owned policy design and completed the shared-frame migration. `BatchingContext`,
+`BatchingTracer`, `BatchingDriver`, and `BatchableOperation` are now policy-generic; the three parallel
+`ArrayProgramBatching*` context/tracer/trait concepts are deleted; and composite extents are parent-owned dimension SSA
+values. The promoted three-member fixture, ordinary array and dimension rules, mixed gateways, dynamic reshape edge,
+mapped-dimension diagnostic, recursive replay, rendering/import, macro integration, full `ryft-core`, and full
+`ryft-xla` suites all pass. Clean repeated `ryft-core` check time remained effectively neutral (`12.17-12.26s`
+baseline versus `12.28-12.31s` repeated current measurements; one `13.24s` current outlier), and warm incremental time
+was `0.17s` versus `0.16s`. Full measurements and the deletion ledger are recorded in
+`.tasks/plan_p5a_batching_policy_prototype.md`.
+
+The remaining open Phase 5 items are intentionally production work, not P5a misses: eliminate the localized
+`static_axis_extent` bridge by centralizing first-class dynamic alignment/broadcasting; prove the generic
+projection/lift dispatcher with the promoted fixture; migrate composite region operations and RNG scan; and run the
+complete nested/dynamic/JAX-parity matrix before the final Phase 5 gate.
 
 ### Phase 6: simplify differentiation and transposition
 
