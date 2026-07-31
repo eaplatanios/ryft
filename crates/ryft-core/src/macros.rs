@@ -2463,7 +2463,7 @@ macro_rules! impl_nullary_batchable_operation {
             #[inline]
             fn batch<__D: $crate::BatchingDriver<__C, $crate::ArrayBatchingPolicy>>(
                 &self,
-                context: &$crate::BatchingContext<__C>,
+                context: &$crate::BatchingContext<__C, $crate::ArrayBatchingPolicy>,
                 _driver: &__D,
                 inputs: &[$crate::ArrayBatch<__C::Value>],
             ) -> Result<Vec<$crate::ArrayBatch<__C::Value>>, $crate::BatchingError> {
@@ -2573,7 +2573,7 @@ macro_rules! define_tracer_operator {
 
         impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
         where
-            $crate::BatchingContext<__C>: $crate::Context<
+            $crate::BatchingContext<__C, $crate::ArrayBatchingPolicy>: $crate::Context<
                     Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
                     Operation: ::std::convert::From<$operation>,
                 >,
@@ -2684,7 +2684,7 @@ macro_rules! define_tracer_operator {
             for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
         where
             __C::Type: $provider,
-            $crate::BatchingContext<__C>: $crate::Context<
+            $crate::BatchingContext<__C, $crate::ArrayBatchingPolicy>: $crate::Context<
                     Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
                     Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
                 >,
@@ -2780,7 +2780,7 @@ macro_rules! define_tracer_operator {
 
         impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
         where
-            $crate::BatchingContext<__C>: $crate::Context<
+            $crate::BatchingContext<__C, $crate::ArrayBatchingPolicy>: $crate::Context<
                     Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
                     Operation: ::std::convert::From<$operation>,
                 >,
@@ -3580,7 +3580,8 @@ macro_rules! check_operation_batching {
         let driver = $driver;
         let axis_size = $axis_size;
         let axis_sharding = $axis_sharding;
-        let context = $crate::batching::BatchingContext::new($context, axis_size)
+        let context =
+            $crate::batching::BatchingContext::<_, $crate::batching::ArrayBatchingPolicy>::new($context, axis_size)
             .with_axis_sharding(axis_sharding);
         $(
             let inputs = vec![$($crate::check_operation_batching!(@batch_value $input)),*];

@@ -888,7 +888,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

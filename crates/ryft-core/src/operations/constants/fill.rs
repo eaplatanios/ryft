@@ -89,7 +89,7 @@ where
 }
 
 impl<C: Context<Type = ArrayType> + Fill<Scalar, C::Value>> Fill<Scalar, BatchingTracer<C, ArrayBatchingPolicy>>
-    for BatchingContext<C>
+    for BatchingContext<C, ArrayBatchingPolicy>
 {
     #[inline]
     fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {

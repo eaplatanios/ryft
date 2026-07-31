@@ -199,7 +199,7 @@ where
 }
 
 impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<BatchingTracer<C, ArrayBatchingPolicy>>
-    for BatchingContext<C>
+    for BatchingContext<C, ArrayBatchingPolicy>
 {
     #[inline]
     fn iota(

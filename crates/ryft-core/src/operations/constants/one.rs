@@ -148,7 +148,9 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType> + One<C::Value>> One<BatchingTracer<C, ArrayBatchingPolicy>> for BatchingContext<C> {
+impl<C: Context<Type = ArrayType> + One<C::Value>> One<BatchingTracer<C, ArrayBatchingPolicy>>
+    for BatchingContext<C, ArrayBatchingPolicy>
+{
     #[inline]
     fn one(&self, r#type: &ArrayType) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().one(r#type)?, BatchAxis::replicated())?;

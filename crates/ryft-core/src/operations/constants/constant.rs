@@ -127,7 +127,7 @@ impl<Stored: Value<Type = ArrayType>, C: Context<Type = ArrayType, Operation: Fr
     #[inline]
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -183,7 +183,7 @@ impl<C: StagingContext> Constant<Tracer<C>, C::Constant> for C {
 }
 
 impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored>, Stored>
-    Constant<BatchingTracer<C, ArrayBatchingPolicy>, Stored> for BatchingContext<C>
+    Constant<BatchingTracer<C, ArrayBatchingPolicy>, Stored> for BatchingContext<C, ArrayBatchingPolicy>
 {
     fn constant(&self, value: Stored) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
         let value = self.parent().constant(value)?;

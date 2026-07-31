@@ -330,7 +330,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -973,7 +973,9 @@ mod tests {
     }
 
     /// Returns an active batching frame over an eager reference-backend parent for direct batching-rule tests.
-    fn batching_context(axis_size: usize) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>> {
+    fn batching_context(
+        axis_size: usize,
+    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy> {
         BatchingContext::new(EagerContext::new(), axis_size)
     }
 

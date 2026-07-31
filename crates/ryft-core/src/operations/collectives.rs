@@ -402,7 +402,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -436,7 +436,7 @@ where
 /// resolution at the next level — or an ordinary tracing context. Batching rules for custom collective-like
 /// operations should use this helper for their "not my axis" arm.
 pub fn forward_collective_to_parent<C>(
-    context: &BatchingContext<C>,
+    context: &BatchingContext<C, ArrayBatchingPolicy>,
     parent_operation: C::Operation,
     inputs: &[ArrayBatch<<C as Domain>::Value>],
 ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
@@ -1958,7 +1958,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -2027,7 +2027,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -2108,7 +2108,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -2175,7 +2175,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -2425,7 +2425,9 @@ mod tests {
 
     /// Creates an active batching frame binding the named axis `"i"` over an eager parent whose operation family
     /// contains every operation the collective batching rule may bind (notably constants and broadcasts for `PMean`).
-    fn batching_context(axis_size: usize) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>> {
+    fn batching_context(
+        axis_size: usize,
+    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy> {
         BatchingContext::new(EagerContext::new(), axis_size).with_axis_name("i".to_string())
     }
 

@@ -841,7 +841,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -938,7 +938,7 @@ where
 /// the per-item scalar predicate across non-scalar branch output shapes. The predicate must carry a mapped batch axis;
 /// the replicated case is the caller's structural staging path.
 pub(crate) fn batch_condition_with_interpreter<C, F>(
-    context: &BatchingContext<C>,
+    context: &BatchingContext<C, ArrayBatchingPolicy>,
     predicate_batch: &ArrayBatch<C::Value>,
     operand_inputs: &[ArrayBatch<C::Value>],
     mut batch_branch: F,

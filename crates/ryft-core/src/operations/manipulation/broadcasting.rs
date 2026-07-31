@@ -275,7 +275,7 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast>> BatchableOperation<C,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        _context: &BatchingContext<C>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

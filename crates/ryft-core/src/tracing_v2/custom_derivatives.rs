@@ -209,7 +209,7 @@ crate::impl_non_transposable_operation!(CustomJvpOperation);
 /// carry the batch axis at axis `0` (replicated inputs are broadcast, matching the convention that every
 /// custom-call input is mapped at axis `0`) and every output carries the batch axis at axis `0`.
 pub(crate) fn stage_rewrapped_custom_call<C, MakeOperationFn>(
-    context: &BatchingContext<C>,
+    context: &BatchingContext<C, ArrayBatchingPolicy>,
     inputs: &[ArrayBatch<<C as Domain>::Value>],
     make_operation: MakeOperationFn,
 ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
@@ -258,7 +258,7 @@ where
 /// Batches the region at `index` using the custom-derivative rewrapping convention: every input and output is mapped
 /// at axis `0`.
 pub(crate) fn batch_rewrapped_program<C: Context<Type = ArrayType>, D: BatchingDriver<C, ArrayBatchingPolicy>>(
-    context: &BatchingContext<C>,
+    context: &BatchingContext<C, ArrayBatchingPolicy>,
     driver: &D,
     index: usize,
 ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
@@ -284,7 +284,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -479,7 +479,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -814,7 +814,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        _context: &BatchingContext<C>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

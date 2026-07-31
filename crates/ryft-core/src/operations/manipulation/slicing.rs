@@ -330,7 +330,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -737,7 +737,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1014,7 +1014,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1298,7 +1298,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -2032,7 +2032,7 @@ where
 /// the completed replicated accumulator is resharded once to the context's mapped placement. This avoids assigning a
 /// nontrivial sharding to the extent-one slices used internally by the expansion.
 pub(crate) fn batch_by_item_expansion<C, O>(
-    context: &BatchingContext<C>,
+    context: &BatchingContext<C, ArrayBatchingPolicy>,
     operation_name: &'static str,
     operation: &O,
     inputs: &[ArrayBatch<C::Value>],

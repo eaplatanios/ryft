@@ -307,7 +307,7 @@ where
     }
 }
 
-impl<C: NamedAxes<Type = ArrayType>> NamedAxes for BatchingContext<C>
+impl<C: NamedAxes<Type = ArrayType>> NamedAxes for BatchingContext<C, ArrayBatchingPolicy>
 where
     C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
@@ -509,7 +509,7 @@ impl<C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>> + Fr
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         _inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {

@@ -1512,7 +1512,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -3461,7 +3461,7 @@ mod tests {
 
     /// Batches `scan` through the public [`BatchingContext::bind`] path with `body` as an owned attached region.
     fn batch_scan(
-        context: &BatchingContext<TestEagerContext>,
+        context: &BatchingContext<TestEagerContext, ArrayBatchingPolicy>,
         scan: ScanOperation<Array>,
         body: Program<Array, TestOperation, Vec<Array>, Vec<Array>>,
         inputs: Vec<ArrayBatch<Array>>,

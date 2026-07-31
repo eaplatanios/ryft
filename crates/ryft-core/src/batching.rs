@@ -695,15 +695,12 @@ pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
 /// for every program universe. This capability owns the universe-specific boundary mechanics: selecting and validating
 /// the mapped extent, packing and physically normalizing inputs, and materializing each requested output axis.
 pub trait BatchingEntrypointPolicy<C: Context>: BatchingPolicy<C> {
-    /// Specification of the mapped axis extent.
-    type AxisSpecification;
-
     /// Prepares the provided input values for the batching transform and constructs a [`BatchingContext`] for them.
     fn prepare_inputs(
         context: &C,
         inputs: Vec<C::Value>,
         input_batch_axes: Vec<BatchAxis>,
-        batch_axis: Self::AxisSpecification,
+        batch_axis: BatchAxisSpecification<Self::Extent>,
     ) -> Result<(BatchingContext<C, Self>, Vec<Self::Batch>), BatchingError>;
 
     /// Materializes `output` with the provided output [`BatchAxis`] and returns its parent value.
@@ -781,13 +778,11 @@ where
 impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchingEntrypointPolicy<C>
     for ArrayBatchingPolicy
 {
-    type AxisSpecification = BatchAxisSpecification;
-
     fn prepare_inputs(
         context: &C,
         inputs: Vec<C::Value>,
         input_batch_axes: Vec<BatchAxis>,
-        batch_axis: Self::AxisSpecification,
+        batch_axis: BatchAxisSpecification<Self::Extent>,
     ) -> Result<(BatchingContext<C, Self>, Vec<Self::Batch>), BatchingError> {
         // Validate before zipping so a malformed flat axis declaration cannot silently drop unmatched inputs or axes.
         if inputs.len() != input_batch_axes.len() {
@@ -1739,11 +1734,7 @@ impl<
 /// for this context's program universe.
 pub trait Batch: Context {
     /// Canonical [`BatchingEntrypointPolicy`] for this [`Context`]'s [`Program`] universe.
-    type Policy: BatchingEntrypointPolicy<Self, AxisSpecification = Self::AxisSpecification>;
-
-    /// User-facing mapped-axis specification form selected by [`Self::Policy`], re-exposed here so call sites and
-    /// bounds can name it without spelling out the policy projection.
-    type AxisSpecification;
+    type Policy: BatchingEntrypointPolicy<Self>;
 
     /// Batches `function` over the mapped axes of `input`, with this [`Context`] executing (or staging) the batched
     /// operations. Refer to the documentation of the [`batch`] function for information on the batching transform and
@@ -1761,7 +1752,7 @@ pub trait Batch: Context {
             >,
         InputBatchAxes: Parameterized<BatchAxis>,
         OutputBatchAxes: Parameterized<BatchAxis>,
-        Specification: Into<Self::AxisSpecification>,
+        Specification: Into<BatchAxisSpecification<<Self::Policy as BatchingPolicy<Self>>::Extent>>,
     >(
         &self,
         function: F,
@@ -1813,7 +1804,6 @@ pub trait Batch: Context {
 
 impl<C: Context<Type: BatchableType<Policy: BatchingEntrypointPolicy<C>>>> Batch for C {
     type Policy = <C::Type as BatchableType>::Policy;
-    type AxisSpecification = <<C::Type as BatchableType>::Policy as BatchingEntrypointPolicy<C>>::AxisSpecification;
 }
 
 /// Batches the provided `function` over the mapped axes of `input`, running it once over whole batches instead of once
@@ -1872,7 +1862,7 @@ pub fn batch<
         >,
     InputBatchAxes: Parameterized<BatchAxis>,
     OutputBatchAxes: Parameterized<BatchAxis>,
-    Specification: Into<<V::ExecutionDomain as Batch>::AxisSpecification>,
+    Specification: Into<BatchAxisSpecification<<<V::ExecutionDomain as Batch>::Policy as BatchingPolicy<V::ExecutionDomain>>::Extent>>,
 >(
     function: F,
     input: I,

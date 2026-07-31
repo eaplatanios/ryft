@@ -919,7 +919,7 @@ impl_differentiable_operation! {
 /// to `[v * batch]`, concatenating the per-item lengths along the folded batch axis.
 fn batch_attention_merge_reshape<C, O>(
     operation: &O,
-    context: &BatchingContext<C>,
+    context: &BatchingContext<C, ArrayBatchingPolicy>,
     inputs: &[ArrayBatch<C::Value>],
     bias_index: Option<usize>,
     bias_cotangent_index: Option<usize>,
@@ -1018,7 +1018,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1037,7 +1037,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

@@ -717,12 +717,12 @@ impl OperationEnum {
     ///
     /// The generated dispatcher is generic over a `__ParentContext` parent context pinned to the enum's primary
     /// type, program constant type, and the enum itself as its operation family. Every variant forwards the active
-    /// `BatchingContext<__ParentContext>` and instruction-scoped `BatchingDriver` to its payload's own rule. Ordinary
-    /// rules execute their lifted work through `context.parent()`, while rules keyed on the active frame (e.g.,
-    /// named-axis collectives) inspect its axis metadata directly. Each payload carries its batching obligation as a
-    /// per-variant `BatchableOperation<__ParentContext, ArrayBatchingPolicy>` predicate that transports the rule's
-    /// own capability requirements to the use site, together with the parent `Zero` leaf that backs accumulator
-    /// seeding. Nested programs batch structurally through
+    /// `BatchingContext<__ParentContext, ArrayBatchingPolicy>` and instruction-scoped `BatchingDriver` to its payload's
+    /// own rule. Ordinary rules execute their lifted work through `context.parent()`, while rules keyed on the active
+    /// frame (e.g., named-axis collectives) inspect its axis metadata directly. Each payload carries its batching
+    /// obligation as a per-variant `BatchableOperation<__ParentContext, ArrayBatchingPolicy>` predicate that transports
+    /// the rule's own capability requirements to the use site, together with the parent `Zero` leaf that backs
+    /// accumulator seeding. Nested programs batch structurally through
     /// `Program::batched`, requested by higher-order rules through their active driver, whose implementation
     /// establishes the finite program-level bounds at its construction site.
     fn generate_batchable_operation(&self) -> TokenStream {
@@ -732,8 +732,9 @@ impl OperationEnum {
         let program_constant_type = &self.program_constant_type;
         let batching_self_type = &self.program_self_type;
 
-        // Fixed-active-context dispatcher: every arm receives the active `BatchingContext<__ParentContext>`, the
-        // current instruction's `BatchingDriver`, and the parent context's own value.
+        // Fixed-active-context dispatcher: every arm receives the active
+        // `BatchingContext<__ParentContext, ArrayBatchingPolicy>`, the current instruction's `BatchingDriver`, and the
+        // parent context's own value.
         let parent_value_type: syn::Type = syn::parse_quote!(<__ParentContext as #ryft::Domain>::Value);
         let mut batching_generics = self.program_generics.clone();
         batching_generics.params.push(syn::parse_quote!(__ParentContext));
@@ -787,7 +788,7 @@ impl OperationEnum {
             {
                 fn batch<__D: #ryft::BatchingDriver<__ParentContext, #ryft::ArrayBatchingPolicy>>(
                     &self,
-                    context: &#ryft::BatchingContext<__ParentContext>,
+                    context: &#ryft::BatchingContext<__ParentContext, #ryft::ArrayBatchingPolicy>,
                     driver: &__D,
                     inputs: &[#ryft::ArrayBatch<#parent_value_type>],
                 ) -> ::std::result::Result<

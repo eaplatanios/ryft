@@ -154,7 +154,7 @@ where
 }
 
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> Zero<BatchingTracer<C, ArrayBatchingPolicy>>
-    for BatchingContext<C>
+    for BatchingContext<C, ArrayBatchingPolicy>
 {
     #[inline]
     fn zero(&self, r#type: &ArrayType) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {

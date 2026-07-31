@@ -279,7 +279,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        _context: &BatchingContext<C>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

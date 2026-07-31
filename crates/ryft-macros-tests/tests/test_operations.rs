@@ -1646,14 +1646,14 @@ impl<V> ArrayBatch<V> {
 trait BatchableOperation<C: Context<Type = ArrayType>, P>: Operation<ArrayType> {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>;
 }
 
 /// Stand-in for `ryft_core::EagerContext`. Mirrors the real context's `Context` membership so that a top-level
-/// eager batch can be represented as `BatchingContext<EagerContext<...>>`.
+/// eager batch can be represented as `BatchingContext<EagerContext<...>, ArrayBatchingPolicy>`.
 struct EagerContext<V: Value, O: Operation<V::Type>> {
     marker: PhantomData<(V, O)>,
 }
@@ -1675,12 +1675,13 @@ impl<V: Value, O: Operation<V::Type>> Zero<V> for EagerContext<V, O> {}
 
 /// Stand-in for `ryft_core::BatchingContext`. Mirrors the real context's parent accessor and observable axis
 /// metadata, which active rules (e.g., named-axis collectives) inspect.
-struct BatchingContext<C> {
+struct BatchingContext<C, P> {
     parent: C,
     axis_name: Option<&'static str>,
+    policy: PhantomData<P>,
 }
 
-impl<C> BatchingContext<C> {
+impl<C, P> BatchingContext<C, P> {
     fn parent(&self) -> &C {
         &self.parent
     }
@@ -1737,7 +1738,7 @@ impl<C, Meta> SpecialBatchValue for Tracer<C, Meta> {}
 impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for ZeroOperation<ArrayType> {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1752,7 +1753,7 @@ impl<Constant: Clone, C: Context<Type = ArrayType>> BatchableOperation<C, ArrayB
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        _context: &BatchingContext<C>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1768,7 +1769,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        _context: &BatchingContext<C>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1814,7 +1815,7 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for CollectiveLikeOperation {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1875,7 +1876,7 @@ where
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        _context: &BatchingContext<C>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1900,7 +1901,11 @@ fn test_batchable_operation_dispatches_batching_to_payloads() {
 
     // Every arm receives the active batching context and flows the parent context's own value (`<Staging as
     // Domain>::Value`, here `Factor`).
-    let context = BatchingContext::<Staging> { parent: TestContext { marker: PhantomData }, axis_name: Some("batch") };
+    let context = BatchingContext::<Staging, ArrayBatchingPolicy> {
+        parent: TestContext { marker: PhantomData },
+        axis_name: Some("batch"),
+        policy: PhantomData,
+    };
 
     let zero = Operation::from(ZeroOperation { r#type: ArrayType });
     assert_eq!(zero.batch(&context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
@@ -1930,9 +1935,10 @@ fn test_batchable_operation_dispatches_batching_over_eager_parents() {
 
     // A top-level eager batch is represented by a `BatchingContext` over an eager parent, not by a separate eager
     // dispatch mechanism, and unnamed frames are observable to rules that inspect the axis metadata.
-    let context = BatchingContext::<EagerContext<Factor, Operation>> {
+    let context = BatchingContext::<EagerContext<Factor, Operation>, ArrayBatchingPolicy> {
         parent: EagerContext { marker: PhantomData },
         axis_name: None,
+        policy: PhantomData,
     };
 
     let zero = Operation::from(ZeroOperation { r#type: ArrayType });
@@ -1966,7 +1972,11 @@ fn test_operation_generates_all_selected_dispatchers() {
 
     let operation = Operation::from(ZeroOperation { r#type: ArrayType });
     let context = Context { marker: PhantomData };
-    let batching_context = BatchingContext { parent: Context { marker: PhantomData }, axis_name: None };
+    let batching_context = BatchingContext::<_, ArrayBatchingPolicy> {
+        parent: Context { marker: PhantomData },
+        axis_name: None,
+        policy: PhantomData,
+    };
     assert_eq!(operation.batch(&batching_context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")],);
 
     let differentiated = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
