@@ -5,7 +5,7 @@
 //! explicitly state how they cross that boundary.
 
 use std::borrow::Cow;
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
@@ -13,8 +13,11 @@ use crate::axes::{NamedAxes, NamedAxis};
 use crate::backends::array_programs::ArrayProgramOperation;
 use crate::backends::arrays::ArrayOperation;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
-use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError};
-use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
+use crate::batching::{
+    ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver,
+    BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
+};
+use crate::contexts::{Context, ProjectedContext, ValueResolution};
 use crate::macros::check_count;
 use crate::operations::constants::{One, OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::SelectOperation;
@@ -30,10 +33,9 @@ use crate::operations::random::RngBitGeneratorOperation;
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::regions::{BindingRegionDriver, EmptyRegionDriver, RegionDriver};
+use crate::programs::regions::{EmptyRegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver};
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
-use crate::sharding::ShardingDimension;
 use crate::types::{ArrayProgramType, ArrayType, DataType, DimensionType};
 
 /// Kind-aware batched view of one composite array-program value.
@@ -130,137 +132,103 @@ impl<V: Value<Type = ArrayProgramType>> Display for ArrayProgramBatch<V> {
     }
 }
 
-/// Composite operation contract used by [`ArrayProgramBatchingContext`].
-pub trait ArrayProgramBatchableOperation<C: Context<Type = ArrayProgramType>>: Operation<ArrayProgramType> {
-    /// Applies this operation's batching rule. The current outer family is region-free, so its implementations do not
-    /// yet use `driver`. Phase 5 assigns region-carrying composite operations dedicated rules that must use this driver
-    /// to recurse into their attached regions rather than treating it as permanently unused.
-    fn batch<D: RegionDriver<C::Constant, C::Operation>>(
-        &self,
-        _context: &ArrayProgramBatchingContext<C>,
-        _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError>;
-}
+/// Batching policy for programs whose values may be arrays or first-class dimensions.
+///
+/// Array members may carry a mapped physical axis. Dimension members are shared shape authority and therefore remain
+/// replicated. The mapped-axis extent is itself an ordinary parent-owned dimension value, so dynamic extents remain
+/// SSA data rather than transform metadata.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ArrayProgramBatchingPolicy;
 
-/// Batching context for composite array programs.
-#[derive(Clone)]
-pub struct ArrayProgramBatchingContext<C: Context<Type = ArrayProgramType>> {
-    /// Parent context that executes or stages physical work.
-    parent: C,
+impl<C: Context<Type = ArrayProgramType>> BatchingPolicy<C> for ArrayProgramBatchingPolicy {
+    type Batch = ArrayProgramBatch<C::Value>;
+    type Extent = C::Value;
 
-    /// Size of the logical mapped axis.
-    // TODO(eaplatanios): Phase 5 replaces this static metadata with a first-class dimension value when the mapped
-    // extent is dynamic.
-    axis_size: usize,
-
-    /// Optional name through which collective operations address the mapped axis.
-    axis_name: Option<String>,
-
-    /// Sharding placement of the mapped axis.
-    axis_sharding: ShardingDimension,
-}
-
-impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchingContext<C> {
-    /// Creates a composite batching context.
     #[inline]
-    pub fn new(parent: C, axis_size: usize) -> Self {
-        Self { parent, axis_size, axis_name: None, axis_sharding: ShardingDimension::Replicated }
+    fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
+        ArrayProgramBatch::new(value, batch_axis)
     }
 
-    /// Sets the optional name through which collective operations address the mapped axis.
     #[inline]
-    pub fn with_axis_name<N: Into<Option<String>>>(mut self, axis_name: N) -> Self {
-        self.axis_name = axis_name.into();
-        self
+    fn replicated(value: C::Value) -> Self::Batch {
+        ArrayProgramBatch::replicated(value)
     }
 
-    /// Sets the sharding placement of the mapped axis.
     #[inline]
-    pub fn with_axis_sharding(mut self, axis_sharding: ShardingDimension) -> Self {
-        self.axis_sharding = axis_sharding;
-        self
+    fn value(batch: &Self::Batch) -> &C::Value {
+        batch.value()
     }
 
-    /// Returns the parent context.
     #[inline]
-    pub fn parent(&self) -> &C {
-        &self.parent
-    }
-
-    /// Returns the mapped-axis size.
-    #[inline]
-    pub fn axis_size(&self) -> usize {
-        self.axis_size
-    }
-
-    /// Returns the optional name through which collective operations address the mapped axis.
-    #[inline]
-    pub fn axis_name(&self) -> Option<&str> {
-        self.axis_name.as_deref()
-    }
-
-    /// Returns the sharding placement of the mapped axis.
-    #[inline]
-    pub fn axis_sharding(&self) -> &ShardingDimension {
-        &self.axis_sharding
+    fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
+        batch.r#type()
     }
 }
 
-impl<C: Context<Type = ArrayProgramType>> Domain for ArrayProgramBatchingContext<C>
+impl<C> RecursiveBatchingPolicy<C> for ArrayProgramBatchingPolicy
 where
-    C::Operation: ArrayProgramBatchableOperation<C>,
+    C: Context<Type = ArrayProgramType>,
+    C::Operation: BatchableOperation<C, ArrayProgramBatchingPolicy>,
 {
-    type Type = ArrayProgramType;
-    type Value = ArrayProgramBatchingTracer<C>;
-    type Constant = C::Constant;
-    type Operation = C::Operation;
-}
-
-impl<C: Context<Type = ArrayProgramType>> Context for ArrayProgramBatchingContext<C>
-where
-    C::Operation: ArrayProgramBatchableOperation<C>,
-{
-    fn lift(&self, constant: C::Constant) -> Result<Self::Value, ProgramError> {
-        Ok(ArrayProgramBatchingTracer::new(self.clone(), ArrayProgramBatch::replicated(self.parent.lift(constant)?)))
+    fn batch_region(
+        context: &BatchingContext<C, Self>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<Self::Batch>,
+    ) -> Result<Vec<Self::Batch>, BatchingError> {
+        let region_mappings = RegionReplayMappings::new();
+        region.interpret_with(
+            inputs,
+            |_, constant| Ok(<Self as BatchingPolicy<C>>::replicated(context.parent().lift(constant.clone())?)),
+            |instruction, instruction_inputs| {
+                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                instruction.operation().batch(context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)
+            },
+        )
     }
 
-    fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
-        &self,
-        operation: O,
-        driver: D,
-        inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
-        let operation = operation.into();
-        let inputs = inputs.iter().map(|input| input.batch.clone()).collect::<Vec<_>>();
-        Ok(operation
-            .batch(self, &driver, inputs.as_slice())?
-            .into_iter()
-            .map(|batch| ArrayProgramBatchingTracer::new(self.clone(), batch))
-            .collect())
-    }
-
-    #[inline]
-    fn is_eager(&self) -> bool {
-        self.parent.is_eager()
-    }
-
-    #[inline]
-    fn resolve(&self, value: &Self::Value) -> ValueResolution<Self::Constant> {
-        self.parent.resolve(value.batch.value())
+    fn batch_program(
+        _context: &BatchingContext<C, Self>,
+        _region: RegionRef<'_, C::Constant, C::Operation>,
+        _input_axes: &[BatchAxis],
+        _output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<(BatchedProgram<C>, Vec<BatchAxis>), BatchingError> {
+        Err(BatchingError::UnsupportedOperation {
+            message: "structural batching of composite regions has not been migrated to the batching policy"
+                .to_string(),
+        })
     }
 }
 
-impl<C: NamedAxes<Type = ArrayProgramType>> NamedAxes for ArrayProgramBatchingContext<C>
+/// Returns a concrete mapped-axis extent for legacy homogeneous rules that still require static broadcast metadata.
+fn static_axis_extent<C>(context: &BatchingContext<C, ArrayProgramBatchingPolicy>) -> Result<usize, BatchingError>
 where
-    C::Operation: ArrayProgramBatchableOperation<C>,
+    C: Context<Type = ArrayProgramType>,
+    C::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
 {
-    #[inline]
+    match context.parent().resolve(context.axis_extent()) {
+        ValueResolution::Constant(axis_extent) => {
+            Ok(<C::Constant as ValueProjection<DimensionType>>::into_projected(axis_extent)?.extent())
+        }
+        ValueResolution::Staged(_) | ValueResolution::Opaque => Err(BatchingError::UnsupportedOperation {
+            message: "this batching rule still requires a statically known mapped-axis extent".to_string(),
+        }),
+    }
+}
+
+impl<C> NamedAxes for BatchingContext<C, ArrayProgramBatchingPolicy>
+where
+    C: NamedAxes<Type = ArrayProgramType>,
+    C::Constant: ValueProjection<DimensionType, Projected = DimensionValue>,
+    C::Operation: BatchableOperation<C, ArrayProgramBatchingPolicy>,
+{
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         if self.axis_name() == Some(name) {
-            Some(NamedAxis::Batched { size: self.axis_size })
+            Some(match static_axis_extent(self) {
+                Ok(size) => NamedAxis::Batched { size },
+                Err(_) => NamedAxis::BatchedDynamic,
+            })
         } else {
-            self.parent.named_axis(name)
+            self.parent().named_axis(name)
         }
     }
 }
@@ -270,16 +238,16 @@ where
 fn batch_explicit_shape_changing_collective<A, C, O>(
     operation: &O,
     axis_name: &str,
-    context: &ArrayProgramBatchingContext<C>,
+    context: &BatchingContext<C, ArrayProgramBatchingPolicy>,
     inputs: &[ArrayProgramBatch<C::Value>],
 ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError>
 where
     A: Value<Type = ArrayType>,
     C: Context<Type = ArrayProgramType>,
-    C::Constant: ValueProjection<ArrayType, Projected = A>,
-    C::Value: ValueProjection<ArrayType, Projected = A>,
-    C::Operation: OperationProjection<ArrayType, Projected = ArrayOperation<A>>,
-    O: BatchableOperation<ProjectedContext<C, ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected = A> + ValueProjection<DimensionType, Projected = DimensionValue>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: From<ArrayOperation<A>> + OperationProjection<ArrayType, Projected = ArrayOperation<A>>,
+    O: Operation<ArrayType> + BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy>,
 {
     let Some((array, extents)) = inputs.split_first() else {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -301,9 +269,10 @@ where
         <C::Value as ValueProjection<ArrayType>>::into_projected(array.value.clone())?,
         array.batch_axis,
     )?;
-    let projected_context = BatchingContext::new(ProjectedContext::new(context.parent.clone()), context.axis_size)
-        .with_axis_name(context.axis_name.clone())
-        .with_axis_sharding(context.axis_sharding.clone());
+    let projected_context =
+        BatchingContext::new(ProjectedContext::new(context.parent().clone()), static_axis_extent(context)?)
+            .with_axis_name(context.axis_name().map(str::to_string))
+            .with_axis_sharding(context.axis_sharding().clone());
     operation
         .batch(&projected_context, &EmptyRegionDriver, &[array])?
         .into_iter()
@@ -317,93 +286,15 @@ where
         .collect()
 }
 
-/// Batch-carrying value flowing through [`ArrayProgramBatchingContext`].
-#[derive(Clone, Parameter)]
-pub struct ArrayProgramBatchingTracer<C: Context<Type = ArrayProgramType>> {
-    /// Context through which operations dispatch.
-    context: ArrayProgramBatchingContext<C>,
-
-    /// Kind-aware physical batch.
-    batch: ArrayProgramBatch<C::Value>,
-}
-
-impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchingTracer<C> {
-    /// Creates a batch-carrying tracer.
-    #[inline]
-    pub fn new(context: ArrayProgramBatchingContext<C>, batch: ArrayProgramBatch<C::Value>) -> Self {
-        Self { context, batch }
-    }
-
-    /// Returns the carried batch.
-    #[inline]
-    pub fn batch(&self) -> &ArrayProgramBatch<C::Value> {
-        &self.batch
-    }
-
-    /// Consumes this tracer and returns its batch.
-    #[inline]
-    pub fn into_batch(self) -> ArrayProgramBatch<C::Value> {
-        self.batch
-    }
-}
-
-impl<C: Context<Type = ArrayProgramType, Value: PartialEq>> PartialEq for ArrayProgramBatchingTracer<C> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.batch == other.batch
-    }
-}
-
-impl<C: Context<Type = ArrayProgramType>> Debug for ArrayProgramBatchingTracer<C> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ArrayProgramBatchingTracer").field("batch", &self.batch).finish()
-    }
-}
-
-impl<C: Context<Type = ArrayProgramType>> Display for ArrayProgramBatchingTracer<C> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.batch, formatter)
-    }
-}
-
-impl<C: Context<Type = ArrayProgramType>> Typed for ArrayProgramBatchingTracer<C> {
-    type Type = ArrayProgramType;
-
-    #[inline]
-    fn r#type(&self) -> Cow<'_, ArrayProgramType> {
-        self.batch.r#type()
-    }
-}
-
-impl<C: Context<Type = ArrayProgramType>> Value for ArrayProgramBatchingTracer<C>
-where
-    C::Operation: ArrayProgramBatchableOperation<C>,
-{
-    type DispatchDomain = ArrayProgramBatchingContext<C>;
-    type ExecutionDomain = ArrayProgramBatchingContext<C>;
-
-    #[inline]
-    fn dispatch_domain(&self) -> Self::DispatchDomain {
-        self.context.clone()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> Self::ExecutionDomain {
-        self.context.clone()
-    }
-}
-
 // TODO(eaplatanios): Move this to the module where `ConcatenateOperation` is defined.
-impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for ConcatenateOperation
+impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatchingPolicy> for ConcatenateOperation
 where
     C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<ConcatenateOperation>,
 {
-    fn batch<D: RegionDriver<C::Constant, C::Operation>>(
+    fn batch<D: BatchingDriver<C, ArrayProgramBatchingPolicy>>(
         &self,
-        context: &ArrayProgramBatchingContext<C>,
+        context: &BatchingContext<C, ArrayProgramBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayProgramBatch<C::Value>],
     ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
@@ -445,7 +336,7 @@ where
             .collect::<Result<Vec<_>, BatchingError>>()?;
         let Some(batch_axis) = projected_inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
             return Ok(context
-                .parent
+                .parent()
                 .bind(
                     self.clone(),
                     Vec::new(),
@@ -465,7 +356,7 @@ where
         let axis_size = ArrayBatch::common_batch_size(&projected_inputs)?.expect("a mapped input pins the batch size");
         let aligned_inputs = projected_inputs
             .iter()
-            .map(|input| input.match_axis(batch_axis, axis_size, context.axis_sharding.clone()))
+            .map(|input| input.match_axis(batch_axis, axis_size, context.axis_sharding().clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
         let lifted_operation = ConcatenateOperation::new(lifted_axis, aligned_inputs[0].r#type().rank())?;
@@ -476,7 +367,7 @@ where
             .collect::<Vec<_>>();
         lifted_inputs.push(result_extent.value.clone());
         context
-            .parent
+            .parent()
             .bind(lifted_operation, Vec::new(), lifted_inputs.as_slice())?
             .into_iter()
             .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(batch_axis)))
@@ -484,10 +375,10 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for CustomCallOperation {
-    fn batch<D: RegionDriver<C::Constant, C::Operation>>(
+impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatchingPolicy> for CustomCallOperation {
+    fn batch<D: BatchingDriver<C, ArrayProgramBatchingPolicy>>(
         &self,
-        _context: &ArrayProgramBatchingContext<C>,
+        _context: &BatchingContext<C, ArrayProgramBatchingPolicy>,
         _driver: &D,
         _inputs: &[ArrayProgramBatch<C::Value>],
     ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
@@ -500,9 +391,11 @@ impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for 
     }
 }
 
-impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for PadOperation
+impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatchingPolicy> for PadOperation
 where
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>> + From<DimensionValue>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected = DimensionValue>
+        + From<DimensionValue>,
     C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<BroadcastOperation>
         + From<PadOperation>
@@ -511,9 +404,9 @@ where
             Projected: From<OneOperation<ArrayType>> + From<SelectOperation> + From<ZeroOperation<ArrayType>>,
         >,
 {
-    fn batch<D: RegionDriver<C::Constant, C::Operation>>(
+    fn batch<D: BatchingDriver<C, ArrayProgramBatchingPolicy>>(
         &self,
-        context: &ArrayProgramBatchingContext<C>,
+        context: &BatchingContext<C, ArrayProgramBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayProgramBatch<C::Value>],
     ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
@@ -546,7 +439,7 @@ where
             .or(Some(0).filter(|_| !padding_value_batch.batch_axis().is_replicated()))
         else {
             return Ok(context
-                .parent
+                .parent()
                 .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>())?
                 .into_iter()
                 .map(ArrayProgramBatch::replicated)
@@ -554,7 +447,7 @@ where
         };
 
         let operand_batch =
-            operand_batch.match_axis(batch_axis, context.axis_size(), context.axis_sharding().clone())?;
+            operand_batch.match_axis(batch_axis, static_axis_extent(context)?, context.axis_sharding().clone())?;
         let mut edge_padding_low = self.edge_padding_low().to_vec();
         edge_padding_low.insert(batch_axis, 0);
         let mut edge_padding_high = self.edge_padding_high().to_vec();
@@ -562,9 +455,7 @@ where
         let mut interior_padding = self.interior_padding().to_vec();
         interior_padding.insert(batch_axis, 0);
         let lifted_operation = PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?;
-        let batch_extent = context
-            .parent
-            .lift(DimensionValue::constant(context.axis_size()).map_err(ProgramError::from)?.into())?;
+        let batch_extent = context.axis_extent().clone();
         let mut lifted_output_extents = Vec::with_capacity(output_extents.len() + 1);
         lifted_output_extents.extend(output_extents[..batch_axis].iter().map(|extent| extent.value.clone()));
         lifted_output_extents.push(batch_extent);
@@ -576,7 +467,7 @@ where
             lifted_inputs.push(padding_value.value.clone());
             lifted_inputs.extend(lifted_output_extents);
             return context
-                .parent
+                .parent()
                 .bind(lifted_operation, Vec::new(), lifted_inputs.as_slice())?
                 .into_iter()
                 .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(batch_axis)))
@@ -588,7 +479,7 @@ where
         // padding values across the result, and select them only at padding positions. This is the same semantic
         // decomposition as the homogeneous array rule, but every shape-changing operation receives the canonical
         // first-class result extents.
-        let array_context = ProjectedContext::<C, ArrayType>::new(context.parent.clone());
+        let array_context = ProjectedContext::<C, ArrayType>::new(context.parent().clone());
         let padding_scalar_type = padding_value_batch.unbatched_type();
         let zero_padding =
             <C::Value as ValueProjection<ArrayType>>::from_projected(array_context.zero(&padding_scalar_type)?);
@@ -597,7 +488,7 @@ where
         padded_inputs.push(operand.clone());
         padded_inputs.push(zero_padding);
         padded_inputs.extend(lifted_output_extents.iter().cloned());
-        let mut padded = context.parent.bind(lifted_operation.clone(), Vec::new(), padded_inputs.as_slice())?;
+        let mut padded = context.parent().bind(lifted_operation.clone(), Vec::new(), padded_inputs.as_slice())?;
         check_count!("output", padded, 1, ProgramError);
         let padded = padded.remove(0);
 
@@ -613,7 +504,7 @@ where
         mask_inputs.push(mask_input);
         mask_inputs.push(mask_padding);
         mask_inputs.extend(lifted_output_extents.iter().cloned());
-        let mut mask = context.parent.bind(lifted_operation, Vec::new(), mask_inputs.as_slice())?;
+        let mut mask = context.parent().bind(lifted_operation, Vec::new(), mask_inputs.as_slice())?;
         check_count!("output", mask, 1, ProgramError);
         let mask = mask.remove(0);
 
@@ -622,10 +513,11 @@ where
             padding_value_batch.move_axis(0)?.into_value(),
         ));
         broadcast_inputs.extend(lifted_output_extents);
-        let mut broadcasted_padding =
-            context
-                .parent
-                .bind(BroadcastOperation::new(vec![batch_axis]), Vec::new(), broadcast_inputs.as_slice())?;
+        let mut broadcasted_padding = context.parent().bind(
+            BroadcastOperation::new(vec![batch_axis]),
+            Vec::new(),
+            broadcast_inputs.as_slice(),
+        )?;
         check_count!("output", broadcasted_padding, 1, ProgramError);
         let broadcasted_padding = broadcasted_padding.remove(0);
 
@@ -641,10 +533,12 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for RngBitGeneratorOperation {
-    fn batch<D: RegionDriver<C::Constant, C::Operation>>(
+impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatchingPolicy>
+    for RngBitGeneratorOperation
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatchingPolicy>>(
         &self,
-        _context: &ArrayProgramBatchingContext<C>,
+        _context: &BatchingContext<C, ArrayProgramBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayProgramBatch<C::Value>],
     ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
@@ -668,16 +562,16 @@ impl<C: Context<Type = ArrayProgramType>> ArrayProgramBatchableOperation<C> for 
     }
 }
 
-impl<A, C> ArrayProgramBatchableOperation<C> for ArrayProgramOperation<A>
+impl<A, C> BatchableOperation<C, ArrayProgramBatchingPolicy> for ArrayProgramOperation<A>
 where
-    A: LegacyBroadcast + Reduce + Reshape + Transpose + Value<Type = ArrayType>,
+    A: Value<Type = ArrayType>,
     C: Context<
             Type = ArrayProgramType,
             Constant: ValueProjection<ArrayType, Projected = A>
                           + ValueProjection<DimensionType, Projected = DimensionValue>
                           + From<DimensionValue>,
         >,
-    C::Value: ValueProjection<ArrayType, Projected = A>
+    C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Reduce + Reshape + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     C::Operation: From<ArrayProgramOperation<A>>
         + From<BroadcastOperation>
@@ -685,11 +579,11 @@ where
         + From<PadOperation>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    ArrayOperation<A>: BatchableOperation<ProjectedContext<C, ArrayType>>,
+    ArrayOperation<A>: BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy>,
 {
-    fn batch<D: RegionDriver<C::Constant, C::Operation>>(
+    fn batch<D: BatchingDriver<C, ArrayProgramBatchingPolicy>>(
         &self,
-        context: &ArrayProgramBatchingContext<C>,
+        context: &BatchingContext<C, ArrayProgramBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayProgramBatch<C::Value>],
     ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
@@ -699,7 +593,7 @@ where
                     return Err(ProgramError::InvalidInputCount { expected: 0, actual: inputs.len() }.into());
                 }
                 Ok(context
-                    .parent
+                    .parent()
                     .bind(self.clone(), Vec::new(), &[])?
                     .into_iter()
                     .map(ArrayProgramBatch::replicated)
@@ -712,7 +606,7 @@ where
                     extent.validate_replicated_dimension()?;
                 }
                 Ok(context
-                    .parent
+                    .parent()
                     .bind(
                         self.clone(),
                         Vec::new(),
@@ -735,9 +629,9 @@ where
                     })
                     .collect::<Result<Vec<_>, BatchingError>>()?;
                 let projected_context =
-                    BatchingContext::new(ProjectedContext::new(context.parent.clone()), context.axis_size)
-                        .with_axis_name(context.axis_name.clone())
-                        .with_axis_sharding(context.axis_sharding.clone());
+                    BatchingContext::new(ProjectedContext::new(context.parent().clone()), static_axis_extent(context)?)
+                        .with_axis_name(context.axis_name().map(str::to_string))
+                        .with_axis_sharding(context.axis_sharding().clone());
                 operation
                     .batch(&projected_context, &EmptyRegionDriver, inputs.as_slice())?
                     .into_iter()
@@ -758,7 +652,7 @@ where
                     .iter()
                     .map(|input| <C::Value as ValueProjection<DimensionType>>::into_projected(input.value.clone()))
                     .collect::<Result<Vec<_>, TypeError>>()?;
-                Ok(ProjectedContext::<C, DimensionType>::new(context.parent.clone())
+                Ok(ProjectedContext::<C, DimensionType>::new(context.parent().clone())
                     .bind(operation.clone(), Vec::new(), inputs.as_slice())?
                     .into_iter()
                     .map(<C::Value as ValueProjection<DimensionType>>::from_projected)
@@ -775,7 +669,7 @@ where
                 right.validate_replicated_dimension()?;
                 // Comparing two replicated dimensions produces ordinary replicated Boolean array data.
                 Ok(context
-                    .parent
+                    .parent()
                     .bind(self.clone(), Vec::new(), &[left.value.clone(), right.value.clone()])?
                     .into_iter()
                     .map(ArrayProgramBatch::replicated)
@@ -793,7 +687,7 @@ where
                     });
                 }
                 Ok(context
-                    .parent
+                    .parent()
                     .bind(self.clone(), Vec::new(), std::slice::from_ref(&input.value))?
                     .into_iter()
                     .map(ArrayProgramBatch::replicated)
@@ -805,7 +699,7 @@ where
                 };
                 input.validate_replicated_dimension()?;
                 Ok(context
-                    .parent
+                    .parent()
                     .bind(self.clone(), Vec::new(), std::slice::from_ref(&input.value))?
                     .into_iter()
                     .map(ArrayProgramBatch::replicated)
@@ -826,18 +720,16 @@ where
                 };
                 let operation = DimensionSizeOperation::new(physical_type, physical_axis)?;
                 Ok(context
-                    .parent
+                    .parent()
                     .bind(ArrayProgramOperation::<A>::from(operation), Vec::new(), std::slice::from_ref(&input.value))?
                     .into_iter()
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
-            Self::Concatenate(operation) => ArrayProgramBatchableOperation::batch(operation, context, driver, inputs),
-            Self::CustomCall(operation) => ArrayProgramBatchableOperation::batch(operation, context, driver, inputs),
-            Self::Pad(operation) => ArrayProgramBatchableOperation::batch(operation, context, driver, inputs),
-            Self::RngBitGenerator(operation) => {
-                ArrayProgramBatchableOperation::batch(operation, context, driver, inputs)
-            }
+            Self::Concatenate(operation) => BatchableOperation::batch(operation, context, driver, inputs),
+            Self::CustomCall(operation) => BatchableOperation::batch(operation, context, driver, inputs),
+            Self::Pad(operation) => BatchableOperation::batch(operation, context, driver, inputs),
+            Self::RngBitGenerator(operation) => BatchableOperation::batch(operation, context, driver, inputs),
             Self::AllGather(operation) => {
                 batch_explicit_shape_changing_collective::<A, C, _>(operation, operation.axis_name(), context, inputs)
             }
@@ -858,7 +750,7 @@ where
 
                 if input.batch_axis.is_replicated() {
                     return Ok(context
-                        .parent
+                        .parent()
                         .bind(
                             self.clone(),
                             Vec::new(),
@@ -877,9 +769,7 @@ where
                 )?
                 .move_axis(0)?;
                 let moved_input = <C::Value as ValueProjection<ArrayType>>::from_projected(moved_input.into_value());
-                let axis_extent = context
-                    .parent
-                    .lift(DimensionValue::constant(context.axis_size()).map_err(ProgramError::from)?.into())?;
+                let axis_extent = context.axis_extent().clone();
 
                 let mut lifted_operation = ReshapeOperation::new();
                 if let Some(dimensions) = operation.dimensions() {
@@ -899,7 +789,7 @@ where
                 lifted_inputs.push(axis_extent);
                 lifted_inputs.extend(output_extents.iter().map(|extent| extent.value.clone()));
                 context
-                    .parent
+                    .parent()
                     .bind(ArrayProgramOperation::<A>::from(lifted_operation), Vec::new(), lifted_inputs.as_slice())?
                     .into_iter()
                     .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(0)))
@@ -916,7 +806,7 @@ where
 
                 if input.batch_axis.is_replicated() {
                     return Ok(context
-                        .parent
+                        .parent()
                         .bind(
                             self.clone(),
                             Vec::new(),
@@ -937,9 +827,7 @@ where
                 )?
                 .move_axis(0)?;
                 let moved_input = <C::Value as ValueProjection<ArrayType>>::from_projected(moved_input.into_value());
-                let axis_extent = context
-                    .parent
-                    .lift(DimensionValue::constant(context.axis_size()).map_err(ProgramError::from)?.into())?;
+                let axis_extent = context.axis_extent().clone();
 
                 let mut lifted_output_axes = Vec::with_capacity(operation.output_axes().len() + 1);
                 lifted_output_axes.push(0);
@@ -956,7 +844,7 @@ where
                 lifted_inputs.push(axis_extent);
                 lifted_inputs.extend(output_extents.iter().map(|extent| extent.value.clone()));
                 context
-                    .parent
+                    .parent()
                     .bind(ArrayProgramOperation::<A>::from(lifted_operation), Vec::new(), lifted_inputs.as_slice())?
                     .into_iter()
                     .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(0)))
@@ -968,12 +856,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::Scalar;
     use crate::backends::array_programs::ArrayProgramValue;
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
+    use crate::batching::BatchingTracer;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::collectives::{
         AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions, PSumScatterOperation,
@@ -984,9 +874,12 @@ mod tests {
         DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionToScalar,
         DimensionToScalarOperation,
     };
+    use crate::operations::math::NegOperation;
     use crate::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use crate::operations::{CollectiveKind, CollectiveOperation};
     use crate::parameters::Placeholder;
+    use crate::programs::ProgramBuilder;
+    use crate::sharding::ShardingDimension;
     use crate::tracing::TracingContext;
     use crate::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::types::{DataType, Dimension, Shape};
@@ -994,9 +887,150 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_array_program_batching_policy() -> Result<(), ProgramError> {
+        type Parent = EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        type PolicyContext = BatchingContext<Parent, ArrayProgramBatchingPolicy>;
+
+        let axis_extent = ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap());
+        let context = PolicyContext::new(Parent::new(), axis_extent.clone()).with_axis_name("items".to_string());
+        assert_eq!(context.axis_extent(), &axis_extent);
+        assert_eq!(context.axis_name(), Some("items"));
+
+        // The generic frame preserves the existing homogeneous array rule unchanged.
+        let input = BatchingTracer::new(
+            context.clone(),
+            ArrayProgramBatch::new(
+                ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+                BatchAxis::new(0),
+            )
+            .unwrap(),
+        );
+        let [output] = context
+            .bind(
+                ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation)),
+                Vec::new(),
+                std::slice::from_ref(&input),
+            )?
+            .try_into()
+            .unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            output.batch().value(),
+            &ArrayProgramValue::Array(Array::matrix(2, 2, vec![-1.0_f32, -2.0, -3.0, -4.0])),
+        );
+
+        // Dimension-only and mixed dimension/array boundaries remain replicated under the same generic frame.
+        let left = ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap());
+        let right = ArrayProgramValue::Dimension(DimensionValue::constant(4).unwrap());
+        let operation = DimensionAddOperation::new(
+            <&DimensionType>::try_from(left.r#type().as_ref()).unwrap(),
+            <&DimensionType>::try_from(right.r#type().as_ref()).unwrap(),
+        )
+        .unwrap();
+        let inputs = [
+            BatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(left)),
+            BatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(right)),
+        ];
+        let [dimension] = context
+            .bind(ArrayProgramOperation::<Array>::Dimension(DimensionOperation::Add(operation)), Vec::new(), &inputs)?
+            .try_into()
+            .unwrap();
+        let scalar = dimension.to_scalar().unwrap().into_batch();
+        assert_eq!(scalar.batch_axis(), BatchAxis::replicated());
+        assert_eq!(scalar.into_value(), ArrayProgramValue::Array(Array::scalar(7_i64)));
+
+        let mapped_dimension = <ArrayProgramBatchingPolicy as BatchingPolicy<Parent>>::batch(
+            ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()),
+            BatchAxis::new(0),
+        );
+        assert!(
+            matches!(mapped_dimension, Err(BatchingError::MappedDimension { axis, .. }) if axis == BatchAxis::new(0))
+        );
+
+        // A staged dynamic mapped extent remains an ordinary SSA operand of the lifted reshape.
+        type TraceContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        let trace = TraceContext::new();
+        let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let batch_type = DimensionType::new(batch_variable.clone());
+        let physical_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch_variable), Dimension::Static(3)]));
+        let batch_extent = trace.input(batch_type.clone().into());
+        let input = trace.input(physical_type.clone().into());
+        let output_extent = trace.constant(ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let batch_extent_id = batch_extent.atom_id().unwrap();
+        let input_id = input.atom_id().unwrap();
+        let output_extent_id = output_extent.atom_id().unwrap();
+        let context = BatchingContext::<_, ArrayProgramBatchingPolicy>::new(trace.clone(), batch_extent)
+            .with_axis_name("items".to_string());
+        assert_eq!(context.named_axis("items"), Some(NamedAxis::BatchedDynamic));
+        let inputs = [
+            BatchingTracer::new(context.clone(), ArrayProgramBatch::new(input, BatchAxis::new(0))?),
+            BatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(output_extent)),
+        ];
+        let [output] = context
+            .bind(ArrayProgramOperation::<Array>::from(ReshapeOperation::new()), Vec::new(), &inputs)?
+            .try_into()
+            .unwrap();
+        let output_id = output.into_batch().into_value().atom_id().unwrap();
+        let builder = trace.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected one lifted reshape instruction");
+        };
+        assert_eq!(instruction.inputs(), &[input_id, batch_extent_id, output_extent_id]);
+        drop(builder);
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output_id],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )?;
+        let rendered = program.to_string();
+        assert_eq!(
+            rendered,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 3] .
+                let %2:dimension<3> = const
+                    %3:f32[batch, 3] = reshape %1 %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
+        // The same policy owns recursive region replay, so composite instructions no longer receive a plain region
+        // driver that cannot re-enter batching.
+        let recursive_parent = TraceContext::new();
+        let recursive_batch_extent = recursive_parent.input(batch_type.into());
+        let recursive_input = recursive_parent.input(physical_type.into());
+        let recursive_axis_extent =
+            recursive_parent.constant(ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let recursive_context =
+            BatchingContext::<_, ArrayProgramBatchingPolicy>::new(recursive_parent, recursive_axis_extent);
+        let recursive_outputs = ArrayProgramBatchingPolicy::batch_region(
+            &recursive_context,
+            program.entry_region_ref(),
+            vec![ArrayProgramBatch::replicated(recursive_batch_extent), ArrayProgramBatch::replicated(recursive_input)],
+        )?;
+        assert_eq!(recursive_outputs.len(), 1);
+        assert_eq!(recursive_outputs[0].batch_axis(), BatchAxis::replicated());
+
+        let mut destination = ProgramBuilder::new();
+        let imported = destination.import_region(program.entry_region_ref());
+        assert_eq!(destination.region_ref(imported)?.to_program().to_string(), rendered);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_array_program_batching() {
         type Parent = EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
-        fn assert_batchable<C: Context<Type = ArrayProgramType>, O: ArrayProgramBatchableOperation<C>>() {}
+        fn assert_batchable<
+            C: Context<Type = ArrayProgramType>,
+            O: BatchableOperation<C, ArrayProgramBatchingPolicy>,
+        >() {
+        }
         assert_batchable::<Parent, ArrayProgramOperation<Array>>();
 
         let dimension_type =
@@ -1017,9 +1051,12 @@ mod tests {
             &ArrayProgramType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]),)),
         );
 
-        let context = ArrayProgramBatchingContext::new(Parent::new(), 2)
-            .with_axis_name("items".to_string())
-            .with_axis_sharding(ShardingDimension::Unconstrained);
+        let context = BatchingContext::<_, ArrayProgramBatchingPolicy>::new(
+            Parent::new(),
+            ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()),
+        )
+        .with_axis_name("items".to_string())
+        .with_axis_sharding(ShardingDimension::Unconstrained);
         assert_eq!(context.axis_name(), Some("items"));
         assert_eq!(context.axis_sharding(), &ShardingDimension::Unconstrained);
 
@@ -1559,12 +1596,12 @@ mod tests {
             }),
         );
 
-        let dimension = ArrayProgramBatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(dimension));
+        let dimension = BatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(dimension));
         let scalar = dimension.to_scalar().unwrap().into_batch();
         assert_eq!(scalar.batch_axis(), BatchAxis::replicated());
         assert_eq!(scalar.into_value(), ArrayProgramValue::Array(Array::scalar(4_i64)));
 
-        let scalar = ArrayProgramBatchingTracer::new(
+        let scalar = BatchingTracer::new(
             context.clone(),
             ArrayProgramBatch::replicated(ArrayProgramValue::Array(Array::scalar(4_i32))),
         );
@@ -1574,7 +1611,7 @@ mod tests {
 
         let array = ArrayProgramValue::Array(Array::matrix(2, 3, vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0]));
         let array = ArrayProgramBatch::new(array, BatchAxis::new(0)).unwrap();
-        let array = ArrayProgramBatchingTracer::new(context, array);
+        let array = BatchingTracer::new(context, array);
         let scalar = array.dimension_size(0).unwrap().to_scalar().unwrap().into_batch();
         assert_eq!(scalar.batch_axis(), BatchAxis::replicated());
         assert_eq!(scalar.into_value(), ArrayProgramValue::Array(Array::scalar(3_i64)));
@@ -1593,8 +1630,11 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let context = ArrayProgramBatchingContext::new(Parent::new(), 2);
-        let input = ArrayProgramBatchingTracer::new(
+        let context = BatchingContext::<_, ArrayProgramBatchingPolicy>::new(
+            Parent::new(),
+            ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let input = BatchingTracer::new(
             context.clone(),
             ArrayProgramBatch::new(
                 ArrayProgramValue::Array(Array::matrix(2, 3, vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0])),

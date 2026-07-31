@@ -720,7 +720,7 @@ impl<V> ValueResolution<V> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::borrow::Cow;
     use std::fmt::Display;
 
@@ -753,7 +753,7 @@ mod tests {
 
     /// Test-only homogeneous member type used by the generic projected-context fixtures.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct ProjectedMemberType<const MEMBER: u8>;
+    pub(crate) struct ProjectedMemberType<const MEMBER: u8>;
 
     impl<const MEMBER: u8> Display for ProjectedMemberType<MEMBER> {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -786,7 +786,7 @@ mod tests {
 
     /// Test-only concrete value for one homogeneous projected member.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct ProjectedMemberValue<const MEMBER: u8>(usize);
+    pub(crate) struct ProjectedMemberValue<const MEMBER: u8>(pub(crate) usize);
 
     impl<const MEMBER: u8> Display for ProjectedMemberValue<MEMBER> {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -817,14 +817,17 @@ mod tests {
         }
     }
 
-    /// Test-only composite storage type with two distinct member kinds.
+    /// Test-only composite storage type with three distinct member kinds.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    enum ProjectedProgramType {
+    pub(crate) enum ProjectedProgramType {
         /// First member kind, used by the ordinary projection tests.
         First(ProjectedMemberType<0>),
 
         /// Second member kind, which exercises the additional-member extensibility gate.
         Second(ProjectedMemberType<1>),
+
+        /// Third member kind, used by transform tests to prove that generic machinery is member-kind-agnostic.
+        Third(ProjectedMemberType<2>),
     }
 
     impl Display for ProjectedProgramType {
@@ -832,6 +835,7 @@ mod tests {
             match self {
                 Self::First(r#type) => Display::fmt(r#type, formatter),
                 Self::Second(r#type) => Display::fmt(r#type, formatter),
+                Self::Third(r#type) => Display::fmt(r#type, formatter),
             }
         }
     }
@@ -861,12 +865,15 @@ mod tests {
 
     /// Test-only composite storage value mirroring [`ProjectedProgramType`].
     #[derive(Clone, Debug, PartialEq, Eq)]
-    enum ProjectedProgramValue {
+    pub(crate) enum ProjectedProgramValue {
         /// First member value, used by the ordinary projection tests.
         First(ProjectedMemberValue<0>),
 
         /// Second member value, which exercises the additional-member extensibility gate.
         Second(ProjectedMemberValue<1>),
+
+        /// Third member value, used by transform tests to prove that generic machinery is member-kind-agnostic.
+        Third(ProjectedMemberValue<2>),
     }
 
     impl Display for ProjectedProgramValue {
@@ -874,6 +881,7 @@ mod tests {
             match self {
                 Self::First(value) => Display::fmt(value, formatter),
                 Self::Second(value) => Display::fmt(value, formatter),
+                Self::Third(value) => Display::fmt(value, formatter),
             }
         }
     }
@@ -887,6 +895,7 @@ mod tests {
             Cow::Owned(match self {
                 Self::First(_) => ProjectedProgramType::First(ProjectedMemberType),
                 Self::Second(_) => ProjectedProgramType::Second(ProjectedMemberType),
+                Self::Third(_) => ProjectedProgramType::Third(ProjectedMemberType),
             })
         }
     }
@@ -919,11 +928,7 @@ mod tests {
                 fn try_from(r#type: &'t ProjectedProgramType) -> Result<Self, Self::Error> {
                     match r#type {
                         ProjectedProgramType::$variant(r#type) => Ok(r#type),
-                        _ => Err(TypeError::invalid(format!(
-                            "expected member {} but got {type}",
-                            $member,
-                            type = r#type,
-                        ))),
+                        _ => Err(TypeError::invalid(format!("expected member {} but got {}", $member, r#type))),
                     }
                 }
             }
@@ -945,22 +950,14 @@ mod tests {
                 {
                     match self {
                         Self::$variant(value) => Ok(value),
-                        _ => Err(TypeError::invalid(format!(
-                            "expected member {} but got {type}",
-                            $member,
-                            type = self.r#type(),
-                        ))),
+                        _ => Err(TypeError::invalid(format!("expected member {} but got {}", $member, self.r#type()))),
                     }
                 }
 
                 fn into_projected(self) -> Result<Self::Projected, TypeError> {
                     match self {
                         Self::$variant(value) => Ok(value),
-                        _ => Err(TypeError::invalid(format!(
-                            "expected member {} but got {type}",
-                            $member,
-                            type = self.r#type(),
-                        ))),
+                        _ => Err(TypeError::invalid(format!("expected member {} but got {}", $member, self.r#type()))),
                     }
                 }
             }
@@ -979,10 +976,11 @@ mod tests {
 
     impl_projected_test_member!(0, First);
     impl_projected_test_member!(1, Second);
+    impl_projected_test_member!(2, Third);
 
     /// Test-only homogeneous identity operation for one projected member kind.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct ProjectedMemberOperation<const MEMBER: u8>;
+    pub(crate) struct ProjectedMemberOperation<const MEMBER: u8>;
 
     impl<const MEMBER: u8> Operation<ProjectedMemberType<MEMBER>> for ProjectedMemberOperation<MEMBER> {
         fn name(&self) -> &'static str {
@@ -999,14 +997,17 @@ mod tests {
         }
     }
 
-    /// Test-only composite operation family embedding both member families.
+    /// Test-only composite operation family embedding all three member families.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    enum ProjectedProgramOperation {
+    pub(crate) enum ProjectedProgramOperation {
         /// First member operation, used by the ordinary projection tests.
         First(ProjectedMemberOperation<0>),
 
         /// Second member operation, which exercises the additional-member extensibility gate.
         Second(ProjectedMemberOperation<1>),
+
+        /// Third member operation, used by transform tests to prove that generic machinery is member-kind-agnostic.
+        Third(ProjectedMemberOperation<2>),
     }
 
     impl ProjectedProgramOperation {
@@ -1035,6 +1036,7 @@ mod tests {
             match self {
                 Self::First(operation) => operation.name(),
                 Self::Second(operation) => operation.name(),
+                Self::Third(operation) => operation.name(),
             }
         }
 
@@ -1046,6 +1048,7 @@ mod tests {
             match self {
                 Self::First(operation) => Self::infer_member(operation, input_types),
                 Self::Second(operation) => Self::infer_member(operation, input_types),
+                Self::Third(operation) => Self::infer_member(operation, input_types),
             }
         }
     }

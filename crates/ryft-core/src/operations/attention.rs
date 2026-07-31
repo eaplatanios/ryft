@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::backends::scalars::Scalar;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
@@ -1011,12 +1011,12 @@ where
 
 /// Batching rule for [`DotProductAttentionOperation`]: one mapped batch level folds into the operation's own batch
 /// dimension via the shared merge-reshape rule; refer to [`batch_attention_merge_reshape`].
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>> BatchableOperation<C>
-    for DotProductAttentionOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>>
+    BatchableOperation<C, ArrayBatchingPolicy> for DotProductAttentionOperation
 where
     DotProductAttentionOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
@@ -1030,12 +1030,12 @@ where
 /// Batching rule for [`DotProductAttentionBackwardOperation`]: the same merge-reshape rule as the forward
 /// operation, additionally restoring a broadcast bias-cotangent batch dimension; refer to
 /// [`batch_attention_merge_reshape`].
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>> BatchableOperation<C>
-    for DotProductAttentionBackwardOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>>
+    BatchableOperation<C, ArrayBatchingPolicy> for DotProductAttentionBackwardOperation
 where
     DotProductAttentionBackwardOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
