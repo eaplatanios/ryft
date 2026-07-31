@@ -720,9 +720,9 @@ impl OperationEnum {
     /// `BatchingContext<__ParentContext>` and instruction-scoped `BatchingDriver` to its payload's own rule. Ordinary
     /// rules execute their lifted work through `context.parent()`, while rules keyed on the active frame (e.g.,
     /// named-axis collectives) inspect its axis metadata directly. Each payload carries its batching obligation as a
-    /// per-variant `BatchableOperation<__ParentContext>` predicate that transports the rule's own capability
-    /// requirements to the use site, together with the parent `Zero` leaf that backs accumulator seeding. Nested
-    /// programs batch structurally through
+    /// per-variant `BatchableOperation<__ParentContext, ArrayBatchingPolicy>` predicate that transports the rule's
+    /// own capability requirements to the use site, together with the parent `Zero` leaf that backs accumulator
+    /// seeding. Nested programs batch structurally through
     /// `Program::batched`, requested by higher-order rules through their active driver, whose implementation
     /// establishes the finite program-level bounds at its construction site.
     fn generate_batchable_operation(&self) -> TokenStream {
@@ -747,8 +747,9 @@ impl OperationEnum {
         });
         batching_where_clause.predicates.extend(variants.iter().map(|variant| {
             let operation_type = &variant.program_payload_type;
-            let predicate: syn::WherePredicate =
-                syn::parse_quote!(#operation_type: #ryft::BatchableOperation<__ParentContext>);
+            let predicate: syn::WherePredicate = syn::parse_quote!(
+                #operation_type: #ryft::BatchableOperation<__ParentContext, #ryft::ArrayBatchingPolicy>
+            );
             predicate
         }));
 
@@ -763,7 +764,10 @@ impl OperationEnum {
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#operation_type as #ryft::BatchableOperation<__ParentContext>>::batch(
+                    <#operation_type as #ryft::BatchableOperation<
+                        __ParentContext,
+                        #ryft::ArrayBatchingPolicy,
+                    >>::batch(
                         #receiver,
                         context,
                         driver,
@@ -775,10 +779,13 @@ impl OperationEnum {
         let (batching_impl_generics, _, batching_where_clause) = batching_generics.split_for_impl();
         const_block(quote! {
             #[automatically_derived]
-            impl #batching_impl_generics #ryft::BatchableOperation<__ParentContext> for #batching_self_type
+            impl #batching_impl_generics #ryft::BatchableOperation<
+                __ParentContext,
+                #ryft::ArrayBatchingPolicy,
+            > for #batching_self_type
             #batching_where_clause
             {
-                fn batch<__D: #ryft::BatchingDriver<__ParentContext>>(
+                fn batch<__D: #ryft::BatchingDriver<__ParentContext, #ryft::ArrayBatchingPolicy>>(
                     &self,
                     context: &#ryft::BatchingContext<__ParentContext>,
                     driver: &__D,

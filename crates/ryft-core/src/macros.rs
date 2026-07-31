@@ -2453,14 +2453,15 @@ macro_rules! impl_nullary_batchable_operation {
 
     // This internal helper emits the replicated batching implementation shared by every public invocation form.
     (@impl_replicated [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
-        impl<__C: $crate::Context<Type = $crate::ArrayType> $(, $generic)*> $crate::BatchableOperation<__C>
+        impl<__C: $crate::Context<Type = $crate::ArrayType> $(, $generic)*>
+            $crate::BatchableOperation<__C, $crate::ArrayBatchingPolicy>
             for $operation
         where
             $operation: $crate::InterpretableOperation<__C>,
             $($bounds)*
         {
             #[inline]
-            fn batch<__D: $crate::BatchingDriver<__C>>(
+            fn batch<__D: $crate::BatchingDriver<__C, $crate::ArrayBatchingPolicy>>(
                 &self,
                 context: &$crate::BatchingContext<__C>,
                 _driver: &__D,
@@ -2570,10 +2571,12 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C>
+        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
         where
-            $crate::BatchingContext<__C>:
-                $crate::Context<Value = $crate::BatchingTracer<__C>, Operation: ::std::convert::From<$operation>>,
+            $crate::BatchingContext<__C>: $crate::Context<
+                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
+                    Operation: ::std::convert::From<$operation>,
+                >,
         {
             type Output = Self;
 
@@ -2676,11 +2679,13 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C>
+        impl<__C: $crate::Context<Type = $crate::ArrayType>>
+            $trait
+            for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
         where
             __C::Type: $provider,
             $crate::BatchingContext<__C>: $crate::Context<
-                    Value = $crate::BatchingTracer<__C>,
+                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
                     Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
                 >,
         {
@@ -2773,10 +2778,12 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C>
+        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
         where
-            $crate::BatchingContext<__C>:
-                $crate::Context<Value = $crate::BatchingTracer<__C>, Operation: ::std::convert::From<$operation>>,
+            $crate::BatchingContext<__C>: $crate::Context<
+                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
+                    Operation: ::std::convert::From<$operation>,
+                >,
         {
             type Output = Self;
 
@@ -4288,7 +4295,7 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingTracer};
+    use crate::batching::{ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
@@ -6112,12 +6119,10 @@ mod tests {
     #[test]
     fn test_impl_nullary_batchable_operation() {
         let context = BatchingContext::new(EagerContext::<Array, TestNullaryOperation>::new(), 2);
-        let outputs = <TestNullaryOperation as BatchableOperation<EagerContext<Array, TestNullaryOperation>>>::batch(
-            &TestNullaryOperation,
-            &context,
-            &EmptyRegionDriver,
-            &[],
-        )
+        let outputs = <TestNullaryOperation as BatchableOperation<
+            EagerContext<Array, TestNullaryOperation>,
+            ArrayBatchingPolicy,
+        >>::batch(&TestNullaryOperation, &context, &EmptyRegionDriver, &[])
         .unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].value(), &Array::scalar(3.0));
@@ -6125,7 +6130,10 @@ mod tests {
         assert!(outputs[0].batch_axis().is_replicated());
         assert!(outputs[1].batch_axis().is_replicated());
         assert!(matches!(
-            <TestNullaryOperation as BatchableOperation<EagerContext<Array, TestNullaryOperation>>>::batch(
+            <TestNullaryOperation as BatchableOperation<
+                EagerContext<Array, TestNullaryOperation>,
+                ArrayBatchingPolicy,
+            >>::batch(
                 &TestNullaryOperation,
                 &context,
                 &EmptyRegionDriver,
@@ -6138,7 +6146,7 @@ mod tests {
         where
             O: Operation<ArrayType>
                 + InterpretableOperation<EagerContext<Array, O>>
-                + BatchableOperation<EagerContext<Array, O>>,
+                + BatchableOperation<EagerContext<Array, O>, ArrayBatchingPolicy>,
         {
         }
 

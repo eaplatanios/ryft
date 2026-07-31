@@ -1643,8 +1643,8 @@ impl<V> ArrayBatch<V> {
 
 /// Stand-in for `ryft_core::BatchableOperation`. Every rule receives the active [`BatchingContext`] and its optional
 /// instruction-scoped [`BatchingDriver`] while physical values remain owned by the parent context `C`.
-trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType> {
-    fn batch<D: BatchingDriver<C>>(
+trait BatchableOperation<C: Context<Type = ArrayType>, P>: Operation<ArrayType> {
+    fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C>,
         driver: &D,
@@ -1691,9 +1691,13 @@ impl<C> BatchingContext<C> {
 }
 
 /// Stand-in for `ryft_core::BatchingDriver`.
-trait BatchingDriver<C: Context<Type = ArrayType>> {}
+trait BatchingDriver<C: Context<Type = ArrayType>, P> {}
 
-impl<C: Context<Type = ArrayType>> BatchingDriver<C> for EmptyRegionDriver {}
+impl<C: Context<Type = ArrayType>, P> BatchingDriver<C, P> for EmptyRegionDriver {}
+
+/// Stand-in for `ryft_core::ArrayBatchingPolicy`.
+#[derive(Copy, Clone, Debug)]
+struct ArrayBatchingPolicy;
 
 /// Stand-in for `ryft_core::BatchAxis`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1730,8 +1734,8 @@ impl<C, Meta> SpecialBatchValue for Tracer<C, Meta> {}
 
 /// Ordinary leaf rule: it neither needs the active frame nor any value capability, and its physical work runs
 /// through the parent context (observed here through the parent-lifted constant in its output label).
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ZeroOperation<ArrayType> {
-    fn batch<D: BatchingDriver<C>>(
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for ZeroOperation<ArrayType> {
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
@@ -1743,8 +1747,10 @@ impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ZeroOperation<Array
     }
 }
 
-impl<Constant: Clone, C: Context<Type = ArrayType>> BatchableOperation<C> for ConstantOperation<ArrayType, Constant> {
-    fn batch<D: BatchingDriver<C>>(
+impl<Constant: Clone, C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy>
+    for ConstantOperation<ArrayType, Constant>
+{
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         _context: &BatchingContext<C>,
         _driver: &D,
@@ -1756,11 +1762,11 @@ impl<Constant: Clone, C: Context<Type = ArrayType>> BatchableOperation<C> for Co
 
 /// Batching rule requiring a value capability that the generated per-variant predicate transports to the owning
 /// enum's use sites without the enum spelling it.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for DotOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for DotOperation
 where
     C::Value: SpecialBatchValue,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         _context: &BatchingContext<C>,
         _driver: &D,
@@ -1805,8 +1811,8 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 {
 }
 
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for CollectiveLikeOperation {
-    fn batch<D: BatchingDriver<C>>(
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for CollectiveLikeOperation {
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
@@ -1861,13 +1867,13 @@ where
 {
 }
 
-impl<C> BatchableOperation<C> for BatchRecursiveOperation<C::Constant, C::Operation>
+impl<C> BatchableOperation<C, ArrayBatchingPolicy> for BatchRecursiveOperation<C::Constant, C::Operation>
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: Concretizable<bool> + SpecialBatchValue,
     C::Operation: From<ZeroOperation<ArrayType>>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         _context: &BatchingContext<C>,
         _driver: &D,

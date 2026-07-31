@@ -1,7 +1,9 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use ryft_core::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use ryft_core::batching::{
+    ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+};
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationError, TransposableOperation,
@@ -270,12 +272,12 @@ impl<V: Clone> Operation<ArrayProgramType> for ShardMapOperation<V> {
 /// Batching rule for [`ShardMapOperation`]: batching through a staged `shard_map` boundary has no rule yet — the
 /// mapped batch axis would need to compose with the boundary's global-to-local sharding on both sides — so batching
 /// is rejected for every context.
-impl<Constant, C> BatchableOperation<C> for ShardMapOperation<Constant>
+impl<Constant, C> BatchableOperation<C, ArrayBatchingPolicy> for ShardMapOperation<Constant>
 where
     Constant: Value<Type = ArrayType>,
     C: Context<Type = ArrayType>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         _context: &BatchingContext<C>,
         _driver: &D,
