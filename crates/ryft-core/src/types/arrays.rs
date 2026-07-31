@@ -597,7 +597,7 @@ impl ArrayTypeRefinements {
     /// reference identity is consumed or defined. Every variable outside the closed set is rejected, because an extent
     /// claimed for an identity foreign to the boundary cannot be justified. In short, use [`Self::bind`] where
     /// observations *create* facts, and use this function where observations must be *justified* against the boundary's
-    /// identity authority, as [`TypeRefinements::validate`] does when checking an output signature against the facts
+    /// identity set, as [`TypeRefinements::validate`] does when checking an output signature against the facts
     /// established from its input boundary.
     fn validate_or_bind(
         &mut self,

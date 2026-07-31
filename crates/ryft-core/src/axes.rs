@@ -6,7 +6,7 @@ use thiserror::Error;
 use ryft_macros::Parameter;
 
 use crate::batching::{
-    ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
@@ -307,10 +307,10 @@ where
     }
 }
 
-impl<C: NamedAxes<Type = ArrayType>> NamedAxes for BatchingContext<C, ArrayBatchingPolicy>
+impl<C: NamedAxes<Type = ArrayType>> NamedAxes for BatchingContext<C, ArrayBatching>
 where
-    C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
+    C::Operation: BatchableOperation<C, ArrayBatching>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatching>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>,
 {
@@ -504,12 +504,14 @@ impl<C: Context<Type = ArrayType, Operation: From<AxisIndexOperation>>> Partiall
 impl_non_differentiable_operation!(AxisIndexOperation);
 impl_nullary_transposable_operation!(AxisIndexOperation);
 
-impl<C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>> + From<AxisIndexOperation>>>
-    BatchableOperation<C, ArrayBatchingPolicy> for AxisIndexOperation
+impl<
+    C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>> + From<AxisIndexOperation>>,
+    P: ArrayBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatching<P>> for AxisIndexOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         _inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -517,7 +519,7 @@ impl<C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>> + Fr
             // This level binds the axis. The per-item index is the length-`size` `iota(0)`, bound into the parent and
             // mapped on this level's batch axis (position 0). The mapped physical `[size]` dimension is then stripped
             // back to the per-item scalar `u64`.
-            let size = *context.axis_extent();
+            let size = P::axis_size(context)?;
             let r#type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(size)]));
             let operation = IotaOperation::new(r#type.clone(), 0)?;
             let mut index = context.parent().bind(operation, Vec::new(), &[])?;

@@ -712,7 +712,6 @@ pub trait BatchingEntrypointPolicy<C: Context>: BatchingPolicy<C> {
     ) -> Result<C::Value, BatchingError>;
 }
 
-// TODO(eaplatanios): Link "dimension-valued policy".
 /// Source of an output dimension of an elementwise batching broadcast operation. The shared elementwise batching
 /// algorithm owns all broadcast geometry. For every physical output axis, it identifies the source of that dimension
 /// and passes it to [`ArrayBatchingPolicy::broadcast_input`]. [`StaticArrayBatchingPolicy`] ignores these sources
@@ -879,8 +878,6 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> ArrayBatc
         ArrayBatch::new(r#type, broadcasted, batch_axis)
     }
 }
-
-// TODO(eaplatanios): Move `DynamicArrayBatchingPolicy` and its implementation blocks here.
 
 /// Homogeneous-array [`BatchingPolicy`] parameterized by its [`ArrayBatchingPolicy`]. The default
 /// [`StaticArrayBatchingPolicy`] preserves the ordinary public array batching API. Composite programs use a private

@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::backends::scalars::Scalar;
 use crate::batching::{
-    ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ArrayBatch, ArrayBatching, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
@@ -917,16 +917,16 @@ impl_differentiable_operation! {
 /// materialized per-item batch after splitting, restoring the broadcast `1` of the unbatched contract. The optional
 /// rank-1 `i32[batch]` sequence-length operands ride the general rule unchanged: aligned `[v, batch]` lengths merge
 /// to `[v * batch]`, concatenating the per-item lengths along the folded batch axis.
-fn batch_attention_merge_reshape<C, O>(
+fn batch_attention_merge_reshape<C, O, M: crate::ArrayBatchingPolicy<C>>(
     operation: &O,
-    context: &BatchingContext<C, ArrayBatchingPolicy>,
+    context: &BatchingContext<C, ArrayBatching<M>>,
     inputs: &[ArrayBatch<C::Value>],
     bias_index: Option<usize>,
     bias_cotangent_index: Option<usize>,
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>,
-    O: Operation<ArrayType> + InterpretableBatchableOperation<C, ArrayBatchingPolicy>,
+    O: Operation<ArrayType> + InterpretableBatchableOperation<C, ArrayBatching<M>>,
 {
     let output_count = |input_types: &[ArrayType]| -> Result<usize, BatchingError> {
         Ok(operation.infer_output_types(input_types, &[]).map_err(ProgramError::from)?.len())
@@ -1011,14 +1011,16 @@ where
 
 /// Batching rule for [`DotProductAttentionOperation`]: one mapped batch level folds into the operation's own batch
 /// dimension via the shared merge-reshape rule; refer to [`batch_attention_merge_reshape`].
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>>
-    BatchableOperation<C, ArrayBatchingPolicy> for DotProductAttentionOperation
+impl<
+    C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>,
+    P: crate::ArrayBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatching<P>> for DotProductAttentionOperation
 where
     DotProductAttentionOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1030,14 +1032,16 @@ where
 /// Batching rule for [`DotProductAttentionBackwardOperation`]: the same merge-reshape rule as the forward
 /// operation, additionally restoring a broadcast bias-cotangent batch dimension; refer to
 /// [`batch_attention_merge_reshape`].
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>>
-    BatchableOperation<C, ArrayBatchingPolicy> for DotProductAttentionBackwardOperation
+impl<
+    C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>,
+    P: crate::ArrayBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatching<P>> for DotProductAttentionBackwardOperation
 where
     DotProductAttentionBackwardOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

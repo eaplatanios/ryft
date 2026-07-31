@@ -148,7 +148,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
 ///     generic payload by adding an `Extension: Operation<T>` bound.
 ///   - Each generated semantic dispatcher receives a corresponding bound on every payload, such as
-///     `Payload: InterpretableOperation<C>` or `Payload: BatchableOperation<C, ArrayBatchingPolicy>`.
+///     `Payload: InterpretableOperation<C>` or `Payload: BatchableOperation<C, ArrayBatching>`.
 ///     Payload-specific value and context requirements belong on the payload's own semantic-trait implementation.
 ///     Rust resolves those requirements through the generated payload bound without requiring the enum to repeat them.
 ///   - Batching, differentiation, and transposition require selecting the corresponding dispatcher. Interpretation

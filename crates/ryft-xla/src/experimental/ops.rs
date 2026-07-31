@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::rc::Rc;
 
 use ryft_core::batching::{
-    ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ArrayBatch, ArrayBatching, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
 };
 use ryft_core::captures::CaptureReference;
@@ -927,14 +927,14 @@ where
 /// client-backed parent (e.g., [`XlaDomain`](crate::XlaDomain)) compiles and executes the batched call immediately, a
 /// staging parent stages it into the enclosing trace, and a differentiation parent dispatches it through its own
 /// `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for JitCallOperation
+impl<C> BatchableOperation<C, ArrayBatching> for JitCallOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<JitCallOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching>,
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {

@@ -1,4 +1,4 @@
-use crate::batching::{ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
+use crate::batching::{ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::Context;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
@@ -133,7 +133,7 @@ impl DifferentiableType for ArrayProgramType {
         match self {
             Self::Array(r#type) => Self::Array(r#type.tangent()),
             Self::Dimension(_) => {
-                // First-class dimensions are shape authority rather than numerical data. Their tangent space is
+                // First-class dimensions describe shapes rather than numerical data. Their tangent space is
                 // structurally zero and uses the ordinary array member so generic zero materialization has one
                 // canonical backend representation.
                 Self::Array(ArrayType::scalar(DataType::Zero))
@@ -147,7 +147,7 @@ impl DifferentiableType for ArrayProgramType {
             Self::Array(r#type) => Self::Array(r#type.cotangent()),
             Self::Dimension(_) => {
                 // As in forward mode, dimensions receive no live adjoint. Keeping the zero space in the array
-                // member prevents a zero value from accidentally granting first-class shape authority.
+                // member prevents a zero value from being mistaken for a first-class dimension.
                 Self::Array(ArrayType::scalar(DataType::Zero))
             }
         }
@@ -340,8 +340,8 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
 impl<C: Context<Type = ArrayType>> DenseDifferentiableType<C> for ArrayType
 where
     C::Value: LegacyBroadcast + Reshape + Slice + Transpose,
-    C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
+    C::Operation: BatchableOperation<C, ArrayBatching>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatching>
         + From<CoordinateBasisOperation<ArrayType>>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>,
@@ -419,7 +419,7 @@ where
         inputs: Vec<Self::PackedValue>,
     ) -> Result<Vec<Self::PackedValue>, DifferentiationError> {
         let context = BatchingContext::new(context.clone(), packed_direction_count);
-        Ok(ArrayBatchingPolicy::batch_region(&context, region, inputs).map_err(ProgramError::from)?)
+        Ok(ArrayBatching::batch_region(&context, region, inputs).map_err(ProgramError::from)?)
     }
 
     fn validate_hessian_block_type(

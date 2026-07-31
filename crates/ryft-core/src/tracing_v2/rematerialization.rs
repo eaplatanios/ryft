@@ -43,7 +43,7 @@ use std::marker::PhantomData;
 
 use thiserror::Error;
 
-use crate::batching::ArrayBatchingPolicy;
+use crate::batching::ArrayBatching;
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -343,15 +343,15 @@ crate::impl_non_transposable_operation!(RematerializeOperation);
 /// Batching rule for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
 /// programs so the rematerialization boundary survives `batch` under eager and staging parents alike; see
 /// `stage_rewrapped_custom_call`.
-impl<C, O> BatchableOperation<C, ArrayBatchingPolicy> for RematerializeOperation
+impl<C, O, P: crate::ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for RematerializeOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
     O: Operation<ArrayType> + From<TransposeOperation> + From<LegacyBroadcastOperation> + From<RematerializeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {

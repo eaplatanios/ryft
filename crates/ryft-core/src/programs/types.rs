@@ -209,8 +209,8 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// instruction consumes or defines the identity, so validation only has to enforce cross-observation consistency).
     /// An unbound identity outside the closed set is rejected.
     ///
-    /// `closed_identities` is only an authority set identifying which identities may establish facts during validation.
-    /// It does not contain concrete extents or inspect runtime value payloads.
+    /// `closed_identities` only identifies which identities may establish facts during validation. It does not contain
+    /// concrete extents or inspect runtime value payloads.
     ///
     /// # Parameters
     ///

@@ -2453,17 +2453,21 @@ macro_rules! impl_nullary_batchable_operation {
 
     // This internal helper emits the replicated batching implementation shared by every public invocation form.
     (@impl_replicated [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
-        impl<__C: $crate::Context<Type = $crate::ArrayType> $(, $generic)*>
-            $crate::BatchableOperation<__C, $crate::ArrayBatchingPolicy>
+        impl<
+            __C: $crate::Context<Type = $crate::ArrayType>,
+            __P: $crate::ArrayBatchingPolicy<__C>
+            $(, $generic)*
+        >
+            $crate::BatchableOperation<__C, $crate::ArrayBatching<__P>>
             for $operation
         where
             $operation: $crate::InterpretableOperation<__C>,
             $($bounds)*
         {
             #[inline]
-            fn batch<__D: $crate::BatchingDriver<__C, $crate::ArrayBatchingPolicy>>(
+            fn batch<__D: $crate::BatchingDriver<__C, $crate::ArrayBatching<__P>>>(
                 &self,
-                context: &$crate::BatchingContext<__C, $crate::ArrayBatchingPolicy>,
+                context: &$crate::BatchingContext<__C, $crate::ArrayBatching<__P>>,
                 _driver: &__D,
                 inputs: &[$crate::ArrayBatch<__C::Value>],
             ) -> Result<Vec<$crate::ArrayBatch<__C::Value>>, $crate::BatchingError> {
@@ -2571,10 +2575,12 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
+        impl<__C: $crate::Context<Type = $crate::ArrayType>>
+            $trait
+            for $crate::BatchingTracer<__C, $crate::ArrayBatching>
         where
-            $crate::BatchingContext<__C, $crate::ArrayBatchingPolicy>: $crate::Context<
-                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
+            $crate::BatchingContext<__C, $crate::ArrayBatching>: $crate::Context<
+                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatching>,
                     Operation: ::std::convert::From<$operation>,
                 >,
         {
@@ -2681,11 +2687,11 @@ macro_rules! define_tracer_operator {
 
         impl<__C: $crate::Context<Type = $crate::ArrayType>>
             $trait
-            for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
+            for $crate::BatchingTracer<__C, $crate::ArrayBatching>
         where
             __C::Type: $provider,
-            $crate::BatchingContext<__C, $crate::ArrayBatchingPolicy>: $crate::Context<
-                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
+            $crate::BatchingContext<__C, $crate::ArrayBatching>: $crate::Context<
+                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatching>,
                     Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
                 >,
         {
@@ -2778,10 +2784,12 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
+        impl<__C: $crate::Context<Type = $crate::ArrayType>>
+            $trait
+            for $crate::BatchingTracer<__C, $crate::ArrayBatching>
         where
-            $crate::BatchingContext<__C, $crate::ArrayBatchingPolicy>: $crate::Context<
-                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
+            $crate::BatchingContext<__C, $crate::ArrayBatching>: $crate::Context<
+                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatching>,
                     Operation: ::std::convert::From<$operation>,
                 >,
         {
@@ -3581,7 +3589,7 @@ macro_rules! check_operation_batching {
         let axis_size = $axis_size;
         let axis_sharding = $axis_sharding;
         let context =
-            $crate::batching::BatchingContext::<_, $crate::batching::ArrayBatchingPolicy>::new($context, axis_size)
+            $crate::batching::BatchingContext::<_, $crate::batching::ArrayBatching>::new($context, axis_size)
             .with_axis_sharding(axis_sharding);
         $(
             let inputs = vec![$($crate::check_operation_batching!(@batch_value $input)),*];
@@ -4296,7 +4304,7 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::batching::{ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingTracer};
+    use crate::batching::{ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
@@ -6122,7 +6130,7 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<Array, TestNullaryOperation>::new(), 2);
         let outputs = <TestNullaryOperation as BatchableOperation<
             EagerContext<Array, TestNullaryOperation>,
-            ArrayBatchingPolicy,
+            ArrayBatching,
         >>::batch(&TestNullaryOperation, &context, &EmptyRegionDriver, &[])
         .unwrap();
         assert_eq!(outputs.len(), 2);
@@ -6133,7 +6141,7 @@ mod tests {
         assert!(matches!(
             <TestNullaryOperation as BatchableOperation<
                 EagerContext<Array, TestNullaryOperation>,
-                ArrayBatchingPolicy,
+                ArrayBatching,
             >>::batch(
                 &TestNullaryOperation,
                 &context,
@@ -6147,7 +6155,7 @@ mod tests {
         where
             O: Operation<ArrayType>
                 + InterpretableOperation<EagerContext<Array, O>>
-                + BatchableOperation<EagerContext<Array, O>, ArrayBatchingPolicy>,
+                + BatchableOperation<EagerContext<Array, O>, ArrayBatching>,
         {
         }
 
