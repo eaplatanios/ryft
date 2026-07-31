@@ -450,6 +450,10 @@ where
 {
     /// Returns the canonical core operation for a member or mixed primitive, or `None` for an XLA-owned
     /// higher-order operation.
+    ///
+    /// This conversion clones the payload, so it is reserved for methods that need the composite family's boundary
+    /// projection or reconstruct an operation anyway (e.g., type inference, identity renaming, interpretation, and
+    /// partial evaluation). Cheap per-instruction accessors dispatch to the borrowed payload directly instead.
     pub(crate) fn to_core_operation(&self) -> Option<ArrayProgramOperation<C::Projected>> {
         Some(match self {
             Self::Zero(operation) => ArrayProgramOperation::Zero(operation.clone()),
@@ -482,6 +486,66 @@ where
             | Self::ShardMap(_) => return None,
         })
     }
+}
+
+macro_rules! dispatch_operation {
+    // Delegates one borrowed `Operation` method to the active payload without materializing the canonical core
+    // operation, so cheap per-instruction accessors (e.g., names, effects, and region slots) never clone payload
+    // vectors on program-construction and validation hot paths. The per-variant trait selection mirrors the
+    // corresponding delegation arms of `ArrayProgramOperation` exactly, so both dispatchers report identical
+    // semantics for shared member and mixed payloads.
+    ($operation:expr, $method:ident $(, $argument:expr)* $(,)?) => {
+        match $operation {
+            XlaOperation::Zero(operation) => operation.$method($($argument),*),
+            XlaOperation::DynamicZero(operation) => operation.$method($($argument),*),
+            XlaOperation::DynamicOne(operation) => operation.$method($($argument),*),
+            XlaOperation::DynamicIota(operation) => operation.$method($($argument),*),
+            XlaOperation::Array(operation) => operation.$method($($argument),*),
+            XlaOperation::Dimension(operation) => operation.$method($($argument),*),
+            XlaOperation::Compare(operation) => Operation::<ArrayProgramType>::$method(operation, $($argument),*),
+            XlaOperation::DimensionSize(operation) => operation.$method($($argument),*),
+            XlaOperation::DimensionFromScalar(operation) => operation.$method($($argument),*),
+            XlaOperation::DimensionToScalar(operation) => operation.$method($($argument),*),
+            XlaOperation::Reshape(operation) => operation.$method($($argument),*),
+            XlaOperation::Broadcast(operation) => operation.$method($($argument),*),
+            XlaOperation::Concatenate(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::CustomCall(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::Pad(operation) => Operation::<ArrayProgramType>::$method(operation, $($argument),*),
+            XlaOperation::RngBitGenerator(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::AllGather(operation) => Operation::<ArrayType>::$method(operation, $($argument),*),
+            XlaOperation::PSumScatter(operation) => Operation::<ArrayType>::$method(operation, $($argument),*),
+            XlaOperation::AllToAll(operation) => Operation::<ArrayType>::$method(operation, $($argument),*),
+            XlaOperation::Condition(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::While(operation) => Operation::<ArrayProgramType>::$method(operation, $($argument),*),
+            XlaOperation::Scan(operation) => Operation::<ArrayProgramType>::$method(operation, $($argument),*),
+            XlaOperation::CustomJvp(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::CustomVjp(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::CustomVjpTangent(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::Rematerialize(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::JitCall(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+            XlaOperation::ShardMap(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
+        }
+    };
 }
 
 macro_rules! dispatch_higher_operation {
@@ -535,17 +599,11 @@ where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     fn name(&self) -> &'static str {
-        match self.to_core_operation() {
-            Some(operation) => operation.name(),
-            None => dispatch_higher_operation!(self, name),
-        }
+        dispatch_operation!(self, name)
     }
 
     fn region_slots(&self) -> &'static [RegionSlot] {
-        match self.to_core_operation() {
-            Some(operation) => operation.region_slots(),
-            None => dispatch_higher_operation!(self, region_slots),
-        }
+        dispatch_operation!(self, region_slots)
     }
 
     fn infer_region_input_types(
@@ -571,24 +629,15 @@ where
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-        match self.to_core_operation() {
-            Some(operation) => operation.output_region_provenance(output_index),
-            None => dispatch_higher_operation!(self, output_region_provenance, output_index),
-        }
+        dispatch_operation!(self, output_region_provenance, output_index)
     }
 
     fn is_zero(&self, output_index: usize) -> bool {
-        match self.to_core_operation() {
-            Some(operation) => operation.is_zero(output_index),
-            None => dispatch_higher_operation!(self, is_zero, output_index),
-        }
+        dispatch_operation!(self, is_zero, output_index)
     }
 
     fn effects(&self) -> Effects {
-        match self.to_core_operation() {
-            Some(operation) => operation.effects(),
-            None => dispatch_higher_operation!(self, effects),
-        }
+        dispatch_operation!(self, effects)
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
@@ -628,10 +677,7 @@ where
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self.to_core_operation() {
-            Some(operation) => operation.render(formatter, indentation),
-            None => dispatch_higher_operation!(self, render, formatter, indentation),
-        }
+        dispatch_operation!(self, render, formatter, indentation)
     }
 }
 

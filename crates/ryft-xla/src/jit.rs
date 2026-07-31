@@ -224,14 +224,12 @@ where
     In::Family: ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaCompileTracer<'c>>,
 {
     let function = move |static_parameters, inputs| {
         let outputs = function(static_parameters, project_tracers::<In>(inputs)?)?;
@@ -262,14 +260,12 @@ where
     In::Family: ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaCompileTracer<'c>>,
 {
     try_jitted_with_options(move |static_parameters, inputs| Ok(function(static_parameters, inputs)), domain, options)
 }
@@ -297,14 +293,12 @@ where
     In::Family: ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayProgramType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
-        + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaCompileTracer<'c>>,
 {
     jitted_with_options(function, domain, XlaOptions::new(mesh))
 }

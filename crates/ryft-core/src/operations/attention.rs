@@ -926,7 +926,7 @@ fn batch_attention_merge_reshape<C, O>(
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>,
-    O: Operation<ArrayType> + InterpretableBatchableOperation<C>,
+    O: Operation<ArrayType> + InterpretableBatchableOperation<C, ArrayBatchingPolicy>,
 {
     let output_count = |input_types: &[ArrayType]| -> Result<usize, BatchingError> {
         Ok(operation.infer_output_types(input_types, &[]).map_err(ProgramError::from)?.len())
