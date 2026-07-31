@@ -1131,7 +1131,7 @@ mod tests {
     use crate::backends::array_programs::ArrayProgramValue;
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
-    use crate::batching::{Batch, BatchingTracer, batch};
+    use crate::batching::{Batch, BatchingTracer, InterpretableBatchableOperation, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::collectives::{
         AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions, PSumScatterOperation,
@@ -1294,6 +1294,23 @@ mod tests {
         let context = PolicyContext::new(Parent::new(), axis_extent.clone()).with_axis_name("items".to_string());
         assert_eq!(context.axis_extent(), &axis_extent);
         assert_eq!(context.axis_name(), Some("items"));
+
+        // The policy-generic interpretation helper unpacks and repackages composite batches without projecting their
+        // member kind or depending on the homogeneous array carrier.
+        let direct_input = ArrayProgramBatch::new(
+            ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let [direct_output] = ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation))
+            .interpret_with_batch_axes(&context, &[direct_input], &[BatchAxis::new(0)])?
+            .try_into()
+            .unwrap();
+        assert_eq!(direct_output.batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            direct_output.value(),
+            &ArrayProgramValue::Array(Array::matrix(2, 2, vec![-1.0_f32, -2.0, -3.0, -4.0])),
+        );
 
         // The generic frame preserves the existing homogeneous array rule unchanged.
         let input = BatchingTracer::new(
