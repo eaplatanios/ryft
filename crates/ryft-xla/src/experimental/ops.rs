@@ -207,6 +207,30 @@ where
             ArrayProgramOperation::AllGather(operation) => Self::AllGather(operation),
             ArrayProgramOperation::PSumScatter(operation) => Self::PSumScatter(operation),
             ArrayProgramOperation::AllToAll(operation) => Self::AllToAll(operation),
+            ArrayProgramOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
+            ArrayProgramOperation::While(operation) => Self::While(operation),
+            ArrayProgramOperation::Scan(operation) => {
+                let captures = operation
+                    .captures()
+                    .iter()
+                    .cloned()
+                    .map(|capture| match capture {
+                        ryft_core::backends::array_programs::ArrayProgramValue::Array(capture) => {
+                            C::from_projected(capture)
+                        }
+                        ryft_core::backends::array_programs::ArrayProgramValue::Dimension(_) => {
+                            unreachable!("validated scan captures are always stacked arrays")
+                        }
+                    })
+                    .collect();
+                Self::Scan(
+                    ScanOperation::<C>::new(operation.carry_count(), operation.length())
+                        .with_reverse(operation.reverse())
+                        .with_unroll(operation.unroll())
+                        .unwrap()
+                        .with_captures(captures),
+                )
+            }
         }
     }
 }
@@ -947,12 +971,14 @@ where
                     .iter()
                     .map(|input| batch_axis_from_position(input.batch_axis_position()))
                     .collect::<Vec<_>>();
-                let (batched_callee, output_axes) = driver.batch_program(
-                    context,
-                    driver.region(0)?,
-                    input_batch_axes.as_slice(),
-                    ProgramBatchingOutputAxesPolicy::Natural,
-                )?;
+                let (batched_callee, output_axes) = driver
+                    .batch_program(
+                        context,
+                        driver.region(0)?,
+                        input_batch_axes.as_slice(),
+                        ProgramBatchingOutputAxesPolicy::Natural,
+                    )?
+                    .into_parts();
                 let output_axes = output_axes.iter().map(batch_axis_position).collect::<Vec<_>>();
                 (batched_callee.into_simplified()?, output_axes)
             }
@@ -1201,10 +1227,11 @@ where
 mod tests {
     use std::rc::Rc;
 
+    use ryft_core::backends::array_programs::ArrayProgramOperation;
     use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};
-    use ryft_core::operations::control_flow::ConditionOperation;
+    use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
     use ryft_core::operations::dimensions::DimensionFromScalarOperation;
     use ryft_core::operations::manipulation::BroadcastOperation;
     use ryft_core::operations::math::{AddOperation, MulOperation};
@@ -1258,6 +1285,29 @@ mod tests {
 
     fn vector_type() -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
+    }
+
+    #[test]
+    fn test_core_composite_control_flow_promotes_to_xla_control_flow() {
+        let condition: XlaOperation<XlaConstant> =
+            ArrayProgramOperation::<XlaArrayConstant>::Condition(ConditionOperation::new()).into();
+        assert!(matches!(condition, XlaOperation::Condition(_)));
+        assert_eq!(condition.region_slots(), ConditionOperation::<XlaConstant>::new().region_slots());
+
+        let r#while: XlaOperation<XlaConstant> =
+            ArrayProgramOperation::<XlaArrayConstant>::While(WhileOperation::new().with_iteration_bound(3).unwrap())
+                .into();
+        assert!(matches!(r#while, XlaOperation::While(operation) if operation.iteration_bound() == Some(3)));
+
+        let scan: XlaOperation<XlaConstant> =
+            ArrayProgramOperation::<XlaArrayConstant>::Scan(ScanOperation::new(2, 5).with_reverse(true)).into();
+        assert!(matches!(
+            scan,
+            XlaOperation::Scan(operation)
+                if operation.carry_count() == 2
+                    && operation.length() == &Dimension::Static(5)
+                    && operation.reverse()
+        ));
     }
 
     #[test]

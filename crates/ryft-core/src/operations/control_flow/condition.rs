@@ -877,36 +877,34 @@ where
         let operand_axes = operand_inputs.iter().map(|input| input.batch_axis()).collect::<Vec<_>>();
         let true_region = driver.region(0)?;
         let false_region = driver.region(1)?;
-        let (_, true_axes) = driver.batch_program(
-            context,
-            true_region,
-            operand_axes.as_slice(),
-            ProgramBatchingOutputAxesPolicy::Natural,
-        )?;
-        let (_, false_axes) = driver.batch_program(
-            context,
-            false_region,
-            operand_axes.as_slice(),
-            ProgramBatchingOutputAxesPolicy::Natural,
-        )?;
+        let (_, true_axes) = driver
+            .batch_program(context, true_region, operand_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
+            .into_parts();
+        let (_, false_axes) = driver
+            .batch_program(context, false_region, operand_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
+            .into_parts();
         check_count!("output", false_axes, true_axes.len(), ProgramError);
         let output_axes: Vec<BatchAxis> = true_axes
             .iter()
             .zip(false_axes.iter())
             .map(|(true_axis, false_axis)| if true_axis.is_replicated() { *false_axis } else { *true_axis })
             .collect();
-        let (batched_true_branch, _) = driver.batch_program(
-            context,
-            true_region,
-            operand_axes.as_slice(),
-            ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
-        )?;
-        let (batched_false_branch, _) = driver.batch_program(
-            context,
-            false_region,
-            operand_axes.as_slice(),
-            ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
-        )?;
+        let (batched_true_branch, _) = driver
+            .batch_program(
+                context,
+                true_region,
+                operand_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
+            )?
+            .into_parts();
+        let (batched_false_branch, _) = driver
+            .batch_program(
+                context,
+                false_region,
+                operand_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
+            )?
+            .into_parts();
 
         // Stage one condition over the batched branches with the unbatched predicate passed through.
         let batched_condition = ConditionOperation::new();
@@ -923,8 +921,8 @@ where
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| {
-                let physical_type = output.r#type().into_owned();
-                ArrayBatch::new(physical_type, output, axis)
+                let batched_type = output.r#type().into_owned();
+                ArrayBatch::new(batched_type, output, axis)
             })
             .collect()
     }
@@ -1257,7 +1255,7 @@ mod tests {
 
     /// Batches a vector-valued condition whose branches scale their input by two and three.
     fn batch_vector_condition(batch_size: usize, item_size: usize, input_values: Vec<f64>) -> ArrayBatch<Array> {
-        let physical_type = ArrayType::new(
+        let batched_type = ArrayType::new(
             DataType::F64,
             Shape::new(vec![Dimension::Static(batch_size), Dimension::Static(item_size)]),
         );
@@ -1270,7 +1268,7 @@ mod tests {
         )
         .unwrap();
         let operand =
-            ArrayBatch::new(physical_type.clone(), Array::from_f64s(physical_type, input_values), BatchAxis::new(0))
+            ArrayBatch::new(batched_type.clone(), Array::from_f64s(batched_type, input_values), BatchAxis::new(0))
                 .unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
         let mut outputs = context
@@ -1647,24 +1645,24 @@ mod tests {
     fn test_condition_region_batching_preserves_mapped_axis_sharding() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let physical_sharding =
+            let batched_sharding =
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                     .unwrap()
                     .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                     .unwrap();
-            let physical_type =
+            let batched_type =
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
-                    .with_sharding(physical_sharding)
+                    .with_sharding(batched_sharding)
                     .unwrap();
             let operand = ArrayBatch::new(
-                physical_type.clone(),
-                Array::from_f64s(physical_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                batched_type.clone(),
+                Array::from_f64s(batched_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
                 BatchAxis::new(0),
             )
             .unwrap();
-            let logical_type = operand.unbatched_type();
+            let unbatched_type = operand.unbatched_type();
             let (_, branch) =
-                EagerContext::<Array, ArrayOperation<Array>>::trace(|inputs: Vec<_>| Ok(inputs), vec![logical_type])
+                EagerContext::<Array, ArrayOperation<Array>>::trace(|inputs: Vec<_>| Ok(inputs), vec![unbatched_type])
                     .unwrap();
             let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
@@ -1680,7 +1678,7 @@ mod tests {
 
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
-            assert_eq!(outputs[0].batch().r#type(), Cow::Borrowed(&physical_type));
+            assert_eq!(outputs[0].batch().r#type(), Cow::Borrowed(&batched_type));
         }
     }
 

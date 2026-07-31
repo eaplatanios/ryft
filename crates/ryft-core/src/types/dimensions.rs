@@ -499,6 +499,13 @@ impl Display for Dimension {
     }
 }
 
+impl From<&Dimension> for Dimension {
+    #[inline]
+    fn from(dimension: &Dimension) -> Self {
+        dimension.clone()
+    }
+}
+
 impl From<usize> for Dimension {
     #[inline]
     fn from(value: usize) -> Self {

@@ -952,12 +952,14 @@ where
         // point is already aligned to the loop-invariant state layout and needs no further normalization.
         let mut batched_body = None;
         for _ in 0..=state_count {
-            let (candidate_body, body_axes) = driver.batch_program(
-                context,
-                body_region,
-                state_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(state_axes.clone()),
-            )?;
+            let (candidate_body, body_axes) = driver
+                .batch_program(
+                    context,
+                    body_region,
+                    state_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::AlignEachTo(state_axes.clone()),
+                )?
+                .into_parts();
             check_count!("output", body_axes, state_count, ProgramError);
             let mut widened = false;
             for (state_axis, body_axis) in state_axes.iter_mut().zip(body_axes.iter()) {
@@ -983,30 +985,31 @@ where
         // Batch the condition at the stabilized axes; a batched predicate output means per-item termination, in
         // which case every state element participates in per-item masking and is therefore widened to a batched
         // element before the masked loop structure is built.
-        let (mut batched_condition, mut condition_axes) = driver.batch_program(
-            context,
-            condition_region,
-            state_axes.as_slice(),
-            ProgramBatchingOutputAxesPolicy::Natural,
-        )?;
+        let (mut batched_condition, mut condition_axes) = driver
+            .batch_program(context, condition_region, state_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
+            .into_parts();
         check_count!("output", condition_axes, 1, ProgramError);
         let batch_varying = !condition_axes[0].is_replicated();
         if batch_varying && state_axes.iter().any(|axis| axis.is_replicated()) {
             state_axes = vec![BatchAxis::new(0); state_count];
-            let (widened_body, body_axes) = driver.batch_program(
-                context,
-                body_region,
-                state_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(state_axes.clone()),
-            )?;
+            let (widened_body, body_axes) = driver
+                .batch_program(
+                    context,
+                    body_region,
+                    state_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::AlignEachTo(state_axes.clone()),
+                )?
+                .into_parts();
             check_count!("output", body_axes, state_count, ProgramError);
             batched_body = widened_body;
-            (batched_condition, condition_axes) = driver.batch_program(
-                context,
-                condition_region,
-                state_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::Natural,
-            )?;
+            (batched_condition, condition_axes) = driver
+                .batch_program(
+                    context,
+                    condition_region,
+                    state_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )?
+                .into_parts();
             check_count!("output", condition_axes, 1, ProgramError);
         }
 
@@ -1028,8 +1031,8 @@ where
                 .into_iter()
                 .zip(state_axes)
                 .map(|(output, axis)| {
-                    let physical_type = output.r#type().into_owned();
-                    ArrayBatch::new(physical_type, output, axis)
+                    let batched_type = output.r#type().into_owned();
+                    ArrayBatch::new(batched_type, output, axis)
                 })
                 .collect();
         }
@@ -1042,12 +1045,14 @@ where
         // eager interpretation continues while any per-item predicate is true and freezes finished items through
         // `WhilePredicate::mask_select`, and the XLA lowering
         // reduces the predicate with `or` and masks carry updates with a broadcast select.
-        let (batched_condition, condition_axes) = driver.batch_program(
-            context,
-            condition_region,
-            state_axes.as_slice(),
-            ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0)]),
-        )?;
+        let (batched_condition, condition_axes) = driver
+            .batch_program(
+                context,
+                condition_region,
+                state_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0)]),
+            )?
+            .into_parts();
         check_count!("output", condition_axes, 1, ProgramError);
         let batched_while = WhileOperation::new().with_iteration_bound(self.iteration_bound())?;
         let outputs = context.parent().bind(batched_while, vec![batched_condition, batched_body], &state_values)?;
@@ -1055,8 +1060,8 @@ where
         outputs
             .into_iter()
             .map(|output| {
-                let physical_type = output.r#type().into_owned();
-                ArrayBatch::new(physical_type, output, Some(0))
+                let batched_type = output.r#type().into_owned();
+                ArrayBatch::new(batched_type, output, Some(0))
             })
             .collect()
     }
@@ -1466,7 +1471,7 @@ where
 /// Data-dependent trip counts therefore need no iteration bound — this is the analogue of
 /// [JAX's `jvp` through an eagerly executed loop](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html) — while a
 /// semantic [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the loop once it is reached, matching
-/// the bounded-`while` truncation semantics. Each body effect executes exactly once per logical iteration.
+/// the bounded-`while` truncation semantics. Each body effect executes exactly once per loop iteration.
 fn jvp_while_eagerly<C, D: DifferentiationDriver<C>>(
     operation: &WhileOperation,
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,

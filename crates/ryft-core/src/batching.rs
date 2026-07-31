@@ -2415,25 +2415,25 @@ mod tests {
     }
 
     #[test]
-    fn test_batched_program() -> Result<(), ProgramError> {
+    fn test_batched_program() {
         // Construction validates that the output axes cover exactly the program's outputs.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32));
-        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])?;
-        let Err(error) = BatchedProgram::new(program, Vec::new()) else {
-            panic!("batched program accepted mismatched output axes");
-        };
-        assert_eq!(error, ProgramError::InvalidOutputCount { expected: 1, actual: 0 });
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            BatchedProgram::new(program, Vec::new()).map(|_| ()),
+            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+        );
 
         // A well-formed result preserves its program and output axes through `into_parts`.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32));
-        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])?;
-        let (program, output_axes) = BatchedProgram::new(program, vec![BatchAxis::replicated()])?.into_parts();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let (program, output_axes) = BatchedProgram::new(program, vec![BatchAxis::replicated()]).unwrap().into_parts();
         assert_eq!(program.output_ids(), &[input]);
         assert_eq!(output_axes, vec![BatchAxis::replicated()]);
-
-        Ok(())
     }
 
     #[test]

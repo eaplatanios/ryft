@@ -1458,7 +1458,7 @@ rename only part of the problem while introducing another carrier.
 - [x] Keep dedicated rules only for genuinely mixed shape-changing and region-carrying operations. Homogeneous array
       operations now use generated generic projection/delegation/lifting; the remaining explicit rules were audited
       and are mixed, region-carrying, RNG, or custom-call contracts.
-- [ ] Move mapped-state RNG batching's carry-free `scan` into the composite region contract and thread every dynamic
+- [x] Move mapped-state RNG batching's state-carry-free `scan` into the composite region contract and thread every dynamic
       bits-output extent through that body as replicated first-class shape authority. Delete P3i's exact
       `"requires Phase 5 composite scan-region support"` boundary only after the resulting program remains
       size-independent in the mapped-axis extent and preserves the existing replicated-state diagnostic.
@@ -1469,8 +1469,19 @@ rename only part of the problem while introducing another carrier.
 - [x] Remove repeated outer-enum matches that only project/lift batches.
 - [ ] Delete dimension/source-array reconstruction in dynamic slice, concatenate, reduce, collectives, RNG, and
       constructors.
-- [ ] Verify nested `vmap`, mapped arrays with dynamic logical extents, replicated dimension residuals, control flow,
+- [x] Verify nested `vmap`, mapped arrays with dynamic logical extents, replicated dimension residuals, control flow,
       and all mapped-authority rejection paths.
+- [ ] P5d — immediately after P5c3, not at the Phase 11 gate: delete every homogeneous batching rule whose composite
+      equivalent has passing parity fixtures (the condition/while/scan control-flow rules, the homogeneous
+      elementwise blanket path, and the matching-axis collective materializations), and migrate any remaining
+      reference-backend or fixture consumer through the composite rules (e.g., via the established member-program
+      unprojection) or delete the consumer together with its rule. The P5a decision to retain these rules as the
+      migration's comparison baseline expires the moment the P5c parity fixtures land; deleting at that point is the
+      cheapest verification moment and turns the Phase 11 batching entries into a ledger check instead of a deletion.
+      Record any blocked deletion with its concrete blocker and owning phase instead of leaving the rule silently
+      frozen.
+- [ ] Gate: after P5d, each operation's batching semantics has exactly one rule across both universes, and the
+      Phase 5 net production-line delta against the P5a baseline is recorded next to the deleted-rule ledger.
 - [x] Gate: adding an array-only primitive with a standard batching rule requires no handwritten change in composite
       batching dispatch.
 
@@ -1493,6 +1504,28 @@ use one generated policy-generic projection/delegation/lifting path, and static 
 one structural alignment algorithm with mode-selected broadcast materialization. The static bridge, duplicated
 composite alignment, and per-primitive outer dispatch are deleted. Focused parity, import/render, macro, core, and XLA
 tests pass. Composite region operations and RNG scan remain deliberately separate Phase 5 units.
+
+P5c is complete and recorded in `.tasks/plan_p5c_composite_region_batching.md` as three separately reviewable vertical
+slices: the explicit composite threaded-extent boundary plus condition, then while/scan, then mapped-state RNG. The
+implementation preserves that separation even though P5c2 and P5c3 were executed together at the user's request.
+Structural region batching carries the mapped extent explicitly as dimension SSA, and the source audit found no
+region projection, source-array extent reconstruction, host concretization, parallel context/tracer, or XLA-local
+copy of the batching semantics.
+
+P5d is the scheduled deletion payback for this arc and runs immediately after P5c3 rather than waiting for the
+Phase 11 gate: the homogeneous batching rules that composite equivalents duplicate are deleted while their parity
+fixtures are freshest, with any surviving consumer migrated through the composite rules or deleted alongside its
+rule. Its checklist item above owns the exact scope and the blocked-deletion recording rule. This converts the
+Phase 5 line-count story from monotone growth into a measured add-then-delete cycle whose net delta is recorded at
+the P5d gate.
+
+P5c is complete. Structural batching selects direct and composite threaded-extent boundary types through
+`BatchingPolicy`, making the distinction static and deleting the interim runtime boundary enum. Condition, while, and
+scan support mixed array/dimension values, explicit mapped-extent threading, nested batching, rendering/import, and
+the existing XLA promotion/lowering/execution path. Composite scan accepts a first-class dynamic trip count, and
+mapped-state RNG batching now decomposes to one state-carry-free composite scan while preserving its exact
+replicated-state diagnostic. The full `ryft-core`, `ryft-xla`, and macro integration suites pass; P5d is the next
+review unit and remains intentionally open.
 
 ### Phase 6: simplify differentiation and transposition
 

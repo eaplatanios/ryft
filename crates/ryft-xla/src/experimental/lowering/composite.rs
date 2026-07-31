@@ -897,5 +897,14 @@ where
                 location,
             )
         }
+        ArrayProgramOperation::Condition(_) | ArrayProgramOperation::While(_) | ArrayProgramOperation::Scan(_) => {
+            Err(LoweringError::UnsupportedOp {
+                op: format!(
+                    "core composite higher-order operation `{}` must be promoted to the XLA operation family before \
+                     lowering",
+                    operation.name(),
+                ),
+            })
+        }
     }
 }

@@ -3201,7 +3201,8 @@ mod tests {
                 &[BatchAxis::new(0); 3],
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
-            .unwrap();
+            .unwrap()
+            .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),

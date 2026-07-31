@@ -229,8 +229,8 @@ where
         return outputs
             .into_iter()
             .map(|tracer| {
-                let physical_type = tracer.r#type().into_owned();
-                ArrayBatch::new(physical_type, tracer, BatchAxis::replicated())
+                let packed_type = tracer.r#type().into_owned();
+                ArrayBatch::new(packed_type, tracer, BatchAxis::replicated())
             })
             .collect();
     }
@@ -245,8 +245,8 @@ where
     outputs
         .into_iter()
         .map(|tracer| {
-            let physical_type = tracer.r#type().into_owned();
-            ArrayBatch::new(physical_type, tracer, Some(0))
+            let packed_type = tracer.r#type().into_owned();
+            ArrayBatch::new(packed_type, tracer, Some(0))
         })
         .collect()
 }
@@ -265,12 +265,14 @@ pub(crate) fn batch_rewrapped_program<
     let region = driver.region(index)?;
     let input_count = region.input_types().len();
     let input_batch_axes = vec![BatchAxis::new(0); input_count];
-    let (program, _) = driver.batch_program(
-        context,
-        region,
-        input_batch_axes.as_slice(),
-        ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
-    )?;
+    let (program, _) = driver
+        .batch_program(
+            context,
+            region,
+            input_batch_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
+        )?
+        .into_parts();
     Ok(program)
 }
 

@@ -2092,7 +2092,8 @@ mod tests {
                 &[BatchAxis::new(0); 4],
                 crate::batching::ProgramBatchingOutputAxesPolicy::Natural,
             )
-            .unwrap();
+            .unwrap()
+            .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),
@@ -2813,6 +2814,7 @@ mod tests {
                 crate::batching::ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
+            .into_parts()
             .0;
         let batched_lhs_type = ArrayType::new(
             DataType::F8E4M3FN,

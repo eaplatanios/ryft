@@ -45,6 +45,8 @@ use ryft_core::sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
 };
 use ryft_core::tracing::DomainTracer;
+#[cfg(test)]
+use ryft_core::types::DimensionType;
 use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
 use ryft_core::types::{
     ArrayProgramType, ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout, Tile, TileDimension,
@@ -4274,6 +4276,43 @@ mod tests {
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![4.0]);
         assert_eq!(program_array(&outputs[1]).shape(), StaticShape::new(vec![4]));
         assert_eq!(read_f32s(&client, program_array(&outputs[1])), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_eager_bind_executes_scan_with_dynamic_scalar_ssa_length() {
+        use ryft_core::operations::control_flow::ScanOperation;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let length = DimensionValue::new(
+            DimensionType::new(DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap())),
+            3,
+        )
+        .unwrap();
+
+        let body = {
+            let mut builder = XlaProgramBuilder::new();
+            let carry = builder.add_input(scalar_type.clone().into());
+            let one = builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![]).unwrap()[0];
+            let next = builder.add_instruction(AddOperation, Vec::new(), vec![carry, one]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let scan = ScanOperation::<XlaConstant>::new(1, length.r#type().to_dimension());
+        let outputs = domain
+            .bind(
+                XlaOperation::Scan(scan),
+                [body],
+                &[ArrayProgramValue::Array(f32_scalar(&client, &mesh, 0.0)), ArrayProgramValue::Dimension(length)],
+            )
+            .unwrap();
+
+        assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![3.0]);
+        assert_eq!(outputs.len(), 1);
     }
 
     #[test]

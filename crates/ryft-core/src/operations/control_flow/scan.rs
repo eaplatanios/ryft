@@ -1,4 +1,4 @@
-//! Contains the `scan` control-flow operation: [`ScanOperation`], a static-trip-count loop that threads
+//! Contains the `scan` control-flow operation: [`ScanOperation`], a shape-determined loop that threads
 //! `carry_count` loop-carried values through an attached body [`Region`](crate::Region) while consuming one slice of
 //! every stacked input and producing one slice of every stacked output per iteration, together with its
 //! interpretation, partial-evaluation, batching, forward-mode differentiation, and transposition rules. This is the
@@ -39,27 +39,27 @@ use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRe
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, Shape};
+use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this.
 
 /// Canonical operation name for [`ScanOperation`].
 pub const SCAN_OPERATION_NAME: &str = "scan";
 
-/// [`Operation`] that applies a nested body [`Program`] a static number of times over a loop-carried
-/// state while
+/// [`Operation`] that applies a nested body [`Program`] a shape-determined number of times over loop-carried state
+/// while
 /// consuming one slice of each stacked input per iteration and stacking the body's per-iteration outputs. This is the
-/// statically shaped loop primitive analogous to JAX's
+/// shape-determined loop primitive analogous to JAX's
 /// [`lax.scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html): where [`WhileOperation`] iterates a
 /// data-dependent number of times and therefore supports reverse-mode differentiation only by unrolling in eager
-/// domains, `scan` has a static trip count, so its linearization can *store* per-iteration residuals as statically
-/// shaped stacks and its linear form transposes totally (see the `tracing_v2` scan rules).
+/// domains, `scan` has a shape-determined trip count, so its linearization can *store* per-iteration residuals as
+/// shape-determined stacks and its linear form transposes totally (see the `tracing_v2` scan rules).
 ///
 /// The body [`Program`] maps `[carry..., x_slice...]` to `[carry..., y_slice...]`: the first
 /// [`carry_count`](Self::carry_count) inputs and outputs are the loop-carried state (with identical type signatures),
 /// the remaining inputs consume one slice of each stacked input per iteration, and the remaining outputs produce one
 /// slice of each stacked output per iteration. The operation's inputs are `[carry..., stacked_xs...]` and its outputs
-/// are `[final_carry..., stacked_ys...]`, where each stacked type prepends a static
+/// are `[final_carry..., stacked_ys...]`, where each stacked type prepends the
 /// [`length`](Self::length) dimension to the corresponding body slice type. Iteration `i` consumes slice `i` of every
 /// stacked input and produces slice `i` of every stacked output; when [`reverse`](Self::reverse) is `true` the
 /// iterations visit the slices from `length - 1` down to `0`, but slice `i` of every stacked output still corresponds
@@ -67,10 +67,10 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// the linear form simply flips [`reverse`](Self::reverse), so no array-reversal operation is ever needed.
 ///
 /// The `length` is stored explicitly so that scans without stacked inputs (pure carry loops with stacked outputs)
-/// remain well-defined. Homogeneous [`ArrayType`] scans retain their fully static body-slice contract. Composite
-/// [`ArrayProgramType`](crate::types::ArrayProgramType) scans may instead carry first-class dimensions and use those
-/// identities in the inner axes of stacked arrays; the prepended scan axis remains the static `length`, so
-/// per-iteration extraction is provably in bounds without treating a dimension value itself as stackable.
+/// remain well-defined. Homogeneous [`ArrayType`] and [`DataType`] scans require a static length. Composite
+/// [`ArrayProgramType`](crate::types::ArrayProgramType) scans may instead use one dynamic dimension identity and then
+/// consume its matching first-class dimension value as a trailing runtime operand; this is the scalar-SSA trip-count
+/// contract used by structurally batched scans.
 ///
 /// The optional [`unroll`](Self::unroll) factor (attached via [`with_unroll`](Self::with_unroll)) is a
 /// **lowering-only** attribute: interpretation and every transform rule (differentiation, transposition, batching)
@@ -97,8 +97,8 @@ pub struct ScanOperation<Capture: Value> {
     /// Number of loop-carried state leaves at the front of the body's inputs and outputs.
     pub(crate) carry_count: usize,
 
-    /// Static trip count of this [`ScanOperation`].
-    pub(crate) length: usize,
+    /// Shape-determined trip count of this [`ScanOperation`].
+    pub(crate) length: Dimension,
 
     /// Boolean indicating whether iterations visit the stacked slices in reverse order.
     pub(crate) reverse: bool,
@@ -108,7 +108,8 @@ pub struct ScanOperation<Capture: Value> {
 }
 
 impl<Capture: Value> ScanOperation<Capture> {
-    /// Creates a new [`ScanOperation`] with the provided carry count and static trip count, visiting iterations in
+    /// Creates a new [`ScanOperation`] with the provided carry count and shape-determined trip count, visiting
+    /// iterations in
     /// increasing order (use [`Self::with_reverse`] to flip the visit order). The body [`Program`]
     /// mapping
     /// `[carry..., x_slice...]` to `[carry..., y_slice...]` is supplied separately as the operation's attached
@@ -118,10 +119,10 @@ impl<Capture: Value> ScanOperation<Capture> {
     /// # Parameters
     ///
     ///   - `carry_count`: Number of loop-carried state leaves at the front of the body's inputs and outputs.
-    ///   - `length`: Static trip count.
+    ///   - `length`: Shape-determined trip count.
     #[inline]
-    pub fn new(carry_count: usize, length: usize) -> Self {
-        Self { captures: Vec::new(), carry_count, length, reverse: false, unroll: 1 }
+    pub fn new<L: Into<Dimension>>(carry_count: usize, length: L) -> Self {
+        Self { captures: Vec::new(), carry_count, length: length.into(), reverse: false, unroll: 1 }
     }
     /// Returns this [`ScanOperation`] with the slice visit order set to `reverse`. For carry-only scalar scans this
     /// only preserves lowering metadata because all iterations consume and produce loop-carried state.
@@ -137,7 +138,7 @@ impl<Capture: Value> ScanOperation<Capture> {
     /// `unroll` body copies per loop trip — and a fully unrolled straight-line lowering with no loop at all when
     /// `unroll` equals [`length`](Self::length).
     pub fn with_unroll(mut self, unroll: usize) -> Result<Self, ProgramError> {
-        validate_scan_unroll(unroll, self.length)?;
+        validate_scan_unroll(unroll, &self.length)?;
         self.unroll = unroll;
         Ok(self)
     }
@@ -170,10 +171,10 @@ impl<Capture: Value> ScanOperation<Capture> {
         self.carry_count
     }
 
-    /// Returns the static trip count of this [`ScanOperation`].
+    /// Returns the shape-determined trip count of this [`ScanOperation`].
     #[inline]
-    pub fn length(&self) -> usize {
-        self.length
+    pub fn length(&self) -> &Dimension {
+        &self.length
     }
 
     /// Returns `true` when iterations of this [`ScanOperation`] visit the stacked slices in reverse order.
@@ -225,14 +226,20 @@ fn check_static_scan_type(role: &str, index: usize, r#type: &ArrayType) -> Resul
     Ok(())
 }
 
-/// Validates a scan unroll factor against the scan's static trip count: the factor must be at least `1` and must
-/// evenly divide `length` (remainder handling is an explicit non-goal). This backs [`ScanOperation::with_unroll`] and
+/// Validates a scan unroll factor against the scan's trip count. The factor must be at least `1`; a static length must
+/// be evenly divisible by it, while a dynamic length only supports `1`. This backs [`ScanOperation::with_unroll`] and
 /// enum-payload validation of scan variants whose fields are public and therefore cannot rely on builder-time
 /// validation alone.
-pub(crate) fn validate_scan_unroll(unroll: usize, length: usize) -> Result<(), TypeError> {
+pub(crate) fn validate_scan_unroll(unroll: usize, length: &Dimension) -> Result<(), TypeError> {
     if unroll == 0 {
         return Err(TypeError::invalid("scan unroll factor must be at least 1".to_string()));
     }
+    let Some(length) = length.value() else {
+        if unroll == 1 {
+            return Ok(());
+        }
+        return Err(TypeError::invalid(format!("scan with dynamic length {length} only supports unroll factor 1",)));
+    };
     if length % unroll != 0 {
         return Err(TypeError::invalid(format!(
             "scan unroll factor {unroll} must evenly divide the scan length {length}"
@@ -241,13 +248,13 @@ pub(crate) fn validate_scan_unroll(unroll: usize, length: usize) -> Result<(), T
     Ok(())
 }
 
-/// Returns the stacked variant of a scan body slice type, prepending a static `length` dimension to its shape. The
+/// Returns the stacked variant of a scan body slice type, prepending `length` to its shape. The
 /// stacked type preserves the slice's memory placement but carries no optional layout or sharding metadata, so it is
 /// a declared type whose optional components are unspecified. Scan input validation compares it against actual input
 /// types with [`Type::is_refined_by`](crate::programs::types::Type::is_refined_by).
-pub(crate) fn stacked_scan_type(slice_type: &ArrayType, length: usize) -> ArrayType {
+pub(crate) fn stacked_scan_type<L: Into<Dimension>>(slice_type: &ArrayType, length: L) -> ArrayType {
     let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
-    dimensions.push(Dimension::Static(length));
+    dimensions.push(length.into());
     dimensions.extend(slice_type.shape().dimensions().iter().cloned());
     ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory())
 }
@@ -266,7 +273,7 @@ pub(crate) fn scan_output_types(
     body_input_types: &[ArrayType],
     body_output_types: &[ArrayType],
     carry_count: usize,
-    length: usize,
+    length: &Dimension,
     input_types: &[ArrayType],
 ) -> Result<Vec<ArrayType>, TypeError> {
     let mut expected_input_types = body_input_types[..carry_count].to_vec();
@@ -319,18 +326,24 @@ pub(crate) fn scalar_scan_output_types(
 /// Type-family semantics for [`ScanOperation`].
 ///
 /// [`ArrayType`] can represent scanned values by prepending a static leading axis to each per-iteration value type,
-/// while [`DataType`] currently has no stack metadata and therefore supports only carry-only scalar scans.
-/// [`ArrayProgramType`] permits both arrays and first-class dimensions in carry positions, but requires every stacked
+/// while [`DataType`] currently has no stack metadata and therefore supports only carry-only scalar scans. Both
+/// homogeneous families require a static trip count. [`ArrayProgramType`] permits arrays and first-class dimensions
+/// in carry positions and a dynamic trip count backed by one trailing dimension operand, but requires every stacked
 /// input, output, and capture to be an array because the composite domain has no ragged or stacked dimension value.
 /// This trait keeps those type rules local to the scan operation so the operation dispatcher itself can be generic
 /// over `T`.
 pub trait ScanTypeSemantics: Type {
+    /// Renames any dynamic identity referenced by a scan length.
+    fn rename_scan_length(length: &Dimension, _renaming: &TypeIdentityRenaming<Self::Identity>) -> Dimension {
+        length.clone()
+    }
+
     /// Validates a scan body signature for this type family.
     fn validate_scan_body(
         body_input_types: &[Self],
         body_output_types: &[Self],
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
     ) -> Result<(), TypeError>;
 
     /// Derives the instantiated body input types from this scan's boundary input types.
@@ -338,7 +351,7 @@ pub trait ScanTypeSemantics: Type {
         input_types: &[Self],
         body_input_count: usize,
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
     ) -> Result<Vec<Self>, TypeError>;
 
     /// Infers this scan's output types from concrete input types.
@@ -346,21 +359,35 @@ pub trait ScanTypeSemantics: Type {
         body_input_types: &[Self],
         body_output_types: &[Self],
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
         input_types: &[Self],
     ) -> Result<Vec<Self>, TypeError>;
 
     /// Validates one capture value stored on this scan.
-    fn validate_scan_capture<C: Value<Type = Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError>;
+    fn validate_scan_capture<C: Value<Type = Self>>(
+        capture: &C,
+        index: usize,
+        length: &Dimension,
+    ) -> Result<(), TypeError>;
 }
 
 impl ScanTypeSemantics for ArrayType {
+    fn rename_scan_length(length: &Dimension, renaming: &TypeIdentityRenaming<Self::Identity>) -> Dimension {
+        length.rename_type_identities(renaming)
+    }
+
     fn validate_scan_body(
         body_input_types: &[Self],
         body_output_types: &[Self],
         carry_count: usize,
-        _length: usize,
+        length: &Dimension,
     ) -> Result<(), TypeError> {
+        if length.variable().is_some() {
+            return Err(TypeError::invalid(format!(
+                "homogeneous array scan requires a static length but got {length}; use a composite scan with a \
+                 trailing first-class dimension operand for a dynamic trip count",
+            )));
+        }
         if carry_count > body_input_types.len() {
             return Err(TypeError::invalid(format!(
                 "scan carry count {carry_count} exceeds the body input count {}",
@@ -390,7 +417,7 @@ impl ScanTypeSemantics for ArrayType {
         input_types: &[Self],
         body_input_count: usize,
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
     ) -> Result<Vec<Self>, TypeError> {
         check_count!("input", input_types, body_input_count, TypeError);
         if carry_count > body_input_count {
@@ -407,7 +434,7 @@ impl ScanTypeSemantics for ArrayType {
                 )));
             }
             let (slice_type, leading_dimension) = input_type.without_dimension(0)?;
-            if leading_dimension != Dimension::Static(length) {
+            if !length.is_refined_by(&leading_dimension) {
                 return Err(TypeError::invalid(format!(
                     "scan stacked input {} must have leading dimension {length} but has type {input_type}",
                     carry_count + index,
@@ -422,15 +449,19 @@ impl ScanTypeSemantics for ArrayType {
         body_input_types: &[Self],
         body_output_types: &[Self],
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
         input_types: &[Self],
     ) -> Result<Vec<Self>, TypeError> {
         scan_output_types(body_input_types, body_output_types, carry_count, length, input_types)
     }
 
-    fn validate_scan_capture<C: Value<Type = Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError> {
+    fn validate_scan_capture<C: Value<Type = Self>>(
+        capture: &C,
+        index: usize,
+        length: &Dimension,
+    ) -> Result<(), TypeError> {
         let capture_type = capture.r#type();
-        if capture_type.rank() == 0 || capture_type.dimension(0) != Dimension::Static(length) {
+        if capture_type.rank() == 0 || !length.is_refined_by(&capture_type.dimension(0)) {
             return Err(TypeError::invalid(format!(
                 "scan capture {index} must have leading dimension {length} but has type {capture_type}",
                 capture_type = capture_type.as_ref(),
@@ -445,8 +476,14 @@ impl ScanTypeSemantics for DataType {
         body_input_types: &[Self],
         body_output_types: &[Self],
         carry_count: usize,
-        _length: usize,
+        length: &Dimension,
     ) -> Result<(), TypeError> {
+        if length.variable().is_some() {
+            return Err(TypeError::invalid(format!(
+                "scalar scan requires a static length but got {length}; use a composite scan with a trailing \
+                 first-class dimension operand for a dynamic trip count",
+            )));
+        }
         scalar_scan_output_types(body_input_types, body_output_types, carry_count, body_input_types)?;
         Ok(())
     }
@@ -455,7 +492,7 @@ impl ScanTypeSemantics for DataType {
         input_types: &[Self],
         body_input_count: usize,
         carry_count: usize,
-        _length: usize,
+        _length: &Dimension,
     ) -> Result<Vec<Self>, TypeError> {
         if carry_count != body_input_count {
             return Err(TypeError::invalid(format!(
@@ -471,7 +508,7 @@ impl ScanTypeSemantics for DataType {
         body_input_types: &[Self],
         body_output_types: &[Self],
         carry_count: usize,
-        _length: usize,
+        _length: &Dimension,
         input_types: &[Self],
     ) -> Result<Vec<Self>, TypeError> {
         scalar_scan_output_types(body_input_types, body_output_types, carry_count, input_types)
@@ -480,19 +517,19 @@ impl ScanTypeSemantics for DataType {
     fn validate_scan_capture<C: Value<Type = Self>>(
         _capture: &C,
         _index: usize,
-        _length: usize,
+        _length: &Dimension,
     ) -> Result<(), TypeError> {
         Err(TypeError::invalid("scalar scan captures require a scalar stack representation".to_string()))
     }
 }
 
 /// Builds one composite scan boundary from per-iteration body types, preserving carry entries and stacking every
-/// trailing array entry along the scan's static leading axis.
+/// trailing array entry along the scan's shape-determined leading axis.
 fn composite_scan_boundary_types(
     role: &str,
     body_types: &[ArrayProgramType],
     carry_count: usize,
-    length: usize,
+    length: &Dimension,
 ) -> Result<Vec<ArrayProgramType>, TypeError> {
     if carry_count > body_types.len() {
         return Err(TypeError::invalid(format!(
@@ -518,11 +555,15 @@ fn composite_scan_boundary_types(
 }
 
 impl ScanTypeSemantics for ArrayProgramType {
+    fn rename_scan_length(length: &Dimension, renaming: &TypeIdentityRenaming<Self::Identity>) -> Dimension {
+        length.rename_type_identities(renaming)
+    }
+
     fn validate_scan_body(
         body_input_types: &[Self],
         body_output_types: &[Self],
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
     ) -> Result<(), TypeError> {
         composite_scan_boundary_types("input", body_input_types, carry_count, length)?;
         composite_scan_boundary_types("output", body_output_types, carry_count, length)?;
@@ -537,16 +578,17 @@ impl ScanTypeSemantics for ArrayProgramType {
         input_types: &[Self],
         body_input_count: usize,
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
     ) -> Result<Vec<Self>, TypeError> {
-        check_count!("input", input_types, body_input_count, TypeError);
+        let runtime_length_count = usize::from(length.variable().is_some());
+        check_count!("input", input_types, body_input_count + runtime_length_count, TypeError);
         if carry_count > body_input_count {
             return Err(TypeError::invalid(format!(
                 "scan carry count {carry_count} exceeds the body input count {body_input_count}",
             )));
         }
         let mut body_input_types = input_types[..carry_count].to_vec();
-        for (index, r#type) in input_types[carry_count..].iter().enumerate() {
+        for (index, r#type) in input_types[carry_count..body_input_count].iter().enumerate() {
             let Self::Array(r#type) = r#type else {
                 return Err(TypeError::invalid(format!(
                     "scan stacked input {} must be an array but got {}",
@@ -561,7 +603,7 @@ impl ScanTypeSemantics for ArrayProgramType {
                 )));
             }
             let (slice_type, leading_dimension) = r#type.without_dimension(0)?;
-            if leading_dimension != Dimension::Static(length) {
+            if !length.is_refined_by(&leading_dimension) {
                 return Err(TypeError::invalid(format!(
                     "scan stacked input {} must have leading dimension {} but has type {}",
                     carry_count + index,
@@ -571,6 +613,15 @@ impl ScanTypeSemantics for ArrayProgramType {
             }
             body_input_types.push(Self::Array(slice_type));
         }
+        if let Some(variable) = length.variable() {
+            let runtime_length_type = <&DimensionType>::try_from(input_types.last().unwrap())?;
+            if runtime_length_type.variable() != variable {
+                return Err(TypeError::invalid(format!(
+                    "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but scan length \
+                     requires {variable}",
+                )));
+            }
+        }
         Ok(body_input_types)
     }
 
@@ -578,7 +629,7 @@ impl ScanTypeSemantics for ArrayProgramType {
         body_input_types: &[Self],
         body_output_types: &[Self],
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
         input_types: &[Self],
     ) -> Result<Vec<Self>, TypeError> {
         let expected_input_types = composite_scan_boundary_types("input", body_input_types, carry_count, length)?;
@@ -587,25 +638,41 @@ impl ScanTypeSemantics for ArrayProgramType {
             &body_input_types[..carry_count],
             &body_output_types[..carry_count],
         ]);
-        check_count!("input", input_types, expected_input_types.len(), TypeError);
-        for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
+        let runtime_length_count = usize::from(length.variable().is_some());
+        check_count!("input", input_types, expected_input_types.len() + runtime_length_count, TypeError);
+        for (index, (expected, actual)) in
+            expected_input_types.iter().zip(&input_types[..expected_input_types.len()]).enumerate()
+        {
             if !expected.is_refined_by(actual) {
                 return Err(TypeError::invalid(format!(
                     "scan input {index} has type {actual} which is incompatible with the expected type {expected}",
                 )));
             }
         }
+        if let Some(variable) = length.variable() {
+            let runtime_length_type = <&DimensionType>::try_from(input_types.last().unwrap())?;
+            if runtime_length_type.variable() != variable {
+                return Err(TypeError::invalid(format!(
+                    "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but scan length \
+                     requires {variable}",
+                )));
+            }
+        }
         Ok(output_types)
     }
 
-    fn validate_scan_capture<C: Value<Type = Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError> {
+    fn validate_scan_capture<C: Value<Type = Self>>(
+        capture: &C,
+        index: usize,
+        length: &Dimension,
+    ) -> Result<(), TypeError> {
         let capture_type = capture.r#type();
         let Self::Array(capture_type) = capture_type.as_ref() else {
             return Err(TypeError::invalid(format!(
                 "scan capture {index} must be a stacked array but got {capture_type}",
             )));
         };
-        if capture_type.rank() == 0 || capture_type.dimension(0) != Dimension::Static(length) {
+        if capture_type.rank() == 0 || !length.is_refined_by(&capture_type.dimension(0)) {
             return Err(TypeError::invalid(format!(
                 "scan capture {index} must have leading dimension {length} but has type {capture_type}",
             )));
@@ -621,7 +688,7 @@ impl ScanTypeSemantics for ArrayProgramType {
 fn validated_scan_interface<'i, T: ScanTypeSemantics>(
     region_interfaces: &'i [RegionInterface<T>],
     carry_count: usize,
-    length: usize,
+    length: &Dimension,
 ) -> Result<&'i RegionInterface<T>, TypeError> {
     if region_interfaces.len() != 1 {
         return Err(TypeError::invalid(format!("scan expects 1 attached region but got {}", region_interfaces.len())));
@@ -661,7 +728,7 @@ where
             input_types,
             region_interfaces[0].input_types().len(),
             self.carry_count,
-            self.length,
+            &self.length,
         )?;
         let mut declared_identities = Vec::new();
         for r#type in region_interfaces[0].input_types() {
@@ -683,16 +750,16 @@ where
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        let body_interface = validated_scan_interface(region_interfaces, self.carry_count, self.length)?;
+        let body_interface = validated_scan_interface(region_interfaces, self.carry_count, &self.length)?;
         let output_types = T::infer_scan_output_types(
             body_interface.input_types(),
             body_interface.output_types(),
             self.carry_count,
-            self.length,
+            &self.length,
             input_types,
         )?;
         for (index, capture) in self.captures.iter().enumerate() {
-            T::validate_scan_capture(capture, index, self.length)?;
+            T::validate_scan_capture(capture, index, &self.length)?;
         }
         Ok(output_types)
     }
@@ -709,7 +776,7 @@ where
                 .map(|capture| capture.rename_type_identities(renaming))
                 .collect::<Result<Vec<_>, _>>()?,
             carry_count: self.carry_count,
-            length: self.length,
+            length: T::rename_scan_length(&self.length, renaming),
             reverse: self.reverse,
             unroll: self.unroll,
         })
@@ -718,7 +785,7 @@ where
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, SCAN_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("carry_count", self.carry_count)?;
-            operation.field("length", self.length)?;
+            operation.field("length", &self.length)?;
             operation.field("reverse", self.reverse)?;
             if self.unroll > 1 {
                 operation.field("unroll", self.unroll)?;
@@ -742,7 +809,7 @@ where
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        <C::Type>::interpret_scan(self.carry_count, self.length, self.reverse, context, driver, inputs)
+        <C::Type>::interpret_scan(self.carry_count, &self.length, self.reverse, context, driver, inputs)
     }
 }
 
@@ -755,7 +822,7 @@ pub(crate) trait ScanInterpretation<C: Domain<Type = Self>>: ScanTypeSemantics {
     /// [`InterpretableOperation::interpret`] for the contract.
     fn interpret_scan<D: InterpretationDriver<C>>(
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
         reverse: bool,
         context: &C,
         driver: &D,
@@ -770,12 +837,18 @@ where
 {
     fn interpret_scan<D: InterpretationDriver<C>>(
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
         reverse: bool,
         context: &C,
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        let length = length.value().ok_or_else(|| ProgramError::UnsupportedOperation {
+            message: format!(
+                "cannot eagerly interpret homogeneous array scan with dynamic length {length} without an explicit \
+                 first-class dimension operand",
+            ),
+        })?;
         let body_interface = driver.region(0)?.interface();
         let y_slice_types = body_interface.output_types()[carry_count..].to_vec();
         interpret_scan_iterations(
@@ -793,12 +866,15 @@ where
 impl<C: Domain<Type = DataType>> ScanInterpretation<C> for DataType {
     fn interpret_scan<D: InterpretationDriver<C>>(
         carry_count: usize,
-        length: usize,
+        length: &Dimension,
         _reverse: bool,
         context: &C,
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        let length = length.value().ok_or_else(|| ProgramError::UnsupportedOperation {
+            message: format!("cannot eagerly interpret scalar scan with dynamic length {length}"),
+        })?;
         let mut state = inputs.to_vec();
         for _ in 0..length {
             state = driver.interpret_region(context, 0, state)?;
@@ -905,7 +981,7 @@ where
 
 /// Writes `value` as slice `iteration` of `accumulator` along its leading axis, prepending a unit axis to `value`
 /// first.
-pub(super) fn write_scan_iteration<V>(accumulator: V, iteration: usize, value: V) -> Result<V, ProgramError>
+pub(crate) fn write_scan_iteration<V>(accumulator: V, iteration: usize, value: V) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayType> + UpdateSlice + Reshape,
 {
@@ -991,7 +1067,7 @@ where
         // A zero-length scan runs no iteration, so probing the body for carry invariance below could execute (or
         // stage) body work — and surface its errors — for iterations that never run; the scan residualizes
         // unchanged instead.
-        if self.length == 0 {
+        if self.length.value() == Some(0) {
             return context.fold_or_residualize(O::from(self.clone()), vec![body.to_program()], inputs);
         }
 
@@ -1128,7 +1204,7 @@ where
             vec![Placeholder; body_output_count],
         )?;
 
-        let scan = ScanOperation::<V>::new(carry_count, self.length)
+        let scan = ScanOperation::<V>::new(carry_count, self.length.clone())
             .with_reverse(self.reverse)
             .with_unroll(self.unroll)?;
 
@@ -1333,7 +1409,7 @@ where
         vec![Placeholder; known_body_inputs.len()],
         vec![Placeholder; known_program_output_indices.len()],
     )?;
-    let known_scan = ScanOperation::<V>::new(known_carry_count, scan.length)
+    let known_scan = ScanOperation::<V>::new(known_carry_count, scan.length.clone())
         .with_reverse(scan.reverse)
         .with_unroll(scan.unroll)?;
     let known_outputs =
@@ -1412,7 +1488,7 @@ where
             vec![Placeholder; unknown_output_count],
         )?;
         let unknown_carry_count = carry_known.iter().filter(|&&known| !known).count();
-        let unknown_scan = ScanOperation::<V>::new(unknown_carry_count, scan.length)
+        let unknown_scan = ScanOperation::<V>::new(unknown_carry_count, scan.length.clone())
             .with_reverse(scan.reverse)
             .with_unroll(scan.unroll)?;
 
@@ -1495,7 +1571,7 @@ where
 /// references that a structurally batched body cannot re-slice — the scan loop is instead replayed per iteration
 /// through `batch_scan_with_interpreter`, with each body instruction re-entering this operation family's batching
 /// rules against the same active context. This is the operational path eager batched scans execute either way, and
-/// its physical stacked accumulators retain per-item placement metadata exactly. Constants lift and stacked-output
+/// its packed stacked accumulators retain per-item placement metadata exactly. Constants lift and stacked-output
 /// accumulators seed (via the parent's [`Zero`]) through `context.parent()`.
 impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ScanOperation<C::Constant>
 where
@@ -1543,12 +1619,9 @@ where
             for _ in 0..=carry_count {
                 let mut iteration_axes = carry_axes.clone();
                 iteration_axes.extend(slice_axes.iter().copied());
-                let (_, output_axes) = driver.batch_program(
-                    context,
-                    body,
-                    iteration_axes.as_slice(),
-                    ProgramBatchingOutputAxesPolicy::Natural,
-                )?;
+                let (_, output_axes) = driver
+                    .batch_program(context, body, iteration_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
+                    .into_parts();
                 check_count!("output", output_axes, body_output_count, ProgramError);
                 let mut widened = false;
                 for (carry_axis, output_axis) in carry_axes.iter_mut().zip(output_axes.iter()) {
@@ -1576,12 +1649,14 @@ where
             iteration_axes.extend(slice_axes.iter().copied());
             let mut target_axes = carry_axes.clone();
             target_axes.extend(y_axes.iter().copied());
-            let (batched_body, _) = driver.batch_program(
-                context,
-                body,
-                iteration_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(target_axes),
-            )?;
+            let (batched_body, _) = driver
+                .batch_program(
+                    context,
+                    body,
+                    iteration_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::AlignEachTo(target_axes),
+                )?
+                .into_parts();
 
             // Widen the parent carry inits whose elements became batched (their batch axis is materialized through
             // a staged broadcast) and stage one batched scan over the batched body.
@@ -1609,29 +1684,31 @@ where
                 .into_iter()
                 .zip(output_axes)
                 .map(|(output, axis)| {
-                    let physical_type = output.r#type().into_owned();
-                    ArrayBatch::new(physical_type, output, axis)
+                    let batched_type = output.r#type().into_owned();
+                    ArrayBatch::new(batched_type, output, axis)
                 })
                 .collect();
         }
 
-        if self.length() == 0 {
+        if self.length().value() == Some(0) {
             check_count!("input", inputs, body.input_types().len(), ProgramError);
 
             // No iteration executes, but batching the body structurally still determines which per-iteration outputs
-            // are mapped and where their physical batch dimensions live. Stacked inputs lose their logical leading
+            // are mapped and where their packed batch dimensions live. Stacked inputs lose their per-item leading
             // scan dimension before entering the body, so their batch axes must be adjusted in the same way as an
             // actual iteration slice.
             let mut iteration_input_axes =
                 inputs[..self.carry_count()].iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
             iteration_input_axes
                 .extend(inputs[self.carry_count()..].iter().map(|input| scan_iteration_batch_axis(input.batch_axis())));
-            let (batched_body, output_axes) = driver.batch_program(
-                context,
-                body,
-                iteration_input_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::Natural,
-            )?;
+            let (batched_body, output_axes) = driver
+                .batch_program(
+                    context,
+                    body,
+                    iteration_input_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )?
+                .into_parts();
             let output_types = batched_body.output_types();
             check_count!("output", output_axes, output_types.len(), ProgramError);
             if output_types.len() < self.carry_count() {
@@ -1644,7 +1721,7 @@ where
             }
 
             // A zero-length scan returns its initial carries unchanged. Its stacked outputs are empty arrays whose
-            // physical element types and batch axes come from the structurally batched body. Inserting the leading
+            // packed element types and batch axes come from the structurally batched body. Inserting the leading
             // scan dimension shifts every mapped output axis right by one while preserving its placement metadata.
             let mut outputs = inputs[..self.carry_count()].to_vec();
             for (output_type, output_axis) in
@@ -1662,9 +1739,15 @@ where
         }
 
         let y_slice_types = body.output_types().split_off(self.carry_count());
+        let length = self.length().value().ok_or_else(|| BatchingError::UnsupportedOperation {
+            message: format!(
+                "eager homogeneous scan batching requires a concrete trip count but got {}",
+                self.length(),
+            ),
+        })?;
         batch_scan_with_interpreter(
             self.carry_count(),
-            self.length(),
+            length,
             self.reverse(),
             y_slice_types.as_slice(),
             inputs,
@@ -1677,9 +1760,9 @@ where
 /// Drives one batched scan loop over `[carry..., stacked_xs...]` input batches, delegating each iteration's body
 /// evaluation to `interpret_iteration` and allocating stacked output accumulators through `allocate_zero`.
 ///
-/// Per-iteration slices of the stacked inputs are read along their *logical* leading axis (see
+/// Per-iteration slices of the stacked inputs are read along their *per-item* leading axis (see
 /// [`read_scan_iteration_batch`]) so the batch axis threads through untouched, and the per-iteration outputs are
-/// stacked along a fresh leading physical axis, shifting each output's batch axis right by one. The visit order
+/// stacked along a fresh leading axis, shifting each output's batch axis right by one. The visit order
 /// reverses when `reverse` is `true` while output slice `i` stays aligned with input slice `i`, exactly like the
 /// unbatched scan loop.
 pub(crate) fn batch_scan_with_interpreter<V, AllocateZeroFn, InterpretIterationFn>(
@@ -1729,7 +1812,7 @@ where
                     accumulator
                 }
                 None => accumulator.insert(ScanOutputAccumulator {
-                    // Unlike the scan operation's unbatched signature helper, this physical accumulator must retain
+                    // Unlike the scan operation's unbatched signature helper, this packed accumulator must retain
                     // the iteration value's mapped-dimension placement. The newly inserted scan dimension itself is
                     // replicated.
                     accumulator: allocate_zero(&iteration_type.with_inserted_dimension(0, Dimension::Static(length))?)?,
@@ -1770,17 +1853,17 @@ where
 /// Per-output stacking state used by [`batch_scan_with_interpreter`]: the accumulator batch holding the iterations
 /// written so far, together with the batch axis every iteration must agree on.
 struct ScanOutputAccumulator<V: Typed<Type = ArrayType>> {
-    /// Stacked accumulator; its leading physical axis is the scan length axis.
+    /// Stacked accumulator; its leading packed axis is the scan length axis.
     accumulator: V,
 
     /// Batch axis of the per-item values written into the accumulator, if the output is batch-varying.
     batch_axis: Option<usize>,
 }
 
-/// Extracts slice `iteration` of a stacked batch along its *logical* leading axis and drops that axis.
+/// Extracts slice `iteration` of a stacked batch along its *per-item* leading axis and drops that axis.
 ///
-/// The logical leading axis is the scan length axis: physical axis `1` when the batch axis sits at physical axis
-/// `0`, and physical axis `0` otherwise. The iteration batch keeps the input's batch axis, decremented when it sat
+/// The per-item leading axis is the scan length axis: packed axis `1` when the batch axis sits at packed axis
+/// `0`, and packed axis `0` otherwise. The iteration batch keeps the input's batch axis, decremented when it sat
 /// after the dropped axis.
 fn read_scan_iteration_batch<V>(stack: &ArrayBatch<V>, iteration: usize) -> Result<ArrayBatch<V>, BatchingError>
 where
@@ -1825,9 +1908,9 @@ where
     ArrayBatch::new(iteration_type, iteration_value, scan_iteration_batch_axis(stack.batch_axis()))
 }
 
-/// Maps a stacked scan input's physical batch axis to the corresponding per-iteration batch axis after removing the
-/// logical leading scan dimension.
-fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
+/// Maps a stacked scan input's packed batch axis to the corresponding per-iteration batch axis after removing the
+/// per-item leading scan dimension.
+pub(crate) fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
     match batch_axis.axis() {
         Some(axis) if axis.value() == 0 => BatchAxis::new(0),
         Some(axis) => BatchAxis::new(axis.value() - 1),
@@ -2555,7 +2638,7 @@ mod tests {
             vec![OutputRegionProvenance { region_index: 0, output_index: 1 }],
         );
         assert_eq!(operation.carry_count(), 1);
-        assert_eq!(operation.length(), 3);
+        assert_eq!(operation.length(), &Dimension::Static(3));
         assert!(!operation.reverse());
         assert_eq!(operation.unroll(), 1);
         assert!(operation.clone().with_reverse(true).reverse());
@@ -3361,7 +3444,7 @@ mod tests {
         // The carry set is preserved (so output arity matches), but the body shrank: `k * k` folded to a constant, so
         // the body drops from three instructions to two.
         assert_eq!(residual_scan.carry_count(), 2);
-        assert_eq!(residual_scan.length(), 3);
+        assert_eq!(residual_scan.length(), &Dimension::Static(3));
         let residual_body = evaluation.program.region_ref(residual_instruction.regions()[0]).unwrap().to_program();
         assert!(residual_body.instructions().len() < body().instructions().len());
         assert_eq!(residual_body.instructions().len(), 2);
@@ -3665,8 +3748,8 @@ mod tests {
 
     #[test]
     fn test_scan_batching_lifts_batched_stacked_inputs() {
-        // Batching a scan whose stacked input is mapped at axis 0 reads each iteration's slice along the logical
-        // leading axis (physical axis 1 when the batch axis sits at 0), so every batch item scans its own row.
+        // Batching a scan whose stacked input is mapped at axis 0 reads each iteration's slice along the per-item
+        // leading axis (packed axis 1 when the batch axis sits at 0), so every batch item scans its own row.
         let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 2);
         let carries = ArrayBatch::replicated(Array::scalar(1.0));
@@ -3682,7 +3765,7 @@ mod tests {
         assert_eq!(outputs[1].r#type().shape().dimensions(), &[Dimension::Static(3), Dimension::Static(2)]);
         assert_eq!(outputs[1].value().to_f64s(), vec![2.0, 5.0, 6.0, 30.0, 24.0, 210.0]);
 
-        // A trailing batch axis (physical `[3, 2]` with the batch axis at 1) reads the same logical iterations, so the
+        // A trailing batch axis (packed `[3, 2]` with the batch axis at 1) reads the same iterations, so the
         // outputs are identical.
         let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 2);
@@ -3723,7 +3806,7 @@ mod tests {
 
     #[test]
     fn test_scan_batching_respects_reverse_visit_order() {
-        // A reversed batched scan visits the logical iterations from the back while keeping output iteration `i`
+        // A reversed batched scan visits the iterations from the back while keeping output iteration `i`
         // aligned with input iteration `i`: the reversed cumulative product over `[2, 3, 4]` is `[24, 12, 4]` per
         // batch item.
         let (scan, scan_body) = product_scan();

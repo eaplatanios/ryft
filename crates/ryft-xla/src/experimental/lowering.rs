@@ -5183,7 +5183,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
         .collect())
 }
 
-/// Lowers one statically counted scan loop to a `stablehlo.while` over the state
+/// Lowers one shape-counted scan loop to a `stablehlo.while` over the state
 /// `[counter, carries..., stacks..., ys...]`.
 ///
 /// The `i64` counter starts at zero and the loop runs while `counter < length`. Each loop trip runs `unroll`
@@ -5201,7 +5201,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
 fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     body_program: &FlatXlaProgram,
     carry_count: usize,
-    length: usize,
+    length: &Dimension,
     reverse: bool,
     unroll: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -5220,12 +5220,26 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     let threads_token = !body_program.effects().is_pure();
     let body_input_types = body_program.input_types();
     let body_output_types = body_program.output_types();
-    if input_values.len() != body_input_types.len() {
+    let runtime_length_count = usize::from(length.variable().is_some());
+    if input_values.len() != body_input_types.len() + runtime_length_count {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("scan expected {} lowered inputs but got {}", body_input_types.len(), input_values.len()),
+            op: format!(
+                "scan expected {} lowered inputs but got {}",
+                body_input_types.len() + runtime_length_count,
+                input_values.len(),
+            ),
         });
     }
-    if unroll == 0 || length % unroll != 0 {
+    let (input_values, runtime_length) = if runtime_length_count == 1 {
+        (&input_values[..body_input_types.len()], Some(input_values[body_input_types.len()]))
+    } else {
+        (input_values, None)
+    };
+    let static_length = length.value();
+    if unroll == 0
+        || static_length.is_some_and(|length| length % unroll != 0)
+        || (static_length.is_none() && unroll != 1)
+    {
         return Err(LoweringError::UnsupportedOp {
             op: format!("scan unroll factor {unroll} must be at least 1 and evenly divide the scan length {length}"),
         });
@@ -5242,25 +5256,55 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
         .collect::<Result<Vec<_>, _>>()
         .map_err(ProgramError::from)?;
     let stacked = |slice_type: &ArrayType| -> Result<ArrayType, LoweringError> {
-        let mut dimensions = vec![length];
-        dimensions.extend(static_dimensions(slice_type)?);
-        Ok(ArrayType::new(
-            slice_type.data_type(),
-            ryft_core::types::Shape::new(dimensions.into_iter().map(Dimension::Static).collect()),
-        ))
+        let mut dimensions = vec![length.clone()];
+        dimensions.extend(slice_type.shape().dimensions().iter().cloned());
+        Ok(ArrayType::new(slice_type.data_type(), ryft_core::types::Shape::new(dimensions)))
+    };
+
+    let initialize_accumulator = |slice_type: &ArrayType,
+                                  block: &mut BlockRef<'b, 'c, 't>|
+     -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+        let stacked_type = stacked(slice_type)?;
+        let physical_length = match length {
+            Dimension::Static(length) => *length,
+            Dimension::Dynamic(_) => {
+                stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| LoweringError::UnsupportedOp {
+                    op: format!("scan length {length} needs a finite upper bound for physical accumulator allocation"),
+                })?
+            }
+        };
+        let mut physical_dimensions = stacked_type.shape().dimensions().to_vec();
+        physical_dimensions[0] = Dimension::Static(physical_length);
+        let physical_type = stacked_type.clone().with_shape(Shape::new(physical_dimensions));
+        let accumulator =
+            lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
+        let Some(runtime_length) = runtime_length else {
+            return Ok(accumulator);
+        };
+        let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
+        let converted = block.append_operation(stable_hlo::convert(runtime_length, i32_scalar_type, location)?)?;
+        let converted = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
+        let tensor_type = lower_tensor_type(&stacked_type, context, location)?;
+        let refined = block.append_operation(stable_hlo::set_dimension_size(
+            accumulator,
+            converted,
+            tensor_type,
+            0,
+            location,
+        )?)?;
+        Ok(refined.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref())
     };
 
     // A fully unrolled scan (`unroll == length`) needs no loop at all: the body copies inline as straight-line
     // operations at static iteration indices, reading and writing the same stacked inputs and zero accumulators the
     // loop form would thread through its state.
-    if unroll == length && length > 0 {
+    if static_length.is_some_and(|length| unroll == length && length > 0) {
+        let length = static_length.unwrap();
         let mut carries = input_values[..carry_count].to_vec();
         let x_stacks = input_values[carry_count..].to_vec();
         let mut y_accumulators = Vec::with_capacity(y_slice_types.len());
         for y_slice_type in &y_slice_types {
-            let stacked_type = stacked(y_slice_type)?;
-            let accumulators = lower_constant_output(std::slice::from_ref(&stacked_type), 0, block, context, location)?;
-            y_accumulators.push(accumulators[0]);
+            y_accumulators.push(initialize_accumulator(y_slice_type, block)?);
         }
         let zero_index = lower_static_index_constants(&[0], block, context, location)?[0];
         let mut iterations: Vec<usize> = (0..length).collect();
@@ -5304,8 +5348,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     state_values.extend_from_slice(input_values);
     for y_slice_type in &y_slice_types {
         let stacked_type = stacked(y_slice_type)?;
-        let accumulators = lower_constant_output(std::slice::from_ref(&stacked_type), 0, block, context, location)?;
-        state_values.push(accumulators[0]);
+        state_values.push(initialize_accumulator(y_slice_type, block)?);
         state_types.push(stacked_type.into());
     }
     // The effect token rides at the very end of the loop state, so all counter/carry/stack/accumulator index math
@@ -5328,11 +5371,14 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     {
         let mut condition_block_ref = condition_block.as_ref();
         let counter = condition_block_ref.argument(0).expect("scan while state should include the counter").as_ref();
-        let length_constant = lower_static_index_constants(&[length], &mut condition_block_ref, context, location)?[0];
+        let length_value = match static_length {
+            Some(length) => lower_static_index_constants(&[length], &mut condition_block_ref, context, location)?[0],
+            None => runtime_length.unwrap(),
+        };
         let predicate = lower_compare_to_mlir(
             ComparisonDirection::LessThan,
             counter,
-            length_constant,
+            length_value,
             &mut condition_block_ref,
             location,
         )?;
@@ -5352,7 +5398,13 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
         // When the visit order is reversed, logical iteration `i` reads iteration `length - 1 - i` (a zero-length
         // reversed scan never runs its body, so the saturated limit constant is inert).
         let reverse_limit = if reverse {
-            Some(lower_static_index_constants(&[length.saturating_sub(1)], &mut body_block_ref, context, location)?[0])
+            let length_value = match static_length {
+                Some(length) => lower_static_index_constants(&[length], &mut body_block_ref, context, location)?[0],
+                None => runtime_length.unwrap(),
+            };
+            let one = lower_static_index_constants(&[1], &mut body_block_ref, context, location)?[0];
+            let limit = body_block_ref.append_operation(stable_hlo::subtract(length_value, one, location)?)?;
+            Some(limit.result(0).expect("stablehlo.subtract should return one result").as_ref())
         } else {
             None
         };
@@ -7874,6 +7926,7 @@ mod tests {
     use ryft_core::operations::math::{
         Atan2Operation, Cos, DivOperation, Dot, DotDimensionNumbers, ReduceOperation, Sin,
     };
+    use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::builders::ProgramBuilder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -10231,6 +10284,123 @@ mod tests {
         assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
         assert!(stablehlo.contains("tensor<?xf32, #stablehlo.bounds<8>>"), "{stablehlo}");
         assert!(!stablehlo.contains("dimension_from_scalar"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_dynamic_scan_length_as_scalar_ssa() {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
+        let length_type = DimensionType::new(length.clone());
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
+
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let carry = builder.add_input(scalar_type.clone());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![carry, carry],
+                    vec![Placeholder],
+                    vec![Placeholder, Placeholder],
+                )
+                .unwrap()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let body_region = builder.import_region(body.entry_region_ref());
+        let carry = builder.add_input(scalar_type.clone());
+        let runtime_length = builder.0.add_input(length_type.clone().into());
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
+                vec![body_region],
+                vec![carry, runtime_length],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                outputs,
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            &[],
+            &(scalar_type.clone(), ArrayType::scalar(DataType::I64)),
+            &(scalar_type, stacked_type),
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.set_dimension_size"), "{stablehlo}");
+        assert!(stablehlo.contains("tensor<?xf32, #stablehlo.bounds<8>>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_mapped_rng_as_dynamic_scan() {
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let batch_type = DimensionType::new(batch.clone());
+        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
+        let stacked_state_type =
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]));
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(2)]));
+        let stacked_bits_type =
+            ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]));
+
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let state = builder.add_input(state_type);
+            let outputs = builder
+                .add_instruction(
+                    XlaOperation::RngBitGenerator(RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type)),
+                    Vec::new(),
+                    vec![state],
+                )
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder, Placeholder])
+                .unwrap()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let body_region = builder.import_region(body.entry_region_ref());
+        let states = builder.add_input(stacked_state_type.clone());
+        let runtime_batch = builder.0.add_input(batch_type.into());
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::Scan(ScanOperation::new(0, Dimension::Dynamic(batch))),
+                vec![body_region],
+                vec![states, runtime_batch],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                outputs,
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            &[],
+            &(stacked_state_type.clone(), ArrayType::scalar(DataType::I64)),
+            &(stacked_state_type, stacked_bits_type),
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.rng_bit_generator"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.set_dimension_size").count(), 2, "{stablehlo}");
     }
 
     #[test]

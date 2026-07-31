@@ -210,10 +210,10 @@ impl_axis_conversions!(usize);
 
 /// A named axis resolved by a [`NamedAxes`] context specifying what an axis name is currently bound to, and by which
 /// kind of transform, at a given trace level. This carries only the *value-free* facts about a binding (i.e., its kind
-/// and any statically known size), not which physical dimension of any particular value carries the axis. That
-/// per-value mapping is partial (a replicated operand has no such dimension even though a collective over it is still
-/// meaningful) and is supplied at consumption time by the owning transform's rule dispatch (e.g., for batching, an
-/// [`ArrayBatch`](crate::ArrayBatch)'s [`batch_axis`](crate::ArrayBatch::batch_axis)).
+/// and any statically known size), not which dimension of any particular value carries the axis. That per-value mapping
+/// is partial (a replicated operand has no such dimension even though a collective over it is still meaningful) and is
+/// supplied at consumption time by the owning transform's rule dispatch (e.g., for batching, an [`ArrayBatch`]'s
+/// [`batch_axis`](ArrayBatch::batch_axis)).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NamedAxis {
     /// Axis bound by an enclosing batching (i.e., vectorization) level.
@@ -239,8 +239,8 @@ pub enum NamedAxis {
 /// innermost-first, and so a nearer binder shadows a farther one. This capability answers only whether a name is
 /// currently bound and, if so, what kind of axis it is and any statically known size: the "is this name in scope"
 /// lookup used for bind-time validation and scalar queries. It is deliberately *not* the evaluator. Specifying how a
-/// use site consumes the axis (and against which physical dimension of a given operand) is the owning transform's
-/// per-operation rule's responsibility, which already receives that per-value position at dispatch time.
+/// use site consumes the axis (and against which dimension of a given operand) is the owning transform's per-operation
+/// rule's responsibility, which already receives that per-value position at dispatch time.
 pub trait NamedAxes: Context {
     /// Resolves `name` against this context, returning the [`NamedAxis`] it is bound to,
     /// or `None` when no enclosing binder binds it.
@@ -517,7 +517,7 @@ impl<
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         if context.axis_name() == Some(self.axis_name.as_str()) {
             // This level binds the axis. The per-item index is the length-`size` `iota(0)`, bound into the parent and
-            // mapped on this level's batch axis (position 0). The mapped physical `[size]` dimension is then stripped
+            // mapped on this level's batch axis (position 0). The mapped packed `[size]` dimension is then stripped
             // back to the per-item scalar `u64`.
             let size = P::axis_size(context)?;
             let r#type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(size)]));
