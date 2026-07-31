@@ -1131,7 +1131,10 @@ mod tests {
     use crate::backends::array_programs::ArrayProgramValue;
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
-    use crate::batching::{Batch, BatchingTracer, InterpretableBatchableOperation, batch};
+    use crate::batching::{
+        Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, InterpretableBatchableOperation,
+        RecursiveBatchingPolicy, batch,
+    };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::collectives::{
         AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions, PSumScatterOperation,

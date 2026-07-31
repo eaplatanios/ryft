@@ -1621,6 +1621,9 @@ complete nested/dynamic/JAX-parity matrix before the final Phase 5 gate.
       wrapper types merely to satisfy the old module-move wording. If a neutral public alias/API is still needed, add
       only the smallest capability-based surface after the operation and transform families settle.
 - [ ] Audit names after responsibilities settle; rename only where the final name is materially clearer.
+- [ ] Known residual from the P4b audit: `ryft-xla/src/profile_guided.rs` names `ArrayProgramValue<Array>` in the
+      `where` clauses of two public functions (`interpret` and `profile_baseline`). Bounds only — no public value
+      positions — but it is public-signature/rustdoc surface; tighten or accept explicitly during this cleanup.
 - [ ] Update every in-repo use site directly without compatibility re-exports.
 - [ ] Update rustdoc, examples, error links, and behavioral JAX fixtures.
 - [ ] Run targeted searches for every old canonical path and classify all remaining matches.

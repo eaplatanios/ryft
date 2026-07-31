@@ -868,8 +868,6 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchingE
     }
 }
 
-// TODO(eaplatanios): Move `ArrayProgramBatchingPolicy` here.
-
 impl ArrayType {
     /// Normalizes and validates the provided [`BatchAxis`] against this physical [`ArrayType`],
     /// returning its canonical [`BatchAxis`] and physical position.
