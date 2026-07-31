@@ -331,21 +331,18 @@ impl From<usize> for BatchAxisSpecification {
 /// beyond the source region's own boundary select their own result type through [`BatchingPolicy::BatchedProgram`]
 /// instead, so consumers statically acknowledge that protocol through the result type's own API rather than through
 /// a shared accessor that could silently drop it.
-pub struct BatchedProgram<C: Domain> {
+pub struct BatchedProgram<V: Typed + Parameter, O> {
     /// Structurally transformed [`Program`].
-    program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+    program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Mapped axes of the source [`Region`](crate::Region)'s outputs.
     output_axes: Vec<BatchAxis>,
 }
 
-impl<C: Domain> BatchedProgram<C> {
+impl<V: Value, O: Operation<V::Type>> BatchedProgram<V, O> {
     /// Creates a new [`BatchedProgram`] that carries exactly the source [`Region`](crate::Region)'s inputs and outputs.
     #[inline]
-    pub fn new(
-        program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        output_axes: Vec<BatchAxis>,
-    ) -> Result<Self, ProgramError> {
+    pub fn new(program: Program<V, O, Vec<V>, Vec<V>>, output_axes: Vec<BatchAxis>) -> Result<Self, ProgramError> {
         check_count!("output", output_axes, program.output_count(), ProgramError);
         Ok(Self { program, output_axes })
     }
@@ -357,9 +354,7 @@ impl<C: Domain> BatchedProgram<C> {
     }
 
     /// Consumes this [`BatchedProgram`] and returns its transformed underlying program and output axes.
-    pub fn into_parts(
-        self,
-    ) -> (Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>) {
+    pub fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>) {
         (self.program, self.output_axes)
     }
 }
@@ -800,17 +795,18 @@ pub enum DimensionSource<V> {
 /// An [`ArrayBatchingPolicy`] is a type-level selector packaging those two differences, so each policy owns the
 /// complete translation from a homogeneous rule's extent and broadcast requests to its universe's operations. Every
 /// policy also implements [`BatchingPolicy`] with `Batch = ArrayBatch<C::Value>` and `BatchedProgram =
-/// BatchedProgram<C>`: homogeneous rules bind structurally batched branch programs directly, so an array-authority
-/// policy is direct-boundary by definition and the supertrait binding lets every rule rely on that without restating
-/// it. The shared rules are then written once against the nominal [`ArrayBatching<P>`] family rather than as a
-/// `P: ArrayBatchingPolicy` blanket, because Rust coherence cannot use the *absence* of a trait implementation to
-/// prove such a blanket disjoint from the genuinely mixed composite-operation rules registered for other policies.
+/// BatchedProgram<C::Constant, C::Operation>`: homogeneous rules bind structurally batched branch programs directly,
+/// so an array-authority policy is direct-boundary by definition and the supertrait binding lets every rule rely on
+/// that without restating it. The shared rules are then written once against the nominal [`ArrayBatching<P>`] family
+/// rather than as a `P: ArrayBatchingPolicy` blanket, because Rust coherence cannot use the *absence* of a trait
+/// implementation to prove such a blanket disjoint from the genuinely mixed composite-operation rules registered
+/// for other policies.
 ///
 /// Keeping this capability on the batching transform, rather than on [`ProjectedContext`](crate::ProjectedContext),
 /// [`ArrayBatch`], or [`Type`], means that neither the carrier nor the type contract needs to know anything about
 /// dynamic-shape state that only batching needs.
 pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>:
-    BatchingPolicy<C, Batch = ArrayBatch<C::Value>, BatchedProgram = BatchedProgram<C>>
+    BatchingPolicy<C, Batch = ArrayBatch<C::Value>, BatchedProgram = BatchedProgram<C::Constant, C::Operation>>
 {
     /// Returns the mapped-axis [`Dimension`] to insert when building a batched [`ArrayType`].
     /// [`StaticArrayBatchingPolicy`] derives an exact [`Dimension::Static`] from the context's mapped-axis extent,
@@ -879,7 +875,7 @@ pub struct StaticArrayBatchingPolicy;
 impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPolicy {
     type Batch = ArrayBatch<C::Value>;
     type Extent = usize;
-    type BatchedProgram = BatchedProgram<C>;
+    type BatchedProgram = BatchedProgram<C::Constant, C::Operation>;
 
     #[inline]
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
@@ -1114,10 +1110,7 @@ where
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<Self::BatchedProgram, BatchingError> {
-        // TODO(eaplatanios): Should we make `region.batched` return a `BatchedProgram` directly?
-        let (program, output_axes) =
-            region.batched(*context.axis_extent(), context.axis_sharding().clone(), input_axes, output_axes_policy)?;
-        Ok(BatchedProgram::new(program, output_axes)?)
+        region.batched(*context.axis_extent(), context.axis_sharding().clone(), input_axes, output_axes_policy)
     }
 }
 
@@ -1874,7 +1867,7 @@ impl<
         axis_sharding: ShardingDimension,
         input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError> {
+    ) -> Result<BatchedProgram<V, O>, BatchingError> {
         let input_count = self.input_ids().len();
         check_count!("input", input_batch_axes, input_count, ProgramError);
 
@@ -1980,7 +1973,7 @@ impl<
         let program = builder
             .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
             .into_simplified()?;
-        Ok((program, output_axes))
+        Ok(BatchedProgram::new(program, output_axes)?)
     }
 }
 
@@ -2009,7 +2002,7 @@ impl<
         axis_sharding: ShardingDimension,
         input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Self, Vec<BatchAxis>), BatchingError> {
+    ) -> Result<BatchedProgram<V, O>, BatchingError> {
         self.entry_region_ref().batched(axis_size, axis_sharding, input_batch_axes, output_axes_policy)
     }
 }
@@ -2336,7 +2329,7 @@ mod tests {
     impl BatchingPolicy<ProjectedProgramContext> for ProjectedProgramBatching {
         type Batch = ProjectedProgramBatch;
         type Extent = usize;
-        type BatchedProgram = BatchedProgram<ProjectedProgramContext>;
+        type BatchedProgram = BatchedProgram<ProjectedProgramValue, ProjectedProgramOperation>;
 
         fn batch(value: ProjectedProgramValue, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
             if !batch_axis.is_replicated() && !matches!(value, ProjectedProgramValue::First(_)) {
@@ -2372,30 +2365,6 @@ mod tests {
             }
             Ok(inputs.to_vec())
         }
-    }
-
-    // TODO(eaplatanios): This unit test does not appear to follow our conventions on naming or placement/ordering.
-    #[test]
-    fn test_direct_batched_program_validates_and_preserves_its_boundary() -> Result<(), ProgramError> {
-        type Context = EagerContext<Array, ArrayOperation<Array>>;
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F32));
-        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])?;
-        let Err(error) = BatchedProgram::<Context>::new(program, Vec::new()) else {
-            panic!("direct batched program accepted mismatched output axes");
-        };
-        assert_eq!(error, ProgramError::InvalidOutputCount { expected: 1, actual: 0 });
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F32));
-        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])?;
-        let (program, output_axes) =
-            BatchedProgram::<Context>::new(program, vec![BatchAxis::replicated()])?.into_parts();
-        assert_eq!(program.output_ids(), &[input]);
-        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
-
-        Ok(())
     }
 
     #[test]
@@ -2446,33 +2415,25 @@ mod tests {
     }
 
     #[test]
-    fn test_batching_policy_is_member_kind_agnostic() {
-        let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
-        let tracer = BatchingTracer::new(
-            context.clone(),
-            ProjectedProgramBatching::replicated(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7))),
-        );
-        assert_eq!(tracer.r#type(), Cow::Owned(ProjectedProgramType::Third(ProjectedMemberType::<2>)));
-        assert_eq!(tracer.batch_extent(), &5);
+    fn test_batched_program() -> Result<(), ProgramError> {
+        // Construction validates that the output axes cover exactly the program's outputs.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])?;
+        let Err(error) = BatchedProgram::new(program, Vec::new()) else {
+            panic!("batched program accepted mismatched output axes");
+        };
+        assert_eq!(error, ProgramError::InvalidOutputCount { expected: 1, actual: 0 });
 
-        let operation = ProjectedProgramOperation::from(ProjectedMemberOperation::<2>);
-        let outputs = operation.batch(&context, &EmptyRegionDriver, &[tracer.into_batch()]).unwrap();
-        assert_eq!(
-            outputs,
-            vec![ProjectedProgramBatch {
-                value: ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
-                batch_axis: BatchAxis::replicated(),
-            }],
-        );
+        // A well-formed result preserves its program and output axes through `into_parts`.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])?;
+        let (program, output_axes) = BatchedProgram::new(program, vec![BatchAxis::replicated()])?.into_parts();
+        assert_eq!(program.output_ids(), &[input]);
+        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
 
-        assert!(matches!(
-            ProjectedProgramBatching::batch(
-                ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
-                BatchAxis::new(0),
-            ),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "member_2 values must remain replicated under batching",
-        ));
+        Ok(())
     }
 
     #[test]
@@ -2786,6 +2747,36 @@ mod tests {
     }
 
     #[test]
+    fn test_batching_policy_is_member_kind_agnostic() {
+        let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
+        let tracer = BatchingTracer::new(
+            context.clone(),
+            ProjectedProgramBatching::replicated(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7))),
+        );
+        assert_eq!(tracer.r#type(), Cow::Owned(ProjectedProgramType::Third(ProjectedMemberType::<2>)));
+        assert_eq!(tracer.batch_extent(), &5);
+
+        let operation = ProjectedProgramOperation::from(ProjectedMemberOperation::<2>);
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[tracer.into_batch()]).unwrap();
+        assert_eq!(
+            outputs,
+            vec![ProjectedProgramBatch {
+                value: ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+                batch_axis: BatchAxis::replicated(),
+            }],
+        );
+
+        assert!(matches!(
+            ProjectedProgramBatching::batch(
+                ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+                BatchAxis::new(0),
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "member_2 values must remain replicated under batching",
+        ));
+    }
+
+    #[test]
     fn test_array_type_normalize_batch_axis() {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(r#type.normalize_batch_axis(BatchAxis::replicated()), Ok((BatchAxis::replicated(), None)));
@@ -2810,19 +2801,6 @@ mod tests {
             r#type.unbatched_type(BatchAxis::new(-1)),
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))),
         );
-    }
-
-    #[test]
-    fn test_batching_context() {
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
-        assert!(context.parent().is_eager());
-        assert_eq!(context.axis_extent(), &4);
-        assert_eq!(context.axis_name(), None);
-        assert_eq!(context.axis_sharding(), &ShardingDimension::Replicated);
-
-        let context = context.with_axis_name("items".to_string()).with_axis_sharding(ShardingDimension::sharded(["x"]));
-        assert_eq!(context.axis_name(), Some("items"));
-        assert_eq!(context.axis_sharding(), &ShardingDimension::sharded(["x"]));
     }
 
     #[test]
@@ -2965,7 +2943,20 @@ mod tests {
     }
 
     #[test]
-    fn test_region_batching_preserves_mapped_axis_sharding() {
+    fn test_batching_context() {
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        assert!(context.parent().is_eager());
+        assert_eq!(context.axis_extent(), &4);
+        assert_eq!(context.axis_name(), None);
+        assert_eq!(context.axis_sharding(), &ShardingDimension::Replicated);
+
+        let context = context.with_axis_name("items".to_string()).with_axis_sharding(ShardingDimension::sharded(["x"]));
+        assert_eq!(context.axis_name(), Some("items"));
+        assert_eq!(context.axis_sharding(), &ShardingDimension::sharded(["x"]));
+    }
+
+    #[test]
+    fn test_region_batched_preserves_mapped_axis_sharding() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let unbatched_sharding = if axis_type == MeshAxisType::Manual {
@@ -2991,7 +2982,8 @@ mod tests {
                     &[BatchAxis::new(1)],
                     ProgramBatchingOutputAxesPolicy::Natural,
                 )
-                .unwrap();
+                .unwrap()
+                .into_parts();
             let expected_sharding =
                 Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
                     .unwrap()
@@ -3022,7 +3014,8 @@ mod tests {
         // row, with the output naturally mapped on the same axis.
         let (batched, output_axes) = program
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
-            .unwrap();
+            .unwrap()
+            .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let outputs = batched.interpret(vec![input]).unwrap();
@@ -3032,7 +3025,8 @@ mod tests {
         // `[3, 2]` packed value and preserves that canonical axis through the elementwise body.
         let (batched, output_axes) = program
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(-1)], ProgramBatchingOutputAxesPolicy::Natural)
-            .unwrap();
+            .unwrap()
+            .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(1)]);
         let input = Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
         let outputs = batched.interpret(vec![input]).unwrap();
@@ -3047,7 +3041,8 @@ mod tests {
                 &[BatchAxis::replicated()],
                 ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
             )
-            .unwrap();
+            .unwrap()
+            .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         let outputs = batched.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0])]).unwrap();
         assert_eq!(outputs, vec![Array::matrix(2, 3, vec![1.0, 4.0, 9.0, 1.0, 4.0, 9.0])]);
@@ -3061,7 +3056,8 @@ mod tests {
                 &[BatchAxis::replicated()],
                 ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(-1)),
             )
-            .unwrap();
+            .unwrap()
+            .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(1)]);
         let outputs = batched.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0])]).unwrap();
         assert_eq!(outputs, vec![Array::matrix(3, 2, vec![1.0, 1.0, 4.0, 4.0, 9.0, 9.0])]);
