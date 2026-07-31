@@ -1,9 +1,9 @@
 //! Contains machinery for _batching_ (i.e., _vectorizing_) computations.
 //!
-//! Batching turns a function written for individual array values into one that processes a logical batch. It does not
-//! mechanically add an outer dimension to every intermediate value. Instead, each flowing value carries the physical
-//! position of its logical batch axis, and each operation decides how to propagate, align, introduce, or remove that
-//! axis. Replicated values carry no batch axis and are broadcast only when an operation needs alignment.
+//! Batching turns a function written for individual array values into one that processes a whole batch. It does not
+//! mechanically add an outer dimension to every intermediate value. Instead, each flowing value carries the packed
+//! position of its batch axis, and each operation decides how to propagate, align, introduce, or remove that axis.
+//! Replicated values carry no batch axis and are broadcast only when an operation needs alignment.
 //!
 //! ```text
 //!  ┌───────────────────────────────────┐
@@ -30,22 +30,22 @@
 //! batching rewrites the program while retaining explicit input and output axis metadata, which is useful for
 //! compilation and higher-order operation rules.
 //!
-//! [`BatchAxis`] describes a leaf as either batched at a signed physical axis or replicated, and a
-//! [`BatchAxisSpecification`] supplies the logical axis extent and optional name. Negative axes are normalized against
-//! each array's rank, and every batched input must agree on the logical extent.
+//! [`BatchAxis`] describes a leaf as either batched at a signed axis or replicated, and a
+//! [`BatchAxisSpecification`] supplies the batch-axis extent and optional name. Negative axes are normalized against
+//! each array's rank, and every batched input must agree on the batch extent.
 //!
 //! # Core Abstractions
 //!
-//! [`ArrayBatch`] pairs an underlying array value with its logical batch-axis position. Its alignment helpers can
-//! broadcast a replicated value, move an existing axis, or align several operands to a common position. The wrapper's
-//! type is the logical unbatched type (the underlying value retains the physical batch dimension).
+//! [`ArrayBatch`] pairs an underlying array value with its batch-axis position. Its alignment helpers can broadcast a
+//! replicated value, move an existing axis, or align several operands to a common position. The wrapper's type is the
+//! unbatched per-item type (the packed value retains its batch dimension).
 //!
 //! [`BatchingContext`] wraps a parent [`Context`] and records the active axis extent and optional axis name.
 //! [`BatchingTracer`] is the value flowing through a batched closure. It carries the representation selected by a
 //! [`BatchingPolicy`] and delegates each bind to the bound operation's [`BatchableOperation`] rule. Because the parent
 //! may be eager or staging, the same rule can execute concrete values or build a transformed program.
 //!
-//! [`ElementwiseOperation`]s infer a common batch size, align operands to a common physical axis, bind the underlying
+//! [`ElementwiseOperation`]s infer a common batch size, align operands to a common batch-axis position, bind the underlying
 //! operation once, and propagate that axis to every result. Shape-changing, reducing, control-flow, and higher-order
 //! operations provide explicit rules because their output axes cannot be inferred from elementwise semantics.
 //!
@@ -66,7 +66,7 @@
 //! For a region-carrying operation, keep the recursive batching logic with that operation and request nested work
 //! through its active [`BatchingDriver`] (per-item replay via [`BatchingDriver::batch_region`] or structural program
 //! batching via [`BatchingDriver::batch_program`]). Preserve named-axis and sharding semantics when moving or
-//! introducing the logical axis, and return [`BatchingError`] for invalid axis contracts rather than panicking.
+//! introducing the batch axis, and return [`BatchingError`] for invalid axis contracts rather than panicking.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -172,13 +172,13 @@ impl From<BatchingError> for ProgramError {
     }
 }
 
-/// A batched value's mapped batch axis. [`BatchAxis::new`]`(k)` means that the value's batch dimension sits at physical
+/// A batched value's mapped batch axis. [`BatchAxis::new`]`(k)` means that the value's batch dimension sits at packed
 /// axis `k`. [`BatchAxis::replicated`] (the [`Default`]) means that the value is *replicated* (i.e., it carries no
-/// physical dimension for the batch and is interpreted as the same value for every batch item). For example, a traced
-/// constant in `batch(|x| x + 1)` is replicated, while `x` carries the mapped input axis. Runtime control flow
-/// predicates may also be replicated, because a single predicate may select one branch for the whole batch while a
-/// batch-varying predicate would need a dedicated batching rule. Note that replication is not limited to rank-0 (i.e.,
-/// scalar) values. Any shaped constant or input is replicated when none of its physical dimensions indexes the batch.
+/// dimension for the batch and is interpreted as the same value for every batch item). For example, a traced constant
+/// in `batch(|x| x + 1)` is replicated, while `x` carries the mapped input axis. Runtime control flow predicates may
+/// also be replicated, because a single predicate may select one branch for the whole batch while a batch-varying
+/// predicate would need a dedicated batching rule. Note that replication is not limited to rank-0 (i.e., scalar)
+/// values. Any shaped constant or input is replicated when none of its dimensions indexes the batch.
 ///
 /// This is the batch axis carried by an [`ArrayBatch`] and, during the batching transform, by the
 /// [`Tracer`](crate::Tracer) metadata. Carrying it on the value itself lets the per-operation batching rules
@@ -187,19 +187,19 @@ impl From<BatchingError> for ProgramError {
 pub struct BatchAxis(Option<Axis>);
 
 impl BatchAxis {
-    /// Creates a mapped [`BatchAxis`] at physical position `axis`.
+    /// Creates a mapped [`BatchAxis`] at position `axis`.
     #[inline]
     pub fn new<A: Into<Axis>>(axis: A) -> Self {
         Self(Some(axis.into()))
     }
 
-    /// Creates a mapped [`BatchAxis`] from an already-normalized physical position.
+    /// Creates a mapped [`BatchAxis`] from an already-normalized position.
     #[inline]
     pub fn from_position(position: usize) -> Self {
         Self::new(position)
     }
 
-    /// Creates a replicated or mapped [`BatchAxis`] from an already-normalized optional physical position.
+    /// Creates a replicated or mapped [`BatchAxis`] from an already-normalized optional position.
     #[inline]
     pub fn from_optional_position(position: Option<usize>) -> Self {
         position.map(Self::from_position).unwrap_or_default()
@@ -326,106 +326,52 @@ impl From<usize> for BatchAxisSpecification {
     }
 }
 
-/// Boundary convention of a structurally batched nested [`Program`], produced by functions like
-/// [`RecursiveBatchingPolicy::batch_program`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum BatchedProgramBoundary {
-    /// The transformed [`Program`] has the same logical boundary arity as its source [`Region`](crate::Region).
-    Direct,
-
-    /// The transformed [`Program`] explicitly threads the mapped extent through its boundary. A structurally batched
-    /// composite [`Region`](crate::Region) is traced as a standalone [`Program`], so it cannot capture the first-class
-    /// dimension Single Static Assignment (SSA) value that represents the mapped extent in its parent program. The
-    /// transformed program therefore accepts that extent as its leading input and returns the same value as its leading
-    /// output. This makes dynamic mapped array dimensions valid references to a boundary-defined identity and lets
-    /// enclosing higher-order operations pass the extent through sealed regions without reconstructing it.
-    ThreadedExtent,
-}
-
-// TODO(eaplatanios): Review this.
-/// Result of structurally batching a nested [`Region`](crate::Region).
-///
-/// Homogeneous array regions retain a direct boundary. Composite regions cannot capture the active mapped extent
-/// from their parent trace, so they carry that ordinary dimension SSA value explicitly as a leading input and return
-/// it unchanged as a leading output. Keeping the convention in this type prevents higher-order rules from silently
-/// assuming that every transformed program has the source region's exact physical boundary.
+/// Result of structurally batching a nested [`Region`](crate::Region) whose transformed program carries exactly the
+/// source region's inputs and outputs. [`BatchingPolicy`]s whose transformed programs carry protocol inputs or outputs
+/// beyond the source region's own boundary select their own result type through [`BatchingPolicy::BatchedProgram`]
+/// instead, so consumers statically acknowledge that protocol through the result type's own API rather than through
+/// a shared accessor that could silently drop it.
 pub struct BatchedProgram<C: Domain> {
-    /// Structurally transformed program.
+    /// Structurally transformed [`Program`].
     program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
 
-    /// Mapped axes of the source region's logical outputs. The protocol-only threaded extent is excluded.
+    /// Mapped axes of the source [`Region`](crate::Region)'s outputs.
     output_axes: Vec<BatchAxis>,
-
-    /// Physical boundary convention used by `program`.
-    boundary: BatchedProgramBoundary,
 }
 
-// TODO(eaplatanios): Review this.
 impl<C: Domain> BatchedProgram<C> {
-    /// Creates a structurally batched program whose physical and logical boundaries coincide.
-    pub fn direct(
+    /// Creates a new [`BatchedProgram`] that carries exactly the source [`Region`](crate::Region)'s inputs and outputs.
+    #[inline]
+    pub fn new(
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         output_axes: Vec<BatchAxis>,
     ) -> Result<Self, ProgramError> {
         check_count!("output", output_axes, program.output_count(), ProgramError);
-        Ok(Self { program, output_axes, boundary: BatchedProgramBoundary::Direct })
+        Ok(Self { program, output_axes })
     }
 
-    /// Creates a structurally batched composite program with a leading threaded-extent input and output.
-    pub fn with_threaded_extent(
-        program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        output_axes: Vec<BatchAxis>,
-    ) -> Result<Self, ProgramError> {
-        if program.input_count() == 0 || program.output_count() == 0 {
-            return Err(ProgramError::MalformedProgram(
-                "a structurally batched program with a threaded extent must have a leading input and output"
-                    .to_string(),
-            ));
-        }
-        check_count!("output", output_axes, program.output_count() - 1, ProgramError);
-        Ok(Self { program, output_axes, boundary: BatchedProgramBoundary::ThreadedExtent })
-    }
-
-    /// Returns the mapped axes of the source region's logical outputs.
+    /// Returns the mapped axes of the source [`Region`](crate::Region)'s outputs.
     #[inline]
     pub fn output_axes(&self) -> &[BatchAxis] {
         self.output_axes.as_slice()
     }
 
-    /// Consumes a direct-boundary result, rejecting a threaded extent rather than dropping it.
-    pub fn into_direct(
+    /// Consumes this [`BatchedProgram`] and returns its transformed underlying program and output axes.
+    pub fn into_parts(
         self,
-    ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), ProgramError>
-    {
-        match self.boundary {
-            BatchedProgramBoundary::Direct => Ok((self.program, self.output_axes)),
-            BatchedProgramBoundary::ThreadedExtent => Err(ProgramError::MalformedProgram(
-                "a direct structural batching boundary received a program with a threaded extent".to_string(),
-            )),
-        }
-    }
-
-    /// Consumes a threaded-extent result, rejecting a direct result rather than inventing the protocol value.
-    pub fn into_threaded_extent(
-        self,
-    ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), ProgramError>
-    {
-        match self.boundary {
-            BatchedProgramBoundary::ThreadedExtent => Ok((self.program, self.output_axes)),
-            BatchedProgramBoundary::Direct => Err(ProgramError::MalformedProgram(
-                "a composite structural batching boundary received a program without a threaded extent".to_string(),
-            )),
-        }
+    ) -> (Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>) {
+        (self.program, self.output_axes)
     }
 }
 
 /// Value with [`ArrayType`] type that represents a _packed_ batch of arrays. [`ArrayBatch`] is the batching
-/// representation for Ryft's batching/vectorization transform. It pairs a physical array value with a [`BatchAxis`]
-/// that marks which of its dimensions indexes the batch items. A value is either *batched* (i.e., its physical type
-/// carries the batch dimension) or *replicated*, meaning that it is shared unchanged across every batch item.
+/// representation for Ryft's batching/vectorization transform over arrays. It pairs a packed array value with a
+/// [`BatchAxis`] that marks which of its dimensions indexes the batch items. A value is either *batched* (i.e., its
+/// packed type carries the batch dimension) or *replicated*, meaning that it is shared unchanged across every batch
+/// item.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub struct ArrayBatch<V> {
-    /// Physical array type of `value`. When the value is batched this type includes the mapped batch dimension at
+    /// Packed array type of `value`. When the value is batched this type includes the mapped batch dimension at
     /// `batch_axis`. The unbatched (i.e., per-item) [`ArrayType`] is recovered by removing that dimension and can be
     /// obtained using [`Self::unbatched_type`].
     r#type: ArrayType,
@@ -457,9 +403,8 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         self.batch_axis
     }
 
-    /// Returns the canonical nonnegative physical position of this [`ArrayBatch`]'s mapped [`BatchAxis`].
-    /// [`ArrayBatch::new`] normalizes signed declarations before storing them, and so internal batching rules
-    /// can use this index directly.
+    /// Returns the canonical nonnegative position of this [`ArrayBatch`]'s mapped [`BatchAxis`]. [`ArrayBatch::new`]
+    /// normalizes signed declarations before storing them, and so internal batching rules can use this index directly.
     #[inline]
     pub fn batch_axis_position(&self) -> Option<usize> {
         self.batch_axis.axis().map(|axis| axis.normalize(self.r#type.rank()).unwrap())
@@ -522,7 +467,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// # Parameters
     ///
     ///   - `axis`: Possibly-negative position of the inserted batch axis in the output, normalized against the
-    ///     physical output rank (e.g., `-1` denotes the final output axis).
+    ///     batched output rank (e.g., `-1` denotes the final output axis).
     ///   - `axis_size`: Dimension of the inserted batch axis.
     ///   - `axis_sharding`: Sharding placement assigned to the inserted batch axis when the value carries
     ///     sharding metadata.
@@ -541,7 +486,8 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
                     .to_string(),
             });
         }
-        // The insertion position is normalized against the physical output rank (i.e., the per-item rank plus the
+
+        // The insertion position is normalized against the batched output rank (i.e., the per-item rank plus the
         // inserted batch dimension).
         let axis = axis.into();
         let per_item_type = self.unbatched_type();
@@ -549,19 +495,22 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         let position = axis
             .normalize(output_rank)
             .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(self.r#type.clone()), axis })?;
-        let mut physical_type = per_item_type.with_inserted_dimension(position, Dimension::Static(axis_size))?;
+
+        let mut batched_type = per_item_type.with_inserted_dimension(position, Dimension::Static(axis_size))?;
         if let Some(sharding) = per_item_type.sharding() {
-            physical_type.sharding = Some(
+            batched_type.sharding = Some(
                 sharding
                     .with_inserted_dimension(position, axis_sharding)
                     .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
             );
         }
+
         let output_axes = (0..per_item_type.rank())
             .map(|dimension| if dimension < position { dimension } else { dimension + 1 })
             .collect::<Vec<_>>();
-        let broadcasted = self.value().clone().legacy_broadcast(physical_type.clone(), output_axes.as_slice())?;
-        ArrayBatch::new(physical_type, broadcasted, axis)
+
+        let broadcasted = self.value().clone().legacy_broadcast(batched_type.clone(), output_axes.as_slice())?;
+        ArrayBatch::new(batched_type, broadcasted, axis)
     }
 
     /// Returns a copy of this [`ArrayBatch`] with its mapped batch axis moved to `axis`, staging a transpose on the
@@ -574,7 +523,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// # Parameters
     ///
     ///   - `axis`: Possibly-negative position the mapped batch axis should occupy in the returned [`ArrayBatch`],
-    ///     normalized against the (unchanged) physical rank (e.g., `-1` denotes the final axis).
+    ///     normalized against the value's unchanged rank (e.g., `-1` denotes the final axis).
     pub fn move_axis<A: Into<Axis>>(&self, axis: A) -> Result<Self, BatchingError>
     where
         V: Transpose,
@@ -582,7 +531,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         let Some(current_axis) = self.batch_axis_position() else {
             return Ok(self.clone());
         };
-        // The target is normalized against the unchanged physical rank.
+        // The target is normalized against the value's unchanged rank.
         let axis = axis.into();
         let position = axis
             .normalize(self.r#type.rank())
@@ -598,13 +547,13 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// Returns a copy of this [`ArrayBatch`] with a batch axis of size `axis_size` materialized at `axis`. An
     /// already-batched value has its mapped axis realigned to `axis` via [`Self::move_axis`], while a replicated
     /// value is broadcast to gain a batch axis there via [`Self::broadcast`]. This is the analogue of JAX's
-    /// `batching.matchaxis`, used by rules whose inputs must agree on one physical batch axis (e.g., `pad`,
+    /// `batching.matchaxis`, used by rules whose inputs must agree on one packed batch axis (e.g., `pad`,
     /// `concatenate`, etc.).
     ///
     /// # Parameters
     ///
     ///   - `axis`: Possibly-negative position the batch axis should occupy in the output, normalized against the
-    ///     physical output rank (e.g., `-1` denotes the final output axis).
+    ///     batched output rank (e.g., `-1` denotes the final output axis).
     ///   - `axis_size`: Dimension of the batch axis.
     ///   - `axis_sharding`: Sharding placement assigned to the batch axis if a replicated value must be broadcast.
     #[inline]
@@ -629,7 +578,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// a different requested position, while a replicated value is broadcast across `axis_size` when the declaration
     /// requests a mapped result. This matches JAX's mapped-output instantiation. A mapped value cannot be collapsed
     /// into a replicated declaration without an explicit reduction and that direction returns
-    /// [`BatchingError::MismatchedOutputAxes`]. Signed declarations are normalized against the resulting physical
+    /// [`BatchingError::MismatchedOutputAxes`]. Signed declarations are normalized against the resulting packed
     /// rank. [`Batch::batch`] uses this function to realize the caller's declared `output_batch_axes`.
     ///
     /// # Parameters
@@ -648,7 +597,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         V: LegacyBroadcast + Transpose,
     {
         // Signed declaration normalization is owned by the delegates: `move_axis` normalizes against the (unchanged)
-        // physical rank and `broadcast` against the physical output rank gaining the batch dimension.
+        // packed rank and `broadcast` against the batched output rank gaining the batch dimension.
         match (self.batch_axis.axis(), batch_axis.axis()) {
             (None, None) => Ok(self.clone()),
             (Some(_), Some(axis)) => self.move_axis(axis),
@@ -708,8 +657,8 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
     }
 }
 
-/// [`Type`] capability selecting the canonical [`BatchingEntrypointPolicy`] used by the public batching transform. This
-/// is a batching-owned extension of [`Type`] and not part of the core type contract. It lets one blanket [`Batch`]
+/// [`Type`] capability selecting the canonical [`BatchingEntrypointPolicy`] used by the public batching transform.
+/// This is a batching-owned extension of [`Type`] and not part of the core type contract. It lets one blanket [`Batch`]
 /// implementation select the canonical policy for each program universe without adding batching machinery to [`Type`]
 /// or [`Context`] and without relying on overlapping blanket implementations distinguished only by [`Domain::Type`].
 pub trait BatchableType: Type {
@@ -724,18 +673,22 @@ impl BatchableType for ArrayType {
 
 /// Transform-owned policy selecting the batch carrier and mapped-axis extent representation used by a
 /// [`BatchingContext`]. One generic batching frame (i.e., [`BatchingContext`], [`BatchingTracer`], [`BatchingDriver`],
-/// and the [`BatchableOperation`] rule contract) serves every [`Program`] universe, and this policy names the only two
+/// and the [`BatchableOperation`] rule contract) serves every [`Program`] universe, and this policy names the three
 /// places where those universes genuinely differ:
 ///
-///   - **The Batch Carrier (i.e., [`Self::Batch`]):** A batched value maintains a split between its logical per-item
-///     type and the parent-owned physical value that stores the whole batch. How that split is represented is specific
-///     to each value kind: an ordinary array gains a physical mapped axis (i.e., [`ArrayBatch`]), while a first-class
-///     dimension has no mapped representation at all (as a per-item extent would be a ragged shape), and so a composite
-///     carrier must keep dimension members replicated and reject mapped non-array members.
+///   - **The Batch Carrier (i.e., [`Self::Batch`]):** A batched value maintains a split between its unbatched per-item
+///     type and the parent-owned packed value that stores the whole batch. How that split is represented is specific
+///     to each value kind: an ordinary array gains a mapped axis in its packed shape (i.e., [`ArrayBatch`]), while a
+///     first-class dimension has no mapped representation at all (as a per-item extent would be a ragged shape), and so
+///     a composite carrier must keep dimension members replicated and reject mapped non-array members.
 ///   - **The Mapped-Axis Extent (i.e., [`Self::Extent`]):** Homogeneous array batching uses a static `usize`, while a
 ///     composite universe may carry an ordinary parent-owned first-class dimension value so that a dynamic batch extent
 ///     remains a Single Static Assignment (SSA) value flowing through operand edges rather than being treated as static
 ///     transform metadata.
+///   - **The Structurally Batched Program (i.e., [`Self::BatchedProgram`]):** Homogeneous array programs preserve the
+///     source region's boundary exactly and produce ordinary [`BatchedProgram`]s, while a composite universe threads
+///     protocol values such as its first-class mapped extent through standalone nested programs and selects a result
+///     type whose API makes that protocol explicit.
 ///
 /// The policy is deliberately limited to carrier selection, construction, and access. Array-specific alignment and
 /// broadcasting are represented as functions on [`ArrayBatch`] (a composite policy may project an array member into
@@ -746,16 +699,19 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// Batch-carrying representation for values owned by `C`.
     type Batch: Clone + Debug + Display + Parameter;
 
-    /// Representation of the logical mapped-axis extent.
+    /// Representation of the mapped-axis extent.
     type Extent: Clone + Debug;
 
-    /// Wraps a parent-owned physical value with the requested mapped axis, validating and normalizing that axis.
+    /// Result of structurally batching a nested [`Program`] under this [`BatchingPolicy`]'s boundary protocol.
+    type BatchedProgram;
+
+    /// Wraps a parent-owned packed value with the requested mapped axis, validating and normalizing that axis.
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError>;
 
-    /// Wraps a parent-owned physical value as replicated across the logical batch.
+    /// Wraps a parent-owned packed value as replicated across the batch.
     fn replicated(value: C::Value) -> Self::Batch;
 
-    /// Returns the parent-owned physical value stored in `batch`.
+    /// Returns the parent-owned packed value stored in `batch`.
     fn value(batch: &Self::Batch) -> &C::Value;
 
     /// Returns the per-item type exposed by `batch` after removing its mapped batch axis, if any.
@@ -781,13 +737,13 @@ pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<BatchedProgram<C>, BatchingError>;
+    ) -> Result<Self::BatchedProgram, BatchingError>;
 }
 
 /// Policy capability for invoking the public batching transform on flat parent values. [`Batch::batch`] owns
 /// [`Parameterized`] broadcasting, tracer construction, closure invocation, and output structure reconstruction once
 /// for every program universe. This capability owns the universe-specific boundary mechanics: selecting and validating
-/// the mapped extent, packing and physically normalizing inputs, and materializing each requested output axis.
+/// the mapped extent, packing and normalizing inputs, and materializing each requested output axis.
 pub trait BatchingEntrypointPolicy<C: Context>: BatchingPolicy<C> {
     /// Prepares the provided input values for the batching transform and constructs a [`BatchingContext`] for them.
     fn prepare_inputs(
@@ -806,7 +762,7 @@ pub trait BatchingEntrypointPolicy<C: Context>: BatchingPolicy<C> {
 }
 
 /// Source of an output dimension of an elementwise batching broadcast operation. The shared elementwise batching
-/// algorithm owns all broadcast geometry. For every physical output axis, it identifies the source of that dimension
+/// algorithm owns all broadcast geometry. For every batched output axis, it identifies the source of that dimension
 /// and passes it to [`ArrayBatchingPolicy::broadcast_input`]. [`StaticArrayBatchingPolicy`] ignores these sources
 /// because its output metadata already carries every extent, while a dimension-valued policy materializes each source
 /// as a first-class value without re-deriving any geometry.
@@ -821,7 +777,7 @@ pub enum DimensionSource<V> {
         /// Parent-owned value whose axis carries this dimension.
         source: V,
 
-        /// Physical axis of `source` carrying this dimension.
+        /// Axis of `source`'s packed shape that carries this dimension.
         axis: usize,
     },
 
@@ -843,19 +799,23 @@ pub enum DimensionSource<V> {
 ///
 /// An [`ArrayBatchingPolicy`] is a type-level selector packaging those two differences, so each policy owns the
 /// complete translation from a homogeneous rule's extent and broadcast requests to its universe's operations. Every
-/// policy also implements [`BatchingPolicy`] with `Batch = ArrayBatch<C::Value>`. The shared rules are then written
-/// once against the nominal [`ArrayBatching<P>`] family rather than as a `P: ArrayBatchingPolicy` blanket, because Rust
-/// coherence cannot use the *absence* of a trait implementation to prove such a blanket disjoint from the genuinely
-/// mixed composite-operation rules registered for other policies.
+/// policy also implements [`BatchingPolicy`] with `Batch = ArrayBatch<C::Value>` and `BatchedProgram =
+/// BatchedProgram<C>`: homogeneous rules bind structurally batched branch programs directly, so an array-authority
+/// policy is direct-boundary by definition and the supertrait binding lets every rule rely on that without restating
+/// it. The shared rules are then written once against the nominal [`ArrayBatching<P>`] family rather than as a
+/// `P: ArrayBatchingPolicy` blanket, because Rust coherence cannot use the *absence* of a trait implementation to
+/// prove such a blanket disjoint from the genuinely mixed composite-operation rules registered for other policies.
 ///
 /// Keeping this capability on the batching transform, rather than on [`ProjectedContext`](crate::ProjectedContext),
 /// [`ArrayBatch`], or [`Type`], means that neither the carrier nor the type contract needs to know anything about
 /// dynamic-shape state that only batching needs.
-pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>: BatchingPolicy<C, Batch = ArrayBatch<C::Value>> {
-    /// Returns the mapped-axis [`Dimension`] to insert when building a physical batched [`ArrayType`].
+pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>:
+    BatchingPolicy<C, Batch = ArrayBatch<C::Value>, BatchedProgram = BatchedProgram<C>>
+{
+    /// Returns the mapped-axis [`Dimension`] to insert when building a batched [`ArrayType`].
     /// [`StaticArrayBatchingPolicy`] derives an exact [`Dimension::Static`] from the context's mapped-axis extent,
     /// while a dimension-valued policy returns the possibly dynamic dimension described by its first-class extent
-    /// value's type. Shape computations can therefore construct physical batched types without forcing the extent to
+    /// value's type. Shape computations can therefore construct batched types without forcing the extent to
     /// be statically known.
     fn axis_dimension(context: &BatchingContext<C, ArrayBatching<Self>>) -> Result<Dimension, BatchingError>;
 
@@ -882,7 +842,7 @@ pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>: BatchingPolicy<C, B
 
     /// Materializes one input/operand at `r#type`, broadcasting its per-item dimensions to the common target
     /// shape and inserting the mapped batch axis. The shared elementwise algorithm computes the complete broadcast
-    /// geometry, including one [`DimensionSource`] per physical output axis, and delegates only the materialization
+    /// geometry, including one [`DimensionSource`] per batched output axis, and delegates only the materialization
     /// itself, which is the policy-specific step. [`StaticArrayBatchingPolicy`] broadcasts with static output metadata
     /// and ignores the sources, while a dimension-valued policy spends each source mechanically (i.e., exact constants
     /// for static dimensions, `dimension_size` reads of the provided source values for dynamic per-item dimensions,
@@ -896,7 +856,7 @@ pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>: BatchingPolicy<C, B
     ///     with the mapped axis inserted at `batch_axis`).
     ///   - `output_axes`: Mapping from each of `input`'s axes to its output axis.
     ///   - `batch_axis`: Position of the mapped batch axis in `r#type`.
-    ///   - `dimension_sources`: Source of each physical output dimension, in axis order.
+    ///   - `dimension_sources`: Source of each batched output dimension, in axis order.
     fn broadcast_input(
         context: &BatchingContext<C, ArrayBatching<Self>>,
         input: &ArrayBatch<C::Value>,
@@ -919,6 +879,7 @@ pub struct StaticArrayBatchingPolicy;
 impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPolicy {
     type Batch = ArrayBatch<C::Value>;
     type Extent = usize;
+    type BatchedProgram = BatchedProgram<C>;
 
     #[inline]
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
@@ -974,11 +935,10 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> ArrayBatc
 
 /// Homogeneous-array [`BatchingPolicy`] parameterized by its [`ArrayBatchingPolicy`]. The default
 /// [`StaticArrayBatchingPolicy`] preserves the ordinary public array batching API. Composite programs use a private
-/// dynamic policy whose extent is a parent-owned first-class dimension value. Keeping both policies
-/// under this nominal policy family lets every homogeneous array operation share one generated dispatcher without
-/// making those implementations overlap genuinely mixed composite-operation rules. The wrapper delegates its batch
-/// carrier and extent representation to `P`. Array-specific alignment is supplied by `P`'s [`ArrayBatchingPolicy`]
-/// implementation.
+/// dynamic policy whose extent is a parent-owned first-class dimension value. Keeping both policies under this
+/// nominal policy family lets every homogeneous array operation share one generated dispatcher without making those
+/// implementations overlap genuinely mixed composite-operation rules. The wrapper delegates its batch carrier and
+/// extent representation to `P`. Array-specific alignment is supplied by `P`'s [`ArrayBatchingPolicy`] implementation.
 pub struct ArrayBatching<P = StaticArrayBatchingPolicy>(PhantomData<fn() -> P>);
 
 impl<P> Copy for ArrayBatching<P> {}
@@ -1009,6 +969,7 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
 {
     type Batch = P::Batch;
     type Extent = P::Extent;
+    type BatchedProgram = P::BatchedProgram;
 
     #[inline]
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
@@ -1045,14 +1006,14 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchingE
             );
         }
 
-        // With no input leaves there is no mapped physical dimension from which to infer the logical batch extent.
+        // With no input leaves there is no mapped dimension from which to infer the batch extent.
         // An explicit extent still permits a valid input-free batching transform.
         if inputs.is_empty() && batch_axis.extent().is_none() {
             return Err(BatchingError::EmptyBatch);
         }
 
-        // Pair each parent-owned physical value with its declared axis. `ArrayBatch::new` normalizes signed axes,
-        // validates them against the physical rank, and derives the logical per-item type.
+        // Pair each parent-owned packed value with its declared axis. `ArrayBatch::new` normalizes signed axes,
+        // validates them against the packed rank, and derives the unbatched per-item type.
         let inputs = inputs
             .into_iter()
             .zip(input_batch_axes)
@@ -1071,17 +1032,17 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchingE
             }
         };
 
-        // Select one placement for the logical batch axis from the original mapped inputs before any normalization.
+        // Select one placement for the batch axis from the original mapped inputs before any normalization.
         // This prevents a subsequently broadcast replicated input from appearing to constrain the placement.
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs.as_slice())?;
 
-        // The batching context carries the reconciled logical extent, optional dynamic-scope name, and common sharding
+        // The batching context carries the reconciled batch extent, optional dynamic-scope name, and common sharding
         // placement that every operation rule at this batching level observes.
         let batching_context = BatchingContext::new(context.clone(), batch_extent)
             .with_axis_name(batch_axis.name().map(String::from))
             .with_axis_sharding(axis_sharding);
 
-        // Materialize the common batch-axis placement on each mapped input whose physical sharding differs.
+        // Materialize the common batch-axis placement on each mapped input whose packed sharding differs.
         // Replicated inputs have no mapped axis and therefore pass through unchanged.
         let inputs = inputs
             .into_iter()
@@ -1094,8 +1055,8 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchingE
                     .transpose()?
                     .flatten();
                 let batch = if let Some(r#type) = normalized_type {
-                    // A rank-preserving broadcast with identity output axes changes only the requested physical
-                    // sharding placement. Rewrapping the result retains the original logical batch-axis declaration.
+                    // A rank-preserving broadcast with identity output axes changes only the requested packed
+                    // sharding placement. Rewrapping the result retains the original batch-axis declaration.
                     let output_axes = (0..batch.r#type().rank()).collect::<Vec<_>>();
                     let value = batch.value.clone().legacy_broadcast(r#type.clone(), output_axes.as_slice())?;
                     ArrayBatch::new(r#type, value, batch.batch_axis)?
@@ -1152,18 +1113,19 @@ where
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<BatchedProgram<C>, BatchingError> {
+    ) -> Result<Self::BatchedProgram, BatchingError> {
+        // TODO(eaplatanios): Should we make `region.batched` return a `BatchedProgram` directly?
         let (program, output_axes) =
             region.batched(*context.axis_extent(), context.axis_sharding().clone(), input_axes, output_axes_policy)?;
-        Ok(BatchedProgram::direct(program, output_axes)?)
+        Ok(BatchedProgram::new(program, output_axes)?)
     }
 }
 
 impl ArrayType {
-    /// Normalizes and validates the provided [`BatchAxis`] against this physical [`ArrayType`],
-    /// returning its canonical [`BatchAxis`] and physical position.
+    /// Normalizes and validates the provided [`BatchAxis`] against this packed [`ArrayType`],
+    /// returning its canonical [`BatchAxis`] and position.
     pub fn normalize_batch_axis(&self, batch_axis: BatchAxis) -> Result<(BatchAxis, Option<usize>), BatchingError> {
-        // A possibly-negative mapped axis is normalized against the physical rank, following Python/JAX indexing:
+        // A possibly-negative mapped axis is normalized against this type's rank, following Python/JAX indexing:
         // valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
         Ok(match batch_axis.axis() {
             Some(axis) => match axis.normalize(self.rank()) {
@@ -1176,8 +1138,8 @@ impl ArrayType {
         })
     }
 
-    /// Returns the logical per-item [`ArrayType`] obtained by removing `batch_axis` from this physical [`ArrayType`].
-    /// A replicated axis leaves the type unchanged. Possibly-negative mapped axes are normalized against the physical
+    /// Returns the unbatched per-item [`ArrayType`] obtained by removing `batch_axis` from this packed [`ArrayType`].
+    /// A replicated axis leaves the type unchanged. Possibly-negative mapped axes are normalized against the packed
     /// rank. When the removed dimension carries sharding, only manual mesh axes remain visible as varying manual axes
     /// in the per-item type because all other placement belongs to the transform-owned batch dimension.
     #[inline]
@@ -1185,7 +1147,7 @@ impl ArrayType {
         self.unbatched_type_and_axis(batch_axis.into()).map(|(r#type, _)| r#type)
     }
 
-    /// Returns the logical per-item [`ArrayType`] together with the normalized [`BatchAxis`]. This internal form lets
+    /// Returns the unbatched per-item [`ArrayType`] together with the normalized [`BatchAxis`]. This internal form lets
     /// composite batch carriers validate and retain canonical axis metadata without cloning or otherwise projecting
     /// their array payloads.
     pub(crate) fn unbatched_type_and_axis(&self, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
@@ -1194,7 +1156,7 @@ impl ArrayType {
             return Ok((self.clone(), batch_axis));
         };
 
-        // This is a logical transform view, not an ordinary rank-changing array operation. In particular, explicit
+        // This is a transform-level view, not an ordinary rank-changing array operation. In particular, explicit
         // placement on the transform-owned mapped dimension describes how the batch is distributed; it is not part
         // of each batch item's placement. `ArrayType::without_dimension` correctly rejects dropping such placement
         // information for regular array dimensions, and so it cannot be used for these batching-specific semantics.
@@ -1207,7 +1169,7 @@ impl ArrayType {
 
             // Manual axes remain semantically visible after their ranked dimension is removed because values may
             // still vary across those axes. All other mesh axes are intentionally omitted (they placed the batch
-            // dimension itself, which is outside the logical per-item type).
+            // dimension itself, which is outside the unbatched per-item type).
             if let ShardingDimension::Sharded(axis_names) = removed_dimension {
                 varying_manual_axes.extend(
                     axis_names.into_iter().filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual)),
@@ -1258,7 +1220,7 @@ pub trait BatchingDriver<C: Context, P: BatchingPolicy<C>>: RegionDriver<C::Cons
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<BatchedProgram<C>, BatchingError>;
+    ) -> Result<P::BatchedProgram, BatchingError>;
 }
 
 impl<C: Context, P: BatchingPolicy<C>> BatchingDriver<C, P> for EmptyRegionDriver {
@@ -1279,7 +1241,7 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingDriver<C, P> for EmptyRegionDrive
         _region: RegionRef<'_, C::Constant, C::Operation>,
         _input_axes: &[BatchAxis],
         _output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<BatchedProgram<C>, BatchingError> {
+    ) -> Result<P::BatchedProgram, BatchingError> {
         Err(ProgramError::MalformedProgram("empty region driver cannot batch a program".to_string()).into())
     }
 }
@@ -1340,21 +1302,20 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<BatchedProgram<C>, BatchingError> {
+    ) -> Result<P::BatchedProgram, BatchingError> {
         P::batch_program(context, region, input_axes, output_axes_policy)
     }
 }
 
-/// Represents [`Operation`]s that can be batched (i.e., vectorized).
-///
-/// The trait is parameterized by the parent [`Context`] `C` that owns the physical values flowing through the batching
-/// transform, and every rule receives the active durable [`BatchingContext`] plus a [`BatchingDriver`]. Ordinary rules
-/// lift their operation to its batch-carrying inputs and then execute or stage the lifted work through
-/// `context.parent()` (typically via [`InterpretableBatchableOperation::interpret_with_batch_axes`]), so an eager
-/// parent interprets it immediately while a staging parent stages it into the enclosing trace. Rules whose semantics
-/// depend on the active transform frame (e.g., named-axis collectives) inspect [`BatchingContext::axis_name`] and
-/// [`BatchingContext::axis_extent`] directly, and recursive higher-order rules replay their nested programs through
-/// the same contract. Consequently, invoking a batching rule always requires an active [`BatchingContext`].
+/// Represents [`Operation`]s that can be batched (i.e., vectorized). The trait is parameterized by the parent
+/// [`Context`] `C` that owns the packed values flowing through the batching transform, and every rule receives
+/// the active durable [`BatchingContext`] plus a [`BatchingDriver`]. Ordinary rules lift their operation to its
+/// batch-carrying inputs and then execute or stage the lifted work through `context.parent()` (typically via
+/// [`InterpretableBatchableOperation::interpret_with_batch_axes`]), so an eager parent interprets it immediately while
+/// a staging parent stages it into the enclosing trace. Rules whose semantics depend on the active transform frame
+/// (e.g., named-axis collectives) inspect [`BatchingContext::axis_name`] and [`BatchingContext::axis_extent`] directly,
+/// and recursive higher-order rules replay their nested programs through the same contract. Consequently, invoking a
+/// batching rule always requires an active [`BatchingContext`].
 ///
 /// # Deriving Batchable Operation Enums
 ///
@@ -1373,7 +1334,7 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<C::Typ
     /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes.
     /// `context` borrows the durable [`BatchingContext`] for the transform level being applied. `driver` exposes the
     /// current operation application's regions and has a region count of zero for region-free applications. Packed
-    /// physical values in `inputs` and the returned outputs are owned by `context.parent()`.
+    /// values in `inputs` and the returned outputs are owned by `context.parent()`.
     ///
     /// # Contract
     ///
@@ -1388,9 +1349,9 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<C::Typ
     ///     arguments.
     ///   - **Zero Propagation:** Linear batching rules preserve zero tangent payloads through their operation-specific
     ///     semantics. Canonical staged zeros are handled before batching reaches concrete value-level interpretation.
-    ///   - **Parent-Owned Physical Work:** Ordinary rules must execute or stage lifted physical work through
-    ///     `context.parent()` and return parent-owned values; only rules keyed on the active frame's axis metadata
-    ///     inspect the [`BatchingContext`] itself.
+    ///   - **Parent-Owned Work:** Ordinary rules must execute or stage lifted work through `context.parent()` and
+    ///     return parent-owned values; only rules keyed on the active frame's axis metadata inspect the
+    ///     [`BatchingContext`] itself.
     ///
     /// Note that in order to be able to provide [`BatchableOperation`] implementations for operation families that
     /// select the generated batching dispatcher, it is a common convention for operations that can be part of such
@@ -1409,13 +1370,13 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<C::Typ
 // `Mul`, `Div`, `Neg`, `Sin`, `Cos`, `Select`, etc.). Operations with non-trivial axis arithmetic (e.g., `Dot`,
 // `Transpose`, `Reshape`, etc.) keep their explicit implementations. Coherence is preserved because none of those
 // types implement `ElementwiseOperation`. The rule follows JAX's `defbroadcasting` policy where every input is
-// broadcast to the common batched physical shape before the operation is applied, so the value-level primitive only
-// ever sees inputs that agree on shape. When no input is mapped there is no batch axis to thread, and so the inputs
-// are interpreted as given and every output is replicated. Otherwise, mapped inputs retain the first mapped input's
-// physical position when that position is valid for every mapped operand. For mixed ranks where it is not, they are
-// temporarily realigned to leading physical axis `0`. Every input is then broadcast to the common per-item shape with
-// the batch axis inserted there. Operands whose per-item shapes are not broadcast-compatible are left at their
-// batch-axis-inserted shapes so the operation surfaces its own shape error.
+// broadcast to the common batched shape before the operation is applied, so the value-level primitive only ever
+// sees inputs that agree on shape. When no input is mapped there is no batch axis to thread, and so the inputs are
+// interpreted as given and every output is replicated. Otherwise, mapped inputs retain the first mapped input's
+// position when that position is valid for every mapped operand. For mixed ranks where it is not, they are temporarily
+// realigned to leading axis `0`. Every input is then broadcast to the common per-item shape with the batch axis
+// inserted there. Operands whose per-item shapes are not broadcast-compatible are left at their batch-axis-inserted
+// shapes so the operation surfaces its own shape error.
 impl<
     C: Context<Type = ArrayType, Value: Transpose>,
     O: ElementwiseOperation + InterpretableOperation<C>,
@@ -1432,13 +1393,13 @@ impl<
         // No input carries the batch axis. Interpret the inputs as given and report every output replicated.
         // Any per-item shape broadcasting between replicated inputs is the operation's own concern.
         let Some(output_batch_axis_position) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
-            let physical_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            let output_count = Operation::infer_output_types(self, physical_types.as_slice(), &[])?.len();
+            let packed_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            let output_count = Operation::infer_output_types(self, packed_types.as_slice(), &[])?.len();
             return self.interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); output_count]);
         };
 
         // Preserve the first mapped input's natural position when every mapped input can represent it. Otherwise, use
-        // a leading internal axis, which is valid regardless of differences in logical per-item rank, and restore the
+        // a leading internal axis, which is valid regardless of differences in unbatched per-item rank, and restore the
         // natural output position after interpretation.
         let batch_axis_position = if inputs
             .iter()
@@ -1450,8 +1411,8 @@ impl<
         };
         let batch_axis = Axis::from(batch_axis_position);
 
-        // Preserve placement removed with each logical mapped dimension, then align every mapped input onto the common
-        // physical axis before broadcasting per-item shapes.
+        // Preserve placement removed with each mapped dimension, then align every mapped input onto the common
+        // batch-axis position before broadcasting per-item shapes.
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
         let unbatched_types = inputs
             .iter()
@@ -1472,8 +1433,8 @@ impl<
             .collect::<Vec<_>>();
         let inputs = inputs.iter().map(|input| input.move_axis(batch_axis)).collect::<Result<Vec<_>, _>>()?;
 
-        // Broadcast every operand to the common logical per-item shape when one exists. Otherwise, retain each input's
-        // own per-item shape and let the operation's inference report the incompatibility.
+        // Broadcast every operand to the common unbatched per-item shape when one exists. Otherwise, retain
+        // each input's own per-item shape and let the operation's inference report the incompatibility.
         let common_unbatched_type = Broadcastable::broadcasted(unbatched_types.as_slice()).ok();
         let axis_dimension = M::axis_dimension(context)?;
         let broadcasted_inputs = inputs
@@ -1482,22 +1443,22 @@ impl<
             .map(|(input, unbatched_type)| -> Result<ArrayBatch<C::Value>, BatchingError> {
                 let mut target_type = common_unbatched_type.as_ref().unwrap_or(unbatched_type).clone();
                 target_type.data_type = unbatched_type.data_type();
-                let mut physical_type =
+                let mut batched_type =
                     target_type.with_inserted_dimension(batch_axis_position, axis_dimension.clone())?;
                 if let Some(sharding) = target_type.sharding() {
-                    physical_type.sharding = Some(
+                    batched_type.sharding = Some(
                         sharding
                             .with_inserted_dimension(batch_axis_position, axis_sharding.clone())
                             .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
                     );
                 }
-                if physical_type == *input.r#type() {
+                if batched_type == *input.r#type() {
                     return Ok(input.clone());
                 }
 
                 // Right-align this input's per-item dimensions in the target while preserving the mapped dimension
-                // at the common physical position.
-                let target_unbatched_rank = physical_type.rank() - 1;
+                // at the common batch-axis position.
+                let target_unbatched_rank = batched_type.rank() - 1;
                 let is_mapped = !input.batch_axis().is_replicated();
                 let output_axes = (0..input.r#type().rank())
                     .map(|dimension| {
@@ -1511,11 +1472,11 @@ impl<
                     })
                     .collect();
 
-                // Resolve the source of every physical output dimension: the mapped axis comes from the
-                // transform's extent, static target dimensions carry their extents directly, and each dynamic target
-                // dimension is read from the broadcast-compatible source axis that supplied it (which exists by
-                // construction of the broadcasted target shape).
-                let dimension_sources = physical_type
+                // Resolve the source of every batched output dimension. The mapped axis comes from the transform's
+                // extent, static target dimensions carry their extents directly, and each dynamic target dimension is
+                // read from the broadcast-compatible source axis that supplied it (which exists by construction of the
+                // broadcasted target shape).
+                let dimension_sources = batched_type
                     .shape()
                     .dimensions()
                     .iter()
@@ -1540,13 +1501,13 @@ impl<
                                 {
                                     return None;
                                 }
-                                let physical_axis =
+                                let packed_axis =
                                     if source.batch_axis().is_replicated() || source_axis < batch_axis_position {
                                         source_axis
                                     } else {
                                         source_axis + 1
                                     };
-                                Some(DimensionSource::Value { source: source.value().clone(), axis: physical_axis })
+                                Some(DimensionSource::Value { source: source.value().clone(), axis: packed_axis })
                             })
                             .ok_or_else(|| {
                                 TypeError::invalid(format!(
@@ -1557,7 +1518,7 @@ impl<
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                M::broadcast_input(context, input, physical_type, output_axes, batch_axis, dimension_sources)
+                M::broadcast_input(context, input, batched_type, output_axes, batch_axis, dimension_sources)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1571,7 +1532,7 @@ impl<
     }
 }
 
-/// Policy for choosing a batched [`Program`]'s output axes. Program batching always replays the program over physical
+/// Policy for choosing a batched [`Program`]'s output axes. Program batching always replays the program over packed
 /// values whose mapped batch axes are specified by the caller. This policy controls how the replayed output tracers are
 /// packaged into the resulting program.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1593,11 +1554,11 @@ pub enum ProgramBatchingOutputAxesPolicy {
 
 /// Capability to interpret an [`Operation`] on [`BatchingPolicy`]-selected batches and repackage its outputs as batches
 /// carrying specified axes. This is the shared application path the per-operation [`BatchableOperation`] rules use once
-/// they have lifted an operation to its batch-carrying inputs. It centralizes the physical-value ownership invariant of
+/// they have lifted an operation to its batch-carrying inputs. It centralizes the packed-value ownership invariant of
 /// the batching transform: the lifted operation is always interpreted against `context.parent()`, which owns the packed
-/// physical values, and never against the [`BatchingContext`] itself. Every [`InterpretableOperation`] over the
-/// parent's values gets it for free through the blanket implementation below, so an operation earns it directly from
-/// its interpretation rule.
+/// values, and never against the [`BatchingContext`] itself. Every [`InterpretableOperation`] over the parent's values
+/// gets it for free through the blanket implementation below, so an operation earns it directly from its interpretation
+/// rule.
 pub trait InterpretableBatchableOperation<C: Context, P: BatchingPolicy<C>> {
     /// Interprets this operation on the *unpacked* values of batched `inputs` against `context.parent()` and repackages
     /// each output as a [`BatchingPolicy`]-selected batch carrying the corresponding `output_batch_axes` entry.
@@ -1626,7 +1587,7 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
     ) -> Result<Vec<P::Batch>, BatchingError> {
         // Every `InterpretableOperation` over the parent context's values is an `InterpretableBatchableOperation`.
         // The batched interpretation unpacks the input values, interprets the operation once through `interpret`
-        // against the parent context (which owns those physical values), and repackages each output with its
+        // against the parent context (which owns those packed values), and repackages each output with its
         // requested `BatchAxis`.
         if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -1642,7 +1603,7 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
     }
 }
 
-/// [`Context`] used to batch a computation by introducing exactly one logical mapped axis. [`BatchingContext`] is the
+/// [`Context`] used to batch a computation by introducing exactly one mapped batch axis. [`BatchingContext`] is the
 /// active context for one batching level. Its [`BatchingPolicy`] selects both the batch-carrying representation and the
 /// extent representation, allowing ordinary homogeneous arrays to use a static `usize` while composite programs retain
 /// a first-class dimension value. [`Operation`]s bound through this context are lifted through their
@@ -1772,11 +1733,11 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
 }
 
 /// Batch-carrying value flowing through a [`BatchingContext`]. The function being batched operates on
-/// [`BatchingTracer`]s directly. Each operation dispatches through the stamped context via [`Context::bind`],
-/// which applies the operation's [`BatchableOperation`] implementation against the parent context. An eager parent
-/// owns concrete physical values, while a staging parent owns [`Tracer`](crate::Tracer)s in the enclosing trace.
-/// The [`Typed`] view is always the policy-provided logical per-item type. The policy-selected inner carrier retains
-/// the physical value and any mapped-axis metadata.
+/// [`BatchingTracer`]s directly. Each operation dispatches through the stamped context via [`Context::bind`], which
+/// applies the operation's [`BatchableOperation`] implementation against the parent context. An eager parent owns
+/// concrete packed values, while a staging parent owns [`Tracer`](crate::Tracer)s in the enclosing trace. The [`Typed`]
+/// view is always the policy-provided unbatched per-item type. The policy-selected inner carrier retains the packed
+/// value and any mapped-axis metadata.
 #[derive(Clone, Parameter)]
 pub struct BatchingTracer<C: Context, P: BatchingPolicy<C>> {
     /// [`BatchingContext`] this value flows through, used to dispatch operations that involve it.
@@ -1884,7 +1845,7 @@ impl<
     /// [`TracingContext`], lifts every instruction through its [`BatchableOperation`] rule, and extracts the resulting
     /// staged program together with the requested [`ProgramBatchingOutputAxesPolicy`].
     ///
-    /// This method is intentionally specific to [`ArrayType`]. It constructs physical mapped input types by inserting
+    /// This method is intentionally specific to [`ArrayType`]. It constructs mapped batched input types by inserting
     /// static [`Dimension`]s, rewrites array sharding metadata, and materializes output axes through [`ArrayBatch`].
     /// Composite program families with first-class dynamic dimension extent values instead own structural recursion
     /// through [`RecursiveBatchingPolicy::batch_program`], where the [`RecursiveBatchingPolicy`] can define how extent
@@ -1934,11 +1895,11 @@ impl<
                 .map(|(unbatched_type, batch_axis)| {
                     let batched_type = match batch_axis.axis() {
                         Some(axis) => {
-                            // A possibly-negative mapped axis is normalized against the physical input rank (i.e.,
-                            // with the inserted batch dimension counted). Valid axes lie in `[-rank, rank)`, with `-1`
+                            // A possibly-negative mapped axis is normalized against the packed input rank (i.e., with
+                            // the inserted batch dimension counted). Valid axes lie in `[-rank, rank)`, with `-1`
                             // denoting the final axis.
-                            let physical_rank = unbatched_type.rank() + 1;
-                            let position = axis.normalize(physical_rank).map_err(|_| {
+                            let batched_rank = unbatched_type.rank() + 1;
+                            let position = axis.normalize(batched_rank).map_err(|_| {
                                 BatchingError::BatchAxisOutOfBounds { r#type: Box::new(unbatched_type.clone()), axis }
                             })?;
                             let mut batched_type =
@@ -2004,7 +1965,7 @@ impl<
                 };
 
                 // Move naturally mapped outputs or broadcast naturally replicated outputs while they are still live
-                // tracers, then report the normalized physical position stored by `ArrayBatch`.
+                // tracers, then report the normalized position stored by `ArrayBatch`.
                 let output =
                     output.align_axis(target_batch_axis, axis_size, batching_context.axis_sharding().clone())?;
                 output_axes.push(output.batch_axis());
@@ -2056,8 +2017,8 @@ impl<
 /// Extension trait that exposes a [`BatchingEntrypointPolicy`]-selected batching transform as a function on a
 /// [`Context`]. Refer to [`batch`] for the transform semantics. This trait also serves call sites that must name the
 /// context explicitly, most notably empty input structures from which the free function cannot recover an execution
-/// domain. [`Self::Policy`] selects the batch carrier, mapped-extent representation, and physical boundary mechanics
-/// for this context's program universe.
+/// domain. [`Self::Policy`] selects the batch carrier, mapped-extent representation, and boundary mechanics for this
+/// context's program universe.
 pub trait Batch: Context {
     /// Canonical [`BatchingEntrypointPolicy`] for this [`Context`]'s [`Program`] universe.
     type Policy: BatchingEntrypointPolicy<Self>;
@@ -2098,7 +2059,7 @@ pub trait Batch: Context {
             .into_parameters()
             .collect::<Vec<_>>();
 
-        // The active policy validates and packs flat inputs, selects the extent representation, normalizes physical
+        // The active policy validates and packs flat inputs, selects the extent representation, normalizes sharding
         // placement, and returns the configured context. Parameter structure remains entirely outside that boundary.
         let (context, inputs) = Self::Policy::prepare_inputs(self, inputs, input_batch_axes, batch_axis.into())?;
         let inputs = inputs.into_iter().map(|batch| BatchingTracer::new(context.clone(), batch)).collect::<Vec<_>>();
@@ -2153,10 +2114,10 @@ impl<C: Context<Type: BatchableType<Policy: BatchingEntrypointPolicy<C>>>> Batch
 /// corresponding parameter structure via [`Parameterized::broadcast_to_parameter_structure`]: a single [`BatchAxis`]
 /// applies to every leaf, a value whose structure matches gives one axis per leaf, and a smaller compatible structure
 /// broadcasts based on its prefixes. On the input side, [`BatchAxis::new(k)`](BatchAxis::new) maps the leaf on axis
-/// `k` of its physical type, while [`BatchAxis::replicated`] shares the leaf unchanged across the batch. On the output
+/// `k` of its packed type, while [`BatchAxis::replicated`] shares the leaf unchanged across the batch. On the output
 /// side, [`BatchAxis::new(k)`](BatchAxis::new) requests the mapped axis at position `k`: a naturally mapped output is
 /// transposed when needed, while a naturally replicated output is broadcast across the batch, matching JAX's `vmap`.
-/// Negative axes are normalized against the physical input or requested output rank, so `-1` denotes the final axis.
+/// Negative axes are normalized against the packed input or requested output rank, so `-1` denotes the final axis.
 /// [`BatchAxis::replicated`] requires the output to remain replicated; collapsing a genuinely mapped output instead
 /// requires an explicit reduction inside `function`.
 ///
@@ -2202,7 +2163,7 @@ pub fn batch<
     context.batch(function, input, input_batch_axes, output_batch_axes, batch_axis)
 }
 
-/// Derives the common [`ShardingDimension`] of mapped axes from physical array types and normalized axis positions.
+/// Derives the common [`ShardingDimension`] of mapped axes from packed array types and normalized axis positions.
 /// This representation-neutral helper lets homogeneous and composite batching share the same placement join without
 /// projecting or cloning array payloads.
 pub(crate) fn batch_axis_sharding<T: std::borrow::Borrow<ArrayType>, I: IntoIterator<Item = (T, Option<usize>)>>(
@@ -2268,7 +2229,7 @@ pub(crate) fn normalized_batch_axis_type(
     position: usize,
     axis_sharding: &ShardingDimension,
 ) -> Result<Option<ArrayType>, BatchingError> {
-    // An unsharded type has no physical placement metadata to normalize.
+    // An unsharded type has no placement metadata to normalize.
     let Some(sharding) = r#type.sharding() else {
         return Ok(None);
     };
@@ -2278,7 +2239,7 @@ pub(crate) fn normalized_batch_axis_type(
         return Ok(None);
     }
 
-    // The batch carrier has already normalized and validated `position` against the physical array rank. Replace only
+    // The batch carrier has already normalized and validated `position` against the array's rank. Replace only
     // that dimension's placement, leaving every non-batch dimension unchanged.
     let mut dimensions = sharding.dimensions().to_vec();
     dimensions[position] = axis_sharding.clone();
@@ -2303,7 +2264,7 @@ pub(crate) fn normalized_batch_axis_type(
         .and_then(|normalized| normalized.with_varying_manual_axes(varying_manual_axes))
         .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
 
-    // Install the validated sharding on a cloned physical type. Returning `Some` tells the caller that it must
+    // Install the validated sharding on a cloned packed type. Returning `Some` tells the caller that it must
     // materialize this placement change rather than reuse the input value unchanged.
     r#type
         .clone()
@@ -2332,6 +2293,7 @@ mod tests {
     use crate::operations::constants::OneLike;
     use crate::operations::math::{AddOperation, NegOperation, Reduce, ReductionKind};
     use crate::parameters::Placeholder;
+    use crate::programs::builders::ProgramBuilder;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::{DomainTracingContext, Trace};
@@ -2342,7 +2304,7 @@ mod tests {
     /// Batch carrier for the shared three-member projection fixture.
     #[derive(Clone, Debug, PartialEq)]
     struct ProjectedProgramBatch {
-        /// Physical composite value.
+        /// Packed composite value.
         value: ProjectedProgramValue,
 
         /// Mapped axis, which only the fixture's first member kind may carry.
@@ -2374,6 +2336,7 @@ mod tests {
     impl BatchingPolicy<ProjectedProgramContext> for ProjectedProgramBatching {
         type Batch = ProjectedProgramBatch;
         type Extent = usize;
+        type BatchedProgram = BatchedProgram<ProjectedProgramContext>;
 
         fn batch(value: ProjectedProgramValue, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
             if !batch_axis.is_replicated() && !matches!(value, ProjectedProgramValue::First(_)) {
@@ -2409,6 +2372,30 @@ mod tests {
             }
             Ok(inputs.to_vec())
         }
+    }
+
+    // TODO(eaplatanios): This unit test does not appear to follow our conventions on naming or placement/ordering.
+    #[test]
+    fn test_direct_batched_program_validates_and_preserves_its_boundary() -> Result<(), ProgramError> {
+        type Context = EagerContext<Array, ArrayOperation<Array>>;
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])?;
+        let Err(error) = BatchedProgram::<Context>::new(program, Vec::new()) else {
+            panic!("direct batched program accepted mismatched output axes");
+        };
+        assert_eq!(error, ProgramError::InvalidOutputCount { expected: 1, actual: 0 });
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])?;
+        let (program, output_axes) =
+            BatchedProgram::<Context>::new(program, vec![BatchAxis::replicated()])?.into_parts();
+        assert_eq!(program.output_ids(), &[input]);
+        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+
+        Ok(())
     }
 
     #[test]
@@ -2494,7 +2481,7 @@ mod tests {
         let matrix_type = matrix.r#type().into_owned();
 
         // `new` builds a batched value when the mapped axis is in bounds, and the accessors report the packed value,
-        // its physical type, the batch size read off the mapped axis, and the per-item type with that axis removed.
+        // its packed type, the batch size read off the mapped axis, and the per-item type with that axis removed.
         let batched = ArrayBatch::new(matrix_type.clone(), matrix.clone(), Some(0)).unwrap();
         assert_eq!(batched.batch_axis(), BatchAxis::new(0));
         assert_eq!(batched.value(), &matrix);
@@ -2513,7 +2500,7 @@ mod tests {
         );
 
         // Negative axes follow Python/JAX indexing and are normalized once at construction.
-        // `-1` denotes the final physical axis and the stored metadata is the canonical nonnegative position.
+        // `-1` denotes the final axis and the stored metadata is the canonical nonnegative position.
         let batched_axis_negative_one =
             ArrayBatch::new(matrix_type.clone(), matrix.clone(), BatchAxis::new(-1)).unwrap();
         assert_eq!(batched_axis_negative_one.batch_axis(), BatchAxis::new(1));
@@ -2533,7 +2520,7 @@ mod tests {
         );
 
         // `replicated` shares the value unchanged across the batch: no mapped axis, no batch size, and the per-item
-        // type is the whole physical type.
+        // type is the whole packed type.
         let vector = Array::vector(vec![1.0, 2.0, 3.0]);
         let vector_type = vector.r#type().into_owned();
         let replicated = ArrayBatch::replicated(vector.clone());
@@ -2668,7 +2655,7 @@ mod tests {
         assert_eq!(batched.align_axis(BatchAxis::new(0), 2, ShardingDimension::Replicated).unwrap(), batched);
 
         // Aligning to a different mapped position stages a transpose (like `move_axis`). [2, 3] mapped at 0 becomes
-        // [3, 2] mapped at 1. The equivalent negative declaration is normalized against the physical output rank.
+        // [3, 2] mapped at 1. The equivalent negative declaration is normalized against the batched output rank.
         let aligned = batched.align_axis(BatchAxis::new(-1), 2, ShardingDimension::Replicated).unwrap();
         assert_eq!(aligned.batch_axis(), BatchAxis::new(1));
         assert_eq!(
@@ -2774,26 +2761,26 @@ mod tests {
         for (batch_axis, dimensions) in [vec![2, 3, 4], vec![3, 2, 4], vec![3, 4, 2]].into_iter().enumerate() {
             let mut sharding_dimensions = vec![ShardingDimension::replicated(); 3];
             sharding_dimensions[batch_axis] = ShardingDimension::sharded(["x"]);
-            let physical_type =
+            let batched_type =
                 ArrayType::new(DataType::F64, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))
                     .with_sharding(Sharding::new(mesh.clone(), sharding_dimensions).unwrap())
                     .unwrap();
             let batch = ArrayBatch::new(
-                physical_type.clone(),
-                Array::from_f64s(physical_type.clone(), (0..24).map(f64::from).collect()),
+                batched_type.clone(),
+                Array::from_f64s(batched_type.clone(), (0..24).map(f64::from).collect()),
                 BatchAxis::from_position(batch_axis),
             )
             .unwrap();
-            let mut logical_dimensions = physical_type.shape().dimensions().to_vec();
-            logical_dimensions.remove(batch_axis);
+            let mut unbatched_dimensions = batched_type.shape().dimensions().to_vec();
+            unbatched_dimensions.remove(batch_axis);
             assert_eq!(
                 batch.unbatched_type(),
-                ArrayType::new(DataType::F64, Shape::new(logical_dimensions))
+                ArrayType::new(DataType::F64, Shape::new(unbatched_dimensions))
                     .with_sharding(Sharding::replicated(mesh.clone(), 2))
                     .unwrap(),
             );
             let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[batch.clone(), batch]).unwrap();
-            assert_eq!(outputs[0].r#type(), Cow::Borrowed(&physical_type));
+            assert_eq!(outputs[0].r#type(), Cow::Borrowed(&batched_type));
             assert_eq!(outputs[0].batch_axis(), BatchAxis::from_position(batch_axis));
         }
     }
@@ -2849,7 +2836,7 @@ mod tests {
             ArrayBatch::new(r#type.clone(), Array::from_f64s(r#type.clone(), values), axis).unwrap()
         };
 
-        // Batching rules always receive the active `BatchingContext`, with the physical work running
+        // Batching rules always receive the active `BatchingContext`, with the underlying work running
         // through its parent context.
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
 
@@ -2875,8 +2862,8 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
-        // Physical mapped-axis positions are canonicalized independently of operand rank. The rank-3 left operand
-        // maps its trailing axis while the rank-1 right operand maps its only axis; their logical per-item shapes are
+        // Packed mapped-axis positions are canonicalized independently of operand rank. The rank-3 left operand
+        // maps its trailing axis while the rank-1 right operand maps its only axis; their unbatched per-item shapes are
         // `[3, 4]` and scalar, respectively. The output is restored to the first mapped input's trailing axis.
         let left_type = ArrayType::new(
             DataType::F64,
@@ -2981,7 +2968,7 @@ mod tests {
     fn test_region_batching_preserves_mapped_axis_sharding() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let logical_sharding = if axis_type == MeshAxisType::Manual {
+            let unbatched_sharding = if axis_type == MeshAxisType::Manual {
                 Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
                     .unwrap()
                     .with_varying_manual_axes(["x"])
@@ -2989,11 +2976,11 @@ mod tests {
             } else {
                 Sharding::replicated(mesh.clone(), 1)
             };
-            let logical_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
-                .with_sharding(logical_sharding)
+            let unbatched_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
+                .with_sharding(unbatched_sharding)
                 .unwrap();
             let (_, program) =
-                EagerContext::<Array, ArrayOperation<Array>>::trace(|inputs: Vec<_>| Ok(inputs), vec![logical_type])
+                EagerContext::<Array, ArrayOperation<Array>>::trace(|inputs: Vec<_>| Ok(inputs), vec![unbatched_type])
                     .unwrap();
 
             let (batched, output_axes) = program
@@ -3023,7 +3010,7 @@ mod tests {
 
     #[test]
     fn test_program_batched_transforms_input_and_output_axes() {
-        // Trace a per-item squaring function into a flat program over per-item (logical) vector types.
+        // Trace a per-item squaring function into a flat program over per-item vector types.
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
@@ -3031,7 +3018,7 @@ mod tests {
         )
         .unwrap();
 
-        // A mapped input at axis 0 turns the program into one over `[2, 3]`-shaped physical inputs that squares each
+        // A mapped input at axis 0 turns the program into one over `[2, 3]`-shaped packed inputs that squares each
         // row, with the output naturally mapped on the same axis.
         let (batched, output_axes) = program
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
@@ -3041,8 +3028,8 @@ mod tests {
         let outputs = batched.interpret(vec![input]).unwrap();
         assert_eq!(outputs, vec![Array::matrix(2, 3, vec![1.0, 4.0, 9.0, 16.0, 25.0, 36.0])]);
 
-        // A negative input axis is normalized against the physical input rank. Mapping the final axis consumes a
-        // `[3, 2]` physical value and preserves that canonical axis through the elementwise body.
+        // A negative input axis is normalized against the packed input rank. Mapping the final axis consumes a
+        // `[3, 2]` packed value and preserves that canonical axis through the elementwise body.
         let (batched, output_axes) = program
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(-1)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap();
@@ -3051,7 +3038,7 @@ mod tests {
         let outputs = batched.interpret(vec![input]).unwrap();
         assert_eq!(outputs, vec![Array::matrix(3, 2, vec![1.0, 16.0, 4.0, 25.0, 9.0, 36.0])]);
 
-        // A replicated input keeps its logical `[3]` type, and `AlignAllTo(0)` broadcasts the naturally replicated
+        // A replicated input keeps its unbatched `[3]` type, and `AlignAllTo(0)` broadcasts the naturally replicated
         // output across the batch so the batched program still produces one `[2, 3]` output per item.
         let (batched, output_axes) = program
             .batched(
