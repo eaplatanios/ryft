@@ -2,6 +2,7 @@ use std::fmt::{Debug, Display};
 use std::ops::Deref;
 
 use crate::axes::{Axes, Axis};
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -259,11 +260,11 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for TransposeOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for TransposeOperation
 where
     TransposeOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

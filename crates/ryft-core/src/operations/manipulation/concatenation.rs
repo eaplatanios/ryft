@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::axes::Axis;
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -257,11 +258,12 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchableOperation<C> for ConcatenateOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchableOperation<C, ArrayBatchingPolicy>
+    for ConcatenateOperation
 where
     ConcatenateOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

@@ -2,6 +2,7 @@ use std::fmt::Display;
 use std::ops::{Div, Mul};
 
 use crate::backends::scalars::Scalar;
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -379,11 +380,11 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReduceOp
 /// rule lifts them past the inserted batch dimension with `lift_reduce_axes` and re-interprets the lifted reduction
 /// over the physical batched value, with a requested output sharding gaining the mapped axis's sharding at the new
 /// output batch axis position (mirroring the dot batching rule).
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ReduceOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for ReduceOperation
 where
     ReduceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

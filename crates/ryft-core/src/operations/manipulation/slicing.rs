@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -323,11 +324,11 @@ where
 
 /// Batching rule for [`SliceOperation`]: a batched operand keeps its batch axis by slicing it fully, so the lifted
 /// operation inserts start index `0`, limit `axis_size`, and stride `1` at the batch axis position.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for SliceOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for SliceOperation
 where
     SliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
@@ -729,12 +730,12 @@ where
 /// Batching rule for [`UpdateSliceOperation`]: the input and update operands are aligned on one physical batch axis
 /// (replicated operands are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
 /// so each batch item updates its own block.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for UpdateSliceOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for UpdateSliceOperation
 where
     C::Value: LegacyBroadcast + Transpose,
     UpdateSliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
@@ -1005,13 +1006,13 @@ where
 /// batch axis is `0` even when the operand carried its batch axis elsewhere). The expansion stages `O(batch_size)`
 /// operations — a gather-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts
 /// because it only goes through the value capability traits.
-impl<C> BatchableOperation<C> for DynamicSliceOperation
+impl<C> BatchableOperation<C, ArrayBatchingPolicy> for DynamicSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: ZeroLike + LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     DynamicSliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
@@ -1289,13 +1290,13 @@ where
 /// even when the operands carried their batch axes elsewhere). The expansion stages `O(batch_size)` operations — a
 /// scatter-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts because it
 /// only goes through the value capability traits.
-impl<C> BatchableOperation<C> for DynamicUpdateSliceOperation
+impl<C> BatchableOperation<C, ArrayBatchingPolicy> for DynamicUpdateSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: ZeroLike + LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     DynamicUpdateSliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

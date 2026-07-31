@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -246,11 +247,12 @@ impl_differentiable_operation! {
 /// Batching rule for [`SortOperation`]: every mapped operand's batch axis moves to the leading physical position,
 /// replicated operands broadcast to the batched physical shape (all sort operands must agree on shape), and the
 /// sort axis lifts past the inserted leading batch dimension while the `key_count` carries through unchanged.
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchableOperation<C> for SortOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchableOperation<C, ArrayBatchingPolicy>
+    for SortOperation
 where
     SortOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

@@ -8,6 +8,7 @@
 
 use std::fmt::{Debug, Display};
 
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
@@ -1497,7 +1498,7 @@ where
 /// rules against the same active context. This is the operational path eager batched scans execute either way, and
 /// its physical stacked accumulators retain per-item placement metadata exactly. Constants lift and stacked-output
 /// accumulators seed (via the parent's [`Zero`]) through `context.parent()`.
-impl<C> BatchableOperation<C> for ScanOperation<C::Constant>
+impl<C> BatchableOperation<C, ArrayBatchingPolicy> for ScanOperation<C::Constant>
 where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
     <C as Domain>::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape,
@@ -1509,7 +1510,7 @@ where
         + From<LegacyReshapeOperation>
         + From<ScanOperation<C::Constant>>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         driver: &D,
@@ -1587,7 +1588,7 @@ where
             // a staged broadcast) and stage one batched scan over the batched body.
             for (carry, carry_axis) in carries.iter_mut().zip(carry_axes.iter()) {
                 if !carry_axis.is_replicated() && carry.batch_axis().is_replicated() {
-                    *carry = carry.broadcast(0, context.axis_size(), context.axis_sharding().clone())?;
+                    *carry = carry.broadcast(0, *context.axis_extent(), context.axis_sharding().clone())?;
                 }
             }
             let batched_scan = ScanOperation::<C::Constant>::new(carry_count, self.length())
@@ -3911,7 +3912,7 @@ mod tests {
                     &tracer_inputs,
                 )
                 .unwrap();
-            let output_axes = outputs.iter().map(BatchingTracer::batch_axis).collect::<Vec<_>>();
+            let output_axes = outputs.iter().map(|output| output.batch().batch_axis()).collect::<Vec<_>>();
             let output_atoms =
                 outputs.iter().map(|output| output.batch().value().atom_id().unwrap()).collect::<Vec<_>>();
             drop(outputs);

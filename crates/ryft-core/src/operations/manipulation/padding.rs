@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -533,13 +534,13 @@ where
 /// padding value is vectorized with a constant-size mask construction: pad the operand with zero, pad an all-true
 /// input mask with false, broadcast the per-item padding values over the padded result, and select those values at
 /// padding positions.
-impl<C> BatchableOperation<C> for PadOperation
+impl<C> BatchableOperation<C, ArrayBatchingPolicy> for PadOperation
 where
     C: Context<Type = ArrayType> + One<C::Value> + Zero<C::Value>,
     C::Value: LegacyBroadcast + Pad + Select + Transpose,
     PadOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

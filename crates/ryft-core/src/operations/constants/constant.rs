@@ -2,7 +2,8 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
+    ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    BatchingTracer,
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
@@ -118,13 +119,13 @@ impl<V: Value, C: Context<Type = V::Type, Operation: From<ConstantOperation<V>>>
 }
 
 impl_non_differentiable_operation!(<V> ConstantOperation<V> where V: Value);
-impl_nullary_transposable_operation!(<F> ConstantOperation<F> where F: Value);
+impl_nullary_transposable_operation!(<V> ConstantOperation<V> where V: Value);
 
 impl<Stored: Value<Type = ArrayType>, C: Context<Type = ArrayType, Operation: From<ConstantOperation<Stored>>>>
-    BatchableOperation<C> for ConstantOperation<Stored>
+    BatchableOperation<C, ArrayBatchingPolicy> for ConstantOperation<Stored>
 {
     #[inline]
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
@@ -181,10 +182,10 @@ impl<C: StagingContext> Constant<Tracer<C>, C::Constant> for C {
     }
 }
 
-impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored>, Stored> Constant<BatchingTracer<C>, Stored>
-    for BatchingContext<C>
+impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored>, Stored>
+    Constant<BatchingTracer<C, ArrayBatchingPolicy>, Stored> for BatchingContext<C>
 {
-    fn constant(&self, value: Stored) -> Result<BatchingTracer<C>, ProgramError> {
+    fn constant(&self, value: Stored) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
         let value = self.parent().constant(value)?;
         let r#type = value.r#type().into_owned();
         let batch = ArrayBatch::new(r#type, value, BatchAxis::replicated())?;

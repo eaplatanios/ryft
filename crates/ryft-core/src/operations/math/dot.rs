@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 
 use crate::backends::scalars::Scalar;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
@@ -628,26 +628,26 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast>> crate::batching::BatchableOperation<C> for DotOperation
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast>> BatchableOperation<C, ArrayBatchingPolicy> for DotOperation
 where
     DotOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
-        inputs: &[crate::batching::ArrayBatch<C::Value>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         // Validate the common batch size across both operands (catching mismatched batched operands) before the
         // mixed arms consult it; a mixed operand pair always has at least one mapped operand.
-        let axis_size = crate::batching::ArrayBatch::common_batch_size(inputs)?;
+        let axis_size = ArrayBatch::common_batch_size(inputs)?;
         // Mixed batched/unbatched: broadcast the replicated operand to gain a singleton batch
         // axis at position 0 (JAX's `matchaxis(0)` convention), then fall through to the
         // both-batched arm of `lift_dot_dimensions`.
         let mixed_axis_size = || axis_size.expect("a mapped input pins the batch size");
-        let aligned_inputs: Vec<crate::batching::ArrayBatch<C::Value>> = match (batch_axes[0], batch_axes[1]) {
+        let aligned_inputs: Vec<ArrayBatch<C::Value>> = match (batch_axes[0], batch_axes[1]) {
             (Some(_), Some(_)) | (None, None) => inputs.to_vec(),
             (Some(_), None) => {
                 vec![inputs[0].clone(), inputs[1].broadcast(0, mixed_axis_size(), context.axis_sharding().clone())?]
@@ -661,7 +661,7 @@ where
             .ok_or_else(|| BatchingError::MisalignedBatchAxes {
                 message: "'dot' batching failed to lift its dimension numbers for the aligned batch axes".to_string(),
             })?;
-        let axis_sharding = crate::batching::ArrayBatch::sharding_for_inputs(inputs)?;
+        let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
         let lifted_op = DotOperation::new(lifted_dimensions)
             .with_accumulation_type(self.accumulation_type)
             .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis, axis_sharding)?);
@@ -1347,12 +1347,12 @@ where
 /// from the lifted operation and multiplied into the `[b, m, n]` result per batch item instead. The rank-3 form has
 /// no rank-4 analogue, so batching an already-batched `scaled_dot` reports an error directing users to batch an
 /// explicit dequantization composition instead.
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Mul + Transpose>> BatchableOperation<C>
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Mul + Transpose>> BatchableOperation<C, ArrayBatchingPolicy>
     for ScaledDotOperation
 where
     ScaledDotOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

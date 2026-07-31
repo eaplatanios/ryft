@@ -31,6 +31,7 @@
 
 use std::fmt::Display;
 
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -260,11 +261,11 @@ impl_differentiable_operation! {
 
 /// Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
 /// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ReshardOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for ReshardOperation
 where
     ReshardOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
@@ -466,11 +467,11 @@ impl_differentiable_operation! {
 /// entry at the new batch dimension: the hint governs only the compiler-propagated auto axes, so the new dimension
 /// is left open for the backend to fill rather than pinned to a derived or replicated entry (matching JAX's
 /// `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ShardingConstraintOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for ShardingConstraintOperation
 where
     ShardingConstraintOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

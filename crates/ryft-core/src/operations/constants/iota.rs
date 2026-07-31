@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{ArrayBatch, ArrayBatchingPolicy, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -198,9 +198,15 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<BatchingTracer<C>> for BatchingContext<C> {
+impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<BatchingTracer<C, ArrayBatchingPolicy>>
+    for BatchingContext<C>
+{
     #[inline]
-    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<BatchingTracer<C>, ProgramError> {
+    fn iota(
+        &self,
+        r#type: &ArrayType,
+        dimension: usize,
+    ) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().iota(r#type, dimension)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }

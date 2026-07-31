@@ -2,6 +2,7 @@ use std::fmt::{Display, Formatter};
 use std::ops::{Add, Mul};
 
 use crate::backends::scalars::Scalar;
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiableType;
@@ -239,12 +240,12 @@ where
 
 // Keep the dedicated operation intact when batching into a staging parent so that backends can lower the packed basis
 // directly. The generic replicated-nullary rule interprets its operation and would expand this primitive instead.
-impl<C> BatchableOperation<C> for CoordinateBasisOperation<ArrayType>
+impl<C> BatchableOperation<C, ArrayBatchingPolicy> for CoordinateBasisOperation<ArrayType>
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<CoordinateBasisOperation<ArrayType>>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

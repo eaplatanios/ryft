@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
 use crate::backends::scalars::Scalar;
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -322,12 +323,12 @@ impl_non_transposable_operation!(RngBitGeneratorOperation);
 ///
 /// A *replicated* state is rejected: every batch item would see the same state and silently draw identical,
 /// correlated bits, so callers derive one state per batch item with [`split_key`] and map over the states instead.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for RngBitGeneratorOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for RngBitGeneratorOperation
 where
     C::Value: Transpose,
     C::Operation: From<RngBitGeneratorOperation> + From<ScanOperation<C::Constant>>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
@@ -359,7 +360,7 @@ where
 
         // Stage one carry-free scan over the per-item states; its stacked outputs are the mapped advanced states
         // and the mapped bits, both at batch axis 0.
-        let scan = ScanOperation::<C::Constant>::new(0, context.axis_size());
+        let scan = ScanOperation::<C::Constant>::new(0, *context.axis_extent());
         let mut outputs = context.parent().bind(scan, vec![body], std::slice::from_ref(states.value()))?;
         check_count!("output", outputs, 2, ProgramError);
         let bits = outputs.remove(1);

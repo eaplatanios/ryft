@@ -7,6 +7,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
@@ -828,7 +829,7 @@ fn reconcile_branch<C: Context>(
 ///     family's batching rules against the same active context, so the multi-operation rewrite composes for eager
 ///     and staging parents alike. Effectful branches are rejected because evaluating both branches would perform
 ///     effects that the per-item selection cannot mask.
-impl<C, O> BatchableOperation<C> for ConditionOperation<C::Constant>
+impl<C, O> BatchableOperation<C, ArrayBatchingPolicy> for ConditionOperation<C::Constant>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: Concretizable<bool> + LegacyBroadcast + Transpose + Select,
@@ -838,7 +839,7 @@ where
         + From<SelectOperation>
         + From<ConditionOperation<C::Constant>>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         driver: &D,

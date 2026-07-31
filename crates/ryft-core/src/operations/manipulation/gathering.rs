@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -385,13 +386,13 @@ where
 /// restack along a fresh leading batch axis. This stages `O(axis_size)` gathers but is correct for every
 /// dimension-number configuration; dimension-number lifting (one lifted gather, no expansion) is a performance
 /// optimization left as a follow-up. When no input is mapped the gather applies once, unbatched.
-impl<C> BatchableOperation<C> for GatherOperation
+impl<C> BatchableOperation<C, ArrayBatchingPolicy> for GatherOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     GatherOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

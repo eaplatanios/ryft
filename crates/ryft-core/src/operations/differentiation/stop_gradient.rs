@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -95,11 +96,11 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for StopGradientOperation wher
 /// [`Context`]. Rebinding is essential when the parent value is itself a differentiation or batching tracer: treating
 /// the packed value as an ordinary interpreted identity would clone that tracer and silently expose its tangent to an
 /// enclosing transform.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for StopGradientOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for StopGradientOperation
 where
     C::Operation: From<StopGradientOperation>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         _driver: &D,

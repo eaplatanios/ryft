@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -399,8 +400,8 @@ impl_differentiable_operation! {
 
 /// Foreign kernels are opaque, so there is no batching rule to derive: batching reports an error, and callers
 /// should invoke a kernel that understands the batch axis instead.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for CustomCallOperation {
-    fn batch<D: BatchingDriver<C>>(
+impl<C: Context<Type = ArrayType>> BatchableOperation<C, ArrayBatchingPolicy> for CustomCallOperation {
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         _context: &BatchingContext<C>,
         _driver: &D,
