@@ -70,6 +70,7 @@
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 use thiserror::Error;
@@ -617,7 +618,7 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
 /// [`Type`] capability selecting the canonical [`BatchingEntrypointPolicy`] used by the public batching transform. This
 /// is a batching-owned extension of [`Type`] and not part of the core type contract. It lets one blanket [`Batch`]
 /// implementation select the canonical policy for each program universe without adding batching machinery to [`Type`]
-/// or [`Context`] and without relying on overlapping blanket implementations distinguished only by [`Context::Type`].
+/// or [`Context`] and without relying on overlapping blanket implementations distinguished only by [`Domain::Type`].
 pub trait BatchableType: Type {
     /// Canonical [`BatchingEntrypointPolicy`] selecting this type universe's batch carrier, extent representation,
     /// and public entrypoint behavior.
@@ -711,67 +712,62 @@ pub trait BatchingEntrypointPolicy<C: Context>: BatchingPolicy<C> {
     ) -> Result<C::Value, BatchingError>;
 }
 
-/// Ordinary homogeneous-array [`BatchingPolicy`].
-#[derive(Copy, Clone, Debug, Default)]
-pub struct ArrayBatchingPolicy;
+/// Homogeneous-array [`BatchingPolicy`] parameterized by its [`BatchExtentAuthority`]. The default
+/// [`StaticBatchExtent`] preserves the ordinary public array batching API. Composite programs use a private
+/// dimension-valued authority whose extent is a parent-owned first-class dimension value. Keeping both authorities
+/// under this nominal policy family lets every homogeneous array operation share one generated dispatcher without
+/// making those implementations overlap genuinely mixed composite-operation rules. The wrapper delegates its batch
+/// carrier and extent representation to `E`. Array-specific alignment is supplied by `E`'s [`BatchExtentAuthority`]
+/// implementation.
+pub struct ArrayBatchingPolicy<E = StaticBatchExtent>(PhantomData<fn() -> E>);
 
-impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for ArrayBatchingPolicy {
-    type Batch = ArrayBatch<C::Value>;
-    type Extent = usize;
+impl<E> Copy for ArrayBatchingPolicy<E> {}
+
+impl<E> Clone for ArrayBatchingPolicy<E> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E> Debug for ArrayBatchingPolicy<E> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ArrayBatchingPolicy")
+    }
+}
+
+impl<E> Default for ArrayBatchingPolicy<E> {
+    #[inline]
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<C: Context<Type = ArrayType>, E: BatchingPolicy<C, Batch = ArrayBatch<C::Value>>> BatchingPolicy<C>
+    for ArrayBatchingPolicy<E>
+{
+    type Batch = E::Batch;
+    type Extent = E::Extent;
 
     #[inline]
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
-        ArrayBatch::new(value.r#type().into_owned(), value, batch_axis)
+        E::batch(value, batch_axis)
     }
 
     #[inline]
     fn replicated(value: C::Value) -> Self::Batch {
-        ArrayBatch::replicated(value)
+        E::replicated(value)
     }
 
     #[inline]
     fn value(batch: &Self::Batch) -> &C::Value {
-        batch.value()
+        E::value(batch)
     }
 
     #[inline]
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
-        Cow::Owned(batch.unbatched_type())
-    }
-}
-
-impl<C: Context<Type = ArrayType>> RecursiveBatchingPolicy<C> for ArrayBatchingPolicy
-where
-    C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
-        + From<TransposeOperation>
-        + From<LegacyBroadcastOperation>,
-{
-    #[inline]
-    fn batch_region(
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
-        region: RegionRef<'_, C::Constant, C::Operation>,
-        inputs: Vec<ArrayBatch<C::Value>>,
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let region_mappings = RegionReplayMappings::new();
-        region.interpret_with(
-            inputs,
-            |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
-            |instruction, instruction_inputs| {
-                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
-                instruction.operation().batch(context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)
-            },
-        )
-    }
-
-    #[inline]
-    fn batch_program(
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
-        region: RegionRef<'_, C::Constant, C::Operation>,
-        input_axes: &[BatchAxis],
-        output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(BatchedProgram<C>, Vec<BatchAxis>), BatchingError> {
-        region.batched(*context.axis_extent(), context.axis_sharding().clone(), input_axes, output_axes_policy)
+        E::unbatched_type(batch)
     }
 }
 
@@ -867,6 +863,214 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchingE
             .into_value())
     }
 }
+
+impl<C: Context<Type = ArrayType>> RecursiveBatchingPolicy<C> for ArrayBatchingPolicy
+where
+    C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
+        + From<TransposeOperation>
+        + From<LegacyBroadcastOperation>,
+{
+    #[inline]
+    fn batch_region(
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<ArrayBatch<C::Value>>,
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        let region_mappings = RegionReplayMappings::new();
+        region.interpret_with(
+            inputs,
+            |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
+            |instruction, instruction_inputs| {
+                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                instruction.operation().batch(context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)
+            },
+        )
+    }
+
+    #[inline]
+    fn batch_program(
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<(BatchedProgram<C>, Vec<BatchAxis>), BatchingError> {
+        region.batched(*context.axis_extent(), context.axis_sharding().clone(), input_axes, output_axes_policy)
+    }
+}
+
+// TODO(eaplatanios): Review this enum.
+/// Authority for one physical output dimension of an elementwise batching broadcast.
+///
+/// The shared elementwise algorithm owns all broadcast geometry: for every physical output axis it determines where
+/// that dimension's authority comes from and hands the result to
+/// [`BatchExtentAuthority::broadcast_input`], whose implementations only *spend* the authority. A static
+/// authority ignores these sources because its output metadata already carries every extent, while a dimension-valued
+/// authority grounds each source in first-class form without re-deriving any geometry.
+#[derive(Clone, Debug)]
+pub enum DimensionSource<V> {
+    /// Dimension with the provided static extent, grounded by an exact dimension constant when first-class form is
+    /// required.
+    Static(usize),
+
+    /// Dynamic per-item dimension readable from physical axis `axis` of the broadcast-compatible source value
+    /// `source`, which is a clone of the corresponding operand's parent-owned physical value.
+    Value {
+        /// Parent-owned physical value whose axis carries this dimension.
+        source: V,
+
+        /// Physical axis of `source` carrying this dimension.
+        axis: usize,
+    },
+
+    /// The mapped batch axis itself, grounded by the transform's authoritative extent.
+    BatchExtent,
+}
+
+// TODO(eaplatanios): Review this docstring.
+/// Array-specific capability that lets one homogeneous-array batching rule set serve multiple extent authorities.
+///
+/// Ordinary array batching and projected array batching inside a composite array/dimension program share everything
+/// that makes an array rule an array rule: the [`ArrayBatch`] carrier, the shared elementwise alignment algorithm,
+/// and every per-operation [`BatchableOperation`] implementation. They differ in exactly two ways:
+///
+///   - **Extent authority:** Ordinary batching knows its mapped-axis extent as one static host `usize`. Projected
+///     batching's extent is an ordinary parent-owned first-class dimension value, so a dynamic batch extent remains a
+///     Single Static Assignment (SSA) value flowing through operand edges rather than static transform metadata.
+///   - **Replicated-Array Materialization:** Aligning a replicated array with mapped inputs requires broadcasting it
+///     across the mapped axis. Ordinary batching can use broadcasting operation with static output metadata, while
+///     projected batching must stage the mixed broadcast that consumes explicit dimension operands.
+///
+/// A [`BatchExtentAuthority`] is a type-level selector packaging those two differences, so each authority owns the
+/// complete translation from a homogeneous rule's extent and broadcast requests to its universe's operations. Every
+/// authority also implements [`BatchingPolicy`] with `Batch = ArrayBatch<C::Value>`; the shared rules are then written
+/// once against the nominal [`ArrayBatchingPolicy<E>`] family rather than as an `E: BatchExtentAuthority` blanket,
+/// because Rust coherence cannot use the *absence* of a trait implementation to prove such a blanket disjoint from
+/// the genuinely mixed composite-operation rules registered for other policies.
+///
+/// Keeping this capability on the batching transform, rather than on [`ProjectedContext`](crate::ProjectedContext),
+/// [`ArrayBatch`], or [`Type`], means that neither the carrier nor the type contract needs to know anything about
+/// dynamic-shape state that only batching needs.
+pub trait BatchExtentAuthority<C: Context<Type = ArrayType>>: BatchingPolicy<C, Batch = ArrayBatch<C::Value>> {
+    /// Returns the mapped-axis [`Dimension`] to insert when building a physical batched [`ArrayType`].
+    /// [`StaticBatchExtent`] derives an exact [`Dimension::Static`] from the context's mapped-axis extent, while a
+    /// dimension-valued authority returns the possibly dynamic dimension described by its first-class extent value's
+    /// type. Shape computations can therefore construct physical batched types without forcing the extent to be
+    /// statically known.
+    fn axis_dimension(context: &BatchingContext<C, ArrayBatchingPolicy<Self>>) -> Result<Dimension, BatchingError>;
+
+    /// Returns the statically known mapped-axis size. This is the exact-size projection of [`Self::axis_dimension`].
+    /// It succeeds when that dimension is static and returns a [`BatchingError::UnsupportedOperation`] when the mapped
+    /// extent is genuinely dynamic. Rules that only move or broadcast arrays must use [`Self::match_axis`] and
+    /// [`Self::broadcast_input`] instead, so that they keep working with dynamic mapped extents.
+    #[inline]
+    fn axis_size(context: &BatchingContext<C, ArrayBatchingPolicy<Self>>) -> Result<usize, BatchingError> {
+        Self::axis_dimension(context)?.value().ok_or_else(|| BatchingError::UnsupportedOperation {
+            message: "this batching rule requires a statically known mapped-axis extent".to_string(),
+        })
+    }
+
+    /// Aligns `batch` so that its mapped axis sits at position `axis`. A mapped batch moves its existing axis. A
+    /// replicated batch is materialized across the mapped extent by inserting the axis at `axis`. [`StaticBatchExtent`]
+    /// broadcasts using the context's exact extent, while a dimension-valued authority stages the mixed broadcast whose
+    /// inserted axis is grounded by the transform's first-class extent value.
+    fn match_axis(
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+        batch: &ArrayBatch<C::Value>,
+        axis: Axis,
+    ) -> Result<ArrayBatch<C::Value>, BatchingError>;
+
+    /// Materializes one input/operand at `r#type`, broadcasting its per-item dimensions to the common target
+    /// shape and inserting the mapped batch axis. The shared elementwise algorithm computes the complete broadcast
+    /// geometry, including one [`DimensionSource`] per physical output axis, and delegates only the materialization
+    /// itself, which is the authority-specific step. [`StaticBatchExtent`] broadcasts with static output metadata and
+    /// ignores the sources, while a dimension-valued authority spends each source mechanically (i.e., exact constants
+    /// for static dimensions, `dimension_size` reads of the provided source values for dynamic per-item dimensions, and
+    /// the transform's extent value for the mapped axis itself).
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active [`BatchingContext`] for the transform level being applied.
+    ///   - `input`: Input/operand batch to materialize.
+    ///   - `r#type`: Complete batched type of the materialized result (i.e., the common per-item target type
+    ///     with the mapped axis inserted at `batch_axis`).
+    ///   - `output_axes`: Mapping from each of `input`'s axes to its output axis.
+    ///   - `batch_axis`: Position of the mapped batch axis in `r#type`.
+    ///   - `dimension_sources`: First-class authority for each physical output axis, in axis order.
+    fn broadcast_input(
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+        input: &ArrayBatch<C::Value>,
+        r#type: ArrayType,
+        output_axes: Vec<usize>,
+        batch_axis: Axis,
+        dimension_sources: Vec<DimensionSource<C::Value>>,
+    ) -> Result<ArrayBatch<C::Value>, BatchingError>;
+}
+
+/// [`BatchExtentAuthority`] for ordinary homogeneous array batching with a static host extent. This is the default
+/// authority of [`ArrayBatchingPolicy`] and preserves the established public array batching behavior. The mapped-axis
+/// extent is one `usize` fixed when the transform is constructed, [`Self::axis_dimension`] is always an exact static
+/// dimension, and replicated arrays are materialized with a broadcasting operation using static output metadata.
+/// [`Self::axis_size`] always succeeds, so every batching rule (including host-side item enumeration) is
+/// available under this authority.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct StaticBatchExtent;
+
+impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticBatchExtent {
+    type Batch = ArrayBatch<C::Value>;
+    type Extent = usize;
+
+    #[inline]
+    fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
+        ArrayBatch::new(value.r#type().into_owned(), value, batch_axis)
+    }
+
+    #[inline]
+    fn replicated(value: C::Value) -> Self::Batch {
+        ArrayBatch::replicated(value)
+    }
+
+    #[inline]
+    fn value(batch: &Self::Batch) -> &C::Value {
+        batch.value()
+    }
+
+    #[inline]
+    fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
+        Cow::Owned(batch.unbatched_type())
+    }
+}
+
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchExtentAuthority<C> for StaticBatchExtent {
+    #[inline]
+    fn axis_dimension(context: &BatchingContext<C, ArrayBatchingPolicy<Self>>) -> Result<Dimension, BatchingError> {
+        Ok(Dimension::Static(*context.axis_extent()))
+    }
+
+    #[inline]
+    fn match_axis(
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+        batch: &ArrayBatch<C::Value>,
+        axis: Axis,
+    ) -> Result<ArrayBatch<C::Value>, BatchingError> {
+        batch.match_axis(axis, *context.axis_extent(), context.axis_sharding().clone())
+    }
+
+    #[inline]
+    fn broadcast_input(
+        _context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
+        input: &ArrayBatch<C::Value>,
+        r#type: ArrayType,
+        output_axes: Vec<usize>,
+        batch_axis: Axis,
+        _dimension_sources: Vec<DimensionSource<C::Value>>,
+    ) -> Result<ArrayBatch<C::Value>, BatchingError> {
+        let broadcasted = input.value().clone().legacy_broadcast(r#type.clone(), output_axes.as_slice())?;
+        ArrayBatch::new(r#type, broadcasted, batch_axis)
+    }
+}
+
+// TODO(eaplatanios): Move `DimensionBatchExtent` and its implementation blocks here.
 
 impl ArrayType {
     /// Normalizes and validates the provided [`BatchAxis`] against this physical [`ArrayType`],
@@ -1135,18 +1339,18 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<C::Typ
 // the batch axis inserted there. Operands whose per-item shapes are not broadcast-compatible are left at their
 // batch-axis-inserted shapes so the operation surfaces its own shape error.
 impl<
-    C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>,
+    C: Context<Type = ArrayType, Value: Transpose>,
     O: ElementwiseOperation + InterpretableOperation<C>,
-> BatchableOperation<C, ArrayBatchingPolicy> for O
+    M: BatchExtentAuthority<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<M>> for O
 {
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+    #[inline]
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<M>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let input_axes = inputs.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
-
         // No input carries the batch axis. Interpret the inputs as given and report every output replicated.
         // Any per-item shape broadcasting between replicated inputs is the operation's own concern.
         let Some(output_batch_axis_position) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
@@ -1168,9 +1372,8 @@ impl<
         };
         let batch_axis = Axis::from(batch_axis_position);
 
-        // Realign every mapped input's batch axis to the common position, then broadcast every input to the common
-        // batched physical shape.
-        let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
+        // Preserve placement removed with each logical mapped dimension, then align every mapped input onto the common
+        // physical axis before broadcasting per-item shapes.
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
         let unbatched_types = inputs
             .iter()
@@ -1191,22 +1394,18 @@ impl<
             .collect::<Vec<_>>();
         let inputs = inputs.iter().map(|input| input.move_axis(batch_axis)).collect::<Result<Vec<_>, _>>()?;
 
-        // The common per-item shape every input broadcasts to, or `None` when the per-item shapes are not
-        // broadcast-compatible, in which case each input keeps its own per-item shape below and the operation
-        // reports the incompatibility itself.
+        // Broadcast every operand to the common logical per-item shape when one exists. Otherwise, retain each input's
+        // own per-item shape and let the operation's inference report the incompatibility.
         let common_unbatched_type = Broadcastable::broadcasted(unbatched_types.as_slice()).ok();
+        let axis_dimension = M::axis_dimension(context)?;
         let broadcasted_inputs = inputs
             .iter()
-            .zip(input_axes.iter())
             .zip(unbatched_types.iter())
-            .map(|((input, input_axis), unbatched_type)| -> Result<ArrayBatch<C::Value>, BatchingError> {
-                // The target physical type is the common per-item shape (falling back to this input's own when
-                // incompatible) carrying this input's own data type (e.g. a Boolean select condition stays Boolean
-                // against numeric branches), with the batch axis inserted at `batch_axis`.
+            .map(|(input, unbatched_type)| -> Result<ArrayBatch<C::Value>, BatchingError> {
                 let mut target_type = common_unbatched_type.as_ref().unwrap_or(unbatched_type).clone();
                 target_type.data_type = unbatched_type.data_type();
                 let mut physical_type =
-                    target_type.with_inserted_dimension(batch_axis_position, Dimension::Static(axis_size))?;
+                    target_type.with_inserted_dimension(batch_axis_position, axis_dimension.clone())?;
                 if let Some(sharding) = target_type.sharding() {
                     physical_type.sharding = Some(
                         sharding
@@ -1218,11 +1417,10 @@ impl<
                     return Ok(input.clone());
                 }
 
-                // Map each aligned dimension to its position in the target. The batch axis maps to itself, and the
-                // per-item dimensions right-align within the target's per-item dimensions, skipping the inserted
-                // batch axis.
+                // Right-align this input's per-item dimensions in the target while preserving the mapped dimension
+                // at the common physical position.
                 let target_unbatched_rank = physical_type.rank() - 1;
-                let is_mapped = !input_axis.is_replicated();
+                let is_mapped = !input.batch_axis().is_replicated();
                 let output_axes = (0..input.r#type().rank())
                     .map(|dimension| {
                         if is_mapped && dimension == batch_axis_position {
@@ -1233,15 +1431,58 @@ impl<
                         let position = (target_unbatched_rank - unbatched_type.rank()) + per_item_index;
                         if position < batch_axis_position { position } else { position + 1 }
                     })
-                    .collect::<Vec<_>>();
-                let broadcasted =
-                    input.value().clone().legacy_broadcast(physical_type.clone(), output_axes.as_slice())?;
-                ArrayBatch::new(physical_type, broadcasted, batch_axis)
+                    .collect();
+
+                // Resolve the authority for every physical output dimension: the mapped axis comes from the
+                // transform's extent, static target dimensions carry their extents directly, and each dynamic target
+                // dimension is read from the broadcast-compatible source axis that supplied it (which exists by
+                // construction of the broadcasted target shape).
+                let dimension_sources = physical_type
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .enumerate()
+                    .map(|(axis, _)| -> Result<DimensionSource<C::Value>, BatchingError> {
+                        if axis == batch_axis_position {
+                            return Ok(DimensionSource::BatchExtent);
+                        }
+                        let target_axis = if axis < batch_axis_position { axis } else { axis - 1 };
+                        let target_dimension = &target_type.shape().dimensions()[target_axis];
+                        if let Dimension::Static(extent) = target_dimension {
+                            return Ok(DimensionSource::Static(*extent));
+                        }
+                        inputs
+                            .iter()
+                            .zip(unbatched_types.iter())
+                            .find_map(|(source, source_type)| {
+                                let rank_offset = target_type.rank() - source_type.rank();
+                                let source_axis = target_axis.checked_sub(rank_offset)?;
+                                if source_axis >= source_type.rank()
+                                    || source_type.shape().dimensions()[source_axis] != *target_dimension
+                                {
+                                    return None;
+                                }
+                                let physical_axis =
+                                    if source.batch_axis().is_replicated() || source_axis < batch_axis_position {
+                                        source_axis
+                                    } else {
+                                        source_axis + 1
+                                    };
+                                Some(DimensionSource::Value { source: source.value().clone(), axis: physical_axis })
+                            })
+                            .ok_or_else(|| {
+                                TypeError::invalid(format!(
+                                    "cannot locate first-class authority for elementwise output dimension \
+                                     {target_dimension}",
+                                ))
+                                .into()
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                M::broadcast_input(context, input, physical_type, output_axes, batch_axis, dimension_sources)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // The lifted operation is the original applied to the batch-carrying inputs. Every output takes the common
-        // batch axis. Broadcast-incompatible per-item shapes surface the operation's own shape error at this inference.
         let input_types = broadcasted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_count = Operation::infer_output_types(self, input_types.as_slice(), &[])?.len();
         let output_batch_axes = vec![BatchAxis::new(batch_axis); output_count];
@@ -1346,14 +1587,15 @@ pub struct BatchingContext<C: Context, P: BatchingPolicy<C>> {
 }
 
 impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
-    /// Creates a new [`BatchingContext`] with an unnamed and [`ShardingDimension::Replicated`] mapped axis.
+    /// Creates a new [`BatchingPolicy`]-explicit [`BatchingContext`] with an unnamed and
+    /// [`ShardingDimension::Replicated`] mapped axis.
     ///
     /// # Parameters
     ///
     ///   - `parent`: [`Context`] into which batched operations are lifted.
     ///   - `axis_extent`: Extent of the transform-owned mapped dimension.
     #[inline]
-    pub fn new(parent: C, axis_extent: P::Extent) -> Self {
+    pub fn with_policy(parent: C, axis_extent: P::Extent) -> Self {
         Self { parent, axis_extent, axis_name: None, axis_sharding: ShardingDimension::Replicated }
     }
 
@@ -1394,6 +1636,16 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
     #[inline]
     pub fn axis_sharding(&self) -> &ShardingDimension {
         &self.axis_sharding
+    }
+}
+
+impl<C: Context<Type: BatchableType<Policy: BatchingPolicy<C>>>>
+    BatchingContext<C, <C::Type as BatchableType>::Policy>
+{
+    /// Creates a [`BatchingContext`] using the canonical policy selected by the provided context's [`BatchableType`].
+    #[inline]
+    pub fn new(parent: C, axis_extent: <<C::Type as BatchableType>::Policy as BatchingPolicy<C>>::Extent) -> Self {
+        Self::with_policy(parent, axis_extent)
     }
 }
 
@@ -2130,7 +2382,8 @@ mod tests {
 
     #[test]
     fn test_batching_policy_is_member_kind_agnostic() {
-        let context = BatchingContext::<_, ProjectedProgramBatchingPolicy>::new(ProjectedProgramContext::new(), 5);
+        let context =
+            BatchingContext::<_, ProjectedProgramBatchingPolicy>::with_policy(ProjectedProgramContext::new(), 5);
         let tracer = BatchingTracer::new(
             context.clone(),
             ProjectedProgramBatchingPolicy::replicated(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7))),
@@ -2577,6 +2830,7 @@ mod tests {
         assert_eq!(outputs[0].value(), &Array::vector(vec![11.0, 22.0, 33.0]));
 
         // Unary elementwise operations use the same blanket rule and preserve the mapped input axis.
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
         let input = make_batch(&vector_type, vec![1.0, 2.0, 3.0], Some(0));
         let outputs = NegOperation.batch(&context, &EmptyRegionDriver, &[input]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
