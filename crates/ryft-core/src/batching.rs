@@ -1274,17 +1274,16 @@ pub enum ProgramBatchingOutputAxesPolicy {
     AlignEachTo(Vec<BatchAxis>),
 }
 
-// TODO(eaplatanios): Does this need to be pinned to `ArrayType` and `ArrayBatchingPolicy` or can it be generic?
-/// Capability to interpret an [`Operation`] on batch-carrying inputs and repackage its outputs as [`ArrayBatch`]es.
-/// This is the shared application path the per-operation [`BatchableOperation`] rules use once they have lifted an
-/// operation to its batch-carrying inputs. It centralizes the physical-value ownership invariant of the batching
-/// transform: the lifted operation is always interpreted against `context.parent()`, which owns the packed physical
-/// values, and never against the [`BatchingContext`] itself. Every [`InterpretableOperation`] over the parent's
-/// values gets it for free through the blanket implementation below, so an operation earns it directly from its
-/// interpretation rule.
-pub trait InterpretableBatchableOperation<C: Context<Type = ArrayType>> {
-    /// Interprets this operation on the *unpacked* values of batched `inputs` against `context.parent()` and
-    /// repackages each output as an [`ArrayBatch`] carrying the corresponding `output_batch_axes` entry.
+/// Capability to interpret an [`Operation`] on [`BatchingPolicy`]-selected batches and repackage its outputs as batches
+/// carrying specified axes. This is the shared application path the per-operation [`BatchableOperation`] rules use once
+/// they have lifted an operation to its batch-carrying inputs. It centralizes the physical-value ownership invariant of
+/// the batching transform: the lifted operation is always interpreted against `context.parent()`, which owns the packed
+/// physical values, and never against the [`BatchingContext`] itself. Every [`InterpretableOperation`] over the
+/// parent's values gets it for free through the blanket implementation below, so an operation earns it directly from
+/// its interpretation rule.
+pub trait InterpretableBatchableOperation<C: Context, P: BatchingPolicy<C>> {
+    /// Interprets this operation on the *unpacked* values of batched `inputs` against `context.parent()` and repackages
+    /// each output as a [`BatchingPolicy`]-selected batch carrying the corresponding `output_batch_axes` entry.
     ///
     /// # Parameters
     ///
@@ -1295,20 +1294,19 @@ pub trait InterpretableBatchableOperation<C: Context<Type = ArrayType>> {
     ///     per output that this [`Operation`] produces on these inputs.
     fn interpret_with_batch_axes(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
-        inputs: &[ArrayBatch<C::Value>],
+        context: &BatchingContext<C, P>,
+        inputs: &[P::Batch],
         output_batch_axes: &[BatchAxis],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>;
+    ) -> Result<Vec<P::Batch>, BatchingError>;
 }
 
-// TODO(eaplatanios): Does this need to be pinned to `ArrayType` and `ArrayBatchingPolicy` or can it be generic?
-impl<C: Context<Type = ArrayType>, O: InterpretableOperation<C>> InterpretableBatchableOperation<C> for O {
+impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> InterpretableBatchableOperation<C, P> for O {
     fn interpret_with_batch_axes(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
-        inputs: &[ArrayBatch<C::Value>],
+        context: &BatchingContext<C, P>,
+        inputs: &[P::Batch],
         output_batch_axes: &[BatchAxis],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         // Every `InterpretableOperation` over the parent context's values is an `InterpretableBatchableOperation`.
         // The batched interpretation unpacks the input values, interprets the operation once through `interpret`
         // against the parent context (which owns those physical values), and repackages each output with its
@@ -1316,13 +1314,13 @@ impl<C: Context<Type = ArrayType>, O: InterpretableOperation<C>> InterpretableBa
         if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         }
-        let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
         let output_values = self.interpret(&context.parent().clone(), &EmptyRegionDriver, input_values.as_slice())?;
         check_count!("output", output_values, output_batch_axes.len(), ProgramError);
         output_values
             .into_iter()
             .zip(output_batch_axes.iter().copied())
-            .map(|(value, axis)| ArrayBatch::new(value.r#type().into_owned(), value, axis))
+            .map(|(value, axis)| P::batch(value, axis))
             .collect()
     }
 }
@@ -2635,8 +2633,8 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let left = ArrayBatch::new(vector_type.clone(), Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(vector_type.clone(), Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
-
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
         let outputs = AddOperation.interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
