@@ -1,4 +1,4 @@
-use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext};
+use crate::batching::{ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::Context;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
@@ -340,8 +340,8 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
 impl<C: Context<Type = ArrayType>> DenseDifferentiableType<C> for ArrayType
 where
     C::Value: LegacyBroadcast + Reshape + Slice + Transpose,
-    C::Operation: BatchableOperation<C>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+    C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
         + From<CoordinateBasisOperation<ArrayType>>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>,
@@ -418,9 +418,8 @@ where
         packed_direction_count: usize,
         inputs: Vec<Self::PackedValue>,
     ) -> Result<Vec<Self::PackedValue>, DifferentiationError> {
-        Ok(BatchingContext::new(context.clone(), packed_direction_count)
-            .batch_region(region, inputs)
-            .map_err(ProgramError::from)?)
+        let context = BatchingContext::new(context.clone(), packed_direction_count);
+        Ok(ArrayBatchingPolicy::batch_region(&context, region, inputs).map_err(ProgramError::from)?)
     }
 
     fn validate_hessian_block_type(

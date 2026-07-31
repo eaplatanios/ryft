@@ -13,13 +13,12 @@ use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
 
-use crate::batching::{BatchableOperation, BatchingContext};
+use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::{Context, EagerContext, ProjectedContext};
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
-use crate::operations::manipulation::{LegacyBroadcastOperation, TransposeOperation};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
@@ -32,7 +31,6 @@ use crate::programs::regions::RegionArena;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValueRef, Value, ValueProjection};
 use crate::tracing::{NestedTracingContext, TracingContext};
-use crate::types::ArrayType;
 
 /// Reference to a value captured outside a staged [`Program`]. A program stores only this lifetime-free reference
 /// in its [`Atom`] table. The corresponding runtime value lives at [`index`](Self::index) in the surrounding
@@ -212,12 +210,8 @@ where
     }
 }
 
-impl<C: CapturingContext<Type = ArrayType>> CapturingContext for BatchingContext<C>
-where
-    C::Operation: BatchableOperation<C>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<TransposeOperation>
-        + From<LegacyBroadcastOperation>,
+impl<C: CapturingContext<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> CapturingContext
+    for BatchingContext<C, P>
 {
     type Capture = C::Capture;
 

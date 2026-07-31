@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
 
-use crate::batching::{ArrayBatch, BatchingTracer};
+use crate::batching::{ArrayBatch, BatchingPolicy, BatchingTracer};
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::DifferentiationTracer;
@@ -166,17 +166,12 @@ impl<C: Context<Value: Concretizable<bool>>> Concretizable<bool> for PartialTrac
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Concretizable<bool>>> Concretizable<bool> for BatchingTracer<C> {
+impl<C: Context, P: BatchingPolicy<C, Batch: Concretizable<bool>>> Concretizable<bool> for BatchingTracer<C, P> {
     #[inline]
     fn concretize(&self) -> Result<bool, ProgramError> {
-        // A batch-carrying value delegates concrete Boolean extraction to its packed value only when it is replicated.
-        // A mapped batch has one Boolean per item and cannot drive one host branch.
-        if !self.batch().batch_axis().is_replicated() {
-            return Err(ProgramError::Concretization {
-                message: "cannot extract a concrete boolean from a batched value".to_string(),
-            });
-        }
-        self.batch().value().concretize()
+        // The policy-selected carrier owns whether this value is replicated and therefore concretizable. Keeping that
+        // decision on the carrier lets every batching policy participate without exposing axis metadata generically.
+        self.batch().concretize()
     }
 }
 
