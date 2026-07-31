@@ -915,8 +915,7 @@ mod tests {
         assert_eq!(
             DimensionType::derive_identity_renaming(&[declared.clone(), declared], &[actual.clone(), other.clone()],),
             Err(TypeError::invalid(format!(
-                "identity {} is renamed to both {} and {}",
-                "declared",
+                "type identity 'declared' is renamed to both '{}' and '{}'",
                 actual.variable(),
                 other.variable(),
             ))),

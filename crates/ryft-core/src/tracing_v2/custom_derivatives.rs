@@ -4,6 +4,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::axes::Axis;
+use crate::batching::ArrayBatchingPolicy;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
@@ -234,7 +235,7 @@ where
             })
             .collect();
     }
-    let axis_size = context.axis_size();
+    let axis_size = *context.axis_extent();
     let aligned_inputs = inputs
         .iter()
         .map(|input| match input.batch_axis_position() {
@@ -256,7 +257,7 @@ where
 
 /// Batches the region at `index` using the custom-derivative rewrapping convention: every input and output is mapped
 /// at axis `0`.
-pub(crate) fn batch_rewrapped_program<C: Context<Type = ArrayType>, D: BatchingDriver<C>>(
+pub(crate) fn batch_rewrapped_program<C: Context<Type = ArrayType>, D: BatchingDriver<C, ArrayBatchingPolicy>>(
     context: &BatchingContext<C>,
     driver: &D,
     index: usize,
@@ -275,13 +276,13 @@ pub(crate) fn batch_rewrapped_program<C: Context<Type = ArrayType>, D: BatchingD
 
 /// Batching rule for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
 /// derivative survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O> BatchableOperation<C> for CustomJvpOperation
+impl<C, O> BatchableOperation<C, ArrayBatchingPolicy> for CustomJvpOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
     O: Operation<ArrayType> + From<TransposeOperation> + From<LegacyBroadcastOperation> + From<CustomJvpOperation>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         driver: &D,
@@ -470,13 +471,13 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 
 /// Batching rule for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward programs so
 /// the custom derivative survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O> BatchableOperation<C> for CustomVjpOperation
+impl<C, O> BatchableOperation<C, ArrayBatchingPolicy> for CustomVjpOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
     O: Operation<ArrayType> + From<TransposeOperation> + From<LegacyBroadcastOperation> + From<CustomVjpOperation>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         context: &BatchingContext<C>,
         driver: &D,
@@ -807,11 +808,11 @@ impl<C: Domain> InterpretableOperation<C> for CustomVjpTangentOperation<C::Type>
 /// Batching rule for [`CustomVjpTangentOperation`]: the opaque custom-VJP tangent carrier is a forward-mode tangent
 /// map that never appears in a batched primal program — reverse mode consumes it during transposition rather than
 /// batching it — so batching is rejected for every context.
-impl<C> BatchableOperation<C> for CustomVjpTangentOperation<ArrayType>
+impl<C> BatchableOperation<C, ArrayBatchingPolicy> for CustomVjpTangentOperation<ArrayType>
 where
     C: Context<Type = ArrayType>,
 {
-    fn batch<D: BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
         _context: &BatchingContext<C>,
         _driver: &D,
