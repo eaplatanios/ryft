@@ -326,6 +326,99 @@ impl From<usize> for BatchAxisSpecification {
     }
 }
 
+/// Boundary convention of a structurally batched nested [`Program`], produced by functions like
+/// [`RecursiveBatchingPolicy::batch_program`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BatchedProgramBoundary {
+    /// The transformed [`Program`] has the same logical boundary arity as its source [`Region`](crate::Region).
+    Direct,
+
+    /// The transformed [`Program`] explicitly threads the mapped extent through its boundary. A structurally batched
+    /// composite [`Region`](crate::Region) is traced as a standalone [`Program`], so it cannot capture the first-class
+    /// dimension Single Static Assignment (SSA) value that represents the mapped extent in its parent program. The
+    /// transformed program therefore accepts that extent as its leading input and returns the same value as its leading
+    /// output. This makes dynamic mapped array dimensions valid references to a boundary-defined identity and lets
+    /// enclosing higher-order operations pass the extent through sealed regions without reconstructing it.
+    ThreadedExtent,
+}
+
+// TODO(eaplatanios): Review this.
+/// Result of structurally batching a nested [`Region`](crate::Region).
+///
+/// Homogeneous array regions retain a direct boundary. Composite regions cannot capture the active mapped extent
+/// from their parent trace, so they carry that ordinary dimension SSA value explicitly as a leading input and return
+/// it unchanged as a leading output. Keeping the convention in this type prevents higher-order rules from silently
+/// assuming that every transformed program has the source region's exact physical boundary.
+pub struct BatchedProgram<C: Domain> {
+    /// Structurally transformed program.
+    program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+
+    /// Mapped axes of the source region's logical outputs. The protocol-only threaded extent is excluded.
+    output_axes: Vec<BatchAxis>,
+
+    /// Physical boundary convention used by `program`.
+    boundary: BatchedProgramBoundary,
+}
+
+// TODO(eaplatanios): Review this.
+impl<C: Domain> BatchedProgram<C> {
+    /// Creates a structurally batched program whose physical and logical boundaries coincide.
+    pub fn direct(
+        program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+        output_axes: Vec<BatchAxis>,
+    ) -> Result<Self, ProgramError> {
+        check_count!("output", output_axes, program.output_count(), ProgramError);
+        Ok(Self { program, output_axes, boundary: BatchedProgramBoundary::Direct })
+    }
+
+    /// Creates a structurally batched composite program with a leading threaded-extent input and output.
+    pub fn with_threaded_extent(
+        program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+        output_axes: Vec<BatchAxis>,
+    ) -> Result<Self, ProgramError> {
+        if program.input_count() == 0 || program.output_count() == 0 {
+            return Err(ProgramError::MalformedProgram(
+                "a structurally batched program with a threaded extent must have a leading input and output"
+                    .to_string(),
+            ));
+        }
+        check_count!("output", output_axes, program.output_count() - 1, ProgramError);
+        Ok(Self { program, output_axes, boundary: BatchedProgramBoundary::ThreadedExtent })
+    }
+
+    /// Returns the mapped axes of the source region's logical outputs.
+    #[inline]
+    pub fn output_axes(&self) -> &[BatchAxis] {
+        self.output_axes.as_slice()
+    }
+
+    /// Consumes a direct-boundary result, rejecting a threaded extent rather than dropping it.
+    pub fn into_direct(
+        self,
+    ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), ProgramError>
+    {
+        match self.boundary {
+            BatchedProgramBoundary::Direct => Ok((self.program, self.output_axes)),
+            BatchedProgramBoundary::ThreadedExtent => Err(ProgramError::MalformedProgram(
+                "a direct structural batching boundary received a program with a threaded extent".to_string(),
+            )),
+        }
+    }
+
+    /// Consumes a threaded-extent result, rejecting a direct result rather than inventing the protocol value.
+    pub fn into_threaded_extent(
+        self,
+    ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), ProgramError>
+    {
+        match self.boundary {
+            BatchedProgramBoundary::ThreadedExtent => Ok((self.program, self.output_axes)),
+            BatchedProgramBoundary::Direct => Err(ProgramError::MalformedProgram(
+                "a composite structural batching boundary received a program without a threaded extent".to_string(),
+            )),
+        }
+    }
+}
+
 /// Value with [`ArrayType`] type that represents a _packed_ batch of arrays. [`ArrayBatch`] is the batching
 /// representation for Ryft's batching/vectorization transform. It pairs a physical array value with a [`BatchAxis`]
 /// that marks which of its dimensions indexes the batch items. A value is either *batched* (i.e., its physical type
@@ -682,13 +775,13 @@ pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
         inputs: Vec<Self::Batch>,
     ) -> Result<Vec<Self::Batch>, BatchingError>;
 
-    /// Structurally batches `region` and returns the resulting transformed program and output batch axes.
+    /// Structurally batches `region` and returns the resulting transformed [`BatchedProgram`].
     fn batch_program(
         context: &BatchingContext<C, Self>,
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(BatchedProgram<C>, Vec<BatchAxis>), BatchingError>;
+    ) -> Result<BatchedProgram<C>, BatchingError>;
 }
 
 /// Policy capability for invoking the public batching transform on flat parent values. [`Batch::batch`] owns
@@ -1059,8 +1152,10 @@ where
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(BatchedProgram<C>, Vec<BatchAxis>), BatchingError> {
-        region.batched(*context.axis_extent(), context.axis_sharding().clone(), input_axes, output_axes_policy)
+    ) -> Result<BatchedProgram<C>, BatchingError> {
+        let (program, output_axes) =
+            region.batched(*context.axis_extent(), context.axis_sharding().clone(), input_axes, output_axes_policy)?;
+        Ok(BatchedProgram::direct(program, output_axes)?)
     }
 }
 
@@ -1141,15 +1236,6 @@ impl ArrayType {
     }
 }
 
-/// Flat standalone [`Program`] produced when a nested [`Region`](crate::Region) is structurally batched
-/// in a `C`-typed context.
-pub type BatchedProgram<C> = Program<
-    <C as Domain>::Constant,
-    <C as Domain>::Operation,
-    Vec<<C as Domain>::Constant>,
-    Vec<<C as Domain>::Constant>,
->;
-
 /// Provides [`Instruction`](crate::Instruction)-scoped access to the nested [`Region`](crate::Region)s attached to
 /// an [`Operation`] being batched. Every [`BatchableOperation`] application receives a [`BatchingDriver`]. The driver
 /// keeps any attached regions borrowed and re-enters batching with the durable [`BatchingContext`] supplied by the
@@ -1172,7 +1258,7 @@ pub trait BatchingDriver<C: Context, P: BatchingPolicy<C>>: RegionDriver<C::Cons
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(BatchedProgram<C>, Vec<BatchAxis>), BatchingError>;
+    ) -> Result<BatchedProgram<C>, BatchingError>;
 }
 
 impl<C: Context, P: BatchingPolicy<C>> BatchingDriver<C, P> for EmptyRegionDriver {
@@ -1193,7 +1279,7 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingDriver<C, P> for EmptyRegionDrive
         _region: RegionRef<'_, C::Constant, C::Operation>,
         _input_axes: &[BatchAxis],
         _output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(BatchedProgram<C>, Vec<BatchAxis>), BatchingError> {
+    ) -> Result<BatchedProgram<C>, BatchingError> {
         Err(ProgramError::MalformedProgram("empty region driver cannot batch a program".to_string()).into())
     }
 }
@@ -1254,7 +1340,7 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(BatchedProgram<C>, Vec<BatchAxis>), BatchingError> {
+    ) -> Result<BatchedProgram<C>, BatchingError> {
         P::batch_program(context, region, input_axes, output_axes_policy)
     }
 }
