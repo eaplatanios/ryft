@@ -68,7 +68,7 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 ///
 /// The `length` is stored explicitly so that scans without stacked inputs (pure carry loops with stacked outputs)
 /// remain well-defined. Homogeneous [`ArrayType`] and [`DataType`] scans require a static length. Composite
-/// [`ArrayProgramType`](crate::types::ArrayProgramType) scans may instead use one dynamic dimension identity and then
+/// [`ArrayProgramType`] scans may instead use one dynamic dimension identity and then
 /// consume its matching first-class dimension value as a trailing runtime operand; this is the scalar-SSA trip-count
 /// contract used by structurally batched scans.
 ///
@@ -1918,15 +1918,16 @@ pub(crate) fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
     }
 }
 
-/// Capture-free forward-mode (JVP) rule for [`ScanOperation`], staging **one fused** jvp `scan` with doubled
-/// carries and doubled scanned inputs as an ordinary primal-enum `scan` operation over the shared builder.
+/// Capture-free forward-mode (JVP) rule for [`ScanOperation`], staging **one fused** jvp `scan` with compact
+/// live-tangent carries and scanned inputs as an ordinary primal-enum `scan` operation over the shared builder.
 ///
-/// The rule builds the body's fused jvp program through its instruction-scoped differentiation driver and permutes
-/// its doubled signature into scan order, giving a fused body
-/// `[primal_carries..., tangent_carries..., primal_slices..., tangent_slices...] ->
-/// [primal_next_carries..., tangent_next_carries..., primal_outputs..., tangent_outputs...]`, and stages one scan
-/// with `2 * carry_count` carries over the operand primals and tangents. Pure forward mode therefore runs a single
-/// loop pass and stores **no** per-iteration residual stacks — the JAX jvp-of-`scan` shape.
+/// The rule builds the body's compact fused jvp program through its instruction-scoped differentiation driver
+/// (boundary entries whose tangent type is a zero differential space carry no tangent entry) and permutes its
+/// signature into scan order, giving a fused body
+/// `[primal_carries..., live(tangent_carries)..., primal_slices..., live(tangent_slices)...] ->
+/// [primal_next_carries..., live(tangent_next_carries)..., primal_outputs..., live(tangent_outputs)...]`, and stages
+/// one scan whose carries are the primal carries followed by the live tangent carries. Pure forward mode therefore
+/// runs a single loop pass and stores **no** per-iteration residual stacks — the JAX jvp-of-`scan` shape.
 ///
 /// The primal/tangent separation that reverse mode needs is deferred to partial evaluation: the known-ness split of
 /// [`Program::linearize`](crate::Program::linearize) marks the primal halves known and the tangent halves unknown,
@@ -1950,82 +1951,132 @@ where
         let length = self.length();
         let reverse = self.reverse();
         let unroll = self.unroll();
-        let fused_body = driver.jvp_program(driver.region(0)?)?;
-        let body_input_count = fused_body.input_types().len() / 2;
-        let body_output_count = fused_body.output_types().len() / 2;
+
+        // The fused body is compact: body inputs and outputs whose tangent type is a zero differential space carry
+        // no tangent boundary entry. Derive the liveness masks from the same body boundary types that the fused-body
+        // construction filtered on.
+        let (input_has_tangent, output_has_tangent) = {
+            let body = driver.region(0)?;
+            let input_has_tangent =
+                body.input_types().iter().map(|r#type| !r#type.tangent().is_zero_space()).collect::<Vec<_>>();
+            let output_has_tangent =
+                body.output_types().iter().map(|r#type| !r#type.tangent().is_zero_space()).collect::<Vec<_>>();
+            (input_has_tangent, output_has_tangent)
+        };
+        let body_input_count = input_has_tangent.len();
+        let body_output_count = output_has_tangent.len();
         check_count!("input", inputs, body_input_count, ProgramError);
+        let live_carry_count = input_has_tangent[..carry_count].iter().filter(|&&live| live).count();
 
-        // The fused jvp body is over `[primal_body_inputs..., tangent_body_inputs...]`; permute its doubled
-        // signature into scan order (carries lead scanned inputs on both sides).
-        let fused_body = permute_doubled_scan_body(fused_body, body_input_count, body_output_count, carry_count)?;
+        // The fused jvp body is over `[primal_body_inputs..., live(tangent_body_inputs)...]`; permute its compact
+        // signature into scan order (carries lead scanned inputs on both the primal and live tangent sides).
+        let fused_body = driver.jvp_program(driver.region(0)?)?;
+        check_count!(
+            "input",
+            fused_body.input_types(),
+            body_input_count + input_has_tangent.iter().filter(|&&live| live).count(),
+            ProgramError,
+        );
+        let fused_body = permute_live_scan_body(fused_body, &input_has_tangent, &output_has_tangent, carry_count)?;
 
-        // Stage the fused scan with doubled carries over
-        // `[primal_carry_inits..., tangent_carry_inits..., primal_stacks..., tangent_stacks...]`.
-        let fused_scan = ScanOperation::<C::Constant>::new(2 * carry_count, length)
+        // Stage the fused scan over
+        // `[primal_carry_inits..., live(tangent_carry_inits)..., primal_stacks..., live(tangent_stacks)...]`.
+        let fused_scan = ScanOperation::<C::Constant>::new(carry_count + live_carry_count, length)
             .with_reverse(reverse)
             .with_unroll(unroll)?;
-        // The fused scan takes every carry and scanned tangent as a real program input, so materialize structural
-        // zeros at this sub-program boundary.
-        let mut operands = Vec::with_capacity(2 * body_input_count);
+        // The fused scan takes each live carry and scanned tangent as a real program input, so materialize their
+        // structural zeros at this sub-program boundary.
+        let mut operands = Vec::with_capacity(fused_body.input_types().len());
         operands.extend(inputs[..carry_count].iter().map(|input| input.primal().clone()));
-        for input in &inputs[..carry_count] {
-            operands.push(input.tangent().clone().materialize(context)?);
+        for (input, &live) in inputs[..carry_count].iter().zip(&input_has_tangent[..carry_count]) {
+            if live {
+                operands.push(input.tangent().clone().materialize(context)?);
+            }
         }
         operands.extend(inputs[carry_count..].iter().map(|input| input.primal().clone()));
-        for input in &inputs[carry_count..] {
-            operands.push(input.tangent().clone().materialize(context)?);
+        for (input, &live) in inputs[carry_count..].iter().zip(&input_has_tangent[carry_count..]) {
+            if live {
+                operands.push(input.tangent().clone().materialize(context)?);
+            }
         }
         let outputs = context.bind(C::Operation::from(fused_scan), vec![fused_body], &operands)?;
-        check_count!("output", outputs, 2 * body_output_count, ProgramError);
+        let live_scanned_output_count = output_has_tangent[carry_count..].iter().filter(|&&live| live).count();
+        check_count!("output", outputs, body_output_count + live_carry_count + live_scanned_output_count, ProgramError,);
 
-        // The fused scan's outputs are `[primal_final_carries..., tangent_final_carries..., primal_stacked...,
-        // tangent_stacked...]`; zip the matching halves back into `DifferentiationDual`s in the original output order.
+        // The fused scan's outputs are `[primal_final_carries..., live(tangent_final_carries)..., primal_stacked...,
+        // live(tangent_stacked)...]`; zip the live halves back into `DifferentiationDual`s in the original output
+        // order, restoring structural zeros for the omitted zero-space outputs.
         let scanned_output_count = body_output_count - carry_count;
+        let stacked_primals_start = carry_count + live_carry_count;
+        let stacked_tangents_start = stacked_primals_start + scanned_output_count;
         let mut jvp_outputs = Vec::with_capacity(body_output_count);
+        let mut carry_tangents = outputs[carry_count..stacked_primals_start].iter().cloned();
         for index in 0..carry_count {
-            jvp_outputs.push(DifferentiationDual::new(outputs[index].clone(), outputs[carry_count + index].clone())?);
+            // Scan's carry fixed point makes the carry input and output tangent liveness masks identical.
+            jvp_outputs.push(if input_has_tangent[index] {
+                DifferentiationDual::new(outputs[index].clone(), carry_tangents.next().unwrap())?
+            } else {
+                DifferentiationDual::new_with_zero_tangent(outputs[index].clone())
+            });
         }
+        let mut stacked_tangents = outputs[stacked_tangents_start..].iter().cloned();
         for index in 0..scanned_output_count {
-            jvp_outputs.push(DifferentiationDual::new(
-                outputs[2 * carry_count + index].clone(),
-                outputs[2 * carry_count + scanned_output_count + index].clone(),
-            )?);
+            jvp_outputs.push(if output_has_tangent[carry_count + index] {
+                DifferentiationDual::new(
+                    outputs[stacked_primals_start + index].clone(),
+                    stacked_tangents.next().unwrap(),
+                )?
+            } else {
+                DifferentiationDual::new_with_zero_tangent(outputs[stacked_primals_start + index].clone())
+            });
         }
         Ok(jvp_outputs)
     }
 }
 
-/// Rebuilds a fused JVP scan body so its doubled boundary uses scan order instead of JVP order.
-fn permute_doubled_scan_body<V, O>(
+/// Rebuilds a fused JVP scan body so its compact boundary uses scan order instead of JVP order. The liveness masks
+/// mark which primal boundary entries carry a tangent entry in the compact fused signature.
+fn permute_live_scan_body<V, O>(
     program: Program<V, O, Vec<V>, Vec<V>>,
-    input_half: usize,
-    output_half: usize,
+    input_has_tangent: &[bool],
+    output_has_tangent: &[bool],
     carry_count: usize,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value,
     O: Operation<V::Type>,
 {
-    let input_order = doubled_scan_signature_permutation(input_half, carry_count)?;
-    let output_order = doubled_scan_signature_permutation(output_half, carry_count)?;
+    let input_order = live_scan_signature_permutation(input_has_tangent, carry_count)?;
+    let output_order = live_scan_signature_permutation(output_has_tangent, carry_count)?;
     reorder_program_boundary(program, input_order.as_slice(), output_order.as_slice())
 }
 
-/// Returns the permutation that converts one side of a fused JVP body's doubled scan signature from JVP order
-/// (`[primal_entries..., tangent_entries...]`, each of length `half`) into scan order, where carries lead the
-/// scanned entries on both the primal and tangent halves:
-/// `[primal_carries..., tangent_carries..., primal_scanned..., tangent_scanned...]`.
-fn doubled_scan_signature_permutation(half: usize, carry_count: usize) -> Result<Vec<usize>, ProgramError> {
-    if carry_count > half {
+/// Returns the permutation that converts one side of a compact fused JVP body signature from JVP order
+/// (`[primal_entries..., live(tangent_entries)...]`) into scan order, where carries lead the scanned entries on both
+/// the primal and live tangent sides:
+/// `[primal_carries..., live(tangent_carries)..., primal_scanned..., live(tangent_scanned)...]`. The `has_tangent`
+/// mask marks the primal entries whose tangent entry exists in the compact signature; the position of the `k`-th
+/// live entry's tangent entry is the number of primal entries plus `k`.
+fn live_scan_signature_permutation(has_tangent: &[bool], carry_count: usize) -> Result<Vec<usize>, ProgramError> {
+    let entry_count = has_tangent.len();
+    if carry_count > entry_count {
         return Err(ProgramError::MalformedProgram(format!(
-            "scan carry count {carry_count} exceeds fused body half-signature size {half}",
+            "scan carry count {carry_count} exceeds fused body signature size {entry_count}",
         )));
     }
-    let mut permutation = Vec::with_capacity(2 * half);
+    let tangent_positions = has_tangent
+        .iter()
+        .scan(entry_count, |next_position, &live| {
+            let position = live.then_some(*next_position);
+            *next_position += usize::from(live);
+            Some(position)
+        })
+        .collect::<Vec<_>>();
+    let mut permutation = Vec::with_capacity(entry_count + has_tangent.iter().filter(|&&live| live).count());
     permutation.extend(0..carry_count);
-    permutation.extend(half..half + carry_count);
-    permutation.extend(carry_count..half);
-    permutation.extend(half + carry_count..2 * half);
+    permutation.extend(tangent_positions[..carry_count].iter().flatten());
+    permutation.extend(carry_count..entry_count);
+    permutation.extend(tangent_positions[carry_count..].iter().flatten());
     Ok(permutation)
 }
 
@@ -3623,6 +3674,94 @@ mod tests {
         // Linearizing the same program is what materializes residual stacks, as known-scan edges.
         let linearization = program.linearize().unwrap();
         assert!(linearization.residual_count() >= 1);
+    }
+
+    #[test]
+    fn test_scan_differentiation_with_zero_space_key_carry() {
+        use crate::backends::scalars::Scalar;
+        use crate::types::{Dimension, Shape};
+
+        // A scan whose carries mix a differentiable accumulator with a zero-differential-space element — here a
+        // `u64` key, the shape of every keyed training loop. The compact fused-JVP contract omits the key's tangent
+        // slot on both the carry and output boundaries, and reverse mode returns a typed zero-space cotangent for
+        // the key input at the public boundary.
+        fn keyed_product_body() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let accumulator = builder.add_input(ArrayType::scalar(DataType::F64));
+            let key = builder.add_input(ArrayType::scalar(DataType::U64));
+            let slice = builder.add_input(ArrayType::scalar(DataType::F64));
+            let product = builder.add_instruction(MulOperation, Vec::new(), vec![accumulator, slice]).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(
+                    vec![product, key, product],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 3],
+                )
+                .unwrap()
+        }
+        fn stage_keyed_product_scan<V: Value<Type = ArrayType>>(
+            accumulator: V,
+            key: V,
+            values: V,
+        ) -> Result<(V, V), ProgramError>
+        where
+            V::DispatchDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
+        {
+            let mut outputs = accumulator.dispatch_domain().bind(
+                ArrayOperation::Scan(ScanOperation::new(2, 3)),
+                vec![keyed_product_body()],
+                &[accumulator.clone(), key, values],
+            )?;
+            let stacked = outputs.remove(2);
+            Ok((outputs.remove(0), stacked))
+        }
+
+        // Forward mode: the fused scan carries `[acc, key, live(ȧcc)]` and its body omits the key tangents.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |(accumulator, key, values)| stage_keyed_product_scan(accumulator, key, values),
+            (
+                ArrayType::scalar(DataType::F64),
+                ArrayType::scalar(DataType::U64),
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),
+            ),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        let jvp = program.jvp().unwrap().into_simplified().unwrap();
+        let scans = jvp
+            .instructions()
+            .iter()
+            .filter_map(|instruction| match instruction.operation() {
+                TestOperation::Scan(operation) => Some((operation, instruction)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scans.len(), 1);
+        let (fused_scan, fused_instruction) = scans[0];
+        assert_eq!(fused_scan.carry_count(), 3);
+        let fused_body = jvp.region_ref(fused_instruction.regions()[0]).unwrap().to_program();
+        assert_eq!(fused_body.input_types().len(), 5);
+        assert_eq!(fused_body.output_types().len(), 5);
+
+        // Reverse mode through the same scan: the accumulator and slice cotangents match the keyless product scan,
+        // while the key input receives a typed zero-space cotangent at the public boundary.
+        let ((output, stacked), pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .vjp(
+                |(accumulator, key, values)| stage_keyed_product_scan(accumulator, key, values),
+                (
+                    Array::scalar(1.0),
+                    Array::new(ArrayType::scalar(DataType::U64), vec![Scalar::U64(7)]).unwrap(),
+                    Array::vector(vec![2.0, 3.0, 4.0]),
+                ),
+            )
+            .unwrap();
+        assert_eq!(output.to_f64s(), vec![24.0]);
+        assert_eq!(stacked.to_f64s(), vec![2.0, 6.0, 24.0]);
+        let (accumulator_cotangent, key_cotangent, values_cotangent) =
+            pullback.apply((Array::scalar(1.0), Array::vector(vec![0.0, 0.0, 0.0]))).unwrap();
+        assert_eq!(accumulator_cotangent.to_f64s(), vec![24.0]);
+        assert_eq!(key_cotangent, Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
+        assert_eq!(values_cotangent.to_f64s(), vec![12.0, 8.0, 6.0]);
     }
 
     #[test]

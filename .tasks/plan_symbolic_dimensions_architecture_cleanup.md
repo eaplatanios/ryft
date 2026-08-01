@@ -1605,14 +1605,19 @@ searches. The complete source ledger and verification record are in
 
 ### Phase 6: simplify differentiation and transposition
 
-- [ ] Express the dimension tangent/cotangent space once in differentiation-owned policy.
-- [ ] Introduce or extend one differentiation-owned residual structure capable of carrying ordinary array-program SSA
+- [x] P6a — execute `.tasks/plan_p6a_differentiation_residual_architecture.md` as the first isolated Phase 6 review
+      unit. Establish one differentiation-owned, storage-generic residual operand contract and prove it end to end on
+      dynamic reshape before migrating other mixed operations or composite regions. The prototype must keep residual
+      dimensions as ordinary SSA values, remove fake dimension tangent/cotangent slots from generated linear programs,
+      and reject side tables, identity lookup, copied shape metadata, or reshape-specific residual fields.
+- [x] Express the dimension tangent/cotangent space once in differentiation-owned policy.
+- [x] Introduce or extend one differentiation-owned residual structure capable of carrying ordinary array-program SSA
       values, including dimensions, without assigning them tangent/cotangent slots.
-- [ ] Make linearization rules declare required primal dimension residuals explicitly while those operands or source
+- [x] Make linearization rules declare required primal dimension residuals explicitly while those operands or source
       arrays are available.
-- [ ] Thread dimension residuals through nested regions, rematerialization, custom derivatives, JVP/VJP construction,
+- [x] Thread dimension residuals through nested regions, rematerialization, custom derivatives, JVP/VJP construction,
       import, and transpose exactly like other residual values.
-- [ ] Rewrite reshape transposition to consume ordinary dimension residual inputs.
+- [x] Rewrite reshape transposition to consume ordinary dimension residual inputs.
 - [x] `ReshapeOperation::transpose_dimension_variables` and every exact identifier occurrence are absent from the
       integration tree. Do not reintroduce an equivalent payload residual manifest while implementing the ordinary
       residual path above.
@@ -1620,10 +1625,10 @@ searches. The complete source ledger and verification record are in
       the same residual contract.
 - [ ] Make generic outer dispatch project/lift array-only JVP, VJP, and transpose rules, reusing the shared toy
       composite fixture promoted in Phase 5 for the member-kind-agnostic dispatch tests.
-- [ ] Preserve dimension values as ordinary structural residuals without tangent slots.
+- [x] Preserve dimension values as ordinary structural residuals without tangent slots.
 - [ ] Keep explicit mixed rules only where primal dimension operands control array results or region interfaces.
 - [ ] Remove temporary homogeneous differentiation programs and dimension recovery.
-- [ ] Add a residual search proving no primal operation payload stores differentiation-only dimension variables or
+- [x] Add a residual search proving no primal operation payload stores differentiation-only dimension variables or
       residual manifests.
 - [ ] Prefer structural zeros over materializing shaped zero arrays.
 - [ ] Inventory every production construction of `ZeroOperation<ArrayProgramType>` and every composite
@@ -1655,11 +1660,44 @@ searches. The complete source ledger and verification record are in
 - [ ] Preserve proven/disproven/residual requirement behavior and `OrderedAssertion` effects.
 - [ ] Verify nested JVP/VJP, linearization, transpose, rematerialization, custom derivatives, condition, while, and
       scan.
-- [ ] Add exact rendered-IR tests proving residual dimension atoms are explicit dataflow edges shared by the forward
+- [x] Add exact rendered-IR tests proving residual dimension atoms are explicit dataflow edges shared by the forward
       linearization and transpose, with no type expression or payload witness.
 - [ ] Gate: adding an array-only primitive with ordinary AD/PE rules requires no handwritten composite dispatcher
       case, the generic composite zero escape hatch is gone, and the only top-level zero variant is the explicit mixed
       constructor.
+
+P6a completed at frozen boundary `236b05b1c`. `DifferentiableType::is_zero_space` now owns the distinction between a
+typed public zero leaf and an omitted generated tangent/cotangent slot. `Linearization`, `Pushforward`, and `Pullback`
+use compact live differential boundaries while preserving the public derivative tree. The new generic
+`LinearCallOperation<T>` structurally associates `[linear operands..., residual operands...]` with attached forward
+and transpose programs; partial evaluation remains the sole owner of residual first-use ordering and SSA
+deduplication. It replaces `CustomVjpTangentOperation` rather than duplicating it, supports eager execution, PE,
+nested JVP, import/identity renaming, transpose, custom VJP/rematerialization, XLA forward-region inlining, and a
+promoted third storage member without a composite-kind match.
+
+Composite dynamic reshape is the first migrated consumer. `[n, 4] -> [2, 2*n]` carries the explicit output extent and
+the independently required source extent as two visible residual edges; repeated/permuted `[n, n]` deduplicates to one
+residual; an already-explicit source extent avoids `dimension_size`; and zero extents, multiple runtime sizes,
+pullback, nested JVP, import, and sharding are covered. No reshape payload metadata, identity lookup, type-to-value
+recovery, or composite reshape Phase 6 rejection remains.
+
+The source ledger is: differential classification in `DifferentiableType`; compact/public boundary handling in
+`Linearization`/`Pushforward`/`Pullback`; residual ordering and deduplication in `PartialEvaluationContext`; association
+and transpose delivery in `LinearCallOperation`; inverse geometry in the composite reshape JVP's attached regions; and
+execution in eager region replay plus XLA forward-region inlining. The final delta is +478 production and +398
+test/documentation Rust lines across core/XLA. The generic 523-line carrier replaces the specialized 477-line custom
+VJP carrier and is shared by the remaining sweep. Controlled clean core check cost is 7.36s versus 6.92s (+6.4%);
+no-op is 0.10s versus 0.11s. Final gates pass 1,065 core tests, 406 XLA tests plus one ignored benchmark, both 17-test
+macro groups, 52 core doctests plus 16 intentional ignores, XLA doctests, formatting, and diff hygiene. Full evidence
+is in `.tasks/plan_p6a_differentiation_residual_architecture.md`.
+
+The next isolated P6 review unit is the extent-residual operation sweep: audit and migrate broadcast, concatenate,
+pad, slicing/gathering, reductions, and collectives onto `LinearCallOperation`. That unit also owns two recorded
+boundaries from the P6a review: an executable linear call currently rejects batching (so `vmap` over a linearized
+program containing one reports an exact diagnostic; the principled rule batches both attached regions with
+replicated residual extents), and each migrated rule should move out of the composite enum dispatcher onto its
+payload's module as the sweep's first mechanical step so the dispatcher does not grow by another six inline rules. Generic outer dispatch and the
+composite-zero deletion remain subsequent units so each stays independently reviewable.
 
 ### Phase 7: backend execution and lowering
 
@@ -1807,9 +1845,9 @@ searches. The complete source ledger and verification record are in
       assumption.
 - [ ] Staged projection preserves SSA atom identity.
 - [ ] Mapped dimension authority and sharded dimension authority remain rejected.
-- [ ] Dimension tangents/cotangents remain absent or structural zero.
-- [ ] Required primal dimension values travel as ordinary differentiation residual SSA values.
-- [ ] No primal operation payload contains `transpose_dimension_variables` or an equivalent residual manifest.
+- [x] Dimension tangents/cotangents remain absent or structural zero.
+- [x] Required primal dimension values travel as ordinary differentiation residual SSA values.
+- [x] No primal operation payload contains `transpose_dimension_variables` or an equivalent residual manifest.
 - [x] Dynamic batching alignment consumes an explicit dimension value.
 - [ ] Requirement effects survive every transform and lower in deterministic order.
 - [ ] Nested condition, while, scan, custom derivative, and rematerialization regions carry dimensions correctly.
@@ -1819,7 +1857,7 @@ searches. The complete source ledger and verification record are in
 - [ ] Exact diagnostics match the baseline.
 - [ ] Bounded dynamic ABI, CPU, and CUDA behavior match the baseline.
 - [ ] Behavioral JAX parity and Ryft-exceeds-JAX cases remain intact.
-- [ ] Toy third-kind tests demonstrate that generic program/context/projection machinery is closed to modification.
+- [x] Toy third-kind tests demonstrate that generic program/context/projection machinery is closed to modification.
 
 ## Abort and reassessment criteria
 

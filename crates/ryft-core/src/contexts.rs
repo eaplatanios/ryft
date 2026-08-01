@@ -730,6 +730,7 @@ pub(crate) mod tests {
     use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::differentiation::forward::DifferentiationTracer;
+    use crate::differentiation::types::DifferentiableType;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
@@ -860,6 +861,20 @@ pub(crate) mod tests {
 
         fn is_complex(&self) -> bool {
             false
+        }
+    }
+
+    impl DifferentiableType for ProjectedProgramType {
+        fn is_zero_space(&self) -> bool {
+            false
+        }
+
+        fn tangent(&self) -> Self {
+            self.clone()
+        }
+
+        fn cotangent(&self) -> Self {
+            self.clone()
         }
     }
 

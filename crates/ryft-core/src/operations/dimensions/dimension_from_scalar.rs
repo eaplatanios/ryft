@@ -435,12 +435,8 @@ mod tests {
         ));
 
         let jvp = program.jvp().unwrap();
-        assert_eq!(jvp.input_ids().len(), 2);
-        assert_eq!(jvp.output_ids().len(), 2);
-        assert_eq!(
-            jvp.outputs().last().unwrap().r#type().as_ref(),
-            &ArrayProgramType::Array(ArrayType::scalar(DataType::Zero)),
-        );
+        assert_eq!(jvp.input_ids().len(), 1);
+        assert_eq!(jvp.output_ids().len(), 1);
 
         let mut transposition_context = TestContext::new();
         assert!(matches!(

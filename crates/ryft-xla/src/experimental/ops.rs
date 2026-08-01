@@ -9,8 +9,8 @@ use ryft_core::captures::CaptureReference;
 use ryft_core::compilation::function::CompiledCallOperation;
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationError, LinearCallOperation,
+    TransposableOperation, TranspositionDriver,
 };
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
@@ -63,7 +63,7 @@ use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::memory::TransferToMemoryOperation;
 use ryft_core::operations::tag::TagOperation;
 use ryft_core::programs::types::{Type, TypeError, Typed};
-use ryft_core::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation};
+use ryft_core::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::types::{ArrayProgramType, ArrayType, DimensionType, DimensionVariable};
 
@@ -158,9 +158,11 @@ where
     /// Backend-owned custom VJP call whose attached regions can contain XLA operations.
     CustomVjp(CustomVjpOperation),
 
-    /// Backend-owned opaque custom-VJP tangent carrier, staged by the capture-free forward of a
-    /// [`CustomVjp`](Self::CustomVjp) call. Its attached backward region can contain XLA operations.
-    CustomVjpTangent(CustomVjpTangentOperation<ArrayProgramType>),
+    /// Differentiation-owned call to an explicitly transposable linear map with ordinary trailing residual
+    /// operands. This variant carries both carrier forms: the executable form (attached forward and transpose
+    /// regions) lowers by inlining its forward region, while the opaque reverse-only `custom_vjp` form (attached
+    /// transpose region only) cannot be lowered and reports the canonical reverse-only diagnostic.
+    LinearCall(LinearCallOperation<ArrayProgramType>),
 
     /// Backend-owned rematerialized call whose attached regions can contain XLA operations.
     Rematerialize(RematerializeOperation),
@@ -231,7 +233,18 @@ where
                         .with_captures(captures),
                 )
             }
+            ArrayProgramOperation::LinearCall(operation) => Self::LinearCall(operation),
         }
+    }
+}
+
+impl<C> From<LinearCallOperation<ArrayProgramType>> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: LinearCallOperation<ArrayProgramType>) -> Self {
+        Self::LinearCall(operation)
     }
 }
 
@@ -302,16 +315,6 @@ where
     #[inline]
     fn from(operation: CustomVjpOperation) -> Self {
         Self::CustomVjp(operation)
-    }
-}
-
-impl<C> From<CustomVjpTangentOperation<ArrayProgramType>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: CustomVjpTangentOperation<ArrayProgramType>) -> Self {
-        Self::CustomVjpTangent(operation)
     }
 }
 
@@ -504,7 +507,7 @@ where
             | Self::Scan(_)
             | Self::CustomJvp(_)
             | Self::CustomVjp(_)
-            | Self::CustomVjpTangent(_)
+            | Self::LinearCall(_)
             | Self::Rematerialize(_)
             | Self::JitCall(_)
             | Self::ShardMap(_) => return None,
@@ -556,7 +559,7 @@ macro_rules! dispatch_operation {
             XlaOperation::CustomVjp(operation) => {
                 Operation::<ArrayProgramType>::$method(operation, $($argument),*)
             }
-            XlaOperation::CustomVjpTangent(operation) => {
+            XlaOperation::LinearCall(operation) => {
                 Operation::<ArrayProgramType>::$method(operation, $($argument),*)
             }
             XlaOperation::Rematerialize(operation) => {
@@ -591,7 +594,7 @@ macro_rules! dispatch_higher_operation {
             XlaOperation::CustomVjp(operation) => {
                 Operation::<ArrayProgramType>::$method(operation, $($argument),*)
             }
-            XlaOperation::CustomVjpTangent(operation) => {
+            XlaOperation::LinearCall(operation) => {
                 Operation::<ArrayProgramType>::$method(operation, $($argument),*)
             }
             XlaOperation::Rematerialize(operation) => {
@@ -684,8 +687,8 @@ where
             Self::CustomVjp(operation) => {
                 Ok(Self::CustomVjp(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
             }
-            Self::CustomVjpTangent(operation) => {
-                Ok(Self::CustomVjpTangent(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
+            Self::LinearCall(operation) => {
+                Ok(Self::LinearCall(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
             }
             Self::Rematerialize(operation) => {
                 Ok(Self::Rematerialize(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
@@ -754,6 +757,7 @@ where
             return operation.jvp(context, driver, inputs);
         }
         match self {
+            Self::LinearCall(operation) => operation.jvp(context, driver, inputs),
             Self::JitCall(operation) => operation.jvp(context, driver, inputs),
             Self::ShardMap(operation) => operation.jvp(context, driver, inputs),
             _ => Err(ProgramError::UnsupportedOperation {
@@ -780,6 +784,9 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
         if let Some(operation) = self.to_core_operation() {
+            return operation.transpose(context, driver, inputs, outputs);
+        }
+        if let Self::LinearCall(operation) = self {
             return operation.transpose(context, driver, inputs, outputs);
         }
         Err(ProgramError::UnsupportedOperation {
@@ -1097,9 +1104,8 @@ where
 /// Partition-aware transpose rule for a *primal* tangent [`JitCallOperation`], the jitted-call counterpart of
 /// [`transpose_primal_condition`](ryft_core::operations::control_flow::transpose_primal_condition),
 /// [`transpose_primal_scan`](ryft_core::operations::control_flow::transpose_primal_scan), and
-/// [`transpose_primal_custom_vjp`](ryft_core::tracing_v2::transpose_primal_custom_vjp). It is used when the
-/// direct reverse transposes a tangent program in the primal [`XlaOperation`] family rather than re-keying it
-/// into a linear operation family.
+/// [`LinearCallOperation`]'s transpose rule. It is used when the direct reverse transposes a tangent program in the
+/// primal [`XlaOperation`] family rather than re-keying it into a linear operation family.
 ///
 /// The forward ([`JitCallOperation::jvp`]) stages the tangent `jit_call` over the operand tangents followed
 /// by the primal call's residual values, wrapping a callee program whose inputs match that operand signature

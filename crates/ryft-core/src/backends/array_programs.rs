@@ -8,8 +8,8 @@ use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment, TransposableOperation,
-    TranspositionDriver,
+    DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment, LinearCallOperation,
+    TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -22,7 +22,8 @@ use crate::operations::collectives::{
 use crate::operations::collectives::{AllGatherOutputVariance, CollectiveOptions};
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::{
-    Iota, IotaOperation, One, OneOperation, Zero, ZeroOperation, infer_dynamic_constructor_output_types,
+    ConstantOperation, Iota, IotaOperation, One, OneOperation, Zero, ZeroOperation,
+    infer_dynamic_constructor_output_types,
 };
 use crate::operations::control_flow::scan::{
     ScanInterpretation, read_scan_iteration, stacked_scan_type, write_scan_iteration,
@@ -36,7 +37,7 @@ use crate::operations::dimensions::{
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, Pad, PadOperation,
-    Reshape, ReshapeOperation, ReshapeParameters, Slice, Transpose, UpdateSlice,
+    Reshape, ReshapeOperation, ReshapeParameters, Slice, Transpose, TransposeOperation, UpdateSlice,
 };
 use crate::operations::math::AddOperation;
 use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
@@ -54,7 +55,7 @@ use crate::programs::regions::{EmptyRegionDriver, OutputRegionProvenance, Region
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, ProjectedValue, Value, ValueProjection};
 use crate::sharding::Sharding;
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
 
 pub mod batching;
@@ -155,6 +156,9 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
 
     /// Composite scan whose body may carry arrays and first-class dimensions.
     Scan(ScanOperation<ArrayProgramValue<A>>),
+
+    /// Differentiation-owned executable linear call with ordinary trailing residual operands.
+    LinearCall(LinearCallOperation<ArrayProgramType>),
 }
 
 impl<A: Value<Type = ArrayType>> Display for ArrayProgramOperation<A> {
@@ -374,6 +378,13 @@ impl<A: Value<Type = ArrayType>> From<PpermuteOperation> for ArrayProgramOperati
     }
 }
 
+impl<A: Value<Type = ArrayType>> From<LinearCallOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: LinearCallOperation<ArrayProgramType>) -> Self {
+        Self::LinearCall(operation)
+    }
+}
+
 impl<A: Value<Type = ArrayType>> OperationProjection<ArrayType> for ArrayProgramOperation<A> {
     type Projected = ArrayOperation<A>;
 }
@@ -439,6 +450,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Condition(operation) => operation.name(),
             Self::While(operation) => Operation::<ArrayProgramType>::name(operation),
             Self::Scan(operation) => operation.name(),
+            Self::LinearCall(operation) => operation.name(),
         }
     }
 
@@ -467,6 +479,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Condition(operation) => operation.region_slots(),
             Self::While(operation) => Operation::<ArrayProgramType>::region_slots(operation),
             Self::Scan(operation) => operation.region_slots(),
+            Self::LinearCall(operation) => operation.region_slots(),
         }
     }
 
@@ -510,6 +523,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Condition(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::While(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::Scan(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            Self::LinearCall(operation) => operation.infer_region_input_types(input_types, region_interfaces),
         }
     }
 
@@ -585,6 +599,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Condition(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::While(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Scan(operation) => operation.infer_output_types(input_types, region_interfaces),
+            Self::LinearCall(operation) => operation.infer_output_types(input_types, region_interfaces),
         }
     }
 
@@ -621,6 +636,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Condition(operation) => operation.output_region_provenance(output_index),
             Self::While(operation) => Operation::<ArrayProgramType>::output_region_provenance(operation, output_index),
             Self::Scan(operation) => operation.output_region_provenance(output_index),
+            Self::LinearCall(operation) => operation.output_region_provenance(output_index),
         }
     }
 
@@ -649,6 +665,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Condition(operation) => operation.is_zero(output_index),
             Self::While(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
             Self::Scan(operation) => operation.is_zero(output_index),
+            Self::LinearCall(operation) => operation.is_zero(output_index),
         }
     }
 
@@ -677,6 +694,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Condition(operation) => operation.effects(),
             Self::While(operation) => Operation::<ArrayProgramType>::effects(operation),
             Self::Scan(operation) => operation.effects(),
+            Self::LinearCall(operation) => operation.effects(),
         }
     }
 
@@ -726,6 +744,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                 Ok(Self::While(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
             }
             Self::Scan(operation) => Ok(Self::Scan(operation.rename_type_identities(renaming)?)),
+            Self::LinearCall(operation) => Ok(Self::LinearCall(operation.rename_type_identities(renaming)?)),
         }
     }
 
@@ -756,6 +775,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Condition(operation) => operation.render(formatter, indentation),
             Self::While(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
             Self::Scan(operation) => operation.render(formatter, indentation),
+            Self::LinearCall(operation) => operation.render(formatter, indentation),
         }
     }
 }
@@ -911,7 +931,7 @@ where
         driver: &D,
         inputs: &[ArrayProgramValue<A>],
     ) -> Result<Vec<ArrayProgramValue<A>>, ProgramError> {
-        if !matches!(self, Self::Condition(_) | Self::While(_) | Self::Scan(_))
+        if !matches!(self, Self::Condition(_) | Self::While(_) | Self::Scan(_) | Self::LinearCall(_))
             && (!self.region_slots().is_empty() || driver.region_count() != 0)
         {
             return Err(ProgramError::MalformedProgram(format!(
@@ -1253,6 +1273,7 @@ where
             Self::Condition(operation) => operation.interpret(context, driver, inputs),
             Self::While(operation) => operation.interpret(context, driver, inputs),
             Self::Scan(operation) => operation.interpret(context, driver, inputs),
+            Self::LinearCall(operation) => operation.interpret(context, driver, inputs),
         }
     }
 }
@@ -1301,7 +1322,7 @@ impl<A: Value<Type = ArrayType>, C: Context<Type = ArrayProgramType, Operation: 
 
 impl<
     A: Value<Type = ArrayType>,
-    C: Context<Type = ArrayProgramType, Constant: ValueProjection<ArrayType, Projected = A>>,
+    C: Context<Type = ArrayProgramType, Constant: ValueProjection<ArrayType, Projected = A>> + Zero<C::Value>,
 > DifferentiableOperation<C> for ArrayProgramOperation<A>
 where
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1311,11 +1332,14 @@ where
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
-        _driver: &D,
+        driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // TODO(eaplatatanios): Split these out into per-payload `DifferentiableOperation` implementations in the
         //  corresponding modules and then have this implementation simply delegate.
+        if let Self::LinearCall(operation) = self {
+            return operation.jvp(context, driver, inputs);
+        }
         if let Self::Pad(_) = self {
             if inputs.len() < 2 {
                 return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
@@ -1417,19 +1441,219 @@ where
             };
             return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
         }
-        if matches!(self, Self::Reshape(_) | Self::Broadcast(_)) {
+        if let Self::Reshape(operation) = self {
             let Some((array, output_extents)) = inputs.split_first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
             let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            let mut primal_outputs = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
-            let primal = primal_outputs.remove(0);
+            let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+            let tangent = match array.tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Value(array_tangent) => {
+                    let input_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.clone();
+                    let input_cotangent_type = input_type.cotangent();
+                    let permuted_input_cotangent_type = match operation.dimensions() {
+                        Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
+                        None => input_cotangent_type.clone(),
+                    };
+                    if permuted_input_cotangent_type
+                        .shape()
+                        .dimensions()
+                        .iter()
+                        .all(|dimension| matches!(dimension, Dimension::Static(_)))
+                    {
+                        let mut tangent_inputs = Vec::with_capacity(inputs.len());
+                        tangent_inputs.push(array_tangent.clone());
+                        tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
+                        MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
+                    } else {
+                        // Record each distinct dynamic input extent while the source array is still available. The
+                        // values become ordinary trailing residual operands of the linear call below; repeated type
+                        // identities reuse the same SSA value in first-use order.
+                        let source_axes = operation.dimensions().map_or_else(
+                            || (0..input_type.rank()).collect::<Vec<_>>(),
+                            |dimensions| dimensions.to_vec(),
+                        );
+                        let mut residual_values =
+                            output_extents.iter().map(|extent| extent.primal().clone()).collect::<Vec<_>>();
+                        let mut dynamic_extents = Vec::<(DimensionVariable, usize)>::new();
+                        let mut inverse_dynamic_indices = Vec::with_capacity(permuted_input_cotangent_type.rank());
+                        for (source_axis, dimension) in
+                            source_axes.iter().copied().zip(permuted_input_cotangent_type.shape().dimensions())
+                        {
+                            match dimension {
+                                Dimension::Static(_) => inverse_dynamic_indices.push(None),
+                                Dimension::Dynamic(variable) => {
+                                    let index = if let Some((_, index)) =
+                                        dynamic_extents.iter().find(|(candidate, _)| candidate == variable)
+                                    {
+                                        *index
+                                    } else if let Some(index) = output_extents.iter().position(|extent| {
+                                        matches!(
+                                            extent.primal().r#type().as_ref(),
+                                            ArrayProgramType::Dimension(r#type) if r#type.variable() == variable
+                                        )
+                                    }) {
+                                        dynamic_extents.push((variable.clone(), index));
+                                        index
+                                    } else {
+                                        let size = context
+                                            .bind(
+                                                ArrayProgramOperation::<A>::from(DimensionSizeOperation::new(
+                                                    &input_type,
+                                                    source_axis,
+                                                )?),
+                                                Vec::new(),
+                                                std::slice::from_ref(array.primal()),
+                                            )?
+                                            .remove(0);
+                                        let index = residual_values.len();
+                                        residual_values.push(size);
+                                        dynamic_extents.push((variable.clone(), index));
+                                        index
+                                    };
+                                    inverse_dynamic_indices.push(Some(index));
+                                }
+                            }
+                        }
+
+                        // The forward region is the ordinary tangent reshape. Its trailing input extents are unused
+                        // here but share one deterministic residual boundary with the transpose region.
+                        let mut forward_input_types = Vec::with_capacity(1 + residual_values.len());
+                        forward_input_types.push(array_tangent.r#type().into_owned());
+                        forward_input_types.extend(residual_values.iter().map(|value| value.r#type().into_owned()));
+                        let output_extent_count = output_extents.len();
+                        let forward_operation = operation.clone();
+                        let (_, forward) = NestedTracingContext::trace(
+                            context.clone(),
+                            move |region_inputs| {
+                                let mut reshape_inputs = Vec::with_capacity(1 + output_extent_count);
+                                reshape_inputs.push(region_inputs[0].clone());
+                                reshape_inputs.extend(region_inputs[1..=output_extent_count].iter().cloned());
+                                region_inputs[0].dispatch_domain().bind(
+                                    ArrayProgramOperation::<A>::from(forward_operation),
+                                    Vec::new(),
+                                    reshape_inputs.as_slice(),
+                                )
+                            },
+                            forward_input_types,
+                        )?;
+
+                        // The transpose region consumes the same residual suffix followed by the output cotangent.
+                        // It reconstructs static axes as literal dimension operations and reads dynamic axes directly
+                        // from the residual SSA inputs before applying the inverse permutation and checking the exact
+                        // input-cotangent type.
+                        let mut transpose_input_types =
+                            residual_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+                        transpose_input_types.push(primal.r#type().cotangent());
+                        let transpose_operation = operation.clone();
+                        let transpose_target_type = input_cotangent_type.clone();
+                        let transpose_permuted_type = permuted_input_cotangent_type.clone();
+                        let (_, transpose) = NestedTracingContext::trace(
+                            context.clone(),
+                            move |region_inputs| {
+                                let transpose_context = region_inputs.last().unwrap().dispatch_domain();
+                                let output_cotangent = region_inputs.last().unwrap().clone();
+                                let residual_inputs = &region_inputs[..region_inputs.len() - 1];
+                                let bridge_sharding = match (
+                                    transpose_permuted_type.sharding(),
+                                    <&ArrayType>::try_from(output_cotangent.r#type().as_ref())?.sharding(),
+                                ) {
+                                    (Some(sharding), _) => Some(sharding.clone()),
+                                    (None, Some(sharding)) => Some(Sharding::replicated(
+                                        sharding.mesh().clone(),
+                                        transpose_permuted_type.rank(),
+                                    )),
+                                    (None, None) => None,
+                                };
+                                let mut inverse_operation = ReshapeOperation::new();
+                                if let Some(bridge_sharding) = bridge_sharding {
+                                    inverse_operation = inverse_operation.with_output_sharding(bridge_sharding);
+                                }
+                                let mut inverse_inputs = Vec::with_capacity(transpose_permuted_type.rank() + 1);
+                                inverse_inputs.push(output_cotangent);
+                                for (axis, dimension) in transpose_permuted_type.shape().dimensions().iter().enumerate()
+                                {
+                                    match dimension {
+                                        Dimension::Dynamic(_) => inverse_inputs
+                                            .push(residual_inputs[inverse_dynamic_indices[axis].unwrap()].clone()),
+                                        Dimension::Static(extent) => {
+                                            let constant = DimensionValue::constant(*extent)?;
+                                            let constant = transpose_context
+                                                .bind(
+                                                    ArrayProgramOperation::<A>::from(DimensionOperation::from(
+                                                        ConstantOperation::new(constant),
+                                                    )),
+                                                    Vec::new(),
+                                                    &[],
+                                                )?
+                                                .remove(0);
+                                            inverse_inputs.push(constant);
+                                        }
+                                    }
+                                }
+                                let cotangent = transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::from(inverse_operation),
+                                        Vec::new(),
+                                        inverse_inputs.as_slice(),
+                                    )?
+                                    .remove(0);
+                                let cotangent = if let Some(dimensions) = transpose_operation.dimensions() {
+                                    transpose_context
+                                        .bind(
+                                            ArrayProgramOperation::<A>::Array(ArrayOperation::Transpose(
+                                                TransposeOperation::new(dimensions.inverse()?),
+                                            )),
+                                            Vec::new(),
+                                            std::slice::from_ref(&cotangent),
+                                        )?
+                                        .remove(0)
+                                } else {
+                                    cotangent
+                                };
+                                let cotangent_type = cotangent.r#type();
+                                let actual_type = <&ArrayType>::try_from(cotangent_type.as_ref())?;
+                                if actual_type != &transpose_target_type {
+                                    return Err(TypeError::invalid(format!(
+                                        "inverse reshape cotangent type {actual_type} does not match input cotangent \
+                                         type {transpose_target_type}",
+                                    ))
+                                    .into());
+                                }
+                                Ok(vec![cotangent])
+                            },
+                            transpose_input_types,
+                        )?;
+
+                        let mut linear_inputs = Vec::with_capacity(1 + residual_values.len());
+                        linear_inputs.push(array_tangent.clone());
+                        linear_inputs.extend(residual_values);
+                        let carrier = LinearCallOperation::new(linear_inputs.len() - 1);
+                        MaybeZero::Value(
+                            context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(carrier),
+                                    vec![forward, transpose],
+                                    linear_inputs.as_slice(),
+                                )?
+                                .remove(0),
+                        )
+                    }
+                }
+            };
+            return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
+        }
+        if let Self::Broadcast(_) = self {
+            let Some((array, output_extents)) = inputs.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
             let tangent = match array.tangent() {
                 MaybeZero::Zero(_) => {
                     let tangent_type = primal.r#type().tangent();
-                    if matches!(self, Self::Broadcast(_))
-                        && tangent_type.identities().any(|(position, _)| position == TypeIdentityPosition::Reference)
-                    {
+                    if tangent_type.identities().any(|(position, _)| position == TypeIdentityPosition::Reference) {
                         let array_tangent_type = <&ArrayType>::try_from(&tangent_type)?.clone();
                         let dynamic_extents = array_tangent_type
                             .shape()
@@ -1447,8 +1671,6 @@ where
                     }
                 }
                 MaybeZero::Value(array_tangent) => {
-                    // Output extents are non-differentiable shape inputs: replay their primal values unchanged while
-                    // applying the same shape operation to the live array tangent.
                     let mut tangent_inputs = Vec::with_capacity(inputs.len());
                     tangent_inputs.push(array_tangent.clone());
                     tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
@@ -1540,7 +1762,8 @@ impl<
     V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected = A> + From<DimensionValue>,
     O: Operation<ArrayProgramType>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
-        + From<ArrayProgramOperation<A>>,
+        + From<ArrayProgramOperation<A>>
+        + From<ZeroOperation<ArrayProgramType>>,
 > TransposableOperation<V, O> for ArrayProgramOperation<A>
 where
     ArrayOperation<A>: TransposableOperation<A, ArrayOperation<A>>,
@@ -1554,6 +1777,9 @@ where
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        if let Self::LinearCall(operation) = self {
+            return operation.transpose(context, driver, inputs, outputs);
+        }
         if let Self::CustomCall(operation) = self {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -1724,7 +1950,8 @@ where
                 .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
             {
                 return Err(ProgramError::UnsupportedOperation {
-                    message: "'reshape' transpose with dynamic input extents requires Phase 6 dimension residuals"
+                    message: "direct transposition of a dynamic 'reshape' requires linearization so its input extents \
+                              are available as explicit residuals"
                         .to_string(),
                 }
                 .into());
@@ -2272,6 +2499,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::operations::OperationProjection;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::tracing::{Tracer, TracingContext};
     use crate::types::{DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Memory, Shape, StridedLayout};
 
@@ -2424,12 +2652,7 @@ mod tests {
         let tangent = ArrayProgramValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
         let result_extent = ArrayProgramValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
         assert_eq!(
-            program.jvp().unwrap().interpret(vec![
-                primal.clone(),
-                result_extent,
-                tangent.clone(),
-                ArrayProgramValue::Array(Array::scalar(Scalar::Zero)),
-            ]),
+            program.jvp().unwrap().interpret(vec![primal.clone(), result_extent, tangent.clone(),]),
             Ok(vec![primal, tangent]),
         );
         assert!(matches!(
@@ -3591,10 +3814,8 @@ mod tests {
 
         let jvp = program.jvp().unwrap();
         let extent = ArrayProgramValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
-        let zero_tangent =
-            ArrayProgramValue::Array(Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
         assert_eq!(
-            jvp.interpret(vec![extent, zero_tangent]),
+            jvp.interpret(vec![extent]),
             Ok(vec![
                 ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
                 ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
@@ -3654,10 +3875,8 @@ mod tests {
 
         let jvp = program.jvp().unwrap();
         let extent = ArrayProgramValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
-        let zero_tangent =
-            ArrayProgramValue::Array(Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
         assert_eq!(
-            jvp.interpret(vec![extent, zero_tangent]),
+            jvp.interpret(vec![extent]),
             Ok(vec![
                 ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0])),
                 ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
@@ -3716,10 +3935,8 @@ mod tests {
 
         let jvp = program.jvp().unwrap();
         let extent = ArrayProgramValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
-        let zero_tangent =
-            ArrayProgramValue::Array(Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
         assert_eq!(
-            jvp.interpret(vec![extent, zero_tangent]),
+            jvp.interpret(vec![extent]),
             Ok(vec![
                 ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 1.0, 2.0])),
                 ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
@@ -3953,16 +4170,178 @@ mod tests {
             Ok(vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0,]))]),
         );
 
-        let source = DimensionVariable::new("source", DimensionBounds::new(1, Some(9)).unwrap());
+        // The inverse cannot recover `n` from the `[2, 2*n]` output shape without division. The reshape JVP must
+        // therefore retain the original source extent as an explicit residual while it still has the source array.
+        let source = DimensionVariable::new("source", DimensionBounds::new(0, Some(9)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source), Dimension::Static(4)]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let source_extent = builder
+            .add_instruction(DimensionSizeOperation::new(&input_type, 0).unwrap(), Vec::new(), vec![input])
+            .unwrap()[0];
+        let two_value = DimensionValue::constant(2).unwrap();
+        let two_type = two_value.r#type().clone();
+        let two = builder.add_constant(ArrayProgramValue::Dimension(two_value));
+        let source_type = DimensionType::new(input_type.shape().dimensions()[0].variable().unwrap().clone());
+        let doubled_extent = builder
+            .add_instruction(
+                DimensionOperation::Mul(DimensionMulOperation::new(&source_type, &two_type).unwrap()),
+                Vec::new(),
+                vec![source_extent, two],
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(ReshapeOperation::new(), Vec::new(), vec![input, two, doubled_extent])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_types().len(), 2);
+        for size in [0, 1, 3, 8] {
+            let element_count = size * 4;
+            let primal_values = (0..element_count).map(|value| value as f64).collect::<Vec<_>>();
+            let tangent_values = (element_count..2 * element_count).map(|value| value as f64).collect::<Vec<_>>();
+            assert_eq!(
+                jvp.interpret(vec![
+                    ArrayProgramValue::Array(Array::matrix(size, 4, primal_values.clone())),
+                    ArrayProgramValue::Array(Array::matrix(size, 4, tangent_values.clone())),
+                ]),
+                Ok(vec![
+                    ArrayProgramValue::Array(Array::matrix(2, 2 * size, primal_values)),
+                    ArrayProgramValue::Array(Array::matrix(2, 2 * size, tangent_values)),
+                ]),
+            );
+        }
+        let linearization = program.linearize().unwrap();
+        let rendered_primal = linearization.primal().to_string();
+        let rendered_tangent = linearization.tangent().to_string();
+        assert_eq!(
+            rendered_primal,
+            "
+lambda %0:f64[source, 4] .
+let %1:dimension<2> = const
+    %2:dimension<source ∈ [0, 9)> = dimension_size [axis=0] %0
+    %3:dimension<source * 2 ∈ [0, 17)> = dimension_mul %2 %1
+    %4:f64[2, source * 2] = reshape %0 %1 %3
+    %5:dimension<source ∈ [0, 9)> = dimension_size [axis=0] %0
+in (%4, %3, %5)
+            "
+            .trim(),
+        );
+        assert_eq!(
+            rendered_tangent,
+            "
+lambda %0:f64[source, 4], %1:dimension<source * 2 ∈ [0, 17)>, %2:dimension<source ∈ [0, 9)> .
+let %3:dimension<2> = const
+    %4:f64[2, source * 2] = linear_call %0 %3 %1 %2 [
+        forward={
+            lambda %0:f64[source, 4], %1:dimension<2>, %2:dimension<source * 2 ∈ [0, 17)>, \
+%3:dimension<source ∈ [0, 9)> .
+            let %4:f64[2, source * 2] = reshape %0 %1 %2
+            in (%4)
+        },
+        transpose={
+            lambda %0:dimension<2>, %1:dimension<source * 2 ∈ [0, 17)>, \
+%2:dimension<source ∈ [0, 9)>, %3:f64[2, source * 2] .
+            let %4:dimension<4> = constant [value=4]
+                %5:f64[source, 4] = reshape %3 %2 %4
+            in (%5)
+        },
+    ]
+in (%4)
+            "
+            .trim(),
+        );
+        assert_eq!(linearization.tangent().input_types()[0], ArrayProgramType::Array(input_type.tangent()));
+        assert!(
+            linearization
+                .tangent()
+                .input_types()
+                .iter()
+                .skip(1)
+                .all(|r#type| matches!(r#type, ArrayProgramType::Dimension(_)))
+        );
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![ArrayProgramValue::Array(Array::matrix(3, 4, (0..12).map(|value| value as f64).collect()))])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        assert_eq!(residuals.len(), linearization.residual_count());
+        assert_eq!(residuals.len(), 2);
+
+        let tangent_values = (12..24).map(|value| value as f64).collect::<Vec<_>>();
+        let mut tangent_inputs = vec![ArrayProgramValue::Array(Array::matrix(3, 4, tangent_values.clone()))];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs.clone()),
+            Ok(vec![ArrayProgramValue::Array(Array::matrix(2, 6, tangent_values))]),
+        );
+
+        // The executable linear boundary remains structural when imported, including both attached regions and every
+        // residual edge. Nested forward differentiation likewise treats only the array input as differentiable.
+        let mut imported_builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let imported_inputs = linearization
+            .tangent()
+            .input_types()
+            .into_iter()
+            .map(|r#type| imported_builder.add_input(r#type))
+            .collect::<Vec<_>>();
+        let imported_outputs =
+            imported_builder.splice_program(linearization.tangent(), imported_inputs.as_slice()).unwrap();
+        let imported = imported_builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                imported_outputs,
+                vec![Placeholder; imported_inputs.len()],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let [imported_call] = imported.instructions() else {
+            panic!("expected one imported linear call");
+        };
+        assert!(matches!(imported_call.operation(), ArrayProgramOperation::LinearCall(_)));
+        assert_eq!(imported_call.regions().len(), 2);
+        assert_eq!(imported.interpret(tangent_inputs.clone()), linearization.tangent().interpret(tangent_inputs));
+
+        let nested_jvp = linearization.tangent().jvp().unwrap();
+        let mut nested_inputs =
+            vec![ArrayProgramValue::Array(Array::matrix(3, 4, (12..24).map(|value| value as f64).collect()))];
+        nested_inputs.extend(residuals.clone());
+        nested_inputs.push(ArrayProgramValue::Array(Array::matrix(3, 4, (24..36).map(|value| value as f64).collect())));
+        assert_eq!(nested_jvp.input_ids().len(), 2 + residuals.len());
+        assert_eq!(
+            nested_jvp.interpret(nested_inputs),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::matrix(2, 6, (12..24).map(|value| value as f64).collect(),)),
+                ArrayProgramValue::Array(Array::matrix(2, 6, (24..36).map(|value| value as f64).collect(),)),
+            ]),
+        );
+
+        let mut pullback_inputs =
+            vec![ArrayProgramValue::Array(Array::matrix(2, 6, (24..36).map(|value| value as f64).collect()))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::matrix(3, 4, (24..36).map(|value| value as f64).collect(),))]),
+        );
+
+        // A matching explicit output-extent operand is already the authoritative SSA value for the source axis, so
+        // the residual path reuses it and does not read the source array again.
+        let source = DimensionVariable::new("reused_source", DimensionBounds::new(1, Some(9)).unwrap());
         let source_type = DimensionType::new(source.clone());
         let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
         let input = builder.add_input(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source), Dimension::Static(4)])).into(),
         );
-        let target_extent = builder.add_input(source_type.clone().into());
-        let second_extent = builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(4).unwrap()));
+        let source_extent = builder.add_input(source_type.into());
+        let four = builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(4).unwrap()));
         let output = builder
-            .add_instruction(ReshapeOperation::new(), Vec::new(), vec![input, target_extent, second_extent])
+            .add_instruction(ReshapeOperation::new(), Vec::new(), vec![input, source_extent, four])
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
@@ -3971,26 +4350,110 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let jvp = program.jvp().unwrap();
-        assert_eq!(jvp.input_types().len(), 4);
-        assert_eq!(
-            jvp.interpret(vec![
-                ArrayProgramValue::Array(Array::matrix(3, 4, (0..12).map(|value| value as f64).collect(),)),
-                ArrayProgramValue::Dimension(DimensionValue::new(source_type, 3).unwrap()),
-                ArrayProgramValue::Array(Array::matrix(3, 4, (12..24).map(|value| value as f64).collect(),)),
-                ArrayProgramValue::Array(Array::scalar(crate::Scalar::Zero)),
-            ]),
-            Ok(vec![
-                ArrayProgramValue::Array(Array::matrix(3, 4, (0..12).map(|value| value as f64).collect(),)),
-                ArrayProgramValue::Array(Array::matrix(3, 4, (12..24).map(|value| value as f64).collect(),)),
-            ]),
+        let linearization = program.linearize().unwrap();
+        assert!(!linearization.primal().to_string().contains("dimension_size"));
+        assert!(!linearization.tangent().to_string().contains("dimension_size"));
+    }
+
+    #[test]
+    fn test_dynamic_reshape_differentiation_deduplicates_repeated_permuted_extents() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Dynamic(extent)]),
         );
-        assert!(matches!(
-            program.transpose_with_respect_to(&[0]),
-            Err(crate::differentiation::DifferentiationError::Program(
-                ProgramError::UnsupportedOperation { message },
-            )) if message == "'reshape' transpose with dynamic input extents requires Phase 6 dimension residuals",
-        ));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let extent = builder
+            .add_instruction(DimensionSizeOperation::new(&input_type, 0).unwrap(), Vec::new(), vec![input])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(ReshapeOperation::new().with_dimensions([1, 0]), Vec::new(), vec![input, extent, extent])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+
+        // Both output axes and both inverse axes use the same SSA extent. Partial evaluation carries it once even
+        // though the linear call consumes it in multiple operand positions.
+        assert_eq!(linearization.residual_count(), 1);
+        assert_eq!(linearization.primal().to_string().matches("dimension_size").count(), 1);
+        let input = ArrayProgramValue::Array(Array::matrix(3, 3, (0..9).map(|value| value as f64).collect()));
+        let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let tangent = ArrayProgramValue::Array(Array::matrix(3, 3, (9..18).map(|value| value as f64).collect()));
+        let mut tangent_inputs = vec![tangent];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::matrix(
+                3,
+                3,
+                vec![9.0, 12.0, 15.0, 10.0, 13.0, 16.0, 11.0, 14.0, 17.0],
+            ))]),
+        );
+        let mut pullback_inputs =
+            vec![ArrayProgramValue::Array(Array::matrix(3, 3, (18..27).map(|value| value as f64).collect()))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::matrix(
+                3,
+                3,
+                vec![18.0, 21.0, 24.0, 19.0, 22.0, 25.0, 20.0, 23.0, 26.0],
+            ))]),
+        );
+
+        // The same compiled programs accept the lower-bound zero without inventing an extent tangent input.
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![ArrayProgramValue::Array(Array::matrix(0, 0, Vec::<f64>::new()))])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let mut tangent_inputs = vec![ArrayProgramValue::Array(Array::matrix(0, 0, Vec::<f64>::new()))];
+        tangent_inputs.extend(residuals);
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::matrix(0, 0, Vec::<f64>::new()))]),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_reshape_differentiation_preserves_sharding_through_the_inverse() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 2);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Static(4)]))
+                .with_sharding(sharding.clone())
+                .unwrap();
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let extent = builder.add_input(DimensionType::new(extent).into());
+        let four = builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(4).unwrap()));
+        let output = builder
+            .add_instruction(
+                ReshapeOperation::new().with_output_sharding(sharding),
+                Vec::new(),
+                vec![input, extent, four],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.tangent().output_types(), vec![input_type.tangent().into()]);
+        assert_eq!(linearization.pullback().unwrap().output_types(), vec![input_type.cotangent().into()]);
     }
 
     #[test]
@@ -4470,10 +4933,8 @@ mod tests {
 
         let jvp = program.jvp().unwrap();
         let extent = ArrayProgramValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
-        let zero_tangent =
-            ArrayProgramValue::Array(Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
         assert_eq!(
-            jvp.interpret(vec![extent, zero_tangent]),
+            jvp.interpret(vec![extent]),
             Ok(vec![
                 ArrayProgramValue::Array(Array::vector(vec![2.5_f64, 2.5, 2.5])),
                 ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
@@ -4892,12 +5353,7 @@ mod tests {
         let tangent = ArrayProgramValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]));
         let expected_tangent = ArrayProgramValue::Array(Array::matrix(2, 3, vec![4.0_f64, 5.0, 6.0, 4.0, 5.0, 6.0]));
         assert_eq!(
-            program.jvp().unwrap().interpret(vec![
-                input_value.clone(),
-                extent_value.clone(),
-                tangent,
-                ArrayProgramValue::Array(Array::scalar(crate::Scalar::Zero)),
-            ]),
+            program.jvp().unwrap().interpret(vec![input_value.clone(), extent_value.clone(), tangent,]),
             Ok(vec![expected.clone(), expected_tangent]),
         );
 

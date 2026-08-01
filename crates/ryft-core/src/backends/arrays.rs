@@ -27,6 +27,7 @@ use crate::axes::{Axis, AxisIndexOperation};
 use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
+use crate::differentiation::LinearCallOperation;
 use crate::macros::check_count;
 use crate::operations::attention::{
     AttentionMask, DotProductAttention, DotProductAttentionBackward, DotProductAttentionBackwardOperation,
@@ -84,7 +85,7 @@ use crate::programs::operations::Operation;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
-use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation};
+use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::{ArrayType, DataType, Dimension, Shape, StaticShape};
 
@@ -190,7 +191,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     CustomCall(CustomCallOperation),
     CustomJvp(CustomJvpOperation),
     CustomVjp(CustomVjpOperation),
-    CustomVjpTangent(CustomVjpTangentOperation<ArrayType>),
+    LinearCall(LinearCallOperation<ArrayType>),
 }
 
 /// [`TracingContext`] over the array universe, pairing [`ArrayType`] types and [`Array`] staged constants with the

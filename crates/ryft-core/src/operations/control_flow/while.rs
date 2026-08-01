@@ -1298,13 +1298,12 @@ where
             mask_stacks.push(broadcasted.remove(0));
         }
 
-        // Build the masked tangent scan body: the tangent body extended so each tangent-carrying per-iteration output
-        // is selected against that state element's mask item, with the mask items appended as extra scanned inputs
-        // after the residual slices. A non-differentiable state element's output is its pushforward tangent unchanged.
-        // The body input order `[state_tangent..., residual_slice..., mask_slice...]` keeps the leading `state_count`
-        // carry tangents linear so the reverse re-key folds the residual and mask slices into scan-local captures.
-        check_count!("input", tangent_program.input_ids(), state_count + residual_count, ProgramError);
-        check_count!("output", tangent_program.output_ids(), state_count, ProgramError);
+        // Build the masked tangent scan body over only the state elements with nonzero differential spaces. Omitting
+        // zero-space carries keeps the generated linear program free of fake values while the dual boundary below
+        // restores their structural zeros.
+        let tangent_state_count = element_has_tangent.iter().filter(|&&has_tangent| has_tangent).count();
+        check_count!("input", tangent_program.input_ids(), tangent_state_count + residual_count, ProgramError);
+        check_count!("output", tangent_program.output_ids(), tangent_state_count, ProgramError);
         let mask_item_types = state_types
             .iter()
             .zip(element_has_tangent.iter())
@@ -1321,19 +1320,13 @@ where
                 |inputs| {
                     let context = inputs[0].context().clone();
                     let tangent_input_count = tangent_program.input_ids().len();
-                    let carried_inputs = inputs[..state_count].to_vec();
+                    let carried_inputs = inputs[..tangent_state_count].to_vec();
                     let mut mask_items = inputs[tangent_input_count..].iter();
                     let pushforward_outputs =
                         tangent_program.interpret_in_context(&context, inputs[..tangent_input_count].to_vec())?;
-                    check_count!("output", pushforward_outputs, state_count, ProgramError);
-                    let mut masked_outputs = Vec::with_capacity(state_count);
-                    for ((pushforward_output, carried_input), &has_tangent) in
-                        pushforward_outputs.into_iter().zip(carried_inputs).zip(element_has_tangent.iter())
-                    {
-                        if !has_tangent {
-                            masked_outputs.push(pushforward_output);
-                            continue;
-                        }
+                    check_count!("output", pushforward_outputs, tangent_state_count, ProgramError);
+                    let mut masked_outputs = Vec::with_capacity(tangent_state_count);
+                    for (pushforward_output, carried_input) in pushforward_outputs.into_iter().zip(carried_inputs) {
                         let mask_item = mask_items.next().cloned().ok_or_else(|| {
                             ProgramError::MalformedProgram(
                                 "masked tangent scan body adapter is missing a mask input".to_string(),
@@ -1351,21 +1344,28 @@ where
         // Stage the length-`bound` tangent scan over the carry tangents followed by the stacked residuals and then the
         // per-tangent-carrying-state-element mask stacks. Iteration `item` reads residual slice `item` and mask slice
         // `item`.
-        let tangent_scan = ScanOperation::<C::Constant>::new(state_count, bound);
-        // The tangent scan takes every carry tangent as a real program input, so materialize structural zeros.
+        let tangent_scan = ScanOperation::<C::Constant>::new(tangent_state_count, bound);
         let mut tangent_operands = inputs
             .iter()
-            .map(|input| input.tangent().clone().materialize(context))
+            .zip(&element_has_tangent)
+            .filter_map(|(input, &has_tangent)| has_tangent.then(|| input.tangent().clone().materialize(context)))
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residual_stacks);
         tangent_operands.extend(mask_stacks);
         let tangent_outputs = context.bind(C::Operation::from(tangent_scan), vec![scan_body], &tangent_operands)?;
-        check_count!("output", tangent_outputs, state_count, ProgramError);
+        check_count!("output", tangent_outputs, tangent_state_count, ProgramError);
 
+        let mut tangent_outputs = tangent_outputs.into_iter();
         Ok(primal_outputs
             .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .zip(element_has_tangent)
+            .map(|(primal, has_tangent)| {
+                if has_tangent {
+                    DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
+                } else {
+                    Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?)
     }
 }
@@ -1395,10 +1395,11 @@ where
 /// runs the pushforward alongside the primal loop instead of storing per-iteration residuals. The fused state is
 /// `[primal_state..., tangent_state...]`: the body is the loop body's fused forward-mode program (built through the
 /// instruction-scoped driver) and the condition is the original condition extended with ignored tangent-state
-/// inputs, so the trip decision reads the primal half alone and the fused loop runs exactly as long as the primal
-/// loop. Because no residuals are stored, the rule applies to loops with *no* [`WhileOperation::iteration_bound`],
-/// and a semantic bound (the scalar `DataType` family routes bounded loops here too) is simply preserved on the
-/// fused loop.
+/// inputs, so the trip decision reads the primal state alone and the fused loop runs exactly as long as the primal
+/// loop. The fused state is compact: state elements whose tangent type is a zero differential space carry no
+/// tangent boundary input or output, and their output duals are restored as structural zeros. Because no residuals
+/// are stored, the rule applies to loops with *no* [`WhileOperation::iteration_bound`], and a semantic bound (the
+/// scalar `DataType` family routes bounded loops here too) is simply preserved on the fused loop.
 ///
 /// The primal/tangent separation that linearization needs is recovered by partial evaluation rather than by this
 /// rule: the fused loop's primal half is *closed* (its next state and the predicate fold from primal state alone),
@@ -1421,14 +1422,25 @@ where
 {
     let state_count = inputs.len();
 
-    // Build the fused body over the doubled state `[primal_state..., tangent_state...]` through the
-    // instruction-scoped driver (region 1 is the loop body).
+    // Build the fused body over the compact state `[primal_state..., live(tangent_state)...]` through the
+    // instruction-scoped driver (region 1 is the loop body). The fused body carries no tangent boundary inputs or
+    // outputs for state elements whose tangent type is a zero differential space, so the liveness mask below is
+    // derived from the same body state types that the fused-body construction filtered on.
+    let element_has_tangent = driver
+        .region(1)?
+        .input_types()
+        .iter()
+        .map(|r#type| !r#type.tangent().is_zero_space())
+        .collect::<Vec<_>>();
+    check_count!("input", element_has_tangent, state_count, ProgramError);
+    let tangent_state_count = element_has_tangent.iter().filter(|&&has_tangent| has_tangent).count();
+    let fused_state_count = state_count + tangent_state_count;
     let fused_body = driver.jvp_program(driver.region(1)?)?;
     let fused_state_types = fused_body.input_types();
-    check_count!("input", fused_state_types, 2 * state_count, ProgramError);
+    check_count!("input", fused_state_types, fused_state_count, ProgramError);
 
-    // Extend the condition over the doubled state: the original condition reads the primal half and the
-    // tangent-state inputs are ignored, so the fused loop's trip count is driven by the primal half alone.
+    // Extend the condition over the compact fused state: the original condition reads the primal prefix and the
+    // live tangent-state inputs are ignored, so the fused loop's trip count is driven by the primal state alone.
     let mut condition_builder = ProgramBuilder::<C::Constant, C::Operation>::new();
     let condition_inputs =
         fused_state_types.into_iter().map(|r#type| condition_builder.add_input(r#type)).collect::<Vec<_>>();
@@ -1436,27 +1448,37 @@ where
     let condition_output_count = condition_outputs.len();
     let fused_condition = condition_builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
         condition_outputs,
-        vec![Placeholder; 2 * state_count],
+        vec![Placeholder; fused_state_count],
         vec![Placeholder; condition_output_count],
     )?;
 
-    // Stage the fused loop over the operand primals followed by their materialized tangents — the fused body takes
-    // every operand tangent as a real program input, so structural zeros are materialized — and zip the output
-    // halves back into `DifferentiationDual`s in the original state order.
+    // Stage the fused loop over the operand primals followed by the materialized tangents of the live differential
+    // state elements — the fused body takes each of those tangents as a real program input, so their structural
+    // zeros are materialized — and zip the output halves back into `DifferentiationDual`s in the original state
+    // order, restoring structural zeros for the omitted zero-space state elements.
     let fused_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
-    let mut operands = Vec::with_capacity(2 * state_count);
+    let mut operands = Vec::with_capacity(fused_state_count);
     operands.extend(inputs.iter().map(|input| input.primal().clone()));
-    for input in inputs {
-        operands.push(input.tangent().clone().materialize(context)?);
+    for (input, &has_tangent) in inputs.iter().zip(&element_has_tangent) {
+        if has_tangent {
+            operands.push(input.tangent().clone().materialize(context)?);
+        }
     }
     let outputs = context.bind(C::Operation::from(fused_while), vec![fused_condition, fused_body], &operands)?;
-    check_count!("output", outputs, 2 * state_count, ProgramError);
+    check_count!("output", outputs, fused_state_count, ProgramError);
     let (primal_outputs, tangent_outputs) = outputs.split_at(state_count);
+    let mut tangent_outputs = tangent_outputs.iter().cloned();
     Ok(primal_outputs
         .iter()
         .cloned()
-        .zip(tangent_outputs.iter().cloned())
-        .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+        .zip(element_has_tangent)
+        .map(|(primal, has_tangent)| {
+            if has_tangent {
+                DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
+            } else {
+                Ok(DifferentiationDual::new_with_zero_tangent(primal))
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?)
 }
 
@@ -2307,7 +2329,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(outputs.to_vec(), vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
         // The known zero divisor is an invariance candidate, so probing would fold `1 / 0`; the rule must fall back
@@ -3502,16 +3524,13 @@ mod tests {
         // and no while loop, and the per-item gradients match the tangent scales.
         let (output, pullback) =
             StagedDispatchTestDomain.vjp(batched_bounded_while, Array::vector(vec![1.0, 5.0, 9.0])).unwrap();
-        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.to_f64s(), vec![8.0, 10.0, 9.0]);
-        let rendered_pullback = pullback.to_string();
+        let rendered_pullback = pullback.program().to_string();
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
         assert!(!rendered_pullback.contains("while"), "{rendered_pullback}");
-        let mut pullback_inputs = vec![Array::vector(vec![1.0, 1.0, 1.0])];
-        pullback_inputs.extend(residuals);
-        let cotangents = pullback.interpret(pullback_inputs).unwrap();
-        assert_eq!(cotangents[0].to_f64s(), vec![8.0, 2.0, 1.0]);
+        let cotangent = pullback.apply(Array::vector(vec![1.0, 1.0, 1.0])).unwrap();
+        assert_eq!(cotangent.to_f64s(), vec![8.0, 2.0, 1.0]);
     }
 
     #[test]
@@ -3568,6 +3587,73 @@ mod tests {
         let outputs = fused.interpret(vec![Array::scalar(16.0), Array::scalar(1.0)]).unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![16.0]);
         assert_eq!(outputs[1].to_f64s(), vec![1.0]);
+    }
+
+    #[test]
+    fn test_unbounded_while_staged_jvp_with_zero_space_counter_state() {
+        // A staged unbounded loop whose state mixes a differentiable carry with a zero-differential-space element —
+        // here an `i64` iteration counter, the shape of every keyed or counted training loop. The compact fused-JVP
+        // contract omits the counter's tangent entirely, so the fused loop state is `[x, i, live(ẋ)]` and the counter's
+        // output dual is restored as a structural zero. `f(x) = while (i < 3) { x = x * x; i = i + 1 }` at `x = 2`
+        // squares three times: primal `x^8 = 256` with tangent `8 x^7 = 1024`.
+        let float_type = ArrayType::scalar(DataType::F64);
+        let counter_type = ArrayType::scalar(DataType::I64);
+        let condition = {
+            let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
+            builder.add_input(float_type.clone());
+            let counter = builder.add_input(counter_type.clone());
+            let bound = builder.add_constant(Array::new(counter_type.clone(), vec![Scalar::I64(3)]).unwrap());
+            let predicate = builder
+                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![counter, bound])
+                .unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
+            let state = builder.add_input(float_type.clone());
+            let counter = builder.add_input(counter_type.clone());
+            let squared = builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
+            let one = builder.add_constant(Array::new(counter_type.clone(), vec![Scalar::I64(1)]).unwrap());
+            let incremented = builder.add_instruction(AddOperation, Vec::new(), vec![counter, one]).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![squared, incremented], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let state = builder.add_input(float_type);
+        let counter = builder.add_input(counter_type.clone());
+        let outputs = builder
+            .add_instruction(
+                TestDomainOperation::While(WhileOperation::new()),
+                vec![condition_region, body_region],
+                vec![state, counter],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // The fused program's boundary is compact: `[x, i, live(ẋ)] -> [x', i', live(ẋ')]` with no counter tangent.
+        let fused = program.jvp().unwrap();
+        assert_eq!(fused.input_types().len(), 3);
+        assert_eq!(fused.output_types().len(), 3);
+        let rendered = fused.to_string();
+        assert_eq!(rendered.matches("= while").count(), 1, "{rendered}");
+        let outputs = fused
+            .interpret(vec![
+                Array::scalar(2.0),
+                Array::new(counter_type, vec![Scalar::I64(0)]).unwrap(),
+                Array::scalar(1.0),
+            ])
+            .unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![256.0]);
+        assert_eq!(outputs[1].values(), &[Scalar::I64(3)]);
+        assert_eq!(outputs[2].to_f64s(), vec![1024.0]);
     }
 
     #[test]

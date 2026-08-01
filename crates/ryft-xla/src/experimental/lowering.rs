@@ -3380,7 +3380,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 }
                 .into())
             }
-            ArrayOperation::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
+            ArrayOperation::LinearCall(operation) => Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
                     operation.name(),
@@ -6554,10 +6554,31 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 &mut lowerer.token,
             )
         }
-        XlaOperation::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
-            message: format!("operation `{}` cannot be lowered to StableHLO", operation.name()),
+        XlaOperation::LinearCall(operation) => {
+            if !operation.is_executable() {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!("operation `{}` cannot be lowered to StableHLO", operation.name()),
+                }
+                .into());
+            }
+            let [forward, _transpose] = regions else {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!("linear_call expected 2 attached regions but got {}", regions.len()),
+                });
+            };
+            lower_nested_program_inline(
+                forward,
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                captured_values,
+                false,
+                lowerer.nested_functions.as_ref(),
+                &lowerer.collective_state,
+                &mut lowerer.token,
+            )
         }
-        .into()),
         XlaOperation::JitCall(_) => {
             let [callee] = regions else {
                 return Err(LoweringError::UnsupportedOp {
@@ -9155,8 +9176,73 @@ mod tests {
     }
 
     #[test]
+    fn test_executable_linear_call_lowering_inlines_only_the_forward_program() {
+        use ryft_core::differentiation::LinearCallOperation;
+
+        let vector_type = test_vector_type(4);
+        let forward = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let tangent = builder.add_input(vector_type.clone());
+            let residual = builder.add_input(vector_type.clone());
+            let output = builder.add_instruction(MulOperation, Vec::new(), vec![tangent, residual]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let transpose = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let residual = builder.add_input(vector_type.clone());
+            let cotangent = builder.add_input(vector_type.clone());
+            let output = builder.add_instruction(AddOperation, Vec::new(), vec![residual, cotangent]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let tangent = builder.add_input(vector_type.clone());
+        let residual = builder.add_input(vector_type.clone());
+        let output = builder
+            .add_instruction(
+                XlaOperation::LinearCall(LinearCallOperation::new(1)),
+                vec![forward, transpose],
+                vec![tangent, residual],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &[vector_type.clone(), vector_type.clone()],
+            &[vector_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(module.contains("stablehlo.multiply"), "{module}");
+        assert!(!module.contains("stablehlo.add"), "{module}");
+    }
+
+    #[test]
     fn test_custom_vjp_tangent_lowering_is_rejected() {
-        use ryft_core::tracing_v2::custom_derivatives::CustomVjpTangentOperation;
+        use ryft_core::differentiation::LinearCallOperation;
 
         // Phase 0 boundary pin for the first-class-program-regions plan: the un-transposed `custom_vjp_tangent`
         // carrier is reverse-mode-only and must be transposed away before lowering, so lowering it is rejected.
@@ -9174,9 +9260,8 @@ mod tests {
                 )
                 .unwrap()
         };
-        let operation = CustomVjpTangentOperation::new(
+        let operation = LinearCallOperation::opaque(
             1,
-            false,
             vec![ArrayProgramType::Array(vector_type.clone())],
             vec![ArrayProgramType::Array(vector_type.clone())],
         );
@@ -9185,7 +9270,7 @@ mod tests {
         let tangent = builder.add_input(vector_type.clone());
         let residual = builder.add_input(vector_type.clone());
         let output = builder
-            .add_instruction(XlaOperation::CustomVjpTangent(operation), vec![backward_region], vec![tangent, residual])
+            .add_instruction(XlaOperation::LinearCall(operation), vec![backward_region], vec![tangent, residual])
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(

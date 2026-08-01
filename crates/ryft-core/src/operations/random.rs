@@ -964,11 +964,9 @@ mod tests {
         assert_eq!(
             program.jvp().unwrap().to_string(),
             indoc! {"
-                lambda %0:u64[2], %1:zero[2] .
-                let %2:u64[2], %3:u32[4] = rng_bit_generator [algorithm=three_fry, output_type=u32[4]] %0
-                    %4:zero[2] = zero [type=zero[2]]
-                    %5:zero[4] = zero [type=zero[4]]
-                in (%2, %3, %4, %5)
+                lambda %0:u64[2] .
+                let %1:u64[2], %2:u32[4] = rng_bit_generator [algorithm=three_fry, output_type=u32[4]] %0
+                in (%1, %2)
             "}
             .trim_end(),
         );

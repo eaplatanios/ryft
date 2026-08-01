@@ -19,6 +19,7 @@ use num_complex::Complex;
 use ryft_macros::{Operation, Parameter};
 
 use crate::contexts::EagerContext;
+use crate::differentiation::LinearCallOperation;
 use crate::macros::check_types;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::complex::{
@@ -47,7 +48,7 @@ use crate::programs::operations::Operation;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
-use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation};
+use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::DataType;
 
@@ -104,7 +105,7 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Print(PrintOperation),
     CustomJvp(CustomJvpOperation),
     CustomVjp(CustomVjpOperation),
-    CustomVjpTangent(CustomVjpTangentOperation<DataType>),
+    LinearCall(LinearCallOperation<DataType>),
 }
 
 /// [`TracingContext`] over the scalar universe, pairing [`DataType`] types and [`Scalar`] staged constants with the

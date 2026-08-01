@@ -2341,6 +2341,9 @@ where
                     .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(0)))
                     .collect()
             }
+            Self::LinearCall(operation) => Err(BatchingError::UnsupportedOperation {
+                message: format!("operation `{}` cannot be batched", operation.name()),
+            }),
         }
     }
 }

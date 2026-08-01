@@ -532,12 +532,8 @@ mod tests {
         assert!(matches!(relocated_instruction.operation(), ArrayProgramOperation::Compare(_)));
 
         let jvp = program.jvp().unwrap();
-        assert_eq!(jvp.input_ids().len(), 4);
-        assert_eq!(jvp.output_ids().len(), 2);
-        assert_eq!(
-            jvp.outputs().last().unwrap().r#type().as_ref(),
-            &ArrayProgramType::Array(ArrayType::scalar(DataType::Zero)),
-        );
+        assert_eq!(jvp.input_ids().len(), 2);
+        assert_eq!(jvp.output_ids().len(), 1);
 
         let operation = ArrayProgramOperation::<Array>::from(CompareOperation::new(ComparisonDirection::LessThan));
         let mut transposition_context = TestContext::new();

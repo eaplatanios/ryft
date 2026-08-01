@@ -11,19 +11,27 @@ use crate::batching::{
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+    LinearCallOperation,
 };
+#[cfg(test)]
+use crate::differentiation::{TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::constants::Zero;
+#[cfg(test)]
+use crate::operations::constants::ZeroOperation;
 use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
+#[cfg(test)]
+use crate::programs::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::regions::{RegionInterface, RegionSlot};
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::{MaybeZero, Program, ProgramError, TypeIdentityRenaming, Value};
-use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
+use crate::programs::types::{TypeError, Typed};
+use crate::programs::{Program, ProgramError, Value};
+#[cfg(test)]
+use crate::tracing::TracingContext;
+use crate::tracing::{DomainTracer, Trace};
 use crate::types::ArrayType;
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
@@ -516,24 +524,24 @@ impl<V: Value> CustomVjpResidual<V> for V {
 }
 
 /// Capture-free forward-mode (JVP) rule for [`CustomVjpOperation`]: replays the user-supplied forward program through
-/// the active context and stages one opaque [`CustomVjpTangentOperation`] carrier for the output tangents.
+/// the active context and stages one transpose-only [`LinearCallOperation`] carrier for the output tangents.
 ///
 /// Unlike [`CustomJvpOperation`], a `custom_vjp` function has no forward tangent program, so the forward cannot
 /// compute the output tangents straight-line. Instead it reproduces — under the capture-free direct-transpose path —
 /// the same structure the capture-based reverse rule builds: the forward program (already an ordinary primal-enum
 /// program mapping `inputs -> (outputs..., residuals...)`) is replayed through
 /// [`Program::interpret_in_context`](crate::Program::interpret_in_context) over the dual
-/// primals, recovering the primal outputs and the residuals; then one [`CustomVjpTangentOperation`] is staged over
+/// primals, recovering the primal outputs and the residuals; then one [`LinearCallOperation`] is staged over
 /// `[input_tangents..., residuals...]` with the residuals as ordinary *operands* (not capture factors). That carrier
 /// is opaque: it stands for the unknown tangent map and rejects interpretation, so a forward-mode use through it
-/// fails with the canonical reverse-only error, while [`transpose_primal_custom_vjp`] replays the user's `backward`
+/// fails with the canonical reverse-only error, while [`LinearCallOperation`]'s transpose rule replays the user's `backward`
 /// program to produce the input cotangents. Because the residuals flow as operand edges and the carrier is a leaf
 /// primal-enum operation, the rule introduces no symbolic capture and needs no
 /// nested differentiation or linearization request.
 impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation
 where
     C::Type: DifferentiableType,
-    C::Operation: From<CustomVjpTangentOperation<C::Type>>,
+    C::Operation: From<LinearCallOperation<C::Type>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -574,7 +582,7 @@ where
             .map(|input| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         carrier_operands.extend(residuals);
-        let carrier = CustomVjpTangentOperation::new(residual_count, false, input_tangent_types, output_tangent_types);
+        let carrier = LinearCallOperation::transpose_only(residual_count, input_tangent_types, output_tangent_types);
         let output_tangents = context.bind(carrier, vec![backward_region.to_program()], &carrier_operands)?;
         check_count!("output", output_tangents, output_count, ProgramError);
 
@@ -587,426 +595,6 @@ where
 }
 
 crate::impl_non_transposable_operation!(CustomVjpOperation);
-
-/// Opaque primal-enum carrier staged by [`CustomVjpOperation`]'s capture-free forward-mode rule.
-///
-/// The tangent program stays in the primal operation family `O` and carries its residuals as ordinary program
-/// operands: the carrier receives them as the trailing operands of the staged operation, after the input tangents.
-/// (The deleted capture-based `CustomVjpCallOperation` reverse path instead closed residuals into captured factors;
-/// the operand form is the sole surviving mechanism.)
-///
-/// In its un-transposed form it stands for the (unknown) tangent map of the custom function and rejects
-/// interpretation: `custom_vjp` functions are reverse-mode-only. Transposition (see [`transpose_primal_custom_vjp`])
-/// reads the residual operands from the pullback and replays the user's backward program on them and the incoming
-/// output cotangents, producing the input cotangents — so reverse mode uses exactly the user-supplied gradient.
-/// The carrier stores its input and output tangent types because they can differ from both the primal types and
-/// the backward region's cotangent types.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CustomVjpTangentOperation<T: Type> {
-    /// Number of residual operands, used to split the backward program's inputs into the residual prefix and the
-    /// output-cotangent suffix.
-    residual_count: usize,
-
-    /// Whether this carrier has been transposed into its executable (pullback) form.
-    transposed: bool,
-
-    /// Expected input tangent types of the un-transposed carrier, in primal-input order.
-    input_tangent_types: Vec<T>,
-
-    /// Output tangent types produced by the un-transposed carrier, in primal-output order.
-    output_tangent_types: Vec<T>,
-}
-
-impl<T: Type> CustomVjpTangentOperation<T> {
-    /// Creates a custom-VJP tangent carrier. Use `transposed = false` for the opaque pushforward form and
-    /// `transposed = true` for the transposed pullback form. The user's backward program (mapping
-    /// `(residuals..., output_cotangents...)` to input cotangents) is supplied separately as the operation's
-    /// single attached `backward` region.
-    ///
-    /// # Parameters
-    ///
-    ///   - `residual_count`: Number of trailing residual operands carried alongside the tangents.
-    ///   - `transposed`: Whether this carrier is in its transposed (pullback) form.
-    ///   - `input_tangent_types`: Types of the un-transposed carrier's input tangents.
-    ///   - `output_tangent_types`: Types of the un-transposed carrier's output tangents.
-    pub fn new(
-        residual_count: usize,
-        transposed: bool,
-        input_tangent_types: Vec<T>,
-        output_tangent_types: Vec<T>,
-    ) -> Self {
-        Self { residual_count, transposed, input_tangent_types, output_tangent_types }
-    }
-
-    /// Returns the number of trailing residual operands.
-    #[inline]
-    pub fn residual_count(&self) -> usize {
-        self.residual_count
-    }
-
-    /// Returns whether this carrier is in its transposed (pullback) form.
-    #[inline]
-    pub fn transposed(&self) -> bool {
-        self.transposed
-    }
-
-    /// Splits the backward interface's input types into the leading residual types and the trailing cotangent
-    /// types (one per primal output).
-    fn split_backward_inputs(&self, backward_interface: &RegionInterface<T>) -> Result<(Vec<T>, Vec<T>), TypeError> {
-        if self.residual_count > backward_interface.input_types().len() {
-            return Err(TypeError::invalid(format!(
-                "custom_vjp residual count {} exceeds backward region input count {}",
-                self.residual_count,
-                backward_interface.input_types().len(),
-            )));
-        }
-        let mut residual_types = backward_interface.input_types().to_vec();
-        let cotangent_types = residual_types.split_off(self.residual_count);
-        Ok((residual_types, cotangent_types))
-    }
-}
-
-impl<T: Type> Display for CustomVjpTangentOperation<T> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.transposed {
-            formatter.write_str("custom_vjp_backward")
-        } else {
-            formatter.write_str("custom_vjp_tangent")
-        }
-    }
-}
-
-impl<T: Type> Operation<T> for CustomVjpTangentOperation<T> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        if self.transposed { "custom_vjp_backward" } else { "custom_vjp_tangent" }
-    }
-
-    #[inline]
-    fn region_slots(&self) -> &'static [RegionSlot] {
-        const { &[RegionSlot::rule("backward")] }
-    }
-
-    fn infer_region_input_types(
-        &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
-        if region_interfaces.len() != 1 {
-            return Err(TypeError::invalid(format!(
-                "{} expects 1 attached region but got {}",
-                self.name(),
-                region_interfaces.len(),
-            )));
-        }
-        let backward_interface = &region_interfaces[0];
-        let (_, cotangent_types) = self.split_backward_inputs(backward_interface)?;
-        let backward_input_types = if self.transposed {
-            check_count!(
-                "custom_vjp backward input type",
-                input_types,
-                cotangent_types.len() + self.residual_count,
-                TypeError,
-            );
-            input_types[cotangent_types.len()..]
-                .iter()
-                .chain(&input_types[..cotangent_types.len()])
-                .cloned()
-                .collect()
-        } else {
-            check_count!(
-                "custom_vjp tangent input type",
-                input_types,
-                self.input_tangent_types.len() + self.residual_count,
-                TypeError,
-            );
-            input_types[self.input_tangent_types.len()..]
-                .iter()
-                .chain(&self.output_tangent_types)
-                .cloned()
-                .collect()
-        };
-        Ok(vec![Some(backward_input_types)])
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError> {
-        if region_interfaces.len() != 1 {
-            return Err(TypeError::invalid(format!(
-                "{} expects 1 attached region but got {}",
-                self.name(),
-                region_interfaces.len(),
-            )));
-        }
-        let backward_interface = &region_interfaces[0];
-        let (residual_types, cotangent_types) = self.split_backward_inputs(backward_interface)?;
-        check_count!(
-            "custom_vjp tangent input type",
-            self.input_tangent_types,
-            backward_interface.output_types().len(),
-            TypeError,
-        );
-        check_count!("custom_vjp tangent output type", self.output_tangent_types, cotangent_types.len(), TypeError,);
-        if self.transposed {
-            // The transposed (pullback) carrier maps `[output_cotangents..., residuals...]` to the input cotangents
-            // carried by the backward program's outputs.
-            let expected: Vec<T> = cotangent_types.iter().chain(residual_types.iter()).cloned().collect();
-            check_types!(@same, "custom_vjp backward", [&expected, input_types]);
-            Ok(backward_interface.output_types().to_vec())
-        } else {
-            // The un-transposed (tangent-map) carrier maps `[input_tangents..., residuals...]` to the output tangents.
-            // Those types are stored explicitly because they need not match the backward program's cotangent
-            // boundary.
-            let expected: Vec<T> = self.input_tangent_types.iter().chain(residual_types.iter()).cloned().collect();
-            check_types!(@same, "custom_vjp tangent", [&expected, input_types]);
-            Ok(self.output_tangent_types.clone())
-        }
-    }
-
-    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
-        Ok(Self {
-            residual_count: self.residual_count,
-            transposed: self.transposed,
-            input_tangent_types: self
-                .input_tangent_types
-                .iter()
-                .map(|r#type| r#type.rename_identities(renaming))
-                .collect::<Result<Vec<_>, _>>()?,
-            output_tangent_types: self
-                .output_tangent_types
-                .iter()
-                .map(|r#type| r#type.rename_identities(renaming))
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
-}
-
-/// Interprets a [`CustomVjpTangentOperation`] by rejecting forward-mode interpretation in both forms.
-///
-/// The un-transposed carrier is the opaque tangent map of a reverse-mode-only `custom_vjp`, so interpreting it is the
-/// operation forward mode would need and is rejected. The transposed carrier is never interpreted as a staged
-/// operation either: [`transpose_primal_custom_vjp`] replays the user's backward program directly through the
-/// pullback builder rather than leaving a transposed carrier in the program, so reaching this interpret path means a
-/// forward-mode use slipped through and the same reverse-only error applies.
-impl<C: Domain> InterpretableOperation<C> for CustomVjpTangentOperation<C::Type> {
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        _inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        Err(TypeError::invalid(
-            "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                value_and_gradient, or jacobian_reverse) instead"
-                .to_string(),
-        )
-        .into())
-    }
-}
-
-/// Batching rule for [`CustomVjpTangentOperation`]: the opaque custom-VJP tangent carrier is a forward-mode tangent
-/// map that never appears in a batched primal program — reverse mode consumes it during transposition rather than
-/// batching it — so batching is rejected for every context.
-impl<C, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>> for CustomVjpTangentOperation<ArrayType>
-where
-    C: Context<Type = ArrayType>,
-{
-    fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
-        &self,
-        _context: &BatchingContext<C, ArrayBatching<M>>,
-        _driver: &D,
-        _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        Err(BatchingError::UnsupportedOperation { message: format!("operation `{}` cannot be batched", self.name()) })
-    }
-}
-
-/// Forward-mode (JVP) rule for [`CustomVjpTangentOperation`]: a `custom_vjp` function is reverse-mode only and has no
-/// forward tangent program, so its tangent carrier rejects forward-mode linearization. The carrier never reaches this
-/// rule on the supported path — the [`CustomVjpOperation`] JVP rule stages it on the tangent side — but the rule is
-/// implemented so the enum dispatch can forward to it uniformly.
-impl<C: Context> DifferentiableOperation<C> for CustomVjpTangentOperation<C::Type> {
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("{} has no forward-mode (jvp) rule; custom_vjp is reverse-mode only", self.name(),),
-        }
-        .into())
-    }
-}
-
-/// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
-/// [`CustomVjpTangentOperation`]; the opaque carrier never has all-known operands in practice (its tangent operands
-/// are unknown by construction), so it residualizes unchanged.
-impl<C: Context> PartiallyEvaluatableOperation<C> for CustomVjpTangentOperation<C::Type> where
-    C::Operation: From<CustomVjpTangentOperation<C::Type>>
-{
-}
-
-/// Partition-aware transpose rule for an opaque [`CustomVjpTangentOperation`], used by the direct reverse path
-/// when it transposes a tangent program in the primal operation family `O` rather than re-keying it into the linear
-/// family. The residuals are ordinary *operands* (known values supplied through `operand_values`) rather than the
-/// deleted capture-based path's capture factors, so the rule reads them from the pullback and replays the user's
-/// backward program forward into the pullback builder.
-///
-/// The forward stages the carrier over `[input_tangents..., residuals...]`, with one tangent operand per primal input.
-/// Partial evaluation may prove some tangent operands known, while the residuals are always known. This rule
-/// therefore:
-///
-///   1. Splits the operands at the carrier's declared tangent count, retaining the linearity of each tangent operand
-///      and reading the trailing residual values from the pullback.
-///   2. Stages the output cotangents (materializing structural zeros so the backward program receives every
-///      cotangent input).
-///   3. Replays the user's `backward` program over `[residuals..., output_cotangents...]` through
-///      [`Program::interpret_in_context`](crate::Program::interpret_in_context), producing the input cotangents. The backward program is
-///      *not* transposed — it already
-///      is the pullback — so it is replayed forward into the active pullback builder.
-///
-/// The returned cotangents place each backward result at its corresponding unknown tangent operand and a structural
-/// [`MaybeZero::Zero`] at known tangent and residual positions. Because the backward program is replayed in the same
-/// operation family `O` through the context's [`bind`](Context::bind), the rule is value-level and introduces no
-/// recursive transposition obligation on `O`.
-///
-/// # Parameters
-///
-///   - `operation`: Opaque custom-VJP tangent carrier staged into the tangent program.
-///   - `context`: Active transpose tracing context the pullback is staged into.
-///   - `inputs`: Per-operand [`PartialValue`] knowledge. The fixed leading tangent prefix may contain both
-///     [`Unknown`](PartialValue::Unknown) and [`Known`](PartialValue::Known) entries; the trailing known entries carry
-///     the residual tracers the pullback reads.
-///   - `outputs`: Symbolic cotangents for the carrier's outputs (one per primal output).
-pub fn transpose_primal_custom_vjp<V, O, D: TranspositionDriver<V, O>>(
-    operation: &CustomVjpTangentOperation<V::Type>,
-    context: &mut TracingContext<V, O>,
-    driver: &D,
-    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
-where
-    V: Value<Type: DifferentiableType>,
-    O: Operation<V::Type> + From<ZeroOperation<V::Type>>,
-{
-    if operation.transposed {
-        return Err(TypeError::invalid(
-            "transposing a custom_vjp pullback (second-order reverse mode through custom_vjp) is not \
-                supported"
-                .to_string(),
-        )
-        .into());
-    }
-
-    // Operand layout is `[input_tangents..., residuals...]`. The tangent prefix has one operand per primal input,
-    // including tangent operands that partial evaluation proved known. The residuals are the trailing known operands
-    // read from the pullback. The dispatch guarantees a `Known` operand carries its pullback value, so each residual
-    // tracer is read directly.
-    let backward = driver.region(0)?;
-    let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
-    let tangent_count = operation.input_tangent_types.len();
-    let residual_count = operation.residual_count;
-    let backward_input_count = backward.input_ids().len();
-    let cotangent_count = backward_input_count.checked_sub(residual_count).ok_or_else(|| {
-        ProgramError::MalformedProgram(format!(
-            "custom_vjp residual count {residual_count} exceeds backward region input count {backward_input_count}",
-        ))
-    })?;
-    let expected_input_count = tangent_count.checked_add(residual_count).ok_or_else(|| {
-        ProgramError::MalformedProgram("custom_vjp tangent input count exceeds usize capacity".to_string())
-    })?;
-    check_count!("input", operand_linear, expected_input_count, ProgramError);
-    let residuals = (tangent_count..inputs.len())
-        .map(|index| {
-            inputs[index]
-                .as_known()
-                .ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!(
-                        "custom_vjp tangent transpose operand {index} has no known residual value"
-                    ))
-                })
-                .cloned()
-        })
-        .collect::<Result<Vec<_>, ProgramError>>()?;
-
-    // Stage the output cotangents, then replay the user's backward program on `[residuals..., outputs...]`.
-    // The backward program is the pullback already, so it is replayed forward into the pullback builder rather than
-    // transposed.
-    check_count!("output", outputs, cotangent_count, ProgramError);
-    let mut backward_inputs = residuals;
-    for cotangent in outputs {
-        backward_inputs.push(cotangent.clone().materialize(context)?);
-    }
-    let input_cotangents = backward.interpret_in_context(context, backward_inputs)?;
-    check_count!("output", input_cotangents, tangent_count, ProgramError);
-
-    // The user's backward program is an opaque replay: its outputs come back as plain values, so any
-    // structural zero-ness a user backward expresses (a `zero`/`zero_like` output for a non-differentiated input)
-    // would otherwise be lost at this boundary and stage wasted adjoint work upstream. Recover it here with one local
-    // pass over the *backward program* itself: an output produced by a canonical `zero` or `zero_like` instruction is
-    // a structural zero. This is the reverse-mode analogue of JAX's `custom_vjp` symbolic zeros, recovered
-    // automatically instead of through an opt-in.
-    let output_is_zero = backward
-        .output_ids()
-        .iter()
-        .map(|output| {
-            backward
-                .instructions()
-                .iter()
-                .find_map(|instruction| {
-                    instruction
-                        .outputs()
-                        .iter()
-                        .position(|candidate| candidate == output)
-                        .map(|output_index| instruction.operation().is_zero(output_index))
-                })
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-
-    // Reassemble one cotangent per operand: unknown tangent operands receive their corresponding backward-program
-    // output, known tangent operands and residuals carry structural zeros, and canonical zero outputs remain structural
-    // zeros.
-    let input_cotangents = input_cotangents.into_iter().zip(output_is_zero).map(|(cotangent, is_zero)| {
-        if is_zero { MaybeZero::Zero(cotangent.r#type().into_owned()) } else { MaybeZero::Value(cotangent) }
-    });
-    let mut cotangents = operand_linear[..tangent_count]
-        .iter()
-        .zip(&inputs[..tangent_count])
-        .zip(input_cotangents)
-        .map(
-            |((&linear, input), cotangent)| {
-                if linear { cotangent } else { MaybeZero::Zero(input.r#type().cotangent()) }
-            },
-        )
-        .collect::<Vec<_>>();
-    cotangents.extend(inputs[tangent_count..].iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())));
-    Ok(cotangents)
-}
-
-/// Transpose rule for the opaque [`CustomVjpTangentOperation`] carrier, forwarding to
-/// [`transpose_primal_custom_vjp`]. The recursion stays value-level (the user's backward program is replayed forward
-/// into the pullback builder through [`Context::bind`]), so instantiating this implementation for a closed operation
-/// enum introduces no recursive [`TransposableOperation`] obligation on `O`.
-impl<V, O> TransposableOperation<V, O> for CustomVjpTangentOperation<V::Type>
-where
-    V: Value<Type: DifferentiableType>,
-    O: Operation<V::Type> + From<ZeroOperation<V::Type>>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        transpose_primal_custom_vjp(self, context, driver, inputs, outputs).map_err(DifferentiationError::from)
-    }
-}
 
 /// Function with a user-supplied JVP rule — the ergonomic analogue of JAX's
 /// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
@@ -1464,12 +1052,12 @@ mod tests {
             Ok(vec![primal_type]),
         );
         assert_eq!(
-            CustomVjpTangentOperation::new(1, false, vec![tangent_type.clone()], vec![tangent_type.clone()],)
+            LinearCallOperation::transpose_only(1, vec![tangent_type.clone()], vec![tangent_type.clone()])
                 .infer_output_types(&[tangent_type.clone(), residual_type], std::slice::from_ref(&backward_interface),),
             Ok(vec![tangent_type]),
         );
         assert_eq!(
-            CustomVjpTangentOperation::new(1, false, Vec::<ArrayType>::new(), Vec::new()).region_role(0),
+            LinearCallOperation::transpose_only(1, Vec::<ArrayType>::new(), Vec::new()).region_role(0),
             Some(RegionRole::Rule),
         );
     }
@@ -1502,9 +1090,8 @@ mod tests {
     #[test]
     fn test_custom_vjp_tangent_carrier_remains_opaque_to_partial_evaluation() {
         let scalar = test_type(&[]);
-        let operation = ArrayOperation::CustomVjpTangent(CustomVjpTangentOperation::new(
+        let operation = ArrayOperation::LinearCall(LinearCallOperation::transpose_only(
             1,
-            false,
             vec![scalar.clone()],
             vec![scalar.clone()],
         ));
@@ -1523,35 +1110,44 @@ mod tests {
 
         assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::CustomVjpTangent(_)));
+        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::LinearCall(_)));
     }
 
     #[test]
     fn test_custom_vjp_tangent_validates_residual_count() {
         let scalar = test_type(&[]);
         let backward_interface = RegionInterface::new(vec![scalar.clone()], vec![scalar.clone()], Effects::PURE);
-        for transposed in [false, true] {
-            assert!(matches!(
-                CustomVjpTangentOperation::new(2, transposed, Vec::new(), Vec::new())
-                    .infer_output_types(&[], std::slice::from_ref(&backward_interface)),
-                Err(TypeError::Invalid { message })
-                    if message == "custom_vjp residual count 2 exceeds backward region input count 1",
-            ));
-        }
+        assert!(matches!(
+            LinearCallOperation::transpose_only(2, Vec::new(), Vec::new())
+                .infer_output_types(&[], std::slice::from_ref(&backward_interface)),
+            Err(TypeError::Invalid { message }) if message == "linear call residual count 2 exceeds input count 0",
+        ));
 
         let backward = tripled_sin_backward_program(&scalar);
         let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         assert!(matches!(
-            transpose_primal_custom_vjp(
-                &CustomVjpTangentOperation::new(3, false, vec![scalar.clone()], vec![scalar.clone()]),
+            LinearCallOperation::transpose_only(3, vec![scalar.clone()], vec![scalar]).transpose(
                 &mut context,
                 &driver,
                 &[],
                 &[],
             ),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "custom_vjp residual count 3 exceeds backward region input count 2",
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
+                if message == "linear call residual count 3 exceeds input count 0",
+        ));
+
+        let scalar = test_type(&[]);
+        let output_cotangent = context.input(scalar.clone());
+        assert!(matches!(
+            LinearCallOperation::transpose_only(1, vec![scalar.clone()], vec![scalar.clone()]).transpose(
+                &mut context,
+                &driver,
+                &[PartialValue::Unknown(scalar.clone()), PartialValue::Unknown(scalar)],
+                &[MaybeZero::Value(output_cotangent)],
+            ),
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
+                if message == "linear call residual operand 0 is not known during transposition",
         ));
     }
 
@@ -1577,14 +1173,15 @@ mod tests {
         let residual = context.input(scalar.clone());
         let output_cotangent = context.input(scalar.clone());
 
-        let contributions = transpose_primal_custom_vjp(
-            &CustomVjpTangentOperation::new(1, false, vec![scalar.clone(), scalar.clone()], vec![scalar.clone()]),
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(scalar), PartialValue::Known(known_tangent), PartialValue::Known(residual)],
-            &[MaybeZero::Value(output_cotangent)],
-        )
-        .unwrap();
+        let contributions =
+            LinearCallOperation::transpose_only(1, vec![scalar.clone(), scalar.clone()], vec![scalar.clone()])
+                .transpose(
+                    &mut context,
+                    &driver,
+                    &[PartialValue::Unknown(scalar), PartialValue::Known(known_tangent), PartialValue::Known(residual)],
+                    &[MaybeZero::Value(output_cotangent)],
+                )
+                .unwrap();
 
         assert_eq!(contributions.len(), 3);
         assert!(matches!(contributions[0], MaybeZero::Value(_)));
@@ -1615,14 +1212,15 @@ mod tests {
         let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(cotangent_type.clone());
-        let contributions = transpose_primal_custom_vjp(
-            &CustomVjpTangentOperation::new(0, false, vec![tangent_type.clone()], vec![tangent_type.clone()]),
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(tangent_type.clone())],
-            &[MaybeZero::Value(output_cotangent)],
-        )
-        .unwrap();
+        let contributions =
+            LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type.clone()])
+                .transpose(
+                    &mut context,
+                    &driver,
+                    &[PartialValue::Unknown(tangent_type.clone())],
+                    &[MaybeZero::Value(output_cotangent)],
+                )
+                .unwrap();
         assert!(matches!(&contributions[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
 
         // `zero_like` is equally structural even though it consumes an exemplar input. Opaque backward replay must
@@ -1637,14 +1235,14 @@ mod tests {
         let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(cotangent_type.clone());
-        let contributions = transpose_primal_custom_vjp(
-            &CustomVjpTangentOperation::new(0, false, vec![tangent_type.clone()], vec![tangent_type]),
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(primal_type.tangent())],
-            &[MaybeZero::Value(output_cotangent)],
-        )
-        .unwrap();
+        let contributions = LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type])
+            .transpose(
+                &mut context,
+                &driver,
+                &[PartialValue::Unknown(primal_type.tangent())],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
         assert!(matches!(&contributions[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
     }
 
@@ -1715,7 +1313,7 @@ mod tests {
         // exactly the operation `jvp` would need to execute; reverse mode transposes it first and replays
         // `backward`.
         let scalar = test_type(&[]);
-        let carrier = CustomVjpTangentOperation::new(1, false, vec![scalar.clone()], vec![scalar]);
+        let carrier = LinearCallOperation::transpose_only(1, vec![scalar.clone()], vec![scalar]);
         assert!(matches!(
         InterpretableOperation::<_>::interpret(
                         &carrier,
@@ -1723,7 +1321,7 @@ mod tests {
                                         &[Array::scalar(1.0)],
                     ),
                     Err(ProgramError::Type(TypeError::Invalid { message }))
-                        if message.starts_with("custom_vjp does not support forward-mode differentiation"),
+                        if message.starts_with("a transpose-only linear call has no forward program to execute"),
                 ));
     }
 

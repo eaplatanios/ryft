@@ -968,10 +968,10 @@ where
 /// ordinary primal-enum operation over the shared builder.
 ///
 /// The rule builds each branch's fused jvp program through its instruction-scoped differentiation driver — both
-/// branches share a signature, so the doubled `[primal_operands..., tangent_operands...] ->
-/// [primal_outputs..., tangent_outputs...]` signatures also match with no joining or padding — and stages one
-/// `condition` over the predicate primal followed by the operand primals and tangents. Pure forward mode therefore
-/// stages a single conditional and no residual plumbing.
+/// branches share a signature, so their compact `[primal_operands..., live_tangent_operands...] ->
+/// [primal_outputs..., live_tangent_outputs...]` signatures also match with no joining or padding — and stages one
+/// `condition` over the predicate primal followed by the operand primals and live tangents. Pure forward mode
+/// therefore stages a single conditional and no residual plumbing.
 ///
 /// The primal/tangent separation that reverse mode needs is deferred to partial evaluation: under the known-ness
 /// split of [`Program::linearize`](crate::Program::linearize) the predicate is a known (symbolic) primal, so the
@@ -997,7 +997,9 @@ where
         check_count!("input", inputs, true_branch.input_types().len() + 1, ProgramError);
         let predicate_primal = inputs[0].primal().clone();
         let operands = &inputs[1..];
-        let output_count = true_branch.output_ids().len();
+        let output_types = true_branch.output_types();
+        let output_count = output_types.len();
+        let tangent_output_count = output_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
 
         // Build both fused jvp branches and stage one fused conditional over the predicate primal followed by the
         // operand primals and tangents.
@@ -1007,21 +1009,29 @@ where
         let mut condition_operands = Vec::with_capacity(2 * operands.len() + 1);
         condition_operands.push(predicate_primal);
         condition_operands.extend(operands.iter().map(|operand| operand.primal().clone()));
-        // The fused branches take every operand tangent as a real program input, so materialize structural zeros.
         for operand in operands {
-            condition_operands.push(operand.tangent().clone().materialize(context)?);
+            if !operand.tangent().r#type().is_zero_space() {
+                condition_operands.push(operand.tangent().clone().materialize(context)?);
+            }
         }
         let outputs = context.bind(fused_condition, vec![fused_true, fused_false], &condition_operands)?;
-        check_count!("output", outputs, 2 * output_count, ProgramError);
+        check_count!("output", outputs, output_count + tangent_output_count, ProgramError);
 
-        // The fused conditional's outputs are the primal outputs followed by the tangent outputs; zip the halves
-        // back into `DifferentiationDual`s in the original output order.
+        // The fused conditional's outputs are the primal outputs followed by only the live tangent outputs. Restore
+        // structural zeros at the dual boundary for zero differential spaces.
         let (primal_outputs, tangent_outputs) = outputs.split_at(output_count);
+        let mut tangent_outputs = tangent_outputs.iter().cloned();
         Ok(primal_outputs
             .iter()
             .cloned()
-            .zip(tangent_outputs.iter().cloned())
-            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .zip(output_types)
+            .map(|(primal, output_type)| {
+                if output_type.tangent().is_zero_space() {
+                    Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                } else {
+                    DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?)
     }
 }
@@ -1969,13 +1979,10 @@ mod tests {
                 (Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]), Array::scalar(4.0)),
             )
             .unwrap();
-        let (pullback, residuals) = pullback.into_parts();
-        let mut pullback_inputs = vec![Array::scalar(5.0)];
-        pullback_inputs.extend(residuals);
-        let cotangents = pullback.interpret(pullback_inputs).unwrap();
+        let cotangents = pullback.apply(Array::scalar(5.0)).unwrap();
         assert_eq!(output.to_f64s(), vec![8.0]);
-        assert_eq!(cotangents[0].values(), &[Scalar::Zero]);
-        assert_eq!(cotangents[1].to_f64s(), vec![10.0]);
+        assert_eq!(cotangents.0.values(), &[Scalar::Zero]);
+        assert_eq!(cotangents.1.to_f64s(), vec![10.0]);
 
         let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
@@ -1990,12 +1997,9 @@ mod tests {
                 (Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]), Array::scalar(4.0)),
             )
             .unwrap();
-        let (pullback, residuals) = pullback.into_parts();
-        let mut pullback_inputs = vec![Array::scalar(5.0)];
-        pullback_inputs.extend(residuals);
-        let cotangents = pullback.interpret(pullback_inputs).unwrap();
+        let cotangents = pullback.apply(Array::scalar(5.0)).unwrap();
         assert_eq!(output.to_f64s(), vec![12.0]);
-        assert_eq!(cotangents[0].values(), &[Scalar::Zero]);
-        assert_eq!(cotangents[1].to_f64s(), vec![15.0]);
+        assert_eq!(cotangents.0.values(), &[Scalar::Zero]);
+        assert_eq!(cotangents.1.to_f64s(), vec![15.0]);
     }
 }

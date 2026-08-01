@@ -856,14 +856,15 @@ where
             .remove(0);
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
-        ArrayProgramOperation::Condition(_) | ArrayProgramOperation::While(_) | ArrayProgramOperation::Scan(_) => {
-            Err(LoweringError::UnsupportedOp {
-                op: format!(
-                    "core composite higher-order operation `{}` must be promoted to the XLA operation family before \
+        ArrayProgramOperation::Condition(_)
+        | ArrayProgramOperation::While(_)
+        | ArrayProgramOperation::Scan(_)
+        | ArrayProgramOperation::LinearCall(_) => Err(LoweringError::UnsupportedOp {
+            op: format!(
+                "core composite higher-order operation `{}` must be promoted to the XLA operation family before \
                      lowering",
-                    operation.name(),
-                ),
-            })
-        }
+                operation.name(),
+            ),
+        }),
     }
 }
