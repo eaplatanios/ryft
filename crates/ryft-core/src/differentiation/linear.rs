@@ -139,8 +139,6 @@ impl<T: DifferentiableType> Display for LinearCallOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
@@ -207,19 +205,18 @@ impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
                 let transpose = &region_interfaces[1];
                 check_types!(@same, "linear call forward input", [input_types, forward.input_types()]);
                 let (linear_types, residual_types) = self.split_inputs(input_types)?;
-                let expected_transpose_inputs = residual_types
+                let transpose_input_types = residual_types
                     .iter()
                     .cloned()
                     .chain(forward.output_types().iter().map(DifferentiableType::cotangent))
                     .collect::<Vec<_>>();
-                let expected_transpose_outputs =
-                    linear_types.iter().map(DifferentiableType::cotangent).collect::<Vec<_>>();
+                let transpose_output_types = linear_types.iter().map(DifferentiableType::cotangent).collect::<Vec<_>>();
                 check_types!(@same, "linear call transpose input", [
-                    &expected_transpose_inputs,
+                    &transpose_input_types,
                     transpose.input_types(),
                 ]);
                 check_types!(@same, "linear call transpose output", [
-                    &expected_transpose_outputs,
+                    &transpose_output_types,
                     transpose.output_types(),
                 ]);
                 Ok(forward.output_types().to_vec())
@@ -229,19 +226,18 @@ impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
                 let transpose = &region_interfaces[0];
                 let (actual_linear_types, residual_types) = self.split_inputs(input_types)?;
                 check_types!(@same, "transpose-only linear call input", [linear_types, actual_linear_types]);
-                let expected_transpose_inputs = residual_types
+                let transpose_input_types = residual_types
                     .iter()
                     .cloned()
                     .chain(output_types.iter().map(DifferentiableType::cotangent))
                     .collect::<Vec<_>>();
-                let expected_transpose_outputs =
-                    linear_types.iter().map(DifferentiableType::cotangent).collect::<Vec<_>>();
+                let transpose_output_types = linear_types.iter().map(DifferentiableType::cotangent).collect::<Vec<_>>();
                 check_types!(@same, "transpose-only linear call transpose input", [
-                    &expected_transpose_inputs,
+                    &transpose_input_types,
                     transpose.input_types(),
                 ]);
                 check_types!(@same, "transpose-only linear call transpose output", [
-                    &expected_transpose_outputs,
+                    &transpose_output_types,
                     transpose.output_types(),
                 ]);
                 Ok(output_types.clone())
@@ -272,6 +268,7 @@ impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
 }
 
 impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCallOperation<C::Type> {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -280,8 +277,8 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCa
     ) -> Result<Vec<C::Value>, ProgramError> {
         if self.is_transpose_only() {
             return Err(TypeError::invalid(
-                "a transpose-only linear call has no forward program to execute; it supports only reverse-mode \
-                 differentiation (e.g., vjp, value_and_gradient, or jacobian_reverse)",
+                "a transpose-only linear call has no forward program to execute; it supports \
+                only reverse-mode differentiation (e.g., vjp, value_and_gradient, or jacobian_reverse)",
             )
             .into());
         }
@@ -289,14 +286,15 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCa
     }
 }
 
-impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for LinearCallOperation<C::Type> where
-    C::Operation: From<LinearCallOperation<C::Type>>
+impl<C: Context<Type: DifferentiableType, Operation: From<LinearCallOperation<C::Type>>>>
+    PartiallyEvaluatableOperation<C> for LinearCallOperation<C::Type>
 {
 }
 
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for LinearCallOperation<ArrayType>
-where
-    C: Context<Type = ArrayType>,
+// TODO(eaplatanios): Review from here onwards.
+
+impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for LinearCallOperation<ArrayType>
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
