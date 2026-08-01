@@ -66,13 +66,44 @@ define_elementwise_capability!(
 
 define_tracer_operator!(@binary std::ops::Div, div, capability = Div, method = div);
 
-impl Div for usize {
-    fn div(&self, right: &Self) -> Result<Self, ProgramError> {
-        self.checked_div(*right).ok_or_else(|| ProgramError::InvalidArgument {
-            message: "'div' divisor must be greater than zero".to_string(),
-        })
-    }
+/// Implements [`Div`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    // Integer primitives use checked arithmetic so that host bookkeeping (e.g., dimension-extent math) reports
+    // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
+    (@integer $type:ty) => {
+        impl Div for $type {
+            fn div(&self, right: &Self) -> Result<Self, ProgramError> {
+                self.checked_div(*right).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("'div' divisor is zero or the result does not fit in {}", stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
+    (@float $type:ty) => {
+        impl Div for $type {
+            fn div(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(*self / *right)
+            }
+        }
+    };
 }
+
+impl_capability_for_primitive!(@integer i8);
+impl_capability_for_primitive!(@integer i16);
+impl_capability_for_primitive!(@integer i32);
+impl_capability_for_primitive!(@integer i64);
+impl_capability_for_primitive!(@integer i128);
+impl_capability_for_primitive!(@integer isize);
+impl_capability_for_primitive!(@integer u8);
+impl_capability_for_primitive!(@integer u16);
+impl_capability_for_primitive!(@integer u32);
+impl_capability_for_primitive!(@integer u64);
+impl_capability_for_primitive!(@integer u128);
+impl_capability_for_primitive!(@integer usize);
+impl_capability_for_primitive!(@float f32);
+impl_capability_for_primitive!(@float f64);
 
 #[cfg(test)]
 mod tests {
@@ -123,7 +154,9 @@ mod tests {
         assert_eq!(Div::div(&7_usize, &2), Ok(3));
         assert_eq!(
             Div::div(&7_usize, &0),
-            Err(ProgramError::InvalidArgument { message: "'div' divisor must be greater than zero".to_string() }),
+            Err(ProgramError::InvalidArgument {
+                message: "'div' divisor is zero or the result does not fit in usize".to_string(),
+            }),
         );
         assert_abs_diff_eq!(
             match InterpretableOperation::<EagerContext<Scalar>>::interpret(
@@ -315,5 +348,23 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_div_for_primitives() {
+        assert_eq!(Div::div(&7_usize, &2), Ok(3));
+        assert_eq!(
+            Div::div(&7_usize, &0),
+            Err(ProgramError::InvalidArgument {
+                message: "'div' divisor is zero or the result does not fit in usize".to_string(),
+            }),
+        );
+        assert_eq!(
+            Div::div(&i8::MIN, &-1),
+            Err(ProgramError::InvalidArgument {
+                message: "'div' divisor is zero or the result does not fit in i8".to_string(),
+            }),
+        );
+        assert_eq!(Div::div(&1.0_f64, &0.0), Ok(f64::INFINITY));
     }
 }

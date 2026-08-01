@@ -1,6 +1,7 @@
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -30,6 +31,20 @@ define_elementwise_capability!(
     round,
     RoundOperation,
 );
+
+/// Implements [`Round`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Round for $type {
+            fn round(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::round_ties_even(*self))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -121,5 +136,11 @@ mod tests {
     #[test]
     fn test_round_partial_evaluation() {
         check_operation_partial_evaluation!(operation = RoundOperation, inputs = [2.5], expected = 2.0,);
+    }
+
+    #[test]
+    fn test_round_for_primitives() {
+        assert_eq!(Round::round(&2.5_f64), Ok(2.0));
+        assert_eq!(Round::round(&3.5_f64), Ok(4.0));
     }
 }

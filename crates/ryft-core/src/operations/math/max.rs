@@ -4,6 +4,7 @@ use crate::macros::{
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::ZeroLike;
 use crate::operations::control_flow::Select;
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -57,6 +58,51 @@ define_elementwise_capability!(
     max(right),
     MaxOperation,
 );
+
+/// Implements [`Max`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    // Integer primitives use ordinary total-order comparison, which cannot fail.
+    (@integer $type:ty) => {
+        impl Max for $type {
+            fn max(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(::std::cmp::Ord::max(*self, *right))
+            }
+        }
+    };
+
+    // Floating-point primitives mirror the reference backends: NaN operands propagate, and signed zeros order
+    // through the IEEE 754 total order (so that `-0.0` sorts below `+0.0`).
+    (@float $type:ty) => {
+        impl Max for $type {
+            fn max(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(if self.is_nan() {
+                    *self
+                } else if right.is_nan() {
+                    *right
+                } else if matches!(self.total_cmp(right), ::std::cmp::Ordering::Less) {
+                    *right
+                } else {
+                    *self
+                })
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(@integer i8);
+impl_capability_for_primitive!(@integer i16);
+impl_capability_for_primitive!(@integer i32);
+impl_capability_for_primitive!(@integer i64);
+impl_capability_for_primitive!(@integer i128);
+impl_capability_for_primitive!(@integer isize);
+impl_capability_for_primitive!(@integer u8);
+impl_capability_for_primitive!(@integer u16);
+impl_capability_for_primitive!(@integer u32);
+impl_capability_for_primitive!(@integer u64);
+impl_capability_for_primitive!(@integer u128);
+impl_capability_for_primitive!(@integer usize);
+impl_capability_for_primitive!(@float f32);
+impl_capability_for_primitive!(@float f64);
 
 #[cfg(test)]
 mod tests {
@@ -232,5 +278,12 @@ mod tests {
             operation = MaxOperation,
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_max_for_primitives() {
+        assert_eq!(Max::max(&3_usize, &4), Ok(4));
+        assert!(Max::max(&1.0_f64, &f64::NAN).unwrap().is_nan());
+        assert_eq!(Max::max(&0.0_f64, &-0.0).unwrap().to_bits(), 0.0_f64.to_bits());
     }
 }

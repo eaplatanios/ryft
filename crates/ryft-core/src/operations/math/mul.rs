@@ -140,12 +140,44 @@ define_elementwise_capability!(
 
 define_tracer_operator!(@binary std::ops::Mul, mul, capability = Mul, method = mul);
 
-impl Mul for usize {
-    fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
-        self.checked_mul(*right)
-            .ok_or_else(|| ProgramError::InvalidArgument { message: "'mul' result does not fit in usize".to_string() })
-    }
+/// Implements [`Mul`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    // Integer primitives use checked arithmetic so that host bookkeeping (e.g., dimension-extent math) reports
+    // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
+    (@integer $type:ty) => {
+        impl Mul for $type {
+            fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
+                self.checked_mul(*right).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("'mul' result does not fit in {}", stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
+    (@float $type:ty) => {
+        impl Mul for $type {
+            fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(*self * *right)
+            }
+        }
+    };
 }
+
+impl_capability_for_primitive!(@integer i8);
+impl_capability_for_primitive!(@integer i16);
+impl_capability_for_primitive!(@integer i32);
+impl_capability_for_primitive!(@integer i64);
+impl_capability_for_primitive!(@integer i128);
+impl_capability_for_primitive!(@integer isize);
+impl_capability_for_primitive!(@integer u8);
+impl_capability_for_primitive!(@integer u16);
+impl_capability_for_primitive!(@integer u32);
+impl_capability_for_primitive!(@integer u64);
+impl_capability_for_primitive!(@integer u128);
+impl_capability_for_primitive!(@integer usize);
+impl_capability_for_primitive!(@float f32);
+impl_capability_for_primitive!(@float f64);
 
 #[cfg(test)]
 mod tests {
@@ -410,5 +442,15 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_mul_for_primitives() {
+        assert_eq!(Mul::mul(&3_usize, &4), Ok(12));
+        assert_eq!(
+            Mul::mul(&i8::MAX, &2),
+            Err(ProgramError::InvalidArgument { message: "'mul' result does not fit in i8".to_string() }),
+        );
+        assert_eq!(Mul::mul(&2.5_f64, &4.0), Ok(10.0));
     }
 }

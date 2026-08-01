@@ -3,6 +3,7 @@ use std::ops::{Add as StandardAdd, Div as StandardDiv};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -38,6 +39,20 @@ define_elementwise_capability!(
     sqrt,
     SqrtOperation,
 );
+
+/// Implements [`Sqrt`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Sqrt for $type {
+            fn sqrt(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::sqrt(*self))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -191,5 +206,10 @@ mod tests {
             operation = SqrtOperation,
             input_types = [ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_sqrt_for_primitives() {
+        assert_eq!(Sqrt::sqrt(&4.0_f64), Ok(2.0));
     }
 }

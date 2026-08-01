@@ -4,6 +4,7 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
 use crate::operations::constants::OneLike;
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -44,6 +45,20 @@ define_elementwise_capability!(
     logistic,
     LogisticOperation,
 );
+
+/// Implements [`Logistic`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Logistic for $type {
+            fn logistic(&self) -> Result<Self, ProgramError> {
+                Ok(((-*self).exp() + 1.0).recip())
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -164,5 +179,10 @@ mod tests {
             operation = LogisticOperation,
             input_types = [ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_logistic_for_primitives() {
+        assert_eq!(Logistic::logistic(&0.0_f64), Ok(0.5));
     }
 }

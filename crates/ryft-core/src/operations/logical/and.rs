@@ -2,6 +2,7 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 /// Canonical operation name for [`AndOperation`].
 pub const AND_OPERATION_NAME: &str = "and";
@@ -34,6 +35,33 @@ define_elementwise_capability!(
 );
 
 define_tracer_operator!(@binary std::ops::BitAnd, bitand, capability = And, method = and);
+
+/// Implements [`And`] for one host primitive type as logical and for `bool` and bitwise and for integers, matching
+/// the reference backends and StableHLO.
+macro_rules! impl_capability_for_primitive {
+    // The `&` operator is logical for `bool` and bitwise for integer primitives, and cannot fail for either.
+    ($type:ty) => {
+        impl And for $type {
+            fn and(&self, rhs: &Self) -> Result<Self, ProgramError> {
+                Ok(*self & *rhs)
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(bool);
+impl_capability_for_primitive!(i8);
+impl_capability_for_primitive!(i16);
+impl_capability_for_primitive!(i32);
+impl_capability_for_primitive!(i64);
+impl_capability_for_primitive!(i128);
+impl_capability_for_primitive!(isize);
+impl_capability_for_primitive!(u8);
+impl_capability_for_primitive!(u16);
+impl_capability_for_primitive!(u32);
+impl_capability_for_primitive!(u64);
+impl_capability_for_primitive!(u128);
+impl_capability_for_primitive!(usize);
 
 #[cfg(test)]
 mod tests {
@@ -119,5 +147,11 @@ mod tests {
             inputs = [Scalar::from(true), Scalar::from(false)],
             expected = Scalar::from(false),
         );
+    }
+
+    #[test]
+    fn test_and_for_primitives() {
+        assert_eq!(And::and(&true, &false), Ok(false));
+        assert_eq!(And::and(&0b1100_u8, &0b1010), Ok(0b1000));
     }
 }

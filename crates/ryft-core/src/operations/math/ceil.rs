@@ -1,6 +1,7 @@
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -30,6 +31,20 @@ define_elementwise_capability!(
     ceil,
     CeilOperation,
 );
+
+/// Implements [`Ceil`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Ceil for $type {
+            fn ceil(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::ceil(*self))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -118,5 +133,10 @@ mod tests {
     #[test]
     fn test_ceil_partial_evaluation() {
         check_operation_partial_evaluation!(operation = CeilOperation, inputs = [2.3], expected = 3.0,);
+    }
+
+    #[test]
+    fn test_ceil_for_primitives() {
+        assert_eq!(Ceil::ceil(&1.25_f64), Ok(2.0));
     }
 }

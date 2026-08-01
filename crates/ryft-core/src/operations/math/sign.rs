@@ -1,6 +1,7 @@
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 use crate::programs::types::TypeError;
 use crate::types::DataType;
 
@@ -42,6 +43,37 @@ define_elementwise_capability!(
     sign,
     SignOperation,
 );
+
+/// Implements [`Sign`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    // Signed integer primitives use the ordinary integer signum, which cannot fail.
+    (@signed $type:ty) => {
+        impl Sign for $type {
+            fn sign(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::signum(*self))
+            }
+        }
+    };
+
+    // Floating-point primitives mirror the reference backends. Signed zeros and NaNs are preserved, and every other
+    // value maps to `1.0` or `-1.0`.
+    (@float $type:ty) => {
+        impl Sign for $type {
+            fn sign(&self) -> Result<Self, ProgramError> {
+                Ok(if self.is_nan() || *self == 0.0 { *self } else { <$type>::signum(*self) })
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(@signed i8);
+impl_capability_for_primitive!(@signed i16);
+impl_capability_for_primitive!(@signed i32);
+impl_capability_for_primitive!(@signed i64);
+impl_capability_for_primitive!(@signed i128);
+impl_capability_for_primitive!(@signed isize);
+impl_capability_for_primitive!(@float f32);
+impl_capability_for_primitive!(@float f64);
 
 #[cfg(test)]
 mod tests {
@@ -152,5 +184,14 @@ mod tests {
     #[test]
     fn test_sign_partial_evaluation() {
         check_operation_partial_evaluation!(operation = SignOperation, inputs = [-0.7], expected = -1.0,);
+    }
+
+    #[test]
+    fn test_sign_for_primitives() {
+        assert_eq!(Sign::sign(&-5_i32), Ok(-1));
+        assert_eq!(Sign::sign(&0_i32), Ok(0));
+        assert_eq!(Sign::sign(&-2.5_f64), Ok(-1.0));
+        assert_eq!(Sign::sign(&-0.0_f64).unwrap().to_bits(), (-0.0_f64).to_bits());
+        assert!(Sign::sign(&f64::NAN).unwrap().is_nan());
     }
 }

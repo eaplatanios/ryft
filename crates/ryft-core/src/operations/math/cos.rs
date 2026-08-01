@@ -3,6 +3,7 @@ use std::ops::{Mul as StandardMul, Neg as StandardNeg};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 use super::Sin;
 
@@ -40,6 +41,20 @@ define_elementwise_capability!(
     cos,
     CosOperation,
 );
+
+/// Implements [`Cos`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Cos for $type {
+            fn cos(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::cos(*self))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -190,5 +205,10 @@ mod tests {
             operation = CosOperation,
             input_types = [ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_cos_for_primitives() {
+        assert_eq!(Cos::cos(&0.0_f64), Ok(1.0));
     }
 }

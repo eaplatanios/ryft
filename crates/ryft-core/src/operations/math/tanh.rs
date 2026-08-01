@@ -4,6 +4,7 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
 use crate::operations::constants::OneLike;
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -43,6 +44,20 @@ define_elementwise_capability!(
     tanh,
     TanhOperation,
 );
+
+/// Implements [`Tanh`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Tanh for $type {
+            fn tanh(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::tanh(*self))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -161,5 +176,10 @@ mod tests {
             operation = TanhOperation,
             input_types = [ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_tanh_for_primitives() {
+        assert_eq!(Tanh::tanh(&0.0_f64), Ok(0.0));
     }
 }

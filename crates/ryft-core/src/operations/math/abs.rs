@@ -13,6 +13,8 @@ use crate::programs::atoms::MaybeZero;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::types::DataType;
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &str = "abs";
 
@@ -128,6 +130,54 @@ define_elementwise_capability!(
     abs,
     AbsOperation,
 );
+
+/// Implements [`Abs`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    // Signed integer primitives use checked absolute values so that the `MIN` overflow reports an error instead of
+    // wrapping like the XLA-mirroring reference backends do on devices.
+    (@signed $type:ty) => {
+        impl Abs for $type {
+            fn abs(&self) -> Result<Self, ProgramError> {
+                self.checked_abs().ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("'abs' result does not fit in {}", stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Unsigned integer primitives are their own absolute values.
+    (@unsigned $type:ty) => {
+        impl Abs for $type {
+            fn abs(&self) -> Result<Self, ProgramError> {
+                Ok(*self)
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 absolute values, which cannot fail.
+    (@float $type:ty) => {
+        impl Abs for $type {
+            fn abs(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::abs(*self))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(@signed i8);
+impl_capability_for_primitive!(@signed i16);
+impl_capability_for_primitive!(@signed i32);
+impl_capability_for_primitive!(@signed i64);
+impl_capability_for_primitive!(@signed i128);
+impl_capability_for_primitive!(@signed isize);
+impl_capability_for_primitive!(@unsigned u8);
+impl_capability_for_primitive!(@unsigned u16);
+impl_capability_for_primitive!(@unsigned u32);
+impl_capability_for_primitive!(@unsigned u64);
+impl_capability_for_primitive!(@unsigned u128);
+impl_capability_for_primitive!(@unsigned usize);
+impl_capability_for_primitive!(@float f32);
+impl_capability_for_primitive!(@float f64);
 
 #[cfg(test)]
 mod tests {
@@ -352,5 +402,16 @@ mod tests {
             operation = AbsOperation,
             input_types = [ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_abs_for_primitives() {
+        assert_eq!(Abs::abs(&-5_i32), Ok(5));
+        assert_eq!(
+            Abs::abs(&i8::MIN),
+            Err(ProgramError::InvalidArgument { message: "'abs' result does not fit in i8".to_string() }),
+        );
+        assert_eq!(Abs::abs(&5_usize), Ok(5));
+        assert_eq!(Abs::abs(&-2.5_f64), Ok(2.5));
     }
 }

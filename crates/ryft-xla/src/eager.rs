@@ -637,7 +637,7 @@ mod tests {
             // Both backends compute at `f32` precision (the device through XLA's polynomial legalization of
             // `chlo.erf` and the reference through a rounded double-precision evaluation), so agreement is checked
             // within an `f32`-scale relative tolerance with an absolute floor for the near-zero inputs.
-            let tolerance = 1e-6f64.max(1e-6 * reference_value.abs());
+            let tolerance = 1e-6f64.max(1e-6 * f64::abs(*reference_value));
             assert!(
                 (f64::from(*device_value) - reference_value).abs() < tolerance,
                 "erf({input}) disagrees: XLA computed {device_value} but the reference backend computed \

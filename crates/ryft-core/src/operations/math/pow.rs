@@ -6,6 +6,7 @@ use crate::macros::{
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{OneLike, ZeroLike};
 use crate::operations::control_flow::Select;
+use crate::programs::ProgramError;
 
 use super::Log;
 
@@ -67,6 +68,21 @@ define_elementwise_capability!(
     pow(exponent),
     PowOperation,
 );
+
+/// Implements [`Pow`] for one host primitive type. Only floating-point primitives are supported, matching the
+/// reference backends' float-only power operation.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Pow for $type {
+            fn pow(&self, exponent: &Self) -> Result<Self, ProgramError> {
+                Ok(<$type>::powf(*self, *exponent))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -219,5 +235,10 @@ mod tests {
             operation = PowOperation,
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_pow_for_primitives() {
+        assert_eq!(Pow::pow(&2.0_f64, &3.0), Ok(8.0));
     }
 }

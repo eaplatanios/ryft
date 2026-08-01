@@ -2,6 +2,7 @@ use crate::macros::{
     check_types, define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 use crate::programs::types::TypeError;
 use crate::types::DataType;
 
@@ -45,6 +46,39 @@ define_elementwise_capability!(
 );
 
 define_tracer_operator!(@unary std::ops::Neg, neg, NegOperation, "`neg` operation failed");
+
+/// Implements [`Neg`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    // Signed integer primitives use checked negation so that the `MIN` overflow reports an error instead of
+    // wrapping like the XLA-mirroring reference backends do on devices.
+    (@signed $type:ty) => {
+        impl Neg for $type {
+            fn neg(&self) -> Result<Self, ProgramError> {
+                self.checked_neg().ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("'neg' result does not fit in {}", stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 negation, which cannot fail.
+    (@float $type:ty) => {
+        impl Neg for $type {
+            fn neg(&self) -> Result<Self, ProgramError> {
+                Ok(-*self)
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(@signed i8);
+impl_capability_for_primitive!(@signed i16);
+impl_capability_for_primitive!(@signed i32);
+impl_capability_for_primitive!(@signed i64);
+impl_capability_for_primitive!(@signed i128);
+impl_capability_for_primitive!(@signed isize);
+impl_capability_for_primitive!(@float f32);
+impl_capability_for_primitive!(@float f64);
 
 #[cfg(test)]
 mod tests {
@@ -218,5 +252,15 @@ mod tests {
                 "},
             }],
         );
+    }
+
+    #[test]
+    fn test_neg_for_primitives() {
+        assert_eq!(Neg::neg(&5_i32), Ok(-5));
+        assert_eq!(
+            Neg::neg(&i8::MIN),
+            Err(ProgramError::InvalidArgument { message: "'neg' result does not fit in i8".to_string() }),
+        );
+        assert_eq!(Neg::neg(&2.5_f64), Ok(-2.5));
     }
 }

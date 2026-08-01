@@ -105,6 +105,20 @@ define_elementwise_capability!(
     Atan2Operation,
 );
 
+/// Implements [`Atan2`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Atan2 for $type {
+            fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
+                Ok(<$type>::atan2(*self, *x))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -297,5 +311,10 @@ mod tests {
             operation = Atan2Operation,
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_atan2_for_primitives() {
+        assert_eq!(Atan2::atan2(&1.0_f64, &1.0), Ok(std::f64::consts::FRAC_PI_4));
     }
 }

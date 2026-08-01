@@ -2,6 +2,7 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 /// Canonical operation name for [`XorOperation`].
 pub const XOR_OPERATION_NAME: &str = "xor";
@@ -32,6 +33,33 @@ define_elementwise_capability!(
 );
 
 define_tracer_operator!(@binary std::ops::BitXor, bitxor, capability = Xor, method = xor);
+
+/// Implements [`Xor`] for one host primitive type as logical exclusive-or for `bool` and bitwise exclusive-or
+/// for integers, matching the reference backends and StableHLO.
+macro_rules! impl_capability_for_primitive {
+    // The `^` operator is logical for `bool` and bitwise for integer primitives, and cannot fail for either.
+    ($type:ty) => {
+        impl Xor for $type {
+            fn xor(&self, rhs: &Self) -> Result<Self, ProgramError> {
+                Ok(*self ^ *rhs)
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(bool);
+impl_capability_for_primitive!(i8);
+impl_capability_for_primitive!(i16);
+impl_capability_for_primitive!(i32);
+impl_capability_for_primitive!(i64);
+impl_capability_for_primitive!(i128);
+impl_capability_for_primitive!(isize);
+impl_capability_for_primitive!(u8);
+impl_capability_for_primitive!(u16);
+impl_capability_for_primitive!(u32);
+impl_capability_for_primitive!(u64);
+impl_capability_for_primitive!(u128);
+impl_capability_for_primitive!(usize);
 
 #[cfg(test)]
 mod tests {
@@ -82,5 +110,12 @@ mod tests {
             inputs = [Scalar::from(true), Scalar::from(false)],
             expected = Scalar::from(true),
         );
+    }
+
+    #[test]
+    fn test_xor_for_primitives() {
+        // The operator is logical for `bool` and bitwise for integer primitives.
+        assert_eq!(Xor::xor(&true, &false), Ok(true));
+        assert_eq!(Xor::xor(&0b1100_u8, &0b1010), Ok(0b0110));
     }
 }

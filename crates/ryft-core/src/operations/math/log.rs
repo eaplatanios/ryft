@@ -3,6 +3,7 @@ use std::ops::Div as StandardDiv;
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -38,6 +39,20 @@ define_elementwise_capability!(
     log,
     LogOperation,
 );
+
+/// Implements [`Log`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Log for $type {
+            fn log(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::ln(*self))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -187,5 +202,10 @@ mod tests {
             operation = LogOperation,
             input_types = [ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_log_for_primitives() {
+        assert_eq!(Log::log(&1.0_f64), Ok(0.0));
     }
 }

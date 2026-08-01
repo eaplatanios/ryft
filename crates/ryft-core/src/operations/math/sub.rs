@@ -2,6 +2,7 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -40,6 +41,45 @@ define_elementwise_capability!(
 );
 
 define_tracer_operator!(@binary std::ops::Sub, sub, capability = Sub, method = sub);
+
+/// Implements [`Sub`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    // Integer primitives use checked arithmetic so that host bookkeeping (e.g., dimension-extent math) reports
+    // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
+    (@integer $type:ty) => {
+        impl Sub for $type {
+            fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
+                self.checked_sub(*right).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("'sub' result does not fit in {}", stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
+    (@float $type:ty) => {
+        impl Sub for $type {
+            fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(*self - *right)
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(@integer i8);
+impl_capability_for_primitive!(@integer i16);
+impl_capability_for_primitive!(@integer i32);
+impl_capability_for_primitive!(@integer i64);
+impl_capability_for_primitive!(@integer i128);
+impl_capability_for_primitive!(@integer isize);
+impl_capability_for_primitive!(@integer u8);
+impl_capability_for_primitive!(@integer u16);
+impl_capability_for_primitive!(@integer u32);
+impl_capability_for_primitive!(@integer u64);
+impl_capability_for_primitive!(@integer u128);
+impl_capability_for_primitive!(@integer usize);
+impl_capability_for_primitive!(@float f32);
+impl_capability_for_primitive!(@float f64);
 
 #[cfg(test)]
 mod tests {
@@ -227,5 +267,15 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_sub_for_primitives() {
+        assert_eq!(Sub::sub(&5_usize, &3), Ok(2));
+        assert_eq!(
+            Sub::sub(&0_usize, &1),
+            Err(ProgramError::InvalidArgument { message: "'sub' result does not fit in usize".to_string() }),
+        );
+        assert_eq!(Sub::sub(&2.5_f32, &0.5), Ok(2.0));
     }
 }

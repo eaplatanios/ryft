@@ -1,6 +1,7 @@
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -30,6 +31,20 @@ define_elementwise_capability!(
     floor,
     FloorOperation,
 );
+
+/// Implements [`Floor`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Floor for $type {
+            fn floor(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::floor(*self))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -118,5 +133,10 @@ mod tests {
     #[test]
     fn test_floor_partial_evaluation() {
         check_operation_partial_evaluation!(operation = FloorOperation, inputs = [2.7], expected = 2.0,);
+    }
+
+    #[test]
+    fn test_floor_for_primitives() {
+        assert_eq!(Floor::floor(&1.75_f64), Ok(1.0));
     }
 }

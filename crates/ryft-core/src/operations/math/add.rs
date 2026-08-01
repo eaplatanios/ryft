@@ -2,6 +2,7 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -41,6 +42,45 @@ define_elementwise_capability!(
 );
 
 define_tracer_operator!(@binary std::ops::Add, add, capability = Add, method = add);
+
+/// Implements [`Add`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    // Integer primitives use checked arithmetic so that host bookkeeping (e.g., dimension-extent math) reports
+    // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
+    (@integer $type:ty) => {
+        impl Add for $type {
+            fn add(&self, rhs: &Self) -> Result<Self, ProgramError> {
+                self.checked_add(*rhs).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("'add' result does not fit in {}", stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
+    (@float $type:ty) => {
+        impl Add for $type {
+            fn add(&self, rhs: &Self) -> Result<Self, ProgramError> {
+                Ok(*self + *rhs)
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(@integer i8);
+impl_capability_for_primitive!(@integer i16);
+impl_capability_for_primitive!(@integer i32);
+impl_capability_for_primitive!(@integer i64);
+impl_capability_for_primitive!(@integer i128);
+impl_capability_for_primitive!(@integer isize);
+impl_capability_for_primitive!(@integer u8);
+impl_capability_for_primitive!(@integer u16);
+impl_capability_for_primitive!(@integer u32);
+impl_capability_for_primitive!(@integer u64);
+impl_capability_for_primitive!(@integer u128);
+impl_capability_for_primitive!(@integer usize);
+impl_capability_for_primitive!(@float f32);
+impl_capability_for_primitive!(@float f64);
 
 #[cfg(test)]
 mod tests {
@@ -225,5 +265,16 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_add_for_primitives() {
+        assert_eq!(Add::add(&2_usize, &3), Ok(5));
+        assert_eq!(Add::add(&-2_i32, &3), Ok(1));
+        assert_eq!(
+            Add::add(&i8::MAX, &1),
+            Err(ProgramError::InvalidArgument { message: "'add' result does not fit in i8".to_string() }),
+        );
+        assert_eq!(Add::add(&2.5_f64, &0.5), Ok(3.0));
     }
 }

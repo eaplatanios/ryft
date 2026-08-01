@@ -2,6 +2,7 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 /// Canonical operation name for [`NotOperation`].
 pub const NOT_OPERATION_NAME: &str = "not";
@@ -34,6 +35,33 @@ define_elementwise_capability!(
 );
 
 define_tracer_operator!(@unary std::ops::Not, not, NotOperation, "`not` operation failed");
+
+/// Implements [`Not`] for one host primitive type as logical not for `bool` and bitwise not for integers, matching the
+/// reference backends and StableHLO.
+macro_rules! impl_capability_for_primitive {
+    // The `!` operator is logical for `bool` and bitwise for integer primitives, and cannot fail for either.
+    ($type:ty) => {
+        impl Not for $type {
+            fn not(&self) -> Result<Self, ProgramError> {
+                Ok(!*self)
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(bool);
+impl_capability_for_primitive!(i8);
+impl_capability_for_primitive!(i16);
+impl_capability_for_primitive!(i32);
+impl_capability_for_primitive!(i64);
+impl_capability_for_primitive!(i128);
+impl_capability_for_primitive!(isize);
+impl_capability_for_primitive!(u8);
+impl_capability_for_primitive!(u16);
+impl_capability_for_primitive!(u32);
+impl_capability_for_primitive!(u64);
+impl_capability_for_primitive!(u128);
+impl_capability_for_primitive!(usize);
 
 #[cfg(test)]
 mod tests {
@@ -84,5 +112,11 @@ mod tests {
             inputs = [Scalar::from(true)],
             expected = Scalar::from(false),
         );
+    }
+
+    #[test]
+    fn test_not_for_primitives() {
+        assert_eq!(Not::not(&true), Ok(false));
+        assert_eq!(Not::not(&0b1100_u8), Ok(0b1111_0011));
     }
 }

@@ -3,6 +3,7 @@ use std::ops::Mul as StandardMul;
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 use super::Cos;
 
@@ -40,6 +41,20 @@ define_elementwise_capability!(
     sin,
     SinOperation,
 );
+
+/// Implements [`Sin`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    ($type:ty) => {
+        impl Sin for $type {
+            fn sin(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::sin(*self))
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(f32);
+impl_capability_for_primitive!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -188,5 +203,10 @@ mod tests {
             operation = SinOperation,
             input_types = [ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_sin_for_primitives() {
+        assert_eq!(Sin::sin(&0.0_f64), Ok(0.0));
     }
 }

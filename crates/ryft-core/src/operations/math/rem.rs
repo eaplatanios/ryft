@@ -4,6 +4,7 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
@@ -66,6 +67,45 @@ define_tracer_operator!(
     capability = Rem,
     method = rem,
 );
+
+/// Implements [`Rem`] for one host primitive type.
+macro_rules! impl_capability_for_primitive {
+    // Integer primitives use checked arithmetic so that host bookkeeping (e.g., dimension-extent math) reports
+    // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
+    (@integer $type:ty) => {
+        impl Rem for $type {
+            fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
+                self.checked_rem(*right).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("'rem' divisor is zero or the result does not fit in {}", stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
+    (@float $type:ty) => {
+        impl Rem for $type {
+            fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(*self % *right)
+            }
+        }
+    };
+}
+
+impl_capability_for_primitive!(@integer i8);
+impl_capability_for_primitive!(@integer i16);
+impl_capability_for_primitive!(@integer i32);
+impl_capability_for_primitive!(@integer i64);
+impl_capability_for_primitive!(@integer i128);
+impl_capability_for_primitive!(@integer isize);
+impl_capability_for_primitive!(@integer u8);
+impl_capability_for_primitive!(@integer u16);
+impl_capability_for_primitive!(@integer u32);
+impl_capability_for_primitive!(@integer u64);
+impl_capability_for_primitive!(@integer u128);
+impl_capability_for_primitive!(@integer usize);
+impl_capability_for_primitive!(@float f32);
+impl_capability_for_primitive!(@float f64);
 
 #[cfg(test)]
 mod tests {
@@ -178,5 +218,17 @@ mod tests {
             operation = RemOperation,
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_rem_for_primitives() {
+        assert_eq!(Rem::rem(&7_usize, &4), Ok(3));
+        assert_eq!(
+            Rem::rem(&7_usize, &0),
+            Err(ProgramError::InvalidArgument {
+                message: "'rem' divisor is zero or the result does not fit in usize".to_string(),
+            }),
+        );
+        assert!(Rem::rem(&1.0_f64, &0.0).unwrap().is_nan());
     }
 }
