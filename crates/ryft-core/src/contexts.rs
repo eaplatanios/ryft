@@ -729,8 +729,11 @@ pub(crate) mod tests {
 
     use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::differentiation::forward::DifferentiationTracer;
-    use crate::differentiation::types::DifferentiableType;
+    use crate::differentiation::forward::{
+        DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,
+    };
+    use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
+    use crate::differentiation::{DifferentiableType, DifferentiationError};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
@@ -738,9 +741,9 @@ pub(crate) mod tests {
     use crate::operations::control_flow::WhileOperation;
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::{Parameter, Placeholder};
-    use crate::partial::PartialTracer;
+    use crate::partial::{PartialTracer, PartialValue};
     use crate::programs::ProgramError;
-    use crate::programs::atoms::{Atom, AtomId};
+    use crate::programs::atoms::{Atom, AtomId, MaybeZero};
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::identities::NoIdentity;
     use crate::programs::operations::OperationProjection;
@@ -782,6 +785,20 @@ pub(crate) mod tests {
 
         fn is_complex(&self) -> bool {
             false
+        }
+    }
+
+    impl<const MEMBER: u8> DifferentiableType for ProjectedMemberType<MEMBER> {
+        fn is_zero_space(&self) -> bool {
+            false
+        }
+
+        fn tangent(&self) -> Self {
+            self.clone()
+        }
+
+        fn cotangent(&self) -> Self {
+            self.clone()
         }
     }
 
@@ -1009,6 +1026,40 @@ pub(crate) mod tests {
         ) -> Result<Vec<ProjectedMemberType<MEMBER>>, TypeError> {
             check_count!("input", input_types, 1, TypeError);
             Ok(input_types.to_vec())
+        }
+    }
+
+    impl<const MEMBER: u8, C: Context<Type = ProjectedMemberType<MEMBER>, Operation: From<Self>>>
+        DifferentiableOperation<C> for ProjectedMemberOperation<MEMBER>
+    {
+        fn jvp<D: DifferentiationDriver<C>>(
+            &self,
+            context: &C,
+            _driver: &D,
+            inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            check_count!("input", inputs, 1, ProgramError);
+            let primal = context.bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
+            Ok(vec![DifferentiationDual::new(primal, inputs[0].tangent().clone())?])
+        }
+    }
+
+    impl<const MEMBER: u8, V: Value<Type = ProjectedMemberType<MEMBER>>, O: Operation<ProjectedMemberType<MEMBER>>>
+        TransposableOperation<V, O> for ProjectedMemberOperation<MEMBER>
+    {
+        fn transpose<D: TranspositionDriver<V, O>>(
+            &self,
+            _context: &mut TracingContext<V, O>,
+            _driver: &D,
+            inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+            outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(vec![match &inputs[0] {
+                PartialValue::Unknown(_) => outputs[0].clone(),
+                PartialValue::Known(_) => MaybeZero::Zero(inputs[0].r#type().cotangent()),
+            }])
         }
     }
 
