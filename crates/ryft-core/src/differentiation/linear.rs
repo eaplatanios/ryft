@@ -225,7 +225,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ///
     /// A mapped [`LinearCallInterface::ForwardAndTranspose`] call batches its forward region to discover the batched
     /// output axes, batches its transpose region under those axes, and aligns the transpose outputs with the original
-    /// linear-input axes (i.e., a cotangent for a replicated linear input is summed across the batch by `reduce_fn`,
+    /// linear-input axes (i.e., a cotangent for a replicated linear input is summed across the batch by `collapse_fn`,
     /// while cotangents for mapped linear inputs retain their packed axes).
     ///
     /// A mapped [`LinearCallInterface::TransposeOnly`] call is rejected because its unavailable forward program cannot
@@ -242,15 +242,18 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ///   - `driver`: [`BatchingDriver`] exposing this call's attached regions.
     ///   - `inputs`: Batched operands, ordered as `[residuals..., linear_inputs...]`.
     ///   - `input_axes`: Batch axis of each operand in `inputs`.
-    ///   - `reduce_fn`: Function that sums one mapped transpose output along the provided axis within the adapted
-    ///     program's own [`TracingContext`]. Callers own this closure because its mechanics are universe-specific
-    ///     (e.g., the homogeneous tracer has a direct reduction capability, while the composite universe binds a
-    ///     projected reduction operation).
+    ///   - `collapse_fn`: Function that sums one mapped transpose output along the provided axis within the adapted
+    ///     program's own [`TracingContext`]. Summation is the correct collapse here because these outputs are
+    ///     cotangents (i.e., a replicated linear input `u` was broadcast across the batch, the batched transpose
+    ///     therefore produced one cotangent `ūᵢ` per batch item, and the transpose of a broadcast is a summation,
+    ///     so the one shared cotangent is `ū = Σᵢ ūᵢ`). Callers own this closure only because its mechanics are
+    ///     universe-specific (e.g., the homogeneous tracer has the direct reduction capability, while the composite
+    ///     universe reaches it through a projected value).
     pub(crate) fn batch_regions<
         C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
         P: BatchingPolicy<C>,
         D: BatchingDriver<C, P>,
-        ReduceFn: Fn(
+        CollapseFn: Fn(
             &TracingContext<C::Constant, C::Operation>,
             Tracer<TracingContext<C::Constant, C::Operation>>,
             Axis,
@@ -261,7 +264,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         driver: &D,
         inputs: &[P::Batch],
         input_axes: Vec<BatchAxis>,
-        reduce_fn: ReduceFn,
+        collapse_fn: CollapseFn,
     ) -> Result<Vec<P::Batch>, BatchingError> {
         if self.residual_count > inputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
@@ -305,12 +308,12 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )?,
             None,
-            &reduce_fn,
+            &collapse_fn,
         )?
         .into_parts();
 
         // Batch the supplied transpose under the forward result axes. Cotangents for replicated linear inputs are
-        // reduced during adaptation; mapped linear inputs instead retain their packed axes.
+        // summed during adaptation; mapped linear inputs instead retain their packed axes.
         let transpose_input_axes = residual_axes.iter().copied().chain(output_axes.iter().copied()).collect::<Vec<_>>();
         let (transpose, transpose_output_axes) = P::adapt_batched_program(
             driver.batch_program(
@@ -320,7 +323,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
                 ProgramBatchingOutputAxesPolicy::AlignEachTo(linear_axes.to_vec()),
             )?,
             Some(linear_axes),
-            &reduce_fn,
+            &collapse_fn,
         )?
         .into_parts();
         check_count!("output", transpose_output_axes, linear_axes.len(), ProgramError);
@@ -932,6 +935,42 @@ mod tests {
             nested.interpret(vec![Array::vector(vec![2.0, 3.0]), Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]),]),
             Ok(vec![Array::matrix(2, 2, vec![8.0, 10.0, 18.0, 21.0])]),
         );
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_preserves_a_replicated_transpose_only_call() {
+        let r#type = ArrayType::scalar(DataType::F64);
+        let transpose = scalar_multiply_program();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(r#type.clone());
+        let linear = builder.add_input(r#type.clone());
+        let output = builder
+            .add_instruction(
+                LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type]),
+                vec![transpose],
+                vec![residual, linear],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // A completely replicated call needs no structural region rewrite, so batching is the one transform the
+        // transpose-only form supports: the call rebinds itself over its untouched backward region.
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+        let instruction = &batched.instructions()[0];
+        assert_eq!(instruction.operation().name(), "transpose_only_linear_call");
+        assert_eq!(instruction.regions().len(), 1);
     }
 
     #[test]
