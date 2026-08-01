@@ -235,11 +235,11 @@ macro_rules! check_builders {
 ///
 /// ```rust,ignore
 /// define_arithmetic_dimension_operation!(
-///     /// Checked dimension-addition operation used by [`DimensionAdd`].
+///     /// Checked dimension-addition operation used by [`Add`].
 ///     DimensionAddOperation,
 ///     DIMENSION_ADD_OPERATION_NAME,
-///     DimensionAdd,
-///     dimension_add,
+///     Add,
+///     add,
 ///     result_name = |left: &DimensionType, right: &DimensionType| {
 ///         format!("{} + {}", left.variable(), right.variable())
 ///     },
@@ -253,8 +253,8 @@ macro_rules! check_builders {
 ///   - `$operation`: Identifier of the generated nominal operation type (e.g., `DimensionAddOperation`).
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `DIMENSION_ADD_OPERATION_NAME`).
 ///   - `$capability`: Value-level capability required by the generated
-///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `DimensionAdd`).
-///   - `$method`: Semantic capability method used for interpretation (e.g., `dimension_add`).
+///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Add`).
+///   - `$method`: Semantic capability method used for interpretation (e.g., `add`).
 ///   - `$result_name`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
 ///     the fresh result identity's diagnostic name.
 ///   - `$infer_bounds`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
@@ -425,23 +425,23 @@ macro_rules! define_arithmetic_dimension_operation {
 ///
 /// ```rust,ignore
 /// define_arithmetic_dimension_capability!(
-///     /// Adds two first-class runtime dimensions.
-///     DimensionAdd,
-///     /// Returns the checked sum of `self` and `right`.
-///     dimension_add(right),
-///     DimensionAddOperation,
+///     /// Returns the maximum of two first-class runtime dimensions.
+///     DimensionMax,
+///     /// Returns the maximum of `self` and `right`.
+///     dimension_max(right),
+///     DimensionMaxOperation,
 /// );
 /// ```
 ///
 /// # Parameters
 ///
 ///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
-///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `DimensionAdd`).
+///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `DimensionMax`).
 ///   - `$(#[$method_documentation])*`: Documentation attributes attached to the generated capability method.
-///   - `$method`: Identifier of the generated binary capability method (e.g., `dimension_add`).
+///   - `$method`: Identifier of the generated binary capability method (e.g., `dimension_max`).
 ///   - `$argument`: Name of the capability method's non-receiver argument (e.g., `right`).
 ///   - `$operation`: Dimension-arithmetic operation constructed and bound by the generated implementation (e.g.,
-///     `DimensionAddOperation`).
+///     `DimensionMaxOperation`).
 #[macro_export]
 macro_rules! define_arithmetic_dimension_capability {
     // This branch defines one semantic binary method plus its generic staging implementation.
@@ -871,10 +871,14 @@ macro_rules! define_elementwise_operation {
 ///   - `$(#[$method_documentation])*`: Documentation attributes attached to the generated capability method.
 ///   - `$method`: Identifier of the generated capability method (e.g., `sin`).
 ///   - `$argument`: Required name for the binary capability's non-receiver argument (e.g., `x` in `atan2(x)`).
-///   - `$operation`: Unit-struct operation bound through the value's dispatch domain (e.g., `SinOperation`).
+///   - `$operation`: Stateless operation marker (e.g., `SinOperation`) whose
+///     [`OperationProvider`](crate::OperationProvider) implementation selects and constructs the concrete operation
+///     staged for each value type family. Stateless operations provide themselves through the blanket implementation,
+///     while type families whose operations carry type-derived metadata (e.g., checked dimension arithmetic) override
+///     the provider for the marker.
 #[macro_export]
 macro_rules! define_elementwise_capability {
-    // This branch defines a receiver capability and binds its unary operation through each value's dispatch domain.
+    // This branch defines a receiver capability whose unary operation is provided by the value type family.
     (
         @unary
         $(#[$capability_documentation:meta])*
@@ -889,14 +893,25 @@ macro_rules! define_elementwise_capability {
             fn $method(&self) -> Result<Self, $crate::ProgramError>;
         }
 
-        impl<__V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
-            $capability for __V
+        impl<__V: $crate::Value> $capability for __V
+        where
+            $operation: $crate::OperationProvider<__V::Type>,
+            __V::DispatchDomain: $crate::Context<
+                    Type = __V::Type,
+                    Value = __V,
+                    Operation: ::std::convert::From<
+                        <$operation as $crate::OperationProvider<__V::Type>>::Operation,
+                    >,
+                >,
         {
             #[inline]
             fn $method(&self) -> Result<Self, $crate::ProgramError> {
+                let input_type = $crate::Typed::r#type(self);
+                let operation =
+                    <$operation as $crate::OperationProvider<__V::Type>>::provide(&[input_type.as_ref()])?;
                 Ok($crate::Context::bind(
                     &$crate::Value::dispatch_domain(self),
-                    $operation,
+                    operation,
                     Vec::new(),
                     ::std::slice::from_ref(self),
                 )?
@@ -905,7 +920,8 @@ macro_rules! define_elementwise_capability {
         }
     };
 
-    // This branch defines a two-operand capability using the caller-provided name for the right operand.
+    // This branch defines a two-operand capability whose binary operation is provided by the value type family,
+    // using the caller-provided name for the right operand.
     (
         @binary
         $(#[$capability_documentation:meta])*
@@ -920,14 +936,28 @@ macro_rules! define_elementwise_capability {
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError>;
         }
 
-        impl<__V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
-            $capability for __V
+        impl<__V: $crate::Value> $capability for __V
+        where
+            $operation: $crate::OperationProvider<__V::Type>,
+            __V::DispatchDomain: $crate::Context<
+                    Type = __V::Type,
+                    Value = __V,
+                    Operation: ::std::convert::From<
+                        <$operation as $crate::OperationProvider<__V::Type>>::Operation,
+                    >,
+                >,
         {
             #[inline]
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError> {
+                let left_type = $crate::Typed::r#type(self);
+                let right_type = $crate::Typed::r#type($argument);
+                let operation = <$operation as $crate::OperationProvider<__V::Type>>::provide(&[
+                    left_type.as_ref(),
+                    right_type.as_ref(),
+                ])?;
                 Ok($crate::Context::bind(
                     &$crate::Value::dispatch_domain(self),
-                    $operation,
+                    operation,
                     Vec::new(),
                     &[self.clone(), $argument.clone()],
                 )?
@@ -2515,12 +2545,10 @@ macro_rules! impl_nullary_batchable_operation {
 ///     `@unary` produces `fn(self) -> Self` operators and `@binary` produces `fn(self, Self) -> Self` operators.
 ///   - `$trait`: Path to the foreign `std::ops` operator trait to implement (e.g., `std::ops::Add`).
 ///   - `$method`: Identifier of the operator trait method to define (e.g., `add`).
-///   - `$operation`: Path to the unit-struct operation, used both as the `From` bound target and as the value bound
-///     through each tracer's context (e.g., `AndOperation`).
-///   - `provider = $provider`: Selects and constructs a binary operation through a type-level provider trait with an
-///     associated `Operation` type and a fallible `operation(left_type, right_type)` constructor. This form supports
-///     one operator across program type families that use distinct operation types.
-///   - `$message`: Panic message used when an eager tracer's bind fails.
+///   - `capability = $capability, method = $capability_method`: Fallible value capability and method that implement
+///     the binary operator. Operator sugar delegates to this pair so operation selection and error behavior remain
+///     defined in one place.
+///   - `$message`: Panic message used when a unary tracer bind fails.
 #[macro_export]
 macro_rules! define_tracer_operator {
     // This branch implements receiver-only operator syntax for every transform tracer family.
@@ -2612,49 +2640,36 @@ macro_rules! define_tracer_operator {
         }
     };
 
-    // This binary form statically selects and constructs a type-family-specific operation through a provider.
-    (@binary $trait:path, $method:ident, provider = $provider:path, $message:literal $(,)?) => {
-        impl<__T: $crate::Type + $provider, __V> $trait for $crate::ProjectedValue<__T, __V>
+    // This branch layers panicking binary operator sugar over one fallible value capability for every tracer family.
+    (
+        @binary $trait:path,
+        $method:ident,
+        capability = $capability:path,
+        method = $capability_method:ident $(,)?
+    ) => {
+        impl<__T: $crate::Type, __V> $trait for $crate::ProjectedValue<__T, __V>
         where
-            $crate::ProjectedValue<__T, __V>: $crate::Value<Type = __T>,
-            <$crate::ProjectedValue<__T, __V> as $crate::Value>::DispatchDomain: $crate::Context<
-                    Type = __T,
-                    Value = $crate::ProjectedValue<__T, __V>,
-                    Operation: ::std::convert::From<<__T as $provider>::Operation>,
-                >,
+            $crate::ProjectedValue<__T, __V>: $crate::Value<Type = __T> + $capability,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self, right: Self) -> Self {
-                let left_type = $crate::Typed::r#type(&self);
-                let right_type = $crate::Typed::r#type(&right);
-                let operation = <__T as $provider>::operation(left_type.as_ref(), right_type.as_ref())
-                    .unwrap_or_else(|error| panic!("{error}"));
-                $crate::Context::bind(
-                    &$crate::Value::dispatch_domain(&self),
-                    operation,
-                    Vec::new(),
-                    &[self.clone(), right],
-                )
-                .expect($message)
-                .remove(0)
+                <Self as $capability>::$capability_method(&self, &right).unwrap_or_else(|error| panic!("{error}"))
             }
         }
 
         impl<__C: $crate::StagingContext> $trait for $crate::Tracer<__C>
         where
-            __C::Type: $provider,
-            __C::Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
+            Self: $capability,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self, right: Self) -> Self {
                 let left_type = $crate::Typed::r#type(&self);
-                let right_type = $crate::Typed::r#type(&right);
-                match <__C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref()) {
-                    Ok(operation) => self.binary(&right, operation),
+                match <Self as $capability>::$capability_method(&self, &right) {
+                    Ok(output) => output,
                     Err(error) => {
                         $crate::StagingContext::error(self.context(), error);
                         $crate::Tracer::new(self.context().clone(), $crate::TracerState::Poison, left_type.into_owned())
@@ -2665,23 +2680,13 @@ macro_rules! define_tracer_operator {
 
         impl<__C: $crate::Context> $trait for $crate::PartialTracer<__C>
         where
-            __C::Type: $provider,
-            $crate::PartialEvaluationContext<__C>: $crate::Context<
-                    Value = $crate::PartialTracer<__C>,
-                    Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
-                >,
+            Self: $capability,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self, right: Self) -> Self {
-                let left_type = $crate::Typed::r#type(&self);
-                let right_type = $crate::Typed::r#type(&right);
-                let operation = <__C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
-                    .unwrap_or_else(|error| panic!("{error}"));
-                $crate::Context::bind(self.context(), operation, Vec::new(), &[self.clone(), right.clone()])
-                    .expect($message)
-                    .remove(0)
+                <Self as $capability>::$capability_method(&self, &right).unwrap_or_else(|error| panic!("{error}"))
             }
         }
 
@@ -2689,134 +2694,25 @@ macro_rules! define_tracer_operator {
             $trait
             for $crate::BatchingTracer<__C, $crate::ArrayBatching>
         where
-            __C::Type: $provider,
-            $crate::BatchingContext<__C, $crate::ArrayBatching>: $crate::Context<
-                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatching>,
-                    Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
-                >,
+            Self: $capability,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self, right: Self) -> Self {
-                let left_type = $crate::Typed::r#type(&self);
-                let right_type = $crate::Typed::r#type(&right);
-                let operation = <__C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
-                    .unwrap_or_else(|error| panic!("{error}"));
-                $crate::Context::bind(self.context(), operation, Vec::new(), &[self.clone(), right.clone()])
-                    .expect($message)
-                    .remove(0)
+                <Self as $capability>::$capability_method(&self, &right).unwrap_or_else(|error| panic!("{error}"))
             }
         }
 
         impl<__C: $crate::Context> $trait for $crate::DifferentiationTracer<__C>
         where
-            __C::Type: $provider,
-            $crate::DifferentiationContext<__C>: $crate::Context<
-                    Value = $crate::DifferentiationTracer<__C>,
-                    Operation: ::std::convert::From<<__C::Type as $provider>::Operation>,
-                >,
+            Self: $capability,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self, right: Self) -> Self {
-                let left_type = $crate::Typed::r#type(&self);
-                let right_type = $crate::Typed::r#type(&right);
-                let operation = <__C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
-                    .unwrap_or_else(|error| panic!("{error}"));
-                $crate::Context::bind(self.context(), operation, Vec::new(), &[self.clone(), right.clone()])
-                    .expect($message)
-                    .remove(0)
-            }
-        }
-    };
-
-    // This branch implements two-operand operator syntax for every transform tracer family.
-    (@binary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
-        impl<__T: $crate::Type, __V> $trait for $crate::ProjectedValue<__T, __V>
-        where
-            $crate::ProjectedValue<__T, __V>: $crate::Value<Type = __T>,
-            <$crate::ProjectedValue<__T, __V> as $crate::Value>::DispatchDomain: $crate::Context<
-                    Type = __T,
-                    Value = $crate::ProjectedValue<__T, __V>,
-                    Operation: ::std::convert::From<$operation>,
-                >,
-        {
-            type Output = Self;
-
-            #[inline]
-            fn $method(self, right: Self) -> Self {
-                $crate::Context::bind(
-                    &$crate::Value::dispatch_domain(&self),
-                    $operation,
-                    Vec::new(),
-                    &[self.clone(), right],
-                )
-                .expect($message)
-                .remove(0)
-            }
-        }
-
-        impl<__C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait
-            for $crate::Tracer<__C>
-        {
-            type Output = Self;
-
-            #[inline]
-            fn $method(self, right: Self) -> Self {
-                self.binary(&right, $operation)
-            }
-        }
-
-        impl<__C: $crate::Context> $trait for $crate::PartialTracer<__C>
-        where
-            $crate::PartialEvaluationContext<__C>:
-                $crate::Context<Value = $crate::PartialTracer<__C>, Operation: ::std::convert::From<$operation>>,
-        {
-            type Output = Self;
-
-            #[inline]
-            fn $method(self, right: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone(), right.clone()])
-                    .expect($message)
-                    .remove(0)
-            }
-        }
-
-        impl<__C: $crate::Context<Type = $crate::ArrayType>>
-            $trait
-            for $crate::BatchingTracer<__C, $crate::ArrayBatching>
-        where
-            $crate::BatchingContext<__C, $crate::ArrayBatching>: $crate::Context<
-                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatching>,
-                    Operation: ::std::convert::From<$operation>,
-                >,
-        {
-            type Output = Self;
-
-            #[inline]
-            fn $method(self, right: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone(), right.clone()])
-                    .expect($message)
-                    .remove(0)
-            }
-        }
-
-        impl<__C: $crate::Context> $trait for $crate::DifferentiationTracer<__C>
-        where
-            $crate::DifferentiationContext<__C>: $crate::Context<
-                    Value = $crate::DifferentiationTracer<__C>,
-                    Operation: ::std::convert::From<$operation>,
-                >,
-        {
-            type Output = Self;
-
-            #[inline]
-            fn $method(self, right: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone(), right.clone()])
-                    .expect($message)
-                    .remove(0)
+                <Self as $capability>::$capability_method(&self, &right).unwrap_or_else(|error| panic!("{error}"))
             }
         }
     };
@@ -4325,7 +4221,7 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::programs::atoms::MaybeZero;
     use crate::programs::identities::TypeIdentityRenaming;
-    use crate::programs::operations::Operation;
+    use crate::programs::operations::{Operation, OperationProvider};
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::{Type, TypeError, Typed};
     use crate::programs::values::ValueProjection;
@@ -4599,38 +4495,32 @@ mod tests {
         fn apply_provided_binary(self, right: Self) -> Self::Output;
     }
 
-    /// Selects the test operation used for each supported program type.
-    trait TestOperationFor: Type {
-        /// Operation selected for this program type.
-        type Operation: Operation<Self>;
-
-        /// Constructs the operation for the two operand types.
-        fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError>;
-    }
-
-    impl TestOperationFor for DataType {
-        type Operation = TestBinaryOperation;
-
-        fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
-            Ok(TestBinaryOperation)
-        }
-    }
-
-    impl TestOperationFor for ArrayType {
-        type Operation = TestBinaryOperation;
-
-        fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
-            Ok(TestBinaryOperation)
-        }
-    }
-
-    impl TestOperationFor for DimensionType {
+    impl OperationProvider<DimensionType> for TestBinaryOperation {
         type Operation = TestArithmeticDimensionOperation;
 
-        fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError> {
-            Ok(TestArithmeticDimensionOperation::new(left_type, right_type)?)
+        fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
+            check_count!("input", input_types, 2, ProgramError);
+            Ok(TestArithmeticDimensionOperation::new(input_types[0], input_types[1])?)
         }
     }
+
+    define_elementwise_capability!(
+        @binary
+        /// Fallible capability used by the ordinary binary operator macro fixture.
+        TestBinaryCapability,
+        /// Applies the fixture's ordinary binary operation.
+        apply_binary_fallible(right),
+        TestBinaryOperation,
+    );
+
+    define_elementwise_capability!(
+        @binary
+        /// Fallible capability used by the type-directed binary operator macro fixture.
+        TestProvidedBinaryCapability,
+        /// Applies the fixture's type-directed binary operation.
+        apply_provided_binary_fallible(right),
+        TestBinaryOperation,
+    );
 
     define_tracer_operator!(
         @unary TestUnaryOperator,
@@ -4642,15 +4532,15 @@ mod tests {
     define_tracer_operator!(
         @binary TestBinaryOperator,
         apply_binary,
-        TestBinaryOperation,
-        "test binary operation failed",
+        capability = TestBinaryCapability,
+        method = apply_binary_fallible,
     );
 
     define_tracer_operator!(
         @binary TestProvidedBinaryOperator,
         apply_provided_binary,
-        provider = TestOperationFor,
-        "test provided binary operation failed",
+        capability = TestProvidedBinaryCapability,
+        method = apply_provided_binary_fallible,
     );
 
     /// Nullary operation used to execute generated transposition and batching rules.

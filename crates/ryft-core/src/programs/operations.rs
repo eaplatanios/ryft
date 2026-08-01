@@ -1,10 +1,10 @@
 use crate::parameters::Parameterized;
-use crate::programs::Value;
 use crate::programs::effects::Effects;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot};
 use crate::programs::types::{Type, TypeError};
+use crate::programs::{ProgramError, Value};
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
 /// If the length exceeds this value, then the section contents will be rendered over multiple lines.
@@ -427,6 +427,49 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
     /// into the composite family goes through the [`From`] super-trait, and trait coherence guarantees that each
     /// composite family names at most one member family per member type `T`.
     type Projected: Operation<T>;
+}
+
+/// Selects and constructs the concrete [`Operation`] staged by one value-level capability for program type `T`.
+///
+/// Capabilities such as [`Mul`](crate::Mul) are declared once through the elementwise capability macro and are
+/// blanket-implemented for every [`Value`]. The same call, for example `left.mul(&right)`, must therefore stage
+/// a different concrete operation depending on the operands' type family (e.g., multiplying arrays stages the
+/// stateless [`MulOperation`](crate::MulOperation) itself, while multiplying first-class dimensions must stage a
+/// [`DimensionMulOperation`](crate::DimensionMulOperation) whose payload is computed from the operand types).
+/// This trait is that selection point. The generated capability implementation calls
+/// `<Marker as OperationProvider<V::Type>>::provide(&[..input types..])` and binds the returned operation
+/// with the declared operation marker acting as its own family's provider.
+///
+/// Two implementation levels cover every case:
+///
+///   - **Self-Provision (Blanket):** A stateless operation that implements [`Operation<T>`](Operation) and [`Default`]
+///     provides itself for `T`, so ordinary homogeneous operation families need no code at all.
+///   - **Per-Type-Family Override:** A type family whose concrete operation carries type-derived metadata implements
+///     this trait for the marker directly (e.g., `impl OperationProvider<DimensionType> for MulOperation`),
+///     constructing the family-specific operation from the input types. Such an override is coherent with the blanket
+///     implementation exactly because the marker does not implement `Operation<T>` for that type family, which is also
+///     precisely the situation that requires providing a different concrete operation.
+///
+/// The contract is deliberately narrow. `input_types` contains exactly the operation's input type descriptors in
+/// operand order, callers (i.e., the generated capability implementations) always pass borrowed stack arrays, and
+/// provider implementations validate the arity they support. Selection is based strictly on types, never on runtime
+/// values. This is *not* a universal operation factory: mixed operations whose signatures cross member kinds,
+/// region-carrying operations, and operations requiring explicit user parameters keep their ordinary constructors.
+pub trait OperationProvider<T: Type> {
+    /// Concrete [`Operation`] type provided for program [`Type`] `T`.
+    type Operation: Operation<T>;
+
+    /// Selects and constructs the [`Operation`] from its ordered input [`Type`]s.
+    fn provide(input_types: &[&T]) -> Result<Self::Operation, ProgramError>;
+}
+
+impl<T: Type, O: Default + Operation<T>> OperationProvider<T> for O {
+    type Operation = O;
+
+    #[inline]
+    fn provide(_input_types: &[&T]) -> Result<Self::Operation, ProgramError> {
+        Ok(Self::default())
+    }
 }
 
 #[cfg(test)]
