@@ -28,18 +28,24 @@ use crate::operations::constants::{
 use crate::operations::control_flow::scan::{
     ScanInterpretation, read_scan_iteration, stacked_scan_type, write_scan_iteration,
 };
-use crate::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation, WhilePredicate};
+use crate::operations::control_flow::{
+    ConditionOperation, ScanOperation, SelectOperation, WhileOperation, WhilePredicate,
+};
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::dimensions::{
-    DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
+    DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMulOperation,
+    DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
     DimensionToScalarOperation,
 };
+use crate::operations::manipulation::ConvertElementTypeOperation;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, Pad, PadOperation,
-    Reshape, ReshapeOperation, ReshapeParameters, Slice, Transpose, TransposeOperation, UpdateSlice,
+    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation,
+    DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, Pad, PadOperation, Reshape,
+    ReshapeOperation, ReshapeParameters, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Slice,
+    Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
-use crate::operations::math::AddOperation;
+use crate::operations::math::{AddOperation, DivOperation, MulOperation, Reduce, ReduceOperation, ReductionKind};
 use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{
@@ -56,9 +62,162 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, ProjectedValue, Value, ValueProjection};
 use crate::sharding::Sharding;
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
+use crate::types::{
+    ArrayProgramType, ArrayType, DataType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape,
+};
 
 pub mod batching;
+
+/// One axis of an exact runtime shape retained by a linearization rule.
+#[derive(Copy, Clone, Debug)]
+enum ExactShapeDimension {
+    /// Compile-time extent that can be reconstructed as a dimension constant in either attached region.
+    Static(usize),
+
+    /// Index of the ordinary SSA residual that carries this dynamic extent.
+    Residual(usize),
+}
+
+/// Exact runtime shape whose dynamic axes refer to entries in a [`LinearResiduals`] list.
+#[derive(Clone, Debug)]
+struct ExactShape(Vec<ExactShapeDimension>);
+
+impl ExactShape {
+    /// Materializes one first-class dimension value per axis in this shape.
+    fn dimensions<A, C>(&self, context: &C, residuals: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
+    where
+        A: Value<Type = ArrayType>,
+        C: Context<Type = ArrayProgramType, Operation: From<ArrayProgramOperation<A>>>,
+    {
+        self.0
+            .iter()
+            .map(|dimension| match dimension {
+                ExactShapeDimension::Static(extent) => dimension_constant::<A, _>(context, *extent),
+                ExactShapeDimension::Residual(index) => Ok(residuals[*index].clone()),
+            })
+            .collect()
+    }
+
+    /// Returns the residual values required by dynamic array constructors, in dynamic-axis order.
+    fn dynamic_dimensions<V: Clone>(&self, residuals: &[V]) -> Vec<V> {
+        self.0
+            .iter()
+            .filter_map(|dimension| match dimension {
+                ExactShapeDimension::Static(_) => None,
+                ExactShapeDimension::Residual(index) => Some(residuals[*index].clone()),
+            })
+            .collect()
+    }
+}
+
+/// Ordered residual list used by an extent-sensitive linearization rule.
+///
+/// Dynamic dimensions are deduplicated by identity, so repeated axes and explicit dimension operands share one SSA
+/// residual. Ordinary array residuals remain positional and are never inspected.
+#[derive(Clone, Debug)]
+struct LinearResiduals<V: Value<Type = ArrayProgramType>> {
+    /// Residual values in linear-call operand order.
+    values: Vec<V>,
+}
+
+impl<V: Value<Type = ArrayProgramType>> LinearResiduals<V> {
+    /// Creates an empty residual list.
+    #[inline]
+    fn new() -> Self {
+        Self { values: Vec::new() }
+    }
+
+    /// Returns the retained residual values.
+    #[inline]
+    fn values(&self) -> &[V] {
+        self.values.as_slice()
+    }
+
+    /// Consumes this residual list and returns its values.
+    #[inline]
+    fn into_values(self) -> Vec<V> {
+        self.values
+    }
+
+    /// Retains `value`, deduplicating dynamic dimension definitions by identity, and returns its residual index.
+    fn retain(&mut self, value: V) -> usize {
+        if let ArrayProgramType::Dimension(r#type) = value.r#type().as_ref()
+            && r#type.extent().is_none()
+            && let Some(index) = self.values.iter().position(|value| {
+                matches!(
+                    value.r#type().as_ref(),
+                    ArrayProgramType::Dimension(candidate) if candidate.variable() == r#type.variable()
+                )
+            })
+        {
+            return index;
+        }
+        let index = self.values.len();
+        self.values.push(value);
+        index
+    }
+
+    /// Retains an ordered value list and returns the residual index corresponding to each source value.
+    fn retain_all(&mut self, values: impl IntoIterator<Item = V>) -> Vec<usize> {
+        values.into_iter().map(|value| self.retain(value)).collect()
+    }
+
+    /// Retains the exact runtime shape of `array`, reading only dynamic axes that are not already represented by a
+    /// dimension residual with the same identity.
+    fn retain_shape<A, C>(&mut self, context: &C, array: &V) -> Result<ExactShape, ProgramError>
+    where
+        A: Value<Type = ArrayType>,
+        C: Context<Type = ArrayProgramType, Value = V, Operation: From<ArrayProgramOperation<A>>>,
+    {
+        let array_type = array.r#type();
+        let array_type = <&ArrayType>::try_from(array_type.as_ref())?;
+        array_type
+            .shape()
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(axis, dimension)| match dimension {
+                Dimension::Static(extent) => Ok(ExactShapeDimension::Static(*extent)),
+                Dimension::Dynamic(variable) => {
+                    if let Some(index) = self.values.iter().position(|value| {
+                        matches!(
+                            value.r#type().as_ref(),
+                            ArrayProgramType::Dimension(r#type) if r#type.variable() == variable
+                        )
+                    }) {
+                        return Ok(ExactShapeDimension::Residual(index));
+                    }
+                    let extent = context
+                        .bind(
+                            ArrayProgramOperation::<A>::from(DimensionSizeOperation::new(array_type, axis)?),
+                            Vec::new(),
+                            std::slice::from_ref(array),
+                        )?
+                        .remove(0);
+                    Ok(ExactShapeDimension::Residual(self.retain(extent)))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(ExactShape)
+    }
+}
+
+/// Materializes one exact first-class dimension constant in a composite array-program context.
+fn dimension_constant<A, C>(context: &C, extent: usize) -> Result<C::Value, ProgramError>
+where
+    A: Value<Type = ArrayType>,
+    C: Context<Type = ArrayProgramType, Operation: From<ArrayProgramOperation<A>>>,
+{
+    Ok(context
+        .bind(
+            ArrayProgramOperation::<A>::from(DimensionOperation::from(ConstantOperation::new(
+                DimensionValue::constant(extent)?,
+            ))),
+            Vec::new(),
+            &[],
+        )?
+        .remove(0))
+}
 
 // TODO(eaplatanios): Review this module.
 
@@ -135,6 +294,9 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
 
     /// Mixed padding operation with one explicit result-extent operand per output axis.
     Pad(PadOperation),
+
+    /// Mixed slice whose starts and output sizes are first-class dimension operands.
+    DynamicShapeSlice(DynamicShapeSliceOperation),
 
     /// Mixed bit generator whose trailing dimension operands define its dynamic bits-output axes.
     RngBitGenerator(RngBitGeneratorOperation),
@@ -271,6 +433,13 @@ impl<A: Value<Type = ArrayType>> From<PadOperation> for ArrayProgramOperation<A>
     #[inline]
     fn from(operation: PadOperation) -> Self {
         Self::Pad(operation)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<DynamicShapeSliceOperation> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: DynamicShapeSliceOperation) -> Self {
+        Self::DynamicShapeSlice(operation)
     }
 }
 
@@ -443,6 +612,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Concatenate(operation) => Operation::<ArrayProgramType>::name(operation),
             Self::CustomCall(operation) => Operation::<ArrayProgramType>::name(operation),
             Self::Pad(operation) => Operation::<ArrayProgramType>::name(operation),
+            Self::DynamicShapeSlice(operation) => operation.name(),
             Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::name(operation),
             Self::AllGather(operation) => Operation::<ArrayType>::name(operation),
             Self::PSumScatter(operation) => Operation::<ArrayType>::name(operation),
@@ -472,6 +642,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Concatenate(operation) => Operation::<ArrayProgramType>::region_slots(operation),
             Self::CustomCall(operation) => Operation::<ArrayProgramType>::region_slots(operation),
             Self::Pad(operation) => Operation::<ArrayProgramType>::region_slots(operation),
+            Self::DynamicShapeSlice(operation) => operation.region_slots(),
             Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::region_slots(operation),
             Self::AllGather(operation) => Operation::<ArrayType>::region_slots(operation),
             Self::PSumScatter(operation) => Operation::<ArrayType>::region_slots(operation),
@@ -518,6 +689,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Concatenate(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::CustomCall(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::Pad(operation) => operation.infer_region_input_types(input_types, region_interfaces),
+            Self::DynamicShapeSlice(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::RngBitGenerator(operation) => operation.infer_region_input_types(input_types, region_interfaces),
             Self::AllGather(_) | Self::PSumScatter(_) | Self::AllToAll(_) => Ok(vec![None; region_interfaces.len()]),
             Self::Condition(operation) => operation.infer_region_input_types(input_types, region_interfaces),
@@ -583,6 +755,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Concatenate(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::CustomCall(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Pad(operation) => operation.infer_output_types(input_types, region_interfaces),
+            Self::DynamicShapeSlice(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::RngBitGenerator(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::AllGather(operation) => {
                 check_count!("region", region_interfaces, 0, TypeError);
@@ -627,6 +800,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
                 Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
             }
             Self::Pad(operation) => Operation::<ArrayProgramType>::output_region_provenance(operation, output_index),
+            Self::DynamicShapeSlice(operation) => operation.output_region_provenance(output_index),
             Self::RngBitGenerator(operation) => {
                 Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
             }
@@ -658,6 +832,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Concatenate(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
             Self::CustomCall(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
             Self::Pad(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
+            Self::DynamicShapeSlice(operation) => operation.is_zero(output_index),
             Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
             Self::AllGather(operation) => Operation::<ArrayType>::is_zero(operation, output_index),
             Self::PSumScatter(operation) => Operation::<ArrayType>::is_zero(operation, output_index),
@@ -687,6 +862,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Concatenate(operation) => Operation::<ArrayProgramType>::effects(operation),
             Self::CustomCall(operation) => Operation::<ArrayProgramType>::effects(operation),
             Self::Pad(operation) => Operation::<ArrayProgramType>::effects(operation),
+            Self::DynamicShapeSlice(operation) => operation.effects(),
             Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::effects(operation),
             Self::AllGather(operation) => Operation::<ArrayType>::effects(operation),
             Self::PSumScatter(operation) => Operation::<ArrayType>::effects(operation),
@@ -727,6 +903,9 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Pad(operation) => {
                 Ok(Self::Pad(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
             }
+            Self::DynamicShapeSlice(operation) => {
+                Ok(Self::DynamicShapeSlice(operation.rename_type_identities(renaming)?))
+            }
             Self::RngBitGenerator(operation) => {
                 Ok(Self::RngBitGenerator(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
             }
@@ -766,6 +945,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::Concatenate(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
             Self::CustomCall(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
             Self::Pad(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
+            Self::DynamicShapeSlice(operation) => operation.render(formatter, indentation),
             Self::RngBitGenerator(operation) => {
                 Operation::<ArrayProgramType>::render(operation, formatter, indentation)
             }
@@ -1078,6 +1258,58 @@ where
                 &EmptyRegionDriver,
                 inputs,
             ),
+            Self::DynamicShapeSlice(operation) => {
+                let Some((input, bounds)) = inputs.split_first() else {
+                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+                };
+                let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
+                let rank = input.r#type().rank();
+                check_count!("input", inputs, 1 + 2 * rank, ProgramError);
+                let starts = bounds[..rank]
+                    .iter()
+                    .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
+                    .map(|result| result.map(DimensionValue::extent))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let sizes = bounds[rank..]
+                    .iter()
+                    .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
+                    .map(|result| result.map(DimensionValue::extent))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let limits = starts
+                    .iter()
+                    .zip(&sizes)
+                    .zip(operation.strides())
+                    .enumerate()
+                    .map(|(axis, ((start, size), stride))| {
+                        let span = if *size == 0 {
+                            0
+                        } else {
+                            size.checked_sub(1)
+                                .and_then(|size| size.checked_mul(*stride))
+                                .and_then(|span| span.checked_add(1))
+                                .ok_or_else(|| {
+                                    TypeError::invalid(format!(
+                                        "'dynamic_shape_slice' span overflows usize on axis {axis}",
+                                    ))
+                                })?
+                        };
+                        let limit = start.checked_add(span).ok_or_else(|| {
+                            TypeError::invalid(format!("'dynamic_shape_slice' limit overflows usize on axis {axis}",))
+                        })?;
+                        let input_size = input.dimension_size(axis)?;
+                        if limit > input_size {
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "'dynamic_shape_slice' limit {limit} exceeds input axis {axis} extent \
+                                     {input_size}",
+                                ),
+                            });
+                        }
+                        Ok(limit)
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                Ok(vec![ArrayProgramValue::Array(input.slice(&starts, &limits, operation.strides())?)])
+            }
             Self::RngBitGenerator(operation) => operation.interpret(
                 &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
                 &EmptyRegionDriver,
@@ -1326,7 +1558,9 @@ impl<
 > DifferentiableOperation<C> for ArrayProgramOperation<A>
 where
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: From<ArrayProgramOperation<A>> + OperationProjection<ArrayType, Projected = ArrayOperation<A>>,
+    C::Operation: From<ArrayProgramOperation<A>>
+        + From<LinearCallOperation<ArrayProgramType>>
+        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>,
     ArrayOperation<A>: DifferentiableOperation<ProjectedContext<C, ArrayType>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -1365,8 +1599,260 @@ where
                         ))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
-                MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
+                let operand_cotangent_type =
+                    <&ArrayType>::try_from(array_inputs[0].primal().r#type().as_ref())?.cotangent();
+                if operand_cotangent_type
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .all(|dimension| matches!(dimension, Dimension::Static(_)))
+                {
+                    tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
+                    MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
+                } else {
+                    let Self::Pad(operation) = self else {
+                        unreachable!();
+                    };
+                    let mut residuals = LinearResiduals::new();
+                    let output_extents =
+                        residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+                    let operand_shape = residuals.retain_shape::<A, _>(context, array_inputs[0].primal())?;
+                    let forward_operation = operation.clone();
+                    let forward_output_extents = output_extents.clone();
+                    let transpose_operation = operation.clone();
+                    let transpose_operand_type = operand_cotangent_type.clone();
+                    let transpose_padding_type =
+                        <&ArrayType>::try_from(array_inputs[1].primal().r#type().as_ref())?.cotangent();
+                    let transpose_output_type = <&ArrayType>::try_from(primal.r#type().as_ref())?.cotangent();
+                    let tangent = LinearCallOperation::stage(
+                        context,
+                        residuals.into_values(),
+                        tangent_inputs,
+                        move |residuals, linear_inputs| {
+                            let mut pad_inputs = linear_inputs.to_vec();
+                            pad_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                            linear_inputs[0].dispatch_domain().bind(
+                                ArrayProgramOperation::<A>::from(forward_operation),
+                                Vec::new(),
+                                pad_inputs.as_slice(),
+                            )
+                        },
+                        move |residuals, output_cotangents| {
+                            let transpose_context = output_cotangents[0].dispatch_domain();
+                            let output_cotangent = output_cotangents[0].clone();
+                            let dimension_constant = |extent| dimension_constant::<A, _>(&transpose_context, extent);
+                            let input_extents = operand_shape.dimensions::<A, _>(&transpose_context, residuals)?;
+
+                            // Inverse edge padding first recovers the dilated input. Its exact result extents are
+                            // `n + max(n - 1, 0) * interior`, derived from the retained input geometry.
+                            let mut dilated_extents = Vec::with_capacity(transpose_operand_type.rank());
+                            for (axis, input_extent) in input_extents.iter().enumerate() {
+                                let interior = usize::try_from(transpose_operation.interior_padding()[axis])
+                                    .map_err(|_| TypeError::invalid("'pad' interior padding must be nonnegative"))?;
+                                if interior == 0 {
+                                    dilated_extents.push(input_extent.clone());
+                                    continue;
+                                }
+                                let one = dimension_constant(1)?;
+                                let input_type = <&DimensionType>::try_from(input_extent.r#type().as_ref())?.clone();
+                                let one_type = <&DimensionType>::try_from(one.r#type().as_ref())?.clone();
+                                let less_one = transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::from(DimensionOperation::SaturatingSub(
+                                            DimensionSaturatingSubOperation::new(&input_type, &one_type)?,
+                                        )),
+                                        Vec::new(),
+                                        &[input_extent.clone(), one],
+                                    )?
+                                    .remove(0);
+                                let interior = dimension_constant(interior)?;
+                                let less_one_type = <&DimensionType>::try_from(less_one.r#type().as_ref())?.clone();
+                                let interior_type = <&DimensionType>::try_from(interior.r#type().as_ref())?.clone();
+                                let gaps = transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::from(DimensionOperation::Mul(
+                                            DimensionMulOperation::new(&less_one_type, &interior_type)?,
+                                        )),
+                                        Vec::new(),
+                                        &[less_one, interior],
+                                    )?
+                                    .remove(0);
+                                let gaps_type = <&DimensionType>::try_from(gaps.r#type().as_ref())?.clone();
+                                dilated_extents.push(
+                                    transpose_context
+                                        .bind(
+                                            ArrayProgramOperation::<A>::from(DimensionOperation::Add(
+                                                DimensionAddOperation::new(&input_type, &gaps_type)?,
+                                            )),
+                                            Vec::new(),
+                                            &[input_extent.clone(), gaps],
+                                        )?
+                                        .remove(0),
+                                );
+                            }
+
+                            let inverse_low = transpose_operation
+                                .edge_padding_low()
+                                .iter()
+                                .enumerate()
+                                .map(|(axis, padding)| {
+                                    padding.checked_neg().ok_or_else(|| {
+                                        TypeError::invalid(format!(
+                                            "'pad' transpose cannot negate edge_padding_low at axis {axis} with \
+                                             value {padding}",
+                                        ))
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let inverse_high = transpose_operation
+                                .edge_padding_high()
+                                .iter()
+                                .enumerate()
+                                .map(|(axis, padding)| {
+                                    padding.checked_neg().ok_or_else(|| {
+                                        TypeError::invalid(format!(
+                                            "'pad' transpose cannot negate edge_padding_high at axis {axis} with \
+                                             value {padding}",
+                                        ))
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let zero = transpose_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(ZeroOperation::new(
+                                        transpose_padding_type.clone(),
+                                    )),
+                                    Vec::new(),
+                                    &[],
+                                )?
+                                .remove(0);
+                            let mut inverse_inputs = vec![output_cotangent.clone(), zero];
+                            inverse_inputs.extend(dilated_extents);
+                            let unpadded = transpose_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(PadOperation::new(
+                                        inverse_low,
+                                        inverse_high,
+                                        vec![0; transpose_operand_type.rank()],
+                                    )?),
+                                    Vec::new(),
+                                    inverse_inputs.as_slice(),
+                                )?
+                                .remove(0);
+                            let starts = (0..transpose_operand_type.rank())
+                                .map(|_| dimension_constant(0))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let mut slice_inputs = Vec::with_capacity(1 + 2 * transpose_operand_type.rank());
+                            slice_inputs.push(unpadded);
+                            slice_inputs.extend(starts);
+                            slice_inputs.extend(input_extents.iter().cloned());
+                            let strides = transpose_operation
+                                .interior_padding()
+                                .iter()
+                                .enumerate()
+                                .map(|(axis, padding)| {
+                                    usize::try_from(*padding)
+                                        .ok()
+                                        .and_then(|padding| padding.checked_add(1))
+                                        .ok_or_else(|| {
+                                            TypeError::invalid(format!(
+                                                "'pad' transpose stride overflows usize on axis {axis}",
+                                            ))
+                                        })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let input_cotangent = transpose_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(
+                                        DynamicShapeSliceOperation::new(transpose_operand_type.rank())
+                                            .with_strides(strides)?,
+                                    ),
+                                    Vec::new(),
+                                    slice_inputs.as_slice(),
+                                )?
+                                .remove(0);
+
+                            // Select padding positions before summing so non-finite cotangents at operand positions
+                            // cannot contaminate the padding-value contribution.
+                            let mask_input_type =
+                                transpose_operand_type.clone().with_data_type(DataType::Boolean).with_layout(None);
+                            let mask_input_extents = mask_input_type
+                                .shape()
+                                .dimensions()
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(axis, dimension)| {
+                                    matches!(dimension, Dimension::Dynamic(_)).then(|| input_extents[axis].clone())
+                                })
+                                .collect::<Vec<_>>();
+                            let mask_input = transpose_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(ZeroOperation::new(mask_input_type)),
+                                    Vec::new(),
+                                    mask_input_extents.as_slice(),
+                                )?
+                                .remove(0);
+                            let mask_padding = transpose_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(OneOperation::new(
+                                        transpose_padding_type
+                                            .clone()
+                                            .with_data_type(DataType::Boolean)
+                                            .with_layout(None),
+                                    )),
+                                    Vec::new(),
+                                    &[],
+                                )?
+                                .remove(0);
+                            let mut mask_inputs = vec![mask_input, mask_padding];
+                            mask_inputs.extend(output_extents.iter().map(|index| residuals[*index].clone()));
+                            let mask = transpose_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(transpose_operation.clone()),
+                                    Vec::new(),
+                                    mask_inputs.as_slice(),
+                                )?
+                                .remove(0);
+                            let output_zero_extents = transpose_output_type
+                                .shape()
+                                .dimensions()
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(axis, dimension)| {
+                                    matches!(dimension, Dimension::Dynamic(_))
+                                        .then(|| residuals[output_extents[axis]].clone())
+                                })
+                                .collect::<Vec<_>>();
+                            let output_zero = transpose_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(ZeroOperation::new(transpose_output_type.clone())),
+                                    Vec::new(),
+                                    output_zero_extents.as_slice(),
+                                )?
+                                .remove(0);
+                            let selected = transpose_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::from(SelectOperation)),
+                                    Vec::new(),
+                                    &[mask, output_cotangent, output_zero],
+                                )?
+                                .remove(0);
+                            let padding_cotangent = transpose_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::from(ReduceOperation::new(
+                                        (0..transpose_output_type.rank()).collect(),
+                                        ReductionKind::Sum,
+                                    ))),
+                                    Vec::new(),
+                                    &[selected],
+                                )?
+                                .remove(0);
+                            Ok(vec![input_cotangent, padding_cotangent])
+                        },
+                    )?
+                    .remove(0);
+                    MaybeZero::Value(tangent)
+                }
             };
             return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
         }
@@ -1390,6 +1876,610 @@ where
                 }
                 .into(),
             );
+        }
+        if let Self::Array(ArrayOperation::Slice(operation)) = self {
+            let [operand] = inputs else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+            };
+            let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+            if operand_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
+                let primal = context.bind(self.clone(), Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
+                let tangent = match operand.tangent() {
+                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                    MaybeZero::Value(operand_tangent) => {
+                        let mut residuals = LinearResiduals::new();
+                        let operand_shape = residuals.retain_shape::<A, _>(context, operand.primal())?;
+                        let forward_operation = operation.clone();
+                        let transpose_shape = operand_shape.clone();
+                        let transpose_operand_type = operand_type.cotangent();
+                        let transpose_starts = operation.start_indices().to_vec();
+                        let transpose_strides = operation.strides().to_vec();
+                        let tangent = LinearCallOperation::stage(
+                            context,
+                            residuals.into_values(),
+                            vec![operand_tangent.clone()],
+                            move |_, linear_inputs| {
+                                linear_inputs[0].dispatch_domain().bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Slice(forward_operation)),
+                                    Vec::new(),
+                                    std::slice::from_ref(&linear_inputs[0]),
+                                )
+                            },
+                            move |residuals, output_cotangents| {
+                                let transpose_context = output_cotangents[0].dispatch_domain();
+                                let mut output_cotangent = output_cotangents[0].clone();
+                                let zero_extents = transpose_shape.dynamic_dimensions(residuals);
+                                let zeros = transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::from(ZeroOperation::new(
+                                            transpose_operand_type.clone(),
+                                        )),
+                                        Vec::new(),
+                                        zero_extents.as_slice(),
+                                    )?
+                                    .remove(0);
+                                if transpose_strides.iter().any(|stride| *stride != 1) {
+                                    let padding_value = transpose_context
+                                        .bind(
+                                            ArrayProgramOperation::<A>::from(ZeroOperation::new(ArrayType::scalar(
+                                                transpose_operand_type.data_type(),
+                                            ))),
+                                            Vec::new(),
+                                            &[],
+                                        )?
+                                        .remove(0);
+                                    output_cotangent = transpose_context
+                                        .bind(
+                                            ArrayProgramOperation::<A>::Array(ArrayOperation::Pad(PadOperation::new(
+                                                vec![0; transpose_operand_type.rank()],
+                                                vec![0; transpose_operand_type.rank()],
+                                                transpose_strides.iter().map(|stride| stride - 1).collect(),
+                                            )?)),
+                                            Vec::new(),
+                                            &[output_cotangent, padding_value],
+                                        )?
+                                        .remove(0);
+                                }
+                                transpose_context.bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::UpdateSlice(
+                                        UpdateSliceOperation::new(transpose_starts),
+                                    )),
+                                    Vec::new(),
+                                    &[zeros, output_cotangent],
+                                )
+                            },
+                        )?
+                        .remove(0);
+                        MaybeZero::Value(tangent)
+                    }
+                };
+                return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
+            }
+        }
+        if let Self::Array(ArrayOperation::DynamicSlice(operation)) = self {
+            let (operand, start_indices) =
+                inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
+            let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+            if operand_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
+                let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+                let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+                let tangent = match operand.tangent() {
+                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                    MaybeZero::Value(operand_tangent) => {
+                        // Start indices have zero differential spaces but remain ordinary residual SSA values because
+                        // both the forward slice and its transpose need their concrete runtime values.
+                        let mut residuals = LinearResiduals::new();
+                        let start_indices =
+                            residuals.retain_all(start_indices.iter().map(|index| index.primal().clone()));
+                        let operand_shape = residuals.retain_shape::<A, _>(context, operand.primal())?;
+                        let forward_operation = operation.clone();
+                        let forward_start_indices = start_indices.clone();
+                        let transpose_shape = operand_shape.clone();
+                        let transpose_operand_type = operand_type.cotangent();
+                        let tangent = LinearCallOperation::stage(
+                            context,
+                            residuals.into_values(),
+                            vec![operand_tangent.clone()],
+                            move |residuals, linear_inputs| {
+                                let mut slice_inputs = Vec::with_capacity(1 + forward_start_indices.len());
+                                slice_inputs.push(linear_inputs[0].clone());
+                                slice_inputs
+                                    .extend(forward_start_indices.iter().map(|index| residuals[*index].clone()));
+                                linear_inputs[0].dispatch_domain().bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::DynamicSlice(forward_operation)),
+                                    Vec::new(),
+                                    slice_inputs.as_slice(),
+                                )
+                            },
+                            move |residuals, output_cotangents| {
+                                let transpose_context = output_cotangents[0].dispatch_domain();
+                                let zero_extents = transpose_shape.dynamic_dimensions(residuals);
+                                let zeros = transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::from(ZeroOperation::new(
+                                            transpose_operand_type.clone(),
+                                        )),
+                                        Vec::new(),
+                                        zero_extents.as_slice(),
+                                    )?
+                                    .remove(0);
+                                let mut update_inputs = Vec::with_capacity(2 + start_indices.len());
+                                update_inputs.push(zeros);
+                                update_inputs.push(output_cotangents[0].clone());
+                                update_inputs.extend(start_indices.iter().map(|index| residuals[*index].clone()));
+                                transpose_context.bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::DynamicUpdateSlice(
+                                        DynamicUpdateSliceOperation,
+                                    )),
+                                    Vec::new(),
+                                    update_inputs.as_slice(),
+                                )
+                            },
+                        )?
+                        .remove(0);
+                        MaybeZero::Value(tangent)
+                    }
+                };
+                return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
+            }
+        }
+        if let Self::Array(ArrayOperation::DynamicUpdateSlice(_)) = self {
+            if inputs.len() < 2 {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+            }
+            let operand = &inputs[0];
+            let update = &inputs[1];
+            let start_indices = &inputs[2..];
+            let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+            if operand_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
+                let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+                let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+                if operand.tangent().is_zero() && update.tangent().is_zero() {
+                    return Ok(vec![DifferentiationDual::new(
+                        primal.clone(),
+                        MaybeZero::Zero(primal.r#type().tangent()),
+                    )?]);
+                }
+
+                // The integer starts are the ordinary primal residuals shared by the forward update and its two
+                // transpose branches. Input extents are retained only when a missing operand tangent must be
+                // materialized inside the forward region; otherwise the output cotangent itself supplies the base
+                // geometry to the transpose without an extra residual.
+                let mut residuals = LinearResiduals::new();
+                let start_indices = residuals.retain_all(start_indices.iter().map(|index| index.primal().clone()));
+                let operand_is_live = !operand.tangent().is_zero();
+                let update_is_live = !update.tangent().is_zero();
+                let operand_shape = (!operand_is_live)
+                    .then(|| residuals.retain_shape::<A, _>(context, operand.primal()))
+                    .transpose()?;
+                let update_type = <&ArrayType>::try_from(update.primal().r#type().as_ref())?.clone();
+                let update_shape = (operand_is_live || !update_is_live)
+                    .then(|| residuals.retain_shape::<A, _>(context, update.primal()))
+                    .transpose()?;
+                let mut linear_values = Vec::with_capacity(usize::from(operand_is_live) + usize::from(update_is_live));
+                if let MaybeZero::Value(tangent) = operand.tangent() {
+                    linear_values.push(tangent.clone());
+                }
+                if let MaybeZero::Value(tangent) = update.tangent() {
+                    linear_values.push(tangent.clone());
+                }
+                let forward_operand_type = operand_type.tangent();
+                let forward_update_type = update_type.tangent();
+                let forward_start_indices = start_indices.clone();
+                let forward_operand_shape = operand_shape.clone();
+                let forward_update_shape = update_shape.clone();
+                let transpose_start_indices = start_indices.clone();
+                let transpose_update_shape = update_shape.clone();
+                let transpose_update_type = update_type.cotangent();
+                let update_sizes = if update_is_live {
+                    transpose_update_type
+                        .shape()
+                        .dimensions()
+                        .iter()
+                        .enumerate()
+                        .map(|(axis, dimension)| {
+                            dimension.value().ok_or_else(|| {
+                                TypeError::invalid(format!(
+                                    "'dynamic_update_slice' transpose requires a static update extent but axis \
+                                     {axis} has size {dimension}",
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    Vec::new()
+                };
+                let tangent = LinearCallOperation::stage(
+                    context,
+                    residuals.into_values(),
+                    linear_values,
+                    move |residuals, linear_inputs| {
+                        let forward_context = linear_inputs[0].dispatch_domain();
+                        let mut linear_index = 0;
+                        let operand_tangent = if operand_is_live {
+                            let tangent = linear_inputs[linear_index].clone();
+                            linear_index += 1;
+                            tangent
+                        } else {
+                            let extents = forward_operand_shape.as_ref().unwrap().dynamic_dimensions(residuals);
+                            forward_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(ZeroOperation::new(forward_operand_type.clone())),
+                                    Vec::new(),
+                                    extents.as_slice(),
+                                )?
+                                .remove(0)
+                        };
+                        let update_tangent = if update_is_live {
+                            linear_inputs[linear_index].clone()
+                        } else {
+                            let extents = forward_update_shape.as_ref().unwrap().dynamic_dimensions(residuals);
+                            forward_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(ZeroOperation::new(forward_update_type.clone())),
+                                    Vec::new(),
+                                    extents.as_slice(),
+                                )?
+                                .remove(0)
+                        };
+                        let mut update_inputs = Vec::with_capacity(2 + forward_start_indices.len());
+                        update_inputs.extend([operand_tangent, update_tangent]);
+                        update_inputs.extend(forward_start_indices.iter().map(|index| residuals[*index].clone()));
+                        forward_context.bind(
+                            ArrayProgramOperation::<A>::Array(ArrayOperation::DynamicUpdateSlice(
+                                DynamicUpdateSliceOperation,
+                            )),
+                            Vec::new(),
+                            update_inputs.as_slice(),
+                        )
+                    },
+                    move |residuals, output_cotangents| {
+                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let mut cotangents =
+                            Vec::with_capacity(usize::from(operand_is_live) + usize::from(update_is_live));
+                        if operand_is_live {
+                            let extents = transpose_update_shape.as_ref().unwrap().dynamic_dimensions(residuals);
+                            let update_zero = transpose_context
+                                .bind(
+                                    ArrayProgramOperation::<A>::from(ZeroOperation::new(transpose_update_type.clone())),
+                                    Vec::new(),
+                                    extents.as_slice(),
+                                )?
+                                .remove(0);
+                            let mut input_cotangent_inputs = vec![output_cotangents[0].clone(), update_zero];
+                            input_cotangent_inputs
+                                .extend(transpose_start_indices.iter().map(|index| residuals[*index].clone()));
+                            cotangents.push(
+                                transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::Array(ArrayOperation::DynamicUpdateSlice(
+                                            DynamicUpdateSliceOperation,
+                                        )),
+                                        Vec::new(),
+                                        input_cotangent_inputs.as_slice(),
+                                    )?
+                                    .remove(0),
+                            );
+                        }
+                        if update_is_live {
+                            let mut update_cotangent_inputs = vec![output_cotangents[0].clone()];
+                            update_cotangent_inputs
+                                .extend(transpose_start_indices.iter().map(|index| residuals[*index].clone()));
+                            cotangents.push(
+                                transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::Array(ArrayOperation::DynamicSlice(
+                                            DynamicSliceOperation::new(update_sizes),
+                                        )),
+                                        Vec::new(),
+                                        update_cotangent_inputs.as_slice(),
+                                    )?
+                                    .remove(0),
+                            );
+                        }
+                        Ok(cotangents)
+                    },
+                )?
+                .remove(0);
+                return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?]);
+            }
+        }
+        if let Self::Array(ArrayOperation::Gather(operation)) = self {
+            let [operand, indices] = inputs else {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+            };
+            let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+            if operand_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
+                let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+                let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+                let tangent = match operand.tangent() {
+                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                    MaybeZero::Value(operand_tangent) => {
+                        let mut residuals = LinearResiduals::new();
+                        let indices_index = residuals.retain(indices.primal().clone());
+                        let operand_shape = residuals.retain_shape::<A, _>(context, operand.primal())?;
+                        let forward_operation = operation.clone();
+                        let transpose_operand_type = operand_type.cotangent();
+                        let dimensions = operation.dimensions();
+                        let transpose_operation = ScatterOperation::new(
+                            ScatterDimensionNumbers::new(
+                                dimensions.offset_dimensions().to_vec(),
+                                dimensions.collapsed_slice_dimensions().to_vec(),
+                                dimensions.start_index_map().to_vec(),
+                            )
+                            .with_batching_dimensions(
+                                dimensions.operand_batching_dimensions().to_vec(),
+                                dimensions.start_indices_batching_dimensions().to_vec(),
+                            ),
+                            ScatterReductionKind::Add,
+                        )
+                        .with_mode(operation.mode())
+                        .with_indices_are_sorted(operation.indices_are_sorted())
+                        .with_unique_indices(operation.unique_indices());
+                        let tangent = LinearCallOperation::stage(
+                            context,
+                            residuals.into_values(),
+                            vec![operand_tangent.clone()],
+                            move |residuals, linear_inputs| {
+                                linear_inputs[0].dispatch_domain().bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Gather(forward_operation)),
+                                    Vec::new(),
+                                    &[linear_inputs[0].clone(), residuals[indices_index].clone()],
+                                )
+                            },
+                            move |residuals, output_cotangents| {
+                                let transpose_context = output_cotangents[0].dispatch_domain();
+                                let zeros = transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::from(ZeroOperation::new(
+                                            transpose_operand_type.clone(),
+                                        )),
+                                        Vec::new(),
+                                        operand_shape.dynamic_dimensions(residuals).as_slice(),
+                                    )?
+                                    .remove(0);
+                                transpose_context.bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Scatter(transpose_operation)),
+                                    Vec::new(),
+                                    &[zeros, residuals[indices_index].clone(), output_cotangents[0].clone()],
+                                )
+                            },
+                        )?
+                        .remove(0);
+                        MaybeZero::Value(tangent)
+                    }
+                };
+                return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
+            }
+        }
+        if let Self::Array(ArrayOperation::Reduce(operation)) = self
+            && matches!(operation.kind(), ReductionKind::Max | ReductionKind::Min)
+        {
+            let [operand] = inputs else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+            };
+            let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+            if operand_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
+                let primal = context.bind(self.clone(), Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
+                let tangent = match operand.tangent() {
+                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                    MaybeZero::Value(operand_tangent) => {
+                        let mut residuals = LinearResiduals::new();
+                        let operand_shape = residuals.retain_shape::<A, _>(context, operand.primal())?;
+                        let input_extents = operand_shape.dimensions::<A, _>(context, residuals.values())?;
+                        let output_axes = (0..operand_type.rank())
+                            .filter(|axis| !operation.axes().contains(axis))
+                            .collect::<Vec<_>>();
+                        let mut broadcast_inputs = Vec::with_capacity(1 + input_extents.len());
+                        broadcast_inputs.push(primal.clone());
+                        broadcast_inputs.extend(input_extents.iter().cloned());
+                        let broadcast_primal = context
+                            .bind(
+                                ArrayProgramOperation::<A>::from(BroadcastOperation::new(output_axes.clone())),
+                                Vec::new(),
+                                broadcast_inputs.as_slice(),
+                            )?
+                            .remove(0);
+                        let mask = context
+                            .bind(
+                                ArrayProgramOperation::<A>::Array(ArrayOperation::Compare(CompareOperation::new(
+                                    ComparisonDirection::Equal,
+                                ))),
+                                Vec::new(),
+                                &[operand.primal().clone(), broadcast_primal],
+                            )?
+                            .remove(0);
+                        let numeric_mask = context
+                            .bind(
+                                ArrayProgramOperation::<A>::Array(ArrayOperation::ConvertElementType(
+                                    ConvertElementTypeOperation::new(operand_type.tangent().data_type()),
+                                )),
+                                Vec::new(),
+                                &[mask],
+                            )?
+                            .remove(0);
+                        let tie_count = context
+                            .bind(
+                                ArrayProgramOperation::<A>::Array(ArrayOperation::Reduce(ReduceOperation::new(
+                                    operation.axes().to_vec(),
+                                    ReductionKind::Sum,
+                                ))),
+                                Vec::new(),
+                                std::slice::from_ref(&numeric_mask),
+                            )?
+                            .remove(0);
+                        let mut tie_broadcast_inputs = Vec::with_capacity(1 + input_extents.len());
+                        tie_broadcast_inputs.push(tie_count);
+                        tie_broadcast_inputs.extend(input_extents);
+                        let broadcast_tie_count = context
+                            .bind(
+                                ArrayProgramOperation::<A>::from(BroadcastOperation::new(output_axes.clone())),
+                                Vec::new(),
+                                tie_broadcast_inputs.as_slice(),
+                            )?
+                            .remove(0);
+                        let normalized_mask = context
+                            .bind(
+                                ArrayProgramOperation::<A>::Array(ArrayOperation::Div(DivOperation)),
+                                Vec::new(),
+                                &[numeric_mask, broadcast_tie_count],
+                            )?
+                            .remove(0);
+                        let mask_index = residuals.retain(normalized_mask);
+                        let forward_axes = operation.axes().to_vec();
+                        let transpose_shape = operand_shape.clone();
+                        let transpose_output_axes = output_axes.clone();
+                        let transpose_target_type = operand_type.cotangent();
+                        let tangent = LinearCallOperation::stage(
+                            context,
+                            residuals.into_values(),
+                            vec![operand_tangent.clone()],
+                            move |residuals, linear_inputs| {
+                                let forward_context = linear_inputs[0].dispatch_domain();
+                                let masked_tangent = forward_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::Array(ArrayOperation::Mul(MulOperation)),
+                                        Vec::new(),
+                                        &[residuals[mask_index].clone(), linear_inputs[0].clone()],
+                                    )?
+                                    .remove(0);
+                                forward_context.bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Reduce(ReduceOperation::new(
+                                        forward_axes.clone(),
+                                        ReductionKind::Sum,
+                                    ))),
+                                    Vec::new(),
+                                    &[masked_tangent],
+                                )
+                            },
+                            move |residuals, output_cotangents| {
+                                let transpose_context = output_cotangents[0].dispatch_domain();
+                                let input_extents =
+                                    transpose_shape.dimensions::<A, _>(&transpose_context, residuals)?;
+                                let mut broadcast_inputs = Vec::with_capacity(1 + input_extents.len());
+                                broadcast_inputs.push(output_cotangents[0].clone());
+                                broadcast_inputs.extend(input_extents);
+                                let broadcasted = transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::from(
+                                            BroadcastOperation::new(transpose_output_axes.clone())
+                                                .with_output_sharding(transpose_target_type.sharding().cloned()),
+                                        ),
+                                        Vec::new(),
+                                        broadcast_inputs.as_slice(),
+                                    )?
+                                    .remove(0);
+                                transpose_context.bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Mul(MulOperation)),
+                                    Vec::new(),
+                                    &[residuals[mask_index].clone(), broadcasted],
+                                )
+                            },
+                        )?
+                        .remove(0);
+                        MaybeZero::Value(tangent)
+                    }
+                };
+                return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
+            }
+        }
+        if let Self::Array(ArrayOperation::Reduce(operation)) = self
+            && matches!(operation.kind(), ReductionKind::Sum | ReductionKind::Mean)
+        {
+            let [operand] = inputs else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+            };
+            let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+            if operand_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
+                let primal = context.bind(self.clone(), Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
+                let tangent = match operand.tangent() {
+                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                    MaybeZero::Value(operand_tangent) => {
+                        let mut residuals = LinearResiduals::new();
+                        let operand_shape = residuals.retain_shape::<A, _>(context, operand.primal())?;
+                        let forward_operation = operation.clone();
+                        let transpose_operand_type = operand_type.cotangent();
+                        let transpose_axes = operation.axes().to_vec();
+                        let transpose_kind = operation.kind();
+                        let transpose_output_axes = (0..transpose_operand_type.rank())
+                            .filter(|axis| !transpose_axes.contains(axis))
+                            .collect::<Vec<_>>();
+                        let tangent = LinearCallOperation::stage(
+                            context,
+                            residuals.into_values(),
+                            vec![operand_tangent.clone()],
+                            move |_, linear_inputs| {
+                                linear_inputs[0].dispatch_domain().bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Reduce(forward_operation)),
+                                    Vec::new(),
+                                    std::slice::from_ref(&linear_inputs[0]),
+                                )
+                            },
+                            move |residuals, output_cotangents| {
+                                let transpose_context = output_cotangents[0].dispatch_domain();
+                                let input_extents = operand_shape.dimensions::<A, _>(&transpose_context, residuals)?;
+                                let mut broadcast_inputs = Vec::with_capacity(1 + input_extents.len());
+                                broadcast_inputs.push(output_cotangents[0].clone());
+                                broadcast_inputs.extend(input_extents.iter().cloned());
+                                let broadcasted = transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::from(
+                                            BroadcastOperation::new(transpose_output_axes.clone())
+                                                .with_output_sharding(transpose_operand_type.sharding().cloned()),
+                                        ),
+                                        Vec::new(),
+                                        broadcast_inputs.as_slice(),
+                                    )?
+                                    .remove(0);
+                                if transpose_kind == ReductionKind::Sum {
+                                    return Ok(vec![broadcasted]);
+                                }
+
+                                let mut element_count = dimension_constant::<A, _>(&transpose_context, 1)?;
+                                for axis in &transpose_axes {
+                                    let left_type =
+                                        <&DimensionType>::try_from(element_count.r#type().as_ref())?.clone();
+                                    let right_type =
+                                        <&DimensionType>::try_from(input_extents[*axis].r#type().as_ref())?.clone();
+                                    element_count = transpose_context
+                                        .bind(
+                                            ArrayProgramOperation::<A>::from(DimensionOperation::Mul(
+                                                DimensionMulOperation::new(&left_type, &right_type)?,
+                                            )),
+                                            Vec::new(),
+                                            &[element_count, input_extents[*axis].clone()],
+                                        )?
+                                        .remove(0);
+                                }
+                                let element_count = transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::from(DimensionToScalarOperation),
+                                        Vec::new(),
+                                        &[element_count],
+                                    )?
+                                    .remove(0);
+                                let element_count = transpose_context
+                                    .bind(
+                                        ArrayProgramOperation::<A>::Array(ArrayOperation::ConvertElementType(
+                                            ConvertElementTypeOperation::new(transpose_operand_type.data_type()),
+                                        )),
+                                        Vec::new(),
+                                        &[element_count],
+                                    )?
+                                    .remove(0);
+                                transpose_context.bind(
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Div(DivOperation)),
+                                    Vec::new(),
+                                    &[broadcasted, element_count],
+                                )
+                            },
+                        )?
+                        .remove(0);
+                        MaybeZero::Value(tangent)
+                    }
+                };
+                return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
+            }
         }
         if let Self::Concatenate(_) = self {
             let Some((result_extent, array_inputs)) = inputs.split_last() else {
@@ -1436,8 +2526,87 @@ where
                         ))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                tangent_inputs.push(result_extent.primal().clone());
-                MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
+                let input_cotangent_types = array_inputs
+                    .iter()
+                    .map(|input| <&ArrayType>::try_from(input.primal().r#type().as_ref()).map(ArrayType::cotangent))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if input_cotangent_types
+                    .iter()
+                    .flat_map(|r#type| r#type.shape().dimensions())
+                    .all(|dimension| matches!(dimension, Dimension::Static(_)))
+                {
+                    tangent_inputs.push(result_extent.primal().clone());
+                    MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
+                } else {
+                    let Self::Concatenate(operation) = self else {
+                        unreachable!();
+                    };
+                    let mut residuals = LinearResiduals::new();
+                    let result_extent_index = residuals.retain(result_extent.primal().clone());
+                    let mut input_shapes = Vec::with_capacity(array_inputs.len());
+                    for input in array_inputs {
+                        input_shapes.push(residuals.retain_shape::<A, _>(context, input.primal())?);
+                    }
+                    let forward_operation = operation.clone();
+                    let transpose_axis = operation.axis();
+                    let tangent = LinearCallOperation::stage(
+                        context,
+                        residuals.into_values(),
+                        tangent_inputs,
+                        move |residuals, linear_inputs| {
+                            let mut concatenate_inputs = linear_inputs.to_vec();
+                            concatenate_inputs.push(residuals[result_extent_index].clone());
+                            linear_inputs[0].dispatch_domain().bind(
+                                ArrayProgramOperation::<A>::from(forward_operation),
+                                Vec::new(),
+                                concatenate_inputs.as_slice(),
+                            )
+                        },
+                        move |residuals, output_cotangents| {
+                            let transpose_context = output_cotangents[0].dispatch_domain();
+                            let zero = dimension_constant::<A, _>(&transpose_context, 0)?;
+                            let mut offset = zero.clone();
+                            let mut cotangents = Vec::with_capacity(input_shapes.len());
+                            for (input_index, input_shape) in input_shapes.iter().enumerate() {
+                                let sizes = input_shape.dimensions::<A, _>(&transpose_context, residuals)?;
+                                let mut starts = vec![zero.clone(); sizes.len()];
+                                starts[transpose_axis] = offset.clone();
+                                let mut slice_inputs = Vec::with_capacity(1 + 2 * sizes.len());
+                                slice_inputs.push(output_cotangents[0].clone());
+                                slice_inputs.extend(starts);
+                                slice_inputs.extend(sizes.iter().cloned());
+                                cotangents.push(
+                                    transpose_context
+                                        .bind(
+                                            ArrayProgramOperation::<A>::from(DynamicShapeSliceOperation::new(
+                                                sizes.len(),
+                                            )),
+                                            Vec::new(),
+                                            slice_inputs.as_slice(),
+                                        )?
+                                        .remove(0),
+                                );
+                                if input_index + 1 < input_shapes.len() {
+                                    let offset_type = <&DimensionType>::try_from(offset.r#type().as_ref())?.clone();
+                                    let size_type =
+                                        <&DimensionType>::try_from(sizes[transpose_axis].r#type().as_ref())?.clone();
+                                    offset = transpose_context
+                                        .bind(
+                                            ArrayProgramOperation::<A>::from(DimensionOperation::Add(
+                                                DimensionAddOperation::new(&offset_type, &size_type)?,
+                                            )),
+                                            Vec::new(),
+                                            &[offset, sizes[transpose_axis].clone()],
+                                        )?
+                                        .remove(0);
+                                }
+                            }
+                            Ok(cotangents)
+                        },
+                    )?
+                    .remove(0);
+                    MaybeZero::Value(tangent)
+                }
             };
             return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
         }
@@ -1474,92 +2643,41 @@ where
                             || (0..input_type.rank()).collect::<Vec<_>>(),
                             |dimensions| dimensions.to_vec(),
                         );
-                        let mut residual_values =
-                            output_extents.iter().map(|extent| extent.primal().clone()).collect::<Vec<_>>();
-                        let mut dynamic_extents = Vec::<(DimensionVariable, usize)>::new();
-                        let mut inverse_dynamic_indices = Vec::with_capacity(permuted_input_cotangent_type.rank());
-                        for (source_axis, dimension) in
-                            source_axes.iter().copied().zip(permuted_input_cotangent_type.shape().dimensions())
-                        {
-                            match dimension {
-                                Dimension::Static(_) => inverse_dynamic_indices.push(None),
-                                Dimension::Dynamic(variable) => {
-                                    let index = if let Some((_, index)) =
-                                        dynamic_extents.iter().find(|(candidate, _)| candidate == variable)
-                                    {
-                                        *index
-                                    } else if let Some(index) = output_extents.iter().position(|extent| {
-                                        matches!(
-                                            extent.primal().r#type().as_ref(),
-                                            ArrayProgramType::Dimension(r#type) if r#type.variable() == variable
-                                        )
-                                    }) {
-                                        dynamic_extents.push((variable.clone(), index));
-                                        index
-                                    } else {
-                                        let size = context
-                                            .bind(
-                                                ArrayProgramOperation::<A>::from(DimensionSizeOperation::new(
-                                                    &input_type,
-                                                    source_axis,
-                                                )?),
-                                                Vec::new(),
-                                                std::slice::from_ref(array.primal()),
-                                            )?
-                                            .remove(0);
-                                        let index = residual_values.len();
-                                        residual_values.push(size);
-                                        dynamic_extents.push((variable.clone(), index));
-                                        index
-                                    };
-                                    inverse_dynamic_indices.push(Some(index));
-                                }
-                            }
-                        }
+                        let mut residuals = LinearResiduals::new();
+                        let output_extents =
+                            residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+                        let input_shape = residuals.retain_shape::<A, _>(context, array.primal())?;
+                        let permuted_input_shape =
+                            ExactShape(source_axes.iter().map(|axis| input_shape.0[*axis]).collect());
 
                         // The forward region is the ordinary tangent reshape over the canonical residuals-first
                         // boundary `[residuals..., tangent]`. The input-extent residuals are unused here but share
                         // one deterministic residual boundary with the transpose region.
-                        let mut forward_input_types =
-                            residual_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-                        forward_input_types.push(array_tangent.r#type().into_owned());
-                        let output_extent_count = output_extents.len();
                         let forward_operation = operation.clone();
-                        let (_, forward) = NestedTracingContext::trace(
-                            context.clone(),
-                            move |region_inputs| {
-                                let tangent = region_inputs.last().unwrap().clone();
-                                let mut reshape_inputs = Vec::with_capacity(1 + output_extent_count);
-                                reshape_inputs.push(tangent.clone());
-                                reshape_inputs.extend(region_inputs[..output_extent_count].iter().cloned());
-                                tangent.dispatch_domain().bind(
+                        let forward_output_extents = output_extents.clone();
+                        let transpose_operation = operation.clone();
+                        let transpose_target_type = input_cotangent_type.clone();
+                        let transpose_permuted_type = permuted_input_cotangent_type.clone();
+                        let tangent = LinearCallOperation::stage(
+                            context,
+                            residuals.into_values(),
+                            vec![array_tangent.clone()],
+                            move |residuals, linear_inputs| {
+                                let mut reshape_inputs = Vec::with_capacity(1 + forward_output_extents.len());
+                                reshape_inputs.push(linear_inputs[0].clone());
+                                reshape_inputs
+                                    .extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                                linear_inputs[0].dispatch_domain().bind(
                                     ArrayProgramOperation::<A>::from(forward_operation),
                                     Vec::new(),
                                     reshape_inputs.as_slice(),
                                 )
                             },
-                            forward_input_types,
-                        )?;
-
-                        // The transpose region consumes the same residual suffix followed by the output cotangent.
-                        // It reconstructs static axes as literal dimension operations and reads dynamic axes directly
-                        // from the residual SSA inputs before applying the inverse permutation and checking the exact
-                        // input-cotangent type.
-                        let mut transpose_input_types =
-                            residual_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-                        transpose_input_types.push(primal.r#type().cotangent());
-                        let transpose_operation = operation.clone();
-                        let transpose_target_type = input_cotangent_type.clone();
-                        let transpose_permuted_type = permuted_input_cotangent_type.clone();
-                        let (_, transpose) = NestedTracingContext::trace(
-                            context.clone(),
-                            move |region_inputs| {
-                                let transpose_context = region_inputs.last().unwrap().dispatch_domain();
-                                let output_cotangent = region_inputs.last().unwrap().clone();
-                                let residual_inputs = &region_inputs[..region_inputs.len() - 1];
+                            move |residuals, output_cotangents| {
+                                let transpose_context = output_cotangents[0].dispatch_domain();
                                 let bridge_sharding = match (
                                     transpose_permuted_type.sharding(),
-                                    <&ArrayType>::try_from(output_cotangent.r#type().as_ref())?.sharding(),
+                                    <&ArrayType>::try_from(output_cotangents[0].r#type().as_ref())?.sharding(),
                                 ) {
                                     (Some(sharding), _) => Some(sharding.clone()),
                                     (None, Some(sharding)) => Some(Sharding::replicated(
@@ -1573,27 +2691,9 @@ where
                                     inverse_operation = inverse_operation.with_output_sharding(bridge_sharding);
                                 }
                                 let mut inverse_inputs = Vec::with_capacity(transpose_permuted_type.rank() + 1);
-                                inverse_inputs.push(output_cotangent);
-                                for (axis, dimension) in transpose_permuted_type.shape().dimensions().iter().enumerate()
-                                {
-                                    match dimension {
-                                        Dimension::Dynamic(_) => inverse_inputs
-                                            .push(residual_inputs[inverse_dynamic_indices[axis].unwrap()].clone()),
-                                        Dimension::Static(extent) => {
-                                            let constant = DimensionValue::constant(*extent)?;
-                                            let constant = transpose_context
-                                                .bind(
-                                                    ArrayProgramOperation::<A>::from(DimensionOperation::from(
-                                                        ConstantOperation::new(constant),
-                                                    )),
-                                                    Vec::new(),
-                                                    &[],
-                                                )?
-                                                .remove(0);
-                                            inverse_inputs.push(constant);
-                                        }
-                                    }
-                                }
+                                inverse_inputs.push(output_cotangents[0].clone());
+                                inverse_inputs
+                                    .extend(permuted_input_shape.dimensions::<A, _>(&transpose_context, residuals)?);
                                 let cotangent = transpose_context
                                     .bind(
                                         ArrayProgramOperation::<A>::from(inverse_operation),
@@ -1625,21 +2725,9 @@ where
                                 }
                                 Ok(vec![cotangent])
                             },
-                            transpose_input_types,
-                        )?;
-
-                        let carrier = LinearCallOperation::new(residual_values.len());
-                        let mut carrier_inputs = residual_values;
-                        carrier_inputs.push(array_tangent.clone());
-                        MaybeZero::Value(
-                            context
-                                .bind(
-                                    ArrayProgramOperation::<A>::from(carrier),
-                                    vec![forward, transpose],
-                                    carrier_inputs.as_slice(),
-                                )?
-                                .remove(0),
-                        )
+                        )?
+                        .remove(0);
+                        MaybeZero::Value(tangent)
                     }
                 }
             };
@@ -1672,10 +2760,125 @@ where
                     }
                 }
                 MaybeZero::Value(array_tangent) => {
-                    let mut tangent_inputs = Vec::with_capacity(inputs.len());
-                    tangent_inputs.push(array_tangent.clone());
-                    tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
-                    MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
+                    let input_cotangent_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent();
+                    if input_cotangent_type
+                        .shape()
+                        .dimensions()
+                        .iter()
+                        .all(|dimension| matches!(dimension, Dimension::Static(_)))
+                    {
+                        let mut tangent_inputs = Vec::with_capacity(inputs.len());
+                        tangent_inputs.push(array_tangent.clone());
+                        tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
+                        MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
+                    } else {
+                        let Self::Broadcast(operation) = self else {
+                            unreachable!();
+                        };
+                        let mut residuals = LinearResiduals::new();
+                        let output_extents =
+                            residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+                        let input_shape = residuals.retain_shape::<A, _>(context, array.primal())?;
+                        let forward_operation = operation.clone();
+                        let forward_output_extents = output_extents.clone();
+                        let transpose_output_axes = operation.output_axes().to_vec();
+                        let transpose_target_type = input_cotangent_type.clone();
+                        let tangent = LinearCallOperation::stage(
+                            context,
+                            residuals.into_values(),
+                            vec![array_tangent.clone()],
+                            move |residuals, linear_inputs| {
+                                let mut broadcast_inputs = Vec::with_capacity(1 + forward_output_extents.len());
+                                broadcast_inputs.push(linear_inputs[0].clone());
+                                broadcast_inputs
+                                    .extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                                linear_inputs[0].dispatch_domain().bind(
+                                    ArrayProgramOperation::<A>::from(forward_operation),
+                                    Vec::new(),
+                                    broadcast_inputs.as_slice(),
+                                )
+                            },
+                            move |residuals, output_cotangents| {
+                                let transpose_context = output_cotangents[0].dispatch_domain();
+                                let mut contribution =
+                                    <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::into_projected(
+                                        output_cotangents[0].clone(),
+                                    )?;
+                                let contribution_type = contribution.r#type().into_owned();
+                                if transpose_output_axes.len() != transpose_target_type.rank()
+                                    || transpose_output_axes.iter().any(|axis| *axis >= contribution_type.rank())
+                                {
+                                    return Err(TypeError::invalid(format!(
+                                        "cannot unalign cotangent type {contribution_type} to input cotangent type \
+                                         {transpose_target_type} using output axes {transpose_output_axes:?}",
+                                    ))
+                                    .into());
+                                }
+                                let mut kept_axes = Vec::with_capacity(transpose_target_type.rank());
+                                for (target_axis, output_axis) in transpose_output_axes.iter().copied().enumerate() {
+                                    let target_dimension = transpose_target_type.dimension(target_axis);
+                                    let output_dimension = contribution_type.dimension(output_axis);
+                                    if target_dimension == output_dimension {
+                                        kept_axes.push((target_axis, output_axis));
+                                    } else if target_dimension != Dimension::Static(1) {
+                                        return Err(TypeError::invalid(format!(
+                                            "cannot unalign cotangent axis {output_axis} of size {output_dimension} \
+                                             to input axis {target_axis} of size {target_dimension}",
+                                        ))
+                                        .into());
+                                    }
+                                }
+                                let reduce_axes = (0..contribution_type.rank())
+                                    .filter(|axis| kept_axes.iter().all(|(_, output_axis)| output_axis != axis))
+                                    .collect::<Vec<_>>();
+                                if !reduce_axes.is_empty() {
+                                    contribution = contribution.reduce(reduce_axes.as_slice(), ReductionKind::Sum);
+                                }
+                                let mut kept_axes_by_output = kept_axes.clone();
+                                kept_axes_by_output.sort_by_key(|(_, output_axis)| *output_axis);
+                                let permutation = kept_axes
+                                    .iter()
+                                    .map(|kept| {
+                                        kept_axes_by_output.iter().position(|candidate| candidate == kept).unwrap()
+                                    })
+                                    .collect::<Vec<_>>();
+                                if permutation.iter().enumerate().any(|(axis, position)| axis != *position) {
+                                    contribution = Transpose::transpose(&contribution, permutation)?;
+                                }
+                                let contribution = contribution.into_value();
+
+                                // Rebind the exact input geometry through ordinary dimension operands. Besides making
+                                // every dynamic extent an explicit data dependency, this prevents a metadata-only
+                                // identity from standing in for the runtime shape at the linear-call boundary.
+                                let contribution_type = contribution.r#type().into_owned();
+                                let mut exact_inputs = Vec::with_capacity(transpose_target_type.rank() + 1);
+                                exact_inputs.push(contribution);
+                                exact_inputs.extend(input_shape.dimensions::<A, _>(&transpose_context, residuals)?);
+                                let contribution_type = <&ArrayType>::try_from(&contribution_type)?;
+                                if contribution_type.shape() == transpose_target_type.shape() {
+                                    transpose_context.bind(
+                                        ArrayProgramOperation::<A>::from(
+                                            BroadcastOperation::new((0..transpose_target_type.rank()).collect())
+                                                .with_output_sharding(transpose_target_type.sharding().cloned()),
+                                        ),
+                                        Vec::new(),
+                                        exact_inputs.as_slice(),
+                                    )
+                                } else {
+                                    transpose_context.bind(
+                                        ArrayProgramOperation::<A>::from(
+                                            ReshapeOperation::new()
+                                                .with_output_sharding(transpose_target_type.sharding().cloned()),
+                                        ),
+                                        Vec::new(),
+                                        exact_inputs.as_slice(),
+                                    )
+                                }
+                            },
+                        )?
+                        .remove(0);
+                        MaybeZero::Value(tangent)
+                    }
                 }
             };
             return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
@@ -1833,7 +3036,9 @@ where
                     .is_ok_and(|r#type| matches!(r#type.to_dimension(), Dimension::Dynamic(_)))
             }) {
                 return Err(ProgramError::UnsupportedOperation {
-                    message: "'pad' transpose with dynamic extents requires Phase 6 dimension residuals".to_string(),
+                    message: "direct 'pad' transposition with dynamic extents requires linearization so that the \
+                              primal geometry can be retained as residuals"
+                        .to_string(),
                 }
                 .into());
             }
@@ -1874,7 +3079,8 @@ where
                 if matches!(input_type.dimension(operation.axis()), Dimension::Dynamic(_)) {
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
-                            "'{}' transpose with dynamic input extents requires Phase 6 dimension residuals",
+                            "direct transposition of a dynamic '{}' requires linearization so its input extents can \
+                             be retained as residuals",
                             CONCATENATE_OPERATION_NAME,
                         ),
                     }
@@ -1907,7 +3113,8 @@ where
                 .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
             {
                 return Err(ProgramError::UnsupportedOperation {
-                    message: "'broadcast' transpose with dynamic input extents requires Phase 6 dimension residuals"
+                    message: "direct transposition of a dynamic 'broadcast' requires linearization so its input \
+                              extents can be retained as residuals"
                         .to_string(),
                 }
                 .into());
@@ -2492,7 +3699,8 @@ mod tests {
         DimensionAddOperation, DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation,
     };
     use crate::operations::manipulation::{
-        Broadcast, BroadcastOperation, ConcatenateOperation, PadOperation, ReshapeOperation,
+        Broadcast, BroadcastOperation, ConcatenateOperation, GatherDimensionNumbers, GatherOperation, PadOperation,
+        ReshapeOperation, SliceOperation,
     };
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
@@ -4489,13 +5697,14 @@ in (%4)
             ]),
         );
 
-        let source = DimensionVariable::new("source", DimensionBounds::new(1, Some(5)).unwrap());
-        let result = DimensionVariable::new("result", DimensionBounds::new(4, Some(12)).unwrap());
+        let source = DimensionVariable::new("source", DimensionBounds::new(0, Some(5)).unwrap());
+        let result = DimensionVariable::new("result", DimensionBounds::new(3, Some(11)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source.clone())]));
+        let result_type = DimensionType::new(result);
         let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
-        let input =
-            builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source)])).into());
+        let input = builder.add_input(input_type.into());
         let padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
-        let output_extent = builder.add_input(DimensionType::new(result).into());
+        let output_extent = builder.add_input(result_type.clone().into());
         let output = builder
             .add_instruction(
                 PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
@@ -4510,12 +5719,589 @@ in (%4)
                 vec![Placeholder],
             )
             .unwrap();
-        assert!(matches!(
-            program.transpose_with_respect_to(&[0, 1]),
-            Err(crate::differentiation::DifferentiationError::Program(
-                ProgramError::UnsupportedOperation { message },
-            )) if message == "'pad' transpose with dynamic extents requires Phase 6 dimension residuals",
-        ));
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 2);
+        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=2]"));
+        assert!(linearization.pullback().unwrap().to_string().contains("dynamic_shape_slice [strides=[2]]"));
+
+        let input = ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0]));
+        let padding_value = ArrayProgramValue::Array(Array::scalar(-1.0_f64));
+        let output_extent = ArrayProgramValue::Dimension(DimensionValue::new(result_type.clone(), 8).unwrap());
+        let mut primal_outputs = linearization.primal().interpret(vec![input, padding_value, output_extent]).unwrap();
+        assert_eq!(
+            primal_outputs[0],
+            ArrayProgramValue::Array(Array::vector(vec![-1.0_f64, 10.0, -1.0, 20.0, -1.0, 30.0, -1.0, -1.0])),
+        );
+        let residuals = primal_outputs.split_off(1);
+
+        let mut tangent_inputs = vec![
+            ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0])),
+            ArrayProgramValue::Array(Array::scalar(4.0_f64)),
+        ];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![4.0_f64, 1.0, 4.0, 2.0, 4.0, 3.0, 4.0, 4.0]))]),
+        );
+
+        let mut pullback_inputs =
+            vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![2.0_f64, 4.0, 6.0])),
+                ArrayProgramValue::Array(Array::scalar(24.0_f64)),
+            ]),
+        );
+
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayProgramValue::Array(Array::vector(Vec::<f64>::new())),
+                ArrayProgramValue::Array(Array::scalar(-1.0_f64)),
+                ArrayProgramValue::Dimension(DimensionValue::new(result_type, 3).unwrap()),
+            ])
+            .unwrap();
+        assert_eq!(primal_outputs[0], ArrayProgramValue::Array(Array::vector(vec![-1.0_f64, -1.0, -1.0])),);
+        let residuals = primal_outputs.split_off(1);
+        let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(Vec::<f64>::new())),
+                ArrayProgramValue::Array(Array::scalar(6.0_f64)),
+            ]),
+        );
+
+        // Explicit pad geometry retains one output extent per physical axis, including statically typed axes. Keep a
+        // static leading axis to verify that the pullback selects dynamic constructor operands from the right axis.
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
+        let padded_columns = DimensionVariable::new("padded_columns", DimensionBounds::new(3, Some(7)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns)]));
+        let padded_columns_type = DimensionType::new(padded_columns);
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let rows = builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let output_extent = builder.add_input(padded_columns_type.clone().into());
+        let output = builder
+            .add_instruction(
+                PadOperation::new(vec![0, 1], vec![0, 1], vec![0, 0]).unwrap(),
+                Vec::new(),
+                vec![input, padding_value, rows, output_extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0])),
+                ArrayProgramValue::Array(Array::scalar(-1.0_f64)),
+                ArrayProgramValue::Dimension(DimensionValue::new(padded_columns_type, 4).unwrap()),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let mut pullback_inputs =
+            vec![ArrayProgramValue::Array(Array::matrix(2, 4, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::matrix(2, 2, vec![2.0_f64, 3.0, 6.0, 7.0])),
+                ArrayProgramValue::Array(Array::scalar(18.0_f64)),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_program_dynamic_slice_differentiation() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(6)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let start = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let output = builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![2]))),
+                Vec::new(),
+                vec![input, start],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+
+        assert_eq!(linearization.residual_count(), 2);
+        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=2]"));
+        assert!(linearization.pullback().unwrap().to_string().contains("dynamic_update_slice"));
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
+                ArrayProgramValue::Array(Array::scalar(1_i32)),
+            ])
+            .unwrap();
+        assert_eq!(primal_outputs[0], ArrayProgramValue::Array(Array::vector(vec![2.0_f64, 3.0])));
+        let residuals = primal_outputs.split_off(1);
+
+        let mut tangent_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![9.0_f64, 10.0, 11.0, 12.0]))];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 11.0]))]),
+        );
+        let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![5.0_f64, 7.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 5.0, 7.0, 0.0]))]),
+        );
+
+        let extent = DimensionVariable::new("strided_extent", DimensionBounds::new(4, Some(7)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::Slice(
+                    SliceOperation::new(vec![0], vec![4]).with_strides(vec![2]).unwrap(),
+                )),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]))])
+            .unwrap();
+        assert_eq!(primal_outputs[0], ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 3.0])));
+        let residuals = primal_outputs.split_off(1);
+        let mut tangent_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![9.0_f64, 10.0, 11.0, 12.0]))];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![9.0_f64, 11.0]))]),
+        );
+        let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![5.0_f64, 7.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![5.0_f64, 0.0, 7.0, 0.0]))]),
+        );
+    }
+
+    #[test]
+    fn test_array_program_gather_differentiation() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(6)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3), Dimension::Static(1)]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let indices = builder.add_input(indices_type.clone().into());
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1]);
+        let output = builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::Gather(operation)),
+                Vec::new(),
+                vec![input, indices],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+
+        assert_eq!(linearization.residual_count(), 2);
+        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=2]"));
+        let indices = ArrayProgramValue::Array(Array::from_f64s(indices_type, vec![1.0, 1.0, 3.0]));
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])), indices])
+            .unwrap();
+        assert_eq!(primal_outputs[0], ArrayProgramValue::Array(Array::vector(vec![20.0_f64, 20.0, 40.0])));
+        let residuals = primal_outputs.split_off(1);
+        let mut tangent_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]))];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![2.0_f64, 2.0, 4.0]))]),
+        );
+        let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![2.0_f64, 3.0, 5.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 5.0, 0.0, 5.0]))]),
+        );
+    }
+
+    #[test]
+    fn test_array_program_reduce_differentiation() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(6)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        for (kind, expected_primal, expected_tangent, expected_cotangent) in
+            [(ReductionKind::Sum, 6.0, 15.0, 6.0), (ReductionKind::Mean, 2.0, 5.0, 2.0)]
+        {
+            let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+            let input = builder.add_input(input_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    ArrayProgramOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], kind))),
+                    Vec::new(),
+                    vec![input],
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let linearization = program.linearize().unwrap();
+
+            assert_eq!(linearization.residual_count(), 1);
+            assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
+            let mut primal_outputs = linearization
+                .primal()
+                .interpret(vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]))])
+                .unwrap();
+            assert_eq!(primal_outputs[0], ArrayProgramValue::Array(Array::scalar(expected_primal)));
+            let residuals = primal_outputs.split_off(1);
+            let mut tangent_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]))];
+            tangent_inputs.extend(residuals.clone());
+            assert_eq!(
+                linearization.tangent().interpret(tangent_inputs),
+                Ok(vec![ArrayProgramValue::Array(Array::scalar(expected_tangent))]),
+            );
+            let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::scalar(6.0_f64))];
+            pullback_inputs.extend(residuals);
+            assert_eq!(
+                linearization.pullback().unwrap().interpret(pullback_inputs),
+                Ok(vec![ArrayProgramValue::Array(Array::vector(vec![
+                    expected_cotangent,
+                    expected_cotangent,
+                    expected_cotangent,
+                ]))]),
+            );
+        }
+
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum))),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![ArrayProgramValue::Array(Array::vector(Vec::<f64>::new()))])
+            .unwrap();
+        assert_eq!(primal_outputs[0], ArrayProgramValue::Array(Array::scalar(0.0_f64)));
+        let residuals = primal_outputs.split_off(1);
+        let mut tangent_inputs = vec![ArrayProgramValue::Array(Array::vector(Vec::<f64>::new()))];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::scalar(0.0_f64))]),
+        );
+        let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::scalar(3.0_f64))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(Vec::<f64>::new()))]),
+        );
+
+        for (kind, values, expected_primal, expected_tangent, expected_cotangent) in [
+            (ReductionKind::Max, vec![1.0, 5.0, 5.0, 2.0], 5.0, 25.0, vec![0.0, 4.0, 4.0, 0.0]),
+            (ReductionKind::Min, vec![1.0, 1.0, 5.0, 2.0], 1.0, 15.0, vec![4.0, 4.0, 0.0, 0.0]),
+        ] {
+            let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(6)).unwrap());
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+            let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+            let input = builder.add_input(input_type.into());
+            let output = builder
+                .add_instruction(
+                    ArrayProgramOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], kind))),
+                    Vec::new(),
+                    vec![input],
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let linearization = program.linearize().unwrap();
+
+            assert_eq!(linearization.residual_count(), 2);
+            let mut primal_outputs =
+                linearization.primal().interpret(vec![ArrayProgramValue::Array(Array::vector(values))]).unwrap();
+            assert_eq!(primal_outputs[0], ArrayProgramValue::Array(Array::scalar(expected_primal)));
+            let residuals = primal_outputs.split_off(1);
+            let mut tangent_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]))];
+            tangent_inputs.extend(residuals.clone());
+            assert_eq!(
+                linearization.tangent().interpret(tangent_inputs),
+                Ok(vec![ArrayProgramValue::Array(Array::scalar(expected_tangent))]),
+            );
+            let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::scalar(8.0_f64))];
+            pullback_inputs.extend(residuals);
+            assert_eq!(
+                linearization.pullback().unwrap().interpret(pullback_inputs),
+                Ok(vec![ArrayProgramValue::Array(Array::vector(expected_cotangent))]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_array_program_scatter_differentiation() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(7)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let indices = builder.add_input(indices_type.clone().into());
+        let updates = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
+        let output = builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::Scatter(ScatterOperation::new(
+                    ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0]),
+                    ScatterReductionKind::Add,
+                ))),
+                Vec::new(),
+                vec![input, indices, updates],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+
+        assert_eq!(linearization.residual_count(), 1);
+        let indices = ArrayProgramValue::Array(Array::from_f64s(indices_type, vec![1.0, 3.0]));
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
+                indices,
+                ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 20.0])),
+            ])
+            .unwrap();
+        assert_eq!(primal_outputs[0], ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 12.0, 3.0, 24.0])));
+        let residuals = primal_outputs.split_off(1);
+        let mut tangent_inputs = vec![
+            ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
+            ArrayProgramValue::Array(Array::vector(vec![5.0_f64, 6.0])),
+        ];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 7.0, 3.0, 10.0]))]),
+        );
+        let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])),
+                ArrayProgramValue::Array(Array::vector(vec![20.0_f64, 40.0])),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_program_slice_differentiation() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(3, Some(6)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::Slice(SliceOperation::new(vec![1], vec![3]))),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+
+        assert_eq!(linearization.residual_count(), 1);
+        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]))])
+            .unwrap();
+        assert_eq!(primal_outputs[0], ArrayProgramValue::Array(Array::vector(vec![2.0_f64, 3.0])));
+        let residuals = primal_outputs.split_off(1);
+        let mut tangent_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![9.0_f64, 10.0, 11.0, 12.0]))];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 11.0]))]),
+        );
+        let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![5.0_f64, 7.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![0.0_f64, 5.0, 7.0, 0.0]))]),
+        );
+    }
+
+    #[test]
+    fn test_array_program_update_slice_differentiation() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(3, Some(6)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let update = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
+        let output = builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::UpdateSlice(UpdateSliceOperation::new(vec![1]))),
+                Vec::new(),
+                vec![input, update],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+
+        assert_eq!(linearization.residual_count(), 0);
+        let primal = vec![
+            ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
+            ArrayProgramValue::Array(Array::vector(vec![9.0_f64, 8.0])),
+        ];
+        assert_eq!(
+            linearization.primal().interpret(primal),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 9.0, 8.0, 4.0]))]),
+        );
+        assert_eq!(
+            linearization.tangent().interpret(vec![
+                ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])),
+                ArrayProgramValue::Array(Array::vector(vec![5.0_f64, 6.0])),
+            ]),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 5.0, 6.0, 40.0]))]),
+        );
+        assert_eq!(
+            linearization
+                .pullback()
+                .unwrap()
+                .interpret(vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0,]))]),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0])),
+                ArrayProgramValue::Array(Array::vector(vec![2.0_f64, 3.0])),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_program_dynamic_update_slice_differentiation() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(6)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let update = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
+        let start = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let output = builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation)),
+                Vec::new(),
+                vec![input, update, start],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+
+        assert_eq!(linearization.residual_count(), 1);
+        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
+                ArrayProgramValue::Array(Array::vector(vec![9.0_f64, 8.0])),
+                ArrayProgramValue::Array(Array::scalar(1_i32)),
+            ])
+            .unwrap();
+        assert_eq!(primal_outputs[0], ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 9.0, 8.0, 4.0])));
+        let residuals = primal_outputs.split_off(1);
+
+        let mut tangent_inputs = vec![
+            ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])),
+            ArrayProgramValue::Array(Array::vector(vec![5.0_f64, 6.0])),
+        ];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 5.0, 6.0, 40.0]))]),
+        );
+        let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0])),
+                ArrayProgramValue::Array(Array::vector(vec![2.0_f64, 3.0])),
+            ]),
+        );
     }
 
     #[test]
@@ -4700,7 +6486,7 @@ in (%4)
         let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
         let input = builder
             .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dynamic_variable)])).into());
-        let extent = builder.add_input(dynamic_extent.into());
+        let extent = builder.add_input(dynamic_extent.clone().into());
         let output =
             builder.add_instruction(BroadcastOperation::new(vec![0]), Vec::new(), vec![input, extent]).unwrap()[0];
         let dynamic_program = builder
@@ -4711,12 +6497,20 @@ in (%4)
             )
             .unwrap();
         assert!(dynamic_program.jvp().is_ok());
-        assert!(matches!(
-            dynamic_program.transpose_with_respect_to(&[0]),
-            Err(crate::differentiation::DifferentiationError::Program(
-                ProgramError::UnsupportedOperation { message },
-            )) if message == "'broadcast' transpose with dynamic input extents requires Phase 6 dimension residuals",
-        ));
+        let linearization = dynamic_program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
+        let input = ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));
+        let extent = ArrayProgramValue::Dimension(DimensionValue::new(dynamic_extent, 3).unwrap());
+        let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let tangent = ArrayProgramValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]));
+        let mut tangent_inputs = vec![tangent.clone()];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![tangent.clone()]));
+        let mut pullback_inputs = vec![tangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![tangent]));
 
         let bounds = DimensionBounds::new(1, Some(9)).unwrap();
         let source = DimensionVariable::new("source", bounds);
@@ -4767,6 +6561,22 @@ in (%4)
                 Shape::new(vec![Dimension::Dynamic(target), Dimension::Static(1)]),
             )),
         );
+    }
+
+    #[test]
+    fn test_array_program_dynamic_shape_slice() -> Result<(), ProgramError> {
+        let context = EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input =
+            ArrayProgramValue::Array(Array::matrix(3, 4, (0..12).map(|value| value as f64).collect::<Vec<_>>()));
+        let dimension = |extent| Ok::<_, ProgramError>(ArrayProgramValue::Dimension(DimensionValue::constant(extent)?));
+        let output = context.bind(
+            DynamicShapeSliceOperation::new(2),
+            Vec::new(),
+            &[input, dimension(1)?, dimension(1)?, dimension(2)?, dimension(2)?],
+        )?;
+        assert_eq!(output, vec![ArrayProgramValue::Array(Array::matrix(2, 2, vec![5.0, 6.0, 9.0, 10.0]))]);
+
+        Ok(())
     }
 
     #[test]
@@ -5079,7 +6889,7 @@ in (%4)
         assert_eq!(program.interpret(vec![left, right]), Ok(vec![output.clone()]));
 
         // The same stored dynamic program composes dimension arithmetic with both forward differentiation and
-        // batching. The explicit result extent remains an ordinary replicated SSA dependency in both transforms.
+        // batching. Its tangent retains the result extent and both operand extents as ordinary residual SSA edges.
         let jvp = program.jvp().unwrap();
         assert_eq!(jvp.input_types().len(), 4);
         let transformed_result_extent = jvp
@@ -5098,8 +6908,14 @@ in (%4)
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![transformed_result_extent, transformed_result_extent],
+            vec![transformed_result_extent],
         );
+        let tangent_call = jvp
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayProgramOperation::LinearCall(_)))
+            .unwrap();
+        assert_eq!(tangent_call.inputs()[0], transformed_result_extent);
         assert_eq!(
             jvp.interpret(vec![
                 ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0])),
@@ -5146,12 +6962,27 @@ in (%4)
             batched_outputs[0].batch().value(),
             &ArrayProgramValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],)),
         );
-        assert!(matches!(
-            program.transpose_with_respect_to(&[0, 1]),
-            Err(crate::differentiation::DifferentiationError::Program(
-                ProgramError::UnsupportedOperation { message },
-            )) if message == "'concatenate' transpose with dynamic input extents requires Phase 6 dimension residuals",
-        ));
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 3);
+        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=3]"));
+        assert!(linearization.pullback().unwrap().to_string().contains("dynamic_shape_slice"));
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+                ArrayProgramValue::Array(Array::vector(vec![3.0_f32])),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let mut pullback_inputs = vec![ArrayProgramValue::Array(Array::vector(vec![7.0_f32, 8.0, 9.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![7.0_f32, 8.0])),
+                ArrayProgramValue::Array(Array::vector(vec![9.0_f32])),
+            ]),
+        );
     }
 
     #[test]

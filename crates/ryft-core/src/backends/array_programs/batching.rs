@@ -21,6 +21,7 @@ use crate::batching::{
     RecursiveBatchingPolicy, batch_axis_sharding, normalized_batch_axis_type,
 };
 use crate::contexts::{Context, ProjectedContext, StagingContext, ValueResolution};
+use crate::differentiation::LinearCallOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::collectives::{
     AllGatherOperation, AllToAllOperation, CollectiveBatchingPolicy, PSumScatterOperation,
@@ -38,10 +39,10 @@ use crate::operations::dimensions::{
 };
 use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
 use crate::operations::manipulation::{
-    BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, LegacyBroadcast, LegacyBroadcastOperation,
-    PadOperation, Reshape, ReshapeOperation, Transpose, TransposeOperation,
+    BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, DynamicShapeSliceOperation, LegacyBroadcast,
+    LegacyBroadcastOperation, PadOperation, Reshape, ReshapeOperation, Transpose, TransposeOperation,
 };
-use crate::operations::math::{Div, Mul, Reduce};
+use crate::operations::math::{Div, Mul, Reduce, ReduceOperation, ReductionKind};
 use crate::operations::random::RngBitGeneratorOperation;
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::operations::{Operation, OperationProjection};
@@ -50,7 +51,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValue, ProjectedValueRef, Value, ValueProjection};
 use crate::programs::{Program, ProgramBuilder, ProgramError};
 use crate::sharding::Sharding;
-use crate::tracing::TracingContext;
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType};
 
 /// Kind-aware batched view of one composite array-program value.
@@ -161,12 +162,15 @@ impl<V: Value<Type = ArrayProgramType>> Display for ArrayProgramBatch<V> {
 /// first-class mapped-extent SSA value. Their boundary has one additional leading dimension input and output:
 /// the input defines the identity referenced by every inserted dynamic batch dimension, and the output forwards that
 /// same atom so enclosing higher-order operations can carry it through the sealed region. Output-axis metadata
-/// excludes this protocol output, and [`Self::into_parts`] documents the arity contract consumers must uphold.
+/// excludes this bookkeeping output, and [`Self::into_parts`] documents the arity contract consumers must uphold.
+/// Consumers that instead need an ordinary [`Region`](crate::Region) boundary shed the widening through
+/// [`BatchingPolicy::adapt_batched_program`] and complete the adapted program's operands with
+/// [`BatchingPolicy::boundary_operands`].
 pub struct ThreadedExtentBatchedProgram<V: Typed<Type = ArrayProgramType> + Parameter, O> {
-    /// Structurally transformed program, including its leading protocol input and output.
+    /// Structurally transformed program, including its leading bookkeeping input and output.
     program: Program<V, O, Vec<V>, Vec<V>>,
 
-    /// Mapped axes of the source region's outputs. The protocol-only threaded extent is excluded.
+    /// Mapped axes of the source region's outputs. The bookkeeping-only threaded extent is excluded.
     output_axes: Vec<BatchAxis>,
 }
 
@@ -206,6 +210,32 @@ impl<C: Context<Type = ArrayProgramType>> BatchingPolicy<C> for ArrayProgramBatc
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
         batch.r#type()
     }
+
+    /// The adapted program's leading input still defines the [`DimensionVariable`](crate::DimensionVariable)
+    /// referenced by every inserted dynamic batch dimension, so the first-class mapped-extent value must become its
+    /// matching operand.
+    #[inline]
+    fn boundary_operands(axis_extent: &Self::Extent) -> Vec<C::Value> {
+        vec![axis_extent.clone()]
+    }
+
+    /// Drops the leading forwarded-extent bookkeeping output that exists only for extent-threading consumers.
+    #[inline]
+    fn adapt_batched_program<CollapseFn>(
+        program: Self::BatchedProgram,
+        required_output_axes: Option<&[BatchAxis]>,
+        collapse_fn: CollapseFn,
+    ) -> Result<BatchedProgram<C::Constant, C::Operation>, BatchingError>
+    where
+        CollapseFn: Fn(
+            &TracingContext<C::Constant, C::Operation>,
+            Tracer<TracingContext<C::Constant, C::Operation>>,
+            Axis,
+        ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+    {
+        let (program, output_axes) = program.into_parts();
+        BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 1, collapse_fn)
+    }
 }
 
 impl<V: Value<Type = ArrayProgramType>, O: Operation<ArrayProgramType>> ThreadedExtentBatchedProgram<V, O> {
@@ -242,7 +272,7 @@ impl<V: Value<Type = ArrayProgramType>, O: Operation<ArrayProgramType>> Threaded
         Ok(Self { program, output_axes })
     }
 
-    /// Returns the mapped axes of the source region's outputs, excluding the protocol-only threaded extent.
+    /// Returns the mapped axes of the source region's outputs, excluding the bookkeeping-only threaded extent.
     #[inline]
     pub fn output_axes(&self) -> &[BatchAxis] {
         self.output_axes.as_slice()
@@ -309,6 +339,45 @@ where
     #[inline]
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, ArrayType> {
         Cow::Owned(batch.unbatched_type())
+    }
+
+    #[inline]
+    fn adapt_batched_program<CollapseFn>(
+        program: Self::BatchedProgram,
+        required_output_axes: Option<&[BatchAxis]>,
+        collapse_fn: CollapseFn,
+    ) -> Result<
+        BatchedProgram<
+            <C::Constant as ValueProjection<ArrayType>>::Projected,
+            <C::Operation as OperationProjection<ArrayType>>::Projected,
+        >,
+        BatchingError,
+    >
+    where
+        CollapseFn: Fn(
+            &TracingContext<
+                <C::Constant as ValueProjection<ArrayType>>::Projected,
+                <C::Operation as OperationProjection<ArrayType>>::Projected,
+            >,
+            Tracer<
+                TracingContext<
+                    <C::Constant as ValueProjection<ArrayType>>::Projected,
+                    <C::Operation as OperationProjection<ArrayType>>::Projected,
+                >,
+            >,
+            Axis,
+        ) -> Result<
+            Tracer<
+                TracingContext<
+                    <C::Constant as ValueProjection<ArrayType>>::Projected,
+                    <C::Operation as OperationProjection<ArrayType>>::Projected,
+                >,
+            >,
+            BatchingError,
+        >,
+    {
+        let (program, output_axes) = program.into_parts();
+        BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, collapse_fn)
     }
 }
 
@@ -1113,8 +1182,8 @@ where
 /// Removes the leading threaded-extent output while preserving the transformed region's complete input boundary.
 ///
 /// A structurally batched condition program forwards the extent because that is the generic composite-region
-/// protocol. A [`WhileOperation`] condition consumes the extent as loop state but must return only its predicate, so
-/// the while rule uses this boundary projection before attaching the condition region.
+/// boundary contract. A [`WhileOperation`] condition consumes the extent as loop state but must return only its
+/// predicate, so the while rule uses this boundary projection before attaching the condition region.
 fn without_threaded_extent_output<C: Context<Type = ArrayProgramType>>(
     program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
 ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, ProgramError> {
@@ -2074,6 +2143,35 @@ where
     ])
 }
 
+impl<C> BatchableOperation<C, ArrayProgramBatching> for LinearCallOperation<ArrayProgramType>
+where
+    C: Context<
+            Type = ArrayProgramType,
+            Operation: From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+        >,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<ReduceOperation>,
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayProgramBatching>,
+        driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let input_axes = inputs.iter().map(ArrayProgramBatch::batch_axis).collect::<Vec<_>>();
+        self.batch_regions(context, driver, inputs, input_axes, |_, output, axis| {
+            // Projecting the replayed array output gives it the ordinary `Reduce` capability, whose staged operation
+            // lifts back through the composite operation family.
+            let output = ValueProjection::<ArrayType>::into_projected(output)?;
+            let axis = axis.normalize(output.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
+                r#type: Box::new(output.r#type().into_owned()),
+                axis,
+            })?;
+            Ok(ValueProjection::from_projected(output.reduce(&[axis], ReductionKind::Sum)))
+        })
+    }
+}
+
 impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ArrayProgramOperation<A>
 where
     A: Value<Type = ArrayType>,
@@ -2088,6 +2186,7 @@ where
     <C::Value as ValueProjection<DimensionType>>::Projected:
         DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
     C::Operation: From<ArrayProgramOperation<A>>
+        + From<LinearCallOperation<ArrayProgramType>>
         + From<BroadcastOperation>
         + From<ConcatenateOperation>
         + From<ConditionOperation<ArrayProgramValue<A>>>
@@ -2226,6 +2325,48 @@ where
             Self::Concatenate(operation) => BatchableOperation::batch(operation, context, driver, inputs),
             Self::CustomCall(operation) => BatchableOperation::batch(operation, context, driver, inputs),
             Self::Pad(operation) => BatchableOperation::batch(operation, context, driver, inputs),
+            Self::DynamicShapeSlice(operation) => {
+                let Some((input, bounds)) = inputs.split_first() else {
+                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+                };
+                let input_type = <&ArrayType>::try_from(input.unbatched_type())?;
+                check_count!("input", inputs, 1 + 2 * input_type.rank(), ProgramError);
+                for bound in bounds {
+                    bound.validate_replicated_dimension()?;
+                }
+                if input.batch_axis().is_replicated() {
+                    return Ok(context
+                        .parent()
+                        .bind(
+                            self.clone(),
+                            Vec::new(),
+                            &inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>(),
+                        )?
+                        .into_iter()
+                        .map(ArrayProgramBatch::replicated)
+                        .collect());
+                }
+
+                let batch_axis = input.batch_axis_position().unwrap();
+                let (starts, sizes) = bounds.split_at(input_type.rank());
+                let mut packed_inputs = Vec::with_capacity(inputs.len() + 2);
+                packed_inputs.push(input.value.clone());
+                packed_inputs.extend(starts.iter().take(batch_axis).map(|bound| bound.value.clone()));
+                packed_inputs.push(dimension_constant(context.parent(), 0)?);
+                packed_inputs.extend(starts.iter().skip(batch_axis).map(|bound| bound.value.clone()));
+                packed_inputs.extend(sizes.iter().take(batch_axis).map(|bound| bound.value.clone()));
+                packed_inputs.push(context.axis_extent().clone());
+                packed_inputs.extend(sizes.iter().skip(batch_axis).map(|bound| bound.value.clone()));
+                let mut strides = operation.strides().to_vec();
+                strides.insert(batch_axis, 1);
+                let operation = DynamicShapeSliceOperation::new(input_type.rank() + 1).with_strides(strides)?;
+                context
+                    .parent()
+                    .bind(ArrayProgramOperation::<A>::from(operation), Vec::new(), packed_inputs.as_slice())?
+                    .into_iter()
+                    .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(batch_axis)))
+                    .collect()
+            }
             Self::RngBitGenerator(operation) => batch_rng_bit_generator::<A, _>(operation, context, inputs),
             Self::AllGather(operation) => batch_all_gather::<A, _>(operation, context, inputs),
             Self::PSumScatter(operation) => batch_psum_scatter::<A, _>(operation, context, inputs),
@@ -2341,9 +2482,7 @@ where
                     .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(0)))
                     .collect()
             }
-            Self::LinearCall(operation) => Err(BatchingError::UnsupportedOperation {
-                message: format!("operation `{}` cannot be batched", operation.name()),
-            }),
+            Self::LinearCall(operation) => BatchableOperation::batch(operation, context, driver, inputs),
         }
     }
 }
@@ -2387,7 +2526,7 @@ mod tests {
     fn test_threaded_extent_batched_program_validates_its_boundary() -> Result<(), ProgramError> {
         type TestProgramBuilder = ProgramBuilder<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
 
-        // A threaded boundary always contributes one leading protocol input and output.
+        // A threaded boundary always contributes one leading bookkeeping input and output.
         let program = TestProgramBuilder::new().build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
             Vec::new(),
             Vec::new(),
@@ -2395,14 +2534,14 @@ mod tests {
         )?;
         let Err(ProgramError::MalformedProgram(message)) = ThreadedExtentBatchedProgram::new(program, Vec::new())
         else {
-            panic!("threaded-extent batching accepted a missing protocol boundary");
+            panic!("threaded-extent batching accepted a missing bookkeeping boundary");
         };
         assert_eq!(
             message,
             "a structurally batched program with a threaded extent must have a leading input and output",
         );
 
-        // The leading protocol input must be a first-class dimension rather than an arbitrary composite member.
+        // The leading bookkeeping input must be a first-class dimension rather than an arbitrary composite member.
         let mut builder = TestProgramBuilder::new();
         let array = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let program = builder.build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
@@ -2412,11 +2551,11 @@ mod tests {
         )?;
         let Err(ProgramError::MalformedProgram(message)) = ThreadedExtentBatchedProgram::new(program, Vec::new())
         else {
-            panic!("threaded-extent batching accepted a non-dimension protocol input");
+            panic!("threaded-extent batching accepted a non-dimension bookkeeping input");
         };
         assert_eq!(message, "a structurally batched program's leading threaded-extent input must be a dimension",);
 
-        // The leading protocol output must also be a first-class dimension.
+        // The leading bookkeeping output must also be a first-class dimension.
         let mut builder = TestProgramBuilder::new();
         builder
             .add_input(DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(0, Some(8))?)).into());
@@ -2428,7 +2567,7 @@ mod tests {
         )?;
         let Err(ProgramError::MalformedProgram(message)) = ThreadedExtentBatchedProgram::new(program, Vec::new())
         else {
-            panic!("threaded-extent batching accepted a non-dimension protocol output");
+            panic!("threaded-extent batching accepted a non-dimension bookkeeping output");
         };
         assert_eq!(message, "a structurally batched program's leading threaded-extent output must be a dimension",);
 
@@ -2446,14 +2585,14 @@ mod tests {
         )?;
         let Err(ProgramError::MalformedProgram(message)) = ThreadedExtentBatchedProgram::new(program, Vec::new())
         else {
-            panic!("threaded-extent batching accepted a substituted protocol output");
+            panic!("threaded-extent batching accepted a substituted bookkeeping output");
         };
         assert_eq!(
             message,
             "a structurally batched program's leading threaded-extent output must forward its leading input",
         );
 
-        // A well-formed threaded boundary preserves its program and excludes the protocol output from its axes.
+        // A well-formed threaded boundary preserves its program and excludes the bookkeeping output from its axes.
         let mut builder = TestProgramBuilder::new();
         let extent = builder
             .add_input(DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(0, Some(8))?)).into());
@@ -2964,7 +3103,7 @@ mod tests {
         )?;
 
         // A replicated predicate keeps one condition. Its transformed branches carry the mapped extent explicitly as
-        // leading dimension state, while the reported output-axis metadata excludes that protocol value.
+        // leading dimension state, while the reported output-axis metadata excludes that bookkeeping value.
         let trace = TraceContext::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
         let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
@@ -3038,7 +3177,8 @@ mod tests {
         );
 
         // Structural callers may force each output axis independently. Alignment happens while the replayed
-        // values are still live tracers, and the leading extent protocol remains separate from the reported axis metadata.
+        // values are still live tracers, and the leading extent bookkeeping boundary remains separate from the
+        // reported axis metadata.
         let forced_trace = TraceContext::new();
         let forced_extent = forced_trace.input(DimensionType::new(batch.clone()).into());
         let forced_context = BatchingContext::<_, ArrayProgramBatching>::new(forced_trace, forced_extent);
@@ -3081,8 +3221,9 @@ mod tests {
                 if *r#type == shared_dimension_type && axis == BatchAxis::new(0),
         ));
 
-        // Exact static extents use the identical threaded-extent protocol and instruction count. Only the boundary types
-        // differ, so structural IR does not grow with or specialize on the mapped extent's runtime value.
+        // Exact static extents use the identical threaded-extent boundary contract and instruction count. Only the
+        // boundary types differ, so structural IR does not grow with or specialize on the mapped extent's runtime
+        // value.
         let static_trace = TraceContext::new();
         let static_extent_type = DimensionValue::constant(2)?.r#type().clone();
         let static_extent = static_trace.input(static_extent_type.clone().into());
@@ -3913,6 +4054,49 @@ mod tests {
                 .iter()
                 .all(|instruction| !matches!(instruction.operation(), ArrayProgramOperation::DimensionSize(_))),
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_executable_linear_call_batching_threads_the_mapped_extent() -> Result<(), ProgramError> {
+        type TestProgram = Program<
+            ArrayProgramValue<Array>,
+            ArrayProgramOperation<Array>,
+            Vec<ArrayProgramValue<Array>>,
+            Vec<ArrayProgramValue<Array>>,
+        >;
+
+        let residual_type = DimensionType::new(DimensionVariable::new("residual", DimensionBounds::new(0, Some(9))?));
+        let array_type = ArrayType::scalar(DataType::F64);
+        let identity_region = || -> Result<TestProgram, ProgramError> {
+            let mut builder = ProgramBuilder::new();
+            builder.add_input(residual_type.clone().into());
+            let linear = builder.add_input(array_type.clone().into());
+            builder.build(vec![linear], vec![Placeholder; 2], vec![Placeholder])
+        };
+        let forward = identity_region()?;
+        let transpose = identity_region()?;
+        let residual = ArrayProgramValue::Dimension(DimensionValue::new(residual_type, 3)?);
+        let linear = ArrayProgramValue::Array(Array::vector(vec![2.0_f64, 5.0]));
+
+        // The dimension residual remains replicated while the linear input and output carry the inferred mapped
+        // extent. Both attached regions are structurally batched with that extent threaded through their boundary.
+        let output: ArrayProgramValue<Array> = batch(
+            |(residual, linear)| {
+                let outputs = residual.context().bind(
+                    ArrayProgramOperation::LinearCall(LinearCallOperation::new(1)),
+                    vec![forward, transpose],
+                    &[residual.clone(), linear],
+                )?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (residual, linear.clone()),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )?;
+        assert_eq!(output, linear);
 
         Ok(())
     }

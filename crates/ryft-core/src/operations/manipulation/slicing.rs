@@ -14,21 +14,18 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroLike, ZeroOperation};
-use crate::operations::control_flow::scan::render_factor_list;
 use crate::operations::manipulation::{LegacyBroadcast, PadOperation, Reshape, Transpose};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
-use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::custom_derivatives::CustomVjpResidual;
-use crate::types::{ArrayType, Dimension, Memory, Shape};
+use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, Memory, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -92,6 +89,106 @@ pub struct SliceOperation {
 
     /// Stride for each input axis (every stride is at least `1`).
     strides: Vec<usize>,
+}
+
+/// Mixed slice operation whose inclusive starts and output sizes are first-class dimensions.
+///
+/// Operands are ordered as `[array, starts..., sizes...]`, with one start and one size per array axis. The output
+/// shape is defined directly by the size operands, so bounded-dynamic slices retain exact runtime geometry without
+/// storing identities or values in the operation payload. The strides are static, positive operation parameters.
+/// Every start and size is nonnegative and execution requires the final selected element on each nonempty axis,
+/// `start + (size - 1) * stride`, to lie within the corresponding input axis. XLA lowers this operation through
+/// `stablehlo.real_dynamic_slice`; [`DynamicSliceOperation`] remains the convenient form for scalar-array starts and
+/// statically known slice sizes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DynamicShapeSliceOperation {
+    /// Static stride applied along each sliced axis.
+    strides: Vec<usize>,
+}
+
+impl DynamicShapeSliceOperation {
+    /// Creates an operation with one unit stride per array axis.
+    #[inline]
+    pub fn new(rank: usize) -> Self {
+        Self { strides: vec![1; rank] }
+    }
+
+    /// Replaces the per-axis strides.
+    pub fn with_strides(mut self, strides: Vec<usize>) -> Result<Self, TypeError> {
+        if strides.len() != self.strides.len() {
+            return Err(TypeError::invalid(format!(
+                "'dynamic_shape_slice' strides has length {} but input has rank {}",
+                strides.len(),
+                self.strides.len(),
+            )));
+        }
+        if let Some((axis, _)) = strides.iter().enumerate().find(|(_, stride)| **stride == 0) {
+            return Err(TypeError::invalid(format!("'dynamic_shape_slice' stride must be positive on axis {axis}",)));
+        }
+        self.strides = strides;
+        Ok(self)
+    }
+
+    /// Returns the static stride applied along each sliced axis.
+    #[inline]
+    pub fn strides(&self) -> &[usize] {
+        &self.strides
+    }
+}
+
+impl Display for DynamicShapeSliceOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation<ArrayProgramType> for DynamicShapeSliceOperation {
+    #[inline]
+    fn name(&self) -> &'static str {
+        "dynamic_shape_slice"
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayProgramType],
+        region_interfaces: &[RegionInterface<ArrayProgramType>],
+    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        let Some(input_type) = input_types.first() else {
+            return Err(TypeError::invalid("'dynamic_shape_slice' expects an array operand"));
+        };
+        let input_type = <&ArrayType>::try_from(input_type)?;
+        if self.strides.len() != input_type.rank() {
+            return Err(TypeError::invalid(format!(
+                "'dynamic_shape_slice' strides has length {} but input has rank {}",
+                self.strides.len(),
+                input_type.rank(),
+            )));
+        }
+        check_count!("input", input_types, 1 + 2 * input_type.rank(), TypeError);
+        let starts = &input_types[1..1 + input_type.rank()];
+        let sizes = &input_types[1 + input_type.rank()..];
+        for start in starts {
+            <&DimensionType>::try_from(start)?;
+        }
+        let dimensions = sizes
+            .iter()
+            .map(<&DimensionType>::try_from)
+            .map(|result| result.map(DimensionType::to_dimension))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_type = ArrayType::new(input_type.data_type(), Shape::new(dimensions.clone()))
+            .with_memory(input_type.memory())
+            .with_sharding(resized_output_sharding(input_type, dimensions.as_slice(), self.name())?)
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        Ok(vec![output_type.into()])
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?
+            .bracketed(|operation| operation.field("strides", format_args!("{:?}", self.strides)))
+    }
 }
 
 impl SliceOperation {
@@ -512,14 +609,6 @@ impl Slice for ArrayType {
         for (axis, ((&start, &limit), &stride)) in
             start_indices.iter().zip(limit_indices.iter()).zip(strides.iter()).enumerate()
         {
-            let dimension = self.dimension(axis);
-            let Dimension::Static(size) = dimension else {
-                return Err(TypeError::invalid(format!(
-                    "'slice' does not support dynamic input axis {axis} with size {dimension}; slice bounds \
-                        cannot be validated against an unknown extent",
-                ))
-                .into());
-            };
             if stride == 0 {
                 return Err(TypeError::invalid(format!(
                     "'slice' strides must be at least 1 but axis {axis} has stride 0"
@@ -532,11 +621,22 @@ impl Slice for ArrayType {
                 ))
                 .into());
             }
-            if limit > size {
-                return Err(TypeError::invalid(format!(
-                    "'slice' limit index {limit} is out of bounds for axis {axis} with size {size}"
-                ))
-                .into());
+            match self.dimension(axis) {
+                Dimension::Static(size) if limit > size => {
+                    return Err(TypeError::invalid(format!(
+                        "'slice' limit index {limit} is out of bounds for axis {axis} with size {size}"
+                    ))
+                    .into());
+                }
+                Dimension::Dynamic(variable) if limit > variable.bounds().lower() => {
+                    return Err(TypeError::invalid(format!(
+                        "'slice' limit index {limit} exceeds the guaranteed minimum extent {} of dynamic axis \
+                         {axis}",
+                        variable.bounds().lower(),
+                    ))
+                    .into());
+                }
+                _ => {}
             }
             output_dimensions.push(Dimension::Static((limit - start).div_ceil(stride)));
         }
@@ -843,20 +943,26 @@ impl UpdateSlice for ArrayType {
                 ))
                 .into());
             };
-            let input_dimension = self.dimension(axis);
-            let Dimension::Static(input_size) = input_dimension else {
-                return Err(TypeError::invalid(format!(
-                    "'update_slice' cannot prove that the update fits along dynamic input axis {axis} with \
-                        size {input_dimension}",
-                ))
-                .into());
-            };
-            if start.checked_add(update_size).is_none_or(|limit| limit > input_size) {
-                return Err(TypeError::invalid(format!(
-                    "'update_slice' update axis {axis} with start index {start} and size {update_size} does not \
-                        fit in input size {input_size}",
-                ))
-                .into());
+            let limit = start.checked_add(update_size).ok_or_else(|| {
+                TypeError::invalid(format!("'update_slice' update limit overflows usize on axis {axis}"))
+            })?;
+            match self.dimension(axis) {
+                Dimension::Static(input_size) if limit > input_size => {
+                    return Err(TypeError::invalid(format!(
+                        "'update_slice' update axis {axis} with start index {start} and size {update_size} does not \
+                            fit in input size {input_size}",
+                    ))
+                    .into());
+                }
+                Dimension::Dynamic(variable) if limit > variable.bounds().lower() => {
+                    return Err(TypeError::invalid(format!(
+                        "'update_slice' update limit {limit} exceeds the guaranteed minimum extent {} of dynamic \
+                         axis {axis}",
+                        variable.bounds().lower(),
+                    ))
+                    .into());
+                }
+                _ => {}
             }
         }
         // The output is distributed like the input operand (the update is written in place); the operand's placement
@@ -1131,13 +1237,11 @@ impl DynamicSlice for ArrayType {
                     ))
                     .into());
                 }
-                Dimension::Dynamic(variable)
-                    if variable.bounds().upper().is_some_and(|upper_bound| size >= upper_bound) =>
-                {
-                    let upper_bound = variable.bounds().upper().unwrap();
+                Dimension::Dynamic(variable) if size > variable.bounds().lower() => {
                     return Err(TypeError::invalid(format!(
-                        "'dynamic_slice' size {size} cannot fit axis {axis} with exclusive upper bound \
-                             {upper_bound}",
+                        "'dynamic_slice' size {size} exceeds the guaranteed minimum extent {} of dynamic axis \
+                         {axis}",
+                        variable.bounds().lower(),
                     ))
                     .into());
                 }
@@ -1422,20 +1526,23 @@ impl DynamicUpdateSlice for ArrayType {
                 ))
                 .into());
             };
-            let input_dimension = self.dimension(axis);
-            let Dimension::Static(input_size) = input_dimension else {
-                return Err(TypeError::invalid(format!(
-                    "'dynamic_update_slice' cannot prove that the update fits along dynamic input axis {axis} \
-                        with size {input_dimension}",
-                ))
-                .into());
-            };
-            if update_size > input_size {
-                return Err(TypeError::invalid(format!(
-                    "'dynamic_update_slice' update axis {axis} has size {update_size} which exceeds input size \
-                        {input_size}",
-                ))
-                .into());
+            match self.dimension(axis) {
+                Dimension::Static(input_size) if update_size > input_size => {
+                    return Err(TypeError::invalid(format!(
+                        "'dynamic_update_slice' update axis {axis} has size {update_size} which exceeds input size \
+                            {input_size}",
+                    ))
+                    .into());
+                }
+                Dimension::Dynamic(variable) if update_size > variable.bounds().lower() => {
+                    return Err(TypeError::invalid(format!(
+                        "'dynamic_update_slice' update size {update_size} exceeds the guaranteed minimum extent {} \
+                         of dynamic axis {axis}",
+                        variable.bounds().lower(),
+                    ))
+                    .into());
+                }
+                _ => {}
             }
         }
         // The output is distributed like the input operand (the update is written in place); the operand's placement
@@ -1463,158 +1570,13 @@ where
     }
 }
 
-// TODO(eaplatanios): Should this be renamed to something that's not about "linearity"? This is about captured primals.
-/// Captured-index dynamic slice linear operation: the linear map `t ↦ dynamic_slice(t, start_indices, sizes)` over
-/// the tangent (or cotangent) of the sliced operand.
-///
-/// It is the captured-index linear map emitted by the JVP of [`DynamicSliceOperation`]:
-/// the scalar integer start indices are primal values captured at linearization time as residual factors (they have
-/// no tangent space, so the map is linear in the single tangent operand), while its transpose scatters the output
-/// cotangent back into the read window. The single operation input is the sliced operand's tangent; the captured
-/// `start_indices` are appended as the dynamic slice's index operands during type inference.
-#[derive(Clone, Debug, PartialEq)]
-pub struct LinearDynamicSliceOperation<F> {
-    /// Captured scalar integer start index factors, one per input axis.
-    start_indices: Vec<F>,
-
-    /// Dimension of the extracted slice along each input axis.
-    sizes: Vec<usize>,
-}
-
-impl<F> LinearDynamicSliceOperation<F> {
-    /// Creates a new [`LinearDynamicSliceOperation`] capturing the provided start index factors and slice sizes.
-    #[inline]
-    pub fn new(start_indices: Vec<F>, sizes: Vec<usize>) -> Self {
-        Self { start_indices, sizes }
-    }
-
-    /// Returns the captured scalar integer start index factors, one per input axis.
-    #[inline]
-    pub fn start_indices(&self) -> &[F] {
-        self.start_indices.as_slice()
-    }
-
-    /// Returns the slice sizes of this [`LinearDynamicSliceOperation`], one per input axis.
-    #[inline]
-    pub fn sizes(&self) -> &[usize] {
-        self.sizes.as_slice()
-    }
-}
-
-impl<F: Value<Type = ArrayType>> Display for LinearDynamicSliceOperation<F> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearDynamicSliceOperation<F> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        DYNAMIC_SLICE_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        let mut full_input_types = input_types.to_vec();
-        full_input_types.extend(self.start_indices.iter().map(|index| index.r#type().into_owned()));
-        DynamicSliceOperation::new(self.sizes.clone()).infer_output_types(full_input_types.as_slice(), &[])
-    }
-
-    fn rename_type_identities(
-        &self,
-        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
-    ) -> Result<Self, TypeError> {
-        Ok(Self {
-            start_indices: self
-                .start_indices
-                .iter()
-                .map(|index| index.rename_type_identities(renaming))
-                .collect::<Result<Vec<_>, _>>()?,
-            sizes: self.sizes.clone(),
-        })
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-            operation.field("start_indices", format_args!("{}", render_factor_list(&self.start_indices)))?;
-            operation.field("sizes", format_args!("{:?}", self.sizes))
-        })
-    }
-}
-
-impl<F, C> InterpretableOperation<C> for LinearDynamicSliceOperation<F>
-where
-    C: Domain<Type = ArrayType, Value: DynamicSlice>,
-    F: CustomVjpResidual<C::Value>,
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let start_indices =
-            self.start_indices().iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
-        Ok(vec![inputs[0].dynamic_slice(start_indices.as_slice(), self.sizes())?])
-    }
-}
-
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a [`LinearDynamicSliceOperation`].
-impl<F: Value<Type = ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
-    for LinearDynamicSliceOperation<F>
-where
-    C::Operation: From<LinearDynamicSliceOperation<F>>,
-{
-}
-
-/// Transpose rule for the captured-index dynamic slice. The forward linear map
-/// `t ↦ dynamic_slice(t, start_indices, sizes)` transposes by scattering the output cotangent back into a zero array
-/// of the input type at the same captured indices, i.e. a captured-index dynamic update-slice with the same start
-/// indices. Symbolic-zero cotangents propagate unchanged.
-impl<V: Value<Type = ArrayType>, O, F: Value<Type = ArrayType>> TransposableOperation<V, O>
-    for LinearDynamicSliceOperation<F>
-where
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearDynamicUpdateSliceOperation<F>>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
-            MaybeZero::Value(cotangent) => {
-                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent()).materialize(context)?;
-                let outputs = context.stage_operation(
-                    LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
-                    Vec::new(),
-                    &[zeros, cotangent.clone()],
-                )?;
-                check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![MaybeZero::Value(outputs.into_iter().next().unwrap())])
-            }
-        }
-    }
-}
-
 /// Partition-aware transpose rule for the primal [`DynamicSliceOperation`]. The scalar integer start indices
 /// (operands 1 onward) have no tangent space, so in a valid pushforward they are the known operands and the sliced
 /// operand (operand 0) is the linear one. The forward map `t ↦ dynamic_slice(t, start_indices, sizes)` transposes by
 /// scattering the output cotangent back into a zero array of the operand type at the same start indices, i.e. a
-/// dynamic update-slice at those indices. This reproduces the captured-index [`LinearDynamicSliceOperation`] transpose
-/// rule, reading the start indices from the pullback through `operand_values` and staging a primal
-/// [`DynamicUpdateSliceOperation`] instead of folding the indices into captured factors. The start indices receive
-/// structural zeros, and a zero output cotangent stays a structural zero.
+/// dynamic update-slice at those indices. The transpose reads the known start indices from the pullback boundary and
+/// stages an ordinary [`DynamicUpdateSliceOperation`], so linearization retains the indices as regular SSA residuals.
+/// The start indices receive structural zeros, and a zero output cotangent stays a structural zero.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicSliceOperation
 where
     O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<DynamicUpdateSliceOperation>,
@@ -1653,162 +1615,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Should this be renamed to something that's not about "linearity"? This is about captured primals.
-/// Captured-index dynamic update-slice linear operation: the linear map
-/// `(t, u) ↦ dynamic_update_slice(t, u, start_indices)` over the tangents (or cotangents) of the input and update
-/// operands.
-///
-/// It is the captured-index linear map emitted by the JVP of
-/// [`DynamicUpdateSliceOperation`]: the scalar integer start indices are primal values captured at linearization time
-/// as residual factors (they have no tangent space, so the map is jointly linear in the two tangent operands). The
-/// two operation inputs are the input and update tangents; the captured `start_indices` are appended as the dynamic
-/// update-slice's index operands during type inference.
-#[derive(Clone, Debug, PartialEq)]
-pub struct LinearDynamicUpdateSliceOperation<F> {
-    /// Captured scalar integer start index factors, one per input axis.
-    start_indices: Vec<F>,
-}
-
-impl<F> LinearDynamicUpdateSliceOperation<F> {
-    /// Creates a new [`LinearDynamicUpdateSliceOperation`] capturing the provided start index factors.
-    #[inline]
-    pub fn new(start_indices: Vec<F>) -> Self {
-        Self { start_indices }
-    }
-
-    /// Returns the captured scalar integer start index factors, one per input axis.
-    #[inline]
-    pub fn start_indices(&self) -> &[F] {
-        self.start_indices.as_slice()
-    }
-}
-
-impl<F: Value<Type = ArrayType>> Display for LinearDynamicUpdateSliceOperation<F> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearDynamicUpdateSliceOperation<F> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        DYNAMIC_UPDATE_SLICE_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
-        let mut full_input_types = input_types.to_vec();
-        full_input_types.extend(self.start_indices.iter().map(|index| index.r#type().into_owned()));
-        DynamicUpdateSliceOperation.infer_output_types(full_input_types.as_slice(), &[])
-    }
-
-    #[inline]
-    fn rename_type_identities(
-        &self,
-        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
-    ) -> Result<Self, TypeError> {
-        Ok(Self {
-            start_indices: self
-                .start_indices
-                .iter()
-                .map(|index| index.rename_type_identities(renaming))
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-            operation.field("start_indices", format_args!("{}", render_factor_list(&self.start_indices)))
-        })
-    }
-}
-
-impl<F, C> InterpretableOperation<C> for LinearDynamicUpdateSliceOperation<F>
-where
-    C: Domain<Type = ArrayType, Value: DynamicUpdateSlice>,
-    F: CustomVjpResidual<C::Value>,
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let start_indices =
-            self.start_indices().iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
-        Ok(vec![inputs[0].dynamic_update_slice(&inputs[1], start_indices.as_slice())?])
-    }
-}
-
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a [`LinearDynamicUpdateSliceOperation`].
-impl<F: Value<Type = ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
-    for LinearDynamicUpdateSliceOperation<F>
-where
-    C::Operation: From<LinearDynamicUpdateSliceOperation<F>>,
-{
-}
-
-/// Transpose rule for the captured-index dynamic update-slice. The forward linear map
-/// `(t, u) ↦ dynamic_update_slice(t, u, start_indices)` splits the output cotangent into two contributions at the same
-/// captured indices: the input cotangent is the cotangent with the update window zeroed (a captured-index dynamic
-/// update-slice with the same start indices) and the update cotangent is the dynamic slice of the cotangent at the
-/// update window (a captured-index dynamic slice with the same start indices). Symbolic-zero cotangents propagate
-/// unchanged.
-impl<V: Value<Type = ArrayType>, O, F: Value<Type = ArrayType>> TransposableOperation<V, O>
-    for LinearDynamicUpdateSliceOperation<F>
-where
-    O: Operation<ArrayType>
-        + From<ZeroOperation<ArrayType>>
-        + From<LinearDynamicUpdateSliceOperation<F>>
-        + From<LinearDynamicSliceOperation<F>>,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent()),
-                MaybeZero::Zero(inputs[1].r#type().cotangent()),
-            ]),
-            MaybeZero::Value(cotangent) => {
-                let update_sizes = static_update_sizes("'dynamic_update_slice' transpose", &inputs[1].r#type())?;
-                let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent()).materialize(context)?;
-                let input_cotangents = context.stage_operation(
-                    LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
-                    Vec::new(),
-                    &[cotangent.clone(), zeros],
-                )?;
-                check_count!("output", input_cotangents, 1, ProgramError);
-                let update_cotangents = context.stage_operation(
-                    LinearDynamicSliceOperation::new(self.start_indices().to_vec(), update_sizes),
-                    Vec::new(),
-                    std::slice::from_ref(cotangent),
-                )?;
-                check_count!("output", update_cotangents, 1, ProgramError);
-                let update_cotangent =
-                    update_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[1].r#type().cotangent())?;
-                Ok(vec![
-                    MaybeZero::Value(input_cotangents.into_iter().next().unwrap()),
-                    MaybeZero::Value(update_cotangent),
-                ])
-            }
-        }
-    }
-}
-
 /// Reads the known scalar integer start-index operands of a dynamic slicing operation from the pullback. Each entry of
 /// `inputs` is the start index's [`PartialValue`]; the dispatch guarantees a [`Known`](PartialValue::Known) operand
 /// carries its pullback value, so each tracer is read directly.
@@ -1827,10 +1633,9 @@ fn read_known_start_indices<V: Value<Type = ArrayType>, O: Operation<ArrayType>>
 /// `(t, u) ↦ dynamic_update_slice(t, u, start_indices)` splits the output cotangent into two contributions at the
 /// same start indices: the input cotangent is the cotangent with the update window zeroed (a dynamic update-slice
 /// writing zeros at the indices) and the update cotangent is the dynamic slice of the cotangent at the update window.
-/// This reproduces the captured-index [`LinearDynamicUpdateSliceOperation`] transpose rule, reading the start indices
-/// from the pullback through `operand_values` and staging primal slicing operations instead of folding the indices
-/// into captured factors. The start indices receive structural zeros, and a zero output cotangent stays a structural
-/// zero.
+/// The transpose reads the known start indices from the pullback boundary and stages ordinary dynamic slicing
+/// operations, so linearization retains the indices as regular SSA residuals. The start indices receive structural
+/// zeros, and a zero output cotangent stays a structural zero.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicUpdateSliceOperation
 where
     O: Operation<ArrayType>
@@ -2166,8 +1971,7 @@ mod tests {
                         DataType::F64,
                         Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())), Dimension::Static(3)]),
                     )],
-                    error = "'slice' does not support dynamic input axis 0 with size dynamic; slice bounds cannot be \
-                        validated against an unknown extent",
+                    error = "'slice' limit index 2 exceeds the guaranteed minimum extent 0 of dynamic axis 0",
                 },
             ],
         );
@@ -2405,10 +2209,7 @@ mod tests {
         assert_eq!(
             UpdateSliceOperation::new(vec![0, usize::MAX])
                 .infer_output_types(&[input_type.clone(), update_type.clone()], &[]),
-            Err(TypeError::invalid(format!(
-                "'update_slice' update axis 1 with start index {} and size 2 does not fit in input size 3",
-                usize::MAX,
-            ))),
+            Err(TypeError::invalid("'update_slice' update limit overflows usize on axis 1".to_string())),
         );
 
         // Interpretation overwrites the selected block of the row-major payload.
@@ -2478,8 +2279,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'update_slice' cannot prove that the update fits along dynamic input axis 0 with size dynamic"
-                    .to_string()
+                "'update_slice' update limit 1 exceeds the guaranteed minimum extent 0 of dynamic axis 0".to_string()
             )),
         );
         assert_eq!(
@@ -2689,15 +2489,18 @@ mod tests {
                 .infer_output_types(&[input_type.clone(), index_type.clone(), index_type.clone(),], &[]),
             Err(TypeError::invalid("'dynamic_slice' size 4 is out of bounds for axis 1 with size 3".to_string())),
         );
-        // A dynamic input axis is accepted: StableHLO clamping keeps the read in bounds against the unknown extent
-        // and the output dimension is still the static `sizes[axis]`. The static axis 1 still validates `2 <= 3`.
+        // A dynamic input axis is accepted when its minimum extent proves the static result window always fits. The
+        // static axis 1 still validates `2 <= 3`.
         assert_eq!(
             operation.infer_output_types(
                 &[
                     ArrayType::new(
                         DataType::F64,
                         Shape::new(vec![
-                            Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+                            Dimension::Dynamic(DimensionVariable::new(
+                                "dynamic",
+                                DimensionBounds::new(1, None).unwrap()
+                            )),
                             Dimension::Static(3)
                         ])
                     ),
@@ -2708,7 +2511,7 @@ mod tests {
             ),
             Ok(vec![output_type.clone()]),
         );
-        // A bounded-dynamic input axis is accepted when its maximum possible extent can contain the static slice.
+        // A bounded-dynamic input axis is accepted when its minimum possible extent contains the static slice.
         assert_eq!(
             operation.infer_output_types(
                 &[
@@ -2717,7 +2520,7 @@ mod tests {
                         Shape::new(vec![
                             Dimension::Dynamic(DimensionVariable::new(
                                 "dynamic",
-                                DimensionBounds::non_negative(Some(2)).unwrap()
+                                DimensionBounds::new(1, Some(2)).unwrap()
                             )),
                             Dimension::Static(3)
                         ])
@@ -2748,7 +2551,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'dynamic_slice' size 1 cannot fit axis 0 with exclusive upper bound 1".to_string()
+                "'dynamic_slice' size 1 exceeds the guaranteed minimum extent 0 of dynamic axis 0".to_string()
             )),
         );
         assert_eq!(
@@ -2969,25 +2772,20 @@ mod tests {
                 "'dynamic_update_slice' update axis 1 has size 4 which exceeds input size 3".to_string()
             )),
         );
+        let dynamic_input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+                Dimension::Static(3),
+            ]),
+        );
         assert_eq!(
             operation.infer_output_types(
-                &[
-                    ArrayType::new(
-                        DataType::F64,
-                        Shape::new(vec![
-                            Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
-                            Dimension::Static(3)
-                        ])
-                    ),
-                    update_type.clone(),
-                    index_type.clone(),
-                    index_type.clone(),
-                ],
+                &[dynamic_input_type.clone(), update_type.clone(), index_type.clone(), index_type.clone(),],
                 &[],
             ),
             Err(TypeError::invalid(
-                "'dynamic_update_slice' cannot prove that the update fits along dynamic input axis 0 with \
-                    size dynamic"
+                "'dynamic_update_slice' update size 1 exceeds the guaranteed minimum extent 0 of dynamic axis 0"
                     .to_string()
             )),
         );

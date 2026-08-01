@@ -2916,7 +2916,7 @@ mod tests {
         DimensionAddOperation, DimensionDivFloorOperation, DimensionSizeOperation, DimensionToScalarOperation,
     };
     use ryft_core::operations::logical::AndOperation;
-    use ryft_core::operations::manipulation::{BroadcastOperation, ReshapeOperation};
+    use ryft_core::operations::manipulation::{BroadcastOperation, DynamicShapeSliceOperation, ReshapeOperation};
     use ryft_core::operations::math::{AddOperation, Atan2Operation, DivOperation, MulOperation, NegOperation};
     use ryft_core::programs::regions::CalleeRegionDriver;
     use ryft_core::sharding::ShardingDimension;
@@ -3405,6 +3405,57 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].shape().as_slice(), &[4]);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![7.0; 4]);
+    }
+
+    #[test]
+    fn test_production_composite_lowering_executes_dynamic_shape_slice() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = replicated_vector_type(&mesh, 6);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let start = builder
+            .add_instruction(
+                XlaOperation::Dimension(DimensionOperation::Constant(ConstantOperation::new(
+                    DimensionValue::constant(1).unwrap(),
+                ))),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()[0];
+        let size = builder
+            .add_instruction(
+                XlaOperation::Dimension(DimensionOperation::Constant(ConstantOperation::new(
+                    DimensionValue::constant(3).unwrap(),
+                ))),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                XlaOperation::DynamicShapeSlice(DynamicShapeSliceOperation::new(1).with_strides(vec![2]).unwrap()),
+                Vec::new(),
+                vec![input, start, size],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let lowering = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert!(lowering.stable_hlo().contains("stablehlo.real_dynamic_slice"));
+        let compiled = domain.compile_xla_program(&lowering).unwrap();
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
+                .unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![input]).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].shape().as_slice(), &[3]);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![1.0, 3.0, 5.0]);
     }
 
     #[test]

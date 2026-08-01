@@ -26,7 +26,9 @@ use ryft_core::operations::dimensions::{
     DimensionFromScalarOperation, DimensionSizeOperation, DimensionToScalarOperation,
 };
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
-use ryft_core::operations::manipulation::{BroadcastOperation, ConcatenateOperation, PadOperation, ReshapeOperation};
+use ryft_core::operations::manipulation::{
+    BroadcastOperation, ConcatenateOperation, DynamicShapeSliceOperation, PadOperation, ReshapeOperation,
+};
 use ryft_core::operations::manipulation::{
     ConvertElementTypeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
     LegacyBroadcastOperation, LegacyReshapeOperation, ScatterOperation, SliceOperation, TransposeOperation,
@@ -131,6 +133,9 @@ where
     /// Pads an array with explicit result extents.
     Pad(PadOperation),
 
+    /// Slices an array using first-class start and size dimensions.
+    DynamicShapeSlice(DynamicShapeSliceOperation),
+
     /// Generates random bits with explicit dynamic result extents.
     RngBitGenerator(RngBitGeneratorOperation),
 
@@ -205,6 +210,7 @@ where
             ArrayProgramOperation::Concatenate(operation) => Self::Concatenate(operation),
             ArrayProgramOperation::CustomCall(operation) => Self::CustomCall(operation),
             ArrayProgramOperation::Pad(operation) => Self::Pad(operation),
+            ArrayProgramOperation::DynamicShapeSlice(operation) => Self::DynamicShapeSlice(operation),
             ArrayProgramOperation::RngBitGenerator(operation) => Self::RngBitGenerator(operation),
             ArrayProgramOperation::AllGather(operation) => Self::AllGather(operation),
             ArrayProgramOperation::PSumScatter(operation) => Self::PSumScatter(operation),
@@ -498,6 +504,7 @@ where
             Self::Concatenate(operation) => ArrayProgramOperation::Concatenate(operation.clone()),
             Self::CustomCall(operation) => ArrayProgramOperation::CustomCall(operation.clone()),
             Self::Pad(operation) => ArrayProgramOperation::Pad(operation.clone()),
+            Self::DynamicShapeSlice(operation) => ArrayProgramOperation::DynamicShapeSlice(operation.clone()),
             Self::RngBitGenerator(operation) => ArrayProgramOperation::RngBitGenerator(operation.clone()),
             Self::AllGather(operation) => ArrayProgramOperation::AllGather(operation.clone()),
             Self::PSumScatter(operation) => ArrayProgramOperation::PSumScatter(operation.clone()),
@@ -542,6 +549,9 @@ macro_rules! dispatch_operation {
                 Operation::<ArrayProgramType>::$method(operation, $($argument),*)
             }
             XlaOperation::Pad(operation) => Operation::<ArrayProgramType>::$method(operation, $($argument),*),
+            XlaOperation::DynamicShapeSlice(operation) => {
+                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+            }
             XlaOperation::RngBitGenerator(operation) => {
                 Operation::<ArrayProgramType>::$method(operation, $($argument),*)
             }

@@ -776,6 +776,77 @@ where
             }
             Ok(results)
         }
+        ArrayProgramOperation::DynamicShapeSlice(operation) => {
+            let Some((input, bounds)) = input_values.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let [output_type] = output_types else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+            };
+            let output_type =
+                <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let rank = output_type.rank();
+            if bounds.len() != 2 * rank {
+                return Err(
+                    ProgramError::InvalidInputCount { expected: 1 + 2 * rank, actual: input_values.len() }.into()
+                );
+            }
+            let (starts, sizes) = bounds.split_at(rank);
+            let stride_type = context
+                .tensor_type(context.signless_integer_type(64), &[MlirSize::Static(rank)], None, location)
+                .map_err(|_| LoweringError::InvalidTensorType {
+                    array_type: ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(rank)])),
+                })?;
+            let stride_values = operation
+                .strides()
+                .iter()
+                .map(|stride| {
+                    i64::try_from(*stride).map_err(|_| ProgramError::InvalidArgument {
+                        message: "'dynamic_shape_slice' stride exceeds the StableHLO i64 index range".to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let starts = lower_explicit_shape(starts, block, context, location)?;
+            let sizes = lower_explicit_shape(sizes, block, context, location)?;
+            let strides = context
+                .dense_i64_elements_attribute(stride_type, stride_values.as_slice())
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+            let strides = block.append_operation(stable_hlo::constant(strides, location)?)?;
+            let strides = strides.result(0).expect("stablehlo.constant should return one result").as_ref();
+            let limits = if stride_values.iter().all(|stride| *stride == 1) {
+                let limits = block.append_operation(stable_hlo::add(starts, sizes, location)?)?;
+                limits.result(0).expect("stablehlo.add should return one result").as_ref()
+            } else {
+                let adjustments = stride_values.iter().map(|stride| stride - 1).collect::<Vec<_>>();
+                let adjustments = context
+                    .dense_i64_elements_attribute(stride_type, adjustments.as_slice())
+                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+                let adjustments = block.append_operation(stable_hlo::constant(adjustments, location)?)?;
+                let adjustments = adjustments.result(0).expect("stablehlo.constant should return one result").as_ref();
+
+                // `max(sizes * strides, strides - 1) - (strides - 1)` is zero for an empty slice and
+                // `(sizes - 1) * strides + 1` otherwise. Computing every axis together avoids rank-proportional
+                // scalar arithmetic while retaining the smallest valid exclusive limit for each axis.
+                let products = block.append_operation(stable_hlo::multiply(sizes, strides, location)?)?;
+                let products = products.result(0).expect("stablehlo.multiply should return one result").as_ref();
+                let adjusted = block.append_operation(stable_hlo::maximum(products, adjustments, location)?)?;
+                let adjusted = adjusted.result(0).expect("stablehlo.maximum should return one result").as_ref();
+                let spans = block.append_operation(stable_hlo::subtract(adjusted, adjustments, location)?)?;
+                let spans = spans.result(0).expect("stablehlo.subtract should return one result").as_ref();
+                let limits = block.append_operation(stable_hlo::add(starts, spans, location)?)?;
+                limits.result(0).expect("stablehlo.add should return one result").as_ref()
+            };
+            let output_type = lower_tensor_type(output_type, context, location)?;
+            let operation = block.append_operation(stable_hlo::real_dynamic_slice(
+                *input,
+                starts,
+                limits,
+                strides,
+                output_type,
+                location,
+            )?)?;
+            Ok(vec![operation.result(0).expect("stablehlo.real_dynamic_slice should return one result").as_ref()])
+        }
         ArrayProgramOperation::RngBitGenerator(operation) => {
             let has_dynamic_output = operation
                 .output_type()

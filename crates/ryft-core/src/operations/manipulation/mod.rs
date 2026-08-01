@@ -25,7 +25,7 @@ pub use scattering::{
     SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
 };
 pub use slicing::{
-    DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicDimensionSliceOperation, DynamicSlice,
+    DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicShapeSliceOperation, DynamicSlice,
     DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, SLICE_OPERATION_NAME, Slice,
     SliceOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
 };
