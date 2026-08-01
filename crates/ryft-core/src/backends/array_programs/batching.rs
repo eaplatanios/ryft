@@ -18,7 +18,7 @@ use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchAxisSpecification, BatchableOperation,
     BatchableType, BatchedProgram, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
     BatchingPolicy, BatchingTracer, DimensionSource, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver,
-    RecursiveBatchingPolicy, batch_axis_sharding, normalized_batch_axis_type,
+    RecursiveBatchingPolicy, batch_axis_sharding, batch_projected_operation, normalized_batch_axis_type,
 };
 use crate::contexts::{Context, ProjectedContext, StagingContext, ValueResolution};
 use crate::differentiation::LinearCallOperation;
@@ -46,7 +46,7 @@ use crate::operations::math::{Div, Mul, Reduce, ReduceOperation, ReductionKind};
 use crate::operations::random::RngBitGeneratorOperation;
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::regions::{EmptyRegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver};
+use crate::programs::regions::{RegionRef, RegionReplayMappings, ReplayRegionDriver};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValue, ProjectedValueRef, Value, ValueProjection};
 use crate::programs::{Program, ProgramBuilder, ProgramError};
@@ -207,6 +207,11 @@ impl<C: Context<Type = ArrayProgramType>> BatchingPolicy<C> for ArrayProgramBatc
     }
 
     #[inline]
+    fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+        batch.batch_axis()
+    }
+
+    #[inline]
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
         batch.r#type()
     }
@@ -334,6 +339,11 @@ where
     #[inline]
     fn value(batch: &Self::Batch) -> &<C::Value as ValueProjection<ArrayType>>::Projected {
         batch.value()
+    }
+
+    #[inline]
+    fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+        batch.batch_axis()
     }
 
     #[inline]
@@ -1002,55 +1012,6 @@ where
     }
 }
 
-/// Projects composite array batches, applies one homogeneous array batching rule, and lifts its outputs.
-fn batch_projected_array_operation<C, O>(
-    operation: &O,
-    context: &BatchingContext<C, ArrayProgramBatching>,
-    inputs: &[ArrayProgramBatch<C::Value>],
-) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError>
-where
-    C: Context<
-            Type = ArrayProgramType,
-            Operation: From<BroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + OperationProjection<ArrayType>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    O: Operation<ArrayType>
-        + BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
-{
-    let inputs = inputs
-        .iter()
-        .map(|input| {
-            let r#type = <&ArrayType>::try_from(input.value.r#type().as_ref())?.clone();
-            ArrayBatch::new(
-                r#type,
-                <C::Value as ValueProjection<ArrayType>>::into_projected(input.value.clone())?,
-                input.batch_axis,
-            )
-        })
-        .collect::<Result<Vec<_>, BatchingError>>()?;
-    let projected_context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
-        ProjectedContext::new(context.parent().clone()),
-        context.axis_extent().clone(),
-    )
-    .with_axis_name(context.axis_name().map(str::to_string))
-    .with_axis_sharding(context.axis_sharding().clone());
-    operation
-        .batch(&projected_context, &EmptyRegionDriver, inputs.as_slice())?
-        .into_iter()
-        .map(|output| {
-            let batch_axis = output.batch_axis();
-            ArrayProgramBatch::new(
-                <C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()),
-                batch_axis,
-            )
-        })
-        .collect()
-}
-
 /// Batches a condition whose regions live in the composite array-program universe.
 ///
 /// A replicated predicate keeps one structural condition and gives each transformed branch the explicit leading
@@ -1161,11 +1122,12 @@ where
         .map(|(true_output, false_output)| match true_output.unbatched_type() {
             ArrayProgramType::Array(_) => {
                 <&ArrayType>::try_from(false_output.unbatched_type())?;
-                let mut selected = batch_projected_array_operation(
-                    &SelectOperation,
-                    context,
-                    &[predicate.clone(), true_output, false_output],
-                )?;
+                let mut selected =
+                    batch_projected_operation::<ArrayType, ArrayBatching<DynamicArrayBatchingPolicy>, _, _, _>(
+                        context,
+                        &SelectOperation,
+                        &[predicate.clone(), true_output, false_output],
+                    )?;
                 check_count!("output", selected, 1, ProgramError);
                 Ok(selected.remove(0))
             }
@@ -2239,7 +2201,11 @@ where
             Self::Condition(_) => batch_condition::<A, _, _>(context, driver, inputs),
             Self::While(operation) => batch_while(operation, context, driver, inputs),
             Self::Scan(operation) => batch_scan(operation, context, driver, inputs),
-            Self::Array(operation) => batch_projected_array_operation(operation, context, inputs),
+            Self::Array(operation) => {
+                batch_projected_operation::<ArrayType, ArrayBatching<DynamicArrayBatchingPolicy>, _, _, _>(
+                    context, operation, inputs,
+                )
+            }
             Self::Dimension(operation) => {
                 for input in inputs {
                     input.validate_replicated_dimension()?;
@@ -2515,6 +2481,7 @@ mod tests {
     use crate::operations::{CollectiveKind, CollectiveOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::ShardingDimension;
     use crate::tracing::TracingContext;
     use crate::types::dimensions::{DimensionBounds, DimensionVariable};
