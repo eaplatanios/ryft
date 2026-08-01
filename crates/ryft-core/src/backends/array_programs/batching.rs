@@ -1123,7 +1123,7 @@ where
             ArrayProgramType::Array(_) => {
                 <&ArrayType>::try_from(false_output.unbatched_type())?;
                 let mut selected =
-                    batch_projected_operation::<ArrayType, ArrayBatching<DynamicArrayBatchingPolicy>, _, _, _>(
+                    batch_projected_operation::<ArrayType, _, _, ArrayBatching<DynamicArrayBatchingPolicy>, _>(
                         context,
                         &SelectOperation,
                         &[predicate.clone(), true_output, false_output],
@@ -2202,7 +2202,7 @@ where
             Self::While(operation) => batch_while(operation, context, driver, inputs),
             Self::Scan(operation) => batch_scan(operation, context, driver, inputs),
             Self::Array(operation) => {
-                batch_projected_operation::<ArrayType, ArrayBatching<DynamicArrayBatchingPolicy>, _, _, _>(
+                batch_projected_operation::<ArrayType, _, _, ArrayBatching<DynamicArrayBatchingPolicy>, _>(
                     context, operation, inputs,
                 )
             }

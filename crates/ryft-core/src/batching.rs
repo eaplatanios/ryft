@@ -4012,7 +4012,7 @@ mod tests {
         // composite policy's packed value and replicated-axis representation.
         let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
         let input = ProjectedProgramBatching::replicated(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)));
-        let outputs = batch_projected_operation::<ProjectedMemberType<2>, ProjectedMemberBatching<2>, _, _, _>(
+        let outputs = batch_projected_operation::<ProjectedMemberType<2>, _, _, ProjectedMemberBatching<2>, _>(
             &context,
             &ProjectedMemberOperation,
             &[input],

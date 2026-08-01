@@ -15,13 +15,13 @@ use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatabl
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId, MaybeZero};
 use crate::programs::builders::ProgramBuilder;
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::programs::Program;
 use crate::programs::regions::{
     BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
 };
-use crate::programs::types::{Type, Typed};
-use crate::programs::values::Value;
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Pullback of a function `f` at a linearization point `x` (i.e., the transposed linear map `ȳ ↦ x̄ = (∂f/∂x)(x)ᵀ · ȳ`),
@@ -1581,6 +1581,124 @@ where
     Ok(((output, auxiliary), gradient))
 }
 
+/// Applies a member operation's transpose rule through a projected view of a composite [`TracingContext`]. Use this
+/// function from a composite operation dispatcher when the linear operation is [`Region`](crate::Region)-free and every
+/// operand and result belongs to the same projectable member type `T`. Because [`TransposableOperation`] rules stage
+/// through a member-typed [`TracingContext`], this function records the rule in a short-lived member program, converts
+/// that program to the composite type, and splices it into the active trace. Known primal inputs and live output
+/// cotangents become splice inputs in encounter order; structural zeros remain types and do not materialize values.
+///
+/// Operations whose transpose crosses member types or whose rule needs attached regions require an explicit composite
+/// transpose rule instead.
+///
+/// # Parameters
+///
+///   - `context`: Active composite [`TracingContext`] into which the projected transpose program is spliced.
+///   - `operation`: Region-free linear operation expressed in the projected member operation family.
+///   - `inputs`: Per-operand primal knowledge, preserving whether each primal is known or is a linear unknown.
+///   - `outputs`: Composite output cotangents, represented as live traced values or structural zeros.
+pub fn transpose_projected_operation<
+    T: DifferentiableType,
+    V: Value<Type: DifferentiableType + From<T>> + ValueProjection<T, Projected: Value<Type = T>>,
+    O: Operation<V::Type>
+        + OperationProjection<
+            T,
+            Projected: TransposableOperation<
+                <V as ValueProjection<T>>::Projected,
+                <O as OperationProjection<T>>::Projected,
+            >,
+        >,
+>(
+    context: &mut TracingContext<V, O>,
+    operation: &<O as OperationProjection<T>>::Projected,
+    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>
+where
+    for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
+{
+    // Stage the native member rule in an isolated member-typed trace. The completed rule program is converted back to
+    // the composite type before it is attached to `context`, so primitive transpose rules never need composite types.
+    let mut rule_context =
+        TracingContext::<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>::new();
+
+    // Build the member rule's boundary and the matching source atoms together. Unknown primals contribute only their
+    // projected types. Known primals become leading member-program inputs and their composite atoms become the leading
+    // splice inputs, preserving the transposition rule's operand order.
+    let mut splice_inputs = Vec::new();
+    let rule_inputs = inputs
+        .iter()
+        .map(|input| -> Result<_, DifferentiationError> {
+            match input {
+                PartialValue::Unknown(r#type) => Ok(PartialValue::Unknown(<&T>::try_from(r#type)?.clone())),
+                PartialValue::Known(value) => {
+                    splice_inputs.push(value.atom_id()?);
+                    Ok(PartialValue::Known(rule_context.input(<&T>::try_from(value.r#type().as_ref())?.clone())))
+                }
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Live output cotangents follow known primals in both boundaries. Structural zeros remain type-only and therefore
+    // consume neither a member-program input nor a composite splice input.
+    let rule_outputs = outputs
+        .iter()
+        .map(|output| -> Result<_, DifferentiationError> {
+            match output {
+                MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(<&T>::try_from(r#type)?.clone())),
+                MaybeZero::Value(value) => {
+                    splice_inputs.push(value.atom_id()?);
+                    Ok(MaybeZero::Value(rule_context.input(<&T>::try_from(value.r#type().as_ref())?.clone())))
+                }
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Apply the native transpose rule to the member boundary. Any operations synthesized by the rule are recorded in
+    // `rule_context`. `EmptyRegionDriver` enforces this helper's region-free contract.
+    let rule_cotangents = operation.transpose(&mut rule_context, &EmptyRegionDriver, &rule_inputs, &rule_outputs)?;
+
+    // Only live cotangents become program outputs. Keep structural zeros in `rule_cotangents` so their exact member
+    // types can be restored after the live program has been spliced.
+    let output_ids = rule_cotangents
+        .iter()
+        .filter_map(MaybeZero::as_value)
+        .map(Tracer::atom_id)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Convert the complete member program into the composite universe, then splice it with the source atoms collected
+    // in precisely the same order as the temporary member-program inputs.
+    let rule_program = rule_context
+        .builder()
+        .borrow()
+        .clone()
+        .build::<Vec<<V as ValueProjection<T>>::Projected>, Vec<<V as ValueProjection<T>>::Projected>>(
+            output_ids,
+            vec![Placeholder; splice_inputs.len()],
+            vec![Placeholder; rule_cotangents.iter().filter(|cotangent| !cotangent.is_zero()).count()],
+        )?
+        .into_unprojected::<V, O>()?;
+    let splice_outputs = context.builder().borrow_mut().splice_program(&rule_program, splice_inputs.as_slice())?;
+    let mut splice_outputs = splice_outputs.into_iter();
+
+    // Rebuild the complete cotangent vector in operation-input order. Structural zeros lift their types directly;
+    // every live member cotangent consumes the next output atom produced by the splice.
+    rule_cotangents
+        .into_iter()
+        .map(|cotangent| match cotangent {
+            MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(V::Type::from(r#type))),
+            MaybeZero::Value(_) => Ok(MaybeZero::Value(context.tracer(
+                splice_outputs.next().ok_or_else(|| {
+                    ProgramError::MalformedProgram(
+                        "projected transposition adapter omitted a live cotangent output".to_string(),
+                    )
+                })?,
+                None,
+            ))),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1592,6 +1710,10 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::contexts::tests::{
+        ProjectedMemberOperation, ProjectedMemberType, ProjectedProgramOperation, ProjectedProgramType,
+        ProjectedProgramValue,
+    };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::jvp;
     use crate::macros::{check_count, check_types};
@@ -2773,5 +2895,54 @@ mod tests {
             jvp(|x| Ok(gradient(|y| (y.clone() * y).sin(), x)?), Scalar::from(x), Scalar::from(2.0)).unwrap();
         assert_abs_diff_eq!(primal, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 2.0 * (2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin()), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_transpose_projected_operation() {
+        // The third fixture member is intentionally unrelated to arrays. Its identity transpose proves that the
+        // adapter records the member rule, converts its program, and splices the live cotangent into the composite
+        // trace without changing its SSA identity or type.
+        let mut context = TracingContext::<ProjectedProgramValue, ProjectedProgramOperation>::new();
+        let member_type = ProjectedProgramType::Third(ProjectedMemberType::<2>);
+        let output_cotangent = context.input(member_type.clone());
+        let cotangents = transpose_projected_operation::<ProjectedMemberType<2>, _, _>(
+            &mut context,
+            &ProjectedMemberOperation,
+            &[PartialValue::Unknown(member_type.clone())],
+            &[MaybeZero::Value(output_cotangent.clone())],
+        )
+        .unwrap();
+        assert_eq!(cotangents.len(), 1);
+        let MaybeZero::Value(input_cotangent) = &cotangents[0] else {
+            panic!("identity transpose must preserve its live output cotangent");
+        };
+        assert_eq!(input_cotangent.atom_id(), output_cotangent.atom_id());
+        assert_eq!(input_cotangent.r#type(), output_cotangent.r#type());
+
+        // Known primal inputs are replay operands rather than linear inputs, so the member rule returns a structural
+        // zero for them. Structural-zero output cotangents also cross the adapter without becoming replay values.
+        let known_input = context.input(member_type.clone());
+        let cotangents = transpose_projected_operation::<ProjectedMemberType<2>, _, _>(
+            &mut context,
+            &ProjectedMemberOperation,
+            &[PartialValue::Known(known_input)],
+            &[MaybeZero::Value(output_cotangent)],
+        )
+        .unwrap();
+        assert!(matches!(
+            cotangents.as_slice(),
+            [MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>))],
+        ));
+        let cotangents = transpose_projected_operation::<ProjectedMemberType<2>, _, _>(
+            &mut context,
+            &ProjectedMemberOperation,
+            &[PartialValue::Unknown(member_type.clone())],
+            &[MaybeZero::Zero(member_type)],
+        )
+        .unwrap();
+        assert!(matches!(
+            cotangents.as_slice(),
+            [MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>))],
+        ));
     }
 }

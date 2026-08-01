@@ -1660,8 +1660,9 @@ searches. The complete source ledger and verification record are in
       residual path above.
 - [x] Audit concatenate, mean/reductions, slice, pad, and gather transposes and migrate every analogous extent need to
       the same residual contract.
-- [ ] Make generic outer dispatch project/lift array-only JVP, VJP, and transpose rules, reusing the shared toy
-      composite fixture promoted in Phase 5 for the member-kind-agnostic dispatch tests.
+- [x] P6c — execute `.tasks/plan_p6c_generic_outer_differentiation_dispatch.md` as the next isolated Phase 6 review
+      unit. Make generic outer dispatch project/lift array-only JVP and transpose rules, let VJP reuse their existing
+      composition, and exercise the shared toy composite fixture for member-kind-agnostic dispatch tests.
 - [x] Preserve dimension values as ordinary structural residuals without tangent slots.
 - [x] Keep explicit mixed rules only where primal dimension operands control array results or region interfaces.
 - [x] Remove temporary homogeneous differentiation programs and dimension recovery.
@@ -1746,8 +1747,8 @@ semantics; the captured-primal payloads, custom residual wrapper, and repeated c
 goldens remain pinned, zero output cotangents stage no allocation, and the full core/XLA/macro/doctest gates pass.
 Executable fixtures pass JAX 0.6.1 and 0.11.0 across the complete extent-sensitive matrix; Ryft deliberately exceeds
 both for non-finite-safe padding-value cotangents. The complete ledger is in
-`.tasks/plan_p6b_extent_residual_operation_sweep.md`. Generic outer differentiation dispatch is the next isolated
-Phase 6 unit; composite-region differentiation and composite-zero deletion remain separate.
+`.tasks/plan_p6b_extent_residual_operation_sweep.md`. Generic outer differentiation dispatch is complete below;
+composite-region differentiation and composite-zero deletion remain separate.
 
 The post-review evaluation of `LinearCallOperation` additionally adopted JAX's `linear_call` transposition shape:
 the carrier's operands and both region interfaces are residuals-first (`forward: (r, u) -> v`,
@@ -1757,8 +1758,29 @@ is therefore involutive, pullback programs retain the linear-call boundary and i
 future batching rule is swap-stable. The swap validates `cotangent(cotangent(u)) = u` for linear operand types at
 staging time, which tangent types satisfy even where primal storage types do not. This deliberately changed the
 staged tangent/pullback program shapes and their exact-IR goldens; the transpose-only `custom_vjp` form still
-replays its user-written backward inline because that program carries no linearity contract of its own. Generic outer dispatch and the
-composite-zero deletion remain subsequent units so each stays independently reviewable.
+replays its user-written backward inline because that program carries no linearity contract of its own.
+
+P6c is complete at frozen boundary `10e98313d`. Homogeneous batching, JVP, and transpose fallbacks now delegate to
+storage-generic, transform-owned adapters built from the existing policy/projection and program-splicing machinery.
+`BatchingPolicy::batch_axis` completes the policy's carrier-access contract, allowing
+`batch_projected_operation<T, Q, C, P, O>` to replace the array-specific batching adapter without a separate
+`BatchProjection` trait. Structural zeros remain types; batching axes and extents cross unchanged; known primal inputs
+and live output cotangents are spliced in deterministic order; and VJP inherits the change through the existing
+JVP-plus-transposition composition. Mixed, extent-sensitive, collective, opaque, and region-carrying rules remain
+explicit. The promoted third member proves all three adapters require no member-kind branch, while production goldens
+cover batching, mapped-condition selection, eager JVP, VJP, and direct transpose.
+
+The array-program batching and differentiation owners delete 122 production lines while their generic transform
+owners add 185, for an explicitly accepted one-time net `+63`; 332 test/documentation lines bring core to 134,196 Rust
+lines from 133,801. There is no duplicate projection protocol, separate projection trait, projected-policy registry,
+new production carrier, or parallel transform API. The three context-first projected-operation helpers are public and
+re-exported from their owning facades so composite backends can reuse the single canonical implementations. Clean
+`ryft-core` check time improves from 14.97 to 12.23 seconds and
+no-op from 0.28 to 0.11 seconds. The full 1,089-test core suite, 407-test XLA suite plus one intentional ignore, macro
+unit/integration/compile-fail suites,
+doctests, formatting, source closure, and JAX extent/collective parity gates pass. Full evidence is in
+`.tasks/plan_p6c_generic_outer_differentiation_dispatch.md`. Composite-region differentiation is the next isolated
+Phase 6 unit; composite-zero deletion remains afterward.
 
 ### Phase 7: backend execution and lowering
 

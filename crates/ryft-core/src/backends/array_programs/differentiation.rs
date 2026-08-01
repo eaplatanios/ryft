@@ -6,6 +6,9 @@
 //! in one capability-specific module avoids duplicating the composite context bounds across operation payloads while
 //! removing the mathematics from the central operation-family module.
 
+use crate::differentiation::forward::jvp_projected_operation;
+use crate::differentiation::reverse::transpose_projected_operation;
+
 use super::*;
 
 impl<
@@ -1523,36 +1526,7 @@ where
                 .collect());
         };
 
-        let projected_inputs = inputs
-            .iter()
-            .map(|input| {
-                let primal = <C::Value as ValueProjection<ArrayType>>::into_projected(input.primal().clone())?;
-                let tangent = match input.tangent() {
-                    MaybeZero::Zero(r#type) => MaybeZero::Zero(<&ArrayType>::try_from(r#type)?.clone()),
-                    MaybeZero::Value(value) => {
-                        MaybeZero::Value(<C::Value as ValueProjection<ArrayType>>::into_projected(value.clone())?)
-                    }
-                };
-                DifferentiationDual::new(primal, tangent)
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?;
-
-        operation
-            .jvp(&ProjectedContext::new(context.clone()), &EmptyRegionDriver, projected_inputs.as_slice())?
-            .into_iter()
-            .map(|output| {
-                let (primal, tangent) = output.into_parts();
-                let primal = <C::Value as ValueProjection<ArrayType>>::from_projected(primal);
-                let tangent = match tangent {
-                    MaybeZero::Zero(r#type) => MaybeZero::Zero(ArrayProgramType::Array(r#type)),
-                    MaybeZero::Value(value) => {
-                        MaybeZero::Value(<C::Value as ValueProjection<ArrayType>>::from_projected(value))
-                    }
-                };
-                DifferentiationDual::new(primal, tangent)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        jvp_projected_operation(context, operation, inputs)
     }
 }
 
@@ -1806,68 +1780,6 @@ where
             .into());
         };
 
-        // Record the homogeneous array rule in a short-lived array-only program. Replaying that program through a
-        // projected view of the composite builder preserves the original SSA identities while keeping every primitive
-        // transposition rule written against its native `ArrayType` contract.
-        let mut rule_context = TracingContext::<A, ArrayOperation<A>>::new();
-        let mut replay_inputs = Vec::new();
-        let rule_inputs = inputs
-            .iter()
-            .map(|input| match input {
-                PartialValue::Unknown(r#type) => Ok(PartialValue::Unknown(<&ArrayType>::try_from(r#type)?.clone())),
-                PartialValue::Known(value) => {
-                    replay_inputs.push(<Tracer<TracingContext<V, O>> as ValueProjection<ArrayType>>::into_projected(
-                        value.clone(),
-                    )?);
-                    Ok(PartialValue::Known(
-                        rule_context.input(<&ArrayType>::try_from(value.r#type().as_ref())?.clone()),
-                    ))
-                }
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?;
-        let rule_outputs = outputs
-            .iter()
-            .map(|output| match output {
-                MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(<&ArrayType>::try_from(r#type)?.clone())),
-                MaybeZero::Value(value) => {
-                    replay_inputs.push(<Tracer<TracingContext<V, O>> as ValueProjection<ArrayType>>::into_projected(
-                        value.clone(),
-                    )?);
-                    Ok(MaybeZero::Value(rule_context.input(<&ArrayType>::try_from(value.r#type().as_ref())?.clone())))
-                }
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?;
-        let rule_cotangents =
-            operation.transpose(&mut rule_context, &EmptyRegionDriver, &rule_inputs, &rule_outputs)?;
-        let output_ids = rule_cotangents
-            .iter()
-            .filter_map(|cotangent| cotangent.as_value())
-            .map(Tracer::atom_id)
-            .collect::<Result<Vec<_>, _>>()?;
-        let rule_program = rule_context.builder().borrow().clone().build::<Vec<A>, Vec<A>>(
-            output_ids,
-            vec![Placeholder; replay_inputs.len()],
-            vec![Placeholder; rule_cotangents.iter().filter(|cotangent| !cotangent.is_zero()).count()],
-        )?;
-        let mut replay_outputs = rule_program
-            .interpret_in_context(&ProjectedContext::new(context.clone()), replay_inputs)?
-            .into_iter();
-
-        rule_cotangents
-            .into_iter()
-            .map(|cotangent| match cotangent {
-                MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(ArrayProgramType::Array(r#type))),
-                MaybeZero::Value(_) => Ok(MaybeZero::Value(
-                    replay_outputs
-                        .next()
-                        .ok_or_else(|| {
-                            ProgramError::MalformedProgram(
-                                "array transposition adapter omitted a live cotangent output".to_string(),
-                            )
-                        })?
-                        .into_value(),
-                )),
-            })
-            .collect()
+        transpose_projected_operation(context, operation, inputs, outputs)
     }
 }

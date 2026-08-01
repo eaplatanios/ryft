@@ -6,7 +6,7 @@ use ryft_macros::Parameter;
 use crate::axes::AxisIndexOperation;
 use crate::backends::arrays::{Array, ArrayOperation, BroadcastKernel};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
-use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, EagerContext, ProjectedContext};
 use crate::differentiation::{
     BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment, LinearCallOperation,
@@ -49,7 +49,7 @@ use crate::operations::manipulation::{
 };
 use crate::operations::math::{AddOperation, DivOperation, MulOperation, Reduce, ReduceOperation, ReductionKind};
 use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
-use crate::parameters::{Parameter, Placeholder};
+use crate::parameters::Parameter;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
@@ -1969,7 +1969,7 @@ mod tests {
         JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, try_jit,
     };
     use crate::contexts::{Context, StagingContext};
-    use crate::differentiation::{DifferentiationTracer, ForwardModeDifferentiate};
+    use crate::differentiation::{DifferentiationTracer, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::collectives::{
         AllGather, AllGatherOperation, AllToAllOperation, PSumScatter, PSumScatterOperation,
@@ -1983,7 +1983,7 @@ mod tests {
         Broadcast, BroadcastOperation, ConcatenateOperation, GatherDimensionNumbers, GatherOperation, PadOperation,
         ReshapeOperation, SliceOperation,
     };
-    use crate::operations::math::AddOperation;
+    use crate::operations::math::{AddOperation, MulOperation};
     use crate::parameters::Placeholder;
     use crate::partial::PartialTracer;
     use crate::programs::AtomId;
@@ -3455,6 +3455,77 @@ mod tests {
                     residual_instructions = 1,
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn test_array_program_homogeneous_differentiation_dispatch() {
+        type TestContext = EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+
+        let context = TestContext::new();
+        let (primal, tangent) = context
+            .jvp(
+                |input| {
+                    let context = input.context().clone();
+                    let factor = context.lift(ArrayProgramValue::Array(Array::scalar(3.0_f64)))?;
+                    Ok(context
+                        .bind(
+                            ArrayProgramOperation::<Array>::Array(ArrayOperation::Mul(MulOperation)),
+                            Vec::new(),
+                            &[input, factor],
+                        )?
+                        .remove(0))
+                },
+                ArrayProgramValue::Array(Array::scalar(2.0_f64)),
+                ArrayProgramValue::Array(Array::scalar(4.0_f64)),
+            )
+            .unwrap();
+        assert_eq!(primal, ArrayProgramValue::Array(Array::scalar(6.0_f64)));
+        assert_eq!(tangent, ArrayProgramValue::Array(Array::scalar(12.0_f64)));
+
+        // Reverse mode composes the same projected JVP with projected transposition. The constant factor is a known
+        // replay input to the homogeneous multiply transpose rule.
+        let (primal, pullback) = context
+            .vjp(
+                |input| {
+                    let context = input.context().clone();
+                    let factor = context.lift(ArrayProgramValue::Array(Array::scalar(3.0_f64)))?;
+                    Ok(context
+                        .bind(
+                            ArrayProgramOperation::<Array>::Array(ArrayOperation::Mul(MulOperation)),
+                            Vec::new(),
+                            &[input, factor],
+                        )?
+                        .remove(0))
+                },
+                ArrayProgramValue::Array(Array::scalar(2.0_f64)),
+            )
+            .unwrap();
+        assert_eq!(primal, ArrayProgramValue::Array(Array::scalar(6.0_f64)));
+        assert_eq!(
+            pullback.apply(ArrayProgramValue::Array(Array::scalar(5.0_f64))),
+            Ok(ArrayProgramValue::Array(Array::scalar(15.0_f64))),
+        );
+
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let factor = builder.add_constant(ArrayProgramValue::Array(Array::scalar(3.0_f64)));
+        let output = builder
+            .add_instruction(
+                ArrayProgramOperation::<Array>::Array(ArrayOperation::Mul(MulOperation)),
+                Vec::new(),
+                vec![input, factor],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<ArrayProgramValue<Array>, ArrayProgramValue<Array>>(vec![output], Placeholder, Placeholder)
+            .unwrap();
+        assert_eq!(
+            program
+                .transpose_with_respect_to(&[0])
+                .unwrap()
+                .interpret(vec![ArrayProgramValue::Array(Array::scalar(5.0_f64))]),
+            Ok(vec![ArrayProgramValue::Array(Array::scalar(15.0_f64))]),
         );
     }
 
