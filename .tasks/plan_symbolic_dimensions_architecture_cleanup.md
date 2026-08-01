@@ -1257,20 +1257,19 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
       different: JAX defines it as conversion plus broadcast, so rank-positive static and dynamic fill reuse the
       canonical constant and broadcast operations and their transforms. All three slices must be complete before the
       Phase 3 gate.
-- [x] P3k canonical tiled collectives: retain the existing all-gather, psum-scatter, and all-to-all payloads on one
-      homogeneous semantic contract while giving their flat composite variants positional result-extent operands.
-      Public composite capabilities derive those operands with `dimension_size` and ordinary checked dimension
-      arithmetic. Mixed inference, eager execution, PE, static matching-axis batching, JVP, identity instantiation,
-      import, rendering, and exact Phase 4/5/6 boundaries are recorded in
-      `.tasks/plan_p3k_collective_dimensions.md`.
-- [ ] Phase 4/P3k continuation — full JAX collective parity: add non-tiled rank-changing modes, validated
-      `axis_index_groups`, the
+- [x] P3k canonical collectives: retain the existing all-gather, psum-scatter, and all-to-all payloads on one
+      homogeneous semantic contract while giving their flat composite variants one positional extent operand per
+      result axis. Public composite capabilities derive those operands with exact constants, `dimension_size`, and
+      ordinary checked dimension arithmetic at the original operation boundary. Mixed inference, eager execution,
+      PE, direct tiled and untiled static and bounded-dynamic batching, JVP, identity instantiation, import, rendering,
+      and exact Phase 4/5/6 boundaries are recorded in `.tasks/plan_p3k_collective_dimensions.md`.
+- [ ] Phase 4/P3k continuation — full JAX collective parity: add validated `axis_index_groups`, the
       all-gather variance policy if the canonical sharding model can represent it, and `pshuffle`/`pswapaxes` as
       compositions. Complete this alongside Phase 4 shard-map migration so the composite graph, group-aware native
       StableHLO lowering, and bounded-dynamic multi-device fixtures land as one vertical slice rather than adding
       another temporary homogeneous API. The public semantics, shared native lowerers, direct composite binder
       fixture, production composite shard-map reachability, and static two-device execution are complete. The
-      checkbox remains open for Phase 5 bounded-dynamic batching, Phase 7 bounded-dynamic execution, and the final
+      checkbox remains open for group-aware production reachability, Phase 7 bounded-dynamic execution, and the final
       current-JAX behavioral/StableHLO comparisons.
 - [ ] Phase 6 owner: route transform-generated zero/one values through structural zero or `zero_like`/`one_like`
       whenever an operand supplies geometry.
@@ -1468,20 +1467,23 @@ rename only part of the problem while introducing another carrier.
       alignment stop using the localized static bridge.
 - [x] Remove repeated outer-enum matches that only project/lift batches.
 - [ ] Delete dimension/source-array reconstruction in dynamic slice, concatenate, reduce, collectives, RNG, and
-      constructors.
+      constructors. P5c/P5d close control flow, RNG, constructors, and collectives. The remaining production reads
+      are the dynamic broadcast/alignment paths (`array_dimensions` and `DimensionSource::Value`), transform-boundary
+      normalization/extent inference, and pad-mask construction in `backends/array_programs/batching.rs`; these still
+      serve concatenate/reduce/slice-style projected rules and keep this checkbox open.
 - [x] Verify nested `vmap`, mapped arrays with dynamic logical extents, replicated dimension residuals, control flow,
       and all mapped-authority rejection paths.
-- [ ] P5d — immediately after P5c3, not at the Phase 11 gate: delete every homogeneous batching rule whose composite
-      equivalent has passing parity fixtures (the condition/while/scan control-flow rules, the homogeneous
-      elementwise blanket path, and the matching-axis collective materializations), and migrate any remaining
-      reference-backend or fixture consumer through the composite rules (e.g., via the established member-program
-      unprojection) or delete the consumer together with its rule. The P5a decision to retain these rules as the
-      migration's comparison baseline expires the moment the P5c parity fixtures land; deleting at that point is the
-      cheapest verification moment and turns the Phase 11 batching entries into a ledger check instead of a deletion.
-      Record any blocked deletion with its concrete blocker and owning phase instead of leaving the rule silently
-      frozen.
-- [ ] Gate: after P5d, each operation's batching semantics has exactly one rule across both universes, and the
-      Phase 5 net production-line delta against the P5a baseline is recorded next to the deleted-rule ledger.
+- [x] P5d — immediately after P5c3: enforce one canonical batching algorithm per semantic contract. Member rules
+      reused through typed projection count once; direct composite rules remain necessary when explicit dimension
+      operands or the threaded-extent region protocol change the contract. Unprojection now promotes condition,
+      while, and scan directly and the nested compatibility arms are deleted. Composite collectives now carry every
+      result extent and implement matching/different-axis batching directly without delegating to homogeneous rules.
+      Homogeneous control-flow and collective rules remain only for the still-public reference array domain, with
+      Phase 6 and Phase 8/9 deletion owners recorded in `.tasks/plan_p5d_batching_rule_consolidation.md`.
+- [x] Gate: after P5d, no semantic contract has independently maintained duplicate rules. The policy-generic
+      elementwise rule is shared infrastructure; homogeneous and explicit-extent collective rules serve distinct
+      contracts; every residual homogeneous control-flow consumer has an owner. The final production and test deltas
+      against the P5a and P5c baselines are recorded in `.tasks/plan_p5d_batching_rule_consolidation.md`.
 - [x] Gate: adding an array-only primitive with a standard batching rule requires no handwritten change in composite
       batching dispatch.
 
@@ -1512,20 +1514,21 @@ Structural region batching carries the mapped extent explicitly as dimension SSA
 region projection, source-array extent reconstruction, host concretization, parallel context/tracer, or XLA-local
 copy of the batching semantics.
 
-P5d is the scheduled deletion payback for this arc and runs immediately after P5c3 rather than waiting for the
-Phase 11 gate: the homogeneous batching rules that composite equivalents duplicate are deleted while their parity
-fixtures are freshest, with any surviving consumer migrated through the composite rules or deleted alongside its
-rule. Its checklist item above owns the exact scope and the blocked-deletion recording rule. This converts the
-Phase 5 line-count story from monotone growth into a measured add-then-delete cycle whose net delta is recorded at
-the P5d gate.
+P5d corrected the earlier deletion premise after auditing the actual contracts. The elementwise blanket is already
+one shared algorithm reached through typed projection. Homogeneous control-flow remains required by the public
+reference execution domain, while the mixed threaded-extent rules have a genuinely different boundary. Homogeneous
+collectives likewise remain reference implementations, but composite collectives now own complete explicit result
+extents and no longer delegate their algorithms. The exact residual owners and measured line-count result are in
+`.tasks/plan_p5d_batching_rule_consolidation.md`.
 
-P5c is complete. Structural batching selects direct and composite threaded-extent boundary types through
+P5c and P5d are complete. Structural batching selects direct and composite threaded-extent boundary types through
 `BatchingPolicy`, making the distinction static and deleting the interim runtime boundary enum. Condition, while, and
 scan support mixed array/dimension values, explicit mapped-extent threading, nested batching, rendering/import, and
 the existing XLA promotion/lowering/execution path. Composite scan accepts a first-class dynamic trip count, and
 mapped-state RNG batching now decomposes to one state-carry-free composite scan while preserving its exact
-replicated-state diagnostic. The full `ryft-core`, `ryft-xla`, and macro integration suites pass; P5d is the next
-review unit and remains intentionally open.
+replicated-state diagnostic. P5d canonicalizes unprojected control-flow carriers, completes direct explicit-extent
+collective batching for static and bounded-dynamic graphs, and records the retained reference-domain rules and their
+deletion owners. The full `ryft-core`, `ryft-xla`, and macro integration suites pass.
 
 ### Phase 6: simplify differentiation and transposition
 
@@ -2715,21 +2718,22 @@ macro integration tests, and 58 runnable core doctests (16 ignored examples), pl
 implementation and review records are in `.tasks/plan_p3j_dynamic_fill.md` and
 `.tasks/plan_p3j_dynamic_iota.md`.
 
-### Execution: P3k canonical tiled collectives
+### Execution: P3k canonical collectives
 
-P3k's first review unit moves the arithmetic result geometry of tiled all-gather, psum-scatter, and all-to-all into
-ordinary dimension SSA without duplicating their semantic operation payloads. The payloads remain homogeneous
-`Operation<ArrayType>` implementations; the flat `ArrayProgramOperation` variant arms own the mixed positional
-contracts. Changed axes come exclusively from trailing dimension operands, unchanged axes retain their input
-identities, and exact extents are checked against participant-count multiplication or division during inference.
+P3k moves the complete result geometry of all-gather, psum-scatter, and all-to-all into ordinary dimension SSA without
+duplicating their semantic operation payloads. The payloads remain homogeneous `Operation<ArrayType>`
+implementations; the flat `ArrayProgramOperation` variant arms own the mixed positional contracts. Every result axis
+has one trailing extent operand in axis order. Unchanged axes preserve their input identities, changed axes carry
+ordinary arithmetic SSA, and exact extents are checked against participant-count multiplication or division during
+inference and eager execution.
 
-The public composite capabilities trace `dimension_size`, lift one exact participant-count constant, apply ordinary
-dimension multiplication or checked division, and bind the collective against the resulting atom. Eager execution
-validates observed geometry and supports only the binder-free one-participant identity. PE folds or residualizes the
-same explicit graph. JVP gives primal and live tangent collectives the same extent SSA. Matching-axis composite
-batching reuses the established homogeneous materializations for static per-item geometry after rejecting mapped
-dimension authority. Bounded-dynamic reshapes and nested-axis forwarding remain Phase 5. Dynamic transpose retains one
-exact Phase 6 residual error rather than rebuilding geometry from types.
+The public composite capabilities produce exact constants for static axes, trace `dimension_size` only for dynamic
+source axes at the operation boundary, apply ordinary dimension multiplication or checked division, and bind the
+collective against the complete result shape. Eager execution validates observed geometry and supports only the
+binder-free one-participant identity. PE folds or residualizes the same explicit graph. JVP gives primal and live
+tangent collectives the same extent SSA. P5d added direct matching-axis materialization and different-axis forwarding
+for static and bounded-dynamic graphs; batching performs no source-array dimension reconstruction. Dynamic transpose
+retains one exact Phase 6 residual error rather than rebuilding geometry from types.
 
 A golden trace proves `dimension_size -> dimension_mul -> all_gather` survives rendering, alpha-renaming,
 instantiation, and import as ordinary operand edges. The residual audit finds no result extent, identity, bound,

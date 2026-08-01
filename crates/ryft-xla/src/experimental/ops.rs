@@ -134,13 +134,13 @@ where
     /// Generates random bits with explicit dynamic result extents.
     RngBitGenerator(RngBitGeneratorOperation),
 
-    /// Gathers values with an explicit dynamic result extent.
+    /// Gathers values with one explicit extent per result axis.
     AllGather(AllGatherOperation),
 
-    /// Scatters values with an explicit dynamic result extent.
+    /// Scatters values with one explicit extent per result axis.
     PSumScatter(PSumScatterOperation),
 
-    /// Exchanges values with explicit dynamic result extents.
+    /// Exchanges values with one explicit extent per result axis.
     AllToAll(AllToAllOperation),
 
     /// Backend-owned condition whose attached branch regions can contain XLA operations.

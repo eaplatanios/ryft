@@ -2,7 +2,6 @@
 
 use ryft_core::backends::array_programs::ArrayProgramOperation;
 use ryft_core::backends::dimensions::DimensionOperation;
-use ryft_core::operations::collectives::CollectiveMode;
 use ryft_core::operations::manipulation::CONCATENATE_OPERATION_NAME;
 use ryft_core::programs::{Operation as CoreOperation, ProgramError};
 use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, MAX_DIMENSION_EXTENT, Shape};
@@ -187,24 +186,23 @@ fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     Ok(vec![result])
 }
 
-/// Applies explicit changed-axis dimension operands to one native collective result.
-fn refine_collective_result_axes<'b, 'c: 'b, 't: 'c>(
+/// Applies one axis-ordered explicit dimension operand per result axis to one native collective result.
+fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
     mut result: ValueRef<'b, 'c, 't>,
-    axes: &[usize],
     extents: &[ValueRef<'b, 'c, 't>],
     output_type: &ArrayType,
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    if axes.len() != extents.len() {
-        return Err(ProgramError::InvalidInputCount { expected: axes.len(), actual: extents.len() }.into());
+    if output_type.rank() != extents.len() {
+        return Err(ProgramError::InvalidInputCount { expected: output_type.rank(), actual: extents.len() }.into());
     }
     let i32_scalar_type = context
         .tensor_type(context.signless_integer_type(32), &[], None, location)
         .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
-    for (&axis, &extent) in axes.iter().zip(extents) {
+    for (axis, &extent) in extents.iter().enumerate() {
         if !matches!(output_type.shape().dimensions()[axis], Dimension::Dynamic(_)) {
             continue;
         }
@@ -815,19 +813,7 @@ where
             let result =
                 lower_all_gather_to_mlir(operation, collective_state, *input, output_type, block, context, location)?
                     .remove(0);
-            let axes = (operation.options().mode() == CollectiveMode::Tiled)
-                .then_some(operation.concat_axis())
-                .into_iter()
-                .collect::<Vec<_>>();
-            refine_collective_result_axes(
-                result,
-                axes.as_slice(),
-                &input_values[1..],
-                output_type,
-                block,
-                context,
-                location,
-            )
+            refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
         ArrayProgramOperation::PSumScatter(operation) => {
             let Some(input) = input_values.first() else {
@@ -841,19 +827,7 @@ where
             let result =
                 lower_psum_scatter_to_mlir(operation, collective_state, *input, output_type, block, context, location)?
                     .remove(0);
-            let axes = (operation.options().mode() == CollectiveMode::Tiled)
-                .then_some(operation.scatter_axis())
-                .into_iter()
-                .collect::<Vec<_>>();
-            refine_collective_result_axes(
-                result,
-                axes.as_slice(),
-                &input_values[1..],
-                output_type,
-                block,
-                context,
-                location,
-            )
+            refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
         ArrayProgramOperation::AllToAll(operation) => {
             let Some(input) = input_values.first() else {
@@ -880,22 +854,7 @@ where
                 location,
             )?
             .remove(0);
-            let axes = if operation.options().mode() == CollectiveMode::Tiled
-                && operation.split_axis() != operation.concat_axis()
-            {
-                vec![operation.split_axis(), operation.concat_axis()]
-            } else {
-                Vec::new()
-            };
-            refine_collective_result_axes(
-                result,
-                axes.as_slice(),
-                &input_values[1..],
-                output_type,
-                block,
-                context,
-                location,
-            )
+            refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
         ArrayProgramOperation::Condition(_) | ArrayProgramOperation::While(_) | ArrayProgramOperation::Scan(_) => {
             Err(LoweringError::UnsupportedOp {

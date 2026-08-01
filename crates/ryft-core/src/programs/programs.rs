@@ -1609,7 +1609,7 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::macros::check_count;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::control_flow::ConditionOperation;
+    use crate::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
     use crate::operations::debugging::PrintOperation;
     use crate::operations::math::{AddOperation, MulOperation, NegOperation};
     use crate::parameters::Placeholder;
@@ -2104,11 +2104,62 @@ mod tests {
         let dynamic_dimension = DimensionVariable::new("elements", DimensionBounds::new(1, Some(8)).unwrap());
         let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dynamic_dimension)]));
 
+        // Build a scan body containing a while loop so unprojection must recursively promote all three control-flow
+        // carriers. The scan capture additionally pins value lifting and capture-order preservation.
+        let mut while_condition_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let while_condition_input = while_condition_builder.add_input(ArrayType::scalar(DataType::F64));
+        let false_predicate = while_condition_builder.add_constant(Array::scalar(false));
+        let while_condition = while_condition_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![false_predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(while_condition.input_ids(), &[while_condition_input]);
+
+        let mut while_body_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let while_body_input = while_body_builder.add_input(ArrayType::scalar(DataType::F64));
+        let while_body = while_body_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![while_body_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut scan_body_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let scan_carry = scan_body_builder.add_input(ArrayType::scalar(DataType::F64));
+        let scan_element = scan_body_builder.add_input(ArrayType::scalar(DataType::F64));
+        let while_condition_region = scan_body_builder.import_program(while_condition);
+        let while_body_region = scan_body_builder.import_program(while_body);
+        let next_carry = scan_body_builder
+            .add_instruction(
+                WhileOperation::new().with_iteration_bound(1).unwrap(),
+                vec![while_condition_region, while_body_region],
+                vec![scan_carry],
+            )
+            .unwrap()[0];
+        let scan_body = scan_body_builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![next_carry, scan_element],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+
         // Build one branch and attach the same imported region to both condition slots. The branch's dynamic type
         // exercises identity preservation, while the otherwise-unused entry constant exercises value lifting.
         let mut branch_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let branch_input = branch_builder.add_input(array_type.clone());
         let branch_output = branch_builder.add_instruction(NegOperation, Vec::new(), vec![branch_input]).unwrap()[0];
+        let scan_carry = branch_builder.add_constant(Array::scalar(1.0_f64));
+        let scan_stack = branch_builder.add_constant(Array::vector(vec![2.0_f64, 3.0]));
+        let scan_capture = Array::vector(vec![5.0_f64, 6.0]);
+        let scan_body_region = branch_builder.import_program(scan_body);
+        branch_builder
+            .add_instruction(
+                ScanOperation::<Array>::new(1, 2)
+                    .with_reverse(true)
+                    .with_unroll(2)
+                    .unwrap()
+                    .with_captures(vec![scan_capture.clone()]),
+                vec![scan_body_region],
+                vec![scan_carry, scan_stack],
+            )
+            .unwrap();
         let branch = branch_builder
             .build::<Vec<Array>, Vec<Array>>(vec![branch_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2130,6 +2181,30 @@ mod tests {
             .unwrap();
         let source_signature = source.type_identity_signature().clone();
         let source_effects = source.effects();
+        let source_region_count = source.regions().len();
+        let source_entry = source.entry();
+        let source_structure = source
+            .regions()
+            .iter()
+            .map(|region| {
+                (
+                    region.atoms().len(),
+                    region.input_ids().to_vec(),
+                    region.output_ids().to_vec(),
+                    region
+                        .instructions()
+                        .iter()
+                        .map(|instruction| {
+                            (
+                                instruction.inputs().to_vec(),
+                                instruction.outputs().to_vec(),
+                                instruction.regions().to_vec(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
 
         let composite: Program<
             ArrayProgramValue<Array>,
@@ -2150,23 +2225,54 @@ mod tests {
         assert_eq!(composite.output_structure(), &Placeholder);
         assert_eq!(composite.effects(), source_effects);
         assert_eq!(composite.type_identity_signature(), &source_signature);
-        assert_eq!(composite.regions().len(), 2);
+        assert_eq!(composite.regions().len(), source_region_count);
+        assert_eq!(composite.entry(), source_entry);
+        for ((atom_count, input_ids, output_ids, instructions), region) in
+            source_structure.iter().zip(composite.regions().iter())
+        {
+            assert_eq!(region.atoms().len(), *atom_count);
+            assert_eq!(region.input_ids(), input_ids);
+            assert_eq!(region.output_ids(), output_ids);
+            assert_eq!(region.instructions().len(), instructions.len());
+            for ((inputs, outputs, regions), instruction) in instructions.iter().zip(region.instructions()) {
+                assert_eq!(instruction.inputs(), inputs);
+                assert_eq!(instruction.outputs(), outputs);
+                assert_eq!(instruction.regions(), regions);
+            }
+        }
 
         let entry = composite.entry_region();
         assert_eq!(entry.instructions().len(), 1);
-        assert_eq!(entry.instructions()[0].regions(), &[RegionId::new(0), RegionId::new(0)]);
-        assert!(matches!(
-            entry.instructions()[0].operation(),
-            ArrayProgramOperation::Array(ArrayOperation::Condition(_)),
-        ));
+        let branch_region = entry.instructions()[0].regions()[0];
+        assert_eq!(entry.instructions()[0].regions(), &[branch_region, branch_region]);
+        assert!(matches!(entry.instructions()[0].operation(), ArrayProgramOperation::Condition(_),));
         assert!(matches!(
             &entry.atoms()[constant.index()],
             Atom::Constant(ArrayProgramValue::Array(value)) if value == &Array::scalar(2.0_f64),
         ));
-        assert!(matches!(
-            composite.region(RegionId::new(0)).unwrap().instructions()[0].operation(),
-            ArrayProgramOperation::Array(ArrayOperation::Neg(_)),
-        ));
+        let branch = composite.region(branch_region).unwrap();
+        assert!(matches!(branch.instructions()[0].operation(), ArrayProgramOperation::Array(ArrayOperation::Neg(_))));
+        let scan_instruction = branch
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayProgramOperation::Scan(_)))
+            .unwrap();
+        let ArrayProgramOperation::Scan(scan) = scan_instruction.operation() else {
+            unreachable!();
+        };
+        assert_eq!(scan.carry_count(), 1);
+        assert_eq!(scan.length(), &Dimension::Static(2));
+        assert!(scan.reverse());
+        assert_eq!(scan.unroll(), 2);
+        assert_eq!(scan.captures(), &[ArrayProgramValue::Array(scan_capture)]);
+        let scan_body = composite.region(scan_instruction.regions()[0]).unwrap();
+        let while_instruction = scan_body
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayProgramOperation::While(_)))
+            .unwrap();
+        assert_eq!(while_instruction.regions().len(), 2);
+        assert!(matches!(while_instruction.operation(), ArrayProgramOperation::While(_)));
     }
 
     #[test]

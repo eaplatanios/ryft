@@ -770,15 +770,16 @@ fn all_gather_output_type(
     Ok(output_type)
 }
 
-/// Infers one canonical mixed collective result from an array operand followed by one explicit extent per changed
-/// output axis.
+/// Infers one canonical mixed collective result from an array operand followed by one explicit extent per output
+/// axis.
 fn infer_explicit_shape_changing_collective_output_type(
     operation_name: &'static str,
     input_types: &[ArrayProgramType],
-    changed_axes: &[usize],
+    base_output_type: ArrayType,
+    unchanged_input_axes: &[Option<usize>],
     validate_exact_extents: impl FnOnce(&ArrayType, &[Dimension]) -> Result<(), TypeError>,
 ) -> Result<Vec<ArrayProgramType>, TypeError> {
-    let expected = 1 + changed_axes.len();
+    let expected = 1 + base_output_type.rank();
     check_count!("input", input_types, expected, TypeError);
     let input_type = <&ArrayType>::try_from(&input_types[0])?;
     if !input_type.unreduced_axes().is_empty() {
@@ -788,23 +789,31 @@ fn infer_explicit_shape_changing_collective_output_type(
         .iter()
         .map(|r#type| <&DimensionType>::try_from(r#type).map(DimensionType::to_dimension))
         .collect::<Result<Vec<_>, _>>()?;
-    validate_exact_extents(input_type, output_extents.as_slice())?;
-
-    let mut output_dimensions = input_type.shape().dimensions().to_vec();
-    for (axis, extent) in changed_axes.iter().copied().zip(output_extents) {
-        let rank = output_dimensions.len();
-        let Some(dimension) = output_dimensions.get_mut(axis) else {
-            return Err(TypeError::invalid(format!(
-                "'{operation_name}' changed axis {axis} is out of bounds for rank {rank}",
-            )));
-        };
-        *dimension = extent;
+    if unchanged_input_axes.len() != output_extents.len() {
+        return Err(TypeError::invalid(format!(
+            "'{operation_name}' internal output-axis mapping has length {} but the result rank is {}",
+            unchanged_input_axes.len(),
+            output_extents.len(),
+        )));
     }
-    let sharding = resized_output_sharding(input_type, output_dimensions.as_slice(), operation_name)?;
-    let mut output_type =
-        ArrayType::new(input_type.data_type(), Shape::new(output_dimensions)).with_memory(input_type.memory());
-    output_type.sharding = sharding;
-    Ok(vec![output_type.into()])
+    for (output_axis, (&input_axis, output_extent)) in unchanged_input_axes.iter().zip(&output_extents).enumerate() {
+        let Some(input_axis) = input_axis else { continue };
+        let input_extent = input_type.shape().dimensions().get(input_axis).ok_or_else(|| {
+            TypeError::invalid(format!(
+                "'{operation_name}' unchanged output axis {output_axis} references input axis {input_axis}, which is \
+                 out of bounds for rank {}",
+                input_type.rank(),
+            ))
+        })?;
+        if output_extent != input_extent {
+            return Err(TypeError::invalid(format!(
+                "'{operation_name}' output axis {output_axis} extent {output_extent} must equal unchanged input axis \
+                 {input_axis} extent {input_extent}",
+            )));
+        }
+    }
+    validate_exact_extents(input_type, output_extents.as_slice())?;
+    Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
 }
 
 /// Infers the composite all-gather contract.
@@ -813,40 +822,76 @@ pub(crate) fn infer_explicit_all_gather_output_types(
     input_types: &[ArrayProgramType],
 ) -> Result<Vec<ArrayProgramType>, TypeError> {
     let effective_axis_size = operation.effective_axis_size()?;
-    if operation.options.mode == CollectiveMode::Untiled {
-        check_count!("input", input_types, 1, TypeError);
-        let input_type = <&ArrayType>::try_from(&input_types[0])?;
-        if !input_type.unreduced_axes().is_empty() {
-            return Err(TypeError::invalid("'all_gather' does not support unreduced operands".to_string()));
+    let Some(input_type) = input_types.first() else {
+        return Err(TypeError::invalid("'all_gather' expects an array followed by its output extents"));
+    };
+    let input_type = <&ArrayType>::try_from(input_type)?;
+    let (base_output_type, unchanged_input_axes) = match operation.options.mode {
+        CollectiveMode::Untiled => (
+            input_type.with_inserted_dimension(operation.concat_axis, Dimension::Static(effective_axis_size))?,
+            (0..=input_type.rank())
+                .map(|axis| {
+                    if axis == operation.concat_axis {
+                        None
+                    } else if axis < operation.concat_axis {
+                        Some(axis)
+                    } else {
+                        Some(axis - 1)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ),
+        CollectiveMode::Tiled => {
+            if operation.concat_axis >= input_type.rank() {
+                return Err(TypeError::invalid(format!(
+                    "'all_gather' concat axis {} is out of bounds for rank {}",
+                    operation.concat_axis,
+                    input_type.rank(),
+                )));
+            }
+            let mut dimensions = input_type.shape().dimensions().to_vec();
+            dimensions[operation.concat_axis] = Dimension::Static(0);
+            let sharding = resized_output_sharding(input_type, dimensions.as_slice(), ALL_GATHER_OPERATION_NAME)?;
+            let mut output_type =
+                ArrayType::new(input_type.data_type(), Shape::new(dimensions)).with_memory(input_type.memory());
+            output_type.sharding = sharding;
+            (output_type, (0..input_type.rank()).map(|axis| (axis != operation.concat_axis).then_some(axis)).collect())
         }
-        let output_type =
-            input_type.with_inserted_dimension(operation.concat_axis, Dimension::Static(effective_axis_size))?;
-        return Ok(vec![all_gather_output_type(input_type, output_type, operation)?.into()]);
-    }
+    };
     let mut output_types = infer_explicit_shape_changing_collective_output_type(
         ALL_GATHER_OPERATION_NAME,
         input_types,
-        &[operation.concat_axis],
+        base_output_type,
+        unchanged_input_axes.as_slice(),
         |input_type, output_extents| {
-            let rank = input_type.rank();
-            let Some(input_extent) = input_type.shape().dimensions().get(operation.concat_axis) else {
-                return Err(TypeError::invalid(format!(
-                    "'all_gather' concat axis {} is out of bounds for rank {rank}",
-                    operation.concat_axis,
-                )));
-            };
-            if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
-                (input_extent, &output_extents[0])
-            {
-                let expected = input_extent.checked_mul(effective_axis_size).ok_or_else(|| {
-                    TypeError::invalid("'all_gather' result extent does not fit in usize".to_string())
-                })?;
-                if *output_extent != expected {
-                    return Err(TypeError::invalid(format!(
-                        "'all_gather' result extent must equal input axis {} extent {input_extent} multiplied by axis \
-                         group size {effective_axis_size}; expected {expected} but got {output_extent}",
-                        operation.concat_axis,
-                    )));
+            match operation.options.mode {
+                CollectiveMode::Untiled => {
+                    let output_extent = &output_extents[operation.concat_axis];
+                    if output_extent != &Dimension::Static(effective_axis_size) {
+                        return Err(TypeError::invalid(format!(
+                            "'all_gather' inserted output axis {} extent must equal axis group size \
+                             {effective_axis_size} but got {output_extent}",
+                            operation.concat_axis,
+                        )));
+                    }
+                }
+                CollectiveMode::Tiled => {
+                    let input_extent = &input_type.shape().dimensions()[operation.concat_axis];
+                    let output_extent = &output_extents[operation.concat_axis];
+                    if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
+                        (input_extent, output_extent)
+                    {
+                        let expected = input_extent.checked_mul(effective_axis_size).ok_or_else(|| {
+                            TypeError::invalid("'all_gather' result extent does not fit in usize".to_string())
+                        })?;
+                        if *output_extent != expected {
+                            return Err(TypeError::invalid(format!(
+                                "'all_gather' result extent must equal input axis {} extent {input_extent} multiplied \
+                                 by axis group size {effective_axis_size}; expected {expected} but got {output_extent}",
+                                operation.concat_axis,
+                            )));
+                        }
+                    }
                 }
             }
             Ok(())
@@ -863,12 +908,11 @@ pub(crate) fn infer_explicit_psum_scatter_output_types(
     input_types: &[ArrayProgramType],
 ) -> Result<Vec<ArrayProgramType>, TypeError> {
     let effective_axis_size = operation.effective_axis_size()?;
+    let Some(input_type) = input_types.first() else {
+        return Err(TypeError::invalid("'psum_scatter' expects an array followed by its output extents"));
+    };
+    let input_type = <&ArrayType>::try_from(input_type)?;
     if operation.options.mode == CollectiveMode::Untiled {
-        check_count!("input", input_types, 1, TypeError);
-        let input_type = <&ArrayType>::try_from(&input_types[0])?;
-        if !input_type.unreduced_axes().is_empty() {
-            return Err(TypeError::invalid("'psum_scatter' does not support unreduced operands".to_string()));
-        }
         let Some(input_extent) = input_type.shape().dimensions().get(operation.scatter_axis) else {
             return Err(TypeError::invalid(format!(
                 "'psum_scatter' scatter axis {} is out of bounds for rank {}",
@@ -885,12 +929,39 @@ pub(crate) fn infer_explicit_psum_scatter_output_types(
                 operation.scatter_axis,
             )));
         }
-        return Ok(vec![input_type.without_dimension(operation.scatter_axis)?.0.into()]);
+        let base_output_type = input_type.without_dimension(operation.scatter_axis)?.0;
+        let unchanged_input_axes = (0..base_output_type.rank())
+            .map(|axis| if axis < operation.scatter_axis { Some(axis) } else { Some(axis + 1) })
+            .collect::<Vec<_>>();
+        return infer_explicit_shape_changing_collective_output_type(
+            PSUM_SCATTER_OPERATION_NAME,
+            input_types,
+            base_output_type,
+            unchanged_input_axes.as_slice(),
+            |_, _| Ok(()),
+        );
     }
+    if operation.scatter_axis >= input_type.rank() {
+        return Err(TypeError::invalid(format!(
+            "'psum_scatter' scatter axis {} is out of bounds for rank {}",
+            operation.scatter_axis,
+            input_type.rank(),
+        )));
+    }
+    let mut dimensions = input_type.shape().dimensions().to_vec();
+    dimensions[operation.scatter_axis] = Dimension::Static(0);
+    let sharding = resized_output_sharding(input_type, dimensions.as_slice(), PSUM_SCATTER_OPERATION_NAME)?;
+    let mut base_output_type =
+        ArrayType::new(input_type.data_type(), Shape::new(dimensions)).with_memory(input_type.memory());
+    base_output_type.sharding = sharding;
+    let unchanged_input_axes = (0..input_type.rank())
+        .map(|axis| (axis != operation.scatter_axis).then_some(axis))
+        .collect::<Vec<_>>();
     infer_explicit_shape_changing_collective_output_type(
         PSUM_SCATTER_OPERATION_NAME,
         input_types,
-        &[operation.scatter_axis],
+        base_output_type,
+        unchanged_input_axes.as_slice(),
         |input_type, output_extents| {
             let rank = input_type.rank();
             let Some(input_extent) = input_type.shape().dimensions().get(operation.scatter_axis) else {
@@ -900,7 +971,7 @@ pub(crate) fn infer_explicit_psum_scatter_output_types(
                 )));
             };
             if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
-                (input_extent, &output_extents[0])
+                (input_extent, &output_extents[operation.scatter_axis])
             {
                 if *input_extent % effective_axis_size != 0 {
                     return Err(TypeError::invalid(format!(
@@ -929,12 +1000,11 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
     input_types: &[ArrayProgramType],
 ) -> Result<Vec<ArrayProgramType>, TypeError> {
     let effective_axis_size = operation.effective_axis_size()?;
+    let Some(input_type) = input_types.first() else {
+        return Err(TypeError::invalid("'all_to_all' expects an array followed by its output extents"));
+    };
+    let input_type = <&ArrayType>::try_from(input_type)?;
     if operation.options.mode == CollectiveMode::Untiled {
-        check_count!("input", input_types, 1, TypeError);
-        let input_type = <&ArrayType>::try_from(&input_types[0])?;
-        if !input_type.unreduced_axes().is_empty() {
-            return Err(TypeError::invalid("'all_to_all' does not support unreduced operands".to_string()));
-        }
         let Some(input_extent) = input_type.shape().dimensions().get(operation.split_axis) else {
             return Err(TypeError::invalid(format!(
                 "'all_to_all' split axis {} is out of bounds for rank {}",
@@ -954,14 +1024,28 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
             .without_dimension(operation.split_axis)?
             .0
             .with_inserted_dimension(operation.concat_axis, Dimension::Static(effective_axis_size))?;
-        return Ok(vec![output_type.into()]);
+        let mut unchanged_input_axes =
+            (0..input_type.rank()).filter(|axis| *axis != operation.split_axis).map(Some).collect::<Vec<_>>();
+        unchanged_input_axes.insert(operation.concat_axis, None);
+        return infer_explicit_shape_changing_collective_output_type(
+            ALL_TO_ALL_OPERATION_NAME,
+            input_types,
+            output_type,
+            unchanged_input_axes.as_slice(),
+            |_, output_extents| {
+                let output_extent = &output_extents[operation.concat_axis];
+                if output_extent != &Dimension::Static(effective_axis_size) {
+                    return Err(TypeError::invalid(format!(
+                        "'all_to_all' inserted output axis {} extent must equal axis group size \
+                         {effective_axis_size} but got {output_extent}",
+                        operation.concat_axis,
+                    )));
+                }
+                Ok(())
+            },
+        );
     }
     if operation.split_axis == operation.concat_axis {
-        check_count!("input", input_types, 1, TypeError);
-        let input_type = <&ArrayType>::try_from(&input_types[0])?;
-        if !input_type.unreduced_axes().is_empty() {
-            return Err(TypeError::invalid("'all_to_all' does not support unreduced operands".to_string()));
-        }
         let Some(input_extent) = input_type.shape().dimensions().get(operation.split_axis) else {
             return Err(TypeError::invalid(format!(
                 "'all_to_all' split axis {} is out of bounds for rank {}",
@@ -978,23 +1062,40 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
                 operation.split_axis,
             )));
         }
-        return Ok(vec![input_type.clone().into()]);
+        return infer_explicit_shape_changing_collective_output_type(
+            ALL_TO_ALL_OPERATION_NAME,
+            input_types,
+            input_type.clone(),
+            &(0..input_type.rank()).map(Some).collect::<Vec<_>>(),
+            |_, _| Ok(()),
+        );
     }
-
+    if operation.split_axis >= input_type.rank() || operation.concat_axis >= input_type.rank() {
+        return Err(TypeError::invalid(format!(
+            "'all_to_all' split axis {} or concat axis {} is out of bounds for rank {}",
+            operation.split_axis,
+            operation.concat_axis,
+            input_type.rank(),
+        )));
+    }
+    let mut dimensions = input_type.shape().dimensions().to_vec();
+    dimensions[operation.split_axis] = Dimension::Static(0);
+    dimensions[operation.concat_axis] = Dimension::Static(0);
+    let sharding = resized_output_sharding(input_type, dimensions.as_slice(), ALL_TO_ALL_OPERATION_NAME)?;
+    let mut base_output_type =
+        ArrayType::new(input_type.data_type(), Shape::new(dimensions)).with_memory(input_type.memory());
+    base_output_type.sharding = sharding;
+    let unchanged_input_axes = (0..input_type.rank())
+        .map(|axis| (axis != operation.split_axis && axis != operation.concat_axis).then_some(axis))
+        .collect::<Vec<_>>();
     infer_explicit_shape_changing_collective_output_type(
         ALL_TO_ALL_OPERATION_NAME,
         input_types,
-        &[operation.split_axis, operation.concat_axis],
+        base_output_type,
+        unchanged_input_axes.as_slice(),
         |input_type, output_extents| {
-            let rank = input_type.rank();
-            if operation.split_axis >= rank || operation.concat_axis >= rank {
-                return Err(TypeError::invalid(format!(
-                    "'all_to_all' split axis {} or concat axis {} is out of bounds for rank {rank}",
-                    operation.split_axis, operation.concat_axis,
-                )));
-            }
             if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
-                (&input_type.shape().dimensions()[operation.split_axis], &output_extents[0])
+                (&input_type.shape().dimensions()[operation.split_axis], &output_extents[operation.split_axis])
             {
                 if *input_extent % effective_axis_size != 0 {
                     return Err(TypeError::invalid(format!(
@@ -1013,7 +1114,7 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
                 }
             }
             if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
-                (&input_type.shape().dimensions()[operation.concat_axis], &output_extents[1])
+                (&input_type.shape().dimensions()[operation.concat_axis], &output_extents[operation.concat_axis])
             {
                 let expected = input_extent.checked_mul(effective_axis_size).ok_or_else(|| {
                     TypeError::invalid("'all_to_all' concatenation result extent does not fit in usize".to_string())
@@ -1569,21 +1670,52 @@ impl AllToAllOperation {
     }
 }
 
+/// Returns an exact first-class collective extent constant.
+fn collective_extent_constant<V>(context: &V::DispatchDomain, extent: usize) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayProgramType>,
+    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+{
+    context.lift(DimensionValue::constant(extent)?.into())
+}
+
+/// Returns one first-class dimension for every input array axis, using exact constants for static axes and explicit
+/// [`DimensionSize`] gateways for dynamic axes.
+fn collective_input_extents<V>(context: &V::DispatchDomain, value: &V) -> Result<Vec<V>, ProgramError>
+where
+    V: Value<Type = ArrayProgramType> + DimensionSize<V>,
+    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+{
+    let r#type = value.r#type();
+    let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
+    input_type
+        .shape()
+        .dimensions()
+        .iter()
+        .enumerate()
+        .map(|(axis, dimension)| match dimension {
+            Dimension::Static(extent) => collective_extent_constant(context, *extent),
+            Dimension::Dynamic(_) => value.dimension_size(axis),
+        })
+        .collect()
+}
+
 /// Computes one tiled collective result extent by multiplying an input-axis extent by the effective participant count.
 fn multiplied_collective_extent<V>(
     context: &V::DispatchDomain,
-    value: &V,
-    axis: usize,
+    input_extent: &V,
     effective_axis_size: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayProgramType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V: Value<Type = ArrayProgramType> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayProgramType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionMul,
 {
-    let input_extent = <V as ValueProjection<DimensionType>>::into_projected(value.dimension_size(axis)?)?;
-    let effective_axis_size = context.lift(DimensionValue::constant(effective_axis_size)?.into())?;
+    let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
+    let effective_axis_size = collective_extent_constant(context, effective_axis_size)?;
     let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
     Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.dimension_mul(&effective_axis_size)?))
 }
@@ -1592,18 +1724,17 @@ where
 /// the effective participant count.
 fn divided_collective_extent<V>(
     context: &V::DispatchDomain,
-    value: &V,
-    axis: usize,
+    input_extent: &V,
     effective_axis_size: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayProgramType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V: Value<Type = ArrayProgramType> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayProgramType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionDivFloor + DimensionRequirement,
 {
-    let input_extent = <V as ValueProjection<DimensionType>>::into_projected(value.dimension_size(axis)?)?;
-    let effective_axis_size = context.lift(DimensionValue::constant(effective_axis_size)?.into())?;
+    let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
+    let effective_axis_size = collective_extent_constant(context, effective_axis_size)?;
     let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
     input_extent.require_divisible_by(&effective_axis_size)?;
     Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.dimension_div_floor(&effective_axis_size)?))
@@ -1612,20 +1743,37 @@ where
 /// Requires an input axis extent to equal the effective participant count used by an untiled collective.
 fn require_collective_axis_extent<V>(
     context: &V::DispatchDomain,
-    value: &V,
-    axis: usize,
+    input_extent: &V,
     effective_axis_size: usize,
 ) -> Result<(), ProgramError>
 where
-    V: Value<Type = ArrayProgramType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V: Value<Type = ArrayProgramType> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayProgramType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement,
 {
-    let input_extent = <V as ValueProjection<DimensionType>>::into_projected(value.dimension_size(axis)?)?;
-    let effective_axis_size = context.lift(DimensionValue::constant(effective_axis_size)?.into())?;
+    let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
+    let effective_axis_size = collective_extent_constant(context, effective_axis_size)?;
     let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
     input_extent.require_equal(&effective_axis_size)
+}
+
+/// Requires an input axis extent to be exactly divisible by the effective participant count.
+fn require_collective_axis_divisible<V>(
+    context: &V::DispatchDomain,
+    input_extent: &V,
+    effective_axis_size: usize,
+) -> Result<(), ProgramError>
+where
+    V: Value<Type = ArrayProgramType> + ValueProjection<DimensionType>,
+    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement,
+{
+    let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
+    let effective_axis_size = collective_extent_constant(context, effective_axis_size)?;
+    let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
+    input_extent.require_divisible_by(&effective_axis_size)
 }
 
 /// Stages an all-gather with first-class dynamic tiled extents and rank-changing untiled semantics.
@@ -1690,12 +1838,30 @@ where
         }
         let operation =
             AllGatherOperation::new(axis_name.to_string(), axis_size, concat_axis, options.clone(), output_variance);
-        let inputs = match options.mode {
-            CollectiveMode::Untiled => vec![self.clone()],
+        let mut output_extents = collective_input_extents(&context, self)?;
+        match options.mode {
+            CollectiveMode::Untiled => {
+                if concat_axis > output_extents.len() {
+                    return Err(TypeError::invalid(format!(
+                        "'all_gather' concat axis {concat_axis} is out of bounds for rank {}",
+                        output_extents.len(),
+                    ))
+                    .into());
+                }
+                output_extents.insert(concat_axis, collective_extent_constant(&context, effective_axis_size)?);
+            }
             CollectiveMode::Tiled => {
-                vec![self.clone(), multiplied_collective_extent(&context, self, concat_axis, effective_axis_size)?]
+                let rank = output_extents.len();
+                let Some(output_extent) = output_extents.get_mut(concat_axis) else {
+                    return Err(TypeError::invalid(format!(
+                        "'all_gather' concat axis {concat_axis} is out of bounds for rank {rank}",
+                    ))
+                    .into());
+                };
+                *output_extent = multiplied_collective_extent(&context, output_extent, effective_axis_size)?;
             }
         };
+        let inputs = std::iter::once(self.clone()).chain(output_extents).collect::<Vec<_>>();
         Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
     }
 }
@@ -1759,15 +1925,25 @@ where
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let effective_axis_size = options.effective_axis_size(PSUM_SCATTER_OPERATION_NAME, axis_size)?;
         let operation = PSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options.clone());
-        let inputs = match options.mode {
+        let mut output_extents = collective_input_extents(&context, self)?;
+        if scatter_axis >= output_extents.len() {
+            return Err(TypeError::invalid(format!(
+                "'psum_scatter' scatter axis {scatter_axis} is out of bounds for rank {}",
+                output_extents.len(),
+            ))
+            .into());
+        }
+        match options.mode {
             CollectiveMode::Untiled => {
-                require_collective_axis_extent(&context, self, scatter_axis, effective_axis_size)?;
-                vec![self.clone()]
+                require_collective_axis_extent(&context, &output_extents[scatter_axis], effective_axis_size)?;
+                output_extents.remove(scatter_axis);
             }
             CollectiveMode::Tiled => {
-                vec![self.clone(), divided_collective_extent(&context, self, scatter_axis, effective_axis_size)?]
+                output_extents[scatter_axis] =
+                    divided_collective_extent(&context, &output_extents[scatter_axis], effective_axis_size)?;
             }
         };
+        let inputs = std::iter::once(self.clone()).chain(output_extents).collect::<Vec<_>>();
         Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
     }
 }
@@ -1833,18 +2009,33 @@ where
         let effective_axis_size = options.effective_axis_size(ALL_TO_ALL_OPERATION_NAME, axis_size)?;
         let operation =
             AllToAllOperation::new(axis_name.to_string(), axis_size, split_axis, concat_axis, options.clone());
-        let inputs = match options.mode {
+        let mut output_extents = collective_input_extents(&context, self)?;
+        let rank = output_extents.len();
+        if split_axis >= rank || concat_axis >= rank {
+            return Err(TypeError::invalid(format!(
+                "'all_to_all' split axis {split_axis} or concat axis {concat_axis} is out of bounds for rank {rank}",
+            ))
+            .into());
+        }
+        match options.mode {
             CollectiveMode::Untiled => {
-                require_collective_axis_extent(&context, self, split_axis, effective_axis_size)?;
-                vec![self.clone()]
+                require_collective_axis_extent(&context, &output_extents[split_axis], effective_axis_size)?;
+                output_extents.remove(split_axis);
+                output_extents.insert(concat_axis, collective_extent_constant(&context, effective_axis_size)?);
             }
-            CollectiveMode::Tiled if split_axis == concat_axis => vec![self.clone()],
-            CollectiveMode::Tiled => vec![
-                self.clone(),
-                divided_collective_extent(&context, self, split_axis, effective_axis_size)?,
-                multiplied_collective_extent(&context, self, concat_axis, effective_axis_size)?,
-            ],
+            CollectiveMode::Tiled if split_axis == concat_axis => {
+                require_collective_axis_divisible(&context, &output_extents[split_axis], effective_axis_size)?;
+            }
+            CollectiveMode::Tiled => {
+                let split_extent =
+                    divided_collective_extent(&context, &output_extents[split_axis], effective_axis_size)?;
+                let concat_extent =
+                    multiplied_collective_extent(&context, &output_extents[concat_axis], effective_axis_size)?;
+                output_extents[split_axis] = split_extent;
+                output_extents[concat_axis] = concat_extent;
+            }
         };
+        let inputs = std::iter::once(self.clone()).chain(output_extents).collect::<Vec<_>>();
         Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
     }
 }
@@ -2715,7 +2906,8 @@ mod tests {
         assert_eq!(operation.split_axis(), 0);
         assert_eq!(operation.concat_axis(), 0);
         assert_eq!(operation.options(), &CollectiveOptions::default());
-        assert_eq!(all_to_all.inputs(), &[program.input_ids()[0]]);
+        assert_eq!(all_to_all.inputs().len(), 3);
+        assert_eq!(all_to_all.inputs()[0], program.input_ids()[0]);
     }
 
     #[test]
@@ -2731,35 +2923,57 @@ mod tests {
                     CollectiveOptions::default(),
                     AllGatherOutputVariance::Varying,
                 ),
-                &[shape(vec![Dimension::Static(2), Dimension::Static(3)]).into()],
+                &[
+                    shape(vec![Dimension::Static(2), Dimension::Static(3)]).into(),
+                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(4).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                ],
             ),
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
             infer_explicit_psum_scatter_output_types(
                 &PSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
-                &[shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()],
+                &[
+                    shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
+                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                ],
             ),
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
             infer_explicit_all_to_all_output_types(
                 &AllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default()),
-                &[shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()],
+                &[
+                    shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
+                    DimensionValue::constant(4).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                ],
             ),
             Ok(vec![shape(vec![Dimension::Static(4), Dimension::Static(2), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
             infer_explicit_all_to_all_output_types(
                 &AllToAllOperation::new("x".to_string(), 4, 1, 1, CollectiveOptions::default()),
-                &[shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()],
+                &[
+                    shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
+                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(4).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                ],
             ),
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
             infer_explicit_psum_scatter_output_types(
                 &PSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
-                &[shape(vec![Dimension::Static(2), Dimension::Static(5)]).into()],
+                &[
+                    shape(vec![Dimension::Static(2), Dimension::Static(5)]).into(),
+                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
+                ],
             ),
             Err(TypeError::invalid("'psum_scatter' untiled scatter axis 1 size 5 must equal group size 4",)),
         );
@@ -2772,7 +2986,7 @@ mod tests {
         assert_eq!(
             infer_explicit_all_gather_output_types(
                 &AllGatherOperation::new("x".to_string(), 4, 0, grouped.clone(), AllGatherOutputVariance::Varying,),
-                &[f32_vector(3).into(), result_extent.into()],
+                &[f32_vector(3).into(), result_extent.into(),],
             ),
             Ok(vec![f32_vector(6).into()]),
         );
@@ -2794,7 +3008,11 @@ mod tests {
         let infer = |output_variance| {
             infer_explicit_all_gather_output_types(
                 &AllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::default(), output_variance),
-                std::slice::from_ref(&ArrayProgramType::Array(input.clone())),
+                &[
+                    ArrayProgramType::Array(input.clone()),
+                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                ],
             )
         };
         let varying = infer(AllGatherOutputVariance::Varying).unwrap();
@@ -2832,7 +3050,11 @@ mod tests {
                     CollectiveOptions::tiled(),
                     AllGatherOutputVariance::Varying
                 ),
-                &[input_type.clone().into(), ArrayProgramType::Dimension(DimensionType::new(concat_result.clone())),],
+                &[
+                    input_type.clone().into(),
+                    ArrayProgramType::Dimension(DimensionType::new(concat_result.clone())),
+                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                ],
             ),
             Ok(vec![
                 ArrayType::new(
@@ -2845,7 +3067,11 @@ mod tests {
         assert_eq!(
             infer_explicit_psum_scatter_output_types(
                 &PSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
-                &[input_type.clone().into(), ArrayProgramType::Dimension(DimensionType::new(split_result.clone())),],
+                &[
+                    input_type.clone().into(),
+                    ArrayProgramType::Dimension(DimensionType::new(split_result.clone())),
+                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                ],
             ),
             Ok(vec![
                 ArrayType::new(
@@ -2875,7 +3101,11 @@ mod tests {
         assert_eq!(
             infer_explicit_all_to_all_output_types(
                 &AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
-                std::slice::from_ref(&ArrayProgramType::Array(input_type.clone())),
+                &[
+                    ArrayProgramType::Array(input_type.clone()),
+                    ArrayProgramType::Dimension(DimensionType::new(input_axis)),
+                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                ],
             ),
             Ok(vec![input_type.into()]),
         );

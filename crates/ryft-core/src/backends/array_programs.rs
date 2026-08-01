@@ -14,9 +14,9 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, CollectiveMode, PSumScatterOperation, PpermuteOperation,
-    infer_explicit_all_gather_output_types, infer_explicit_all_to_all_output_types,
-    infer_explicit_psum_scatter_output_types,
+    ALL_GATHER_OPERATION_NAME, ALL_TO_ALL_OPERATION_NAME, AllGatherOperation, AllToAllOperation, CollectiveMode,
+    PSUM_SCATTER_OPERATION_NAME, PSumScatterOperation, PpermuteOperation, infer_explicit_all_gather_output_types,
+    infer_explicit_all_to_all_output_types, infer_explicit_psum_scatter_output_types,
 };
 #[cfg(test)]
 use crate::operations::collectives::{AllGatherOutputVariance, CollectiveOptions};
@@ -90,7 +90,8 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// dimensions are consumed as explicit first-class dimension operands in axis order.
     DynamicIota(IotaOperation<ArrayType>),
 
-    /// Homogeneous array operation.
+    /// Region-free homogeneous array operation. Member control-flow operations are promoted to their direct
+    /// composite carriers when an array program is unprojected.
     Array(ArrayOperation<A>),
 
     /// Homogeneous first-class-dimension operation.
@@ -137,17 +138,13 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// Mixed bit generator whose trailing dimension operands define its dynamic bits-output axes.
     RngBitGenerator(RngBitGeneratorOperation),
 
-    /// Mixed all-gather whose trailing dimension operand defines the changed result axis in tiled mode. Untiled mode
-    /// materializes the exact participant count and therefore needs no dimension operand.
+    /// Mixed all-gather whose trailing dimension operands define every result axis in axis order.
     AllGather(AllGatherOperation),
 
-    /// Mixed sum-scatter whose trailing dimension operand defines the changed result axis in tiled mode. Untiled
-    /// mode removes the exact participant axis and therefore needs no result-extent operand.
+    /// Mixed sum-scatter whose trailing dimension operands define every result axis in axis order.
     PSumScatter(PSumScatterOperation),
 
-    /// Mixed all-to-all whose trailing dimension operands define the changed split and concatenation result axes in
-    /// tiled mode when those axes differ. Untiled mode exchanges one exact ranked axis with the named axis and needs
-    /// no result-extent operands.
+    /// Mixed all-to-all whose trailing dimension operands define every result axis in axis order.
     AllToAll(AllToAllOperation),
 
     /// Composite condition whose attached branches may carry arrays and first-class dimensions.
@@ -170,7 +167,15 @@ impl<A: Value<Type = ArrayType>> Display for ArrayProgramOperation<A> {
 impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayProgramOperation<A> {
     #[inline]
     fn from(operation: ArrayOperation<A>) -> Self {
-        Self::Array(operation)
+        match operation {
+            ArrayOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
+            ArrayOperation::While(operation) => Self::While(operation),
+            ArrayOperation::Scan(operation) => {
+                let captures = operation.captures().iter().cloned().map(ArrayProgramValue::Array).collect();
+                Self::Scan(operation.with_captures(captures))
+            }
+            operation => Self::Array(operation),
+        }
     }
 }
 
@@ -850,6 +855,34 @@ fn materialize_dynamic_constructor_type<A: Value<Type = ArrayType>>(
     Ok(r#type.clone().with_shape(Shape::new(dimensions)))
 }
 
+/// Resolves and validates one shape-changing collective's complete axis-ordered result extents.
+fn explicit_collective_output_extents<A: Value<Type = ArrayType>>(
+    operation_name: &str,
+    inputs: &[ArrayProgramValue<A>],
+    expected_extents: &[usize],
+) -> Result<Vec<usize>, ProgramError> {
+    let expected_input_count = 1 + expected_extents.len();
+    if inputs.len() != expected_input_count {
+        return Err(ProgramError::InvalidInputCount { expected: expected_input_count, actual: inputs.len() });
+    }
+    let output_extents = inputs[1..]
+        .iter()
+        .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
+        .map(|result| result.map(DimensionValue::extent))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (axis, (&expected, &actual)) in expected_extents.iter().zip(&output_extents).enumerate() {
+        if actual != expected {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "'{operation_name}' output axis {axis} extent must equal observed result extent {expected} but got \
+                     {actual}",
+                ),
+            });
+        }
+    }
+    Ok(output_extents)
+}
+
 impl<
     A: BroadcastKernel
         + Concatenate
@@ -1038,6 +1071,36 @@ where
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
                 };
                 let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
+                let mut expected_extents =
+                    (0..input.r#type().rank()).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
+                match operation.options().mode() {
+                    CollectiveMode::Untiled => {
+                        if operation.concat_axis() > expected_extents.len() {
+                            return Err(TypeError::invalid(format!(
+                                "'all_gather' concat axis {} is out of bounds for rank {}",
+                                operation.concat_axis(),
+                                expected_extents.len(),
+                            ))
+                            .into());
+                        }
+                        expected_extents.insert(operation.concat_axis(), effective_axis_size);
+                    }
+                    CollectiveMode::Tiled => {
+                        let rank = expected_extents.len();
+                        let Some(output_extent) = expected_extents.get_mut(operation.concat_axis()) else {
+                            return Err(TypeError::invalid(format!(
+                                "'all_gather' concat axis {} is out of bounds for rank {rank}",
+                                operation.concat_axis(),
+                            ))
+                            .into());
+                        };
+                        *output_extent = output_extent
+                            .checked_mul(effective_axis_size)
+                            .ok_or_else(|| TypeError::invalid("'all_gather' result extent does not fit in usize"))?;
+                    }
+                }
+                let output_extents =
+                    explicit_collective_output_extents(ALL_GATHER_OPERATION_NAME, inputs, &expected_extents)?;
                 if effective_axis_size != 1 {
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
@@ -1050,11 +1113,7 @@ where
                 let output = match operation.options().mode() {
                     CollectiveMode::Tiled => input.clone(),
                     CollectiveMode::Untiled => {
-                        let mut dimensions = (0..input.r#type().rank())
-                            .map(|axis| input.dimension_size(axis).map(Dimension::Static))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        dimensions.insert(operation.concat_axis(), Dimension::Static(effective_axis_size));
-                        input.reshape(Shape::new(dimensions))?
+                        input.reshape(Shape::new(output_extents.into_iter().map(Dimension::Static).collect()))?
                     }
                 };
                 Ok(vec![ArrayProgramValue::Array(output)])
@@ -1067,6 +1126,44 @@ where
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
                 };
                 let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
+                let mut expected_extents =
+                    (0..input.r#type().rank()).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
+                if operation.scatter_axis() >= expected_extents.len() {
+                    return Err(TypeError::invalid(format!(
+                        "'psum_scatter' scatter axis {} is out of bounds for rank {}",
+                        operation.scatter_axis(),
+                        expected_extents.len(),
+                    ))
+                    .into());
+                }
+                match operation.options().mode() {
+                    CollectiveMode::Untiled => {
+                        if expected_extents[operation.scatter_axis()] != effective_axis_size {
+                            return Err(TypeError::invalid(format!(
+                                "'psum_scatter' untiled scatter axis {} size {} must equal group size \
+                                 {effective_axis_size}",
+                                operation.scatter_axis(),
+                                expected_extents[operation.scatter_axis()],
+                            ))
+                            .into());
+                        }
+                        expected_extents.remove(operation.scatter_axis());
+                    }
+                    CollectiveMode::Tiled => {
+                        if expected_extents[operation.scatter_axis()] % effective_axis_size != 0 {
+                            return Err(TypeError::invalid(format!(
+                                "'psum_scatter' scatter axis {} size {} is not divisible by group size \
+                                 {effective_axis_size}",
+                                operation.scatter_axis(),
+                                expected_extents[operation.scatter_axis()],
+                            ))
+                            .into());
+                        }
+                        expected_extents[operation.scatter_axis()] /= effective_axis_size;
+                    }
+                }
+                let output_extents =
+                    explicit_collective_output_extents(PSUM_SCATTER_OPERATION_NAME, inputs, &expected_extents)?;
                 if effective_axis_size != 1 {
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
@@ -1079,11 +1176,7 @@ where
                 let output = match operation.options().mode() {
                     CollectiveMode::Tiled => input.clone(),
                     CollectiveMode::Untiled => {
-                        let mut dimensions = (0..input.r#type().rank())
-                            .map(|axis| input.dimension_size(axis).map(Dimension::Static))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        dimensions.remove(operation.scatter_axis());
-                        input.reshape(Shape::new(dimensions))?
+                        input.reshape(Shape::new(output_extents.into_iter().map(Dimension::Static).collect()))?
                     }
                 };
                 Ok(vec![ArrayProgramValue::Array(output)])
@@ -1096,6 +1189,50 @@ where
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
                 };
                 let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
+                let mut expected_extents =
+                    (0..input.r#type().rank()).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
+                let rank = expected_extents.len();
+                if operation.split_axis() >= rank || operation.concat_axis() >= rank {
+                    return Err(TypeError::invalid(format!(
+                        "'all_to_all' split axis {} or concat axis {} is out of bounds for rank {rank}",
+                        operation.split_axis(),
+                        operation.concat_axis(),
+                    ))
+                    .into());
+                }
+                match operation.options().mode() {
+                    CollectiveMode::Untiled => {
+                        if expected_extents[operation.split_axis()] != effective_axis_size {
+                            return Err(TypeError::invalid(format!(
+                                "'all_to_all' untiled split axis {} size {} must equal group size \
+                                 {effective_axis_size}",
+                                operation.split_axis(),
+                                expected_extents[operation.split_axis()],
+                            ))
+                            .into());
+                        }
+                        expected_extents.remove(operation.split_axis());
+                        expected_extents.insert(operation.concat_axis(), effective_axis_size);
+                    }
+                    CollectiveMode::Tiled if expected_extents[operation.split_axis()] % effective_axis_size != 0 => {
+                        return Err(TypeError::invalid(format!(
+                            "'all_to_all' split axis {} size {} is not divisible by group size {effective_axis_size}",
+                            operation.split_axis(),
+                            expected_extents[operation.split_axis()],
+                        ))
+                        .into());
+                    }
+                    CollectiveMode::Tiled if operation.split_axis() == operation.concat_axis() => {}
+                    CollectiveMode::Tiled => {
+                        expected_extents[operation.split_axis()] /= effective_axis_size;
+                        expected_extents[operation.concat_axis()] =
+                            expected_extents[operation.concat_axis()].checked_mul(effective_axis_size).ok_or_else(
+                                || TypeError::invalid("'all_to_all' concatenation result extent does not fit in usize"),
+                            )?;
+                    }
+                }
+                let output_extents =
+                    explicit_collective_output_extents(ALL_TO_ALL_OPERATION_NAME, inputs, &expected_extents)?;
                 if effective_axis_size != 1 {
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
@@ -1108,12 +1245,7 @@ where
                 let output = match operation.options().mode() {
                     CollectiveMode::Tiled => input.clone(),
                     CollectiveMode::Untiled => {
-                        let mut dimensions = (0..input.r#type().rank())
-                            .map(|axis| input.dimension_size(axis).map(Dimension::Static))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        dimensions.remove(operation.split_axis());
-                        dimensions.insert(operation.concat_axis(), Dimension::Static(effective_axis_size));
-                        input.reshape(Shape::new(dimensions))?
+                        input.reshape(Shape::new(output_extents.into_iter().map(Dimension::Static).collect()))?
                     }
                 };
                 Ok(vec![ArrayProgramValue::Array(output)])
@@ -2126,7 +2258,7 @@ mod tests {
         AllGather, AllGatherOperation, AllToAllOperation, PSumScatter, PSumScatterOperation,
     };
     use crate::operations::constants::{ConstantOperation, ZeroOperation};
-    use crate::operations::control_flow::ConditionOperation;
+    use crate::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
     use crate::operations::dimensions::{
         DimensionAddOperation, DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation,
     };
@@ -2177,7 +2309,7 @@ mod tests {
             context.bind(
                 AllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
                 Vec::new(),
-                std::slice::from_ref(&input),
+                &[input.clone(), extent.clone()],
             ),
             Ok(vec![input.clone()]),
         );
@@ -2609,6 +2741,31 @@ mod tests {
             Ok(vec![array_type.clone().into()]),
         );
 
+        // Member control-flow operations promote to their direct composite carriers. Scan promotion also lifts its
+        // capture values while preserving every semantic and lowering attribute.
+        assert!(matches!(
+            ArrayProgramOperation::<Array>::from(ArrayOperation::Condition(ConditionOperation::new())),
+            ArrayProgramOperation::Condition(_),
+        ));
+        let while_operation = WhileOperation::new().with_iteration_bound(7).unwrap();
+        let promoted_while = ArrayProgramOperation::<Array>::from(ArrayOperation::While(while_operation.clone()));
+        assert!(matches!(promoted_while, ArrayProgramOperation::While(operation) if operation == while_operation));
+        let capture = Array::vector(vec![3.0_f32, 4.0, 5.0, 6.0]);
+        let scan_operation = ScanOperation::<Array>::new(1, 4)
+            .with_reverse(true)
+            .with_unroll(2)
+            .unwrap()
+            .with_captures(vec![capture.clone()]);
+        let promoted_scan = ArrayProgramOperation::<Array>::from(ArrayOperation::Scan(scan_operation));
+        let ArrayProgramOperation::Scan(promoted_scan) = promoted_scan else {
+            panic!("expected a direct composite scan operation");
+        };
+        assert_eq!(promoted_scan.carry_count(), 1);
+        assert_eq!(promoted_scan.length(), &Dimension::Static(4));
+        assert!(promoted_scan.reverse());
+        assert_eq!(promoted_scan.unroll(), 2);
+        assert_eq!(promoted_scan.captures(), &[ArrayProgramValue::Array(capture)]);
+
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
         let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
@@ -2645,18 +2802,15 @@ mod tests {
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
 
-        // Region projection preserves the complete higher-order interface, including effects, before delegating to
-        // the homogeneous condition operation.
+        // The direct composite condition preserves the complete higher-order interface, including effects.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let interface = RegionInterface::new(
             vec![array_type.clone().into()],
             vec![array_type.clone().into()],
             Effects::single(Effect::OrderedIo),
         );
-        let (_, projected_interfaces) =
-            project_operation_boundary::<ArrayType>(&[], std::slice::from_ref(&interface)).unwrap();
-        assert_eq!(projected_interfaces[0].effects(), Effects::single(Effect::OrderedIo));
-        let condition = ArrayProgramOperation::<Array>::from(ArrayOperation::Condition(ConditionOperation::new()));
+        let condition = ArrayProgramOperation::<Array>::Condition(ConditionOperation::new());
+        assert!(matches!(condition, ArrayProgramOperation::Condition(_)));
         assert_eq!(
             condition.infer_output_types(
                 &[predicate_type.into(), array_type.clone().into()],
@@ -2674,10 +2828,10 @@ mod tests {
             ),
             Ok(vec![None, None]),
         );
-        assert_eq!(condition.region_slots(), ConditionOperation::<Array>::new().region_slots());
+        assert_eq!(condition.region_slots(), ConditionOperation::<ArrayProgramValue<Array>>::new().region_slots());
         assert_eq!(
             condition.output_region_provenance(0),
-            ConditionOperation::<Array>::new().output_region_provenance(0),
+            ConditionOperation::<ArrayProgramValue<Array>>::new().output_region_provenance(0),
         );
 
         // Identity-bearing payloads are renamed by their owning homogeneous family.
@@ -3042,10 +3196,10 @@ mod tests {
             }),
         );
 
-        let condition = ArrayProgramOperation::<Array>::from(ArrayOperation::Condition(ConditionOperation::new()));
+        let condition = ArrayProgramOperation::<Array>::Condition(ConditionOperation::new());
         assert_eq!(
             condition.interpret(&context, &EmptyRegionDriver, &[]),
-            Err(ProgramError::MalformedProgram("projected operation `condition` cannot carry regions".to_string(),)),
+            Err(ProgramError::MalformedProgram("condition interpretation requires a predicate input".to_string(),)),
         );
     }
 
