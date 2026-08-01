@@ -74,8 +74,7 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
     }
 
     /// Creates a new [`DifferentiationDual`] with a [`MaybeZero::Zero`] tangent carrying the primal's concrete
-    /// tangent boundary [`Type`](crate::Type). A primal with no tangent space uses its first-class zero-space
-    /// [`Type`](crate::Type).
+    /// tangent boundary [`Type`]. A primal with no tangent space uses its first-class zero-space [`Type`].
     #[inline]
     pub fn new_with_zero_tangent(primal: V) -> Self {
         let tangent = MaybeZero::Zero(primal.r#type().tangent());
@@ -122,8 +121,14 @@ impl<V: Typed + Display> Display for DifferentiationDual<V> {
 ///   - the [`primal`](Self::primal) sub-program `x ↦ (y, r)`, computing the primal outputs `y = f(x)` together with
 ///     the residuals `r` (i.e., the intermediate values of the derivative computation that depend only on `x`; e.g.,
 ///     `cos(x)` when `f` is `sin`), and
-///   - the [`tangent`](Self::tangent) sub-program `(ẋ, r) ↦ ẏ`, computing the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`.
-///     It is linear in `ẋ`, with the linearization point `x` entering only through the residuals `r`.
+///   - the [`tangent`](Self::tangent) sub-program `(live(ẋ), r) ↦ live(ẏ)`, computing
+///     `ẏ = (∂f/∂x)(x) · ẋ`. Here `live(ẋ)` contains one SSA input for each primal input whose tangent type is
+///     not a zero differential space, and `live(ẏ)` similarly contains one Single Static Assignment (SSA) output for
+///     each primal output whose tangent type is not a zero differential space. A tangent in a zero differential space
+///     can only be zero, so it requires no SSA slot; the corresponding primal value remains in the primal program, and
+///     structured callable APIs reconstruct the uniquely determined typed zero where their public result structure
+///     requires it. The tangent program is linear in `ẋ`, with the linearization point `x` entering only through the
+///     residuals `r`.
 ///
 /// This is the domain-free, interpretation-free core shared by every linearization entry point. It carries only the
 /// two sub-programs and the residual count that relates them, leaving the concrete primal outputs to be recovered by
@@ -134,8 +139,9 @@ pub struct Linearization<V: Value, O: Operation<V::Type>> {
     /// form the residual environment consumed by the tangent sub-program.
     primal: Program<V, O, Vec<V>, Vec<V>>,
 
-    /// Linear tangent sub-program `(ẋ, r) ↦ ẏ`. It takes the tangent inputs `ẋ` followed by the residuals `r` and
-    /// produces the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`.
+    /// Linear tangent sub-program `(live(ẋ), r) ↦ live(ẏ)`. It has one leading Single Static Assignment (SSA) input for
+    /// each primal input whose tangent type is not a zero differential space, followed by the residuals `r`, and one
+    /// SSA output for each primal output whose tangent type is not a zero differential space.
     tangent: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Number of residuals `r` threaded from the primal sub-program into the tangent sub-program (i.e., the count of
@@ -146,8 +152,9 @@ pub struct Linearization<V: Value, O: Operation<V::Type>> {
 impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
     /// Creates a new [`Linearization`] from its parts, validating the boundary contract documented on [`Linearization`]
     /// where `primal` produces its primal outputs followed by its trailing `residual_count` residuals, and `tangent`
-    /// consumes one tangent input per primal input followed by those same residuals and produces one tangent output per
-    /// primal output. Violations are reported as [`MalformedProgram`](ProgramError::MalformedProgram) errors: too few
+    /// consumes one tangent input per non-zero differential input followed by those same residuals and produces one
+    /// tangent output per non-zero differential output. Violations are reported as
+    /// [`MalformedProgram`](ProgramError::MalformedProgram) errors: too few
     /// primal outputs or tangent inputs to hold the residuals, sub-program boundary counts that disagree with each
     /// other, or a residual whose primal output type differs from its tangent input type. [`Program::linearize`] is the
     /// function that typically calls this function and constructs [`Linearization`]s.
@@ -171,22 +178,30 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
                 tangent.input_ids().len(),
             ))
         })?;
-        if tangent_input_count != primal.input_ids().len() {
+        let differentiable_primal_inputs =
+            primal.inputs().filter(|input| !input.r#type().tangent().is_zero_space()).collect::<Vec<_>>();
+        if tangent_input_count != differentiable_primal_inputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "linearization tangent program consumes {tangent_input_count} tangent inputs \
-                 while the primal program consumes {} inputs",
-                primal.input_ids().len(),
+                 while the primal program has {} nonzero differential inputs",
+                differentiable_primal_inputs.len(),
             )));
         }
-        if tangent.output_ids().len() != primal_output_count {
+        let differentiable_primal_outputs = primal
+            .outputs()
+            .take(primal_output_count)
+            .filter(|output| !output.r#type().tangent().is_zero_space())
+            .collect::<Vec<_>>();
+        if tangent.output_ids().len() != differentiable_primal_outputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "linearization tangent program produces {} outputs \
-                 while the primal program produces {primal_output_count} primal outputs",
+                 while the primal program has {} nonzero differential outputs",
                 tangent.output_ids().len(),
+                differentiable_primal_outputs.len(),
             )));
         }
         for (index, (primal_input, tangent_input)) in
-            primal.inputs().zip(tangent.inputs().take(tangent_input_count)).enumerate()
+            differentiable_primal_inputs.into_iter().zip(tangent.inputs().take(tangent_input_count)).enumerate()
         {
             let primal_type = primal_input.r#type();
             let tangent_type = primal_type.tangent();
@@ -201,7 +216,7 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
             }
         }
         for (index, (primal_output, tangent_output)) in
-            primal.outputs().take(primal_output_count).zip(tangent.outputs()).enumerate()
+            differentiable_primal_outputs.into_iter().zip(tangent.outputs()).enumerate()
         {
             let primal_type = primal_output.r#type();
             let tangent_type = primal_type.tangent();
@@ -239,9 +254,8 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
         &self.primal
     }
 
-    /// Returns the linear tangent sub-program `(ẋ, r) ↦ ẏ`. It takes the tangent inputs `ẋ` followed by the residuals
-    /// `r` and produces the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`. The sub-program is linear in `ẋ`, with the
-    /// linearization point `x` entering only through the residuals `r`.
+    /// Returns the compact linear tangent sub-program `(live(ẋ), r) ↦ live(ẏ)`. The sub-program is linear in its
+    /// tangent inputs, with the linearization point `x` entering only through the residuals `r`.
     #[inline]
     pub fn tangent(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         &self.tangent
@@ -262,28 +276,28 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
         (self.primal, self.tangent, self.residual_count)
     }
 
-    /// Returns the forward-mode pushforward program `(ẋ, r) ↦ ẏ` which takes the tangent inputs `ẋ` followed by the
-    /// residuals `r` and produces the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`. Because linearization already produces
-    /// the pushforward as its unknown half, this is the [`tangent`](Self::tangent) sub-program itself, cloned (i.e.,
-    /// the identity counterpart of [`pullback`](Self::pullback), which derives its program by transposition).
+    /// Returns the compact forward-mode pushforward program `(live(ẋ), r) ↦ live(ẏ)`. Because linearization already
+    /// produces the pushforward as its unknown half, this is the [`tangent`](Self::tangent) sub-program itself, cloned
+    /// (i.e., the identity counterpart of [`pullback`](Self::pullback), which derives its program by transposition).
     #[inline]
     pub fn pushforward(&self) -> Program<V, O, Vec<V>, Vec<V>> {
         self.tangent.clone()
     }
 
-    /// Builds the reverse-mode pullback program `(ȳ, r) ↦ x̄` by transposing the [`tangent`](Self::tangent) sub-program.
-    /// It takes the output cotangents `ȳ` followed by the residuals `r` and produces the input cotangents
-    /// `x̄ = (∂f/∂x)(x)ᵀ · ȳ`. It is the derived third member of this [`Linearization`]'s program family, alongside the
-    /// stored [`primal`](Self::primal) and [`tangent`](Self::tangent) sub-programs. Rather than re-keying each bilinear
-    /// operation of the tangent sub-program into a closed captured factor (e.g., folding a scalar `Mul` against a known
-    /// operand into a multiply-by-a-captured-constant) by folding the consuming residual value, this function leaves
-    /// the tangent sub-program in the primal operation family `O` and transposes it through
-    /// [`Program::transpose_with_respect_to`]. The tangent sub-program's inputs are `(ẋ, r)`, and so it is transposed
-    /// with respect to the leading tangent inputs `ẋ` while the trailing [`residual_count`](Self::residual_count)
-    /// residual inputs are held as known parameters. Partition-aware transposition then threads each known residual
-    /// through to the pullback as a pullback input (consumed by the adjoint operation that the bilinear operation's
-    /// transpose rule stages), rather than folding it into a captured factor, so the returned pullback program stays
-    /// over the primal operation family `O` and produces the cotangents of the linear tangent inputs only.
+    /// Builds the compact reverse-mode pullback program `(live(ȳ), r) ↦ live(x̄)` by transposing the
+    /// [`tangent`](Self::tangent) sub-program. Conceptually, it takes the output cotangents `ȳ` followed by the
+    /// residuals `r` and produces the input cotangents `x̄ = (∂f/∂x)(x)ᵀ · ȳ`. It is the derived third member of this
+    /// [`Linearization`]'s program family, alongside the stored [`primal`](Self::primal) and [`tangent`](Self::tangent)
+    /// sub-programs. Rather than re-keying each bilinear operation of the tangent sub-program into a closed captured
+    /// factor (e.g., folding a scalar `Mul` against a known operand into a multiply-by-a-captured-constant) by folding
+    /// the consuming residual value, this function leaves the tangent sub-program in the primal operation family `0`
+    /// and transposes it through [`Program::transpose_with_respect_to`]. The tangent sub-program's inputs are `(ẋ, r)`,
+    /// and so it is transposed with respect to the leading tangent inputs `ẋ` while the trailing
+    /// [`residual_count`](Self::residual_count) residual inputs are held as known parameters. Partition-aware
+    /// transposition then threads each known residual through to the pullback as a pullback input (consumed by the
+    /// adjoint operation that the bilinear operation's transpose rule stages), rather than folding it into a captured
+    /// factor, so the returned pullback program stays over the primal operation family `O` and produces the cotangents
+    /// of the linear tangent inputs only.
     #[inline]
     pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     where
@@ -310,6 +324,8 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
 /// and reshaping the flat tangent outputs against the closure's output structure. It thus pushes any number of tangents
 /// through the function's Jacobian without re-tracing or re-differentiating (e.g., replaying every coordinate basis
 /// tangent to build a Jacobian), amortizing the cost of differentiating once over many tangent applications.
+/// The stored program is compact as zero differential input and output leaves are absent. [`apply`](Self::apply)
+/// filters those input leaves and restores typed zeros in the returned public structure.
 ///
 /// The context `C` supplies the value semantics and operation family, `Input` is the closure's structured input type,
 /// and `Output` is its structured output type, whose [`ParameterStructure`](Parameterized::ParameterStructure) is
@@ -330,6 +346,14 @@ pub struct Pushforward<C: Context, Input, Output: Parameterized<C::Value>> {
     /// interpreting it.
     residuals: Vec<C::Value>,
 
+    /// Complete public primal input boundary. The executable pushforward omits inputs whose derived tangent type is a
+    /// zero differential space.
+    primal_input_types: Vec<C::Type>,
+
+    /// Complete public primal output boundary. The executable pushforward omits outputs whose derived tangent type is
+    /// a zero differential space.
+    primal_output_types: Vec<C::Type>,
+
     /// Parameter structure of the closure's output, used to reshape the flat tangent outputs.
     output_structure: Output::ParameterStructure,
 
@@ -341,8 +365,11 @@ pub struct Pushforward<C: Context, Input, Output: Parameterized<C::Value>> {
     marker: PhantomData<fn() -> Input>,
 }
 
-impl<C: Context, Input: Parameterized<C::Value>, Output: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>>
-    Pushforward<C, Input, Output>
+impl<
+    C: Context<Type: DifferentiableType>,
+    Input: Parameterized<C::Value>,
+    Output: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>,
+> Pushforward<C, Input, Output>
 {
     /// Creates a new [`Pushforward`] closing `program` over the linearization-point `residuals`, validating the
     /// contract documented on [`Pushforward`] where `program` consumes the flat tangents followed by `residuals`
@@ -353,6 +380,8 @@ impl<C: Context, Input: Parameterized<C::Value>, Output: Parameterized<C::Value,
         context: C,
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,
+        input_types: Vec<C::Type>,
+        output_types: Vec<C::Type>,
         output_structure: Output::ParameterStructure,
     ) -> Result<Self, ProgramError> {
         let tangent_input_count = program.input_ids().len().checked_sub(residuals.len()).ok_or_else(|| {
@@ -372,7 +401,32 @@ impl<C: Context, Input: Parameterized<C::Value>, Output: Parameterized<C::Value,
                 )));
             }
         }
-        Ok(Self { context, program, residuals, output_structure, marker: PhantomData })
+        let live_input_count = input_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
+        if live_input_count != tangent_input_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "pushforward program consumes {tangent_input_count} tangent inputs but its public boundary has {} \
+                 nonzero differential inputs",
+                live_input_count,
+            )));
+        }
+        let live_output_count = output_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
+        if live_output_count != program.output_ids().len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "pushforward program produces {} tangent outputs but its public boundary has {} nonzero differential \
+                 outputs",
+                program.output_ids().len(),
+                live_output_count,
+            )));
+        }
+        Ok(Self {
+            context,
+            program,
+            residuals,
+            primal_input_types: input_types,
+            primal_output_types: output_types,
+            output_structure,
+            marker: PhantomData,
+        })
     }
 
     /// Returns the pushforward [`Program`] `(ẋ, r) ↦ ẏ` that this callable closes over. Its inputs are the flat
@@ -389,8 +443,22 @@ impl<C: Context, Input: Parameterized<C::Value>, Output: Parameterized<C::Value,
         &self.residuals
     }
 
-    /// Consumes this [`Pushforward`] and returns its open parts: the pushforward program `(ẋ, r) ↦ ẏ` and the
-    /// linearization-point residuals `r` its trailing inputs consume, in that order.
+    /// Returns the complete public primal input boundary.
+    #[inline]
+    pub(crate) fn primal_input_types(&self) -> &[C::Type] {
+        &self.primal_input_types
+    }
+
+    /// Returns the complete public primal output boundary.
+    #[inline]
+    pub(crate) fn primal_output_types(&self) -> &[C::Type] {
+        &self.primal_output_types
+    }
+
+    /// Consumes this [`Pushforward`] and returns its open parts: the compact pushforward program
+    /// `(live(ẋ), r) ↦ live(ẏ)` and the linearization-point residuals `r` its trailing inputs consume, in that order.
+    /// Unlike [`apply`](Self::apply), the returned program does not insert typed-zero values for public tangent leaves
+    /// omitted from its SSA boundary because their differential spaces contain only zero.
     #[inline]
     pub fn into_parts(self) -> (Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<C::Value>) {
         (self.program, self.residuals)
@@ -403,8 +471,32 @@ impl<C: Context, Input: Parameterized<C::Value>, Output: Parameterized<C::Value,
     /// enclosing trace and returns tracers), and the flat tangent outputs are reshaped against the closure's output
     /// structure.
     #[inline]
-    pub fn apply(&self, tangents: Input::To<C::Value>) -> Result<Output::To<C::Value>, ProgramError> {
-        let mut inputs = tangents.into_parameters().collect::<Vec<_>>();
+    pub fn apply(&self, tangents: Input::To<C::Value>) -> Result<Output::To<C::Value>, ProgramError>
+    where
+        C: Zero<C::Value>,
+    {
+        let public_inputs = tangents.into_parameters().collect::<Vec<_>>();
+        if public_inputs.len() != self.primal_input_types.len() {
+            return Err(ProgramError::InvalidInputCount {
+                expected: self.primal_input_types.len(),
+                actual: public_inputs.len(),
+            });
+        }
+        let mut inputs = Vec::new();
+        for (index, (value, primal_type)) in public_inputs.into_iter().zip(&self.primal_input_types).enumerate() {
+            let tangent_type = primal_type.tangent();
+            if value.r#type().as_ref() != &tangent_type {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pushforward tangent {} has type {} but its primal boundary requires tangent type {}",
+                    index,
+                    value.r#type(),
+                    tangent_type,
+                )));
+            }
+            if !tangent_type.is_zero_space() {
+                inputs.push(value);
+            }
+        }
         let tangent_input_count = self.program.input_ids().len() - self.residuals.len();
         if inputs.len() != tangent_input_count {
             return Err(ProgramError::MalformedProgram(format!(
@@ -424,22 +516,46 @@ impl<C: Context, Input: Parameterized<C::Value>, Output: Parameterized<C::Value,
             }
         }
         inputs.extend(self.residuals.iter().cloned());
-        let tangent_outputs = self.program.interpret_in_context(&self.context, inputs)?;
-        Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), tangent_outputs)?)
+        let mut tangent_outputs = self.program.interpret_in_context(&self.context, inputs)?.into_iter();
+        let outputs = self
+            .primal_output_types
+            .iter()
+            .map(|r#type| {
+                let tangent_type = r#type.tangent();
+                if tangent_type.is_zero_space() {
+                    self.context.zero(&tangent_type)
+                } else {
+                    tangent_outputs.next().ok_or_else(|| {
+                        ProgramError::MalformedProgram(
+                            "pushforward program omitted a nonzero differential output".to_string(),
+                        )
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if tangent_outputs.next().is_some() {
+            return Err(ProgramError::MalformedProgram(
+                "pushforward program produced more nonzero differential outputs than its public boundary".to_string(),
+            ));
+        }
+        Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)
     }
 }
 
-/// Provides call-scoped access to the regions attached to the instruction being differentiated. Transform dispatch
-/// constructs a driver for one operation application and passes it directly to that operation's
-/// [`jvp`](DifferentiableOperation::jvp) rule. [`RegionDriver`] provides structural region access, while this trait adds
-/// differentiation-specific recursion. Region-free applications receive a driver with no regions.
+/// Provides call-scoped access to the regions attached to the instruction being differentiated. Transform
+/// dispatch constructs a driver for one operation application and passes it directly to that operation's
+/// [`jvp`](DifferentiableOperation::jvp) rule. [`RegionDriver`] provides structural region access, while this
+/// trait adds differentiation-specific recursion. Region-free applications receive a driver with no regions.
 ///
 /// Structural transform requests accept borrowed [`RegionRef`]s directly, allowing the same request to serve both a
 /// region selected from this driver and the entry region of a program rebuilt by an operation rule. Implementations
 /// must recursively dispatch each nested instruction with the driver for that nested application.
 pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operation> {
-    /// Builds the fused forward-mode program of `region`. The returned program maps
-    /// `[primals..., tangents...]` to `[primal outputs..., tangent outputs...]`.
+    /// Builds the compact fused forward-mode program of `region`. The returned program maps `[primals...,
+    /// live(tangents)...]` to `[primal outputs..., live(tangent outputs)...]`, where `live(...)` omits every boundary
+    /// leaf whose tangent type is a zero differential space (see [`DifferentiableType::is_zero_space`]). Callers must
+    /// derive their tangent liveness masks from the same region boundary types this construction filters on and restore
+    /// the omitted boundary leaves as structural zeros.
     fn jvp_program(
         &self,
         region: RegionRef<'_, C::Constant, C::Operation>,
@@ -902,6 +1018,11 @@ where
     /// Refer to the documentation of [`Program::jvp`] for more information.
     pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         let primal_input_count = self.input_ids().len();
+        let tangent_input_count = self
+            .input_ids()
+            .iter()
+            .filter(|input| !self.atoms()[input.index()].r#type().tangent().is_zero_space())
+            .count();
 
         // Hold a standalone `Rc` clone of the context's builder, and move the context itself into the block below, so
         // that scoping every tracer (and the context) inside that block makes the `Rc::try_unwrap` at the end a real
@@ -920,8 +1041,8 @@ where
             let mut primals: Vec<Option<Tracer<TracingContext<V, O>>>> = vec![None; self.atoms().len()];
             let mut tangents: Vec<Option<MaybeZero<Tracer<TracingContext<V, O>>>>> = vec![None; self.atoms().len()];
 
-            // Primal inputs become the leading inputs. One fresh tangent input is added per primal input afterward
-            // so that the input order is `(primals ++ tangents)`.
+            // Primal inputs become the leading inputs. One fresh tangent input is added afterward for each nonzero
+            // differential space, so first-class metadata never acquires a fictitious tangent operand.
             for input_id in self.input_ids().iter().copied() {
                 let r#type = self.atoms()[input_id.index()].r#type().into_owned();
                 primals[input_id.index()] = Some(context.input(r#type));
@@ -929,9 +1050,8 @@ where
             for input_id in self.input_ids().iter().copied() {
                 let primal_type = self.atoms()[input_id.index()].r#type();
                 let tangent_type = primal_type.tangent();
-                let tangent = context.input(tangent_type.clone());
                 tangents[input_id.index()] = Some(if !tangent_type.is_zero_space() {
-                    MaybeZero::Value(tangent)
+                    MaybeZero::Value(context.input(tangent_type.clone()))
                 } else {
                     MaybeZero::Zero(tangent_type)
                 });
@@ -1021,9 +1141,8 @@ where
                 }
             }
 
-            // Collect the outputs: the primal outputs followed by the tangent outputs, in the original output order.
-            // Structural zero tangents are materialized as typed `ZeroOperation` instructions here (the output boundary
-            // is the only place the fused program requires a real atom for them).
+            // Collect the primal outputs followed by the live tangent outputs. Zero differential spaces remain
+            // structural and therefore contribute no executable result slot.
             let primal_output_atoms = self
                 .output_ids()
                 .iter()
@@ -1052,9 +1171,16 @@ where
                                 .tangent(),
                         ),
                     };
-                    tangent.materialize(&context)?.atom_id()
+                    if tangent.r#type().is_zero_space() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(tangent.materialize(&context)?.atom_id()?))
+                    }
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, ProgramError>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
 
             let mut output_atoms = primal_output_atoms;
             output_atoms.extend(tangent_output_atoms);
@@ -1063,7 +1189,7 @@ where
 
         // All tracing handles are dropped here, so the builder can be recovered and finalized.
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let input_count = 2 * primal_input_count;
+        let input_count = primal_input_count + tangent_input_count;
         let output_count = output_atoms.len();
         builder
             .build::<Vec<V>, Vec<V>>(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])
@@ -1075,6 +1201,11 @@ where
     /// documentation of [`Program::linearize`] for more information.
     pub fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
         let primal_input_count = self.input_ids().len();
+        let tangent_input_count = self
+            .input_ids()
+            .iter()
+            .filter(|input| !self.atoms()[input.index()].r#type().tangent().is_zero_space())
+            .count();
 
         // Keep one standalone handle to the primal builder. Every tracer and context clone is scoped below and must
         // be gone before this handle can be unwrapped at the trace boundary.
@@ -1085,17 +1216,18 @@ where
 
         // Seed the direct walk's boundary. Unknown tangent ordinals are already the canonical tangent input positions,
         // unlike the former fused program where they were offset by the primal-input count.
+        let mut tangent_index = 0usize;
         let input_duals = self
             .input_ids()
             .iter()
             .copied()
-            .enumerate()
-            .map(|(index, input_atom)| {
+            .map(|input_atom| {
                 let primal_type = self.atoms()[input_atom.index()].r#type().into_owned();
                 let tangent_type = primal_type.tangent();
                 let primal = primal_context.input(primal_type);
-                let tangent = evaluation_context.unknown_input(tangent_type.clone(), index);
                 let tangent = if !tangent_type.is_zero_space() {
+                    let tangent = evaluation_context.unknown_input(tangent_type.clone(), tangent_index);
+                    tangent_index += 1;
                     MaybeZero::Value(PartialTracer::new(evaluation_context.clone(), tangent))
                 } else {
                     MaybeZero::Zero(tangent_type)
@@ -1154,6 +1286,9 @@ where
                 .into());
             }
             primal_output_atoms.push(primal.atom_id()?);
+            if tangent.r#type().is_zero_space() {
+                continue;
+            }
             let tangent = match tangent {
                 MaybeZero::Value(tracer) => {
                     let value = tracer.into_value()?;
@@ -1177,8 +1312,9 @@ where
         // Drop the differentiation context before finalizing partial evaluation (its parent clone would otherwise
         // keep the residual builder alive and correctly trigger the escaped-builder guard).
         drop(differentiation_context);
+        let tangent_output_count = tangent_outputs.len();
         let evaluation = evaluation_context.into_evaluation(tangent_outputs)?;
-        if evaluation.outputs.len() != self.output_ids().len()
+        if evaluation.outputs.len() != tangent_output_count
             || evaluation.outputs.iter().enumerate().any(
                 |(index, output)| !matches!(output, PartialEvaluationOutput::Unknown(ordinal) if *ordinal == index),
             )
@@ -1200,11 +1336,11 @@ where
             )
             .into());
         }
-        let mut residual_output_atoms = Vec::with_capacity(evaluation.inputs.len().saturating_sub(primal_input_count));
+        let mut residual_output_atoms = Vec::with_capacity(evaluation.inputs.len().saturating_sub(tangent_input_count));
         for (index, input) in evaluation.inputs.into_iter().enumerate() {
             match input {
-                PartialEvaluationInput::Unknown(ordinal) if index < primal_input_count && ordinal == index => {}
-                PartialEvaluationInput::Known(feeder) if index >= primal_input_count => {
+                PartialEvaluationInput::Unknown(ordinal) if index < tangent_input_count && ordinal == index => {}
+                PartialEvaluationInput::Known(feeder) if index >= tangent_input_count => {
                     if !Rc::ptr_eq(feeder.builder(), &primal_builder) {
                         return Err(ProgramError::MalformedProgram(
                             "linearization produced a residual feeder owned by a foreign trace".to_string(),
@@ -1262,12 +1398,17 @@ where
     /// `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ) = (y, ẏ)`. In terms of the program boundaries, if the input program has inputs
     /// `[x_1, …, x_n]` and outputs `[y_1, …, y_m]` (so that `y = f(x)`), the returned program has:
     ///
-    ///   - inputs `[x_1, …, x_n, ẋ_1, …, ẋ_n]`, which correspond to the `n` primal inputs followed by one fresh tangent
-    ///     input `ẋ_i` per primal input `x_i`, using the type returned by [`DifferentiableType::tangent`]. A
-    ///     non-differentiable input uses a zero-space value that preserves positional arity, but the transform treats
-    ///     that slot as a structural zero and does not read its value; and
-    ///   - outputs `[y_1, …, y_m, ẏ_1, …, ẏ_m]`, which correspond to the `m` primal outputs `y_j = f_j(x)` followed by
-    ///     the `m` tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`.
+    ///   - inputs `[x_1, …, x_n, live(ẋ_1, …, ẋ_n)]`, which correspond to the primal inputs followed by one fresh
+    ///     tangent input for each nonzero differential input, and
+    ///   - outputs `[y_1, …, y_m, live(ẏ_1, …, ẏ_m)]`, which correspond to the primal outputs followed by the
+    ///     tangents of nonzero differential outputs.
+    ///
+    /// More precisely, `live(ẋ_1, …, ẋ_n)` is the subsequence containing only tangents whose types are not zero
+    /// differential spaces. A tangent in a zero differential space has exactly one possible value, so the transformed
+    /// program allocates no Single Static Assignment (SSA) input or output for it. This omission applies only to
+    /// tangent slots. All primal inputs and outputs remain present, and an ordinary primal residual remains present
+    /// whenever derivative computation needs its value. Higher-level callable transforms retain their structured public
+    /// boundaries and insert the uniquely determined typed zeros when rebuilding their results.
     ///
     /// The program is *not* split into separate primal and tangent sub-programs unlike [`Self::linearize`], which
     /// directly composes differentiation with partial evaluation. This un-split form remains exposed for fused
@@ -1282,7 +1423,8 @@ where
     /// input tangent is structural zero only when each output zero tangent can be materialized without runtime identity
     /// operands (or by reusing a compatible zero-producing primal). It stages the primal directly and pairs each output
     /// with a typed structural zero tangent. Structural zeros are materialized as typed [`ZeroOperation`] instructions
-    /// only at the output boundary, preserving the `(primal_outputs ++ tangent_outputs)` program contract.
+    /// only when a nonzero differential output requires a real value, preserving a compact
+    /// `(primal_outputs ++ live_tangent_outputs)` program contract.
     #[inline]
     pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         self.entry_region_ref().jvp()
@@ -1295,15 +1437,15 @@ where
     /// normally dispatches its forward-mode rule once; the established nonempty all-structural-zero fast path instead
     /// binds only its primal operation and propagates typed structural zeros.
     ///
-    /// The resulting [`Linearization`] has the canonical boundary `x -> (y, r)` and `(dx, r) -> dy`. Every source input
-    /// is seeded eagerly as one known primal tracer and one leading unknown tangent input. When tangent work first
-    /// consumes a known primal value, partial evaluation materializes that value as a residual and its shared
-    /// materialization slot deduplicates later uses; literal constants instead remain inline tangent-program constants.
-    /// Residual feeder tracers are appended to the primal outputs in exactly the tangent program's trailing input
-    /// order. Structural-zero tangent outputs are materialized only at the public tangent output boundary, preserving
-    /// one tangent output per primal output without introducing zero work inside the walk. A tangent that folds to a
-    /// known value is rejected: a well-formed linear tangent map must represent an input-independent zero as
-    /// [`MaybeZero::Zero`], while accepting an arbitrary known value would silently mask a nonlinear rule.
+    /// The resulting [`Linearization`] has the boundary `x -> (y, r)` and `(live(dx), r) -> live(dy)`. Every source
+    /// input is seeded eagerly as one known primal tracer and, for a nonzero differential space, one leading unknown
+    /// tangent input. When tangent work first consumes a known primal value, partial evaluation materializes that value
+    /// as a residual and its shared materialization slot deduplicates later uses; literal constants instead remain
+    /// inline tangent-program constants. Residual feeder tracers are appended to the primal outputs in exactly the
+    /// tangent program's trailing input order. Zero differential outputs remain structural and are omitted from the
+    /// tangent program. A tangent that folds to a known value is rejected as a well-formed linear tangent map must
+    /// represent an input-independent zero as [`MaybeZero::Zero`], while accepting an arbitrary known value would
+    /// silently mask a nonlinear rule.
     ///
     /// Effect placement is inherited from [`PartialEvaluationContext`]. All-known effects stage once into the primal
     /// program, while tangent-dependent effects residualize once into the tangent program. Higher-order operations own
@@ -1424,21 +1566,23 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
 
         let input_structure = primals.parameter_structure();
         let input_values = primals.into_parameters().collect::<Vec<_>>();
-        let tangent_input_count = input_values.len();
+        let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let tangent_input_count = input_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
 
         // Wrap each primal as a dual over a partial-evaluation context wrapping this context. The primal half is a
         // known value and the tangent half is an unknown seeded as a leading residual-program input, in primal-input
         // order.
         let evaluation_context = PartialEvaluationContext::new(self.clone());
         let differentiation_context = DifferentiationContext::new(evaluation_context.clone());
+        let mut tangent_index = 0usize;
         let input_duals = input_values
             .into_iter()
-            .enumerate()
-            .map(|(index, value)| {
+            .map(|value| {
                 let primal_type = value.r#type().into_owned();
                 let tangent_type = primal_type.tangent();
-                let tangent = evaluation_context.unknown_input(tangent_type.clone(), index);
                 let tangent = if !tangent_type.is_zero_space() {
+                    let tangent = evaluation_context.unknown_input(tangent_type.clone(), tangent_index);
+                    tangent_index += 1;
                     MaybeZero::Value(PartialTracer::new(evaluation_context.clone(), tangent))
                 } else {
                     MaybeZero::Zero(tangent_type)
@@ -1454,9 +1598,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         let output = function(input)?;
 
         // Split each output dual into its known primal value and its tangent. Primal work depends only on the known
-        // primal inputs, so every primal half must have folded to a known value. Structural-zero tangent halves are
-        // restored as staged zeros, and so the pushforward program presents the canonical one-tangent-output-per-
-        // primal-output arity (matching `Program::linearize`'s restoration). A value tangent that folded to known is
+        // primal inputs, so every primal half must have folded to a known value. Zero differential outputs remain
+        // structural and are omitted from the executable pushforward boundary. A value tangent that folded to known is
         // malformed. A well-formed rule must preserve an input-independent zero as `MaybeZero::Zero`, while accepting
         // an arbitrary known value would silently turn the pushforward into an affine map.
         let output_structure = output.parameter_structure();
@@ -1468,6 +1611,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         };
         let mut primal_outputs = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
+        let mut output_types = Vec::with_capacity(output_duals.len());
         for output_dual in output_duals {
             let (primal, tangent) = output_dual.into_dual().into_parts();
             let primal = match primal.into_value()?.value() {
@@ -1481,6 +1625,12 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
                     .into());
                 }
             };
+            let tangent_type = tangent.r#type().into_owned();
+            output_types.push(primal.r#type().into_owned());
+            if tangent_type.is_zero_space() {
+                primal_outputs.push(primal);
+                continue;
+            }
             let tangent = match tangent {
                 MaybeZero::Value(tracer) => {
                     let value = tracer.into_value()?;
@@ -1525,7 +1675,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         }
 
         // Close the pushforward program over the linearization-point residuals behind the reusable callable.
-        let pushforward = Pushforward::new(self.clone(), evaluation.program, residuals, output_structure)?;
+        let pushforward =
+            Pushforward::new(self.clone(), evaluation.program, residuals, input_types, output_types, output_structure)?;
         Ok((output, pushforward))
     }
 }
@@ -2056,6 +2207,11 @@ mod tests {
             .unwrap();
         assert_eq!(value, Scalar::Token);
         assert_eq!(pushforward.apply(Scalar::Zero), Ok(Scalar::Zero));
+        assert!(matches!(
+            pushforward.apply(Scalar::Token),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "pushforward tangent 0 has type token but its primal boundary requires tangent type zero",
+        ));
 
         // Under an active trace, the free `linearize` recovers the staging context from its tracer input instead,
         // so primal work stages into the enclosing trace and the pushforward replays there when applied.
