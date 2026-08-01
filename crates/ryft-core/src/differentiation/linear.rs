@@ -2,8 +2,9 @@ use std::fmt::Display;
 
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ProgramBatchingOutputAxesPolicy,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::DifferentiationError;
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
 use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
@@ -11,6 +12,8 @@ use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::math::{Reduce, ReduceOperation, ReductionKind};
+use crate::parameters::Placeholder;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
@@ -319,20 +322,105 @@ impl<C: Context<Type: DifferentiableType, Operation: From<LinearCallOperation<C:
 {
 }
 
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for LinearCallOperation<ArrayType>
+impl<
+    C: Context<Type = ArrayType, Operation: From<LinearCallOperation<ArrayType>> + From<ReduceOperation>>,
+    P: ArrayBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatching<P>> for LinearCallOperation<ArrayType>
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        _context: &BatchingContext<C, ArrayBatching<P>>,
-        _driver: &D,
-        _inputs: &[ArrayBatch<C::Value>],
+        context: &BatchingContext<C, ArrayBatching<P>>,
+        driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        // TODO(eaplatanios): Fix this in phase 6.
-        // Batching a linear call admits a principled rule (batch the attached forward and transpose regions and
-        // replicate residual extents), which the Phase 6 extent-residual operation sweep owns; until then, `vmap`
-        // over a linearized program containing an executable call reports this exact boundary.
-        Err(BatchingError::UnsupportedOperation { message: format!("operation `{}` cannot be batched", self.name()) })
+        if self.residual_count > inputs.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "linear call residual count {} exceeds input count {}",
+                self.residual_count,
+                inputs.len(),
+            ))
+            .into());
+        }
+
+        // A completely replicated call needs no structural region rewrite. Keeping the original call also avoids
+        // manufacturing a batch axis that neither region observes.
+        if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
+            let outputs = context.parent().bind(
+                self.clone(),
+                driver.regions().map(|region| region.to_program()).collect::<Vec<_>>(),
+                &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+            )?;
+            return Ok(outputs.into_iter().map(ArrayBatch::replicated).collect());
+        }
+
+        if self.is_transpose_only() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "a transpose-only linear call cannot be batched with mapped inputs because its unavailable \
+                          forward program does not determine output batch axes"
+                    .to_string(),
+            });
+        }
+
+        let input_axes = inputs.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
+        let (residual_axes, linear_axes) = input_axes.split_at(self.residual_count);
+        let (forward, output_axes) = driver
+            .batch_program(context, driver.region(0)?, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
+            .into_parts();
+
+        // Batch the supplied transpose under the forward result axes. A cotangent for a replicated linear input must
+        // sum contributions across a naturally mapped output axis; mapped linear inputs instead retain their packed
+        // axis. This is the transpose of the *batched* map, rather than merely a per-item transpose.
+        let transpose_input_axes = residual_axes.iter().copied().chain(output_axes.iter().copied()).collect::<Vec<_>>();
+        let (transpose, transpose_output_axes) = driver
+            .batch_program(
+                context,
+                driver.region(1)?,
+                transpose_input_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(linear_axes.to_vec()),
+            )?
+            .into_parts();
+        check_count!("output", transpose_output_axes, linear_axes.len(), ProgramError);
+        check_count!("output", transpose.output_ids(), linear_axes.len(), ProgramError);
+        let transpose = {
+            let tracing_context = TracingContext::<C::Constant, C::Operation>::new();
+            let builder = tracing_context.builder().clone();
+            let transpose_inputs =
+                transpose.input_types().into_iter().map(|r#type| tracing_context.input(r#type)).collect::<Vec<_>>();
+            let transpose_outputs = transpose.interpret_in_context(&tracing_context, transpose_inputs)?;
+            let transpose_outputs = transpose_outputs
+                .into_iter()
+                .zip(transpose_output_axes.iter().zip(linear_axes))
+                .map(|(output, (actual, target))| match (actual.axis(), target.axis()) {
+                    (Some(axis), None) => Ok(output.reduce(
+                        &[axis.normalize(output.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
+                            r#type: Box::new(output.r#type().into_owned()),
+                            axis,
+                        })?],
+                        ReductionKind::Sum,
+                    )),
+                    _ => Ok(output),
+                })
+                .collect::<Result<Vec<_>, BatchingError>>()?;
+            let output_ids = transpose_outputs.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+            let input_count = transpose.input_count();
+            let output_count = output_ids.len();
+            drop((tracing_context, transpose_outputs));
+            let builder =
+                std::rc::Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+            builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
+        };
+
+        context
+            .parent()
+            .bind(
+                LinearCallOperation::new(self.residual_count),
+                vec![forward, transpose],
+                &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+            )?
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, axis))
+            .collect()
     }
 }
 
@@ -500,6 +588,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::StagingContext;
     use crate::contexts::tests::{
         ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue,
@@ -514,6 +603,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::programs::Program;
     use crate::programs::regions::{RegionDriver, RegionRef};
+    use crate::sharding::ShardingDimension;
     use crate::tracing::TracingContext;
     use crate::types::{ArrayType, DataType};
 
@@ -630,6 +720,97 @@ mod tests {
                                reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or \
                                'jacobian_reverse')",
         ));
+        assert!(matches!(
+            program.batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "a transpose-only linear call cannot be batched with mapped inputs because its \
+                               unavailable forward program does not determine output batch axes",
+        ));
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_preserves_its_transpose() {
+        let r#type = ArrayType::scalar(DataType::F64);
+        let forward = scalar_multiply_program();
+        let transpose = forward.clone();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(r#type.clone());
+        let linear = builder.add_input(r#type);
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // A varying residual with a shared linear input produces mapped outputs. Its transpose must sum the per-item
+        // cotangents back into the single shared input cotangent.
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched.interpret(vec![Array::vector(vec![2.0, 3.0]), Array::scalar(4.0)]),
+            Ok(vec![Array::vector(vec![8.0, 12.0])]),
+        );
+
+        let instruction = &batched.instructions()[0];
+        let transpose = batched.region_ref(instruction.regions()[1]).unwrap().to_program();
+        assert_eq!(
+            transpose.interpret(vec![Array::vector(vec![2.0, 3.0]), Array::vector(vec![5.0, 7.0])]),
+            Ok(vec![Array::scalar(31.0)]),
+        );
+
+        // A replicated residual and mapped linear input preserve the mapped cotangent instead of reducing it.
+        let (batched_linear, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched_linear.interpret(vec![Array::scalar(2.0), Array::vector(vec![3.0, 4.0])]),
+            Ok(vec![Array::vector(vec![6.0, 8.0])]),
+        );
+        let instruction = &batched_linear.instructions()[0];
+        let transpose = batched_linear.region_ref(instruction.regions()[1]).unwrap().to_program();
+        assert_eq!(
+            transpose.interpret(vec![Array::scalar(2.0), Array::vector(vec![5.0, 7.0])]),
+            Ok(vec![Array::vector(vec![10.0, 14.0])]),
+        );
+
+        // Rebatching an executable linear call composes mapped axes without losing either attached region.
+        let (nested, output_axes) = batched_linear
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            nested.interpret(vec![Array::vector(vec![2.0, 3.0]), Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]),]),
+            Ok(vec![Array::matrix(2, 2, vec![8.0, 10.0, 18.0, 21.0])]),
+        );
     }
 
     #[test]
