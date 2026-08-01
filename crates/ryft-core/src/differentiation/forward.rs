@@ -78,7 +78,7 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
     #[inline]
     pub fn new_with_zero_tangent(primal: V) -> Self {
         let tangent = MaybeZero::Zero(primal.r#type().tangent());
-        Self::new(primal, tangent).unwrap()
+        Self { primal, tangent }
     }
 }
 
@@ -1892,21 +1892,18 @@ pub fn jvp_projected_operation<
     context: &C,
     operation: &<C::Operation as OperationProjection<T>>::Projected,
     inputs: &[DifferentiationDual<C::Value>],
-) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-where
-    for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
-{
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
     let projected_inputs = inputs
         .iter()
         .map(|input| {
             let primal = <C::Value as ValueProjection<T>>::into_projected(input.primal().clone())?;
-            let tangent = match input.tangent() {
-                MaybeZero::Zero(r#type) => MaybeZero::Zero(<&T>::try_from(r#type)?.clone()),
+            match input.tangent() {
+                MaybeZero::Zero(_) => Ok(DifferentiationDual::new_with_zero_tangent(primal)),
                 MaybeZero::Value(value) => {
-                    MaybeZero::Value(<C::Value as ValueProjection<T>>::into_projected(value.clone())?)
+                    let tangent = <C::Value as ValueProjection<T>>::into_projected(value.clone())?;
+                    DifferentiationDual::new(primal, tangent)
                 }
-            };
-            DifferentiationDual::new(primal, tangent)
+            }
         })
         .collect::<Result<Vec<_>, TypeError>>()?;
     operation

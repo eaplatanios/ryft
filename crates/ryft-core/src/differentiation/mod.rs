@@ -102,7 +102,7 @@ pub use elementwise::{
 };
 pub use forward::{
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,
-    ForwardModeDifferentiate, Linearization, LinearizationTracer, Pushforward, jvp, linearize,
+    ForwardModeDifferentiate, Linearization, LinearizationTracer, Pushforward, jvp, jvp_projected_operation, linearize,
 };
 pub use hessian::{
     Hessian, HessianBlock, HessianDifferentiate, hessian, hessian_holomorphic, hessian_holomorphic_with_aux,
@@ -116,8 +116,8 @@ pub use jacobian::{
 pub use linear::LinearCallOperation;
 pub use reverse::{
     Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, gradient, gradient_holomorphic,
-    gradient_holomorphic_with_aux, gradient_with_aux, value_and_gradient, value_and_gradient_holomorphic,
-    value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
+    gradient_holomorphic_with_aux, gradient_with_aux, transpose_projected_operation, value_and_gradient,
+    value_and_gradient_holomorphic, value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
 
