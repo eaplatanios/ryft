@@ -507,22 +507,6 @@ where
     }
 }
 
-/// Access to a custom-VJP residual payload as a concrete value during pullback interpretation.
-///
-/// Implemented by plain values as the identity.
-#[doc(hidden)]
-pub trait CustomVjpResidual<V: Value>: Value<Type = V::Type> {
-    /// Returns the concrete residual value.
-    fn residual_value(&self) -> Result<V, ProgramError>;
-}
-
-impl<V: Value> CustomVjpResidual<V> for V {
-    #[inline]
-    fn residual_value(&self) -> Result<V, ProgramError> {
-        Ok(self.clone())
-    }
-}
-
 /// Capture-free forward-mode (JVP) rule for [`CustomVjpOperation`]: replays the user-supplied forward program through
 /// the active context and stages one transpose-only [`LinearCallOperation`] carrier for the output tangents.
 ///
