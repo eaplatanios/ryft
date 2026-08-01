@@ -357,14 +357,15 @@ impl<V: Value, O: Operation<V::Type>> BatchedProgram<V, O> {
     ///   - It drops the leading `widening_output_count` outputs, which carry transform bookkeeping (e.g., the
     ///     composite policy's forwarded mapped extent) rather than source-region results.
     ///   - It reconciles each remaining output with the batch axis its consumer requires: an output that is mapped
-    ///     while its required axis is replicated is collapsed along its mapped axis by `reduce_fn`. Every other
+    ///     while its required axis is replicated is collapsed along its mapped axis by `collapse_fn`. Every other
     ///     combination passes through unchanged.
     ///
     /// Unlike [`Self::new`], the provided parts deliberately do *not* need to satisfy this type's boundary
     /// invariant: `output_axes` excludes the bookkeeping outputs that `program` still carries, so the parts only
     /// become a valid [`BatchedProgram`] once the replay has dropped those outputs. The constructed result always
-    /// satisfies the invariant. When neither adjustment applies (no bookkeeping outputs and no required axes), the
-    /// parts are rewrapped directly, without a replay.
+    /// satisfies the invariant, and its output axes report each collapsed output as replicated (collapsing is what
+    /// made it so). When neither adjustment applies (no bookkeeping outputs and no required axes), the parts are
+    /// rewrapped directly, without a replay.
     ///
     /// This is the shared implementation behind every [`BatchingPolicy::adapt_batched_program`] implementation:
     /// each policy calls it with its own widening output count so that the replay machinery exists exactly once.
@@ -375,18 +376,24 @@ impl<V: Value, O: Operation<V::Type>> BatchedProgram<V, O> {
     ///     bookkeeping outputs beyond the source region's own outputs.
     ///   - `output_axes`: Mapped batch axis of each source-region output of `program`, in order, *excluding* the
     ///     bookkeeping outputs (i.e., one entry per output that the constructed result keeps).
-    ///   - `required_output_axes`: Batch axis that the consumer requires for each kept output, or [`None`] to keep
-    ///     every output's natural axis. Only mapped-to-replicated mismatches are resolved (via `reduce_fn`), because
-    ///     they are the one mismatch no structural axis movement can fix; batch the program with
-    ///     [`ProgramBatchingOutputAxesPolicy::AlignEachTo`] so that every structurally movable axis already matches
-    ///     its requirement.
+    ///   - `required_output_axes`: Batch axis that the consumer requires for each kept output, or [`None`] to
+    ///     keep every output's natural axis. Only mapped-to-replicated mismatches are resolved (via `collapse_fn`),
+    ///     because they are the one mismatch no structural axis movement can fix; batch the program with
+    ///     [`ProgramBatchingOutputAxesPolicy::AlignEachTo`] so that every structurally movable axis already
+    ///     matches its requirement.
     ///   - `widening_output_count`: Number of leading `program` outputs that belong to the policy's boundary
     ///     widening and must be dropped.
-    ///   - `reduce_fn`: Collapses one mapped output along the provided axis, within the replay's own
-    ///     [`TracingContext`]. Callers own this step because collapsing is consumer semantics (e.g., summing
-    ///     per-batch-item cotangents for a replicated input), not boundary bookkeeping.
+    ///   - `collapse_fn`: Collapses one mapped output along the provided axis, within the replay's own
+    ///     [`TracingContext`]. A collapsed output arrives as the per-item family `{y₀, …, yₙ₋₁}` packed along the
+    ///     mapped axis while its consumer requires the one value that is correct in the replicated position, so this
+    ///     function is the consumer's chosen left inverse to replication along the batch axis. Which inverse is correct
+    ///     depends on what the output *means*, which is why callers own this step. For example, the
+    ///     [`LinearCallOperation`](crate::LinearCallOperation) transpose consumer collapses cotangents by summation
+    ///     (i.e., `ȳ = Σᵢ ȳᵢ`, because replicating a primal across the batch is a broadcast and the transpose of a
+    ///     broadcast is a summation), while a hypothetical consumer of replicated primal values would instead select
+    ///     any one item.
     pub fn from_widened_boundary<
-        ReduceFn: Fn(
+        CollapseFn: Fn(
             &TracingContext<V, O>,
             Tracer<TracingContext<V, O>>,
             Axis,
@@ -396,7 +403,7 @@ impl<V: Value, O: Operation<V::Type>> BatchedProgram<V, O> {
         output_axes: Vec<BatchAxis>,
         required_output_axes: Option<&[BatchAxis]>,
         widening_output_count: usize,
-        reduce_fn: ReduceFn,
+        collapse_fn: CollapseFn,
     ) -> Result<Self, BatchingError> {
         if let Some(required_output_axes) = required_output_axes {
             check_count!("output", output_axes, required_output_axes.len(), ProgramError);
@@ -425,7 +432,7 @@ impl<V: Value, O: Operation<V::Type>> BatchedProgram<V, O> {
                     .into_iter()
                     .zip(output_axes.iter().zip(required_output_axes))
                     .map(|(output, (actual, required))| match (actual.axis(), required.axis()) {
-                        (Some(axis), None) => reduce_fn(&context, output, axis),
+                        (Some(axis), None) => collapse_fn(&context, output, axis),
                         _ => Ok(output),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -440,6 +447,21 @@ impl<V: Value, O: Operation<V::Type>> BatchedProgram<V, O> {
         let output_count = output_ids.len();
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
         let program = builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
+
+        // A collapsed output is replicated in the rebuilt program, so the reported axes must say so
+        // instead of repeating the pre-collapse mapped axis.
+        let output_axes = match required_output_axes {
+            Some(required_output_axes) => output_axes
+                .into_iter()
+                .zip(required_output_axes)
+                .map(|(actual, required)| match (actual.axis(), required.axis()) {
+                    (Some(_), None) => BatchAxis::replicated(),
+                    _ => actual,
+                })
+                .collect(),
+            None => output_axes,
+        };
+
         Ok(Self::new(program, output_axes)?)
     }
 
@@ -848,10 +870,17 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// [extent, inputs...] ↦ [extent, outputs...]
     /// ```
     ///
-    /// where the leading output only forwards the leading extent input for extent-threading consumers.
-    /// Adapting that program drops the forwarded output, producing `[extent, inputs...] ↦ [outputs...]`, and
-    /// [`Self::boundary_operands`] supplies the matching leading operand value (e.g., a batched linear call consumes
-    /// the extent as one more leading residual). Homogeneous array policies adapt without any boundary change.
+    /// The two extent slots play different roles, which is why adaptation removes one but not the other. The leading
+    /// *input* is load-bearing for the program itself: it defines the
+    /// [`DimensionVariable`](crate::DimensionVariable) that every inserted dynamic batch dimension's type references,
+    /// and a sealed program's types must be grounded by a value in its own scope, so removing it would leave the
+    /// program referencing an undefined identity. The leading *output* carries no information of its own: it merely
+    /// relays the extent so an enclosing extent-threading operation can chain it through its own sealed regions
+    /// (e.g., a batched while body must return the extent it consumed so the next iteration's boundary can be fed).
+    /// A consumer that does not thread extents has no use for the relay, so adapting the program drops the forwarded
+    /// output, producing `[extent, inputs...] ↦ [outputs...]`, while [`Self::boundary_operands`] supplies the value
+    /// for the kept input (e.g., a batched linear call consumes the extent as one more leading residual).
+    /// Homogeneous array policies adapt without any boundary change.
     ///
     /// When `required_output_axes` is provided, the adaptation additionally reconciles each remaining output with
     /// the batch axis its consumer requires (i.e., an output that is mapped while its required axis is replicated is
@@ -871,11 +900,14 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     ///     because no structural alignment can fix them; batch the program with
     ///     [`ProgramBatchingOutputAxesPolicy::AlignEachTo`] so that every structurally
     ///     movable axis already matches its requirement.
-    ///   - `reduce_fn`: Function that collapses one mapped output along the provided axis within the replayed program's
-    ///     own [`TracingContext`]. Callers own this step because collapsing is consumer semantics (e.g., cotangent
-    ///     summation), and not boundary bookkeeping.
+    ///   - `collapse_fn`: Function that collapses one mapped output along the provided axis within the replayed
+    ///     program's own [`TracingContext`], turning the per-item family `{y₀, …, yₙ₋₁}` packed along that axis into
+    ///     the one value that is correct in the replicated position (i.e., the consumer's chosen left inverse to
+    ///     replication along the batch axis). Callers own this step because which inverse is correct depends on what
+    ///     the output means (e.g., summation for cotangents), and not on boundary bookkeeping. Refer to the
+    ///     documentation of [`BatchedProgram::from_widened_boundary`] for more information.
     fn adapt_batched_program<
-        ReduceFn: Fn(
+        CollapseFn: Fn(
             &TracingContext<C::Constant, C::Operation>,
             Tracer<TracingContext<C::Constant, C::Operation>>,
             Axis,
@@ -883,7 +915,7 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     >(
         program: Self::BatchedProgram,
         required_output_axes: Option<&[BatchAxis]>,
-        reduce_fn: ReduceFn,
+        collapse_fn: CollapseFn,
     ) -> Result<BatchedProgram<C::Constant, C::Operation>, BatchingError>;
 }
 
@@ -1073,7 +1105,7 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPoli
 
     #[inline]
     fn adapt_batched_program<
-        ReduceFn: Fn(
+        CollapseFn: Fn(
             &TracingContext<C::Constant, C::Operation>,
             Tracer<TracingContext<C::Constant, C::Operation>>,
             Axis,
@@ -1081,10 +1113,10 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPoli
     >(
         program: Self::BatchedProgram,
         required_output_axes: Option<&[BatchAxis]>,
-        reduce_fn: ReduceFn,
+        collapse_fn: CollapseFn,
     ) -> Result<BatchedProgram<C::Constant, C::Operation>, BatchingError> {
         let (program, output_axes) = program.into_parts();
-        BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, reduce_fn)
+        BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, collapse_fn)
     }
 }
 
@@ -1184,7 +1216,7 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
 
     #[inline]
     fn adapt_batched_program<
-        ReduceFn: Fn(
+        CollapseFn: Fn(
             &TracingContext<C::Constant, C::Operation>,
             Tracer<TracingContext<C::Constant, C::Operation>>,
             Axis,
@@ -1192,9 +1224,9 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
     >(
         program: Self::BatchedProgram,
         required_output_axes: Option<&[BatchAxis]>,
-        reduce_fn: ReduceFn,
+        collapse_fn: CollapseFn,
     ) -> Result<BatchedProgram<C::Constant, C::Operation>, BatchingError> {
-        P::adapt_batched_program(program, required_output_axes, reduce_fn)
+        P::adapt_batched_program(program, required_output_axes, collapse_fn)
     }
 }
 
@@ -2563,7 +2595,7 @@ mod tests {
         }
 
         fn adapt_batched_program<
-            ReduceFn: Fn(
+            CollapseFn: Fn(
                 &TracingContext<ProjectedProgramValue, ProjectedProgramOperation>,
                 Tracer<TracingContext<ProjectedProgramValue, ProjectedProgramOperation>>,
                 Axis,
@@ -2572,10 +2604,10 @@ mod tests {
         >(
             program: Self::BatchedProgram,
             required_output_axes: Option<&[BatchAxis]>,
-            reduce_fn: ReduceFn,
+            collapse_fn: CollapseFn,
         ) -> Result<BatchedProgram<ProjectedProgramValue, ProjectedProgramOperation>, BatchingError> {
             let (program, output_axes) = program.into_parts();
-            BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, reduce_fn)
+            BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, collapse_fn)
         }
     }
 
@@ -2660,6 +2692,92 @@ mod tests {
         let (program, output_axes) = BatchedProgram::new(program, vec![BatchAxis::replicated()]).unwrap().into_parts();
         assert_eq!(program.output_ids(), &[input]);
         assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+    }
+
+    #[test]
+    fn test_batched_program_from_widened_boundary() {
+        let packed_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+        let sum = |context: &TracingContext<Array, ArrayOperation<Array>>,
+                   output: Tracer<TracingContext<Array, ArrayOperation<Array>>>,
+                   axis: Axis| {
+            let _ = context;
+            Ok(output.reduce(&[axis.normalize(output.r#type().rank()).unwrap()], ReductionKind::Sum))
+        };
+
+        // Parts that need no adjustment (no widening outputs and no required axes) are rewrapped without a replay.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(packed_type.clone());
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let rendered = program.to_string();
+        let (program, output_axes) =
+            BatchedProgram::from_widened_boundary(program, vec![BatchAxis::new(0)], None, 0, |_, _, _| {
+                unreachable!("rewrapping must not collapse any output")
+            })
+            .unwrap()
+            .into_parts();
+        assert_eq!(program.to_string(), rendered);
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+
+        // Widening outputs are bookkeeping rather than source-region results, so the rebuilt boundary drops them
+        // while the corresponding inputs stay (they ground the program's own computation).
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let widening = builder.add_input(ArrayType::scalar(DataType::F64));
+        let source = builder.add_input(packed_type.clone());
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![widening, source], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let (program, output_axes) =
+            BatchedProgram::from_widened_boundary(program, vec![BatchAxis::new(0)], None, 1, |_, _, _| {
+                unreachable!("dropping a widening output must not collapse any source output")
+            })
+            .unwrap()
+            .into_parts();
+        assert_eq!(program.input_count(), 2);
+        assert_eq!(
+            program.interpret(vec![Array::scalar(7.0), Array::vector(vec![2.0, 3.0])]),
+            Ok(vec![Array::vector(vec![2.0, 3.0])]),
+        );
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+
+        // A mapped output whose required axis is replicated is collapsed by `collapse_fn` and reported as replicated,
+        // while a mapped output whose required axis is mapped passes through untouched.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(packed_type.clone());
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![input, input], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let (program, output_axes) = BatchedProgram::from_widened_boundary(
+            program,
+            vec![BatchAxis::new(0), BatchAxis::new(0)],
+            Some(&[BatchAxis::replicated(), BatchAxis::new(0)]),
+            0,
+            sum,
+        )
+        .unwrap()
+        .into_parts();
+        assert_eq!(
+            program.interpret(vec![Array::vector(vec![2.0, 3.0])]),
+            Ok(vec![Array::scalar(5.0), Array::vector(vec![2.0, 3.0])]),
+        );
+        assert_eq!(output_axes, vec![BatchAxis::replicated(), BatchAxis::new(0)]);
+
+        // The required axes must cover exactly the non-widening outputs.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(packed_type);
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert!(matches!(
+            BatchedProgram::from_widened_boundary(
+                program,
+                vec![BatchAxis::new(0)],
+                Some(&[BatchAxis::replicated(), BatchAxis::new(0)]),
+                0,
+                sum,
+            )
+            .map(|_| ()),
+            Err(BatchingError::Program(ProgramError::InvalidOutputCount { expected: 2, actual: 1 })),
+        ));
     }
 
     #[test]
