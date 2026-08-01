@@ -94,7 +94,7 @@ use crate::programs::regions::{
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
-use crate::tracing::TracingContext;
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Dimension, DimensionType, Shape};
 
 /// Represents batching-related errors.
@@ -180,9 +180,9 @@ impl From<BatchingError> for ProgramError {
 /// predicate would need a dedicated batching rule. Note that replication is not limited to rank-0 (i.e., scalar)
 /// values. Any shaped constant or input is replicated when none of its dimensions indexes the batch.
 ///
-/// This is the batch axis carried by an [`ArrayBatch`] and, during the batching transform, by the
-/// [`Tracer`](crate::Tracer) metadata. Carrying it on the value itself lets the per-operation batching rules
-/// route the mapped batch axis straight from the value in hand.
+/// This is the batch axis carried by an [`ArrayBatch`] and, during the batching transform, by the [`Tracer`] metadata.
+/// Carrying it on the value itself lets the per-operation batching rules route the mapped batch axis straight from the
+/// value in hand.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
 pub struct BatchAxis(Option<Axis>);
 
@@ -327,10 +327,10 @@ impl From<usize> for BatchAxisSpecification {
 }
 
 /// Result of structurally batching a nested [`Region`](crate::Region) whose transformed program carries exactly the
-/// source region's inputs and outputs. [`BatchingPolicy`]s whose transformed programs carry protocol inputs or outputs
-/// beyond the source region's own boundary select their own result type through [`BatchingPolicy::BatchedProgram`]
-/// instead, so consumers statically acknowledge that protocol through the result type's own API rather than through
-/// a shared accessor that could silently drop it.
+/// source region's inputs and outputs. [`BatchingPolicy`]s whose transformed programs carry bookkeeping inputs or
+/// outputs beyond the source region's own boundary select their own result type through
+/// [`BatchingPolicy::BatchedProgram`] instead, so consumers statically acknowledge that widened boundary
+/// through the result type's own API rather than through a shared accessor that could silently drop it.
 pub struct BatchedProgram<V: Typed + Parameter, O> {
     /// Structurally transformed [`Program`].
     program: Program<V, O, Vec<V>, Vec<V>>,
@@ -345,6 +345,102 @@ impl<V: Value, O: Operation<V::Type>> BatchedProgram<V, O> {
     pub fn new(program: Program<V, O, Vec<V>, Vec<V>>, output_axes: Vec<BatchAxis>) -> Result<Self, ProgramError> {
         check_count!("output", output_axes, program.output_count(), ProgramError);
         Ok(Self { program, output_axes })
+    }
+
+    /// Creates a new plain source-boundary [`BatchedProgram`] from the parts of a structurally batched program
+    /// whose boundary may still carry a [`BatchingPolicy`]'s widening.
+    ///
+    /// This constructor performs the two boundary adjustments that turn a widened batched program back into an
+    /// ordinary [`Region`](crate::Region) program, both by replaying the program and rebuilding its output
+    /// boundary:
+    ///
+    ///   - It drops the leading `widening_output_count` outputs, which carry transform bookkeeping (e.g., the
+    ///     composite policy's forwarded mapped extent) rather than source-region results.
+    ///   - It reconciles each remaining output with the batch axis its consumer requires: an output that is mapped
+    ///     while its required axis is replicated is collapsed along its mapped axis by `reduce_fn`. Every other
+    ///     combination passes through unchanged.
+    ///
+    /// Unlike [`Self::new`], the provided parts deliberately do *not* need to satisfy this type's boundary
+    /// invariant: `output_axes` excludes the bookkeeping outputs that `program` still carries, so the parts only
+    /// become a valid [`BatchedProgram`] once the replay has dropped those outputs. The constructed result always
+    /// satisfies the invariant. When neither adjustment applies (no bookkeeping outputs and no required axes), the
+    /// parts are rewrapped directly, without a replay.
+    ///
+    /// This is the shared implementation behind every [`BatchingPolicy::adapt_batched_program`] implementation:
+    /// each policy calls it with its own widening output count so that the replay machinery exists exactly once.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Structurally batched program, which may still carry `widening_output_count` leading
+    ///     bookkeeping outputs beyond the source region's own outputs.
+    ///   - `output_axes`: Mapped batch axis of each source-region output of `program`, in order, *excluding* the
+    ///     bookkeeping outputs (i.e., one entry per output that the constructed result keeps).
+    ///   - `required_output_axes`: Batch axis that the consumer requires for each kept output, or [`None`] to keep
+    ///     every output's natural axis. Only mapped-to-replicated mismatches are resolved (via `reduce_fn`), because
+    ///     they are the one mismatch no structural axis movement can fix; batch the program with
+    ///     [`ProgramBatchingOutputAxesPolicy::AlignEachTo`] so that every structurally movable axis already matches
+    ///     its requirement.
+    ///   - `widening_output_count`: Number of leading `program` outputs that belong to the policy's boundary
+    ///     widening and must be dropped.
+    ///   - `reduce_fn`: Collapses one mapped output along the provided axis, within the replay's own
+    ///     [`TracingContext`]. Callers own this step because collapsing is consumer semantics (e.g., summing
+    ///     per-batch-item cotangents for a replicated input), not boundary bookkeeping.
+    pub fn from_widened_boundary<
+        ReduceFn: Fn(
+            &TracingContext<V, O>,
+            Tracer<TracingContext<V, O>>,
+            Axis,
+        ) -> Result<Tracer<TracingContext<V, O>>, BatchingError>,
+    >(
+        program: Program<V, O, Vec<V>, Vec<V>>,
+        output_axes: Vec<BatchAxis>,
+        required_output_axes: Option<&[BatchAxis]>,
+        widening_output_count: usize,
+        reduce_fn: ReduceFn,
+    ) -> Result<Self, BatchingError> {
+        if let Some(required_output_axes) = required_output_axes {
+            check_count!("output", output_axes, required_output_axes.len(), ProgramError);
+        } else if widening_output_count == 0 {
+            return Ok(Self::new(program, output_axes)?);
+        }
+
+        // Replay the program over fresh tracer inputs so that its output boundary can be rebuilt. The block scopes the
+        // tracing context and every traced value because recovering the rebuilt program below requires unique ownership
+        // of the shared builder, and so all other handles to it must have been released by then.
+        let (builder, output_ids) = {
+            let context = TracingContext::<V, O>::new();
+            let builder = context.builder().clone();
+            let inputs = program.input_types().into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
+            let mut outputs = program.interpret_in_context(&context, inputs)?;
+            check_count!("output", outputs, output_axes.len() + widening_output_count, ProgramError);
+
+            // The leading widening outputs carry transform bookkeeping rather than source-region results, so the
+            // rebuilt boundary omits them.
+            outputs.drain(..widening_output_count);
+
+            // Collapse each output that is mapped while its consumer requires it replicated. This is the one
+            // mismatch no structural axis movement can resolve, so it must be reduced away here.
+            if let Some(required_output_axes) = required_output_axes {
+                outputs = outputs
+                    .into_iter()
+                    .zip(output_axes.iter().zip(required_output_axes))
+                    .map(|(output, (actual, required))| match (actual.axis(), required.axis()) {
+                        (Some(axis), None) => reduce_fn(&context, output, axis),
+                        _ => Ok(output),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+
+            (builder, outputs.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?)
+        };
+
+        // With the context and tracers gone, the builder handle is unique and the traced instructions can be sealed
+        // into the rebuilt program behind the adjusted output boundary.
+        let input_count = program.input_count();
+        let output_count = output_ids.len();
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let program = builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
+        Ok(Self::new(program, output_axes)?)
     }
 
     /// Returns the mapped axes of the source [`Region`](crate::Region)'s outputs.
@@ -682,8 +778,10 @@ impl BatchableType for ArrayType {
 ///     transform metadata.
 ///   - **The Structurally Batched Program (i.e., [`Self::BatchedProgram`]):** Homogeneous array programs preserve the
 ///     source region's boundary exactly and produce ordinary [`BatchedProgram`]s, while a composite universe threads
-///     protocol values such as its first-class mapped extent through standalone nested programs and selects a result
-///     type whose API makes that protocol explicit.
+///     bookkeeping values such as its first-class mapped extent through standalone nested programs and selects
+///     a result type whose API makes that widened boundary explicit. [`Self::boundary_operands`] and
+///     [`Self::adapt_batched_program`] let consumers complete or shed that widening without knowing
+///     which policy produced the program.
 ///
 /// The policy is deliberately limited to carrier selection, construction, and access. Array-specific alignment and
 /// broadcasting are represented as functions on [`ArrayBatch`] (a composite policy may project an array member into
@@ -697,7 +795,9 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// Representation of the mapped-axis extent.
     type Extent: Clone + Debug;
 
-    /// Result of structurally batching a nested [`Program`] under this [`BatchingPolicy`]'s boundary protocol.
+    /// Result of structurally batching a nested [`Program`], including any policy-owned bookkeeping widening of the
+    /// program boundary. Refer to the documentation of [`Self::adapt_batched_program`] for how consumers shed that
+    /// widening when they need an ordinary [`Region`](crate::Region) boundary.
     type BatchedProgram;
 
     /// Wraps a parent-owned packed value with the requested mapped axis, validating and normalizing that axis.
@@ -711,6 +811,80 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
 
     /// Returns the per-item type exposed by `batch` after removing its mapped batch axis, if any.
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type>;
+
+    /// Returns the parent-owned bookkeeping operand values that this policy's structurally batched programs require
+    /// prepended to their source operands when they are rebound as ordinary [`Region`](crate::Region)s of an operation
+    /// that does not thread this policy's batching state itself.
+    ///
+    /// A structurally batched program's boundary is not always the source region's boundary. A batched nested program
+    /// is sealed and cannot reference values owned by the parent program, so a policy whose batching state is itself a
+    /// parent-owned value must widen the batched boundary with leading inputs that reintroduce that state. This
+    /// function supplies the parent-owned value for each such input, in boundary order, so consumers can complete
+    /// an adapted program's operands without knowing which policy produced it:
+    ///
+    ///   - Homogeneous array policies return no values (the default), because their mapped-axis extent is static
+    ///     transform metadata and their batched programs carry exactly the source boundary.
+    ///   - [`ArrayProgramBatching`](crate::backends::ArrayProgramBatching) returns its first-class mapped-extent
+    ///     dimension value, because every dynamic batch dimension inserted into one of its batched programs references
+    ///     the [`DimensionVariable`](crate::DimensionVariable) defined by that program's leading extent input.
+    ///
+    /// Refer to the documentation of [`Self::adapt_batched_program`] for the output-side counterpart of this contract,
+    /// along with a complete boundary example.
+    #[inline]
+    fn boundary_operands(_axis_extent: &Self::Extent) -> Vec<C::Value> {
+        Vec::new()
+    }
+
+    /// Adapts one structurally batched program to an ordinary [`Region`](crate::Region) boundary by removing this
+    /// policy's bookkeeping outputs and reducing each mapped output whose requested target axis is replicated.
+    ///
+    /// Structural batching widens some policies' program boundaries with bookkeeping state (refer to the documentation
+    /// of [`Self::boundary_operands`] for more information on that bookkeeping state). Extent-threading higher-order
+    /// operations such as `condition`, `while`, and `scan` consume that widened boundary as-is, but an operation whose
+    /// attached regions are plain programs must adapt it first. For example, batched program with support for dynamic
+    /// dimensions and shapes may have the boundary:
+    ///
+    /// ```text
+    /// [extent, inputs...] ↦ [extent, outputs...]
+    /// ```
+    ///
+    /// where the leading output only forwards the leading extent input for extent-threading consumers.
+    /// Adapting that program drops the forwarded output, producing `[extent, inputs...] ↦ [outputs...]`, and
+    /// [`Self::boundary_operands`] supplies the matching leading operand value (e.g., a batched linear call consumes
+    /// the extent as one more leading residual). Homogeneous array policies adapt without any boundary change.
+    ///
+    /// When `required_output_axes` is provided, the adaptation additionally reconciles each remaining output with
+    /// the batch axis its consumer requires (i.e., an output that is mapped while its required axis is replicated is
+    /// passed to `reduce`, which must collapse it along the mapped axis). This is, for example, how a batched transpose
+    /// program returns one shared cotangent for a replicated linear input (i.e., replicating a value across batch items
+    /// is semantically a broadcast, the transpose of a broadcast is a summation, and so the per-item cotangents are
+    /// summed).
+    ///
+    /// The result is always a plain source-boundary [`BatchedProgram`], so programs that need neither adjustment are
+    /// rewrapped unchanged, without a replay.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Structurally batched program to adapt.
+    ///   - `required_output_axes`: Batch axes that the consumer requires for each non-bookkeeping output, or [`None`]
+    ///     when the outputs' natural axes are already correct. Only mapped-to-replicated mismatches are resolved here,
+    ///     because no structural alignment can fix them; batch the program with
+    ///     [`ProgramBatchingOutputAxesPolicy::AlignEachTo`] so that every structurally
+    ///     movable axis already matches its requirement.
+    ///   - `reduce_fn`: Function that collapses one mapped output along the provided axis within the replayed program's
+    ///     own [`TracingContext`]. Callers own this step because collapsing is consumer semantics (e.g., cotangent
+    ///     summation), and not boundary bookkeeping.
+    fn adapt_batched_program<
+        ReduceFn: Fn(
+            &TracingContext<C::Constant, C::Operation>,
+            Tracer<TracingContext<C::Constant, C::Operation>>,
+            Axis,
+        ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+    >(
+        program: Self::BatchedProgram,
+        required_output_axes: Option<&[BatchAxis]>,
+        reduce_fn: ReduceFn,
+    ) -> Result<BatchedProgram<C::Constant, C::Operation>, BatchingError>;
 }
 
 /// Policy capability for recursively applying batching to nested [`Program`] [`Region`](crate::Region)s. This is
@@ -896,6 +1070,22 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPoli
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
         Cow::Owned(batch.unbatched_type())
     }
+
+    #[inline]
+    fn adapt_batched_program<
+        ReduceFn: Fn(
+            &TracingContext<C::Constant, C::Operation>,
+            Tracer<TracingContext<C::Constant, C::Operation>>,
+            Axis,
+        ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+    >(
+        program: Self::BatchedProgram,
+        required_output_axes: Option<&[BatchAxis]>,
+        reduce_fn: ReduceFn,
+    ) -> Result<BatchedProgram<C::Constant, C::Operation>, BatchingError> {
+        let (program, output_axes) = program.into_parts();
+        BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, reduce_fn)
+    }
 }
 
 impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> ArrayBatchingPolicy<C>
@@ -985,6 +1175,26 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
     #[inline]
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
         P::unbatched_type(batch)
+    }
+
+    #[inline]
+    fn boundary_operands(axis_extent: &Self::Extent) -> Vec<C::Value> {
+        P::boundary_operands(axis_extent)
+    }
+
+    #[inline]
+    fn adapt_batched_program<
+        ReduceFn: Fn(
+            &TracingContext<C::Constant, C::Operation>,
+            Tracer<TracingContext<C::Constant, C::Operation>>,
+            Axis,
+        ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+    >(
+        program: Self::BatchedProgram,
+        required_output_axes: Option<&[BatchAxis]>,
+        reduce_fn: ReduceFn,
+    ) -> Result<BatchedProgram<C::Constant, C::Operation>, BatchingError> {
+        P::adapt_batched_program(program, required_output_axes, reduce_fn)
     }
 }
 
@@ -1728,9 +1938,9 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
 /// Batch-carrying value flowing through a [`BatchingContext`]. The function being batched operates on
 /// [`BatchingTracer`]s directly. Each operation dispatches through the stamped context via [`Context::bind`], which
 /// applies the operation's [`BatchableOperation`] implementation against the parent context. An eager parent owns
-/// concrete packed values, while a staging parent owns [`Tracer`](crate::Tracer)s in the enclosing trace. The [`Typed`]
-/// view is always the policy-provided unbatched per-item type. The policy-selected inner carrier retains the packed
-/// value and any mapped-axis metadata.
+/// concrete packed values, while a staging parent owns [`Tracer`]s in the enclosing trace. The [`Typed`] view is always
+/// the policy-provided unbatched per-item type. The policy-selected inner carrier retains the packed value and any
+/// mapped-axis metadata.
 #[derive(Clone, Parameter)]
 pub struct BatchingTracer<C: Context, P: BatchingPolicy<C>> {
     /// [`BatchingContext`] this value flows through, used to dispatch operations that involve it.
@@ -2096,9 +2306,9 @@ impl<C: Context<Type: BatchableType<Policy: BatchingEntrypointPolicy<C>>>> Batch
 /// uniformly across the whole stack: an eager backend context interprets each batched operation immediately, an active
 /// [`StagingContext`] stages it into the enclosing trace, and a [`BatchingContext`] nests `batch` inside `batch` (each
 /// level's [`BatchingTracer`] carries its own batch axis and so nested maps thread through with no side table).
-/// Concretely, staged [`Tracer`](crate::Tracer)s recover their trace, [`BatchingTracer`]s recover their batching level,
-/// concrete values recover the eager backend domain they name, etc. Inputs with *no leaf values* are the one case this
-/// function cannot serve. With nothing to recover a context from, it returns [`BatchingError::EmptyBatch`] even when
+/// Concretely, staged [`Tracer`]s recover their trace, [`BatchingTracer`]s recover their batching level, concrete
+/// values recover the eager backend domain they name, etc. Inputs with *no leaf values* are the one case this function
+/// cannot serve. With nothing to recover a context from, it returns [`BatchingError::EmptyBatch`] even when
 /// `batch_axis` supplies an explicit batch extent. [`Batch::batch`] must be used in that case, with an explicit
 /// context.
 ///
@@ -2350,6 +2560,22 @@ mod tests {
 
         fn unbatched_type(batch: &Self::Batch) -> Cow<'_, ProjectedProgramType> {
             batch.r#type()
+        }
+
+        fn adapt_batched_program<
+            ReduceFn: Fn(
+                &TracingContext<ProjectedProgramValue, ProjectedProgramOperation>,
+                Tracer<TracingContext<ProjectedProgramValue, ProjectedProgramOperation>>,
+                Axis,
+            )
+                -> Result<Tracer<TracingContext<ProjectedProgramValue, ProjectedProgramOperation>>, BatchingError>,
+        >(
+            program: Self::BatchedProgram,
+            required_output_axes: Option<&[BatchAxis]>,
+            reduce_fn: ReduceFn,
+        ) -> Result<BatchedProgram<ProjectedProgramValue, ProjectedProgramOperation>, BatchingError> {
+            let (program, output_axes) = program.into_parts();
+            BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, reduce_fn)
         }
     }
 
