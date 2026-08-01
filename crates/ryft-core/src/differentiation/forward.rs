@@ -290,7 +290,7 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
     /// [`Linearization`]'s program family, alongside the stored [`primal`](Self::primal) and [`tangent`](Self::tangent)
     /// sub-programs. Rather than re-keying each bilinear operation of the tangent sub-program into a closed captured
     /// factor (e.g., folding a scalar `Mul` against a known operand into a multiply-by-a-captured-constant) by folding
-    /// the consuming residual value, this function leaves the tangent sub-program in the primal operation family `0`
+    /// the consuming residual value, this function leaves the tangent sub-program in the primal operation family `O`
     /// and transposes it through [`Program::transpose_with_respect_to`]. The tangent sub-program's inputs are `(ẋ, r)`,
     /// and so it is transposed with respect to the leading tangent inputs `ẋ` while the trailing
     /// [`residual_count`](Self::residual_count) residual inputs are held as known parameters. Partition-aware
@@ -422,22 +422,52 @@ impl<
                 )));
             }
         }
-        let live_input_count = primal_input_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
-        if live_input_count != tangent_input_count {
+        let live_input_tangent_types = primal_input_types
+            .iter()
+            .map(DifferentiableType::tangent)
+            .filter(|r#type| !r#type.is_zero_space())
+            .collect::<Vec<_>>();
+        if live_input_tangent_types.len() != tangent_input_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "pushforward program consumes {tangent_input_count} tangent inputs but its public boundary has {} \
-                 nonzero differential inputs",
-                live_input_count,
+                "pushforward program consumes {} tangent inputs but its public boundary has {} \
+                nonzero differential inputs",
+                tangent_input_count,
+                live_input_tangent_types.len(),
             )));
         }
-        let live_output_count = primal_output_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
-        if live_output_count != program.output_ids().len() {
+        for (index, (input, tangent_type)) in program.inputs().zip(&live_input_tangent_types).enumerate() {
+            if input.r#type().as_ref() != tangent_type {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pushforward program tangent input {} has type {} but its public boundary requires tangent type {}",
+                    index,
+                    input.r#type(),
+                    tangent_type,
+                )));
+            }
+        }
+        let live_output_tangent_types = primal_output_types
+            .iter()
+            .map(DifferentiableType::tangent)
+            .filter(|r#type| !r#type.is_zero_space())
+            .collect::<Vec<_>>();
+        if live_output_tangent_types.len() != program.output_ids().len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "pushforward program produces {} tangent outputs but its public boundary has {} nonzero differential \
                  outputs",
                 program.output_ids().len(),
-                live_output_count,
+                live_output_tangent_types.len(),
             )));
+        }
+        for (index, (output, tangent_type)) in program.outputs().zip(&live_output_tangent_types).enumerate() {
+            if output.r#type().as_ref() != tangent_type {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pushforward program tangent output {} has type {} but its public boundary requires tangent \
+                    type {}",
+                    index,
+                    output.r#type(),
+                    tangent_type,
+                )));
+            }
         }
         Ok(Self {
             context,
@@ -808,7 +838,7 @@ impl<C: Context> DifferentiationTracer<C> {
         &self.dual
     }
 
-    /// Consumes this tracer and returns the[`DifferentiationDual`] that it carries.
+    /// Consumes this tracer and returns the [`DifferentiationDual`] that it carries.
     #[inline]
     pub fn into_dual(self) -> DifferentiationDual<C::Value> {
         self.dual
@@ -2207,7 +2237,8 @@ mod tests {
             )),
         ));
 
-        // With no leaf value to recover a context from, the free `jvp` reports an invalid input count.
+        // With no leaf value to recover a context from, the free `jvp` reports that differentiation requires
+        // at least one input leaf.
         assert_eq!(
             jvp(
                 |x: Vec<DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| Ok(x),
@@ -2317,7 +2348,8 @@ mod tests {
         );
         assert_abs_diff_eq!(pushforward.apply((Scalar::from(0.0), Scalar::from(1.0))).unwrap(), 0.5, epsilon = 1e-9,);
 
-        // With no leaf value to recover a context from, the free `linearize` reports an invalid input count.
+        // With no leaf value to recover a context from, the free `linearize` reports that differentiation requires
+        // at least one input leaf.
         assert_eq!(
             linearize(
                 |x: Vec<LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| Ok(x),

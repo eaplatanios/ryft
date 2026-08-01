@@ -132,22 +132,53 @@ impl<
                 )));
             }
         }
-        let live_output_count = primal_output_types.iter().filter(|r#type| !r#type.cotangent().is_zero_space()).count();
-        if live_output_count != cotangent_input_count {
+        let live_output_cotangent_types = primal_output_types
+            .iter()
+            .map(DifferentiableType::cotangent)
+            .filter(|r#type| !r#type.is_zero_space())
+            .collect::<Vec<_>>();
+        if live_output_cotangent_types.len() != cotangent_input_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "pullback program consumes {} cotangent inputs but its public boundary has {} \
                 nonzero differential outputs",
-                cotangent_input_count, live_output_count,
+                cotangent_input_count,
+                live_output_cotangent_types.len(),
             )));
         }
-        let live_input_count = primal_input_types.iter().filter(|r#type| !r#type.cotangent().is_zero_space()).count();
-        if live_input_count != program.output_ids().len() {
+        for (index, (input, cotangent_type)) in program.inputs().zip(&live_output_cotangent_types).enumerate() {
+            if input.r#type().as_ref() != cotangent_type {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pullback program cotangent input {} has type {} but its public boundary requires cotangent \
+                    type {}",
+                    index,
+                    input.r#type(),
+                    cotangent_type,
+                )));
+            }
+        }
+        let live_input_cotangent_types = primal_input_types
+            .iter()
+            .map(DifferentiableType::cotangent)
+            .filter(|r#type| !r#type.is_zero_space())
+            .collect::<Vec<_>>();
+        if live_input_cotangent_types.len() != program.output_ids().len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "pullback program produces {} cotangent outputs but its public boundary has {} nonzero differential \
-                 inputs",
+                inputs",
                 program.output_ids().len(),
-                live_input_count,
+                live_input_cotangent_types.len(),
             )));
+        }
+        for (index, (output, cotangent_type)) in program.outputs().zip(&live_input_cotangent_types).enumerate() {
+            if output.r#type().as_ref() != cotangent_type {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pullback program cotangent output {} has type {} but its public boundary requires \
+                    cotangent type {}",
+                    index,
+                    output.r#type(),
+                    cotangent_type,
+                )));
+            }
         }
         Ok(Self {
             context,
@@ -160,8 +191,9 @@ impl<
         })
     }
 
-    /// Returns the pullback [`Program`] `(ȳ, r) ↦ x̄` that this callable closes over. Its inputs are the flat output
-    /// cotangents followed by the residuals carried by [`residuals`](Self::residuals).
+    /// Returns the compact pullback [`Program`] `(live(ȳ), r) ↦ live(x̄)` that this callable closes over. Its inputs are
+    /// the live (non-zero-space) output cotangents followed by the residuals carried by [`residuals`](Self::residuals),
+    /// and its outputs omit zero-space input-cotangent leaves.
     #[inline]
     pub fn program(&self) -> &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>> {
         &self.program
@@ -259,7 +291,7 @@ impl<
     }
 }
 
-/// [`RegionDriver`] that provides call-scoped access to the [`Region`]s attached to the
+/// [`RegionDriver`] that provides call-scoped access to the [`Region`](crate::Region)s attached to the
 /// [`Instruction`](crate::Instruction) being transposed and to nested transposition work over those regions.
 /// The transposition engine constructs a [`TranspositionDriver`] for every instruction. [`RegionDriver`] provides
 /// structural region access, while this trait adds transposition-specific recursion.
@@ -285,9 +317,9 @@ impl<V: Value, O: Operation<V::Type>> TranspositionDriver<V, O> for EmptyRegionD
 }
 
 /// [`TranspositionDriver`] scoped to one replayed linear [`Instruction`](crate::Instruction), borrowing exactly the
-/// [`Region`]s attached to that instruction.
+/// [`Region`](crate::Region)s attached to that instruction.
 struct RecursiveTranspositionDriver<'r, V: Value, O: Operation<V::Type>> {
-    /// Borrowed attached [`Region`](crate::Region)s, in region order.
+    /// Borrowed attached [`Region`](crate::Region)(crate::Region)s, in region order.
     regions: Vec<RegionRef<'r, V, O>>,
 }
 
@@ -427,7 +459,7 @@ impl<
     O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
 > RegionRef<'_, V, O>
 {
-    /// Transposes this borrowed linear _pushforward_ [`Region`] into its reverse-mode _pullback_.
+    /// Transposes this borrowed linear _pushforward_ [`Region`](crate::Region) into its reverse-mode _pullback_.
     /// Refer to the documentation of [`Program::transpose_with_respect_to`] for more information.
     pub fn transpose_with_respect_to(
         &self,
@@ -718,7 +750,34 @@ impl<
         let max_instruction_output_count =
             self.instructions().iter().map(|instruction| instruction.outputs().len()).max().unwrap_or(0);
         let mut instruction_output_cotangents = Vec::with_capacity(max_instruction_output_count);
-        for instruction in self.instructions().iter().rev() {
+        for (instruction_index, instruction) in self.instructions().iter().enumerate().rev() {
+            // Transposition cannot preserve observable effects on the linear side. Skipping an effectful instruction
+            // would silently drop its effect from the pullback, and replaying it through a transpose rule would execute
+            // it in the reversed program with no defined ordering contract. Reject it the way the known side rejects
+            // effectful producers, before the dead-edge skip below can drop it. Known-only effectful instructions keep
+            // their demand-driven rejection in the lazy materialization path.
+            let has_linear_output = instruction
+                .outputs()
+                .iter()
+                .copied()
+                .map(|output| linear.get(output.index()).copied().ok_or(ProgramError::UnboundAtomId { id: output }))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .any(|is_linear| is_linear);
+            if has_linear_output {
+                let effects = self.instruction_effects(instruction_index)?;
+                if !effects.is_pure() {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "partition-aware transpose cannot transpose effectful linear instruction `{}`; \
+                             transposition cannot replay observable effects",
+                            instruction.operation().name(),
+                        ),
+                    }
+                    .into());
+                }
+            }
+
             // Skip dead reverse edges early. If none of an instruction's outputs carries an adjoint, the instruction
             // cannot contribute to any input cotangent. This is the only operand-side guard. A live transpose rule may
             // read non-linear operands; pure known producer subgraphs are materialized lazily below, while effectful
@@ -937,8 +996,11 @@ where
     /// Callers that want predictable pullback cost should partially evaluate and carry such values as residual inputs.
     /// Effectful known producers are never copied. Replaying one in the pullback could duplicate, omit, or reorder an
     /// effect that belongs on the primal side, so this method returns [`ProgramError::UnsupportedOperation`] and asks
-    /// the caller to partial-evaluate that value into a residual input. Known program inputs are always exposed as
-    /// pullback inputs, while literal constants are copied lazily under the same demand-driven policy.
+    /// the caller to partial-evaluate that value into a residual input. Effectful instructions with *linear* outputs
+    /// are rejected the same way, before dead-edge elimination can drop them as skipping one would silently lose its
+    /// effect from the pullback, and replaying one would execute it in the reversed program with no defined ordering
+    /// contract. Known program inputs are always exposed as pullback inputs, while literal constants are copied
+    /// lazily under the same demand-driven policy.
     ///
     /// The pullback is staged into a fresh internal [`TracingContext`]: transposition records one cotangent input
     /// per program output, walks this program in reverse instruction order applying each [`Operation`]'s
@@ -2193,6 +2255,22 @@ mod tests {
                 if message.contains("cannot replay effectful known intermediate producer `effectful_identity`"),
         ));
 
+        // An effectful instruction whose *output is linear* is rejected outright, even when its adjoint is dead:
+        // skipping it would silently drop the effect from the pullback, and transposing it would replay the effect
+        // in the reversed program.
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let linear = builder.add_input(DataType::F64);
+        let effectful =
+            builder.add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![linear]).unwrap()[0];
+        let program = builder.build::<Scalar, Scalar>(vec![effectful], Placeholder, Placeholder).unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message
+                    == "partition-aware transpose cannot transpose effectful linear instruction \
+                        `effectful_identity`; transposition cannot replay observable effects",
+        ));
+
         // Effects nested inside a known producer's attached region are equally observable. The outer operation is
         // intrinsically pure, so this specifically verifies recursive effect accounting through the region closure.
         let mut region_builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
@@ -2311,7 +2389,8 @@ mod tests {
         .unwrap();
         assert_eq!(program.interpret(vec![Scalar::Token, Scalar::Zero]), Ok(vec![Scalar::Token, Scalar::Zero]),);
 
-        // With no leaf value to recover a context from, the free `vjp` reports an invalid input count.
+        // With no leaf value to recover a context from, the free `vjp` reports that differentiation requires
+        // at least one input leaf.
         let error = vjp(
             |x: Vec<LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| Ok(x),
             Vec::<Scalar>::new(),
@@ -2456,7 +2535,8 @@ mod tests {
         let free_gradient = gradient(|x| x.clone() * x.sin().unwrap(), Scalar::from(0.7)).unwrap();
         assert_abs_diff_eq!(free_gradient, 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
-        // With no leaf value to recover a context from, the free `gradient` reports an invalid input count.
+        // With no leaf value to recover a context from, the free `gradient` reports that differentiation requires
+        // at least one input leaf.
         let error = gradient(
             |x: Vec<LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| x.into_iter().next().unwrap(),
             Vec::<Scalar>::new(),
