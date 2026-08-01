@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroOperation};
@@ -17,7 +17,7 @@ use crate::partial::{
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, MaybeZero};
 use crate::programs::identities::TypeIdentityPosition;
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::programs::Program;
 use crate::programs::regions::{
     BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
@@ -1864,6 +1864,67 @@ pub fn linearize<
     context.linearize(function, primals)
 }
 
+/// Applies a member operation's Jacobian-Vector Product (JVP) rule through a projected view of a composite
+/// differentiation context. Use this function from a composite operation dispatcher when the operation is
+/// [`Region`](crate::Region)-free and every operand and result belongs to the same projectable member type `T`. It
+/// projects primal values and live tangent values into the member value family, carries structural-zero tangents as
+/// types without materializing values, runs the member's existing [`DifferentiableOperation`] rule, and lifts the
+/// resulting duals back into the composite value family.
+///
+/// Operations whose derivative crosses member types or whose rule needs attached regions require an explicit composite
+/// Jacobian-Vector Product (JVP) rule instead.
+///
+/// # Parameters
+///
+///   - `context`: Active composite [`Context`] through which the projected member rule stages its primal and tangent
+///     operations.
+///   - `operation`: Region-free operation expressed in the projected member operation family.
+///   - `inputs`: Composite [`DifferentiationDual`]s corresponding to the operation's operands.
+pub fn jvp_projected_operation<
+    T: DifferentiableType,
+    C: Context<
+            Type: DifferentiableType + From<T>,
+            Value: ValueProjection<T, Projected: Value<Type = T>>,
+            Constant: ValueProjection<T, Projected: Value<Type = T>>,
+            Operation: OperationProjection<T, Projected: DifferentiableOperation<ProjectedContext<C, T>>>,
+        >,
+>(
+    context: &C,
+    operation: &<C::Operation as OperationProjection<T>>::Projected,
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+where
+    for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
+{
+    let projected_inputs = inputs
+        .iter()
+        .map(|input| {
+            let primal = <C::Value as ValueProjection<T>>::into_projected(input.primal().clone())?;
+            let tangent = match input.tangent() {
+                MaybeZero::Zero(r#type) => MaybeZero::Zero(<&T>::try_from(r#type)?.clone()),
+                MaybeZero::Value(value) => {
+                    MaybeZero::Value(<C::Value as ValueProjection<T>>::into_projected(value.clone())?)
+                }
+            };
+            DifferentiationDual::new(primal, tangent)
+        })
+        .collect::<Result<Vec<_>, TypeError>>()?;
+    operation
+        .jvp(&ProjectedContext::new(context.clone()), &EmptyRegionDriver, projected_inputs.as_slice())?
+        .into_iter()
+        .map(|output| {
+            let (primal, tangent) = output.into_parts();
+            let primal = <C::Value as ValueProjection<T>>::from_projected(primal);
+            let tangent = match tangent {
+                MaybeZero::Zero(r#type) => MaybeZero::Zero(C::Type::from(r#type)),
+                MaybeZero::Value(value) => MaybeZero::Value(<C::Value as ValueProjection<T>>::from_projected(value)),
+            };
+            DifferentiationDual::new(primal, tangent)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -1873,6 +1934,10 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::contexts::tests::{
+        ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
+        ProjectedProgramType, ProjectedProgramValue,
+    };
     use crate::contexts::{Context, EagerContext};
     use crate::operations::collectives::{CollectiveKind, CollectiveOperation};
     use crate::operations::differentiation::{StopGradient, StopGradientOperation};
@@ -2358,5 +2423,38 @@ mod tests {
             .unwrap_err(),
             DifferentiationError::EmptyInput
         );
+    }
+
+    #[test]
+    fn test_jvp_projected_operation() {
+        // The third fixture member is intentionally unrelated to arrays. Its identity JVP proves that the adapter
+        // projects both halves of a live dual and lifts the resulting member values back into the composite family.
+        let context = EagerContext::<ProjectedProgramValue, ProjectedProgramOperation>::new();
+        let input = DifferentiationDual::new(
+            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(3)),
+        )
+        .unwrap();
+        let output =
+            jvp_projected_operation::<ProjectedMemberType<2>, _>(&context, &ProjectedMemberOperation, &[input])
+                .unwrap()
+                .remove(0);
+        let (primal, tangent) = output.into_parts();
+        assert_eq!(primal, ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)));
+        assert!(matches!(tangent, MaybeZero::Value(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(3))),));
+
+        // Structural zeros cross the same adapter as types and therefore do not stage or materialize member values.
+        let input = DifferentiationDual::new(
+            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(11)),
+            MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>)),
+        )
+        .unwrap();
+        let output =
+            jvp_projected_operation::<ProjectedMemberType<2>, _>(&context, &ProjectedMemberOperation, &[input])
+                .unwrap()
+                .remove(0);
+        let (primal, tangent) = output.into_parts();
+        assert_eq!(primal, ProjectedProgramValue::Third(ProjectedMemberValue::<2>(11)));
+        assert!(matches!(tangent, MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>)),));
     }
 }
