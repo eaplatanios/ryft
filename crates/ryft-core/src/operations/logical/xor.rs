@@ -31,7 +31,7 @@ define_elementwise_capability!(
     XorOperation,
 );
 
-define_tracer_operator!(@binary std::ops::BitXor, bitxor, XorOperation, "`xor` operation failed");
+define_tracer_operator!(@binary std::ops::BitXor, bitxor, capability = Xor, method = xor);
 
 #[cfg(test)]
 mod tests {

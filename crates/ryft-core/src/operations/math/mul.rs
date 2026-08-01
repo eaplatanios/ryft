@@ -9,10 +9,9 @@ use crate::macros::{
 };
 use crate::operations::ElementwiseOperation;
 use crate::programs::ProgramError;
-use crate::programs::operations::Operation;
-use crate::programs::types::{Type, TypeError};
+use crate::programs::types::TypeError;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType};
+use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this module.
 
@@ -127,33 +126,6 @@ impl_differentiable_elementwise_operation! {
     },
 }
 
-/// Selects the operation used to implement traced [`std::ops::Mul`] for a program type family.
-pub trait MulOperationFor: Type {
-    /// Concrete multiplication operation staged for this type family.
-    type Operation: Operation<Self>;
-
-    /// Constructs the multiplication operation for `left_type` and `right_type`.
-    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError>;
-}
-
-impl MulOperationFor for DataType {
-    type Operation = MulOperation;
-
-    #[inline]
-    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
-        Ok(MulOperation)
-    }
-}
-
-impl MulOperationFor for ArrayType {
-    type Operation = MulOperation;
-
-    #[inline]
-    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
-        Ok(MulOperation)
-    }
-}
-
 define_elementwise_capability!(
     @binary
     /// Value-level elementwise multiplication capability. [`Mul`] is the fallible Ryft counterpart to
@@ -166,7 +138,14 @@ define_elementwise_capability!(
     MulOperation,
 );
 
-define_tracer_operator!(@binary std::ops::Mul, mul, provider = MulOperationFor, "`mul` operation failed");
+define_tracer_operator!(@binary std::ops::Mul, mul, capability = Mul, method = mul);
+
+impl Mul for usize {
+    fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
+        self.checked_mul(*right)
+            .ok_or_else(|| ProgramError::InvalidArgument { message: "'mul' result does not fit in usize".to_string() })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -222,6 +201,11 @@ mod tests {
                 &[Scalar::from(Complex::new(1.0f64, 2.0)), Scalar::from(Complex::new(0.5f64, -1.0))],
             ),
             Ok(vec![Scalar::from(Complex::new(1.0f64, 2.0) * Complex::new(0.5f64, -1.0))]),
+        );
+        assert_eq!(Mul::mul(&3_usize, &4), Ok(12));
+        assert_eq!(
+            Mul::mul(&usize::MAX, &2),
+            Err(ProgramError::InvalidArgument { message: "'mul' result does not fit in usize".to_string() }),
         );
     }
 

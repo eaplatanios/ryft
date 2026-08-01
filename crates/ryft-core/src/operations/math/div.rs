@@ -7,10 +7,7 @@ use crate::macros::{
     impl_differentiable_elementwise_operation,
 };
 use crate::programs::ProgramError;
-use crate::programs::operations::Operation;
-use crate::programs::types::Type;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -55,33 +52,6 @@ impl_differentiable_elementwise_operation! {
     },
 }
 
-/// Selects the operation used to implement traced [`std::ops::Div`] for a program type family.
-pub trait DivOperationFor: Type {
-    /// Concrete division operation staged for this type family.
-    type Operation: Operation<Self>;
-
-    /// Constructs the division operation for `left_type` and `right_type`.
-    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError>;
-}
-
-impl DivOperationFor for DataType {
-    type Operation = DivOperation;
-
-    #[inline]
-    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
-        Ok(DivOperation)
-    }
-}
-
-impl DivOperationFor for ArrayType {
-    type Operation = DivOperation;
-
-    #[inline]
-    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
-        Ok(DivOperation)
-    }
-}
-
 define_elementwise_capability!(
     @binary
     /// Value-level elementwise division capability. [`Div`] is the fallible Ryft counterpart to [`std::ops::Div`]
@@ -94,7 +64,15 @@ define_elementwise_capability!(
     DivOperation,
 );
 
-define_tracer_operator!(@binary std::ops::Div, div, provider = DivOperationFor, "`div` operation failed");
+define_tracer_operator!(@binary std::ops::Div, div, capability = Div, method = div);
+
+impl Div for usize {
+    fn div(&self, right: &Self) -> Result<Self, ProgramError> {
+        self.checked_div(*right).ok_or_else(|| ProgramError::InvalidArgument {
+            message: "'div' divisor must be greater than zero".to_string(),
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -141,6 +119,11 @@ mod tests {
                 &[Array::scalar(7.0), Array::scalar(2.0)],
             ),
             Ok(vec![Array::scalar(3.5)]),
+        );
+        assert_eq!(Div::div(&7_usize, &2), Ok(3));
+        assert_eq!(
+            Div::div(&7_usize, &0),
+            Err(ProgramError::InvalidArgument { message: "'div' divisor must be greater than zero".to_string() }),
         );
         assert_abs_diff_eq!(
             match InterpretableOperation::<EagerContext<Scalar>>::interpret(

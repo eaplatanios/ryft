@@ -33,7 +33,7 @@ define_elementwise_capability!(
     AndOperation,
 );
 
-define_tracer_operator!(@binary std::ops::BitAnd, bitand, AndOperation, "`and` operation failed");
+define_tracer_operator!(@binary std::ops::BitAnd, bitand, capability = And, method = and);
 
 #[cfg(test)]
 mod tests {

@@ -33,7 +33,7 @@ define_elementwise_capability!(
     OrOperation,
 );
 
-define_tracer_operator!(@binary std::ops::BitOr, bitor, OrOperation, "`or` operation failed");
+define_tracer_operator!(@binary std::ops::BitOr, bitor, capability = Or, method = or);
 
 #[cfg(test)]
 mod tests {
