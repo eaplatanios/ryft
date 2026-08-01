@@ -145,12 +145,12 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         Ok(input_types.split_at(self.residual_count))
     }
 
-    /// Stages one executable residual-parameterized linear map. It traces its two attached [`Region`](crate::Region)s
-    /// and binds the resulting _forward-and-transpose_ [`LinearCallOperation`] in `context`. This is a canonical
-    /// constructor rather than a separate binding path as the final step is still an ordinary [`Context::bind`], and
-    /// everything before it only constructs the operation's two region programs. It exists because every producer of an
-    /// [`LinearCallInterface::ForwardAndTranspose`] linear call must uphold the same boundary convention, which is easy
-    /// to get subtly wrong at any one of many call sites:
+    /// Stages a [`LinearCallInterface::ForwardAndTranspose`] residual-parameterized [`LinearCallOperation`].
+    /// It traces its two attached [`Region`](crate::Region)s and binds the resulting _forward-and-transpose_
+    /// [`LinearCallOperation`] in `context`. This is a canonical constructor rather than a separate binding path as the
+    /// final step is still an ordinary [`Context::bind`], and everything before it only constructs the operation's two
+    /// region programs. It exists because every producer of an [`LinearCallInterface::ForwardAndTranspose`] linear call
+    /// must uphold the same boundary convention, which is easy to get subtly wrong at any one of many call sites:
     ///
     ///   - the operands are ordered as `[residuals..., linear_inputs...]`,
     ///   - the `forward` region receives the same values in the same order,
@@ -161,6 +161,11 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ///
     /// Callers therefore provide only the operation-specific mathematics of the two maps, as closures over tracers that
     /// are already split into their residual and linear/cotangent groups.
+    ///
+    /// The _transpose-only_ form (i.e., [`LinearCallInterface::TransposeOnly`]) deliberately has no staging counterpart
+    /// (e.g., an `Option`al `transpose_fn` or a `stage_transpose_only` sibling) as it shares _none_ of this function's
+    /// mechanics, because there is no forward map to trace and therefore no traced outputs to derive the transpose
+    /// boundary from (its interface types are stated explicitly instead).
     ///
     /// # Parameters
     ///
@@ -215,49 +220,49 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         context.bind(Self::new(residual_count), vec![forward, transpose], inputs.as_slice())
     }
 
-    // TODO(eaplatanios): Review this function.
-    /// Batches a linear call by structurally batching its two attached [`Region`](crate::Region)s.
+    /// Batches an invocation to this [`LinearCallOperation`] by structurally batching its two attached
+    /// [`Region`](crate::Region)s. Both [`LinearCallInterface`] forms preserve a completely replicated call unchanged.
     ///
-    /// Both interface forms preserve a completely replicated call unchanged. A mapped forward-and-transpose call
-    /// batches its forward region to discover the batched output axes, batches its transpose region under those
-    /// axes, and aligns the transpose outputs with the original linear-input axes: a cotangent for a replicated
-    /// linear input is summed across the batch by `reduce`, while cotangents for mapped linear inputs retain their
-    /// packed axes. A mapped transpose-only call is rejected because its unavailable forward program cannot
+    /// A mapped [`LinearCallInterface::ForwardAndTranspose`] call batches its forward region to discover the batched
+    /// output axes, batches its transpose region under those axes, and aligns the transpose outputs with the original
+    /// linear-input axes (i.e., a cotangent for a replicated linear input is summed across the batch by `reduce_fn`,
+    /// while cotangents for mapped linear inputs retain their packed axes).
+    ///
+    /// A mapped [`LinearCallInterface::TransposeOnly`] call is rejected because its unavailable forward program cannot
     /// determine the batched output axes.
     ///
-    /// The batching policy owns the boundary shape of its structurally batched programs:
+    /// The batching policy owns the boundary shape of its structurally batched programs.
     /// [`BatchingPolicy::adapt_batched_program`] adapts each batched region to the plain two-region linear-call
-    /// boundary, and any [`BatchingPolicy::boundary_operands`] (e.g., a composite program's first-class mapped
-    /// extent) become additional leading residuals of the batched call.
+    /// boundary, and any [`BatchingPolicy::boundary_operands`] (e.g., a composite program's first-class mapped extent)
+    /// become additional leading residuals of the batched call.
     ///
     /// # Parameters
     ///
     ///   - `context`: Active [`BatchingContext`] for the transform level being applied.
-    ///   - `driver`: Driver exposing this call's attached regions.
+    ///   - `driver`: [`BatchingDriver`] exposing this call's attached regions.
     ///   - `inputs`: Batched operands, ordered as `[residuals..., linear_inputs...]`.
     ///   - `input_axes`: Batch axis of each operand in `inputs`.
-    ///   - `reduce`: Sums one mapped transpose output along the provided axis within the adapted program's own
-    ///     [`TracingContext`]. Callers own this closure because its mechanics are universe-specific (e.g., the
-    ///     homogeneous tracer has a direct reduction capability, while the composite universe binds a projected
-    ///     reduction operation).
-    pub(crate) fn batch_regions<C, P, D, Reduce>(
+    ///   - `reduce_fn`: Function that sums one mapped transpose output along the provided axis within the adapted
+    ///     program's own [`TracingContext`]. Callers own this closure because its mechanics are universe-specific
+    ///     (e.g., the homogeneous tracer has a direct reduction capability, while the composite universe binds a
+    ///     projected reduction operation).
+    pub(crate) fn batch_regions<
+        C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
+        P: BatchingPolicy<C>,
+        D: BatchingDriver<C, P>,
+        ReduceFn: Fn(
+            &TracingContext<C::Constant, C::Operation>,
+            Tracer<TracingContext<C::Constant, C::Operation>>,
+            Axis,
+        ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+    >(
         &self,
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
         input_axes: Vec<BatchAxis>,
-        reduce: Reduce,
-    ) -> Result<Vec<P::Batch>, BatchingError>
-    where
-        C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
-        P: BatchingPolicy<C>,
-        D: BatchingDriver<C, P>,
-        Reduce: Fn(
-            &TracingContext<C::Constant, C::Operation>,
-            Tracer<TracingContext<C::Constant, C::Operation>>,
-            Axis,
-        ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
-    {
+        reduce_fn: ReduceFn,
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         if self.residual_count > inputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "linear call residual count {} exceeds input count {}",
@@ -285,7 +290,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
             LinearCallInterface::TransposeOnly { .. } => {
                 return Err(BatchingError::UnsupportedOperation {
                     message: "a transpose-only linear call cannot be batched with mapped inputs because its \
-                              unavailable forward program does not determine output batch axes"
+                             unavailable forward program does not determine output batch axes"
                         .to_string(),
                 });
             }
@@ -300,7 +305,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )?,
             None,
-            &reduce,
+            &reduce_fn,
         )?
         .into_parts();
 
@@ -315,7 +320,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
                 ProgramBatchingOutputAxesPolicy::AlignEachTo(linear_axes.to_vec()),
             )?,
             Some(linear_axes),
-            &reduce,
+            &reduce_fn,
         )?
         .into_parts();
         check_count!("output", transpose_output_axes, linear_axes.len(), ProgramError);
