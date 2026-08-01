@@ -681,13 +681,43 @@ fn shape_changing_collective_dimensions(
     input_types: &[ArrayType],
 ) -> Result<Vec<usize>, TypeError> {
     check_count!("input", input_types, 1, TypeError);
-    if !input_types[0].unreduced_axes().is_empty() {
+    if operation_name != PSUM_SCATTER_OPERATION_NAME && !input_types[0].unreduced_axes().is_empty() {
         return Err(TypeError::invalid(format!("'{operation_name}' does not support unreduced operands")));
     }
     let Some(shape) = input_types[0].static_shape() else {
         return Err(TypeError::invalid(format!("'{operation_name}' does not support dynamically shaped operands")));
     };
     Ok(shape.dimensions().to_vec())
+}
+
+/// Applies sum-scatter's reduction-state transition. Ordinary operands preserve their variance metadata. An operand
+/// that is unreduced over the scattered manual axis is the cotangent of a reduced all-gather result; sum-scatter
+/// consumes that pending reduction and returns a value varying over the manual axis.
+fn psum_scatter_output_type(
+    input_type: &ArrayType,
+    mut output_type: ArrayType,
+    operation: &PSumScatterOperation,
+) -> Result<ArrayType, TypeError> {
+    if input_type.unreduced_axes().is_empty() {
+        return Ok(output_type);
+    }
+    if input_type.unreduced_axes().len() != 1 || !input_type.unreduced_axes().contains(operation.axis_name()) {
+        return Err(TypeError::invalid(format!(
+            "'psum_scatter' only supports an unreduced operand over its own axis '{}'",
+            operation.axis_name(),
+        )));
+    }
+    let input_sharding = input_type.sharding().expect("unreduced axes require sharding metadata");
+    let mut varying_axes = input_sharding.varying_manual_axes().clone();
+    varying_axes.insert(operation.axis_name().to_string());
+    let output_sharding = output_type.sharding().expect("shape projection preserves sharding").clone();
+    output_type.sharding = Some(
+        output_sharding
+            .with_unreduced_axes(Vec::<String>::new())
+            .and_then(|sharding| sharding.with_varying_manual_axes(varying_axes))
+            .map_err(|error| TypeError::invalid(error.to_string()))?,
+    );
+    Ok(output_type)
 }
 
 /// Builds a shape-changing collective's output type from its operand and resized dimensions, carrying the operand
@@ -783,7 +813,7 @@ fn infer_explicit_shape_changing_collective_output_type(
     let expected = 1 + base_output_type.rank();
     check_count!("input", input_types, expected, TypeError);
     let input_type = <&ArrayType>::try_from(&input_types[0])?;
-    if !input_type.unreduced_axes().is_empty() {
+    if operation_name != PSUM_SCATTER_OPERATION_NAME && !input_type.unreduced_axes().is_empty() {
         return Err(TypeError::invalid(format!("'{operation_name}' does not support unreduced operands")));
     }
     let output_extents = input_types[1..]
@@ -934,13 +964,15 @@ pub(crate) fn infer_explicit_psum_scatter_output_types(
         let unchanged_input_axes = (0..base_output_type.rank())
             .map(|axis| if axis < operation.scatter_axis { Some(axis) } else { Some(axis + 1) })
             .collect::<Vec<_>>();
-        return infer_explicit_shape_changing_collective_output_type(
+        let mut output_types = infer_explicit_shape_changing_collective_output_type(
             PSUM_SCATTER_OPERATION_NAME,
             input_types,
             base_output_type,
             unchanged_input_axes.as_slice(),
             |_, _| Ok(()),
-        );
+        )?;
+        let output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
+        return Ok(vec![psum_scatter_output_type(input_type, output_type, operation)?.into()]);
     }
     if operation.scatter_axis >= input_type.rank() {
         return Err(TypeError::invalid(format!(
@@ -958,7 +990,7 @@ pub(crate) fn infer_explicit_psum_scatter_output_types(
     let unchanged_input_axes = (0..input_type.rank())
         .map(|axis| (axis != operation.scatter_axis).then_some(axis))
         .collect::<Vec<_>>();
-    infer_explicit_shape_changing_collective_output_type(
+    let mut output_types = infer_explicit_shape_changing_collective_output_type(
         PSUM_SCATTER_OPERATION_NAME,
         input_types,
         base_output_type,
@@ -992,7 +1024,9 @@ pub(crate) fn infer_explicit_psum_scatter_output_types(
             }
             Ok(())
         },
-    )
+    )?;
+    let output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
+    Ok(vec![psum_scatter_output_type(input_type, output_type, operation)?.into()])
 }
 
 /// Infers the composite all-to-all contract.
@@ -1711,9 +1745,10 @@ shape_changing_collective! {
     /// [JAX's `all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html) with `tiled = True`
     /// and [StableHLO's `all_gather`](https://openxla.org/stablehlo/spec#all_gather). The output extends
     /// `concat_axis` by the axis size; all other dimensions are unchanged. The collective is linear and its
-    /// transpose is [`PSumScatterOperation`] over the same axis and dimension. A matching `batch` level consumes the
-    /// mapped batch axis by merging it item-major into `concat_axis`, replicating the gathered value across the
-    /// batch items.
+    /// transpose depends on the requested output variance: varying results use [`PSumScatterOperation`], invariant
+    /// results select the current participant's chunk locally, and reduced results use sum-scatter while consuming
+    /// the cotangent's unreduced-axis state. A matching `batch` level consumes the mapped batch axis by merging it
+    /// item-major into `concat_axis`, replicating the gathered value across the batch items.
     operation = AllGatherOperation,
     name = ALL_GATHER_OPERATION_NAME = "all_gather",
     #[doc(hidden)]
@@ -1808,7 +1843,7 @@ shape_changing_collective! {
     },
     infer = |operation, input_type, dimensions| {
         let effective_axis_size = operation.effective_axis_size()?;
-        match operation.options.mode {
+        let output_type = match operation.options.mode {
             CollectiveMode::Untiled => {
                 let Some(dimension) = dimensions.get(operation.scatter_axis) else {
                     return Err(TypeError::invalid(format!(
@@ -1850,7 +1885,8 @@ shape_changing_collective! {
                     output_dimensions,
                 )
             }
-        }
+        }?;
+        psum_scatter_output_type(input_type, output_type, operation)
     },
 }
 
@@ -2758,13 +2794,11 @@ where
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        if self.output_variance != AllGatherOutputVariance::Varying {
+        if self.output_variance == AllGatherOutputVariance::Invariant {
             return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "transposing 'all_gather' with {:?} output variance requires the Phase 6 variance-specific \
-                     adjoint",
-                    self.output_variance,
-                ),
+                message: "direct homogeneous transposition of invariant 'all_gather' cannot represent the \
+                          participant-indexed slice; linearize through the composite array-program operation"
+                    .to_string(),
             }
             .into());
         }
@@ -3341,6 +3375,17 @@ mod tests {
         let reduced = <&ArrayType>::try_from(&reduced[0]).unwrap();
         assert!(reduced.sharding().unwrap().varying_manual_axes().is_empty());
         assert_eq!(reduced.sharding().unwrap().reduced_axes(), &["x".to_string()].into_iter().collect());
+
+        // The cotangent of a reduced gather result is unreduced. Sum-scatter consumes exactly that marker and
+        // restores the varying operand-cotangent state without a second reduce-scatter operation type.
+        let reduced_cotangent = reduced.cotangent();
+        assert_eq!(
+            infer_explicit_psum_scatter_output_types(
+                &PSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default()),
+                &[reduced_cotangent.into(), DimensionValue::constant(3).unwrap().r#type().clone().into(),],
+            ),
+            Ok(vec![input.cotangent().into()]),
+        );
     }
 
     #[test]
@@ -3894,6 +3939,94 @@ mod tests {
             "#}
             .trim_end(),
         );
+
+        let groups = vec![vec![0, 2], vec![3, 1]];
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(f32_vector(2));
+        let output = builder
+            .add_instruction(
+                AllGatherOperation::new(
+                    "x".to_string(),
+                    4,
+                    0,
+                    CollectiveOptions::tiled().with_axis_index_groups(groups.clone()),
+                    AllGatherOutputVariance::Varying,
+                ),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        let ArrayOperation::PSumScatter(adjoint) = pullback.instructions()[0].operation() else {
+            panic!("expected grouped all-gather transpose to stage psum-scatter");
+        };
+        assert_eq!(adjoint.options().axis_index_groups(), Some(groups.as_slice()));
+
+        // Reduced output variance swaps to an unreduced cotangent type. The same sum-scatter operation consumes that
+        // state and returns the original varying operand cotangent.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type = f32_vector(2)
+            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(
+                AllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::tiled(),
+                    AllGatherOutputVariance::Reduced,
+                ),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        assert!(matches!(pullback.instructions()[0].operation(), ArrayOperation::PSumScatter(_)));
+        assert_eq!(pullback.output_types(), vec![input_type.cotangent()]);
+    }
+
+    #[test]
+    fn test_shape_changing_collective_transposes_are_involutive() {
+        use crate::parameters::Placeholder;
+        use crate::programs::ProgramBuilder;
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(f32_vector(8));
+        let output = builder
+            .add_instruction(
+                PSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        let transposed_twice =
+            program.transpose_with_respect_to(&[0]).unwrap().transpose_with_respect_to(&[0]).unwrap();
+        assert!(matches!(transposed_twice.instructions()[0].operation(), ArrayOperation::PSumScatter(_)));
+        assert_eq!(transposed_twice.input_types(), program.input_types());
+        assert_eq!(transposed_twice.output_types(), program.output_types());
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder
+            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(3)])));
+        let output = builder
+            .add_instruction(
+                AllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        let transposed_twice =
+            program.transpose_with_respect_to(&[0]).unwrap().transpose_with_respect_to(&[0]).unwrap();
+        assert!(matches!(transposed_twice.instructions()[0].operation(), ArrayOperation::AllToAll(_)));
+        assert_eq!(transposed_twice.input_types(), program.input_types());
+        assert_eq!(transposed_twice.output_types(), program.output_types());
     }
 
     #[test]

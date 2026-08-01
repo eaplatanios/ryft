@@ -9,9 +9,10 @@ supports tiled and untiled shape semantics, validated participant groups, all-ga
 `pshuffle`/`pswapaxes` compositions. Phase 4 has completed the production XLA/composite cutover and verified explicit
 dimension authority through condition, while, scan, eager branch execution, nested-region import, and repeated
 alpha-equivalent program splicing. Arithmetic extents remain ordinary dimension SSA through inference, eager
-execution, PE, JVP, import, rendering, and native lowering. Bounded-dynamic batching remains Phase 5, dynamic adjoints
-remain Phase 6, and checked gateway/public bounded-dynamic shard-map execution remains Phase 7 because it requires
-ordered assertion and `PadToStatic` lowering. The final current-JAX comparison fixtures remain an explicit P3k gate.
+execution, PE, batching, JVP/VJP, import, rendering, and native lowering. Phase 6's shape-changing collective
+adjoints are implemented through ordinary linear-call residuals. Checked gateway/public bounded-dynamic shard-map
+execution remains Phase 7 because it requires ordered assertion and `PadToStatic` lowering. The final current-JAX
+comparison fixtures remain an explicit P3k gate.
 
 On 2026-08-01 the plan's end state was extended beyond the containment cleanup: after the cleanup closure gates
 (Phases 10–11), Phases 12–14 take Ryft from input-derived (tier-2) dynamism to full data-dependent (tier-3) dynamism.
@@ -1657,7 +1658,7 @@ searches. The complete source ledger and verification record are in
 - [x] `ReshapeOperation::transpose_dimension_variables` and every exact identifier occurrence are absent from the
       integration tree. Do not reintroduce an equivalent payload residual manifest while implementing the ordinary
       residual path above.
-- [ ] Audit concatenate, mean/reductions, slice, pad, and gather transposes and migrate every analogous extent need to
+- [x] Audit concatenate, mean/reductions, slice, pad, and gather transposes and migrate every analogous extent need to
       the same residual contract.
 - [ ] Make generic outer dispatch project/lift array-only JVP, VJP, and transpose rules, reusing the shared toy
       composite fixture promoted in Phase 5 for the member-kind-agnostic dispatch tests.
@@ -1727,12 +1728,13 @@ no-op is 0.10s versus 0.11s. Final gates pass 1,065 core tests, 406 XLA tests pl
 macro groups, 52 core doctests plus 16 intentional ignores, XLA doctests, formatting, and diff hygiene. Full evidence
 is in `.tasks/plan_p6a_differentiation_residual_architecture.md`.
 
-The next isolated P6 review unit is the extent-residual operation sweep: audit and migrate broadcast, concatenate,
-pad, slicing/gathering, reductions, and collectives onto `LinearCallOperation`. That unit also owns two recorded
-boundaries from the P6a review: an executable linear call currently rejects batching (so `vmap` over a linearized
-program containing one reports an exact diagnostic; the principled rule batches both attached regions with
-replicated residual extents), and each migrated rule should move out of the composite enum dispatcher onto its
-payload's module as the sweep's first mechanical step so the dispatcher does not grow by another six inline rules.
+P6b's batching, mixed-shape, array-only, and collective implementation slices are complete. Executable linear calls
+batch both attached regions, and broadcast, concatenate, pad, slicing/gathering, reductions, and all shape-changing
+collectives retain their exact primal geometry as ordinary residual SSA. The collective adjoints cover varying,
+invariant, and reduced all-gather, psum-scatter, and all-to-all without a payload witness or a migration-phase
+diagnostic. The remaining P6b work is its Phase 4 latest-JAX executable comparison/mapped execution gate followed by
+Phase 5 consolidation: move operation-specific adjoint bodies out of the central dispatcher, delete superseded
+machinery, prove structural-zero preservation, and record the final net-deletion and performance ledger.
 
 The post-review evaluation of `LinearCallOperation` additionally adopted JAX's `linear_call` transposition shape:
 the carrier's operands and both region interfaces are residuals-first (`forward: (r, u) -> v`,

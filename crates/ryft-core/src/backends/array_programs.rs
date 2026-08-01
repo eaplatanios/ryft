@@ -3,6 +3,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::axes::AxisIndexOperation;
 use crate::backends::arrays::{Array, ArrayOperation, BroadcastKernel};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
@@ -13,13 +14,14 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::collectives::{
-    ALL_GATHER_OPERATION_NAME, ALL_TO_ALL_OPERATION_NAME, AllGatherOperation, AllToAllOperation, CollectiveMode,
-    PSUM_SCATTER_OPERATION_NAME, PSumScatterOperation, PpermuteOperation, infer_explicit_all_gather_output_types,
-    infer_explicit_all_to_all_output_types, infer_explicit_psum_scatter_output_types,
-};
 #[cfg(test)]
-use crate::operations::collectives::{AllGatherOutputVariance, CollectiveOptions};
+use crate::operations::collectives::CollectiveOptions;
+use crate::operations::collectives::{
+    ALL_GATHER_OPERATION_NAME, ALL_TO_ALL_OPERATION_NAME, AllGatherOperation, AllGatherOutputVariance,
+    AllToAllOperation, CollectiveMode, PSUM_SCATTER_OPERATION_NAME, PSumScatterOperation, PpermuteOperation,
+    infer_explicit_all_gather_output_types, infer_explicit_all_to_all_output_types,
+    infer_explicit_psum_scatter_output_types,
+};
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::{
     ConstantOperation, Iota, IotaOperation, One, OneOperation, Zero, ZeroOperation,
@@ -63,7 +65,8 @@ use crate::programs::values::{Concretizable, ProjectedValue, Value, ValueProject
 use crate::sharding::Sharding;
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 use crate::types::{
-    ArrayProgramType, ArrayType, DataType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape,
+    ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType,
+    DimensionVariable, Shape,
 };
 
 pub mod batching;
@@ -2892,10 +2895,151 @@ where
             let tangent = match array.tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
                 MaybeZero::Value(array_tangent) => {
-                    let mut tangent_inputs = Vec::with_capacity(inputs.len());
-                    tangent_inputs.push(array_tangent.clone());
-                    tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
-                    MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
+                    let mut residuals = LinearResiduals::new();
+                    let output_extents =
+                        residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+                    let input_shape = residuals.retain_shape::<A, _>(context, array.primal())?;
+                    let forward_operation = self.clone();
+                    let forward_output_extents = output_extents.clone();
+                    let transpose_operation = self.clone();
+                    let transpose_target_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent();
+                    let tangent = LinearCallOperation::stage(
+                        context,
+                        residuals.into_values(),
+                        vec![array_tangent.clone()],
+                        move |residuals, linear_inputs| {
+                            let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
+                            collective_inputs.push(linear_inputs[0].clone());
+                            collective_inputs
+                                .extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                            linear_inputs[0].dispatch_domain().bind(
+                                forward_operation,
+                                Vec::new(),
+                                collective_inputs.as_slice(),
+                            )
+                        },
+                        move |residuals, output_cotangents| {
+                            let transpose_context = output_cotangents[0].dispatch_domain();
+                            let input_dimensions = input_shape.dimensions::<A, _>(&transpose_context, residuals)?;
+                            let adjoint_operation = match &transpose_operation {
+                                ArrayProgramOperation::AllGather(operation)
+                                    if operation.output_variance() == AllGatherOutputVariance::Varying
+                                        || operation.output_variance() == AllGatherOutputVariance::Reduced =>
+                                {
+                                    ArrayProgramOperation::<A>::from(PSumScatterOperation::new(
+                                        operation.axis_name().to_string(),
+                                        operation.axis_size(),
+                                        operation.concat_axis(),
+                                        operation.options().clone(),
+                                    ))
+                                }
+                                ArrayProgramOperation::PSumScatter(operation) => {
+                                    ArrayProgramOperation::<A>::from(AllGatherOperation::new(
+                                        operation.axis_name().to_string(),
+                                        operation.axis_size(),
+                                        operation.scatter_axis(),
+                                        operation.options().clone(),
+                                        AllGatherOutputVariance::Varying,
+                                    ))
+                                }
+                                ArrayProgramOperation::AllToAll(operation) => {
+                                    ArrayProgramOperation::<A>::from(AllToAllOperation::new(
+                                        operation.axis_name().to_string(),
+                                        operation.axis_size(),
+                                        operation.concat_axis(),
+                                        operation.split_axis(),
+                                        operation.options().clone(),
+                                    ))
+                                }
+                                ArrayProgramOperation::AllGather(operation) => {
+                                    let output_cotangent_type = output_cotangents[0].r#type();
+                                    let output_cotangent_type = <&ArrayType>::try_from(output_cotangent_type.as_ref())?;
+                                    let output_rank = output_cotangent_type.rank();
+                                    let zero = dimension_constant::<A, _>(&transpose_context, 0)?;
+                                    let chunk_extent = match operation.options().mode() {
+                                        CollectiveMode::Tiled => input_dimensions[operation.concat_axis()].clone(),
+                                        CollectiveMode::Untiled => dimension_constant::<A, _>(&transpose_context, 1)?,
+                                    };
+                                    let start = if operation.axis_size() == 1 {
+                                        zero.clone()
+                                    } else {
+                                        let axis_index = transpose_context
+                                            .bind(
+                                                ArrayProgramOperation::<A>::Array(ArrayOperation::AxisIndex(
+                                                    AxisIndexOperation::new(operation.axis_name().to_string()),
+                                                )),
+                                                Vec::new(),
+                                                &[],
+                                            )?
+                                            .remove(0);
+                                        let axis_index_variable = DimensionVariable::new(
+                                            format!("{}_index", operation.axis_name()),
+                                            DimensionBounds::non_negative(Some(operation.axis_size()))?,
+                                        );
+                                        let axis_index = transpose_context
+                                            .bind(
+                                                ArrayProgramOperation::<A>::from(DimensionFromScalarOperation::new(
+                                                    axis_index_variable,
+                                                )),
+                                                Vec::new(),
+                                                std::slice::from_ref(&axis_index),
+                                            )?
+                                            .remove(0);
+                                        let axis_index_type =
+                                            <&DimensionType>::try_from(axis_index.r#type().as_ref())?.clone();
+                                        let chunk_extent_type =
+                                            <&DimensionType>::try_from(chunk_extent.r#type().as_ref())?.clone();
+                                        transpose_context
+                                            .bind(
+                                                ArrayProgramOperation::<A>::from(DimensionOperation::Mul(
+                                                    DimensionMulOperation::new(&axis_index_type, &chunk_extent_type)?,
+                                                )),
+                                                Vec::new(),
+                                                &[axis_index, chunk_extent.clone()],
+                                            )?
+                                            .remove(0)
+                                    };
+                                    let mut starts = vec![zero; output_rank];
+                                    starts[operation.concat_axis()] = start;
+                                    let mut slice_sizes = input_dimensions.clone();
+                                    if operation.options().mode() == CollectiveMode::Untiled {
+                                        slice_sizes.insert(operation.concat_axis(), chunk_extent);
+                                    }
+                                    let mut slice_inputs = Vec::with_capacity(1 + 2 * output_rank);
+                                    slice_inputs.push(output_cotangents[0].clone());
+                                    slice_inputs.extend(starts);
+                                    slice_inputs.extend(slice_sizes);
+                                    let selected = transpose_context
+                                        .bind(
+                                            ArrayProgramOperation::<A>::from(DynamicShapeSliceOperation::new(
+                                                output_rank,
+                                            )),
+                                            Vec::new(),
+                                            slice_inputs.as_slice(),
+                                        )?
+                                        .remove(0);
+                                    let mut reshape_inputs = Vec::with_capacity(1 + input_dimensions.len());
+                                    reshape_inputs.push(selected);
+                                    reshape_inputs.extend(input_dimensions);
+                                    return transpose_context.bind(
+                                        ArrayProgramOperation::<A>::from(
+                                            ReshapeOperation::new()
+                                                .with_output_sharding(transpose_target_type.sharding().cloned()),
+                                        ),
+                                        Vec::new(),
+                                        reshape_inputs.as_slice(),
+                                    );
+                                }
+                                _ => unreachable!(),
+                            };
+                            let mut adjoint_inputs = Vec::with_capacity(1 + input_dimensions.len());
+                            adjoint_inputs.push(output_cotangents[0].clone());
+                            adjoint_inputs.extend(input_dimensions);
+                            transpose_context.bind(adjoint_operation, Vec::new(), adjoint_inputs.as_slice())
+                        },
+                    )?
+                    .remove(0);
+                    MaybeZero::Value(tangent)
                 }
             };
             return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
@@ -3014,13 +3158,44 @@ where
             return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
         }
         if matches!(self, Self::AllGather(_) | Self::PSumScatter(_) | Self::AllToAll(_)) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "'{}' transpose with explicit result extents requires Phase 6 dimension residuals",
-                    self.name(),
-                ),
+            let Some((array_input, output_extents)) = inputs.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            if matches!(
+                self,
+                Self::AllGather(operation) if operation.output_variance() == AllGatherOutputVariance::Invariant
+            ) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "direct invariant 'all_gather' transposition requires linearization so that the current \
+                              participant can select its gathered chunk"
+                        .to_string(),
+                }
+                .into());
             }
-            .into());
+            if array_input.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference)
+                || output_extents.iter().any(|extent| {
+                    extent.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference)
+                })
+            {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "direct '{}' transposition with dynamic extents requires linearization so that the primal \
+                         geometry can be retained as residuals",
+                        self.name(),
+                    ),
+                }
+                .into());
+            }
+            let operation = match self {
+                Self::AllGather(operation) => ArrayOperation::AllGather(operation.clone()),
+                Self::PSumScatter(operation) => ArrayOperation::PSumScatter(operation.clone()),
+                Self::AllToAll(operation) => ArrayOperation::AllToAll(operation.clone()),
+                _ => unreachable!(),
+            };
+            let mut cotangents =
+                Self::Array(operation).transpose(context, driver, std::slice::from_ref(array_input), outputs)?;
+            cotangents.extend(output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())));
+            return Ok(cotangents);
         }
         if let Self::Pad(operation) = self {
             if inputs.len() < 2 {
@@ -3832,7 +4007,7 @@ mod tests {
             ],
         );
 
-        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
         let dimension_type = DimensionType::new(variable.clone());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
         let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
@@ -3860,16 +4035,195 @@ mod tests {
             .unwrap();
         let primal = ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
         let tangent = ArrayProgramValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
-        let result_extent = ArrayProgramValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
+        let result_extent = ArrayProgramValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap());
+        let jvp = program.jvp().unwrap();
         assert_eq!(
-            program.jvp().unwrap().interpret(vec![primal.clone(), result_extent, tangent.clone(),]),
+            jvp.interpret(vec![primal.clone(), result_extent.clone(), tangent.clone(),]),
             Ok(vec![primal, tangent]),
         );
+        assert!(
+            jvp.instructions()
+                .iter()
+                .any(|instruction| { matches!(instruction.operation(), ArrayProgramOperation::LinearCall(_)) })
+        );
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])), result_extent])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let cotangent = ArrayProgramValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
+        let mut pullback_inputs = vec![cotangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
+        let zero_extent = ArrayProgramValue::Dimension(DimensionValue::new(dimension_type, 0).unwrap());
+        let zero_array = || {
+            ArrayProgramValue::Array(Array::from_f64s(
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(0)])),
+                Vec::new(),
+            ))
+        };
+        let mut primal_outputs = linearization.primal().interpret(vec![zero_array(), zero_extent]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let zero_cotangent = zero_array();
+        let mut pullback_inputs = vec![zero_cotangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![zero_cotangent]));
         assert!(matches!(
             program.transpose_with_respect_to(&[0]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "'all_gather' transpose with explicit result extents requires Phase 6 dimension residuals",
+                if message == "direct 'all_gather' transposition with dynamic extents requires linearization so that \
+                    the primal geometry can be retained as residuals",
         ));
+    }
+
+    #[test]
+    fn test_array_program_invariant_all_gather_linearization() {
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let dimension_type = DimensionType::new(variable.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let array = builder.add_input(array_type.into());
+        let result_extent = builder.add_input(dimension_type.clone().into());
+        let output = builder
+            .add_instruction(
+                AllGatherOperation::new(
+                    "x".to_string(),
+                    1,
+                    0,
+                    CollectiveOptions::tiled(),
+                    AllGatherOutputVariance::Invariant,
+                ),
+                Vec::new(),
+                vec![array, result_extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let rendered_tangent = linearization.tangent().to_string();
+        assert!(rendered_tangent.contains("dynamic_shape_slice"));
+        assert!(rendered_tangent.contains("reshape"));
+        let input = ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let extent = ArrayProgramValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
+        let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let cotangent = ArrayProgramValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
+        let mut pullback_inputs = vec![cotangent];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]))]),
+        );
+
+        // A nondegenerate untiled invariant gather selects the current participant's size-one slice and reshapes
+        // away the ranked participant axis.
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let array = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
+        let participant_extent =
+            builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let input_extent = builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let output = builder
+            .add_instruction(
+                AllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::default(),
+                    AllGatherOutputVariance::Invariant,
+                ),
+                Vec::new(),
+                vec![array, participant_extent, input_extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "direct invariant 'all_gather' transposition requires linearization so that the current \
+                    participant can select its gathered chunk",
+        ));
+        let pullback = program.linearize().unwrap().pullback().unwrap().to_string();
+        assert!(pullback.contains("axis_index [axis_name=\"x\"]"));
+        assert!(pullback.contains("dimension_from_scalar"));
+        assert!(pullback.contains("dimension_mul"));
+        assert!(pullback.contains("dynamic_shape_slice"));
+    }
+
+    #[test]
+    fn test_array_program_shape_changing_collective_linearization() {
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let dimension_type = DimensionType::new(variable.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let array = builder.add_input(array_type.into());
+        let result_extent = builder.add_input(dimension_type.clone().into());
+        let output = builder
+            .add_instruction(
+                PSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
+                Vec::new(),
+                vec![array, result_extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
+        let input = ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let extent = ArrayProgramValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
+        let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let cotangent = ArrayProgramValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
+        let mut pullback_inputs = vec![cotangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
+
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let array = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
+        let extent = builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let output = builder
+            .add_instruction(
+                AllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
+                Vec::new(),
+                vec![array, extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert!(linearization.tangent().to_string().contains("linear_call"));
+        let input = ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let cotangent = ArrayProgramValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
+        let mut pullback_inputs = vec![cotangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
     }
 
     #[test]
