@@ -1820,6 +1820,13 @@ Phase 6 unit; composite-zero deletion remains afterward.
       type.
 - [ ] Exercise the prototype through inference, eager interpretation, tracing, PE, batching, JVP, VJP, transposition,
       rendering, region import, and XLA lowering.
+- [ ] Simplify the three projected-operation helper signatures and every call site after `Operation::Type` makes the
+      member type recoverable from the projected operation: `jvp_projected_operation` and
+      `transpose_projected_operation` must require no turbofish, while `batch_projected_operation` must drop its
+      explicit member-type argument and either infer its projected batching policy from the final policy contracts or
+      keep that one irreducible policy selection explicit. Do not retain inferred generic placeholders or introduce a
+      marker/wrapper solely to relocate the same type annotation. Add compile-checked direct-call fixtures pinning the
+      final syntax.
 - [ ] Add compile-fail tests proving one payload cannot acquire two semantic type contracts and a homogeneous enum
       cannot combine mismatched payload types.
 - [ ] Measure clean/incremental compile time, peak memory, macro output size, and trait-solver stability against
