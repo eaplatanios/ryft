@@ -492,33 +492,35 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::contexts::Context;
+    use crate::contexts::StagingContext;
     use crate::contexts::tests::{
         ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue,
     };
+    use crate::differentiation::DifferentiationError;
+    use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
     use crate::operations::math::MulOperation;
     use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
+    use crate::programs::atoms::MaybeZero;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::values::Value;
+    use crate::programs::programs::Program;
+    use crate::programs::regions::{RegionDriver, RegionRef};
+    use crate::tracing::TracingContext;
     use crate::types::{ArrayType, DataType};
 
-    use super::LinearCallOperation;
+    use super::*;
 
     #[test]
     fn test_linear_call_is_generic_over_a_third_composite_member() {
-        type Operation = LinearCallOperation<ProjectedProgramType>;
-
         let linear_type = ProjectedProgramType::First(ProjectedMemberType);
         let residual_type = ProjectedProgramType::Third(ProjectedMemberType);
         let forward = {
-            let mut builder = ProgramBuilder::<ProjectedProgramValue, Operation>::new();
+            let mut builder = ProgramBuilder::<ProjectedProgramValue, LinearCallOperation<ProjectedProgramType>>::new();
             builder.add_input(residual_type.clone());
             let linear = builder.add_input(linear_type.clone());
             builder
@@ -530,7 +532,7 @@ mod tests {
                 .unwrap()
         };
         let transpose = {
-            let mut builder = ProgramBuilder::<ProjectedProgramValue, Operation>::new();
+            let mut builder = ProgramBuilder::<ProjectedProgramValue, LinearCallOperation<ProjectedProgramType>>::new();
             builder.add_input(residual_type.clone());
             let cotangent = builder.add_input(linear_type.clone());
             builder
@@ -541,7 +543,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<ProjectedProgramValue, Operation>::new();
+        let mut builder = ProgramBuilder::<ProjectedProgramValue, LinearCallOperation<ProjectedProgramType>>::new();
         let forward = builder.import_region(forward.entry_region_ref());
         let transpose = builder.import_region(transpose.entry_region_ref());
         let residual = builder.add_input(residual_type);
@@ -556,7 +558,6 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-
         let linear = ProjectedProgramValue::First(ProjectedMemberValue(2));
         let residual = ProjectedProgramValue::Third(ProjectedMemberValue(7));
         assert_eq!(program.interpret(vec![residual, linear.clone()]), Ok(vec![linear]));
@@ -565,15 +566,6 @@ mod tests {
 
     #[test]
     fn test_linear_call_transposition_swaps_the_attached_regions() {
-        use crate::contexts::StagingContext;
-        use crate::differentiation::DifferentiationError;
-        use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
-        use crate::partial::PartialValue;
-        use crate::programs::Program;
-        use crate::programs::atoms::MaybeZero;
-        use crate::programs::regions::{RegionDriver, RegionRef};
-        use crate::tracing::TracingContext;
-
         /// Exposes the executable carrier's two regions to the transpose rule without entering full reverse mode.
         struct TwoRegionDriver<'r> {
             forward: RegionRef<'r, Array, ArrayOperation<Array>>,
@@ -653,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_executable_linear_call_nested_jvp_differentiates_residual_parameters() {
+    fn test_forward_and_transpose_linear_call_nested_jvp_differentiates_residual_parameters() {
         let r#type = ArrayType::scalar(DataType::F64);
         let forward = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
