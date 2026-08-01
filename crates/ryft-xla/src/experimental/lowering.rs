@@ -6555,7 +6555,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )
         }
         XlaOperation::LinearCall(operation) => {
-            if !operation.is_executable() {
+            if operation.is_transpose_only() {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!("operation `{}` cannot be lowered to StableHLO", operation.name()),
                 }
@@ -9241,11 +9241,11 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_vjp_tangent_lowering_is_rejected() {
+    fn test_transpose_only_linear_call_lowering_is_rejected() {
         use ryft_core::differentiation::LinearCallOperation;
 
-        // Phase 0 boundary pin for the first-class-program-regions plan: the un-transposed `custom_vjp_tangent`
-        // carrier is reverse-mode-only and must be transposed away before lowering, so lowering it is rejected.
+        // Phase 0 boundary pin for the first-class-program-regions plan: the un-transposed transpose-only linear
+        // call carrier is reverse-mode-only and must be transposed away before lowering, so lowering it is rejected.
         let vector_type = test_vector_type(4);
         let backward = {
             let mut builder = CompositeXlaProgramBuilder::new();
@@ -9260,7 +9260,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let operation = LinearCallOperation::opaque(
+        let operation = LinearCallOperation::transpose_only(
             1,
             vec![ArrayProgramType::Array(vector_type.clone())],
             vec![ArrayProgramType::Array(vector_type.clone())],
@@ -9285,7 +9285,7 @@ mod tests {
         assert!(matches!(
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
             Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == "operation `custom_vjp_tangent` cannot be lowered to StableHLO",
+                if message == "operation `transpose_only_linear_call` cannot be lowered to StableHLO",
         ));
     }
 

@@ -159,9 +159,9 @@ where
     CustomVjp(CustomVjpOperation),
 
     /// Differentiation-owned call to an explicitly transposable linear map with ordinary trailing residual
-    /// operands. This variant carries both carrier forms: the executable form (attached forward and transpose
-    /// regions) lowers by inlining its forward region, while the opaque reverse-only `custom_vjp` form (attached
-    /// transpose region only) cannot be lowered and reports the canonical reverse-only diagnostic.
+    /// operands. This variant carries both carrier forms: the forward-and-transpose form lowers by inlining its
+    /// forward region, while the reverse-only transpose-only form (attached transpose region only) cannot be lowered
+    /// and reports the canonical reverse-only diagnostic.
     LinearCall(LinearCallOperation<ArrayProgramType>),
 
     /// Backend-owned rematerialized call whose attached regions can contain XLA operations.

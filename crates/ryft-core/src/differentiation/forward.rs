@@ -371,17 +371,38 @@ impl<
     Output: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>,
 > Pushforward<C, Input, Output>
 {
-    /// Creates a new [`Pushforward`] closing `program` over the linearization-point `residuals`, validating the
-    /// contract documented on [`Pushforward`] where `program` consumes the flat tangents followed by `residuals`
-    /// and produces the flat tangent outputs that `output_structure` reshapes. Violations are reported as
-    /// [`MalformedProgram`](ProgramError::MalformedProgram) errors: too few program inputs to hold the residuals,
-    /// or a trailing residual input whose type differs from the type of the residual value that feeds it.
+    /// Creates a [`Pushforward`] from a compact tangent [`Program`] and the complete primal boundary from which that
+    /// program was derived. The program has the boundary `(live(ẋ), r) ↦ live(ẏ)`. It omits every tangent input and
+    /// output whose differential space contains only zero. Its boundary therefore cannot recover the omitted leaves'
+    /// positions or types, and the tangent-type mapping is not generally invertible. `primal_input_types` and
+    /// `primal_output_types` preserve that complete boundary so [`apply`](Self::apply) can validate all public tangent
+    /// leaves, remove the zero-space inputs before replay, and insert typed zeros at the correct output positions
+    /// afterward.
+    ///
+    /// This function validates the relationship among all three boundaries. In particular, the program must consume
+    /// one leading input for every nonzero tangent in `primal_input_types`, followed by one input for every residual,
+    /// and must produce one output for every nonzero tangent in `primal_output_types`. A mismatch is reported as a
+    /// [`MalformedProgram`](ProgramError::MalformedProgram) error.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Context in which [`apply`](Self::apply) interprets or stages the compact pushforward program.
+    ///   - `program`: Compact pushforward program `(live(ẋ), r) ↦ live(ẏ)` whose trailing inputs consume the
+    ///     residual values.
+    ///   - `residuals`: Primal values `r` captured at the linearization point, in the same order as the program's
+    ///     trailing inputs.
+    ///   - `primal_input_types`: Complete flattened input-type boundary of the original primal function, including
+    ///     leaves whose tangent spaces contain only zero and which are consequently absent from `program`.
+    ///   - `primal_output_types`: Complete flattened output-type boundary of the original primal function, including
+    ///     leaves whose tangent spaces contain only zero and which are consequently absent from `program`.
+    ///   - `output_structure`: Parameter structure used to rebuild the complete public tangent output after typed
+    ///     zeros have been inserted for the omitted leaves.
     pub fn new(
         context: C,
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,
-        input_types: Vec<C::Type>,
-        output_types: Vec<C::Type>,
+        primal_input_types: Vec<C::Type>,
+        primal_output_types: Vec<C::Type>,
         output_structure: Output::ParameterStructure,
     ) -> Result<Self, ProgramError> {
         let tangent_input_count = program.input_ids().len().checked_sub(residuals.len()).ok_or_else(|| {
@@ -401,7 +422,7 @@ impl<
                 )));
             }
         }
-        let live_input_count = input_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
+        let live_input_count = primal_input_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
         if live_input_count != tangent_input_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "pushforward program consumes {tangent_input_count} tangent inputs but its public boundary has {} \
@@ -409,7 +430,7 @@ impl<
                 live_input_count,
             )));
         }
-        let live_output_count = output_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
+        let live_output_count = primal_output_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
         if live_output_count != program.output_ids().len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "pushforward program produces {} tangent outputs but its public boundary has {} nonzero differential \
@@ -422,8 +443,8 @@ impl<
             context,
             program,
             residuals,
-            primal_input_types: input_types,
-            primal_output_types: output_types,
+            primal_input_types,
+            primal_output_types,
             output_structure,
             marker: PhantomData,
         })
@@ -443,13 +464,19 @@ impl<
         &self.residuals
     }
 
-    /// Returns the complete public primal input boundary.
+    /// Returns the type of every flattened input leaf of the original primal function, including leaves whose tangent
+    /// spaces contain only zero and which therefore have no corresponding input in [`program`](Self::program). This
+    /// metadata lets reverse-mode construction derive the complete cotangent boundary before it consumes the compact
+    /// [`Pushforward`].
     #[inline]
     pub(crate) fn primal_input_types(&self) -> &[C::Type] {
         &self.primal_input_types
     }
 
-    /// Returns the complete public primal output boundary.
+    /// Returns the type of every flattened output leaf of the original primal function, including leaves whose tangent
+    /// spaces contain only zero and which therefore have no corresponding output in [`program`](Self::program). This
+    /// metadata lets reverse-mode construction derive the complete cotangent boundary before it consumes the compact
+    /// [`Pushforward`].
     #[inline]
     pub(crate) fn primal_output_types(&self) -> &[C::Type] {
         &self.primal_output_types
@@ -475,15 +502,20 @@ impl<
     where
         C: Zero<C::Value>,
     {
-        let public_inputs = tangents.into_parameters().collect::<Vec<_>>();
-        if public_inputs.len() != self.primal_input_types.len() {
+        // Flatten the caller's structured tangent tree and first validate it against the complete primal boundary,
+        // including the leaves whose differential spaces contain only zero.
+        let public_tangents = tangents.into_parameters().collect::<Vec<_>>();
+        if public_tangents.len() != self.primal_input_types.len() {
             return Err(ProgramError::InvalidInputCount {
                 expected: self.primal_input_types.len(),
-                actual: public_inputs.len(),
+                actual: public_tangents.len(),
             });
         }
-        let mut inputs = Vec::new();
-        for (index, (value, primal_type)) in public_inputs.into_iter().zip(&self.primal_input_types).enumerate() {
+
+        // Validate every public tangent against the tangent type derived from its primal leaf. Forward only the
+        // information-carrying values because the compact program has no SSA input for a zero differential space.
+        let mut program_inputs = Vec::new();
+        for (index, (value, primal_type)) in public_tangents.into_iter().zip(&self.primal_input_types).enumerate() {
             let tangent_type = primal_type.tangent();
             if value.r#type().as_ref() != &tangent_type {
                 return Err(ProgramError::MalformedProgram(format!(
@@ -494,18 +526,21 @@ impl<
                 )));
             }
             if !tangent_type.is_zero_space() {
-                inputs.push(value);
+                program_inputs.push(value);
             }
         }
+
+        // Defensively verify that the filtered public boundary agrees with the compact program's leading tangent
+        // boundary. `Pushforward::new` established the same contract when this callable was constructed.
         let tangent_input_count = self.program.input_ids().len() - self.residuals.len();
-        if inputs.len() != tangent_input_count {
+        if program_inputs.len() != tangent_input_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "pushforward received {} tangents but its program consumes {} tangent inputs",
-                inputs.len(),
+                program_inputs.len(),
                 tangent_input_count,
             )));
         }
-        for (index, (input, expected)) in inputs.iter().zip(self.program.inputs()).enumerate() {
+        for (index, (input, expected)) in program_inputs.iter().zip(self.program.inputs()).enumerate() {
             if input.r#type().as_ref() != expected.r#type().as_ref() {
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward tangent {} has type {} but its program requires type {}",
@@ -515,8 +550,13 @@ impl<
                 )));
             }
         }
-        inputs.extend(self.residuals.iter().cloned());
-        let mut tangent_outputs = self.program.interpret_in_context(&self.context, inputs)?.into_iter();
+
+        // Close the compact tangent boundary over the primal residuals and replay it in the originating context.
+        program_inputs.extend(self.residuals.iter().cloned());
+        let mut tangent_outputs = self.program.interpret_in_context(&self.context, program_inputs)?.into_iter();
+
+        // Reconstruct the complete flattened public output boundary. Consume one program result for each nonzero
+        // tangent space and materialize the uniquely determined typed zero for every omitted zero-space leaf.
         let outputs = self
             .primal_output_types
             .iter()
@@ -533,11 +573,16 @@ impl<
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        // Construction validated the expected output count. Reject a malformed replay rather than silently dropping
+        // an unexpected compact-program result.
         if tangent_outputs.next().is_some() {
             return Err(ProgramError::MalformedProgram(
                 "pushforward program produced more nonzero differential outputs than its public boundary".to_string(),
             ));
         }
+
+        // Restore the closure's original structured output shape after rebuilding every flattened tangent leaf.
         Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)
     }
 }

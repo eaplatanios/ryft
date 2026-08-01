@@ -576,12 +576,15 @@ where
 
         // Stage one opaque carrier over `[input_tangents..., residuals...]`, producing the output tangents. The
         // carrier rejects forward interpretation and transposes by replaying the user's backward region.
-        // The opaque carrier takes every input tangent as a real operand, so materialize structural zeros.
-        let mut carrier_operands = inputs
-            .iter()
-            .map(|input| input.tangent().clone().materialize(context))
-            .collect::<Result<Vec<_>, _>>()?;
-        carrier_operands.extend(residuals);
+        // The transpose-only carrier takes its residuals first, followed by every input tangent as a real operand,
+        // so materialize structural zeros.
+        let mut carrier_operands = residuals;
+        carrier_operands.extend(
+            inputs
+                .iter()
+                .map(|input| input.tangent().clone().materialize(context))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         let carrier = LinearCallOperation::transpose_only(residual_count, input_tangent_types, output_tangent_types);
         let output_tangents = context.bind(carrier, vec![backward_region.to_program()], &carrier_operands)?;
         check_count!("output", output_tangents, output_count, ProgramError);
@@ -1053,7 +1056,7 @@ mod tests {
         );
         assert_eq!(
             LinearCallOperation::transpose_only(1, vec![tangent_type.clone()], vec![tangent_type.clone()])
-                .infer_output_types(&[tangent_type.clone(), residual_type], std::slice::from_ref(&backward_interface),),
+                .infer_output_types(&[residual_type, tangent_type.clone()], std::slice::from_ref(&backward_interface),),
             Ok(vec![tangent_type]),
         );
         assert_eq!(
@@ -1088,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_vjp_tangent_carrier_remains_opaque_to_partial_evaluation() {
+    fn test_custom_vjp_transpose_only_carrier_remains_opaque_to_partial_evaluation() {
         let scalar = test_type(&[]);
         let operation = ArrayOperation::LinearCall(LinearCallOperation::transpose_only(
             1,
@@ -1114,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_vjp_tangent_validates_residual_count() {
+    fn test_custom_vjp_transpose_only_carrier_validates_residual_count() {
         let scalar = test_type(&[]);
         let backward_interface = RegionInterface::new(vec![scalar.clone()], vec![scalar.clone()], Effects::PURE);
         assert!(matches!(
@@ -1178,14 +1181,14 @@ mod tests {
                 .transpose(
                     &mut context,
                     &driver,
-                    &[PartialValue::Unknown(scalar), PartialValue::Known(known_tangent), PartialValue::Known(residual)],
+                    &[PartialValue::Known(residual), PartialValue::Unknown(scalar), PartialValue::Known(known_tangent)],
                     &[MaybeZero::Value(output_cotangent)],
                 )
                 .unwrap();
 
         assert_eq!(contributions.len(), 3);
-        assert!(matches!(contributions[0], MaybeZero::Value(_)));
-        assert!(contributions[1].is_zero());
+        assert!(contributions[0].is_zero());
+        assert!(matches!(contributions[1], MaybeZero::Value(_)));
         assert!(contributions[2].is_zero());
     }
 
@@ -1320,7 +1323,7 @@ mod tests {
                         &crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver,
                                         &[Array::scalar(1.0)],
                     ),
-                    Err(ProgramError::Type(TypeError::Invalid { message }))
+                    Err(ProgramError::UnsupportedOperation { message })
                         if message.starts_with("a transpose-only linear call has no forward program to execute"),
                 ));
     }
