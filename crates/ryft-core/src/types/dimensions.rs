@@ -271,6 +271,56 @@ impl TypeIdentity for DimensionVariable {
 /// equality, hashing, display, and retained-compilation cache identity must not distinguish two calls whose dynamic
 /// extents differ, or every concrete extent would acquire its own specialization). Boundary facts instead live in the
 /// complete-signature [`TypeRefinements`](crate::TypeRefinements) environment established at program boundaries.
+///
+/// # Motivation
+///
+/// First-class typed dimensions exist to make programs *shape polymorphic*. A program traced once over symbolic extents
+/// is type checked once, transformed once (e.g., differentiated, batched, or partially evaluated), and then executed at
+/// every concrete extent its bounds admit. All of that rests on one invariant that the entire tracing and transform
+/// stack consumes: the type of every operation output is computable at trace time from the types of its inputs. Typed
+/// dimensions preserve that invariant in the presence of dynamic extents, which buys us:
+///
+///   - **Trace-Time Shape Checking:** Shape-carrying operations prove facts such as "this reshape preserves the element
+///     count" symbolically while tracing, and reject violations with a precise trace-time error instead of deferring
+///     them to backend compilation or to a runtime crash on some particular input.
+///   - **Transformability:** Transforms must synthesize types for values that do not exist in the original program,
+///     such as batched intermediates, tangents, and cotangent zeros. Because every dynamic extent is defined by a
+///     dimension value derived from the input signature, transforms can thread those definitions through the programs
+///     they build (e.g., as residuals of a linearization), and the resulting programs remain well-typed and themselves
+///     shape polymorphic.
+///   - **One Compiled Artifact Across Extents:** Concrete extents are not part of the type, so retained compilations
+///     are keyed by the symbolic signature and reused across every admitted extent, with the boundary
+///     [`TypeRefinements`](crate::TypeRefinements) environment binding actual extents per call.
+///
+/// The restriction this type encodes is therefore one of *provenance*. Dimension values derive only from the input
+/// signature (i.e., dimension inputs, extents of array inputs, and explicit dimension arithmetic over those) and never
+/// from array *data*. Backend IRs are more permissive. For example, a StableHLO
+/// [`dynamic_reshape`](https://openxla.org/stablehlo/spec#dynamic_reshape) consumes an ordinary runtime integer tensor
+/// with no provenance requirement, so lowering does not need this machinery. The restriction is a frontend type-system
+/// choice: a data-derived extent would make output *types* depend on runtime *values*, breaking the trace-time
+/// invariant above, and data-dependent dynamism also remains unevenly supported across backends (refer to the
+/// [dynamism in StableHLO](https://openxla.org/stablehlo/dynamism) documentation for more information). The
+/// authoritative [`DimensionBounds`] carried by every [`DimensionVariable`] additionally keep each dynamic extent
+/// inside a static envelope that backends can plan buffers and generate loops against.
+///
+/// # Example
+///
+/// The following program reshapes a `f64[source, 4]` input into `f64[2, source * 2]`. The input array type's dynamic
+/// axis references the variable `source`, `dimension_size` defines that variable as a Single Static Assignment (SSA)
+/// value, and `dimension_mul` derives a fresh variable whose diagnostic name and bounds record the arithmetic (i.e.,
+/// `source ∈ [0, 9)` implies `source * 2 ∈ [0, 17)`):
+///
+/// ```text
+/// lambda %0: f64[source, 4] .
+/// let %1: dimension<2>                    = const
+///     %2: dimension<source ∈ [0, 9)>      = dimension_size [axis=0] %0
+///     %3: dimension<source * 2 ∈ [0, 17)> = dimension_mul %2 %1
+///     %4: f64[2, source * 2]              = reshape %0 %1 %3
+/// in (%4)
+/// ```
+///
+/// This one program type checks, differentiates, and compiles once, and then executes at every `source ∈ [0, 9)`,
+/// with the concrete extent bound at each execution boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct DimensionType {
     /// [`DimensionVariable`] defined by values of this type.

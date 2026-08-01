@@ -722,6 +722,9 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
 /// signature: an [`ArrayType`] member *references* the variables named by its dynamic axes, while a [`DimensionType`]
 /// member *defines* its variable. [`Type::derive_identity_renaming`] therefore checks a variable repeated across
 /// array and dimension members for consistency, exactly as it does within one member kind.
+///
+/// Refer to the documentation of [`DimensionType`] for why runtime dimensions can be first-class typed values in the
+/// first place, the input-derived provenance restriction they encode, and how it enables shape-polymorphic programs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayProgramType {
     /// An ordinary array type.
