@@ -18,19 +18,17 @@ use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
-use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::custom_derivatives::CustomVjpResidual;
 use crate::types::{ArrayType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this.
 
-use super::scattering::{LinearScatterAddOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
+use super::scattering::{ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 use super::slicing::batch_by_item_expansion;
 
 /// Canonical operation name for [`GatherOperation`].
@@ -490,160 +488,13 @@ pub(crate) fn validate_unique_in_range(
     Ok(())
 }
 
-// TODO(eaplatanios): Should this be renamed to something that's not about "linearity"? This is about captured primals.
-/// Captured-index gather linear operation: the linear map `t ↦ gather(t, indices; dimensions)` over the tangent (or
-/// cotangent) of the gathered operand.
-///
-/// It is the captured-index linear map emitted by the JVP of [`GatherOperation`]: the
-/// integer index operand is a primal value captured at linearization time as a residual factor (it has no tangent
-/// space, so the map is linear in the single tangent operand), and its transpose is the dual scatter-add. The single
-/// operation input is the gathered operand's tangent; the captured `indices` factor supplies the gather's index
-/// operand during type inference.
-#[derive(Clone, Debug, PartialEq)]
-pub struct LinearGatherOperation<F> {
-    /// Underlying [`GatherOperation`] describing the gather geometry.
-    operation: GatherOperation,
-
-    /// Captured integer index operand factor.
-    indices: F,
-}
-
-impl<F> LinearGatherOperation<F> {
-    /// Creates a new [`LinearGatherOperation`] from the underlying gather and the captured index factor.
-    #[inline]
-    pub fn new(operation: GatherOperation, indices: F) -> Self {
-        Self { operation, indices }
-    }
-
-    /// Returns the underlying [`GatherOperation`] describing the gather geometry.
-    #[inline]
-    pub fn operation(&self) -> &GatherOperation {
-        &self.operation
-    }
-
-    /// Returns the captured integer index operand factor.
-    #[inline]
-    pub fn indices(&self) -> &F {
-        &self.indices
-    }
-}
-
-impl<F: Value<Type = ArrayType>> Display for LinearGatherOperation<F> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearGatherOperation<F> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        GATHER_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        self.operation
-            .infer_output_types(&[input_types[0].clone(), self.indices.r#type().into_owned()], &[])
-    }
-
-    #[inline]
-    fn rename_type_identities(
-        &self,
-        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
-    ) -> Result<Self, TypeError> {
-        Ok(Self { operation: self.operation.clone(), indices: self.indices.rename_type_identities(renaming)? })
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        let _ = indentation;
-        formatter.write_str(self.name())
-    }
-}
-
-impl<F, C> InterpretableOperation<C> for LinearGatherOperation<F>
-where
-    C: Domain<Type = ArrayType, Value: Gather>,
-    F: CustomVjpResidual<C::Value>,
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].gather(&self.indices().residual_value()?, self.operation())?])
-    }
-}
-
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a [`LinearGatherOperation`].
-impl<F: Value<Type = ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
-    for LinearGatherOperation<F>
-where
-    C::Operation: From<LinearGatherOperation<F>>,
-{
-}
-
-/// Transpose rule for the captured-index gather. The forward linear map
-/// `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that writes the output cotangent back into a
-/// zero operand at the gathered windows: the scatter geometry mirrors the gather axis-for-axis and the captured
-/// indices carry over. Symbolic-zero cotangents propagate unchanged.
-impl<V: Value<Type = ArrayType>, O, F: Value<Type = ArrayType>> TransposableOperation<V, O> for LinearGatherOperation<F>
-where
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearScatterAddOperation<F>>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
-            MaybeZero::Value(cotangent) => {
-                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent()).materialize(context)?;
-                let dimensions = self.operation().dimensions();
-                let scatter_dimensions = ScatterDimensionNumbers::new(
-                    dimensions.offset_dimensions().to_vec(),
-                    dimensions.collapsed_slice_dimensions().to_vec(),
-                    dimensions.start_index_map().to_vec(),
-                )
-                .with_batching_dimensions(
-                    dimensions.operand_batching_dimensions().to_vec(),
-                    dimensions.start_indices_batching_dimensions().to_vec(),
-                );
-                let scatter_operation = ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add)
-                    .with_mode(self.operation().mode())
-                    .with_indices_are_sorted(self.operation().indices_are_sorted())
-                    .with_unique_indices(self.operation().unique_indices());
-                let outputs = context.stage_operation(
-                    LinearScatterAddOperation::new(scatter_operation, self.indices().clone()),
-                    Vec::new(),
-                    &[zeros, cotangent.clone()],
-                )?;
-                check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![MaybeZero::Value(outputs.into_iter().next().unwrap())])
-            }
-        }
-    }
-}
-
 /// Partition-aware transpose rule for the primal [`GatherOperation`]. The integer index operand (operand 1) has no
 /// tangent space, so in a valid pushforward it is the known operand and the gathered operand (operand 0) is the
 /// linear one. The forward map `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that writes the
 /// output cotangent back into a zero operand at the gathered windows: the scatter geometry mirrors the gather
-/// axis-for-axis. This reproduces the captured-index [`LinearGatherOperation`] transpose rule, reading the indices
-/// from the pullback through `operand_values` and staging a primal additive [`ScatterOperation`] instead of folding
-/// the indices into a captured factor. The indices receive a structural zero, and a zero output cotangent stays a
-/// structural zero.
+/// axis-for-axis. The transpose reads the known indices from the pullback boundary and stages an ordinary additive
+/// [`ScatterOperation`], so linearization retains the indices as regular SSA residuals. The indices receive a
+/// structural zero, and a zero output cotangent stays a structural zero.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for GatherOperation
 where
     O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScatterOperation>,
@@ -844,13 +695,23 @@ impl Gather for ArrayType {
             .into());
         }
         for (axis, &size) in slice_sizes.iter().enumerate() {
-            if let Dimension::Static(extent) = operand.dimension(axis)
-                && size > extent
-            {
-                return Err(TypeError::invalid(format!(
-                    "'{GATHER_OPERATION_NAME}' slice size {size} at axis {axis} exceeds the operand extent {extent}"
-                ))
-                .into());
+            match operand.dimension(axis) {
+                Dimension::Static(extent) if size > extent => {
+                    return Err(TypeError::invalid(format!(
+                        "'{GATHER_OPERATION_NAME}' slice size {size} at axis {axis} exceeds the operand extent \
+                         {extent}"
+                    ))
+                    .into());
+                }
+                Dimension::Dynamic(variable) if size > variable.bounds().lower() => {
+                    return Err(TypeError::invalid(format!(
+                        "'{GATHER_OPERATION_NAME}' slice size {size} exceeds the guaranteed minimum extent {} of \
+                         dynamic operand axis {axis}",
+                        variable.bounds().lower(),
+                    ))
+                    .into());
+                }
+                _ => {}
             }
             if collapsed.contains(&axis) && size != 1 {
                 return Err(TypeError::invalid(format!(

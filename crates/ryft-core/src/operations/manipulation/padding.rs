@@ -319,7 +319,8 @@ impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
         if driver.region_count() != 0 {
             return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
         }
-        self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
+        let expected_input_count = 2 + self.edge_padding_low.len();
+        check_count!("input", inputs, expected_input_count, ProgramError);
         let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
         let padding_value = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(&inputs[1])?;
         let output =

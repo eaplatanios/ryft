@@ -18,21 +18,19 @@ use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
-use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{LogicalMesh, Sharding};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::custom_derivatives::CustomVjpResidual;
 use crate::types::{ArrayType, Dimension};
 
 // TODO(eaplatanios): Review this.
 
 use super::gathering::{
-    GatherDimensionNumbers, GatherOperation, GatherScatterMode, LinearGatherOperation, dimension_has_explicit_axis,
-    references_auto_axis, validate_sorted_unique_in_range, validate_unique_in_range,
+    GatherDimensionNumbers, GatherOperation, GatherScatterMode, dimension_has_explicit_axis, references_auto_axis,
+    validate_sorted_unique_in_range, validate_unique_in_range,
 };
 use super::slicing::batch_by_item_expansion;
 
@@ -417,12 +415,10 @@ where
 /// operand while the scattered operand (operand 0) and the updates (operand 2) are the linear ones. Scatter-add
 /// accumulates into its operand (`output = operand + scattered(updates)`, so the operand Jacobian is the identity), so
 /// the operand cotangent is the output cotangent unchanged; the update cotangent gathers the output cotangent at the
-/// scattered windows via the dual gather built by mirroring the scatter geometry. This reproduces the captured-index
-/// [`LinearScatterAddOperation`] transpose rule, reading
-/// the indices from the pullback through `operand_values` and staging a primal [`GatherOperation`] instead of folding
-/// the indices into a captured factor. The indices receive a structural zero, and a zero output cotangent stays a
-/// structural zero. Non-additive combiners are not linear and are
-/// rejected.
+/// scattered windows via the dual gather built by mirroring the scatter geometry. The transpose reads the known
+/// indices from the pullback boundary and stages an ordinary [`GatherOperation`], so linearization retains the
+/// indices as regular SSA residuals. The indices receive a structural zero, and a zero output cotangent stays a
+/// structural zero. Non-additive combiners are not linear and are rejected.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ScatterOperation
 where
     O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<GatherOperation>,
@@ -553,187 +549,6 @@ fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), T
         )));
     }
     Ok(())
-}
-
-// TODO(eaplatanios): Should this be renamed to something that's not about "linearity"? This is about captured primals.
-/// Captured-index scatter-add linear operation: the linear map
-/// `(t, u) ↦ scatter_add(t, indices, u; dimensions)` over the tangents (or cotangents) of the scattered operand and
-/// the updates.
-///
-/// It is the captured-index linear map emitted by the JVP of [`ScatterOperation`] with
-/// an [`Add`](ScatterReductionKind::Add) combiner: the integer index operand is a primal value captured at
-/// linearization time as a residual factor (it has no tangent space, so the map is jointly linear in the two tangent
-/// operands), and its transpose is the dual gather. The two operation inputs are the operand and update tangents; the
-/// captured `indices` factor is inserted between them as the scatter's index operand during type inference.
-#[derive(Clone, Debug, PartialEq)]
-pub struct LinearScatterAddOperation<F> {
-    /// Underlying [`ScatterOperation`] describing the scatter geometry.
-    operation: ScatterOperation,
-
-    /// Captured integer index operand factor.
-    indices: F,
-}
-
-impl<F> LinearScatterAddOperation<F> {
-    /// Creates a new [`LinearScatterAddOperation`] from the underlying scatter and the captured index factor.
-    #[inline]
-    pub fn new(operation: ScatterOperation, indices: F) -> Self {
-        Self { operation, indices }
-    }
-
-    /// Returns the underlying [`ScatterOperation`] describing the scatter geometry.
-    #[inline]
-    pub fn operation(&self) -> &ScatterOperation {
-        &self.operation
-    }
-
-    /// Returns the captured integer index operand factor.
-    #[inline]
-    pub fn indices(&self) -> &F {
-        &self.indices
-    }
-}
-
-impl<F: Value<Type = ArrayType>> Display for LinearScatterAddOperation<F> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearScatterAddOperation<F> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        SCATTER_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
-        self.operation.infer_output_types(
-            &[input_types[0].clone(), self.indices.r#type().into_owned(), input_types[1].clone()],
-            &[],
-        )
-    }
-
-    #[inline]
-    fn rename_type_identities(
-        &self,
-        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
-    ) -> Result<Self, TypeError> {
-        Ok(Self { operation: self.operation.clone(), indices: self.indices.rename_type_identities(renaming)? })
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        let _ = indentation;
-        formatter.write_str(self.name())
-    }
-}
-
-impl<F, C> InterpretableOperation<C> for LinearScatterAddOperation<F>
-where
-    C: Domain<Type = ArrayType, Value: Scatter>,
-    F: CustomVjpResidual<C::Value>,
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].scatter(&self.indices().residual_value()?, &inputs[1], self.operation())?])
-    }
-}
-
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a [`LinearScatterAddOperation`].
-impl<F: Value<Type = ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
-    for LinearScatterAddOperation<F>
-where
-    C::Operation: From<LinearScatterAddOperation<F>>,
-{
-}
-
-/// Transpose rule for the captured-index scatter-add. Because scatter-add accumulates into its operand
-/// (`output = operand + scattered(updates)`, so `∂output/∂operand = I`), the operand cotangent is the output cotangent
-/// unchanged; the update cotangent gathers the output cotangent at the scattered windows via the dual gather built by
-/// mirroring the scatter geometry. That gather needs the operand and update types, so the input count is checked
-/// before the dual gather is derived. Symbolic-zero cotangents propagate unchanged.
-impl<V: Value<Type = ArrayType>, O, F: Value<Type = ArrayType>> TransposableOperation<V, O>
-    for LinearScatterAddOperation<F>
-where
-    O: Operation<ArrayType> + From<LinearGatherOperation<F>>,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let dimensions = self.operation().dimensions();
-        let operand_type = inputs[0].r#type();
-        let updates_type = inputs[1].r#type();
-        let operand_rank = operand_type.rank();
-        let update_window_dimensions = dimensions.update_window_dimensions();
-        let inserted_window_dimensions = dimensions.inserted_window_dimensions();
-        let operand_batching_dimensions = dimensions.operand_batching_dimensions();
-        let mut slice_sizes = Vec::with_capacity(operand_rank);
-        let mut window_position = 0;
-        for operand_axis in 0..operand_rank {
-            if inserted_window_dimensions.contains(&operand_axis) || operand_batching_dimensions.contains(&operand_axis)
-            {
-                slice_sizes.push(1);
-            } else {
-                let update_axis = update_window_dimensions[window_position];
-                let extent = updates_type.dimension(update_axis).value().ok_or_else(|| {
-                    ProgramError::from(TypeError::invalid(format!(
-                        "'{SCATTER_OPERATION_NAME}' transpose requires a static update shape but update axis \
-                             {update_axis} has a dynamic size",
-                    )))
-                })?;
-                slice_sizes.push(extent);
-                window_position += 1;
-            }
-        }
-        let gather_dimensions = GatherDimensionNumbers::new(
-            update_window_dimensions.to_vec(),
-            inserted_window_dimensions.to_vec(),
-            dimensions.scatter_dimensions_to_operand_dimensions().to_vec(),
-        )
-        .with_batching_dimensions(
-            operand_batching_dimensions.to_vec(),
-            dimensions.scatter_indices_batching_dimensions().to_vec(),
-        );
-        let gather_operation = GatherOperation::new(gather_dimensions, slice_sizes)
-            .with_mode(self.operation().mode())
-            .with_indices_are_sorted(self.operation().indices_are_sorted())
-            .with_unique_indices(self.operation().unique_indices())
-            .with_output_sharding(updates_type.sharding().cloned());
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent()),
-                MaybeZero::Zero(inputs[1].r#type().cotangent()),
-            ]),
-            MaybeZero::Value(cotangent) => {
-                let update_cotangents = context.stage_operation(
-                    LinearGatherOperation::new(gather_operation, self.indices().clone()),
-                    Vec::new(),
-                    std::slice::from_ref(cotangent),
-                )?;
-                check_count!("output", update_cotangents, 1, ProgramError);
-                let update_cotangent =
-                    update_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[1].r#type().cotangent())?;
-                Ok(vec![MaybeZero::Value(cotangent.clone()), MaybeZero::Value(update_cotangent)])
-            }
-        }
-    }
 }
 
 /// Value-level scatter capability: the receiver-style entry point for staging or executing [`ScatterOperation`].

@@ -15,21 +15,18 @@ pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOper
 pub use conversion::{
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation, ElementType,
 };
-pub use gathering::{
-    GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode, LinearGatherOperation,
-};
+pub use gathering::{GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode};
 pub use padding::{PAD_OPERATION_NAME, Pad, PadOperation};
 pub use reshaping::{
     LegacyReshapeOperation, RESHAPE_OPERATION_NAME, Reshape, ReshapeDimensionExpression, ReshapeOperation,
     ReshapeParameters, ReshapeTarget,
 };
 pub use scattering::{
-    LinearScatterAddOperation, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation,
-    ScatterReductionKind,
+    SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
 };
 pub use slicing::{
-    DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice, DynamicSliceOperation,
-    DynamicUpdateSlice, DynamicUpdateSliceOperation, LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation,
-    SLICE_OPERATION_NAME, Slice, SliceOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
+    DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicDimensionSliceOperation, DynamicSlice,
+    DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, SLICE_OPERATION_NAME, Slice,
+    SliceOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
 };
 pub use transposition::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation};
