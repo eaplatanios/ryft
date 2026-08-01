@@ -494,6 +494,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
@@ -503,9 +506,10 @@ mod tests {
     };
     use crate::differentiation::DifferentiationError;
     use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
-    use crate::operations::math::MulOperation;
+    use crate::operations::math::{AddOperation, MulOperation};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
+    use crate::programs::ProgramError;
     use crate::programs::atoms::MaybeZero;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::programs::Program;
@@ -515,8 +519,43 @@ mod tests {
 
     use super::*;
 
+    /// Builds the scalar program `(r, u) ↦ r · u` used as a residual-parameterized linear-map region.
+    fn scalar_multiply_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let r#type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let residual = builder.add_input(r#type.clone());
+        let linear = builder.add_input(r#type);
+        let output = builder.add_instruction(MulOperation, Vec::new(), vec![linear, residual]).unwrap()[0];
+        builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap()
+    }
+
     #[test]
-    fn test_linear_call_is_generic_over_a_third_composite_member() {
+    fn test_linear_call_operation() {
+        let r#type = ArrayType::scalar(DataType::F64);
+
+        // The forward-and-transpose form derives its interface from two attached regions.
+        let operation = LinearCallOperation::<ArrayType>::new(1);
+        assert_eq!(operation.residual_count(), 1);
+        assert!(!operation.is_transpose_only());
+        assert_eq!(operation.to_string(), "linear_call [residual_count=1]");
+        assert_eq!(
+            format!("{operation:?}"),
+            "LinearCallOperation { residual_count: 1, interface: ForwardAndTranspose }",
+        );
+
+        // The transpose-only form stores the unavailable forward interface and renders under its distinct name.
+        let operation = LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type]);
+        assert_eq!(operation.residual_count(), 1);
+        assert!(operation.is_transpose_only());
+        assert_eq!(operation.to_string(), "transpose_only_linear_call [residual_count=1]");
+    }
+
+    #[test]
+    fn test_linear_call_operation_supports_a_third_composite_member() {
+        // A third-member residual paired with a first-member linear value proves that the operation and its attached
+        // regions use generic program storage without an array/dimension-specific projection.
         let linear_type = ProjectedProgramType::First(ProjectedMemberType);
         let residual_type = ProjectedProgramType::Third(ProjectedMemberType);
         let forward = {
@@ -558,6 +597,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
+
         let linear = ProjectedProgramValue::First(ProjectedMemberValue(2));
         let residual = ProjectedProgramValue::Third(ProjectedMemberValue(7));
         assert_eq!(program.interpret(vec![residual, linear.clone()]), Ok(vec![linear]));
@@ -565,8 +605,66 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_call_transposition_swaps_the_attached_regions() {
-        /// Exposes the executable carrier's two regions to the transpose rule without entering full reverse mode.
+    fn test_linear_call_operation_transpose_only_form_rejects_forward_execution() {
+        let r#type = ArrayType::scalar(DataType::F64);
+        let transpose = scalar_multiply_program();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(r#type.clone());
+        let linear = builder.add_input(r#type.clone());
+        let output = builder
+            .add_instruction(
+                LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type]),
+                vec![transpose],
+                vec![residual, linear],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        assert!(matches!(
+            program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "a transpose-only linear call has no forward program to execute; it supports only \
+                               reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or \
+                               'jacobian_reverse')",
+        ));
+    }
+
+    #[test]
+    fn test_linear_call_operation_nested_jvp_differentiates_residual_parameters() {
+        let r#type = ArrayType::scalar(DataType::F64);
+        let forward = scalar_multiply_program();
+        let transpose = forward.clone();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(r#type.clone());
+        let linear = builder.add_input(r#type);
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // For `Lᵣ(u) = r · u`, the nested JVP is `(r, u, ṙ, u̇) ↦ (r · u, ṙ · u + r · u̇)`. At
+        // `(r, u, ṙ, u̇) = (2, 3, 5, 7)`, the primal is `6` and the tangent is `5 · 3 + 2 · 7 = 29`.
+        assert_eq!(
+            program.jvp().unwrap().interpret(vec![
+                Array::scalar(2.0),
+                Array::scalar(3.0),
+                Array::scalar(5.0),
+                Array::scalar(7.0),
+            ]),
+            Ok(vec![Array::scalar(6.0), Array::scalar(29.0)]),
+        );
+    }
+
+    #[test]
+    fn test_linear_call_operation_transposition_swaps_the_attached_regions() {
+        /// Exposes an executable linear call's two regions directly to its transposition rule.
         struct TwoRegionDriver<'r> {
             forward: RegionRef<'r, Array, ArrayOperation<Array>>,
             transpose: RegionRef<'r, Array, ArrayOperation<Array>>,
@@ -593,90 +691,69 @@ mod tests {
             }
         }
 
-        // For `Lᵣ(u) = r · u`, transposing the call must stage the *swapped* linear call over
-        // `[residual, output cotangent]` instead of inlining the transpose region's body, so the pullback retains
-        // the linear-call boundary and its residual edge, and transposing twice restores the original call.
         let r#type = ArrayType::scalar(DataType::F64);
-        let region = {
+        let forward = scalar_multiply_program();
+        let transpose = {
+            // Deliberately use a different body from `forward` so the rendered program proves the region order was
+            // swapped instead of merely proving that two indistinguishable regions remain attached.
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let residual = builder.add_input(r#type.clone());
-            let linear = builder.add_input(r#type.clone());
-            let output = builder.add_instruction(MulOperation, Vec::new(), vec![linear, residual]).unwrap()[0];
+            let output_cotangent = builder.add_input(r#type.clone());
+            let input_cotangent =
+                builder.add_instruction(AddOperation, Vec::new(), vec![output_cotangent, residual]).unwrap()[0];
             builder
-                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![input_cotangent], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let transpose_region = region.clone();
-        let driver =
-            TwoRegionDriver { forward: region.entry_region_ref(), transpose: transpose_region.entry_region_ref() };
+        let driver = TwoRegionDriver { forward: forward.entry_region_ref(), transpose: transpose.entry_region_ref() };
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let residual = context.input(r#type.clone());
         let output_cotangent = context.input(r#type.clone());
+
+        // Transposition must assign a structural zero to the known residual and stage one swapped linear call for the
+        // unknown linear input's cotangent.
         let cotangents = LinearCallOperation::new(1)
             .transpose(
                 &mut context,
                 &driver,
-                &[PartialValue::Known(residual), PartialValue::Unknown(r#type.clone())],
+                &[PartialValue::Known(residual), PartialValue::Unknown(r#type)],
                 &[MaybeZero::Value(output_cotangent)],
             )
             .unwrap();
-
-        // The residual receives a structural zero and the linear input receives the staged swapped call's output.
         assert_eq!(cotangents.len(), 2);
         assert!(cotangents[0].is_zero());
-        assert!(matches!(cotangents[1], MaybeZero::Value(_)));
-
-        // The staged pullback contains one swapped linear call whose leading region is the transpose program.
-        let output_atom_id = match &cotangents[1] {
+        let output = match &cotangents[1] {
             MaybeZero::Value(value) => value.atom_id().unwrap(),
-            MaybeZero::Zero(_) => unreachable!(),
+            MaybeZero::Zero(_) => panic!("expected a live linear-input cotangent"),
         };
+
         let builder = context.builder().clone();
         drop((context, cotangents));
-        let builder =
-            std::rc::Rc::try_unwrap(builder).expect("the builder is uniquely owned once every tracer is dropped");
-        let staged = builder
-            .into_inner()
-            .build::<Vec<Array>, Vec<Array>>(vec![output_atom_id], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let rendered = staged.to_string();
-        assert!(rendered.contains("linear_call [residual_count=1]"), "{rendered}");
-        assert_eq!(rendered.matches("= mul").count(), 2, "{rendered}");
-    }
-
-    #[test]
-    fn test_forward_and_transpose_linear_call_nested_jvp_differentiates_residual_parameters() {
-        let r#type = ArrayType::scalar(DataType::F64);
-        let forward = {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let residual = builder.add_input(r#type.clone());
-            let linear = builder.add_input(r#type.clone());
-            let output = builder.add_instruction(MulOperation, Vec::new(), vec![linear, residual]).unwrap()[0];
-            builder
-                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let transpose = forward.clone();
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let forward = builder.import_region(forward.entry_region_ref());
-        let transpose = builder.import_region(transpose.entry_region_ref());
-        let residual = builder.add_input(r#type.clone());
-        let linear = builder.add_input(r#type);
-        let output = builder
-            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear])
-            .unwrap()[0];
+        let builder = Rc::try_unwrap(builder).expect("the builder is uniquely owned once every tracer is dropped");
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .into_inner()
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
         assert_eq!(
-            program.jvp().unwrap().interpret(vec![
-                Array::scalar(2.0),
-                Array::scalar(3.0),
-                Array::scalar(5.0),
-                Array::scalar(7.0),
-            ]),
-            Ok(vec![Array::scalar(6.0), Array::scalar(29.0)]),
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = linear_call [residual_count=1] %0 %1 [
+                    forward={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = add %1 %0
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
         );
     }
 }
