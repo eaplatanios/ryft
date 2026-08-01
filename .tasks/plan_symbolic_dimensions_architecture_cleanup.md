@@ -1696,7 +1696,17 @@ pad, slicing/gathering, reductions, and collectives onto `LinearCallOperation`. 
 boundaries from the P6a review: an executable linear call currently rejects batching (so `vmap` over a linearized
 program containing one reports an exact diagnostic; the principled rule batches both attached regions with
 replicated residual extents), and each migrated rule should move out of the composite enum dispatcher onto its
-payload's module as the sweep's first mechanical step so the dispatcher does not grow by another six inline rules. Generic outer dispatch and the
+payload's module as the sweep's first mechanical step so the dispatcher does not grow by another six inline rules.
+
+The post-review evaluation of `LinearCallOperation` additionally adopted JAX's `linear_call` transposition shape:
+the carrier's operands and both region interfaces are residuals-first (`forward: (r, u) -> v`,
+`transpose: (r, v̄) -> ū`, matching the `custom_vjp` backward convention verbatim), and transposing the executable
+form *swaps* the attached regions into one staged linear call instead of inlining the transpose body. Transposition
+is therefore involutive, pullback programs retain the linear-call boundary and its explicit residual edges, and the
+future batching rule is swap-stable. The swap validates `cotangent(cotangent(u)) = u` for linear operand types at
+staging time, which tangent types satisfy even where primal storage types do not. This deliberately changed the
+staged tangent/pullback program shapes and their exact-IR goldens; the transpose-only `custom_vjp` form still
+replays its user-written backward inline because that program carries no linearity contract of its own. Generic outer dispatch and the
 composite-zero deletion remain subsequent units so each stays independently reviewable.
 
 ### Phase 7: backend execution and lowering

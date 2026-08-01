@@ -33,6 +33,8 @@ use crate::tracing::{Tracer, TracingContext};
 /// cotangents against the closure's input structure. It thus pulls any number of cotangents back through the function's
 /// transposed Jacobian without re-tracing or re-differentiating (e.g., replaying every coordinate basis cotangent to
 /// build a Jacobian row by row), amortizing the cost of differentiating once over many cotangent applications.
+/// The stored program is compact as zero differential input and output leaves are absent. [`apply`](Self::apply)
+/// filters those output cotangent leaves and restores typed zeros in the returned public input structure.
 ///
 /// The context `C` supplies the value semantics and operation family, `Input` is the closure's structured input type,
 /// whose [`ParameterStructure`](Parameterized::ParameterStructure) is retained so that the flat input cotangents
@@ -54,6 +56,14 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     /// when interpreting it.
     residuals: Vec<C::Value>,
 
+    /// Complete public primal input boundary. The executable pullback omits outputs whose derived cotangent type is a
+    /// zero differential space.
+    primal_input_types: Vec<C::Type>,
+
+    /// Complete public primal output boundary. The executable pullback omits inputs whose derived cotangent type is a
+    /// zero differential space.
+    primal_output_types: Vec<C::Type>,
+
     /// Parameter structure of the closure's input, used to reshape the flat input cotangents.
     input_structure: Input::ParameterStructure,
 
@@ -65,18 +75,44 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     marker: PhantomData<fn() -> Output>,
 }
 
-impl<C: Context, Input: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>, Output: Parameterized<C::Value>>
-    Pullback<C, Input, Output>
+impl<
+    C: Context<Type: DifferentiableType>,
+    Input: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>,
+    Output: Parameterized<C::Value>,
+> Pullback<C, Input, Output>
 {
-    /// Creates a new [`Pullback`] closing `program` over the linearization-point `residuals`, validating the contract
-    /// documented on [`Pullback`] where `program` consumes the flat output cotangents followed by `residuals` and
-    /// produces the flat input cotangents that `input_structure` reshapes. Violations are reported as
-    /// [`MalformedProgram`](ProgramError::MalformedProgram) errors: too few program inputs to hold the residuals,
-    /// or a trailing residual input whose type differs from the type of the residual value that feeds it.
+    /// Creates a [`Pullback`] from a compact cotangent [`Program`] and the complete primal boundary from which that
+    /// program was derived. The program has the boundary `(live(ȳ), r) ↦ live(x̄)`. It omits every cotangent input and
+    /// output whose differential space contains only zero. Its boundary therefore cannot recover the omitted leaves'
+    /// positions or types, and the cotangent-type mapping is not generally invertible. `primal_input_types` and
+    /// `primal_output_types` preserve that complete boundary so [`apply`](Self::apply) can validate all public
+    /// cotangent leaves, remove the zero-space inputs before replay, and insert typed zeros at the correct output
+    /// positions afterward.
+    ///
+    /// This function validates the relationship among all three boundaries. In particular, the program must consume one
+    /// leading input for every nonzero cotangent in `primal_output_types`, followed by one input for every residual,
+    /// and must produce one output for every nonzero cotangent in `primal_input_types`. A mismatch is reported as a
+    /// [`MalformedProgram`](ProgramError::MalformedProgram) error.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Context in which [`apply`](Self::apply) interprets or stages the compact pullback program.
+    ///   - `program`: Compact pullback program `(live(ȳ), r) ↦ live(x̄)` whose trailing inputs consume the residual
+    ///     values.
+    ///   - `residuals`: Primal values `r` captured at the linearization point, in the same order as the program's
+    ///     trailing inputs.
+    ///   - `primal_input_types`: Complete flattened input-type boundary of the original primal function, including
+    ///     leaves whose cotangent spaces contain only zero and which are consequently absent from `program` outputs.
+    ///   - `primal_output_types`: Complete flattened output-type boundary of the original primal function, including
+    ///     leaves whose cotangent spaces contain only zero and which are consequently absent from `program` inputs.
+    ///   - `input_structure`: Parameter structure used to rebuild the complete public input cotangent after typed
+    ///     zeros have been inserted for the omitted leaves.
     pub fn new(
         context: C,
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,
+        primal_input_types: Vec<C::Type>,
+        primal_output_types: Vec<C::Type>,
         input_structure: Input::ParameterStructure,
     ) -> Result<Self, ProgramError> {
         let cotangent_input_count = program.input_ids().len().checked_sub(residuals.len()).ok_or_else(|| {
@@ -89,13 +125,39 @@ impl<C: Context, Input: Parameterized<C::Value, Family: ParameterizedFamily<C::V
         for (index, (input, residual)) in program.inputs().skip(cotangent_input_count).zip(&residuals).enumerate() {
             if input.r#type().as_ref() != residual.r#type().as_ref() {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "pullback residual {index} has type {} in the pullback program but carries a value of type {}",
+                    "pullback residual {} has type {} in the pullback program but carries a value of type {}",
+                    index,
                     input.r#type(),
                     residual.r#type(),
                 )));
             }
         }
-        Ok(Self { context, program, residuals, input_structure, marker: PhantomData })
+        let live_output_count = primal_output_types.iter().filter(|r#type| !r#type.cotangent().is_zero_space()).count();
+        if live_output_count != cotangent_input_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "pullback program consumes {} cotangent inputs but its public boundary has {} \
+                nonzero differential outputs",
+                cotangent_input_count, live_output_count,
+            )));
+        }
+        let live_input_count = primal_input_types.iter().filter(|r#type| !r#type.cotangent().is_zero_space()).count();
+        if live_input_count != program.output_ids().len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "pullback program produces {} cotangent outputs but its public boundary has {} nonzero differential \
+                 inputs",
+                program.output_ids().len(),
+                live_input_count,
+            )));
+        }
+        Ok(Self {
+            context,
+            program,
+            residuals,
+            primal_input_types,
+            primal_output_types,
+            input_structure,
+            marker: PhantomData,
+        })
     }
 
     /// Returns the pullback [`Program`] `(ȳ, r) ↦ x̄` that this callable closes over. Its inputs are the flat output
@@ -112,8 +174,11 @@ impl<C: Context, Input: Parameterized<C::Value, Family: ParameterizedFamily<C::V
         &self.residuals
     }
 
-    /// Consumes this [`Pullback`] and returns its open parts: the pullback program `(ȳ, r) ↦ x̄` and the
-    /// linearization-point residuals `r` its trailing inputs consume, in that order.
+    /// Consumes this [`Pullback`] and returns its open parts (i.e., the compact pullback program
+    /// `(live(ȳ), r) ↦ live(x̄)` and the linearization-point residuals `r` its trailing inputs consume, in that order).
+    /// Unlike [`apply`](Self::apply), the returned program does not insert typed-zero values for public cotangent
+    /// leaves omitted from its Single Static Assignment (SSA) boundary because their differential spaces contain only
+    /// zero.
     #[inline]
     pub fn into_parts(self) -> (Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<C::Value>) {
         (self.program, self.residuals)
@@ -126,11 +191,71 @@ impl<C: Context, Input: Parameterized<C::Value, Family: ParameterizedFamily<C::V
     /// enclosing trace and returns tracers), and the flat input cotangents are reshaped against the closure's input
     /// structure.
     #[inline]
-    pub fn apply(&self, cotangents: Output::To<C::Value>) -> Result<Input::To<C::Value>, ProgramError> {
-        let mut inputs = cotangents.into_parameters().collect::<Vec<_>>();
-        inputs.extend(self.residuals.iter().cloned());
-        let input_cotangents = self.program.interpret_in_context(&self.context, inputs)?;
-        Ok(Input::To::<C::Value>::from_parameters(self.input_structure.clone(), input_cotangents)?)
+    pub fn apply(&self, cotangents: Output::To<C::Value>) -> Result<Input::To<C::Value>, ProgramError>
+    where
+        C: Zero<C::Value>,
+    {
+        // Flatten the caller's structured cotangent tree and first validate it against the complete primal output
+        // boundary, including the leaves whose differential spaces contain only zero.
+        let public_cotangents = cotangents.into_parameters().collect::<Vec<_>>();
+        if public_cotangents.len() != self.primal_output_types.len() {
+            return Err(ProgramError::InvalidInputCount {
+                expected: self.primal_output_types.len(),
+                actual: public_cotangents.len(),
+            });
+        }
+
+        // Validate every public cotangent against the cotangent type derived from its primal output leaf. Forward
+        // only the information-carrying values because the compact program has no SSA input for a zero differential
+        // space.
+        let mut program_inputs = Vec::new();
+        for (index, (value, primal_type)) in public_cotangents.into_iter().zip(&self.primal_output_types).enumerate() {
+            let cotangent_type = primal_type.cotangent();
+            if value.r#type().as_ref() != &cotangent_type {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pullback cotangent {index} has type {} but its primal boundary requires cotangent type \
+                     {cotangent_type}",
+                    value.r#type(),
+                )));
+            }
+            if !cotangent_type.is_zero_space() {
+                program_inputs.push(value);
+            }
+        }
+
+        // Close the compact cotangent boundary over the primal residuals and replay it in the originating context.
+        program_inputs.extend(self.residuals.iter().cloned());
+        let mut input_cotangents = self.program.interpret_in_context(&self.context, program_inputs)?.into_iter();
+
+        // Reconstruct the complete flattened public input boundary. Consume one program result for each nonzero
+        // cotangent space and materialize the uniquely determined typed zero for every omitted zero-space leaf.
+        let cotangents = self
+            .primal_input_types
+            .iter()
+            .map(|r#type| {
+                let cotangent_type = r#type.cotangent();
+                if cotangent_type.is_zero_space() {
+                    self.context.zero(&cotangent_type)
+                } else {
+                    input_cotangents.next().ok_or_else(|| {
+                        ProgramError::MalformedProgram(
+                            "pullback program omitted a nonzero differential input".to_string(),
+                        )
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Construction validated the expected output count; reject a malformed replay rather than silently dropping
+        // an unexpected compact-program result.
+        if input_cotangents.next().is_some() {
+            return Err(ProgramError::MalformedProgram(
+                "pullback program produced more nonzero differential inputs than its public boundary".to_string(),
+            ));
+        }
+
+        // Restore the closure's original structured input shape after rebuilding every flattened cotangent leaf.
+        Ok(Input::To::<C::Value>::from_parameters(self.input_structure.clone(), cotangents)?)
     }
 }
 
@@ -861,6 +986,7 @@ macro_rules! define_value_and_gradient_function_in_trait {
             primals: Input,
         ) -> Result<$result, DifferentiationError>
         where
+            Self: Zero<Self::Value>,
             Self::Operation: From<OneOperation<Self::Type>>,
         {
             let ($output, $gradient) = value_and_gradient_in_context(self, function, primals, $holomorphic)?;
@@ -947,6 +1073,8 @@ pub trait ReverseModeDifferentiate:
     ) -> Result<(Output::To<Self::Value>, Pullback<Self, Input, Output::To<Self::Value>>), DifferentiationError> {
         let input_structure = primals.parameter_structure();
         let (output, pushforward) = self.linearize(function, primals)?;
+        let input_types = pushforward.primal_input_types().to_vec();
+        let output_types = pushforward.primal_output_types().to_vec();
         let (program, residuals) = pushforward.into_parts();
 
         // Transpose the pushforward program with respect to its leading tangent inputs, holding the trailing residual
@@ -963,7 +1091,7 @@ pub trait ReverseModeDifferentiate:
 
         let with_respect_to = (0..tangent_input_count).collect::<Vec<_>>();
         let program = program.transpose_with_respect_to(with_respect_to.as_slice())?;
-        Ok((output, Pullback::new(self.clone(), program, residuals, input_structure)?))
+        Ok((output, Pullback::new(self.clone(), program, residuals, input_types, output_types, input_structure)?))
     }
 
     define_value_and_gradient_function_in_trait!(
@@ -1161,7 +1289,7 @@ macro_rules! define_value_and_gradient_function {
         pub fn $function_name<
             V: Value<
                     Type: DifferentiableType,
-                    ExecutionDomain: ReverseModeDifferentiate<Operation: From<OneOperation<V::Type>>>,
+                    ExecutionDomain: ReverseModeDifferentiate<Operation: From<OneOperation<V::Type>>> + Zero<V>,
                 >,
             F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
             Input: Parameterized<
@@ -1338,7 +1466,7 @@ fn value_and_gradient_in_context<C, F, Input, Output>(
     holomorphic: bool,
 ) -> Result<(C::Value, Input::To<C::Value>), DifferentiationError>
 where
-    C: ReverseModeDifferentiate,
+    C: ReverseModeDifferentiate + Zero<C::Value>,
     C::Operation: From<OneOperation<C::Type>>,
     F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
     Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
@@ -1379,22 +1507,15 @@ where
     (LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>):
         Parameterized<LinearizationTracer<C>, To<C::Value> = (C::Value, Aux), Family: ParameterizedFamily<C::Value>>,
 {
-    let input_structure = primals.parameter_structure();
     let ((output, auxiliary), pullback): ((C::Value, Aux), _) =
         context.vjp(|input| function(input).into_result().map_err(ProgramError::from), primals)?;
-    let (pullback, residuals) = pullback.into_parts();
-
-    // The flat pullback consumes `[output_cotangents ++ residuals]`. The traced output flattens as the scalar output
-    // followed by the auxiliary leaves, so seed the scalar with one and every auxiliary leaf with zero before appending
-    // the linearization-point residuals.
-    let mut pullback_inputs = vec![context.gradient_seed(&output, holomorphic)?];
-    for value in Parameterized::<C::Value>::parameters(&auxiliary) {
-        pullback_inputs.push(context.zero(&value.r#type().cotangent())?);
-    }
-    pullback_inputs.extend(residuals);
-
-    let input_cotangents = pullback.interpret_in_context(context, pullback_inputs)?;
-    let gradient = Input::To::<C::Value>::from_parameters(input_structure, input_cotangents)?;
+    let auxiliary_structure = auxiliary.parameter_structure();
+    let auxiliary_cotangents = auxiliary
+        .parameters()
+        .map(|value| context.zero(&value.r#type().cotangent()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let auxiliary_cotangents = Aux::To::<C::Value>::from_parameters(auxiliary_structure, auxiliary_cotangents)?;
+    let gradient = pullback.apply((context.gradient_seed(&output, holomorphic)?, auxiliary_cotangents))?;
     Ok(((output, auxiliary), gradient))
 }
 
@@ -2155,6 +2276,11 @@ mod tests {
             .unwrap();
         assert_eq!(value, Scalar::Token);
         assert_eq!(pullback.apply(Scalar::Zero), Ok(Scalar::Zero));
+        assert!(matches!(
+            pullback.apply(Scalar::Token),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "pullback cotangent 0 has type token but its primal boundary requires cotangent type zero",
+        ));
 
         // Under an active trace, the free `vjp` recovers the staging context from its tracer input instead, so the
         // primal work and the pullback replay both stage into the enclosing trace.
