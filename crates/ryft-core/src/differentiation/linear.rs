@@ -28,17 +28,17 @@ enum LinearCallInterface<T: DifferentiableType> {
     /// Executable linear map. Both the map and its transpose have attached regions (i.e., `forward` followed by
     /// `transpose`), and the complete operation interface is derived from the `forward` [`Region`](crate::Region)'s
     /// boundary, so no [`Type`](crate::Type)s are stored.
-    Executable,
+    ForwardAndTranspose,
 
-    /// Reverse-only linear map staged for [`CustomVjpOperation`](crate::CustomVjpOperation). Exactly one region is
-    /// attached (i.e., the `transpose` region, which is the user's `backward` program) because `custom_vjp` supplies
-    /// a custom backward pass but no executable tangent program. The forward map `u ↦ Lᵣ(u)` therefore exists
-    /// mathematically but has no region boundary to derive the operation interface from, so its input and output types
-    /// are stored here explicitly. Interpreting this form is deliberately an error (i.e., the canonical reverse-only
-    /// diagnostic). The call exists in a linearized program only so that reverse mode can transpose it by replaying the
-    /// attached [`Region`](crate::Region). Refer to the documentation of [`LinearCallOperation`]'s for how this
-    /// [`LinearCallInterface`] relates to [`Self::Executable`].
-    Opaque {
+    /// Reverse-only linear map that supplies a transpose program but no executable forward program, so exactly one
+    /// region is attached, named `transpose`. The forward map `u ↦ Lᵣ(u)` therefore exists mathematically but has
+    /// no region boundary to derive the operation interface from, and its input and output types are stored here
+    /// explicitly. Interpreting this form is deliberately an error (i.e., the canonical reverse-only diagnostic).
+    /// The call exists in a linearized program only so that reverse mode can transpose it by replaying the attached
+    /// [`Region`](crate::Region). For example, [`CustomVjpOperation`](crate::CustomVjpOperation) stages this form
+    /// because `custom_vjp` supplies a user-written backward program without a tangent program. Refer to the
+    /// documentation of [`LinearCallOperation`] for how this form relates to [`Self::ForwardAndTranspose`].
+    TransposeOnly {
         /// Input [`Type`](crate::Type)s of the unavailable forward map (one per linear operand).
         input_types: Vec<T>,
 
@@ -77,33 +77,34 @@ enum LinearCallInterface<T: DifferentiableType> {
 /// reshape regions to one [`LinearCallOperation`]. Other shape-dependent linear rules can use the same mechanism; the
 /// operation itself has no array- or dimension-specific semantics.
 ///
-/// The _executable_ form of this operation derives its complete interface from attached `forward` and `transpose`
-/// [`Region`](crate::Region)s and can be interpreted, lowered, transposed, and differentiated again. The _opaque_
-/// form is the deliberate exception: `custom_vjp` supplies only a reverse rule, so it stores the unavailable forward
-/// input/output types and attaches only the transpose region. Attempting to execute or differentiate that reverse-only
-/// map in forward mode is an error.
+/// The _forward-and-transpose_ form of this operation derives its complete interface from attached `forward` and
+/// `transpose` [`Region`](crate::Region)s and can be interpreted, lowered, transposed, and differentiated again. The
+/// _transpose-only_ form is the deliberate exception for linear maps that supply only a reverse rule: it stores the
+/// unavailable forward input/output types and attaches only the transpose region, so attempting to execute or
+/// differentiate it in forward mode is an error (e.g., [`CustomVjpOperation`](crate::CustomVjpOperation) stages
+/// this form because it supplies a backward program without a tangent program).
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinearCallOperation<T: DifferentiableType> {
     /// Number of trailing residual operands.
     residual_count: usize,
 
-    /// Specifies whether this call has an executable forward program or represents an opaque custom
-    /// Vector-Jacobian Product (VJP) tangent map.
+    /// Specifies whether this call has an executable forward program or is a reverse-only transpose-only map.
     interface: LinearCallInterface<T>,
 }
 
 impl<T: DifferentiableType> LinearCallOperation<T> {
-    /// Creates an _executable_ [`LinearCallOperation`] with two attached regions, `forward` and `transpose`.
+    /// Creates a _forward-and-transpose_ [`LinearCallOperation`] with two attached regions,
+    /// `forward` and `transpose`.
     #[inline]
     pub fn new(residual_count: usize) -> Self {
-        Self { residual_count, interface: LinearCallInterface::Executable }
+        Self { residual_count, interface: LinearCallInterface::ForwardAndTranspose }
     }
 
-    /// Creates a reverse-only _opaque_ [`LinearCallOperation`] intended to be used by the custom
-    /// Vector-Jacobian Product (VJP) operation.
+    /// Creates a reverse-only _transpose-only_ [`LinearCallOperation`] for a linear map that supplies a transpose
+    /// program but no executable forward program, stating the unavailable forward map's interface explicitly.
     #[inline]
-    pub fn opaque(residual_count: usize, input_types: Vec<T>, output_types: Vec<T>) -> Self {
-        Self { residual_count, interface: LinearCallInterface::Opaque { input_types, output_types } }
+    pub fn transpose_only(residual_count: usize, input_types: Vec<T>, output_types: Vec<T>) -> Self {
+        Self { residual_count, interface: LinearCallInterface::TransposeOnly { input_types, output_types } }
     }
 
     /// Returns the number of trailing residual operands.
@@ -112,10 +113,11 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         self.residual_count
     }
 
-    /// Returns `true` if this call has an executable forward [`Region`](crate::Region).
+    /// Returns `true` if this call has the _transpose-only_ form, which attaches no executable forward
+    /// [`Region`](crate::Region).
     #[inline]
-    pub fn is_executable(&self) -> bool {
-        matches!(self.interface, LinearCallInterface::Executable)
+    pub fn is_transpose_only(&self) -> bool {
+        matches!(self.interface, LinearCallInterface::TransposeOnly { .. })
     }
 
     /// Splits the provided `input_types` into its leading linear types and trailing residual types.
@@ -130,8 +132,6 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: DifferentiableType> Display for LinearCallOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -139,18 +139,22 @@ impl<T: DifferentiableType> Display for LinearCallOperation<T> {
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
-        if self.is_executable() { "linear_call" } else { "custom_vjp_tangent" }
+        // The two forms render under distinct names so rendered programs and the diagnostics built from this name
+        // distinguish a reverse-only call from an executable one without inspecting region counts.
+        if self.is_transpose_only() { "transpose_only_linear_call" } else { "linear_call" }
     }
 
     #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
-        if self.is_executable() {
-            const { &[RegionSlot::rule("forward"), RegionSlot::rule("transpose")] }
-        } else {
+        if self.is_transpose_only() {
             const { &[RegionSlot::rule("transpose")] }
+        } else {
+            const { &[RegionSlot::rule("forward"), RegionSlot::rule("transpose")] }
         }
     }
 
@@ -160,7 +164,7 @@ impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
         match &self.interface {
-            LinearCallInterface::Executable => {
+            LinearCallInterface::ForwardAndTranspose => {
                 check_count!("region", region_interfaces, 2, TypeError);
                 let forward = &region_interfaces[0];
                 let renaming = T::derive_identity_renaming(forward.input_types(), input_types)?;
@@ -177,7 +181,7 @@ impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
                     .collect();
                 Ok(vec![Some(input_types.to_vec()), Some(transpose_input_types)])
             }
-            LinearCallInterface::Opaque { output_types, .. } => {
+            LinearCallInterface::TransposeOnly { output_types, .. } => {
                 check_count!("region", region_interfaces, 1, TypeError);
                 let (_, residual_types) = self.split_inputs(input_types)?;
                 Ok(vec![Some(
@@ -197,7 +201,7 @@ impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         match &self.interface {
-            LinearCallInterface::Executable => {
+            LinearCallInterface::ForwardAndTranspose => {
                 check_count!("region", region_interfaces, 2, TypeError);
                 let forward = &region_interfaces[0];
                 let transpose = &region_interfaces[1];
@@ -220,11 +224,11 @@ impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
                 ]);
                 Ok(forward.output_types().to_vec())
             }
-            LinearCallInterface::Opaque { input_types: linear_types, output_types } => {
+            LinearCallInterface::TransposeOnly { input_types: linear_types, output_types } => {
                 check_count!("region", region_interfaces, 1, TypeError);
                 let transpose = &region_interfaces[0];
                 let (actual_linear_types, residual_types) = self.split_inputs(input_types)?;
-                check_types!(@same, "opaque linear call input", [linear_types, actual_linear_types]);
+                check_types!(@same, "transpose-only linear call input", [linear_types, actual_linear_types]);
                 let expected_transpose_inputs = residual_types
                     .iter()
                     .cloned()
@@ -232,11 +236,11 @@ impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
                     .collect::<Vec<_>>();
                 let expected_transpose_outputs =
                     linear_types.iter().map(DifferentiableType::cotangent).collect::<Vec<_>>();
-                check_types!(@same, "opaque linear call transpose input", [
+                check_types!(@same, "transpose-only linear call transpose input", [
                     &expected_transpose_inputs,
                     transpose.input_types(),
                 ]);
-                check_types!(@same, "opaque linear call transpose output", [
+                check_types!(@same, "transpose-only linear call transpose output", [
                     &expected_transpose_outputs,
                     transpose.output_types(),
                 ]);
@@ -249,18 +253,19 @@ impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
         Ok(Self {
             residual_count: self.residual_count,
             interface: match &self.interface {
-                LinearCallInterface::Executable => LinearCallInterface::Executable,
-                LinearCallInterface::Opaque { input_types, output_types } => LinearCallInterface::Opaque {
-                    input_types: input_types.iter().map(|r#type| r#type.rename_identities(renaming)).collect::<Result<
-                        Vec<_>,
-                        _,
-                    >>(
-                    )?,
-                    output_types: output_types
-                        .iter()
-                        .map(|r#type| r#type.rename_identities(renaming))
-                        .collect::<Result<Vec<_>, _>>()?,
-                },
+                LinearCallInterface::ForwardAndTranspose => LinearCallInterface::ForwardAndTranspose,
+                LinearCallInterface::TransposeOnly { input_types, output_types } => {
+                    LinearCallInterface::TransposeOnly {
+                        input_types: input_types
+                            .iter()
+                            .map(|r#type| r#type.rename_identities(renaming))
+                            .collect::<Result<Vec<_>, _>>()?,
+                        output_types: output_types
+                            .iter()
+                            .map(|r#type| r#type.rename_identities(renaming))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    }
+                }
             },
         })
     }
@@ -273,10 +278,10 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCa
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        if !self.is_executable() {
+        if self.is_transpose_only() {
             return Err(TypeError::invalid(
-                "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                 value_and_gradient, or jacobian_reverse) instead",
+                "a transpose-only linear call has no forward program to execute; it supports only reverse-mode \
+                 differentiation (e.g., vjp, value_and_gradient, or jacobian_reverse)",
             )
             .into());
         }
@@ -316,9 +321,10 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if !self.is_executable() {
+        if self.is_transpose_only() {
             return Err(ProgramError::UnsupportedOperation {
-                message: "custom_vjp_tangent has no forward-mode (jvp) rule; custom_vjp is reverse-mode-only"
+                message: "a transpose-only linear call has no forward-mode (jvp) rule; it supports only \
+                          reverse-mode differentiation"
                     .to_string(),
             }
             .into());
@@ -398,9 +404,9 @@ where
         if outputs.iter().all(MaybeZero::is_zero) {
             return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
         }
-        // The transpose region follows the executable form's leading forward region (index 1) and is the opaque
-        // form's only region (index 0).
-        let transpose = driver.region(usize::from(self.is_executable()))?;
+        // The transpose region follows the forward-and-transpose form's leading forward region (index 1) and is
+        // the transpose-only form's only region (index 0).
+        let transpose = driver.region(if self.is_transpose_only() { 0 } else { 1 })?;
         let mut transpose_inputs = residuals;
         transpose_inputs
             .extend(outputs.iter().cloned().map(|output| output.materialize(context)).collect::<Result<Vec<_>, _>>()?);
