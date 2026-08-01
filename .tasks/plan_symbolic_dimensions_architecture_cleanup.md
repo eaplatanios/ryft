@@ -1480,10 +1480,62 @@ rename only part of the problem while introducing another carrier.
       result extent and implement matching/different-axis batching directly without delegating to homogeneous rules.
       Homogeneous control-flow and collective rules remain only for the still-public reference array domain, with
       Phase 6 and Phase 8/9 deletion owners recorded in `.tasks/plan_p5d_batching_rule_consolidation.md`.
-- [x] Gate: after P5d, no semantic contract has independently maintained duplicate rules. The policy-generic
-      elementwise rule is shared infrastructure; homogeneous and explicit-extent collective rules serve distinct
-      contracts; every residual homogeneous control-flow consumer has an owner. The final production and test deltas
-      against the P5a and P5c baselines are recorded in `.tasks/plan_p5d_batching_rule_consolidation.md`.
+- [x] P5d provisional gate: the policy-generic elementwise rule is shared infrastructure and every residual
+      homogeneous control-flow consumer has an owner. P5d originally treated homogeneous implicit extents and
+      composite explicit extents as different collective contracts; the follow-up audit found that this criterion was
+      too weak because both implementations repeat the same axis choreography. P5e supersedes that part of this gate.
+- [ ] P5e — execute `.tasks/plan_p5e_extent_polymorphic_collective_batching.md` immediately after P5d and before
+      Phase 6. Preserve both `ArrayOperation` and `ArrayProgramOperation`, but make each collective's batching
+      semantics one extent-polymorphic algorithm reached through thin implicit-extent and explicit-extent adapters.
+      Do not introduce a whole-program promotion pass, a parallel batching context/tracer, or another operation
+      family.
+- [ ] Freeze committed P5d revision `ef42b00aa` as P5e's comparison boundary: its six changed Rust files contain 1,417
+      insertions and 272 deletions relative to committed P5c, split into a net 765 production lines and 380 test lines;
+      warm `ryft-core` check time is 2.54 seconds; the core/XLA/macro gates pass 1,033, 405 plus one ignored, and two
+      groups of 17 tests respectively. Re-measure the same file set and commands after every prototype.
+- [ ] Make Ryft's fallible arithmetic capabilities provider-aware where the prototype requires it. `Mul::mul`,
+      `Div::div`, and any analogous capability used by the shared rule must select the operation declared by
+      `MulOperationFor`, `DivOperationFor`, and the corresponding provider rather than hard-coding the array
+      operation. `DimensionType` must continue selecting checked dimension operations. Add direct checked host-extent
+      implementations where coherence permits; do not add `multiply_extents`, `divide_extents`, or a parallel extent
+      arithmetic trait that restates Ryft's existing fallible capabilities.
+- [ ] Keep `ArrayBatchingPolicy` limited to representation boundaries: obtaining an arithmetic extent view when the
+      public boundary extent is a composite value, creating exact constants in the owning domain, materializing
+      reshape/broadcast/alignment with explicit extents, and staging requirements that cannot use the existing
+      `DimensionRequirement` capability directly. First test whether `BatchingPolicy::Extent` can serve as the
+      arithmetic extent unchanged; introduce at most one associated projected extent type only if the composite
+      value's `ArrayProgramType` wrapper makes that impossible. Do not put collective formulas or per-operation axis
+      decisions on the policy.
+- [ ] Prototype all-gather end to end before touching the other collective rules. Its one shared matching-axis kernel
+      must be generic over the policy's fallible extent operations and materialization hooks. The homogeneous adapter
+      derives its complete logical result extents from `ArrayType`; the composite adapter validates and projects the
+      explicit dimension operands. Non-matching-axis forwarding may retain two small encoding adapters, but the move,
+      merge, reshape, variance, group, sharding, and diagnostic decisions must exist once.
+- [ ] Gate the prototype on lower production lines than the P5d all-gather implementation, no new source-array extent
+      reconstruction, no worse diagnostics, stable trait solving, and unchanged static/dynamic/nested behavior. If
+      the prototype needs pervasive wrappers, duplicated bounds, or operation-specific policy methods, stop and
+      redesign rather than applying it to sum-scatter and all-to-all.
+- [ ] Apply the accepted pattern to sum-scatter and all-to-all. Share their reduction/split/swap/merge choreography,
+      checked multiplication, exact division plus divisibility requirement, output-axis placement, and output
+      sharding once across both operation families. Preserve tiled and untiled modes, matching and different named
+      axes, replicated and mapped operands, bounded-dynamic extents, and the exact group/variance rejection policy.
+- [ ] Delete the superseded composite-only collective arithmetic, reshape, alignment, and matching-axis helpers and
+      every independently maintained homogeneous/composite algorithm body. Retain only helpers that encode one
+      genuinely shared policy boundary or are reused by non-collective operations. Run a source ledger showing the
+      single owner of each collective's semantic decisions and every remaining family-specific adapter.
+- [ ] Audit the dimension-specific arithmetic capability aliases after the provider-aware fallible traits work. Delete
+      `DimensionMul`, `DimensionDivFloor`, or analogous capability traits only when the corresponding Ryft `Mul`,
+      `Div`, or other fallible trait has identical checked semantics, diagnostics, bounds inference, eager behavior,
+      and staging coverage. Keep distinct operations such as saturating subtraction and requirement effects when no
+      generic arithmetic capability expresses their semantics.
+- [ ] Re-run the complete P5d matrix: static and bounded-dynamic tiled/untiled collective batching, replicated and
+      mapped inputs, matching and different named axes, nested `vmap`, rendering/import, PE/JVP, exact diagnostics,
+      StableHLO lowering, CPU multi-device execution, full `ryft-core`, full `ryft-xla`, macro integration, formatting,
+      diff hygiene, and the source gates for no `dimension_size` reconstruction inside collective batching.
+- [ ] P5e gate: the final tree supports both operation families with one collective batching algorithm per operation;
+      introduces no redundant extent algebra; has a strictly negative production-line delta relative to the verified
+      P5d boundary; and does not regress warm check time by more than 10% without an explained, measured reason. Record
+      the exact deletion ledger and measurements before Phase 6 begins.
 - [x] Gate: adding an array-only primitive with a standard batching rule requires no handwritten change in composite
       batching dispatch.
 
@@ -1514,12 +1566,12 @@ Structural region batching carries the mapped extent explicitly as dimension SSA
 region projection, source-array extent reconstruction, host concretization, parallel context/tracer, or XLA-local
 copy of the batching semantics.
 
-P5d corrected the earlier deletion premise after auditing the actual contracts. The elementwise blanket is already
-one shared algorithm reached through typed projection. Homogeneous control-flow remains required by the public
-reference execution domain, while the mixed threaded-extent rules have a genuinely different boundary. Homogeneous
-collectives likewise remain reference implementations, but composite collectives now own complete explicit result
-extents and no longer delegate their algorithms. The exact residual owners and measured line-count result are in
-`.tasks/plan_p5d_batching_rule_consolidation.md`.
+P5d completed the missing explicit-extent collective capability and correctly established that the elementwise
+blanket is already one shared algorithm reached through typed projection. Its follow-up audit found that retaining
+homogeneous and composite collective batching as independently maintained algorithms was not an acceptable cleanup:
+although their operand encodings differ, they repeat the same axis choreography and produced a net 765-line
+production increase. `.tasks/plan_p5d_batching_rule_consolidation.md` remains the capability baseline and records the
+consumer ledger; P5e supersedes its contract-based duplication exception.
 
 P5c and P5d are complete. Structural batching selects direct and composite threaded-extent boundary types through
 `BatchingPolicy`, making the distinction static and deleting the interim runtime boundary enum. Condition, while, and
@@ -1529,6 +1581,11 @@ mapped-state RNG batching now decomposes to one state-carry-free composite scan 
 replicated-state diagnostic. P5d canonicalizes unprojected control-flow carriers, completes direct explicit-extent
 collective batching for static and bounded-dynamic graphs, and records the retained reference-domain rules and their
 deletion owners. The full `ryft-core`, `ryft-xla`, and macro integration suites pass.
+
+P5e is the immediate next review unit. It keeps both operation families while finishing the purpose of
+`ArrayBatchingPolicy`: one rule operates over static host extents or projected first-class dimension extents through
+Ryft's existing fallible arithmetic traits, and each universe owns only its representation adapter. Phase 6 must not
+begin until the P5e deletion, line-count, compile-time, and full-parity gates pass.
 
 ### Phase 6: simplify differentiation and transposition
 
