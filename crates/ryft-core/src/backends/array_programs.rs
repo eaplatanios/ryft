@@ -1517,20 +1517,22 @@ where
                             }
                         }
 
-                        // The forward region is the ordinary tangent reshape. Its trailing input extents are unused
-                        // here but share one deterministic residual boundary with the transpose region.
-                        let mut forward_input_types = Vec::with_capacity(1 + residual_values.len());
+                        // The forward region is the ordinary tangent reshape over the canonical residuals-first
+                        // boundary `[residuals..., tangent]`. The input-extent residuals are unused here but share
+                        // one deterministic residual boundary with the transpose region.
+                        let mut forward_input_types =
+                            residual_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
                         forward_input_types.push(array_tangent.r#type().into_owned());
-                        forward_input_types.extend(residual_values.iter().map(|value| value.r#type().into_owned()));
                         let output_extent_count = output_extents.len();
                         let forward_operation = operation.clone();
                         let (_, forward) = NestedTracingContext::trace(
                             context.clone(),
                             move |region_inputs| {
+                                let tangent = region_inputs.last().unwrap().clone();
                                 let mut reshape_inputs = Vec::with_capacity(1 + output_extent_count);
-                                reshape_inputs.push(region_inputs[0].clone());
-                                reshape_inputs.extend(region_inputs[1..=output_extent_count].iter().cloned());
-                                region_inputs[0].dispatch_domain().bind(
+                                reshape_inputs.push(tangent.clone());
+                                reshape_inputs.extend(region_inputs[..output_extent_count].iter().cloned());
+                                tangent.dispatch_domain().bind(
                                     ArrayProgramOperation::<A>::from(forward_operation),
                                     Vec::new(),
                                     reshape_inputs.as_slice(),
@@ -1626,16 +1628,15 @@ where
                             transpose_input_types,
                         )?;
 
-                        let mut linear_inputs = Vec::with_capacity(1 + residual_values.len());
-                        linear_inputs.push(array_tangent.clone());
-                        linear_inputs.extend(residual_values);
-                        let carrier = LinearCallOperation::new(linear_inputs.len() - 1);
+                        let carrier = LinearCallOperation::new(residual_values.len());
+                        let mut carrier_inputs = residual_values;
+                        carrier_inputs.push(array_tangent.clone());
                         MaybeZero::Value(
                             context
                                 .bind(
                                     ArrayProgramOperation::<A>::from(carrier),
                                     vec![forward, transpose],
-                                    linear_inputs.as_slice(),
+                                    carrier_inputs.as_slice(),
                                 )?
                                 .remove(0),
                         )
@@ -1763,6 +1764,7 @@ impl<
     O: Operation<ArrayProgramType>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + From<ArrayProgramOperation<A>>
+        + From<LinearCallOperation<ArrayProgramType>>
         + From<ZeroOperation<ArrayProgramType>>,
 > TransposableOperation<V, O> for ArrayProgramOperation<A>
 where
@@ -4239,11 +4241,11 @@ in (%4, %3, %5)
             "
 lambda %0:f64[source, 4], %1:dimension<source * 2 ∈ [0, 17)>, %2:dimension<source ∈ [0, 9)> .
 let %3:dimension<2> = const
-    %4:f64[2, source * 2] = linear_call %0 %3 %1 %2 [
+    %4:f64[2, source * 2] = linear_call [residual_count=3] %3 %1 %2 %0 [
         forward={
-            lambda %0:f64[source, 4], %1:dimension<2>, %2:dimension<source * 2 ∈ [0, 17)>, \
-%3:dimension<source ∈ [0, 9)> .
-            let %4:f64[2, source * 2] = reshape %0 %1 %2
+            lambda %0:dimension<2>, %1:dimension<source * 2 ∈ [0, 17)>, %2:dimension<source ∈ [0, 9)>, \
+%3:f64[source, 4] .
+            let %4:f64[2, source * 2] = reshape %3 %0 %1
             in (%4)
         },
         transpose={
