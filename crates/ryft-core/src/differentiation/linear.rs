@@ -1,10 +1,11 @@
 use std::fmt::Display;
 
+use crate::axes::Axis;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    ProgramBatchingOutputAxesPolicy,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
 };
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationError;
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
 use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
@@ -13,7 +14,6 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::math::{Reduce, ReduceOperation, ReductionKind};
-use crate::parameters::Placeholder;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
@@ -22,7 +22,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionSlot};
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 use crate::types::ArrayType;
 
 /// Interface form implemented by a [`LinearCallOperation`].
@@ -143,6 +143,200 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
             )));
         }
         Ok(input_types.split_at(self.residual_count))
+    }
+
+    /// Stages one executable residual-parameterized linear map. It traces its two attached [`Region`](crate::Region)s
+    /// and binds the resulting _forward-and-transpose_ [`LinearCallOperation`] in `context`. This is a canonical
+    /// constructor rather than a separate binding path as the final step is still an ordinary [`Context::bind`], and
+    /// everything before it only constructs the operation's two region programs. It exists because every producer of an
+    /// [`LinearCallInterface::ForwardAndTranspose`] linear call must uphold the same boundary convention, which is easy
+    /// to get subtly wrong at any one of many call sites:
+    ///
+    ///   - the operands are ordered as `[residuals..., linear_inputs...]`,
+    ///   - the `forward` region receives the same values in the same order,
+    ///   - the `transpose` region receives the same residuals followed by one cotangent-typed input
+    ///     per traced forward output, and
+    ///   - the operation carries its regions in `[forward, transpose]` order, with
+    ///     [`residual_count`](Self::residual_count) separating the two operand roles.
+    ///
+    /// Callers therefore provide only the operation-specific mathematics of the two maps, as closures over tracers that
+    /// are already split into their residual and linear/cotangent groups.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`Context`] in which the linear call is staged.
+    ///   - `residuals`: Fixed primal values parameterizing both regions.
+    ///   - `linear_inputs`: Tangent values to which the forward linear map is applied.
+    ///   - `forward`: Function that builds the forward map `v = Lᵣ(u)` from `(residuals, linear_inputs)`.
+    ///   - `transpose`: Function that builds the transpose map `ū = Lᵣᵀ(v̄)` from `(residuals, output_cotangents)`.
+    pub(crate) fn stage<
+        C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
+        ForwardFn: FnOnce(
+            &[Tracer<NestedTracingContext<C>>],
+            &[Tracer<NestedTracingContext<C>>],
+        ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+        TransposeFn: FnOnce(
+            &[Tracer<NestedTracingContext<C>>],
+            &[Tracer<NestedTracingContext<C>>],
+        ) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+    >(
+        context: &C,
+        residuals: Vec<C::Value>,
+        linear_inputs: Vec<C::Value>,
+        forward_fn: ForwardFn,
+        transpose_fn: TransposeFn,
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        let residual_count = residuals.len();
+        let forward_input_types =
+            residuals.iter().chain(&linear_inputs).map(|value| value.r#type().into_owned()).collect();
+        let (_, forward) = NestedTracingContext::trace(
+            context.clone(),
+            move |inputs| {
+                let (residuals, linear_inputs) = inputs.split_at(residual_count);
+                forward_fn(residuals, linear_inputs)
+            },
+            forward_input_types,
+        )?;
+        let transpose_input_types = residuals
+            .iter()
+            .map(|value| value.r#type().into_owned())
+            .chain(forward.outputs().map(|output| output.r#type().into_owned().cotangent()))
+            .collect();
+        let (_, transpose) = NestedTracingContext::trace(
+            context.clone(),
+            move |inputs| {
+                let (residuals, output_cotangents) = inputs.split_at(residual_count);
+                transpose_fn(residuals, output_cotangents)
+            },
+            transpose_input_types,
+        )?;
+        let mut inputs = residuals;
+        inputs.extend(linear_inputs);
+        context.bind(Self::new(residual_count), vec![forward, transpose], inputs.as_slice())
+    }
+
+    // TODO(eaplatanios): Review this function.
+    /// Batches a linear call by structurally batching its two attached [`Region`](crate::Region)s.
+    ///
+    /// Both interface forms preserve a completely replicated call unchanged. A mapped forward-and-transpose call
+    /// batches its forward region to discover the batched output axes, batches its transpose region under those
+    /// axes, and aligns the transpose outputs with the original linear-input axes: a cotangent for a replicated
+    /// linear input is summed across the batch by `reduce`, while cotangents for mapped linear inputs retain their
+    /// packed axes. A mapped transpose-only call is rejected because its unavailable forward program cannot
+    /// determine the batched output axes.
+    ///
+    /// The batching policy owns the boundary shape of its structurally batched programs:
+    /// [`BatchingPolicy::adapt_batched_program`] adapts each batched region to the plain two-region linear-call
+    /// boundary, and any [`BatchingPolicy::boundary_operands`] (e.g., a composite program's first-class mapped
+    /// extent) become additional leading residuals of the batched call.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active [`BatchingContext`] for the transform level being applied.
+    ///   - `driver`: Driver exposing this call's attached regions.
+    ///   - `inputs`: Batched operands, ordered as `[residuals..., linear_inputs...]`.
+    ///   - `input_axes`: Batch axis of each operand in `inputs`.
+    ///   - `reduce`: Sums one mapped transpose output along the provided axis within the adapted program's own
+    ///     [`TracingContext`]. Callers own this closure because its mechanics are universe-specific (e.g., the
+    ///     homogeneous tracer has a direct reduction capability, while the composite universe binds a projected
+    ///     reduction operation).
+    pub(crate) fn batch_regions<C, P, D, Reduce>(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+        input_axes: Vec<BatchAxis>,
+        reduce: Reduce,
+    ) -> Result<Vec<P::Batch>, BatchingError>
+    where
+        C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
+        P: BatchingPolicy<C>,
+        D: BatchingDriver<C, P>,
+        Reduce: Fn(
+            &TracingContext<C::Constant, C::Operation>,
+            Tracer<TracingContext<C::Constant, C::Operation>>,
+            Axis,
+        ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+    {
+        if self.residual_count > inputs.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "linear call residual count {} exceeds input count {}",
+                self.residual_count,
+                inputs.len(),
+            ))
+            .into());
+        }
+        check_count!("input", input_axes, inputs.len(), ProgramError);
+        let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
+
+        // A completely replicated call needs no structural region rewrite. Keeping the original call also avoids
+        // manufacturing a batch axis that neither region observes.
+        if input_axes.iter().all(BatchAxis::is_replicated) {
+            let outputs = context.parent().bind(
+                self.clone(),
+                driver.regions().map(|region| region.to_program()).collect::<Vec<_>>(),
+                input_values.as_slice(),
+            )?;
+            return Ok(outputs.into_iter().map(P::replicated).collect());
+        }
+
+        match &self.interface {
+            LinearCallInterface::ForwardAndTranspose => {}
+            LinearCallInterface::TransposeOnly { .. } => {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: "a transpose-only linear call cannot be batched with mapped inputs because its \
+                              unavailable forward program does not determine output batch axes"
+                        .to_string(),
+                });
+            }
+        }
+
+        let (residual_axes, linear_axes) = input_axes.split_at(self.residual_count);
+        let (forward, output_axes) = P::adapt_batched_program(
+            driver.batch_program(
+                context,
+                driver.region(0)?,
+                input_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )?,
+            None,
+            &reduce,
+        )?
+        .into_parts();
+
+        // Batch the supplied transpose under the forward result axes. Cotangents for replicated linear inputs are
+        // reduced during adaptation; mapped linear inputs instead retain their packed axes.
+        let transpose_input_axes = residual_axes.iter().copied().chain(output_axes.iter().copied()).collect::<Vec<_>>();
+        let (transpose, transpose_output_axes) = P::adapt_batched_program(
+            driver.batch_program(
+                context,
+                driver.region(1)?,
+                transpose_input_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(linear_axes.to_vec()),
+            )?,
+            Some(linear_axes),
+            &reduce,
+        )?
+        .into_parts();
+        check_count!("output", transpose_output_axes, linear_axes.len(), ProgramError);
+        check_count!("output", transpose.output_ids(), linear_axes.len(), ProgramError);
+
+        let boundary_operands = P::boundary_operands(context.axis_extent());
+        let mut packed_inputs = Vec::with_capacity(boundary_operands.len() + input_values.len());
+        let boundary_operand_count = boundary_operands.len();
+        packed_inputs.extend(boundary_operands);
+        packed_inputs.extend(input_values);
+        context
+            .parent()
+            .bind(
+                LinearCallOperation::new(self.residual_count + boundary_operand_count),
+                vec![forward, transpose],
+                packed_inputs.as_slice(),
+            )?
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| P::batch(output, axis))
+            .collect()
     }
 }
 
@@ -333,94 +527,16 @@ impl<
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        if self.residual_count > inputs.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "linear call residual count {} exceeds input count {}",
-                self.residual_count,
-                inputs.len(),
-            ))
-            .into());
-        }
-
-        // A completely replicated call needs no structural region rewrite. Keeping the original call also avoids
-        // manufacturing a batch axis that neither region observes.
-        if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
-            let outputs = context.parent().bind(
-                self.clone(),
-                driver.regions().map(|region| region.to_program()).collect::<Vec<_>>(),
-                &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
-            )?;
-            return Ok(outputs.into_iter().map(ArrayBatch::replicated).collect());
-        }
-
-        if self.is_transpose_only() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "a transpose-only linear call cannot be batched with mapped inputs because its unavailable \
-                          forward program does not determine output batch axes"
-                    .to_string(),
-            });
-        }
-
         let input_axes = inputs.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
-        let (residual_axes, linear_axes) = input_axes.split_at(self.residual_count);
-        let (forward, output_axes) = driver
-            .batch_program(context, driver.region(0)?, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
-            .into_parts();
-
-        // Batch the supplied transpose under the forward result axes. A cotangent for a replicated linear input must
-        // sum contributions across a naturally mapped output axis; mapped linear inputs instead retain their packed
-        // axis. This is the transpose of the *batched* map, rather than merely a per-item transpose.
-        let transpose_input_axes = residual_axes.iter().copied().chain(output_axes.iter().copied()).collect::<Vec<_>>();
-        let (transpose, transpose_output_axes) = driver
-            .batch_program(
-                context,
-                driver.region(1)?,
-                transpose_input_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(linear_axes.to_vec()),
-            )?
-            .into_parts();
-        check_count!("output", transpose_output_axes, linear_axes.len(), ProgramError);
-        check_count!("output", transpose.output_ids(), linear_axes.len(), ProgramError);
-        let transpose = {
-            let tracing_context = TracingContext::<C::Constant, C::Operation>::new();
-            let builder = tracing_context.builder().clone();
-            let transpose_inputs =
-                transpose.input_types().into_iter().map(|r#type| tracing_context.input(r#type)).collect::<Vec<_>>();
-            let transpose_outputs = transpose.interpret_in_context(&tracing_context, transpose_inputs)?;
-            let transpose_outputs = transpose_outputs
-                .into_iter()
-                .zip(transpose_output_axes.iter().zip(linear_axes))
-                .map(|(output, (actual, target))| match (actual.axis(), target.axis()) {
-                    (Some(axis), None) => Ok(output.reduce(
-                        &[axis.normalize(output.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
-                            r#type: Box::new(output.r#type().into_owned()),
-                            axis,
-                        })?],
-                        ReductionKind::Sum,
-                    )),
-                    _ => Ok(output),
-                })
-                .collect::<Result<Vec<_>, BatchingError>>()?;
-            let output_ids = transpose_outputs.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-            let input_count = transpose.input_count();
-            let output_count = output_ids.len();
-            drop((tracing_context, transpose_outputs));
-            let builder =
-                std::rc::Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-            builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
-        };
-
-        context
-            .parent()
-            .bind(
-                LinearCallOperation::new(self.residual_count),
-                vec![forward, transpose],
-                &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
-            )?
-            .into_iter()
-            .zip(output_axes)
-            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, axis))
-            .collect()
+        self.batch_regions(context, driver, inputs, input_axes, |_, output, axis| {
+            Ok(output.reduce(
+                &[axis.normalize(output.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
+                    r#type: Box::new(output.r#type().into_owned()),
+                    axis,
+                })?],
+                ReductionKind::Sum,
+            ))
+        })
     }
 }
 

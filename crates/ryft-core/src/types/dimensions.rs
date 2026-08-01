@@ -284,24 +284,29 @@ impl TypeIdentity for DimensionVariable {
 ///     count" symbolically while tracing, and reject violations with a precise trace-time error instead of deferring
 ///     them to backend compilation or to a runtime crash on some particular input.
 ///   - **Transformability:** Transforms must synthesize types for values that do not exist in the original program,
-///     such as batched intermediates, tangents, and cotangent zeros. Because every dynamic extent is defined by a
-///     dimension value derived from the input signature, transforms can thread those definitions through the programs
-///     they build (e.g., as residuals of a linearization), and the resulting programs remain well-typed and themselves
-///     shape polymorphic.
+///     such as batched intermediates, tangents, and cotangent zeros. Because every dynamic extent is defined by an
+///     explicit dimension value in the same program, transforms can thread those definitions through the programs they
+///     build (e.g., as residuals of a linearization), and the resulting programs remain well-typed and themselves shape
+///     polymorphic.
 ///   - **One Compiled Artifact Across Extents:** Concrete extents are not part of the type, so retained compilations
 ///     are keyed by the symbolic signature and reused across every admitted extent, with the boundary
 ///     [`TypeRefinements`](crate::TypeRefinements) environment binding actual extents per call.
 ///
-/// The restriction this type encodes is therefore one of *provenance*. Dimension values derive only from the input
-/// signature (i.e., dimension inputs, extents of array inputs, and explicit dimension arithmetic over those) and never
-/// from array *data*. Backend IRs are more permissive. For example, a StableHLO
+/// The restriction this type encodes is therefore one of *provenance*. Dimension values derive from the input signature
+/// (i.e., dimension inputs, extents of array inputs, and explicit dimension arithmetic over those), with exactly one
+/// deliberate, checked exception (the [`DimensionFromScalar`](crate::DimensionFromScalar) gateway converts rank-zero
+/// integer array *data* into a fresh bounded dimension). The gateway admits data-dependent extents while keeping the
+/// invariant above intact, because its output type is a fresh variable plus declared bounds (computable at trace time
+/// like every other dimension type) with the concrete extent checked against those bounds at execution time. Backend
+/// IRs are more permissive. For example, a StableHLO
 /// [`dynamic_reshape`](https://openxla.org/stablehlo/spec#dynamic_reshape) consumes an ordinary runtime integer tensor
 /// with no provenance requirement, so lowering does not need this machinery. The restriction is a frontend type-system
-/// choice: a data-derived extent would make output *types* depend on runtime *values*, breaking the trace-time
-/// invariant above, and data-dependent dynamism also remains unevenly supported across backends (refer to the
+/// choice: an *unchecked* data-derived extent would make output types depend on unbounded runtime values, and
+/// data-dependent dynamism also remains unevenly supported across backends (refer to the
 /// [dynamism in StableHLO](https://openxla.org/stablehlo/dynamism) documentation for more information). The
-/// authoritative [`DimensionBounds`] carried by every [`DimensionVariable`] additionally keep each dynamic extent
-/// inside a static envelope that backends can plan buffers and generate loops against.
+/// authoritative [`DimensionBounds`] carried by every [`DimensionVariable`] additionally keep each dynamic extent,
+/// input-derived or gateway-derived, inside a static envelope that backends can plan buffers and generate loops
+/// against.
 ///
 /// # Example
 ///

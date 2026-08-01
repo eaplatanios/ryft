@@ -13,6 +13,16 @@ execution, PE, JVP, import, rendering, and native lowering. Bounded-dynamic batc
 remain Phase 6, and checked gateway/public bounded-dynamic shard-map execution remains Phase 7 because it requires
 ordered assertion and `PadToStatic` lowering. The final current-JAX comparison fixtures remain an explicit P3k gate.
 
+On 2026-08-01 the plan's end state was extended beyond the containment cleanup: after the cleanup closure gates
+(Phases 10–11), Phases 12–14 take Ryft from input-derived (tier-2) dynamism to full data-dependent (tier-3) dynamism.
+The semantic entry point already exists — P3d landed the checked `dimension_from_scalar` provenance gateway with
+eager bounds-checked execution, partial evaluation, and mapped-batching rejection — so the remaining tier-3 work is
+Phase 12 (close the semantics: effects-model decision, cache-identity and transform coverage, fixtures), Phase 13
+(bounded data-dependent compiled execution), and Phase 14 (ragged batching). The tier definitions and the
+representation rationale are recorded at the end of the **Objective** section; the P6a `LinearCallOperation` residual
+contract is deliberately reused unchanged as tier 3's differentiation mechanism, which is the strongest evidence that
+the tier-2 architecture was built correctly.
+
 This plan remains a containment and simplification follow-up to `.tasks/plan_first_class_dimension_programs.md`. It
 preserves that plan's user-visible capabilities and its decision to represent runtime dimensions as ordinary SSA
 values, but supersedes the following implementation compromises:
@@ -60,6 +70,18 @@ This is an architectural cleanup, not a feature reduction. The final implementat
   lowering;
 - caller/callee requirement composition and exact diagnostics; and
 - replicated-only dense batching/sharding of dimension authority.
+
+As of 2026-08-01 this plan also owns Ryft's dynamism end state. The dynamism tiers are: **tier 1** — static extents;
+**tier 2** — input-derived extents (dimension inputs, `dimension_size` of array inputs, and dimension arithmetic over
+those), which is the scope of Phases 0–11; and **tier 3** — data-dependent extents computed from array contents within
+declared bounds. Phases 12–14 extend the finished cleanup to full tier 3. The dimensions-as-SSA-values representation
+was chosen with this end state in mind: it is the architecture JAX's own dynamic-shapes effort
+(`DShapedArray` avals containing jaxpr variables, `bint` bounded integers with padding rules) headed toward before
+stalling on retrofit scale, and tier 3 is reachable here by relaxing provenance *policy* through one checked gateway
+rather than by re-architecting types, transforms, or programs. The gateway itself (`dimension_from_scalar`) already
+landed in P3d; Phases 12–14 complete the semantics, backend execution, and batching around it. Every tier preserves
+the same invariants: rank stays static, types carry identities and bounds but never expressions or values, and the
+graph remains the complete source of data dependencies.
 
 ## Architectural diagnosis
 
@@ -204,6 +226,11 @@ expression language while solving only the algebraic subset of residual needs.
   resolved the same way before Phase 8 lands.
 - `dimension_size` means `array -> dimension` in every context.
 - `dimension_to_scalar` is the explicit `dimension -> scalar-array` gateway.
+- `dimension_from_scalar` (landed in P3d) is the explicit checked `scalar-array -> dimension` gateway and the *only*
+  operation that converts data into dimension authority. It declares a fresh `DimensionVariable` with caller-declared
+  `DimensionBounds`, and eager execution checks every accepted integer payload against them. Its compiled runtime
+  bounds check is deferred to Phase 7 ordered-assertion lowering, and Phase 12 owns the effects-model decision for
+  how that check survives DCE and ordering.
 - A shape-carrying operation is mixed even when a particular invocation happens to have only static dimensions.
 - A static convenience API may omit dimension operands only when the payload's metadata proves there are none; it
   still binds the same mixed operation contract. Constructors are the documented exception: an identity-free
@@ -463,6 +490,11 @@ objective:         rejected
 residual:          allowed
 partial value:     known integer or unknown dimension SSA
 ```
+
+This table is the tier-2 policy and is unchanged by Phase 12: a data-derived dimension whose gateway operand is
+replicated behaves identically to every other replicated dimension. Phase 14 alone may relax `batching: replicated
+only` to a ragged mapped representation owned by the batch carrier; no other row changes at any tier, and raggedness
+must never appear on `Type`.
 
 Generic outer transform dispatch projects a homogeneous operation and its values, invokes its existing rule through a
 zero-state projected context, and lifts results. Mixed operations retain explicit rules because their semantics truly
@@ -1610,6 +1642,10 @@ searches. The complete source ledger and verification record are in
       dynamic reshape before migrating other mixed operations or composite regions. The prototype must keep residual
       dimensions as ordinary SSA values, remove fake dimension tangent/cotangent slots from generated linear programs,
       and reject side tables, identity lookup, copied shape metadata, or reshape-specific residual fields.
+- [ ] P6b — execute `.tasks/plan_p6b_extent_residual_operation_sweep.md` as separately reviewable batching,
+      mixed-shape, array-only, and collective slices. Extend the P6a linear-call residual contract across every
+      remaining extent-sensitive derivative rule, delete superseded captured-factor payloads and Phase 6 rejections,
+      and require full JAX parity plus Ryft's bounded-dynamic extensions before the P6b gate.
 - [x] Express the dimension tangent/cotangent space once in differentiation-owned policy.
 - [x] Introduce or extend one differentiation-owned residual structure capable of carrying ordinary array-program SSA
       values, including dimensions, without assigning them tangent/cotangent slots.
@@ -1727,6 +1763,10 @@ composite-zero deletion remain subsequent units so each stays independently revi
       deterministic first-failure order within the assertion class and independence from ordered I/O.
 - [ ] Verify ordered runtime assertions preserve exact actor-named diagnostics and deterministic same-class order.
 - [ ] Run CPU and CUDA eager/JIT parity for the full dynamic operation matrix, including `PadToStatic`.
+- [ ] While sweeping mixed-operation lowering above, record an initial per-operation padding-discipline inventory
+      (padding-oblivious versus mask-required versus zero-padding-required under bound-shaped physical storage) as
+      Phase 13 input. This is classification only — no behavior changes in this phase — but capturing it during the
+      lowering sweep avoids a second complete pass over the same operations later.
 - [ ] Gate: backend behavior, diagnostics, and bounded physical storage match or exceed the archived golden evidence.
 
 ### Phase 8: enforce contracts and consolidate operation declarations
@@ -1839,6 +1879,110 @@ composite-zero deletion remain subsequent units so each stays independently revi
 - [ ] Gate: a staff-level review confirms simpler dependency direction, one source of truth, no compatibility layer,
       no redundant abstraction, and no unexplained bloat.
 
+### Phase 12: close tier-3 semantics around the `dimension_from_scalar` gateway
+
+Phases 12–14 extend the finished cleanup from input-derived (tier-2) to data-dependent (tier-3) dynamism. Begin only
+after the Phase 11 gate: tier 3 is a provenance-policy relaxation over a *stable* architecture, and starting it over
+moving transform rules would repeat the retrofit failure mode this phase order exists to avoid. The design bet being
+cashed here is that tier 3 requires no new type-system, program, or transform machinery. The entry point already
+exists: P3d landed `DimensionFromScalarOperation` as the sole checked `rank-0 integer array -> dimension` gateway,
+with a declared fresh identity plus bounds, eager bounds-checked execution, partial-evaluation fold/residualize
+behavior, and the mapped-batching rejection diagnostic. A gateway output types exactly like a derived arithmetic
+dimension (fresh identity plus bounds), and the P6a `LinearCallOperation` residual contract threads dimension values
+through differentiation without caring where they came from. This phase turns those properties from
+believed-by-construction into verified-by-fixture, and makes the one open design decision the gateway deferred. The
+non-negotiable invariants are unchanged: rank stays static, no expression trees or witnesses, no side tables, no
+ambient environments, and the graph remains the complete source of data dependencies.
+
+- [ ] Decide the gateway's effects model. The operation is currently pure and P3d deferred its compiled range check
+      to Phase 7. Under the requirement effects model the check is trace-time-inconclusive whenever the operand range
+      is unproven, which argues for retaining `Effect::OrderedAssertion` on the unproven path (matching
+      `DimensionRequirementOperation`) so the bounds check survives DCE and keeps deterministic ordering; the
+      alternative is lowering through a staged requirement operation. Decide once, with fixtures for DCE survival,
+      PE erasure when the operand range is proven, and deterministic assertion order; do not leave the check droppable
+      by dead-code elimination.
+- [ ] Add a retained-JIT cache-identity test proving one compiled specialization serves multiple runtime extents of a
+      data-derived dimension: structural equality, hashing, and cache identity must not observe the data dependence.
+- [ ] Verify gateway-defined variables need no boundary `TypeRefinements` entry: they are internal identities
+      established by their producing instruction under the existing structural-closure rules. Cover closure, import,
+      alpha-renaming, and repeated splicing.
+- [ ] Differentiation: dimensions remain nondifferentiable, and the linear-call residual contract must carry
+      gateway-defined dimensions through linearization, transposition, and nested JVP without modification. Add a
+      rendered-IR fixture in which a data-derived extent is a visible residual edge of a `linear_call`.
+- [ ] Batching: pin the existing tier-3 MVP policy with fixtures — a gateway whose scalar operand is replicated
+      produces ordinary replicated dimension authority; a mapped operand keeps its exact typed rejection diagnostic,
+      updated to name Phase 14 raggedness as the missing capability.
+- [ ] Control flow: verify the existing carry-type equality checks reject shape-varying loop-carried state with exact
+      diagnostics (a fresh per-iteration variable cannot instantiate the declared carry type). Bounds-widened
+      loop-carried extents are an explicit non-goal; record the rejection fixture rather than designing widening.
+- [ ] Confirm the Phase 8 authoritative operation declaration covers the gateway so it acquires generated dispatch,
+      conversions, and classification like every other dimension operation.
+- [ ] Update the `DimensionType` motivation rustdoc in `types/dimensions.rs` so the provenance story describes the
+      tiers and names the gateway as the single data-to-dimension boundary, and update the `ArrayProgramType`
+      cross-reference if its wording changes.
+- [ ] Add JAX comparison fixtures for eager and staged `n = count(mask); take(x, n)`-shaped programs that JAX rejects
+      (`ConcretizationTypeError`) and Ryft accepts eagerly and stages symbolically. Compiled execution may reject with
+      an exact "requires Phase 13 bounded data-dependent lowering" diagnostic until Phase 13 lands.
+- [ ] Gate: tier-3 programs interpret eagerly end to end; staged tier-3 programs type-check, batch (replicated),
+      differentiate, and partially evaluate; the bounds check provably survives DCE with deterministic ordering; every
+      unsupported surface fails with an exact diagnostic rather than silently mis-executing; and no expression trees,
+      side tables, or ambient environments were added.
+
+### Phase 13: bounded data-dependent compiled execution
+
+This is the dominant tier-3 cost and the piece most exposed to backend maturity: XLA's support for data-dependent
+dynamism is uneven, which is part of why JAX's own effort stalled. The physical model is fixed — bound-shaped buffers
+carrying smaller logical extents — but the encoding route is an explicit measured decision, not an assumption. Phase 7
+already owns the gateway's own compiled lowering (its range check as an ordered assertion plus the checked
+`PadToStatic` boundary); this phase makes the *rest of the operation set* correct over data-derived extents.
+
+- [ ] Decide the compiled route for operations consuming data-derived extents, on measured evidence: (a) XLA bounded
+      dynamism through the existing bounded-input ABI, `set_dimension_size`, and `PadToStatic` machinery; or (b) fully
+      static bound-shaped StableHLO plus explicit Ryft-generated masks. Prototype (a) first because the ABI already
+      exists; record CPU and CUDA coverage evidence before committing, and fall back to (b) per backend where (a) is
+      unsupported rather than globally.
+- [ ] Require a finite upper bound at the gateway for any program that reaches compilation; reject unbounded
+      data-derived dimensions at lowering with an exact diagnostic naming the variable and its bounds.
+- [ ] Confirm the Phase 7 gateway lowering composes with the Phase 12 effects-model decision: the range check rides
+      the per-class `OrderedAssertion` token chain with its exact diagnostic and deterministic same-class ordering.
+- [ ] Complete the per-operation padding-discipline inventory started in Phase 7 and record it in this plan as the
+      authoritative table: padding-oblivious (elementwise, reshape-within-bounds), mask-required (reductions,
+      argmin/argmax, cumulative and windowed operations), or zero-padding-required (contractions, convolutions).
+- [ ] Implement the padding rules for the supported operation matrix so padding garbage is unobservable in results.
+      Every unclassified or unsupported operation must reject lowering of data-derived extents with an exact
+      diagnostic naming the operation; silent truncation or garbage propagation is an abort criterion.
+- [ ] Run CPU (and CUDA where backend support permits) eager/JIT parity for a data-dependent golden set including the
+      Phase 12 fixtures, proving one compiled specialization serves multiple runtime extents.
+- [ ] Gate: bounded data-dependent programs compile and execute correctly on supported backends, padding effects are
+      unobservable in every supported operation's results, unsupported operations fail before execution with exact
+      diagnostics, and the route decision is recorded with its measured evidence.
+
+### Phase 14: ragged batching for data-dependent extents
+
+The last and largest tier-3 unit: `vmap` over a data-derived extent yields per-batch-element extents, i.e. ragged
+intermediates — the exact problem JAX's team named as the hard transform case, and the one place where djax built
+substantial machinery (`RaggedAxis`). Ryft has two structural advantages to reuse: the recursive batching meta stack
+composes nested axes already, and the relaxed-while-predicate work established the consumer-owned-masking pattern.
+
+- [ ] Confirm and record the concrete motivating workload (e.g., ragged/variable-length batch items without API-level
+      padding waste) before implementation so the supported operation surface is demand-shaped rather than
+      speculative. If the owner explicitly approves deferral instead, record it here and re-scope the tier-3 exit
+      criteria; do not defer silently.
+- [ ] Extend `BatchingPolicy` with a ragged mapped-extent representation: a per-element extent vector (dimension SSA
+      indexed along the batch axis) plus the declared bound as the packed physical extent, with masks owned by
+      consumers. Raggedness lives on the batch carrier only; do not add it to `Type` and do not build a parallel
+      batching context/tracer tower.
+- [ ] Batching rule for the gateway: a mapped scalar operand now yields a ragged mapped dimension instead of the
+      Phase 12 rejection; replicated behavior is unchanged.
+- [ ] Ragged rules for the elementwise blanket, masked reductions, and the shape-carrying `linear_call` carrier
+      (batch both attached regions with replicated residual extents and ragged linear operands, reusing the
+      swap-stable P6 batching rule). Every operation without a ragged rule keeps an exact typed diagnostic.
+- [ ] Prove nested `vmap` over ragged extents composes through the recursive batching meta stack.
+- [ ] Control flow: ragged trip counts remain rejected with an exact diagnostic; record the fixture.
+- [ ] Gate: the ragged surface covers the recorded workload end to end with static and dynamic tests, every
+      unsupported path has an exact diagnostic, and no parallel batching tower or type-level raggedness was
+      introduced.
+
 ## Verification matrix
 
 - [ ] Static array-only primitives never inspect the heterogeneous storage sum.
@@ -1868,6 +2012,12 @@ composite-zero deletion remain subsequent units so each stays independently revi
 - [ ] Bounded dynamic ABI, CPU, and CUDA behavior match the baseline.
 - [ ] Behavioral JAX parity and Ryft-exceeds-JAX cases remain intact.
 - [x] Toy third-kind tests demonstrate that generic program/context/projection machinery is closed to modification.
+- [ ] (Tier 3) Data-to-dimension conversion occurs only through the checked `dimension_from_scalar` gateway.
+- [ ] (Tier 3) Data-derived dimensions never enter structural type identity or retained-compilation cache keys.
+- [ ] (Tier 3) Gateway bounds checks retain `OrderedAssertion` ordering through every transform and lowering.
+- [ ] (Tier 3) Data-derived extents ride the linear-call residual contract through differentiation unchanged.
+- [ ] (Tier 3) Every operation without data-dependent lowering or ragged batching support fails with an exact
+      diagnostic before execution; padding effects are unobservable on every supported path.
 
 ## Abort and reassessment criteria
 
@@ -1888,8 +2038,13 @@ Stop the current phase and revise this plan if any of the following occurs:
 - diagnostics regress to generic assertion/type errors;
 - a phase increases production code after its temporary coexistence code should have been deleted;
 - a broad Rust check causes extreme memory growth; reduce generic obligations before rerunning;
-- any backend path restores shape expression evaluation, host readback, or reconstruction; or
-- the toy third-kind test still requires edits throughout generic program and transform machinery.
+- any backend path restores shape expression evaluation, host readback, or reconstruction;
+- the toy third-kind test still requires edits throughout generic program and transform machinery;
+- a tier-3 phase needs changes to generic type-system, program, projection, or residual machinery beyond the single
+  `dimension_from_scalar` gateway and transform-owned policy — that falsifies the bet Phase 12 exists to cash and
+  requires a design review, not incremental patching; or
+- any supported data-dependent lowering path lets padding garbage become observable or silently truncates logical
+  extents instead of failing with an exact diagnostic.
 
 ## Exit criteria
 
@@ -1915,6 +2070,18 @@ The cleanup is complete only when:
 16. Exact behavior, diagnostics, cache identity, ABI, CPU/CUDA execution, and performance gates pass.
 17. Production code is materially smaller, with the special-purpose adapter modules reduced by at least 40%.
 18. Adding a third nondifferentiable member kind does not require another core-wide architecture sweep.
+
+Full tier-3 dynamism (Phases 12–14) is additionally complete only when:
+
+19. Data-derived dimension authority exists through exactly one checked gateway with mandatory bounds and ordered
+    assertion semantics, and remains unrepresentable everywhere else.
+20. Tier-3 programs interpret eagerly, stage, batch, differentiate, and partially evaluate with unchanged
+    type-system, program, and residual machinery — the gateway is the only new operation.
+21. Bounded data-dependent programs compile and execute on supported backends with padding effects unobservable in
+    every supported operation's results.
+22. Ragged batching covers the recorded motivating workload (or its deferral is explicitly owner-approved and
+    recorded), with exact diagnostics on every unsupported path.
+23. No tier introduced expression trees, witnesses, scopes, substitution, side tables, or ambient environments.
 
 ## Review
 
@@ -3018,3 +3185,29 @@ Verification passed all 1,020 core library tests, all 57 runnable core doctests 
 runnable XLA library tests (one timing benchmark ignored), both macro integration suites, the XLA all-target check,
 formatting, and diff hygiene. The complete fixture and implementation ledger is recorded in
 `.tasks/plan_p4c_composite_region_verification.md`.
+
+### Plan revision: tier-3 data-dependent dynamism extension (2026-08-01)
+
+The plan's end state was extended from the containment cleanup to full data-dependent (tier-3) dynamism. The tier
+vocabulary (tier 1 static, tier 2 input-derived, tier 3 data-dependent within declared bounds) is now defined in the
+**Objective** section, and Phases 12–14 were added after the cleanup closure gates: Phase 12 closes tier-3 semantics
+around the existing P3d `dimension_from_scalar` gateway (effects-model decision for DCE-surviving bounds checks,
+cache-identity and closure coverage, linear-call residual and control-flow fixtures, JAX-rejection comparison
+fixtures), Phase 13 owns bounded data-dependent compiled execution (measured route decision between XLA bounded
+dynamism and static-bound-plus-masks, the authoritative per-operation padding-discipline table, exact rejection
+diagnostics for unsupported operations), and Phase 14 owns ragged batching (carrier-owned per-element extents plus
+consumer-owned masks, demand-shaped by a recorded motivating workload). Phase 7 gained one classification-only item
+capturing the initial padding-discipline inventory during its existing lowering sweep, the operation-contract
+invariants now name the gateway, the transform policy table records that only Phase 14 may relax replicated-only
+dimension batching, and the verification matrix, abort criteria, and exit criteria gained tier-3 entries.
+
+The revision was motivated by external evidence gathered while reviewing the P6 linear-call architecture: JAX's
+stalled dynamic-shapes effort (`DShapedArray` avals containing jaxpr variables, `bint` bounded integers with padding
+rules, and a residuals-first `call_transpose` annotation convention identical to `LinearCallOperation`'s swap
+signature) validates dimensions-as-SSA-values as the tier-3-capable representation and locates the retrofit costs
+Ryft avoids by being greenfield. The audit for this revision also found that the semantic entry point was further
+along than the drafted phases assumed: P3d had already landed the gateway with eager checked execution, partial
+evaluation, and the mapped-batching rejection, so Phase 12 was scoped as verification-and-closure rather than
+introduction, and the gateway's own compiled lowering remains Phase 7 work as recorded by P4c. The `DimensionType`
+motivation rustdoc added earlier the same day overstated the provenance restriction ("never from array data") and was
+corrected in the same session to name the gateway as the single checked exception.
