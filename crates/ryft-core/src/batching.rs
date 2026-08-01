@@ -79,20 +79,20 @@ use ryft_macros::Parameter;
 
 use crate::axes::{Axis, AxisError};
 use crate::broadcasting::Broadcastable;
-use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
+use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::ElementwiseOperation;
 use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::ProgramError;
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::programs::Program;
 use crate::programs::regions::{
     BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
 };
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Dimension, DimensionType, Shape};
@@ -831,6 +831,9 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// Returns the parent-owned packed value stored in `batch`.
     fn value(batch: &Self::Batch) -> &C::Value;
 
+    /// Returns the [`BatchAxis`] carried by `batch`.
+    fn batch_axis(batch: &Self::Batch) -> BatchAxis;
+
     /// Returns the per-item type exposed by `batch` after removing its mapped batch axis, if any.
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type>;
 
@@ -1099,6 +1102,11 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPoli
     }
 
     #[inline]
+    fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+        batch.batch_axis()
+    }
+
+    #[inline]
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
         Cow::Owned(batch.unbatched_type())
     }
@@ -1202,6 +1210,11 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
     #[inline]
     fn value(batch: &Self::Batch) -> &C::Value {
         P::value(batch)
+    }
+
+    #[inline]
+    fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+        P::batch_axis(batch)
     }
 
     #[inline]
@@ -2508,6 +2521,59 @@ pub(crate) fn normalized_batch_axis_type(
         .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
 }
 
+/// Applies a member [`Operation`]'s batching rule through a projected view of a composite [`BatchingContext`]. Use
+/// this function from a composite operation dispatcher when the operation is [`Region`](crate::Region)-free and every
+/// operand and result belongs to the same projectable member type `T`. It converts the packed input values to the
+/// member value family, preserves the outer batch axes and mapped extent, runs the member's existing batching rule,
+/// and converts the results back to the composite value family. This keeps homogeneous member rules independent of
+/// the enclosing composite type.
+///
+/// Operations with mixed member types or attached regions require an explicit composite batching rule instead.
+///
+/// # Parameters
+///
+///   - `context`: Active composite [`BatchingContext`] whose mapped extent, axis metadata, and parent context are
+///     preserved while the member rule runs.
+///   - `operation`: Region-free operation expressed in the projected member operation family.
+///   - `inputs`: Packed composite batches corresponding to the operation's operands.
+pub fn batch_projected_operation<
+    T: Type,
+    O: BatchableOperation<ProjectedContext<C, T>, Q>,
+    P: BatchingPolicy<C>,
+    Q: BatchingPolicy<ProjectedContext<C, T>, Extent = P::Extent>,
+    C: Context<
+            Value: ValueProjection<T, Projected: Value<Type = T>>,
+            Constant: ValueProjection<T, Projected: Value<Type = T>>,
+            Operation: OperationProjection<T>,
+        >,
+>(
+    context: &BatchingContext<C, P>,
+    operation: &O,
+    inputs: &[P::Batch],
+) -> Result<Vec<P::Batch>, BatchingError> {
+    let projected_context = BatchingContext::<_, Q>::with_policy(
+        ProjectedContext::new(context.parent().clone()),
+        context.axis_extent().clone(),
+    )
+    .with_axis_name(context.axis_name().map(str::to_string))
+    .with_axis_sharding(context.axis_sharding().clone());
+    let inputs = inputs
+        .iter()
+        .map(|input| {
+            Q::batch(<C::Value as ValueProjection<T>>::into_projected(P::value(input).clone())?, P::batch_axis(input))
+        })
+        .collect::<Result<Vec<_>, BatchingError>>()?;
+    operation
+        .batch(&projected_context, &EmptyRegionDriver, inputs.as_slice())?
+        .into_iter()
+        .map(|output| {
+            let batch_axis = Q::batch_axis(&output);
+            let value = <C::Value as ValueProjection<T>>::from_projected(Q::value(&output).clone());
+            P::batch(value, batch_axis)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -2536,26 +2602,26 @@ mod tests {
 
     use super::*;
 
-    /// Batch carrier for the shared three-member projection fixture.
+    /// Batch carrier shared by the composite and projected-member batching fixtures.
     #[derive(Clone, Debug, PartialEq)]
-    struct ProjectedProgramBatch {
-        /// Packed composite value.
-        value: ProjectedProgramValue,
+    struct ProjectedBatch<V: Value> {
+        /// Packed value.
+        value: V,
 
-        /// Mapped axis, which only the fixture's first member kind may carry.
+        /// Mapped axis.
         batch_axis: BatchAxis,
     }
 
-    impl Display for ProjectedProgramBatch {
+    impl<V: Value> Display for ProjectedBatch<V> {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(formatter, "batch[{}, {}]", self.value, self.batch_axis)
         }
     }
 
-    impl Parameter for ProjectedProgramBatch {}
+    impl<V: Value> Parameter for ProjectedBatch<V> {}
 
-    impl Typed for ProjectedProgramBatch {
-        type Type = ProjectedProgramType;
+    impl<V: Value> Typed for ProjectedBatch<V> {
+        type Type = V::Type;
 
         fn r#type(&self) -> Cow<'_, Self::Type> {
             self.value.r#type()
@@ -2569,7 +2635,7 @@ mod tests {
     type ProjectedProgramContext = EagerContext<ProjectedProgramValue, ProjectedProgramOperation>;
 
     impl BatchingPolicy<ProjectedProgramContext> for ProjectedProgramBatching {
-        type Batch = ProjectedProgramBatch;
+        type Batch = ProjectedBatch<ProjectedProgramValue>;
         type Extent = usize;
         type BatchedProgram = BatchedProgram<ProjectedProgramValue, ProjectedProgramOperation>;
 
@@ -2579,15 +2645,19 @@ mod tests {
                     message: format!("{} values must remain replicated under batching", value.r#type()),
                 });
             }
-            Ok(ProjectedProgramBatch { value, batch_axis })
+            Ok(ProjectedBatch { value, batch_axis })
         }
 
         fn replicated(value: ProjectedProgramValue) -> Self::Batch {
-            ProjectedProgramBatch { value, batch_axis: BatchAxis::replicated() }
+            ProjectedBatch { value, batch_axis: BatchAxis::replicated() }
         }
 
         fn value(batch: &Self::Batch) -> &ProjectedProgramValue {
             &batch.value
+        }
+
+        fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+            batch.batch_axis
         }
 
         fn unbatched_type(batch: &Self::Batch) -> Cow<'_, ProjectedProgramType> {
@@ -2616,11 +2686,72 @@ mod tests {
             &self,
             _context: &BatchingContext<ProjectedProgramContext, ProjectedProgramBatching>,
             _driver: &D,
-            inputs: &[ProjectedProgramBatch],
-        ) -> Result<Vec<ProjectedProgramBatch>, BatchingError> {
+            inputs: &[ProjectedBatch<ProjectedProgramValue>],
+        ) -> Result<Vec<ProjectedBatch<ProjectedProgramValue>>, BatchingError> {
             if inputs.len() != 1 {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             }
+            Ok(inputs.to_vec())
+        }
+    }
+
+    /// Projected-member policy used to prove that projected batching does not depend on array carriers.
+    #[derive(Copy, Clone, Debug)]
+    struct ProjectedMemberBatching<const MEMBER: u8>;
+
+    impl<const MEMBER: u8, C: Context<Type = ProjectedMemberType<MEMBER>>> BatchingPolicy<C>
+        for ProjectedMemberBatching<MEMBER>
+    {
+        type Batch = ProjectedBatch<C::Value>;
+        type Extent = usize;
+        type BatchedProgram = BatchedProgram<C::Constant, C::Operation>;
+
+        fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
+            Ok(ProjectedBatch { value, batch_axis })
+        }
+
+        fn replicated(value: C::Value) -> Self::Batch {
+            ProjectedBatch { value, batch_axis: BatchAxis::replicated() }
+        }
+
+        fn value(batch: &Self::Batch) -> &C::Value {
+            &batch.value
+        }
+
+        fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+            batch.batch_axis
+        }
+
+        fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
+            batch.r#type()
+        }
+
+        fn adapt_batched_program<
+            CollapseFn: Fn(
+                &TracingContext<C::Constant, C::Operation>,
+                Tracer<TracingContext<C::Constant, C::Operation>>,
+                Axis,
+            ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+        >(
+            program: Self::BatchedProgram,
+            required_output_axes: Option<&[BatchAxis]>,
+            collapse_fn: CollapseFn,
+        ) -> Result<BatchedProgram<C::Constant, C::Operation>, BatchingError> {
+            let (program, output_axes) = program.into_parts();
+            BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, collapse_fn)
+        }
+    }
+
+    impl<const MEMBER: u8, C: Context<Type = ProjectedMemberType<MEMBER>>>
+        BatchableOperation<C, ProjectedMemberBatching<MEMBER>> for ProjectedMemberOperation<MEMBER>
+    {
+        fn batch<D: BatchingDriver<C, ProjectedMemberBatching<MEMBER>>>(
+            &self,
+            _context: &BatchingContext<C, ProjectedMemberBatching<MEMBER>>,
+            _driver: &D,
+            inputs: &[ProjectedBatch<C::Value>],
+        ) -> Result<Vec<ProjectedBatch<C::Value>>, BatchingError> {
+            check_count!("input", inputs, 1, ProgramError);
             Ok(inputs.to_vec())
         }
     }
@@ -3104,7 +3235,7 @@ mod tests {
         let outputs = operation.batch(&context, &EmptyRegionDriver, &[tracer.into_batch()]).unwrap();
         assert_eq!(
             outputs,
-            vec![ProjectedProgramBatch {
+            vec![ProjectedBatch {
                 value: ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
                 batch_axis: BatchAxis::replicated(),
             }],
@@ -3872,5 +4003,27 @@ mod tests {
         let input = Array::matrix(3, 4, (0..12).map(|value| value as f64).collect());
         let output = program.interpret(input).unwrap();
         assert_eq!(output.to_f64s(), (0..12).map(|value| value as f64 + 1.0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_batch_projected_operation() {
+        // The third fixture member is intentionally unrelated to arrays. Successfully applying its identity batching
+        // rule proves that the adapter depends only on the projection and policy contracts, while preserving the
+        // composite policy's packed value and replicated-axis representation.
+        let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
+        let input = ProjectedProgramBatching::replicated(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)));
+        let outputs = batch_projected_operation::<ProjectedMemberType<2>, ProjectedMemberBatching<2>, _, _, _>(
+            &context,
+            &ProjectedMemberOperation,
+            &[input],
+        )
+        .unwrap();
+        assert_eq!(
+            outputs,
+            vec![ProjectedBatch {
+                value: ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+                batch_axis: BatchAxis::replicated(),
+            }],
+        );
     }
 }

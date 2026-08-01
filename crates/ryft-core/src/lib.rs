@@ -33,7 +33,7 @@ pub use batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation,
     BatchableType, BatchedProgram, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
     BatchingPolicy, BatchingTracer, DimensionSource, InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy,
-    RecursiveBatchingPolicy, StaticArrayBatchingPolicy, batch,
+    RecursiveBatchingPolicy, StaticArrayBatchingPolicy, batch, batch_projected_operation,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
