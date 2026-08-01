@@ -25,16 +25,16 @@ pub mod dimension_size;
 pub mod dimension_sub;
 pub mod dimension_to_scalar;
 
-pub use dimension_add::{DIMENSION_ADD_OPERATION_NAME, DimensionAdd, DimensionAddOperation};
-pub use dimension_div_floor::{DIMENSION_DIV_FLOOR_OPERATION_NAME, DimensionDivFloor, DimensionDivFloorOperation};
+pub use dimension_add::{DIMENSION_ADD_OPERATION_NAME, DimensionAddOperation};
+pub use dimension_div_floor::{DIMENSION_DIV_FLOOR_OPERATION_NAME, DimensionDivFloorOperation};
 pub use dimension_from_scalar::{
     DIMENSION_FROM_SCALAR_OPERATION_NAME, DimensionFromScalar, DimensionFromScalarOperation,
 };
 pub use dimension_max::{DIMENSION_MAX_OPERATION_NAME, DimensionMax, DimensionMaxOperation};
 pub use dimension_min::{DIMENSION_MIN_OPERATION_NAME, DimensionMin, DimensionMinOperation};
-pub use dimension_mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMul, DimensionMulOperation};
+pub use dimension_mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMulOperation};
 pub use dimension_pow::{DIMENSION_POW_OPERATION_NAME, DimensionPow, DimensionPowOperation};
-pub use dimension_rem::{DIMENSION_REM_OPERATION_NAME, DimensionRem, DimensionRemOperation};
+pub use dimension_rem::{DIMENSION_REM_OPERATION_NAME, DimensionRemOperation};
 pub use dimension_requirement::{
     DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME,
     DIMENSION_REQUIRE_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DimensionRequirement,
@@ -44,7 +44,7 @@ pub use dimension_saturating_sub::{
     DIMENSION_SATURATING_SUB_OPERATION_NAME, DimensionSaturatingSub, DimensionSaturatingSubOperation,
 };
 pub use dimension_size::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize, DimensionSizeOperation};
-pub use dimension_sub::{DIMENSION_SUB_OPERATION_NAME, DimensionSub, DimensionSubOperation};
+pub use dimension_sub::{DIMENSION_SUB_OPERATION_NAME, DimensionSubOperation};
 pub use dimension_to_scalar::{
     DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionToScalar, DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,
 };

@@ -1,7 +1,8 @@
-use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_dimension_operation};
-use crate::operations::math::SubOperationFor;
+use crate::macros::check_count;
+use crate::macros::define_arithmetic_dimension_operation;
+use crate::operations::math::{Sub, SubOperation};
 use crate::parameters::Parameter;
-use crate::programs::ProgramError;
+use crate::programs::{OperationProvider, ProgramError};
 use crate::types::{DimensionBounds, DimensionError, DimensionType};
 
 use super::representable_extent_range;
@@ -10,47 +11,23 @@ use super::representable_extent_range;
 pub const DIMENSION_SUB_OPERATION_NAME: &str = "dimension_sub";
 
 define_arithmetic_dimension_operation!(
-    /// Checked dimension-subtraction operation used by [`DimensionSub`].
-    ///
-    /// Refer to [`DimensionSub`] for semantic details and an example.
+    /// Checked dimension-subtraction operation used by [`Sub`].
     DimensionSubOperation, DIMENSION_SUB_OPERATION_NAME,
-    DimensionSub, dimension_sub,
+    Sub, sub,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} - {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
 );
 
-impl SubOperationFor for DimensionType {
+impl OperationProvider<DimensionType> for SubOperation {
     type Operation = DimensionSubOperation;
 
-    #[inline]
-    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError> {
-        Ok(DimensionSubOperation::new(left_type, right_type)?)
+    fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Ok(DimensionSubOperation::new(input_types[0], input_types[1])?)
     }
 }
-
-define_arithmetic_dimension_capability!(
-    /// Subtracts one first-class runtime dimension from another and rejects negative results.
-    /// [`DimensionSub::dimension_sub`] is the fallible counterpart to [`std::ops::Sub`];
-    /// [`DimensionValue`](crate::DimensionValue) supports `-` as panicking convenience syntax.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::{DimensionSub, DimensionValue, ProgramError};
-    /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(7)?.dimension_sub(&DimensionValue::constant(3)?)?;
-    /// assert_eq!(result.extent(), 4);
-    /// assert!(DimensionValue::constant(3)?.dimension_sub(&DimensionValue::constant(7)?).is_err());
-    /// # Ok(())
-    /// # }
-    /// ```
-    DimensionSub,
-    /// Returns `self - right`, failing if `right` is greater than `self`.
-    dimension_sub(right),
-    DimensionSubOperation,
-);
 
 /// Derives sound bounds for checked dimension subtraction.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<DimensionBounds, DimensionError> {
@@ -82,11 +59,7 @@ mod tests {
         assert_eq!(operation.to_string(), DIMENSION_SUB_OPERATION_NAME);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(8)).unwrap());
         assert_eq!(
-            DimensionValue::constant(7)
-                .unwrap()
-                .dimension_sub(&DimensionValue::constant(3).unwrap())
-                .unwrap()
-                .extent(),
+            DimensionValue::constant(7).unwrap().sub(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             4,
         );
     }

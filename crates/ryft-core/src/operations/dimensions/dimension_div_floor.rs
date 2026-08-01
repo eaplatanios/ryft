@@ -1,7 +1,8 @@
-use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_dimension_operation};
-use crate::operations::math::DivOperationFor;
+use crate::macros::check_count;
+use crate::macros::define_arithmetic_dimension_operation;
+use crate::operations::math::{Div, DivOperation};
 use crate::parameters::Parameter;
-use crate::programs::ProgramError;
+use crate::programs::{OperationProvider, ProgramError};
 use crate::types::{DimensionBounds, DimensionError, DimensionType};
 
 use super::{positive_divisor_lower_bound, representable_extent_range};
@@ -10,47 +11,23 @@ use super::{positive_divisor_lower_bound, representable_extent_range};
 pub const DIMENSION_DIV_FLOOR_OPERATION_NAME: &str = "dimension_div_floor";
 
 define_arithmetic_dimension_operation!(
-    /// Checked dimension-floor-division operation used by [`DimensionDivFloor`].
-    ///
-    /// Refer to [`DimensionDivFloor`] for semantic details and an example.
+    /// Checked dimension-floor-division operation used by [`Div`].
     DimensionDivFloorOperation, DIMENSION_DIV_FLOOR_OPERATION_NAME,
-    DimensionDivFloor, dimension_div_floor,
+    Div, div,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} // {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
 );
 
-impl DivOperationFor for DimensionType {
+impl OperationProvider<DimensionType> for DivOperation {
     type Operation = DimensionDivFloorOperation;
 
-    #[inline]
-    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError> {
-        Ok(DimensionDivFloorOperation::new(left_type, right_type)?)
+    fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Ok(DimensionDivFloorOperation::new(input_types[0], input_types[1])?)
     }
 }
-
-define_arithmetic_dimension_capability!(
-    /// Floor-divides one runtime dimension by a positive runtime dimension.
-    /// [`DimensionDivFloor::dimension_div_floor`] is the fallible counterpart to [`std::ops::Div`]; because dimensions
-    /// are nonnegative integers, [`DimensionValue`](crate::DimensionValue)'s `/` operator has these same floor-division
-    /// semantics.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::{DimensionDivFloor, DimensionValue, ProgramError};
-    /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(7)?.dimension_div_floor(&DimensionValue::constant(3)?)?;
-    /// assert_eq!(result.extent(), 2);
-    /// # Ok(())
-    /// # }
-    /// ```
-    DimensionDivFloor,
-    /// Returns `self // right`, failing when `right` is zero.
-    dimension_div_floor(right),
-    DimensionDivFloorOperation,
-);
 
 /// Derives sound bounds for checked dimension floor division.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<DimensionBounds, DimensionError> {
@@ -65,6 +42,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::dimensions::DimensionValue;
+    use crate::operations::math::Div;
     use crate::types::DimensionBounds;
 
     use super::super::test_dimension_type;
@@ -78,11 +56,7 @@ mod tests {
         assert_eq!(operation.to_string(), DIMENSION_DIV_FLOOR_OPERATION_NAME);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(9)).unwrap());
         assert_eq!(
-            DimensionValue::constant(7)
-                .unwrap()
-                .dimension_div_floor(&DimensionValue::constant(3).unwrap())
-                .unwrap()
-                .extent(),
+            DimensionValue::constant(7).unwrap().div(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             2,
         );
     }

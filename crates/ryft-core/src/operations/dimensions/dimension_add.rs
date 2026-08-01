@@ -1,7 +1,8 @@
-use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_dimension_operation};
-use crate::operations::math::AddOperationFor;
+use crate::macros::check_count;
+use crate::macros::define_arithmetic_dimension_operation;
+use crate::operations::math::{Add, AddOperation};
 use crate::parameters::Parameter;
-use crate::programs::ProgramError;
+use crate::programs::{OperationProvider, ProgramError};
 use crate::types::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
 
 use super::{bounds_overflow, representable_extent_range};
@@ -10,51 +11,25 @@ use super::{bounds_overflow, representable_extent_range};
 pub const DIMENSION_ADD_OPERATION_NAME: &str = "dimension_add";
 
 define_arithmetic_dimension_operation!(
-    /// Checked dimension-addition operation used by [`DimensionAdd`].
-    ///
-    /// Refer to [`DimensionAdd`] for semantic details and an example.
+    /// Checked dimension-addition operation used by [`Add`].
     DimensionAddOperation,
     DIMENSION_ADD_OPERATION_NAME,
-    DimensionAdd,
-    dimension_add,
+    Add,
+    add,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} + {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
 );
 
-impl AddOperationFor for DimensionType {
+impl OperationProvider<DimensionType> for AddOperation {
     type Operation = DimensionAddOperation;
 
-    #[inline]
-    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError> {
-        Ok(DimensionAddOperation::new(left_type, right_type)?)
+    fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Ok(DimensionAddOperation::new(input_types[0], input_types[1])?)
     }
 }
-
-define_arithmetic_dimension_capability!(
-    /// Adds two first-class runtime dimensions using checked nonnegative integer arithmetic.
-    ///
-    /// The result owns a fresh dimension identity whose bounds contain every representable sum admitted by the
-    /// operands. Addition fails when either inferred bounds or a concrete result exceeds Ryft's portable dimension
-    /// representation. [`DimensionAdd::dimension_add`] is the fallible counterpart to [`std::ops::Add`];
-    /// [`DimensionValue`](crate::DimensionValue) supports `+` as panicking convenience syntax.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::{DimensionAdd, DimensionValue, ProgramError};
-    /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(3)?.dimension_add(&DimensionValue::constant(4)?)?;
-    /// assert_eq!(result.extent(), 7);
-    /// # Ok(())
-    /// # }
-    /// ```
-    DimensionAdd,
-    /// Returns the checked sum of `self` and `right`.
-    dimension_add(right),
-    DimensionAddOperation,
-);
 
 /// Derives sound bounds for checked dimension addition.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<DimensionBounds, DimensionError> {
@@ -91,11 +66,7 @@ mod tests {
         assert_eq!(operation.right_type(), &right);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(3, Some(13)).unwrap());
         assert_eq!(
-            DimensionValue::constant(7)
-                .unwrap()
-                .dimension_add(&DimensionValue::constant(3).unwrap())
-                .unwrap()
-                .extent(),
+            DimensionValue::constant(7).unwrap().add(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             10,
         );
     }
@@ -136,7 +107,7 @@ mod tests {
         let (traced_type, traced_program) = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
             |left| {
                 let right = left.context().lift(DimensionValue::constant(2)?)?;
-                left.dimension_add(&right)?.dimension_add(&right)
+                left.add(&right)?.add(&right)
             },
             left_type.clone(),
         )

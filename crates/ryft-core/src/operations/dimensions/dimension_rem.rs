@@ -1,7 +1,8 @@
-use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_dimension_operation};
-use crate::operations::math::RemOperationFor;
+use crate::macros::check_count;
+use crate::macros::define_arithmetic_dimension_operation;
+use crate::operations::math::{Rem, RemOperation};
 use crate::parameters::Parameter;
-use crate::programs::ProgramError;
+use crate::programs::{OperationProvider, ProgramError};
 use crate::types::{DimensionBounds, DimensionError, DimensionType};
 
 use super::{positive_divisor_lower_bound, representable_extent_range};
@@ -10,46 +11,23 @@ use super::{positive_divisor_lower_bound, representable_extent_range};
 pub const DIMENSION_REM_OPERATION_NAME: &str = "dimension_rem";
 
 define_arithmetic_dimension_operation!(
-    /// Checked dimension-remainder operation used by [`DimensionRem`].
-    ///
-    /// Refer to [`DimensionRem`] for semantic details and an example.
+    /// Checked dimension-remainder operation used by [`Rem`].
     DimensionRemOperation, DIMENSION_REM_OPERATION_NAME,
-    DimensionRem, dimension_rem,
+    Rem, rem,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} % {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
 );
 
-impl RemOperationFor for DimensionType {
+impl OperationProvider<DimensionType> for RemOperation {
     type Operation = DimensionRemOperation;
 
-    #[inline]
-    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError> {
-        Ok(DimensionRemOperation::new(left_type, right_type)?)
+    fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Ok(DimensionRemOperation::new(input_types[0], input_types[1])?)
     }
 }
-
-define_arithmetic_dimension_capability!(
-    /// Computes the remainder of one runtime dimension divided by a positive runtime dimension.
-    /// [`DimensionRem::dimension_rem`] is the fallible counterpart to [`std::ops::Rem`];
-    /// [`DimensionValue`](crate::DimensionValue) supports `%` as panicking convenience syntax.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::{DimensionRem, DimensionValue, ProgramError};
-    /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(7)?.dimension_rem(&DimensionValue::constant(3)?)?;
-    /// assert_eq!(result.extent(), 1);
-    /// # Ok(())
-    /// # }
-    /// ```
-    DimensionRem,
-    /// Returns `self % right`, failing when `right` is zero.
-    dimension_rem(right),
-    DimensionRemOperation,
-);
 
 /// Derives sound bounds for checked dimension remainder.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<DimensionBounds, DimensionError> {
@@ -77,11 +55,7 @@ mod tests {
         assert_eq!(operation.to_string(), DIMENSION_REM_OPERATION_NAME);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(4)).unwrap());
         assert_eq!(
-            DimensionValue::constant(7)
-                .unwrap()
-                .dimension_rem(&DimensionValue::constant(3).unwrap())
-                .unwrap()
-                .extent(),
+            DimensionValue::constant(7).unwrap().rem(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             1,
         );
     }

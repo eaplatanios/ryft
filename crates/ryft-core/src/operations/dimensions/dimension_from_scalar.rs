@@ -37,7 +37,7 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 ///
 /// ```rust
 /// # use ryft_core::{
-/// #     ArrayProgramValue, DimensionBounds, DimensionFromScalar, DimensionMul, DimensionValue, DimensionVariable,
+/// #     ArrayProgramValue, DimensionBounds, DimensionFromScalar, DimensionValue, DimensionVariable, Mul,
 /// #     ProgramError,
 /// # };
 /// # use ryft_core::backends::arrays::Array;
@@ -49,7 +49,7 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 ///     unreachable!("dimension_from_scalar always returns a dimension member");
 /// };
 /// assert_eq!(dimension.extent(), 5);
-/// let doubled = dimension.dimension_mul(&DimensionValue::constant(2)?)?;
+/// let doubled = dimension.mul(&DimensionValue::constant(2)?)?;
 /// assert_eq!(doubled.extent(), 10);
 /// # Ok(())
 /// # }
