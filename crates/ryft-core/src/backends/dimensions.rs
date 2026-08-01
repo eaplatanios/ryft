@@ -6,11 +6,12 @@ use ryft_macros::{Operation, Parameter};
 use crate::contexts::EagerContext;
 use crate::operations::constants::ConstantOperation;
 use crate::operations::dimensions::{
-    DimensionAdd, DimensionAddOperation, DimensionDivFloor, DimensionDivFloorOperation, DimensionMax,
-    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMul, DimensionMulOperation, DimensionPow,
-    DimensionPowOperation, DimensionRem, DimensionRemOperation, DimensionRequirement, DimensionRequirementOperation,
-    DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSub, DimensionSubOperation, checked_power,
+    DimensionAddOperation, DimensionDivFloorOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
+    DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
+    DimensionRequirement, DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation,
+    DimensionSubOperation, checked_power,
 };
+use crate::operations::math::{Add, Div, Mul, Rem, Sub};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::identities::TypeIdentityRenaming;
@@ -19,9 +20,6 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
 use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
-
-// TODO(eaplatanios): Why can we not use `AddOperation` instead of `DimensionAddOperation`, etc.? That would also
-//  remove the need for `AddOperationFor`, etc.
 
 /// Closed [`Operation`] type for staged [`DimensionValue`] [`Program`](crate::Program)s.
 #[derive(Clone, Debug, Operation)]
@@ -44,7 +42,7 @@ pub type DimensionTracingContext = TracingContext<DimensionValue, DimensionOpera
 
 /// Checked host representation of a first-class runtime [`Dimension`](crate::Dimension) value. Its eager domain
 /// performs checked host integer arithmetic without allocating an array or dispatching to a device backend. Fallible
-/// capabilities such as [`DimensionAdd::dimension_add`] form the canonical arithmetic API. [`std::ops::Add`],
+/// capabilities such as [`Add::add`] form the canonical arithmetic API. [`std::ops::Add`],
 /// [`std::ops::Sub`], [`std::ops::Mul`], [`std::ops::Div`], and [`std::ops::Rem`] implementations provide panicking
 /// operator sugar for both owned and borrowed values.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
@@ -143,8 +141,8 @@ impl Concretizable<usize> for DimensionValue {
 
 // TODO(eaplatanios): Review from here onwards.
 
-impl DimensionAdd for DimensionValue {
-    fn dimension_add(&self, right: &Self) -> Result<Self, ProgramError> {
+impl Add for DimensionValue {
+    fn add(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionAddOperation::new(&self.r#type, &right.r#type)?;
         let inputs = &[self.r#type.clone(), right.r#type.clone()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
@@ -161,8 +159,8 @@ impl DimensionAdd for DimensionValue {
     }
 }
 
-impl DimensionSub for DimensionValue {
-    fn dimension_sub(&self, right: &Self) -> Result<Self, ProgramError> {
+impl Sub for DimensionValue {
+    fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionSubOperation::new(&self.r#type, &right.r#type)?;
         let inputs = &[self.r#type.clone(), right.r#type.clone()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
@@ -189,8 +187,8 @@ impl DimensionSaturatingSub for DimensionValue {
     }
 }
 
-impl DimensionMul for DimensionValue {
-    fn dimension_mul(&self, right: &Self) -> Result<Self, ProgramError> {
+impl Mul for DimensionValue {
+    fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionMulOperation::new(&self.r#type, &right.r#type)?;
         let inputs = &[self.r#type.clone(), right.r#type.clone()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
@@ -226,8 +224,8 @@ impl DimensionPow for DimensionValue {
     }
 }
 
-impl DimensionDivFloor for DimensionValue {
-    fn dimension_div_floor(&self, right: &Self) -> Result<Self, ProgramError> {
+impl Div for DimensionValue {
+    fn div(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionDivFloorOperation::new(&self.r#type, &right.r#type)?;
         let inputs = &[self.r#type.clone(), right.r#type.clone()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
@@ -246,8 +244,8 @@ impl DimensionDivFloor for DimensionValue {
     }
 }
 
-impl DimensionRem for DimensionValue {
-    fn dimension_rem(&self, right: &Self) -> Result<Self, ProgramError> {
+impl Rem for DimensionValue {
+    fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionRemOperation::new(&self.r#type, &right.r#type)?;
         let inputs = &[self.r#type.clone(), right.r#type.clone()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
@@ -326,11 +324,11 @@ macro_rules! impl_dimension_operator {
     };
 }
 
-impl_dimension_operator!(Add, add, DimensionAdd, dimension_add);
-impl_dimension_operator!(Sub, sub, DimensionSub, dimension_sub);
-impl_dimension_operator!(Mul, mul, DimensionMul, dimension_mul);
-impl_dimension_operator!(Div, div, DimensionDivFloor, dimension_div_floor);
-impl_dimension_operator!(Rem, rem, DimensionRem, dimension_rem);
+impl_dimension_operator!(Add, add, Add, add);
+impl_dimension_operator!(Sub, sub, Sub, sub);
+impl_dimension_operator!(Mul, mul, Mul, mul);
+impl_dimension_operator!(Div, div, Div, div);
+impl_dimension_operator!(Rem, rem, Rem, rem);
 
 impl DimensionRequirement for DimensionValue {
     fn require_equal(&self, right: &Self) -> Result<(), ProgramError> {
@@ -362,9 +360,7 @@ impl DimensionRequirement for DimensionValue {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::operations::dimensions::{
-        DimensionAdd, DimensionDivFloor, DimensionRem, DimensionRequirement, DimensionSub,
-    };
+    use crate::operations::dimensions::DimensionRequirement;
     use crate::tracing::Trace;
 
     use super::*;
@@ -398,7 +394,7 @@ mod tests {
 
         let left = DimensionValue::constant(7).unwrap();
         let right = DimensionValue::constant(3).unwrap();
-        assert_eq!(left.dimension_add(&right).unwrap().extent(), 10);
+        assert_eq!(left.add(&right).unwrap().extent(), 10);
         left.require_less_than_or_equal(&DimensionValue::constant(8).unwrap()).unwrap();
 
         // Concrete capabilities derive fresh result types from their operands without exposing IR operations in the
@@ -408,13 +404,13 @@ mod tests {
             DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(0, Some(10)).unwrap()));
         let left = DimensionValue::new(left_type.clone(), 7).unwrap();
         let right = DimensionValue::new(right_type.clone(), 3).unwrap();
-        let sum = left.dimension_add(&right).unwrap();
+        let sum = left.add(&right).unwrap();
         assert_eq!(sum.r#type().bounds(), DimensionBounds::new(0, Some(19)).unwrap());
         assert_eq!(sum.extent(), 10);
 
         // Concrete backend capability implementations retain operand-specific diagnostics for invalid observed
         // extents admitted by otherwise valid operand bounds.
-        let error = DimensionValue::new(left_type.clone(), 1).unwrap().dimension_sub(&right).unwrap_err();
+        let error = DimensionValue::new(left_type.clone(), 1).unwrap().sub(&right).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::RequirementViolation {
@@ -422,12 +418,12 @@ mod tests {
             }),
         );
         let zero = DimensionValue::new(right_type.clone(), 0).unwrap();
-        let error = left.dimension_div_floor(&zero).unwrap_err();
+        let error = left.div(&zero).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::RequirementViolation { message: "right > 0; observed left=7, right=0".to_string() }),
         );
-        let error = left.dimension_rem(&zero).unwrap_err();
+        let error = left.rem(&zero).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::RequirementViolation { message: "right > 0; observed left=7, right=0".to_string() }),

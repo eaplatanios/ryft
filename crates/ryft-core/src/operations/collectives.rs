@@ -11,14 +11,14 @@
 //! body and lowers to cross-device collectives over that mesh axis.
 
 use std::fmt::{Debug, Display};
-use std::ops::Mul;
+use std::ops::Mul as StdMul;
 
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::backends::dimensions::DimensionValue;
 use crate::backends::scalars::Scalar;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError,
+    BatchingError, StaticArrayBatchingPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -28,17 +28,18 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::{Fill, ZeroLike};
-use crate::operations::dimensions::{DimensionDivFloor, DimensionMul, DimensionRequirement, DimensionSize};
+use crate::operations::dimensions::{DimensionRequirement, DimensionSize};
+use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
 use crate::operations::manipulation::slicing::resized_output_sharding;
-use crate::operations::manipulation::{Concatenate, LegacyBroadcast, Reshape, Slice, Transpose};
-use crate::operations::math::{Reduce, ReductionKind};
+use crate::operations::manipulation::{Concatenate, LegacyBroadcast, Reshape, ReshapeParameters, Slice, Transpose};
+use crate::operations::math::{Div, Mul, Reduce, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{ProjectedValue, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::sharding::ShardingDimension;
+use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
 
@@ -399,7 +400,7 @@ impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for C
 where
     C: Context<Type = ArrayType> + Fill<Scalar, C::Value>,
     C::Operation: From<CollectiveOperation>,
-    <C as Domain>::Value: Reduce + Mul<Output = <C as Domain>::Value>,
+    <C as Domain>::Value: Reduce + StdMul<Output = <C as Domain>::Value>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -467,7 +468,7 @@ fn collective_reduce_batch<V, MakePMeanFactor>(
     make_pmean_factor: MakePMeanFactor,
 ) -> Result<Vec<ArrayBatch<V>>, BatchingError>
 where
-    V: Value<Type = ArrayType> + Reduce + Mul<Output = V>,
+    V: Value<Type = ArrayType> + Reduce + StdMul<Output = V>,
     MakePMeanFactor: FnOnce(ArrayType, f64) -> Result<V, ProgramError>,
 {
     check_count!("input", inputs, 1, ProgramError);
@@ -1153,48 +1154,392 @@ fn interpret_degenerate_collective<V: Clone>(
     Ok(vec![inputs[0].clone()])
 }
 
-/// Shared operand preparation for the shape-changing collective batching rules at a matching `batch` level. It
-/// validates the single-operand contract, realigns the mapped batch axis to the leading physical axis, and returns
-/// the packed physical value together with its static dimensions (whose leading entry is the batch size).
+/// Representation boundary used only by shape-changing collective batching rules.
 ///
-/// A replicated operand is first materialized as `axis_size` identical batch items via [`ArrayBatch::broadcast`],
-/// which yields the degenerate collective-of-a-replicated-value semantics for free: an `all_gather` of a replicated
-/// value concatenates `axis_size` copies, a `psum_scatter` scatters the `axis_size`-fold sum, and so on. A mapped
-/// batch axis whose size disagrees with the operation's resolved `axis_size` reports an error; the staging
-/// capabilities resolve both from the same binder, so a mismatch indicates a hand-constructed operation.
-fn shape_changing_collective_batch_operand<V>(
-    operation_name: &str,
-    axis_name: &str,
-    axis_size: usize,
-    inputs: &[ArrayBatch<V>],
-) -> Result<(V, Vec<usize>), BatchingError>
+/// The collective kernels own every formula. This trait exposes only the extent representation and the alignment and
+/// reshape encodings that differ between homogeneous arrays and composite array/dimension programs.
+pub(crate) trait CollectiveBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBatchingPolicy<C> {
+    /// Extent representation consumed by the shared collective kernels.
+    type ShapeExtent: Clone + Debug + Div + Mul;
+
+    /// Returns and validates the active mapped-axis extent in the kernel's representation.
+    fn collective_axis_extent(
+        context: &BatchingContext<C, ArrayBatching<Self>>,
+        operation_name: &str,
+        axis_name: &str,
+        axis_size: usize,
+    ) -> Result<Self::ShapeExtent, BatchingError>;
+
+    /// Materializes a statically known extent in the kernel's representation.
+    fn collective_extent_constant(
+        context: &BatchingContext<C, ArrayBatching<Self>>,
+        extent: usize,
+    ) -> Result<Self::ShapeExtent, BatchingError>;
+
+    /// Materializes a statically known type-level dimension in the kernel's representation.
+    fn collective_extent_from_dimension(
+        context: &BatchingContext<C, ArrayBatching<Self>>,
+        dimension: &Dimension,
+    ) -> Result<Self::ShapeExtent, BatchingError> {
+        let extent = dimension.value().ok_or_else(|| BatchingError::UnsupportedOperation {
+            message: "shape-changing collective batching requires statically shaped operands".to_string(),
+        })?;
+        Self::collective_extent_constant(context, extent)
+    }
+
+    /// Enforces exact divisibility when it is not statically decidable.
+    fn require_divisible_collective_extents(
+        left: &Self::ShapeExtent,
+        right: &Self::ShapeExtent,
+    ) -> Result<(), BatchingError>;
+
+    /// Aligns `batch` to the leading mapped axis using its complete logical input extents.
+    fn match_collective_axis(
+        context: &BatchingContext<C, ArrayBatching<Self>>,
+        batch: &ArrayBatch<C::Value>,
+        input_extents: &[Self::ShapeExtent],
+    ) -> Result<ArrayBatch<C::Value>, BatchingError>;
+
+    /// Reshapes `value` using a complete extent list in this policy's representation.
+    fn reshape_collective(
+        context: &BatchingContext<C, ArrayBatching<Self>>,
+        value: C::Value,
+        output_extents: &[Self::ShapeExtent],
+        output_sharding: Option<Sharding>,
+    ) -> Result<C::Value, BatchingError>;
+}
+
+impl<C> CollectiveBatchingPolicy<C> for StaticArrayBatchingPolicy
 where
-    V: Value<Type = ArrayType> + LegacyBroadcast + Transpose,
+    C: Context<Type = ArrayType, Value: LegacyBroadcast + Reshape + Transpose>,
 {
-    check_count!("input", inputs, 1, ProgramError);
-    let input = if inputs[0].batch_axis().is_replicated() {
-        inputs[0].broadcast(0, axis_size, ShardingDimension::Replicated)?
-    } else {
-        inputs[0].move_axis(0)?
+    type ShapeExtent = usize;
+
+    fn collective_axis_extent(
+        context: &BatchingContext<C, ArrayBatching<Self>>,
+        operation_name: &str,
+        axis_name: &str,
+        axis_size: usize,
+    ) -> Result<Self::ShapeExtent, BatchingError> {
+        let batch_size = *context.axis_extent();
+        if batch_size != axis_size {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "'{operation_name}' over axis '{axis_name}' resolved axis size {axis_size} but the mapped batch \
+                     axis has size {batch_size}",
+                ),
+            });
+        }
+        Ok(batch_size)
+    }
+
+    fn collective_extent_constant(
+        _context: &BatchingContext<C, ArrayBatching<Self>>,
+        extent: usize,
+    ) -> Result<Self::ShapeExtent, BatchingError> {
+        Ok(extent)
+    }
+
+    fn require_divisible_collective_extents(
+        left: &Self::ShapeExtent,
+        right: &Self::ShapeExtent,
+    ) -> Result<(), BatchingError> {
+        if *right == 0 || left % right != 0 {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!("extent {left} must be divisible by extent {right}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn match_collective_axis(
+        context: &BatchingContext<C, ArrayBatching<Self>>,
+        batch: &ArrayBatch<C::Value>,
+        _input_extents: &[Self::ShapeExtent],
+    ) -> Result<ArrayBatch<C::Value>, BatchingError> {
+        Self::match_axis(context, batch, 0.into())
+    }
+
+    fn reshape_collective(
+        _context: &BatchingContext<C, ArrayBatching<Self>>,
+        value: C::Value,
+        output_extents: &[Self::ShapeExtent],
+        output_sharding: Option<Sharding>,
+    ) -> Result<C::Value, BatchingError> {
+        let output_shape = Shape::new(output_extents.iter().copied().map(Dimension::Static).collect());
+        if value.r#type().shape() == &output_shape && value.r#type().sharding() == output_sharding.as_ref() {
+            return Ok(value);
+        }
+        Ok(value.reshape(ReshapeParameters::new(output_shape).with_output_sharding(output_sharding))?)
+    }
+}
+
+/// Returns the physical concat axis and mapped result axis for a forwarded all-gather.
+pub(crate) fn forwarded_all_gather_axes(mode: CollectiveMode, concat_axis: usize, batch_axis: usize) -> (usize, usize) {
+    match mode {
+        CollectiveMode::Tiled => (concat_axis + usize::from(concat_axis >= batch_axis), batch_axis),
+        CollectiveMode::Untiled if concat_axis <= batch_axis => (concat_axis, batch_axis + 1),
+        CollectiveMode::Untiled => (concat_axis + 1, batch_axis),
+    }
+}
+
+/// Returns the physical scatter axis and mapped result axis for a forwarded sum-scatter.
+pub(crate) fn forwarded_psum_scatter_axes(
+    mode: CollectiveMode,
+    scatter_axis: usize,
+    batch_axis: usize,
+) -> (usize, usize) {
+    let physical_scatter_axis = scatter_axis + usize::from(scatter_axis >= batch_axis);
+    let output_batch_axis = match mode {
+        CollectiveMode::Tiled => batch_axis,
+        CollectiveMode::Untiled if scatter_axis < batch_axis => batch_axis - 1,
+        CollectiveMode::Untiled => batch_axis,
     };
-    // The operand is mapped at axis 0 by construction (a replicated operand was just broadcast onto a mapped axis),
-    // so a missing batch size is impossible here; a dynamic batch axis errors through `batch_size` itself.
-    let batch_size = input.batch_size()?.unwrap();
-    if batch_size != axis_size {
+    (physical_scatter_axis, output_batch_axis)
+}
+
+/// Returns the physical split/concat axes and mapped result axis for a forwarded all-to-all.
+pub(crate) fn forwarded_all_to_all_axes(
+    mode: CollectiveMode,
+    split_axis: usize,
+    concat_axis: usize,
+    batch_axis: usize,
+) -> (usize, usize, usize) {
+    let physical_split_axis = split_axis + usize::from(split_axis >= batch_axis);
+    let (physical_concat_axis, output_batch_axis) = match mode {
+        CollectiveMode::Tiled => (concat_axis + usize::from(concat_axis >= batch_axis), batch_axis),
+        CollectiveMode::Untiled => {
+            let output_batch_axis = batch_axis - usize::from(split_axis < batch_axis);
+            if concat_axis <= output_batch_axis {
+                (concat_axis, output_batch_axis + 1)
+            } else {
+                (concat_axis + 1, output_batch_axis)
+            }
+        }
+    };
+    (physical_split_axis, physical_concat_axis, output_batch_axis)
+}
+
+/// Forwards one shape-changing collective while updating its mapped result axis.
+fn forward_shape_changing_collective<C, P>(
+    context: &BatchingContext<C, ArrayBatching<P>>,
+    operation: C::Operation,
+    input: &ArrayBatch<C::Value>,
+    output_batch_axis: Option<usize>,
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    P: ArrayBatchingPolicy<C>,
+{
+    let mut outputs = context.parent().bind(operation, Vec::new(), std::slice::from_ref(input.value()))?;
+    check_count!("output", outputs, 1, ProgramError);
+    let output = outputs.remove(0);
+    let output_type = output.r#type().into_owned();
+    let output_batch_axis = output_batch_axis.map_or_else(BatchAxis::replicated, BatchAxis::from_position);
+    Ok(vec![ArrayBatch::new(output_type, output, output_batch_axis)?])
+}
+
+/// Applies the matching-axis all-gather batching semantics over the policy-selected extent representation.
+pub(crate) fn batch_all_gather_matching_axis<C, P>(
+    operation: &AllGatherOperation,
+    context: &BatchingContext<C, ArrayBatching<P>>,
+    input: &ArrayBatch<C::Value>,
+    logical_input_rank: usize,
+    output_extents: Vec<P::ShapeExtent>,
+    output_sharding: Option<Sharding>,
+) -> Result<ArrayBatch<C::Value>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    C::Value: Transpose,
+    P: CollectiveBatchingPolicy<C>,
+{
+    if operation.options.axis_index_groups.is_some() {
+        return Err(BatchingError::UnsupportedOperation {
+            message: "'all_gather' axis index groups are not supported when a batch transform binds the collective \
+                      axis"
+                .to_string(),
+        });
+    }
+    if operation.output_variance == AllGatherOutputVariance::Reduced {
+        return Err(BatchingError::UnsupportedOperation {
+            message: "'all_gather' with reduced output variance is not supported when a batch transform binds the \
+                      collective axis"
+                .to_string(),
+        });
+    }
+    let axis_extent =
+        P::collective_axis_extent(context, ALL_GATHER_OPERATION_NAME, &operation.axis_name, operation.axis_size)?;
+
+    let axis_is_out_of_bounds = match operation.options.mode {
+        CollectiveMode::Untiled => operation.concat_axis > logical_input_rank,
+        CollectiveMode::Tiled => operation.concat_axis >= logical_input_rank,
+    };
+    if axis_is_out_of_bounds {
         return Err(BatchingError::UnsupportedOperation {
             message: format!(
-                "'{operation_name}' over axis '{axis_name}' resolved axis size {axis_size} but the mapped batch \
-                 axis has size {batch_size}",
+                "'all_gather' concat axis {} is out of bounds for rank {logical_input_rank}",
+                operation.concat_axis,
             ),
         });
     }
-    let Some(shape) = input.value().r#type().static_shape() else {
+
+    let mut input_extents = output_extents.clone();
+    match operation.options.mode {
+        CollectiveMode::Untiled => {
+            input_extents.remove(operation.concat_axis);
+        }
+        CollectiveMode::Tiled => {
+            P::require_divisible_collective_extents(&output_extents[operation.concat_axis], &axis_extent)?;
+            input_extents[operation.concat_axis] = output_extents[operation.concat_axis].div(&axis_extent)?;
+        }
+    }
+    let input = P::match_collective_axis(context, input, input_extents.as_slice())?;
+    let moved = input.into_value().move_axis(0, operation.concat_axis)?;
+    let gathered = P::reshape_collective(context, moved, output_extents.as_slice(), output_sharding)?;
+    Ok(ArrayBatch::replicated(gathered))
+}
+
+/// Applies the matching-axis sum-scatter batching semantics over the policy-selected extent representation.
+pub(crate) fn batch_psum_scatter_matching_axis<C, P>(
+    operation: &PSumScatterOperation,
+    context: &BatchingContext<C, ArrayBatching<P>>,
+    input: &ArrayBatch<C::Value>,
+    logical_input_rank: usize,
+    output_extents: Vec<P::ShapeExtent>,
+    output_sharding: Option<Sharding>,
+) -> Result<ArrayBatch<C::Value>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    C::Value: Reduce + Transpose,
+    P: CollectiveBatchingPolicy<C>,
+{
+    if operation.options.axis_index_groups.is_some() {
         return Err(BatchingError::UnsupportedOperation {
-            message: format!("'{operation_name}' batching requires statically shaped operands"),
+            message: "'psum_scatter' axis index groups are not supported when a batch transform binds the collective \
+                      axis"
+                .to_string(),
         });
+    }
+    if operation.scatter_axis >= logical_input_rank {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "'psum_scatter' scatter axis {} is out of bounds for rank {logical_input_rank}",
+                operation.scatter_axis,
+            ),
+        });
+    }
+
+    let axis_extent =
+        P::collective_axis_extent(context, PSUM_SCATTER_OPERATION_NAME, &operation.axis_name, operation.axis_size)?;
+
+    let mut input_extents = output_extents.clone();
+    match operation.options.mode {
+        CollectiveMode::Untiled => input_extents.insert(operation.scatter_axis, axis_extent.clone()),
+        CollectiveMode::Tiled => {
+            input_extents[operation.scatter_axis] = output_extents[operation.scatter_axis].mul(&axis_extent)?;
+        }
+    }
+    let input = P::match_collective_axis(context, input, input_extents.as_slice())?;
+    let summed = input.into_value().reduce(&[0], ReductionKind::Sum);
+    let scattered = match operation.options.mode {
+        CollectiveMode::Untiled => summed.move_axis(operation.scatter_axis, 0)?,
+        CollectiveMode::Tiled => {
+            let mut split_extents = output_extents.clone();
+            split_extents.insert(operation.scatter_axis, axis_extent.clone());
+            P::reshape_collective(context, summed, split_extents.as_slice(), None)?
+                .move_axis(operation.scatter_axis, 0)?
+        }
     };
-    let dimensions = shape.dimensions().to_vec();
-    Ok((input.into_value(), dimensions))
+    let mut physical_output_extents = Vec::with_capacity(output_extents.len() + 1);
+    physical_output_extents.push(axis_extent);
+    physical_output_extents.extend(output_extents);
+    let physical_output_sharding = output_sharding
+        .map(|sharding| lift_output_sharding_for_leading_batch_axis(&sharding, context.axis_sharding().clone()))
+        .transpose()?;
+    let output =
+        P::reshape_collective(context, scattered, physical_output_extents.as_slice(), physical_output_sharding)?;
+    ArrayBatch::new(output.r#type().into_owned(), output, BatchAxis::from_position(0))
+}
+
+/// Applies the matching-axis all-to-all batching semantics over the policy-selected extent representation.
+pub(crate) fn batch_all_to_all_matching_axis<C, P>(
+    operation: &AllToAllOperation,
+    context: &BatchingContext<C, ArrayBatching<P>>,
+    input: &ArrayBatch<C::Value>,
+    logical_input_rank: usize,
+    output_extents: Vec<P::ShapeExtent>,
+    output_sharding: Option<Sharding>,
+) -> Result<ArrayBatch<C::Value>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    C::Value: Transpose,
+    P: CollectiveBatchingPolicy<C>,
+{
+    if operation.options.axis_index_groups.is_some() {
+        return Err(BatchingError::UnsupportedOperation {
+            message: "'all_to_all' axis index groups are not supported when a batch transform binds the collective \
+                      axis"
+                .to_string(),
+        });
+    }
+    if operation.split_axis >= logical_input_rank || operation.concat_axis >= logical_input_rank {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "'all_to_all' split axis {} or concat axis {} is out of bounds for rank {logical_input_rank}",
+                operation.split_axis, operation.concat_axis,
+            ),
+        });
+    }
+
+    let axis_extent =
+        P::collective_axis_extent(context, ALL_TO_ALL_OPERATION_NAME, &operation.axis_name, operation.axis_size)?;
+
+    let (input_extents, chunk_extent) = match operation.options.mode {
+        CollectiveMode::Untiled => {
+            let mut input_extents = output_extents.clone();
+            input_extents.remove(operation.concat_axis);
+            input_extents.insert(operation.split_axis, axis_extent.clone());
+            (input_extents, P::collective_extent_constant(context, 1)?)
+        }
+        CollectiveMode::Tiled if operation.split_axis == operation.concat_axis => {
+            P::require_divisible_collective_extents(&output_extents[operation.split_axis], &axis_extent)?;
+            (output_extents.clone(), output_extents[operation.split_axis].div(&axis_extent)?)
+        }
+        CollectiveMode::Tiled => {
+            P::require_divisible_collective_extents(&output_extents[operation.concat_axis], &axis_extent)?;
+            let mut input_extents = output_extents.clone();
+            input_extents[operation.split_axis] = output_extents[operation.split_axis].mul(&axis_extent)?;
+            input_extents[operation.concat_axis] = output_extents[operation.concat_axis].div(&axis_extent)?;
+            (input_extents, output_extents[operation.split_axis].clone())
+        }
+    };
+    let input = P::match_collective_axis(context, input, input_extents.as_slice())?;
+    let mut split_extents = Vec::with_capacity(input_extents.len() + 2);
+    split_extents.push(axis_extent.clone());
+    split_extents.extend(input_extents.iter().cloned());
+    split_extents[operation.split_axis + 1] = axis_extent.clone();
+    split_extents.insert(operation.split_axis + 2, chunk_extent);
+    let split = P::reshape_collective(context, input.into_value(), split_extents.as_slice(), None)?;
+    let exchanged = split.swap_axes(0, operation.split_axis + 1)?;
+    let received = match operation.options.mode {
+        CollectiveMode::Untiled => {
+            let mut squeezed_extents = Vec::with_capacity(input_extents.len() + 1);
+            squeezed_extents.push(axis_extent.clone());
+            squeezed_extents.extend(input_extents);
+            P::reshape_collective(context, exchanged, squeezed_extents.as_slice(), None)?
+                .move_axis(operation.split_axis + 1, operation.concat_axis + 1)?
+        }
+        CollectiveMode::Tiled => exchanged.move_axis(operation.split_axis + 1, operation.concat_axis + 1)?,
+    };
+    let mut physical_output_extents = Vec::with_capacity(output_extents.len() + 1);
+    physical_output_extents.push(axis_extent);
+    physical_output_extents.extend(output_extents);
+    let physical_output_sharding = output_sharding
+        .map(|sharding| lift_output_sharding_for_leading_batch_axis(&sharding, context.axis_sharding().clone()))
+        .transpose()?;
+    let output =
+        P::reshape_collective(context, received, physical_output_extents.as_slice(), physical_output_sharding)?;
+    ArrayBatch::new(output.r#type().into_owned(), output, BatchAxis::from_position(0))
 }
 
 /// Implements the shared structure of the shape-changing collectives: the operation struct with its accessors, the
@@ -1712,12 +2057,12 @@ where
     V: Value<Type = ArrayProgramType> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayProgramType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionMul,
+    <V as ValueProjection<DimensionType>>::Projected: Mul,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
     let effective_axis_size = collective_extent_constant(context, effective_axis_size)?;
     let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
-    Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.dimension_mul(&effective_axis_size)?))
+    Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.mul(&effective_axis_size)?))
 }
 
 /// Computes one tiled collective result extent by requiring exact divisibility and dividing an input-axis extent by
@@ -1731,13 +2076,13 @@ where
     V: Value<Type = ArrayProgramType> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayProgramType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionDivFloor + DimensionRequirement,
+    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
     let effective_axis_size = collective_extent_constant(context, effective_axis_size)?;
     let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
     input_extent.require_divisible_by(&effective_axis_size)?;
-    Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.dimension_div_floor(&effective_axis_size)?))
+    Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.div(&effective_axis_size)?))
 }
 
 /// Requires an input axis extent to equal the effective participant count used by an untiled collective.
@@ -1817,7 +2162,7 @@ where
     V::DispatchDomain: Context<Type = ArrayProgramType> + NamedAxes,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V::DispatchDomain as Domain>::Operation: From<AllGatherOperation>,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionMul,
+    <V as ValueProjection<DimensionType>>::Projected: Mul,
 {
     fn all_gather_with_options(
         &self,
@@ -1913,7 +2258,7 @@ where
     V::DispatchDomain: Context<Type = ArrayProgramType> + NamedAxes,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V::DispatchDomain as Domain>::Operation: From<PSumScatterOperation>,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionDivFloor + DimensionRequirement,
+    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div,
 {
     fn psum_scatter_with_options(
         &self,
@@ -1995,7 +2340,7 @@ where
     V::DispatchDomain: Context<Type = ArrayProgramType> + NamedAxes,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V::DispatchDomain as Domain>::Operation: From<AllToAllOperation>,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionDivFloor + DimensionMul + DimensionRequirement,
+    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div + Mul,
 {
     fn all_to_all_with_options(
         &self,
@@ -2142,11 +2487,11 @@ impl<V: AllToAll> PSwapAxes for V {}
 /// merged into it, laying the gathered chunks out item-major (item 0's chunk first), which matches the tiled
 /// StableHLO `all_gather` ordering. Every batch item sees the same gathered value, so the output is replicated. A
 /// non-matching level forwards the collective untouched to the parent context via [`forward_collective_to_parent`].
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllGatherOperation
+impl<C, P: CollectiveBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllGatherOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<AllGatherOperation>,
-    <C as Domain>::Value: LegacyBroadcast + Reshape + Transpose,
+    <C as Domain>::Value: Transpose,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -2155,54 +2500,48 @@ where
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+            let [input] = inputs else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+            };
+            let Some(batch_axis) = input.batch_axis_position() else {
+                return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+            };
+            let (concat_axis, output_batch_axis) =
+                forwarded_all_gather_axes(self.options.mode, self.concat_axis, batch_axis);
+            let operation = Self::new(
+                self.axis_name.clone(),
+                self.axis_size,
+                concat_axis,
+                self.options.clone(),
+                self.output_variance,
+            );
+            return forward_shape_changing_collective(
+                context,
+                C::Operation::from(operation),
+                input,
+                Some(output_batch_axis),
+            );
         }
-        if self.options.axis_index_groups.is_some() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "'all_gather' axis index groups are not supported when a batch transform binds the \
-                          collective axis"
-                    .to_string(),
-            });
-        }
-        if self.output_variance == AllGatherOutputVariance::Reduced {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "'all_gather' with reduced output variance is not supported when a batch transform binds \
-                          the collective axis"
-                    .to_string(),
-            });
-        }
-        let (value, dimensions) = shape_changing_collective_batch_operand(
-            ALL_GATHER_OPERATION_NAME,
-            &self.axis_name,
-            self.axis_size,
-            inputs,
-        )?;
-        let per_item_rank = dimensions.len() - 1;
-        let axis_is_out_of_bounds = match self.options.mode {
-            CollectiveMode::Untiled => self.concat_axis > per_item_rank,
-            CollectiveMode::Tiled => self.concat_axis >= per_item_rank,
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
-        if axis_is_out_of_bounds {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "'all_gather' concat axis {} is out of bounds for rank {per_item_rank}",
-                    self.concat_axis,
-                ),
-            });
-        }
-        let moved = value.move_axis(0, self.concat_axis)?;
-        let gathered = match self.options.mode {
-            CollectiveMode::Untiled => moved,
-            CollectiveMode::Tiled => {
-                // The physical layout is `[b, d_0, ..., d_{r-1}]`. Moving the leading batch axis to position
-                // `concat_axis` places it immediately before the per-item `concat_axis` dimension, so the row-major
-                // merge of `(b, d_c)` into `b * d_c` concatenates the batch items item-major.
-                let mut output_dimensions = dimensions[1..].to_vec();
-                output_dimensions[self.concat_axis] *= dimensions[0];
-                moved.reshape(Shape::new(output_dimensions.into_iter().map(Dimension::Static).collect()))?
-            }
-        };
-        Ok(vec![ArrayBatch::replicated(gathered)])
+        let input_type = input.unbatched_type();
+        let mut output_types = self.infer_output_types(std::slice::from_ref(&input_type), &[])?;
+        let output_type = output_types.remove(0);
+        let output_extents = output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| P::collective_extent_from_dimension(context, dimension))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(vec![batch_all_gather_matching_axis::<C, P>(
+            self,
+            context,
+            input,
+            input_type.rank(),
+            output_extents,
+            output_type.sharding().cloned(),
+        )?])
     }
 }
 
@@ -2211,11 +2550,11 @@ where
 /// `(b, d_s / b)` chunks and the new chunk axis becomes the output batch axis, so batch item `i` receives chunk `i`
 /// of the sum. A non-matching level forwards the collective untouched to the parent context via
 /// [`forward_collective_to_parent`].
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for PSumScatterOperation
+impl<C, P: CollectiveBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for PSumScatterOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<PSumScatterOperation>,
-    <C as Domain>::Value: LegacyBroadcast + Reduce + Reshape + Transpose,
+    <C as Domain>::Value: Reduce + Transpose,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -2224,67 +2563,42 @@ where
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+            let [input] = inputs else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+            };
+            let Some(batch_axis) = input.batch_axis_position() else {
+                return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+            };
+            let (scatter_axis, output_batch_axis) =
+                forwarded_psum_scatter_axes(self.options.mode, self.scatter_axis, batch_axis);
+            let operation = Self::new(self.axis_name.clone(), self.axis_size, scatter_axis, self.options.clone());
+            return forward_shape_changing_collective(
+                context,
+                C::Operation::from(operation),
+                input,
+                Some(output_batch_axis),
+            );
         }
-        if self.options.axis_index_groups.is_some() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "'psum_scatter' axis index groups are not supported when a batch transform binds the \
-                          collective axis"
-                    .to_string(),
-            });
-        }
-        let (value, dimensions) = shape_changing_collective_batch_operand(
-            PSUM_SCATTER_OPERATION_NAME,
-            &self.axis_name,
-            self.axis_size,
-            inputs,
-        )?;
-        let batch_size = dimensions[0];
-        let per_item_rank = dimensions.len() - 1;
-        if self.scatter_axis >= per_item_rank {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "'psum_scatter' scatter axis {} is out of bounds for rank {per_item_rank}",
-                    self.scatter_axis,
-                ),
-            });
-        }
-        let scatter_dimension = dimensions[self.scatter_axis + 1];
-        let summed = value.reduce(&[0], ReductionKind::Sum);
-        let scattered = match self.options.mode {
-            CollectiveMode::Untiled => {
-                if scatter_dimension != batch_size {
-                    return Err(BatchingError::UnsupportedOperation {
-                        message: format!(
-                            "'psum_scatter' untiled scatter axis {} size {scatter_dimension} must equal axis size \
-                             {batch_size}",
-                            self.scatter_axis,
-                        ),
-                    });
-                }
-                summed.move_axis(self.scatter_axis, 0)?
-            }
-            CollectiveMode::Tiled => {
-                if scatter_dimension % batch_size != 0 {
-                    return Err(BatchingError::UnsupportedOperation {
-                        message: format!(
-                            "'psum_scatter' scatter axis {} size {scatter_dimension} is not divisible by axis size \
-                             {batch_size}",
-                            self.scatter_axis,
-                        ),
-                    });
-                }
-                // Split the per-item `scatter_axis` into `(b, d_s / b)` chunks and map the chunk axis at the front.
-                let mut split_dimensions = dimensions[1..].to_vec();
-                split_dimensions[self.scatter_axis] = batch_size;
-                split_dimensions.insert(self.scatter_axis + 1, scatter_dimension / batch_size);
-                let split =
-                    summed.reshape(Shape::new(split_dimensions.into_iter().map(Dimension::Static).collect()))?;
-                split.move_axis(self.scatter_axis, 0)?
-            }
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
-        let physical_type = scattered.r#type().into_owned();
-        Ok(vec![ArrayBatch::new(physical_type, scattered, Some(0))?])
+        let input_type = input.unbatched_type();
+        let mut output_types = self.infer_output_types(std::slice::from_ref(&input_type), &[])?;
+        let output_type = output_types.remove(0);
+        let output_extents = output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| P::collective_extent_from_dimension(context, dimension))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(vec![batch_psum_scatter_matching_axis::<C, P>(
+            self,
+            context,
+            input,
+            input_type.rank(),
+            output_extents,
+            output_type.sharding().cloned(),
+        )?])
     }
 }
 
@@ -2296,7 +2610,7 @@ impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for P
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<PpermuteOperation>,
-    <C as Domain>::Value: LegacyBroadcast + Concatenate + Slice + Transpose + ZeroLike,
+    <C as Domain>::Value: Concatenate + Slice + Transpose + ZeroLike,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -2307,9 +2621,26 @@ where
         if context.axis_name() != Some(self.axis_name.as_str()) {
             return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
         }
-        let (value, dimensions) =
-            shape_changing_collective_batch_operand(PPERMUTE_OPERATION_NAME, &self.axis_name, self.axis_size, inputs)?;
-        let batch_size = dimensions[0];
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+        };
+        let input = P::match_axis(context, input, 0.into())?;
+        let batch_size = P::axis_size(context)?;
+        if batch_size != self.axis_size {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "'ppermute' over axis '{}' resolved axis size {} but the mapped batch axis has size {batch_size}",
+                    self.axis_name, self.axis_size,
+                ),
+            });
+        }
+        let Some(shape) = input.value().r#type().static_shape() else {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "'ppermute' batching requires statically shaped operands".to_string(),
+            });
+        };
+        let dimensions = shape.dimensions().to_vec();
+        let value = input.into_value();
         // Map each target position along the batch axis to the source item that sends to it; positions that no pair
         // targets receive zeros. Pair uniqueness is enforced by output type inference, so it is not revalidated here.
         let mut sources = vec![None; batch_size];
@@ -2359,11 +2690,11 @@ where
 /// then merged item-major into the per-item `concat_axis` — batch item `i` receives every item's chunk `i`,
 /// concatenated along `concat_axis`. A non-matching level forwards the collective untouched to the parent context
 /// via [`forward_collective_to_parent`].
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllToAllOperation
+impl<C, P: CollectiveBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllToAllOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<AllToAllOperation>,
-    <C as Domain>::Value: LegacyBroadcast + Reshape + Transpose,
+    <C as Domain>::Value: Transpose,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -2372,80 +2703,43 @@ where
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+            let [input] = inputs else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+            };
+            let Some(batch_axis) = input.batch_axis_position() else {
+                return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+            };
+            let (split_axis, concat_axis, output_batch_axis) =
+                forwarded_all_to_all_axes(self.options.mode, self.split_axis, self.concat_axis, batch_axis);
+            let operation =
+                Self::new(self.axis_name.clone(), self.axis_size, split_axis, concat_axis, self.options.clone());
+            return forward_shape_changing_collective(
+                context,
+                C::Operation::from(operation),
+                input,
+                Some(output_batch_axis),
+            );
         }
-        if self.options.axis_index_groups.is_some() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "'all_to_all' axis index groups are not supported when a batch transform binds the \
-                          collective axis"
-                    .to_string(),
-            });
-        }
-        let (value, dimensions) = shape_changing_collective_batch_operand(
-            ALL_TO_ALL_OPERATION_NAME,
-            &self.axis_name,
-            self.axis_size,
-            inputs,
-        )?;
-        let batch_size = dimensions[0];
-        let per_item_rank = dimensions.len() - 1;
-        if self.split_axis >= per_item_rank || self.concat_axis >= per_item_rank {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "'all_to_all' split axis {} or concat axis {} is out of bounds for rank {per_item_rank}",
-                    self.split_axis, self.concat_axis,
-                ),
-            });
-        }
-        let split_dimension = dimensions[self.split_axis + 1];
-        match self.options.mode {
-            CollectiveMode::Untiled if split_dimension != batch_size => {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "'all_to_all' untiled split axis {} size {split_dimension} must equal axis size {batch_size}",
-                        self.split_axis,
-                    ),
-                });
-            }
-            CollectiveMode::Tiled if split_dimension % batch_size != 0 => {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "'all_to_all' split axis {} size {split_dimension} is not divisible by axis size {batch_size}",
-                        self.split_axis,
-                    ),
-                });
-            }
-            CollectiveMode::Untiled | CollectiveMode::Tiled => {}
-        }
-        // Split the per-item `split_axis` (physical position `split_axis + 1`) into `(b, d_p / b)` so its leading
-        // factor indexes the chunks, then swap the chunk axis with the leading sender axis: afterwards the leading
-        // axis indexes the *receiving* item and the axis at `split_axis + 1` indexes the sender.
-        let mut split_dimensions = dimensions.clone();
-        split_dimensions[self.split_axis + 1] = batch_size;
-        split_dimensions.insert(self.split_axis + 2, split_dimension / batch_size);
-        let split = value.reshape(Shape::new(split_dimensions.into_iter().map(Dimension::Static).collect()))?;
-        let exchanged = split.swap_axes(0, self.split_axis + 1)?;
-        let received = match self.options.mode {
-            CollectiveMode::Untiled => {
-                // The chunk size is one. Remove that singleton, then move the sender axis from the deleted split
-                // position to the requested materialized named-axis position.
-                let mut squeezed_dimensions = dimensions;
-                squeezed_dimensions[self.split_axis + 1] = batch_size;
-                let squeezed =
-                    exchanged.reshape(Shape::new(squeezed_dimensions.into_iter().map(Dimension::Static).collect()))?;
-                squeezed.move_axis(self.split_axis + 1, self.concat_axis + 1)?
-            }
-            CollectiveMode::Tiled => {
-                // Move the sender axis before `concat_axis` and merge it with that existing dimension.
-                let moved = exchanged.move_axis(self.split_axis + 1, self.concat_axis + 1)?;
-                let mut output_dimensions = dimensions;
-                output_dimensions[self.split_axis + 1] /= batch_size;
-                output_dimensions[self.concat_axis + 1] *= batch_size;
-                moved.reshape(Shape::new(output_dimensions.into_iter().map(Dimension::Static).collect()))?
-            }
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
-        let physical_type = received.r#type().into_owned();
-        Ok(vec![ArrayBatch::new(physical_type, received, Some(0))?])
+        let input_type = input.unbatched_type();
+        let mut output_types = self.infer_output_types(std::slice::from_ref(&input_type), &[])?;
+        let output_type = output_types.remove(0);
+        let output_extents = output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| P::collective_extent_from_dimension(context, dimension))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(vec![batch_all_to_all_matching_axis::<C, P>(
+            self,
+            context,
+            input,
+            input_type.rank(),
+            output_extents,
+            output_type.sharding().cloned(),
+        )?])
     }
 }
 
@@ -2802,6 +3096,24 @@ mod tests {
 
         assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])),);
         assert_eq!(output.to_f64s(), vec![4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_shape_changing_collective_forwarding_accounts_for_the_mapped_axis() {
+        assert_eq!(forwarded_all_gather_axes(CollectiveMode::Tiled, 0, 0), (1, 0));
+        assert_eq!(forwarded_all_gather_axes(CollectiveMode::Tiled, 0, 1), (0, 1));
+        assert_eq!(forwarded_all_gather_axes(CollectiveMode::Untiled, 0, 0), (0, 1));
+        assert_eq!(forwarded_all_gather_axes(CollectiveMode::Untiled, 1, 0), (2, 0));
+
+        assert_eq!(forwarded_psum_scatter_axes(CollectiveMode::Tiled, 0, 0), (1, 0));
+        assert_eq!(forwarded_psum_scatter_axes(CollectiveMode::Tiled, 0, 1), (0, 1));
+        assert_eq!(forwarded_psum_scatter_axes(CollectiveMode::Untiled, 0, 1), (0, 0));
+        assert_eq!(forwarded_psum_scatter_axes(CollectiveMode::Untiled, 1, 0), (2, 0));
+
+        assert_eq!(forwarded_all_to_all_axes(CollectiveMode::Tiled, 0, 1, 1), (0, 2, 1));
+        assert_eq!(forwarded_all_to_all_axes(CollectiveMode::Tiled, 1, 0, 0), (2, 1, 0));
+        assert_eq!(forwarded_all_to_all_axes(CollectiveMode::Untiled, 0, 0, 2), (0, 0, 2));
+        assert_eq!(forwarded_all_to_all_axes(CollectiveMode::Untiled, 1, 1, 0), (2, 2, 0));
     }
 
     /// Returns the static `f32` vector type of the provided length used by the shape-changing collective tests.

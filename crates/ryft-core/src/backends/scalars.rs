@@ -845,8 +845,8 @@ impl Abs for Scalar {
             Scalar::I64(value) => Scalar::I64(value.wrapping_abs()),
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().abs())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().abs())),
-            Scalar::F32(value) => Scalar::F32(value.abs()),
-            Scalar::F64(value) => Scalar::F64(value.abs()),
+            Scalar::F32(value) => Scalar::F32((*value).abs()),
+            Scalar::F64(value) => Scalar::F64((*value).abs()),
             Scalar::C64(value) => Scalar::F32(value.norm()),
             Scalar::C128(value) => Scalar::F64(value.norm()),
             other => {
@@ -1124,8 +1124,8 @@ impl Sin for Scalar {
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().sin())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().sin())),
-            Scalar::F32(value) => Scalar::F32(value.sin()),
-            Scalar::F64(value) => Scalar::F64(value.sin()),
+            Scalar::F32(value) => Scalar::F32((*value).sin()),
+            Scalar::F64(value) => Scalar::F64((*value).sin()),
             Scalar::C64(value) => {
                 let expm1_imaginary = value.im.exp_m1();
                 let expm1_negative_imaginary = (-value.im).exp_m1();
@@ -1169,8 +1169,8 @@ impl Cos for Scalar {
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().cos())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().cos())),
-            Scalar::F32(value) => Scalar::F32(value.cos()),
-            Scalar::F64(value) => Scalar::F64(value.cos()),
+            Scalar::F32(value) => Scalar::F32((*value).cos()),
+            Scalar::F64(value) => Scalar::F64((*value).cos()),
             Scalar::C64(value) => {
                 let expm1_imaginary = value.im.exp_m1();
                 let expm1_negative_imaginary = (-value.im).exp_m1();
@@ -1252,8 +1252,8 @@ impl Exp for Scalar {
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().exp())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().exp())),
-            Scalar::F32(value) => Scalar::F32(value.exp()),
-            Scalar::F64(value) => Scalar::F64(value.exp()),
+            Scalar::F32(value) => Scalar::F32((*value).exp()),
+            Scalar::F64(value) => Scalar::F64((*value).exp()),
             Scalar::C64(value) => Scalar::C64(value.exp()),
             Scalar::C128(value) => Scalar::C128(value.exp()),
             other => {
@@ -1304,8 +1304,8 @@ impl Sqrt for Scalar {
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().sqrt())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().sqrt())),
-            Scalar::F32(value) => Scalar::F32(value.sqrt()),
-            Scalar::F64(value) => Scalar::F64(value.sqrt()),
+            Scalar::F32(value) => Scalar::F32((*value).sqrt()),
+            Scalar::F64(value) => Scalar::F64((*value).sqrt()),
             Scalar::C64(value) => Scalar::C64(value.sqrt()),
             Scalar::C128(value) => Scalar::C128(value.sqrt()),
             other => {
@@ -1333,8 +1333,8 @@ impl Rsqrt for Scalar {
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().sqrt().recip())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().sqrt().recip())),
-            Scalar::F32(value) => Scalar::F32(value.sqrt().recip()),
-            Scalar::F64(value) => Scalar::F64(value.sqrt().recip()),
+            Scalar::F32(value) => Scalar::F32((*value).sqrt().recip()),
+            Scalar::F64(value) => Scalar::F64((*value).sqrt().recip()),
             Scalar::C64(value) => Scalar::C64(value.sqrt().inv()),
             Scalar::C128(value) => Scalar::C128(value.sqrt().inv()),
             other => {
@@ -1359,8 +1359,8 @@ impl Tanh for Scalar {
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().tanh())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().tanh())),
-            Scalar::F32(value) => Scalar::F32(value.tanh()),
-            Scalar::F64(value) => Scalar::F64(value.tanh()),
+            Scalar::F32(value) => Scalar::F32((*value).tanh()),
+            Scalar::F64(value) => Scalar::F64((*value).tanh()),
             Scalar::C64(value) => Scalar::C64(value.tanh()),
             Scalar::C128(value) => Scalar::C128(value.tanh()),
             other => {
@@ -1670,8 +1670,8 @@ impl Floor for Scalar {
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().floor())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().floor())),
-            Scalar::F32(value) => Scalar::F32(value.floor()),
-            Scalar::F64(value) => Scalar::F64(value.floor()),
+            Scalar::F32(value) => Scalar::F32((*value).floor()),
+            Scalar::F64(value) => Scalar::F64((*value).floor()),
             other => {
                 return Err(TypeError::invalid(format!(
                     "cannot compute the floor of a scalar of data type {}",
@@ -1693,8 +1693,8 @@ impl Ceil for Scalar {
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().ceil())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().ceil())),
-            Scalar::F32(value) => Scalar::F32(value.ceil()),
-            Scalar::F64(value) => Scalar::F64(value.ceil()),
+            Scalar::F32(value) => Scalar::F32((*value).ceil()),
+            Scalar::F64(value) => Scalar::F64((*value).ceil()),
             other => {
                 return Err(TypeError::invalid(format!(
                     "cannot compute the ceiling of a scalar of data type {}",

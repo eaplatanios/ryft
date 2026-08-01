@@ -23,7 +23,9 @@ use crate::batching::{
 use crate::contexts::{Context, ProjectedContext, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
 use crate::operations::collectives::{
-    AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveMode, PSumScatterOperation,
+    AllGatherOperation, AllToAllOperation, CollectiveBatchingPolicy, PSumScatterOperation,
+    batch_all_gather_matching_axis, batch_all_to_all_matching_axis, batch_psum_scatter_matching_axis,
+    forwarded_all_gather_axes, forwarded_all_to_all_axes, forwarded_psum_scatter_axes,
     infer_explicit_all_gather_output_types, infer_explicit_all_to_all_output_types,
     infer_explicit_psum_scatter_output_types,
 };
@@ -32,15 +34,14 @@ use crate::operations::control_flow::scan::scan_iteration_batch_axis;
 use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
 use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::dimensions::{
-    DimensionDivFloor, DimensionMul, DimensionRequirement, DimensionRequirementOperation, DimensionSizeOperation,
-    DimensionToScalarOperation,
+    DimensionRequirement, DimensionRequirementOperation, DimensionSizeOperation, DimensionToScalarOperation,
 };
 use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
 use crate::operations::manipulation::{
     BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, LegacyBroadcast, LegacyBroadcastOperation,
     PadOperation, Reshape, ReshapeOperation, Transpose, TransposeOperation,
 };
-use crate::operations::math::{Reduce, ReductionKind};
+use crate::operations::math::{Div, Mul, Reduce};
 use crate::operations::random::RngBitGeneratorOperation;
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::operations::{Operation, OperationProjection};
@@ -498,6 +499,114 @@ where
         let value = <C::Value as ValueProjection<ArrayType>>::from_projected(input.value().clone());
         let value = broadcast_array(outer_context, value, output_dimensions, output_axes, r#type.sharding().cloned())?;
         ArrayBatch::new(r#type, <C::Value as ValueProjection<ArrayType>>::into_projected(value)?, batch_axis)
+    }
+}
+
+impl<C> CollectiveBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayBatchingPolicy
+where
+    C: Context<
+            Type = ArrayProgramType,
+            Operation: From<BroadcastOperation>
+                           + From<DimensionOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + From<ReshapeOperation>
+                           + OperationProjection<ArrayType>,
+        >,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value:
+        ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
+    <C::Value as ValueProjection<DimensionType>>::Projected:
+        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
+{
+    type ShapeExtent = <C::Value as ValueProjection<DimensionType>>::Projected;
+
+    fn collective_axis_extent(
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        _operation_name: &str,
+        _axis_name: &str,
+        axis_size: usize,
+    ) -> Result<Self::ShapeExtent, BatchingError> {
+        let axis_extent = <C::Value as ValueProjection<DimensionType>>::into_projected(context.axis_extent().clone())?;
+        let axis_size = Self::collective_extent_constant(context, axis_size)?;
+        axis_extent.require_equal(&axis_size)?;
+        Ok(axis_extent)
+    }
+
+    fn collective_extent_constant(
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        extent: usize,
+    ) -> Result<Self::ShapeExtent, BatchingError> {
+        Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(dimension_constant(
+            context.parent().parent(),
+            extent,
+        )?)?)
+    }
+
+    fn require_divisible_collective_extents(
+        left: &Self::ShapeExtent,
+        right: &Self::ShapeExtent,
+    ) -> Result<(), BatchingError> {
+        left.require_divisible_by(right).map_err(Into::into)
+    }
+
+    fn match_collective_axis(
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        batch: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        input_extents: &[Self::ShapeExtent],
+    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
+        if !batch.batch_axis().is_replicated() {
+            return batch.move_axis(0);
+        }
+
+        let input_type = batch.unbatched_type();
+        let input_extent_dimensions =
+            input_extents.iter().map(|extent| extent.r#type().to_dimension()).collect::<Vec<_>>();
+        let value = if input_type.shape().dimensions() == input_extent_dimensions {
+            batch.value().clone()
+        } else {
+            Self::reshape_collective(context, batch.value().clone(), input_extents, input_type.sharding().cloned())?
+        };
+        let output_axes = (1..=input_type.rank()).collect::<Vec<_>>();
+        let output_sharding = input_type
+            .sharding()
+            .map(|sharding| {
+                sharding
+                    .with_inserted_dimension(0, context.axis_sharding().clone())
+                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
+            })
+            .transpose()?;
+        let mut output_extents = Vec::with_capacity(input_extents.len() + 1);
+        output_extents.push(context.axis_extent().clone());
+        output_extents
+            .extend(input_extents.iter().cloned().map(<C::Value as ValueProjection<DimensionType>>::from_projected));
+        let value = broadcast_array(
+            context.parent().parent(),
+            <C::Value as ValueProjection<ArrayType>>::from_projected(value),
+            output_extents,
+            output_axes,
+            output_sharding,
+        )?;
+        let r#type = <&ArrayType>::try_from(value.r#type().as_ref())?.clone();
+        ArrayBatch::new(
+            r#type,
+            <C::Value as ValueProjection<ArrayType>>::into_projected(value)?,
+            BatchAxis::from_position(0),
+        )
+    }
+
+    fn reshape_collective(
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        value: <C::Value as ValueProjection<ArrayType>>::Projected,
+        output_extents: &[Self::ShapeExtent],
+        output_sharding: Option<Sharding>,
+    ) -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, BatchingError> {
+        let operation = ReshapeOperation::new().with_output_sharding(output_sharding);
+        let inputs = std::iter::once(<C::Value as ValueProjection<ArrayType>>::from_projected(value))
+            .chain(output_extents.iter().cloned().map(<C::Value as ValueProjection<DimensionType>>::from_projected))
+            .collect::<Vec<_>>();
+        let mut outputs = context.parent().parent().bind(operation, Vec::new(), inputs.as_slice())?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(<C::Value as ValueProjection<ArrayType>>::into_projected(outputs.remove(0))?)
     }
 }
 
@@ -1343,74 +1452,6 @@ where
     Ok(outputs.remove(0))
 }
 
-/// Multiplies two explicit composite dimension values through their projected dimension domain.
-fn multiply_dimensions<C>(left: &C::Value, right: &C::Value) -> Result<C::Value, BatchingError>
-where
-    C: Context<Type = ArrayProgramType>,
-    C::Value: ValueProjection<DimensionType>,
-    <C::Value as ValueProjection<DimensionType>>::Projected: DimensionMul + Value<Type = DimensionType>,
-{
-    let left = <C::Value as ValueProjection<DimensionType>>::into_projected(left.clone())?;
-    let right = <C::Value as ValueProjection<DimensionType>>::into_projected(right.clone())?;
-    Ok(<C::Value as ValueProjection<DimensionType>>::from_projected(left.dimension_mul(&right)?))
-}
-
-/// Exactly divides two explicit composite dimension values after staging the required divisibility assertion.
-fn divide_dimensions<C>(left: &C::Value, right: &C::Value) -> Result<C::Value, BatchingError>
-where
-    C: Context<Type = ArrayProgramType>,
-    C::Value: ValueProjection<DimensionType>,
-    <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionDivFloor + DimensionRequirement + Value<Type = DimensionType>,
-{
-    let left = <C::Value as ValueProjection<DimensionType>>::into_projected(left.clone())?;
-    let right = <C::Value as ValueProjection<DimensionType>>::into_projected(right.clone())?;
-    left.require_divisible_by(&right)?;
-    Ok(<C::Value as ValueProjection<DimensionType>>::from_projected(left.dimension_div_floor(&right)?))
-}
-
-/// Requires two explicit composite dimension values to be equal.
-fn require_equal_dimension_values<C>(left: &C::Value, right: &C::Value) -> Result<(), BatchingError>
-where
-    C: Context<Type = ArrayProgramType>,
-    C::Value: ValueProjection<DimensionType>,
-    <C::Value as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Value<Type = DimensionType>,
-{
-    let left = <C::Value as ValueProjection<DimensionType>>::into_projected(left.clone())?;
-    let right = <C::Value as ValueProjection<DimensionType>>::into_projected(right.clone())?;
-    left.require_equal(&right)?;
-    Ok(())
-}
-
-/// Reshapes a composite array using a complete first-class extent list.
-fn reshape_collective_array<A, C>(
-    context: &C,
-    value: C::Value,
-    output_extents: &[C::Value],
-    output_sharding: Option<Sharding>,
-) -> Result<C::Value, BatchingError>
-where
-    A: Value<Type = ArrayType>,
-    C: Context<Type = ArrayProgramType, Operation: From<ArrayProgramOperation<A>>>,
-{
-    let operation = ReshapeOperation::new().with_output_sharding(output_sharding);
-    let inputs = std::iter::once(value).chain(output_extents.iter().cloned()).collect::<Vec<_>>();
-    let mut outputs = context.bind(ArrayProgramOperation::<A>::from(operation), Vec::new(), inputs.as_slice())?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
-
-/// Lifts one logical result sharding with the leading mapped axis used by matching-axis composite collective rules.
-fn lifted_collective_output_sharding<C: Context<Type = ArrayProgramType>>(
-    output_type: &ArrayType,
-    context: &BatchingContext<C, ArrayProgramBatching>,
-) -> Result<Option<Sharding>, BatchingError> {
-    output_type
-        .sharding()
-        .map(|sharding| lift_output_sharding_for_leading_batch_axis(sharding, context.axis_sharding().clone()))
-        .transpose()
-}
-
 /// Binds one collective over a non-matching named axis after lifting the current mapped axis into its physical result
 /// extent list. Replicated arrays require no lifting and remain replicated.
 fn forward_explicit_collective<A, C>(
@@ -1440,70 +1481,6 @@ where
         .collect()
 }
 
-/// Aligns a collective operand to the leading mapped axis using only its explicit logical input extents.
-fn align_collective_array<A, C>(
-    context: &BatchingContext<C, ArrayProgramBatching>,
-    array: &ArrayProgramBatch<C::Value>,
-    input_extents: &[C::Value],
-) -> Result<ArrayProgramBatch<C::Value>, BatchingError>
-where
-    A: Value<Type = ArrayType>,
-    C: Context<
-            Type = ArrayProgramType,
-            Operation: From<ArrayProgramOperation<A>> + From<BroadcastOperation> + OperationProjection<ArrayType>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-{
-    if !array.batch_axis().is_replicated() {
-        let physical_type = <&ArrayType>::try_from(array.value.r#type().as_ref())?.clone();
-        let array = ArrayBatch::new(
-            physical_type,
-            <C::Value as ValueProjection<ArrayType>>::into_projected(array.value.clone())?,
-            array.batch_axis(),
-        )?
-        .move_axis(0)?;
-        return ArrayProgramBatch::new(
-            <C::Value as ValueProjection<ArrayType>>::from_projected(array.into_value()),
-            BatchAxis::from_position(0),
-        );
-    }
-
-    let input_type = <&ArrayType>::try_from(array.unbatched_type())?;
-    let input_extent_dimensions = input_extents
-        .iter()
-        .map(|extent| {
-            let extent_type = extent.r#type();
-            <&DimensionType>::try_from(extent_type.as_ref()).map(DimensionType::to_dimension)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let requires_retyping = input_type.shape().dimensions() != input_extent_dimensions;
-    let value = if requires_retyping {
-        reshape_collective_array::<A, _>(
-            context.parent(),
-            array.value.clone(),
-            input_extents,
-            input_type.sharding().cloned(),
-        )?
-    } else {
-        array.value.clone()
-    };
-    let output_axes = (1..=input_type.rank()).collect::<Vec<_>>();
-    let output_sharding = input_type
-        .sharding()
-        .map(|sharding| {
-            sharding
-                .with_inserted_dimension(0, context.axis_sharding().clone())
-                .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
-        })
-        .transpose()?;
-    let mut physical_extents = Vec::with_capacity(input_extents.len() + 1);
-    physical_extents.push(context.axis_extent().clone());
-    physical_extents.extend(input_extents.iter().cloned());
-    let value = broadcast_array(context.parent(), value, physical_extents, output_axes, output_sharding)?;
-    ArrayProgramBatch::new(value, BatchAxis::from_position(0))
-}
-
 /// Batches an explicit-extent all-gather without reconstructing any logical output dimensions from array metadata.
 fn batch_all_gather<A, C>(
     operation: &AllGatherOperation,
@@ -1517,13 +1494,15 @@ where
             Operation: From<ArrayProgramOperation<A>>
                            + From<BroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + From<ReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value:
         ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionDivFloor + DimensionRequirement + Value<Type = DimensionType>,
+        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
 {
     let (array, output_extents) = explicit_collective_inputs(inputs)?;
     let logical_input_types = explicit_collective_input_types(inputs);
@@ -1541,15 +1520,8 @@ where
             );
         }
         let input_batch_axis = array.batch_axis_position().unwrap();
-        let (physical_concat_axis, output_batch_axis) = match operation.options().mode() {
-            CollectiveMode::Tiled => {
-                (operation.concat_axis() + usize::from(operation.concat_axis() >= input_batch_axis), input_batch_axis)
-            }
-            CollectiveMode::Untiled if operation.concat_axis() <= input_batch_axis => {
-                (operation.concat_axis(), input_batch_axis + 1)
-            }
-            CollectiveMode::Untiled => (operation.concat_axis() + 1, input_batch_axis),
-        };
+        let (physical_concat_axis, output_batch_axis) =
+            forwarded_all_gather_axes(operation.options().mode(), operation.concat_axis(), input_batch_axis);
         let physical_operation = AllGatherOperation::new(
             operation.axis_name().to_string(),
             operation.axis_size(),
@@ -1566,44 +1538,33 @@ where
         );
     }
 
-    if operation.options().axis_index_groups().is_some() {
-        return Err(BatchingError::UnsupportedOperation {
-            message: "'all_gather' axis index groups are not supported when a batch transform binds the collective \
-                      axis"
-                .to_string(),
-        });
-    }
-    if operation.output_variance() == AllGatherOutputVariance::Reduced {
-        return Err(BatchingError::UnsupportedOperation {
-            message: "'all_gather' with reduced output variance is not supported when a batch transform binds the \
-                      collective axis"
-                .to_string(),
-        });
-    }
-    let axis_size = dimension_constant(context.parent(), operation.axis_size())?;
-    require_equal_dimension_values::<C>(context.axis_extent(), &axis_size)?;
-    let output_extents = output_extents.iter().map(|extent| extent.value.clone()).collect::<Vec<_>>();
-    let mut input_extents = output_extents.clone();
-    match operation.options().mode() {
-        CollectiveMode::Untiled => {
-            input_extents.remove(operation.concat_axis());
-        }
-        CollectiveMode::Tiled => {
-            input_extents[operation.concat_axis()] =
-                divide_dimensions::<C>(&output_extents[operation.concat_axis()], context.axis_extent())?;
-        }
-    }
-    let array = align_collective_array::<A, _>(context, array, input_extents.as_slice())?;
-    let array = <C::Value as ValueProjection<ArrayType>>::into_projected(array.into_value())?;
-    let moved = array.move_axis(0, operation.concat_axis())?;
-    let moved = <C::Value as ValueProjection<ArrayType>>::from_projected(moved);
-    let output = reshape_collective_array::<A, _>(
-        context.parent(),
-        moved,
-        output_extents.as_slice(),
+    let array_type = <&ArrayType>::try_from(array.value.r#type().as_ref())?.clone();
+    let array = ArrayBatch::new(
+        array_type,
+        <C::Value as ValueProjection<ArrayType>>::into_projected(array.value.clone())?,
+        array.batch_axis,
+    )?;
+    let output_extents = output_extents
+        .iter()
+        .map(|extent| <C::Value as ValueProjection<DimensionType>>::into_projected(extent.value.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let projected_context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        ProjectedContext::new(context.parent().clone()),
+        context.axis_extent().clone(),
+    )
+    .with_axis_name(context.axis_name().map(str::to_string))
+    .with_axis_sharding(context.axis_sharding().clone());
+    let output = batch_all_gather_matching_axis::<_, DynamicArrayBatchingPolicy>(
+        operation,
+        &projected_context,
+        &array,
+        array.unbatched_type().rank(),
+        output_extents,
         logical_output_type.sharding().cloned(),
     )?;
-    Ok(vec![ArrayProgramBatch::replicated(output)])
+    Ok(vec![ArrayProgramBatch::replicated(<C::Value as ValueProjection<ArrayType>>::from_projected(
+        output.into_value(),
+    ))])
 }
 
 /// Batches an explicit-extent sum-scatter while retaining its result extents as the sole reshape shape source.
@@ -1619,13 +1580,15 @@ where
             Operation: From<ArrayProgramOperation<A>>
                            + From<BroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + From<ReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Reduce + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionMul + DimensionRequirement + Value<Type = DimensionType>,
+        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
 {
     let (array, output_extents) = explicit_collective_inputs(inputs)?;
     let logical_input_types = explicit_collective_input_types(inputs);
@@ -1643,13 +1606,8 @@ where
             );
         }
         let input_batch_axis = array.batch_axis_position().unwrap();
-        let physical_scatter_axis =
-            operation.scatter_axis() + usize::from(operation.scatter_axis() >= input_batch_axis);
-        let output_batch_axis = match operation.options().mode() {
-            CollectiveMode::Tiled => input_batch_axis,
-            CollectiveMode::Untiled if operation.scatter_axis() < input_batch_axis => input_batch_axis - 1,
-            CollectiveMode::Untiled => input_batch_axis,
-        };
+        let (physical_scatter_axis, output_batch_axis) =
+            forwarded_psum_scatter_axes(operation.options().mode(), operation.scatter_axis(), input_batch_axis);
         let physical_operation = PSumScatterOperation::new(
             operation.axis_name().to_string(),
             operation.axis_size(),
@@ -1665,48 +1623,33 @@ where
         );
     }
 
-    if operation.options().axis_index_groups().is_some() {
-        return Err(BatchingError::UnsupportedOperation {
-            message: "'psum_scatter' axis index groups are not supported when a batch transform binds the collective \
-                      axis"
-                .to_string(),
-        });
-    }
-    let axis_size = dimension_constant(context.parent(), operation.axis_size())?;
-    require_equal_dimension_values::<C>(context.axis_extent(), &axis_size)?;
-    let output_extents = output_extents.iter().map(|extent| extent.value.clone()).collect::<Vec<_>>();
-    let mut input_extents = output_extents.clone();
-    match operation.options().mode() {
-        CollectiveMode::Untiled => input_extents.insert(operation.scatter_axis(), context.axis_extent().clone()),
-        CollectiveMode::Tiled => {
-            input_extents[operation.scatter_axis()] =
-                multiply_dimensions::<C>(&output_extents[operation.scatter_axis()], context.axis_extent())?;
-        }
-    }
-    let array = align_collective_array::<A, _>(context, array, input_extents.as_slice())?;
-    let array = <C::Value as ValueProjection<ArrayType>>::into_projected(array.into_value())?;
-    let summed = array.reduce(&[0], ReductionKind::Sum);
-    let scattered = match operation.options().mode() {
-        CollectiveMode::Untiled => summed.move_axis(operation.scatter_axis(), 0)?,
-        CollectiveMode::Tiled => {
-            let mut split_extents = output_extents.clone();
-            split_extents.insert(operation.scatter_axis(), context.axis_extent().clone());
-            let summed = <C::Value as ValueProjection<ArrayType>>::from_projected(summed);
-            let split = reshape_collective_array::<A, _>(context.parent(), summed, split_extents.as_slice(), None)?;
-            <C::Value as ValueProjection<ArrayType>>::into_projected(split)?.move_axis(operation.scatter_axis(), 0)?
-        }
-    };
-    let scattered = <C::Value as ValueProjection<ArrayType>>::from_projected(scattered);
-    let mut physical_output_extents = Vec::with_capacity(output_extents.len() + 1);
-    physical_output_extents.push(context.axis_extent().clone());
-    physical_output_extents.extend(output_extents);
-    let output = reshape_collective_array::<A, _>(
-        context.parent(),
-        scattered,
-        physical_output_extents.as_slice(),
-        lifted_collective_output_sharding(&logical_output_type, context)?,
+    let array_type = <&ArrayType>::try_from(array.value.r#type().as_ref())?.clone();
+    let array = ArrayBatch::new(
+        array_type,
+        <C::Value as ValueProjection<ArrayType>>::into_projected(array.value.clone())?,
+        array.batch_axis,
     )?;
-    Ok(vec![ArrayProgramBatch::new(output, BatchAxis::from_position(0))?])
+    let output_extents = output_extents
+        .iter()
+        .map(|extent| <C::Value as ValueProjection<DimensionType>>::into_projected(extent.value.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let projected_context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        ProjectedContext::new(context.parent().clone()),
+        context.axis_extent().clone(),
+    )
+    .with_axis_name(context.axis_name().map(str::to_string))
+    .with_axis_sharding(context.axis_sharding().clone());
+    let output = batch_psum_scatter_matching_axis::<_, DynamicArrayBatchingPolicy>(
+        operation,
+        &projected_context,
+        &array,
+        array.unbatched_type().rank(),
+        output_extents,
+        logical_output_type.sharding().cloned(),
+    )?;
+    let batch_axis = output.batch_axis();
+    ArrayProgramBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
+        .map(|output| vec![output])
 }
 
 /// Batches an explicit-extent all-to-all using dimension SSA for the temporary split and merge shapes.
@@ -1722,13 +1665,15 @@ where
             Operation: From<ArrayProgramOperation<A>>
                            + From<BroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + From<ReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value:
         ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionDivFloor + DimensionMul + DimensionRequirement + Value<Type = DimensionType>,
+        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
 {
     let (array, output_extents) = explicit_collective_inputs(inputs)?;
     let logical_input_types = explicit_collective_input_types(inputs);
@@ -1746,20 +1691,12 @@ where
             );
         }
         let input_batch_axis = array.batch_axis_position().unwrap();
-        let physical_split_axis = operation.split_axis() + usize::from(operation.split_axis() >= input_batch_axis);
-        let (physical_concat_axis, output_batch_axis) = match operation.options().mode() {
-            CollectiveMode::Tiled => {
-                (operation.concat_axis() + usize::from(operation.concat_axis() >= input_batch_axis), input_batch_axis)
-            }
-            CollectiveMode::Untiled => {
-                let output_batch_axis = input_batch_axis - usize::from(operation.split_axis() < input_batch_axis);
-                if operation.concat_axis() <= output_batch_axis {
-                    (operation.concat_axis(), output_batch_axis + 1)
-                } else {
-                    (operation.concat_axis() + 1, output_batch_axis)
-                }
-            }
-        };
+        let (physical_split_axis, physical_concat_axis, output_batch_axis) = forwarded_all_to_all_axes(
+            operation.options().mode(),
+            operation.split_axis(),
+            operation.concat_axis(),
+            input_batch_axis,
+        );
         let physical_operation = AllToAllOperation::new(
             operation.axis_name().to_string(),
             operation.axis_size(),
@@ -1776,70 +1713,33 @@ where
         );
     }
 
-    if operation.options().axis_index_groups().is_some() {
-        return Err(BatchingError::UnsupportedOperation {
-            message: "'all_to_all' axis index groups are not supported when a batch transform binds the collective \
-                      axis"
-                .to_string(),
-        });
-    }
-    let axis_size = dimension_constant(context.parent(), operation.axis_size())?;
-    require_equal_dimension_values::<C>(context.axis_extent(), &axis_size)?;
-    let output_extents = output_extents.iter().map(|extent| extent.value.clone()).collect::<Vec<_>>();
-
-    let (input_extents, chunk_extent) = match operation.options().mode() {
-        CollectiveMode::Untiled => {
-            let mut input_extents = output_extents.clone();
-            input_extents.remove(operation.concat_axis());
-            input_extents.insert(operation.split_axis(), context.axis_extent().clone());
-            (input_extents, dimension_constant(context.parent(), 1)?)
-        }
-        CollectiveMode::Tiled if operation.split_axis() == operation.concat_axis() => (
-            output_extents.clone(),
-            divide_dimensions::<C>(&output_extents[operation.split_axis()], context.axis_extent())?,
-        ),
-        CollectiveMode::Tiled => {
-            let mut input_extents = output_extents.clone();
-            input_extents[operation.split_axis()] =
-                multiply_dimensions::<C>(&output_extents[operation.split_axis()], context.axis_extent())?;
-            input_extents[operation.concat_axis()] =
-                divide_dimensions::<C>(&output_extents[operation.concat_axis()], context.axis_extent())?;
-            (input_extents, output_extents[operation.split_axis()].clone())
-        }
-    };
-    let array = align_collective_array::<A, _>(context, array, input_extents.as_slice())?;
-    let mut split_extents = Vec::with_capacity(input_extents.len() + 2);
-    split_extents.push(context.axis_extent().clone());
-    split_extents.extend(input_extents.iter().cloned());
-    split_extents[operation.split_axis() + 1] = context.axis_extent().clone();
-    split_extents.insert(operation.split_axis() + 2, chunk_extent);
-    let split = reshape_collective_array::<A, _>(context.parent(), array.into_value(), split_extents.as_slice(), None)?;
-    let split = <C::Value as ValueProjection<ArrayType>>::into_projected(split)?;
-    let exchanged = split.swap_axes(0, operation.split_axis() + 1)?;
-    let received = match operation.options().mode() {
-        CollectiveMode::Untiled => {
-            let mut squeezed_extents = Vec::with_capacity(input_extents.len() + 1);
-            squeezed_extents.push(context.axis_extent().clone());
-            squeezed_extents.extend(input_extents);
-            let exchanged = <C::Value as ValueProjection<ArrayType>>::from_projected(exchanged);
-            let squeezed =
-                reshape_collective_array::<A, _>(context.parent(), exchanged, squeezed_extents.as_slice(), None)?;
-            <C::Value as ValueProjection<ArrayType>>::into_projected(squeezed)?
-                .move_axis(operation.split_axis() + 1, operation.concat_axis() + 1)?
-        }
-        CollectiveMode::Tiled => exchanged.move_axis(operation.split_axis() + 1, operation.concat_axis() + 1)?,
-    };
-    let received = <C::Value as ValueProjection<ArrayType>>::from_projected(received);
-    let mut physical_output_extents = Vec::with_capacity(output_extents.len() + 1);
-    physical_output_extents.push(context.axis_extent().clone());
-    physical_output_extents.extend(output_extents);
-    let output = reshape_collective_array::<A, _>(
-        context.parent(),
-        received,
-        physical_output_extents.as_slice(),
-        lifted_collective_output_sharding(&logical_output_type, context)?,
+    let array_type = <&ArrayType>::try_from(array.value.r#type().as_ref())?.clone();
+    let array = ArrayBatch::new(
+        array_type,
+        <C::Value as ValueProjection<ArrayType>>::into_projected(array.value.clone())?,
+        array.batch_axis,
     )?;
-    Ok(vec![ArrayProgramBatch::new(output, BatchAxis::from_position(0))?])
+    let output_extents = output_extents
+        .iter()
+        .map(|extent| <C::Value as ValueProjection<DimensionType>>::into_projected(extent.value.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let projected_context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        ProjectedContext::new(context.parent().clone()),
+        context.axis_extent().clone(),
+    )
+    .with_axis_name(context.axis_name().map(str::to_string))
+    .with_axis_sharding(context.axis_sharding().clone());
+    let output = batch_all_to_all_matching_axis::<_, DynamicArrayBatchingPolicy>(
+        operation,
+        &projected_context,
+        &array,
+        array.unbatched_type().rank(),
+        output_extents,
+        logical_output_type.sharding().cloned(),
+    )?;
+    let batch_axis = output.batch_axis();
+    ArrayProgramBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
+        .map(|output| vec![output])
 }
 
 // TODO(eaplatanios): Move this to the module where `ConcatenateOperation` is defined.
@@ -2186,7 +2086,7 @@ where
     <C::Value as ValueProjection<ArrayType>>::Projected:
         LegacyBroadcast + Reduce + Reshape + Select + Transpose + Value<Type = ArrayType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionDivFloor + DimensionMul + DimensionRequirement + Value<Type = DimensionType>,
+        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
     C::Operation: From<ArrayProgramOperation<A>>
         + From<BroadcastOperation>
         + From<ConcatenateOperation>
@@ -2195,6 +2095,7 @@ where
         + From<OneOperation<ArrayType>>
         + From<PadOperation>
         + From<RngBitGeneratorOperation>
+        + From<ReshapeOperation>
         + From<ScanOperation<ArrayProgramValue<A>>>
         + From<WhileOperation>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
