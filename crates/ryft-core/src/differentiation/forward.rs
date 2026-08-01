@@ -1016,9 +1016,9 @@ where
         // primal synthesis and tangent typing.
         let zero_input_tangents = !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero());
 
-        // Dynamic one already relies on this routing to stage an explicit dynamic-zero tangent. Other dynamic-output
-        // rules that still return structural zeros need Phase 6 extent residuals, which must also revisit the
-        // region-carrying escape below.
+        // Dynamic one already relies on this routing to stage an explicit dynamic-zero tangent. Other dynamic output
+        // rules returning structural zeros must retain the extents needed to materialize them. Region-carrying
+        // operations remain on the established fast path until their differentiation rules own that policy.
         let reusable_zero_outputs = if zero_input_tangents {
             // Region-free operations can be inspected without reproducing the parent's region-identity instantiation.
             // Region-carrying rules retain the established fast path here. Their explicit dynamic-output migration
@@ -1163,13 +1163,12 @@ where
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
 
-                // TODO(eaplatanios): Does this need to be updated in Phase 6?
                 // All-zero fast path: skip the operation's rule only when every input tangent is structural zero and
                 // every output zero tangent can later be materialized without runtime identity operands (or by reusing
                 // a zero-producing primal). Zero-input operations remain excluded so their dedicated rules keep
                 // handling primal synthesis and tangent typing. Dynamic one already relies on this routing to stage
-                // an explicit dynamic-zero tangent. Other dynamic-output rules that still return structural zeros need
-                // Phase 6 extent residuals.
+                // an explicit dynamic-zero tangent. Other dynamic-output rules must retain any runtime extents needed
+                // to materialize their structural-zero tangents.
                 let all_input_tangents_are_zero =
                     !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero());
                 let can_materialize_output_tangents_without_rules = || {

@@ -1065,9 +1065,9 @@ mod tests {
             }],
         );
 
-        // A dynamic non-concatenated axis cannot be reconstructed by a static slice. Phase 6 will make that runtime
-        // extent an explicit transform residual; until then, transposition rejects the case instead of consulting
-        // hidden input-shape metadata.
+        // A dynamic non-concatenated axis cannot be reconstructed by this homogeneous static-slice rule. Composite
+        // differentiation retains that runtime extent as an explicit residual. Direct homogeneous transposition
+        // rejects the case instead of consulting hidden input-shape metadata.
         let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
         let left_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns.clone())]));

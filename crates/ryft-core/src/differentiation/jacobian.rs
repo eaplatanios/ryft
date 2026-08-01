@@ -768,8 +768,8 @@ pub(crate) fn jacobian_forward_in_context<
     // so capture the auxiliary primals while its closure runs and move them back out after constructing the Jacobian.
     // Output types are validated inside the closure, before linearization materializes a structural zero in a nonzero
     // dynamic array differential space, so a non-finite coordinate space retains the precise Jacobian diagnostic.
-    // TODO(eaplatanios): Phase 6's later `zero_like` migration should remove this duplicate validation once dynamic
-    //  structural zeros no longer require a nullary type-only constructor.
+    // Validate here because a dynamic structural zero still cannot be materialized by a nullary type-only constructor.
+    // A future operand-relative zero operation may make this early validation redundant.
     let mut auxiliary = None;
     let (output, pushforward) = context.linearize(
         |input| {
@@ -945,10 +945,9 @@ pub(crate) fn jacobian_reverse_in_context<
 
     // Validate the input coordinate spaces before deriving the pullback, so a non-finite input coordinate space
     // reports its input role instead of the identity-bearing nullary-constructor error that materializing a zero
-    // input cotangent during the pullback trace would otherwise raise first.
-    // TODO(eaplatanios): This pre-validation is transitional duplication caused by dynamic nullary cotangent
-    //  materialization during the pullback trace. Phase 6's structural-zero preservation and explicit extent
-    //  residuals should remove the need for it; revisit and minimize it in that phase.
+    // input cotangent during the pullback trace would otherwise raise first. This pre-validation remains necessary
+    // while pullback tracing can materialize a dynamic nullary cotangent before reporting that the corresponding
+    // coordinate space is non-finite. A future operand-relative zero operation may make it redundant.
     coordinate_prefix_offsets::<C, _>(
         &input_types,
         DerivativeTransform::JacobianReverse,

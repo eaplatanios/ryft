@@ -1643,7 +1643,7 @@ searches. The complete source ledger and verification record are in
       dynamic reshape before migrating other mixed operations or composite regions. The prototype must keep residual
       dimensions as ordinary SSA values, remove fake dimension tangent/cotangent slots from generated linear programs,
       and reject side tables, identity lookup, copied shape metadata, or reshape-specific residual fields.
-- [ ] P6b — execute `.tasks/plan_p6b_extent_residual_operation_sweep.md` as separately reviewable batching,
+- [x] P6b — execute `.tasks/plan_p6b_extent_residual_operation_sweep.md` as separately reviewable batching,
       mixed-shape, array-only, and collective slices. Extend the P6a linear-call residual contract across every
       remaining extent-sensitive derivative rule, delete superseded captured-factor payloads and Phase 6 rejections,
       and require full JAX parity plus Ryft's bounded-dynamic extensions before the P6b gate.
@@ -1663,11 +1663,13 @@ searches. The complete source ledger and verification record are in
 - [ ] Make generic outer dispatch project/lift array-only JVP, VJP, and transpose rules, reusing the shared toy
       composite fixture promoted in Phase 5 for the member-kind-agnostic dispatch tests.
 - [x] Preserve dimension values as ordinary structural residuals without tangent slots.
-- [ ] Keep explicit mixed rules only where primal dimension operands control array results or region interfaces.
-- [ ] Remove temporary homogeneous differentiation programs and dimension recovery.
+- [x] Keep explicit mixed rules only where primal dimension operands control array results or region interfaces.
+- [x] Remove temporary homogeneous differentiation programs and dimension recovery.
 - [x] Add a residual search proving no primal operation payload stores differentiation-only dimension variables or
       residual manifests.
-- [ ] Prefer structural zeros over materializing shaped zero arrays.
+- [x] Prefer structural zeros over materializing shaped zero arrays within the P6b residual carrier and migrated
+      extent-sensitive rules. The complete composite-zero operation deletion remains the separately assigned unit
+      below.
 - [ ] Inventory every production construction of `ZeroOperation<ArrayProgramType>` and every composite
       `Zero<ArrayProgramValue<_>>` materialization path, including the retained-linearization residual-zero sites in
       `differentiation/forward.rs`. Classify each as a structural zero that should remain unmaterialized, an
@@ -1728,13 +1730,24 @@ no-op is 0.10s versus 0.11s. Final gates pass 1,065 core tests, 406 XLA tests pl
 macro groups, 52 core doctests plus 16 intentional ignores, XLA doctests, formatting, and diff hygiene. Full evidence
 is in `.tasks/plan_p6a_differentiation_residual_architecture.md`.
 
-P6b's batching, mixed-shape, array-only, and collective implementation slices are complete. Executable linear calls
-batch both attached regions, and broadcast, concatenate, pad, slicing/gathering, reductions, and all shape-changing
-collectives retain their exact primal geometry as ordinary residual SSA. The collective adjoints cover varying,
-invariant, and reduced all-gather, psum-scatter, and all-to-all without a payload witness or a migration-phase
-diagnostic. The remaining P6b work is its Phase 4 latest-JAX executable comparison/mapped execution gate followed by
-Phase 5 consolidation: move operation-specific adjoint bodies out of the central dispatcher, delete superseded
-machinery, prove structural-zero preservation, and record the final net-deletion and performance ledger.
+P6b is complete. Executable linear calls batch both attached regions, and broadcast, concatenate, pad,
+slicing/gathering, reductions, and all shape-changing collectives retain their exact primal geometry as ordinary
+residual SSA. The collective adjoints cover varying, invariant, and reduced all-gather, psum-scatter, and all-to-all
+without a payload witness or migration-phase diagnostic. Composite derivative semantics now live in the private
+`backends::array_programs::differentiation` capability module rather than the central operation-family module, while
+exact-static broadcast, reshape, pad, and concatenate transpose through their canonical homogeneous rules. This
+removes the remaining duplicate inverse geometry and the last composite static-extent reconstruction without adding
+a payload trait or public policy.
+
+The Phase 5 consolidation is net `-21` production Rust lines and four Rust lines overall. Across complete P6b, the
+frozen `87065b914` baseline grows by 1,591 production and 1,238 Rust test/documentation lines for the new supported
+semantics; the captured-primal payloads, custom residual wrapper, and repeated carrier assembly are deleted. Clean
+`ryft-core` checks are unchanged at 14.321 seconds frozen versus 14.306 seconds final. Residual-count and exact-IR
+goldens remain pinned, zero output cotangents stage no allocation, and the full core/XLA/macro/doctest gates pass.
+Executable fixtures pass JAX 0.6.1 and 0.11.0 across the complete extent-sensitive matrix; Ryft deliberately exceeds
+both for non-finite-safe padding-value cotangents. The complete ledger is in
+`.tasks/plan_p6b_extent_residual_operation_sweep.md`. Generic outer differentiation dispatch is the next isolated
+Phase 6 unit; composite-region differentiation and composite-zero deletion remain separate.
 
 The post-review evaluation of `LinearCallOperation` additionally adopted JAX's `linear_call` transposition shape:
 the carrier's operands and both region interfaces are residuals-first (`forward: (r, u) -> v`,

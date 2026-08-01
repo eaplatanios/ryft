@@ -1752,7 +1752,7 @@ shape_changing_collective! {
     operation = AllGatherOperation,
     name = ALL_GATHER_OPERATION_NAME = "all_gather",
     #[doc(hidden)]
-    /// Frozen homogeneous capability retained for array-only Phase 4–9 consumers.
+    /// Homogeneous capability retained for the array-only operation and transform language.
     capability = LegacyAllGather::all_gather,
     fields = {
         /// Axis of the operand along which the participants' values are concatenated.
@@ -1832,7 +1832,7 @@ shape_changing_collective! {
     operation = PSumScatterOperation,
     name = PSUM_SCATTER_OPERATION_NAME = "psum_scatter",
     #[doc(hidden)]
-    /// Frozen homogeneous capability retained for array-only Phase 4–9 consumers.
+    /// Homogeneous capability retained for the array-only operation and transform language.
     capability = LegacyPSumScatter::psum_scatter,
     fields = {
         /// Axis of the operand along which the summed result is scattered across the participants.
@@ -1969,7 +1969,7 @@ shape_changing_collective! {
     operation = AllToAllOperation,
     name = ALL_TO_ALL_OPERATION_NAME = "all_to_all",
     #[doc(hidden)]
-    /// Frozen homogeneous capability retained for array-only Phase 4–9 consumers.
+    /// Homogeneous capability retained for the array-only operation and transform language.
     capability = LegacyAllToAll::all_to_all,
     fields = {
         /// Axis of the operand that is split into one chunk per participant.
@@ -2781,7 +2781,8 @@ where
 
 /// Transpose rule for [`AllGatherOperation`]. A varying all-gather is the adjoint of a sum-scatter with the same
 /// mode, axis, and participant groups, so the operand cotangent is a [`PSumScatterOperation`] of the output
-/// cotangent. Invariant and reduced variance require the Phase 6 residual-aware adjoints.
+/// cotangent. Invariant and reduced variance require the residual-aware composite adjoints because their pullbacks
+/// depend on participant-indexed runtime geometry.
 impl<V, O> TransposableOperation<V, O> for AllGatherOperation
 where
     V: Value<Type = ArrayType>,

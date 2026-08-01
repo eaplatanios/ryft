@@ -331,8 +331,9 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast>, P: ArrayBatchingPolic
 
 /// Frozen homogeneous broadcast capability used only by the legacy array-only operation and transform language.
 ///
-/// New program construction must use [`Broadcast`], whose output extents are explicit SSA operands. This capability
-/// remains hidden from normal documentation only while its named Phase 4–9 consumers migrate.
+/// New composite-program construction must use [`Broadcast`], whose output extents are explicit SSA operands. This
+/// capability remains hidden from normal documentation because it exists only for the homogeneous array operation and
+/// transform language, where complete output geometry is carried by [`ArrayType`].
 #[doc(hidden)]
 pub trait LegacyBroadcast: Sized {
     /// Broadcasts `self` to `output_type` using `output_axes`.

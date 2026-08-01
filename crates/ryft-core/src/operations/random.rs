@@ -86,11 +86,11 @@ impl Display for RandomAlgorithm {
 /// Both outputs are discrete, so differentiation assigns structural-zero tangents and transposition is rejected.
 /// Homogeneous array batching of a *mapped* state (one state per batch item, e.g. derived with [`split_key`]) stages
 /// one carry-free [`ScanOperation`] over the per-item states, so each batch item draws its own bits from its own state.
-/// Composite array-program batching requires the Phase 5 region-carrying operation migration before that scan can
-/// retain first-class extent operands and currently returns an exact unsupported diagnostic. Batching a *replicated*
-/// state is rejected in either contract because every batch item would see the same state and draw identical bits.
-/// The reference array backend implements both [`ThreeFry`](RandomAlgorithm::ThreeFry) and
-/// [`Philox`](RandomAlgorithm::Philox) bit-exactly with XLA's implementation.
+/// Composite array-program batching remains unsupported because the scan must retain first-class extent operands across
+/// its region boundary. Batching a *replicated* state is rejected in either contract because every batch item would see
+/// the same state and draw identical bits. The reference array backend implements both
+/// [`ThreeFry`](RandomAlgorithm::ThreeFry) and [`Philox`](RandomAlgorithm::Philox)
+/// bit-exactly with XLA's implementation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RngBitGeneratorOperation {
     /// Algorithm generating the bits.

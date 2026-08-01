@@ -1047,6 +1047,23 @@ mod tests {
                 .unwrap()
         };
         let driver = TwoRegionDriver { forward: forward.entry_region_ref(), transpose: transpose.entry_region_ref() };
+
+        // A structural-zero output cotangent returns structural zeros for both the residual and the linear operand
+        // without replaying either region or staging a materialized array zero.
+        let mut zero_context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let residual = zero_context.input(r#type.clone());
+        let zero_cotangents = LinearCallOperation::new(1)
+            .transpose(
+                &mut zero_context,
+                &driver,
+                &[PartialValue::Known(residual), PartialValue::Unknown(r#type.clone())],
+                &[MaybeZero::Zero(r#type.clone())],
+            )
+            .unwrap();
+        assert_eq!(zero_cotangents.len(), 2);
+        assert!(zero_cotangents.iter().all(MaybeZero::is_zero));
+        assert!(zero_context.builder().borrow().instructions().is_empty());
+
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let residual = context.input(r#type.clone());
         let output_cotangent = context.input(r#type.clone());
