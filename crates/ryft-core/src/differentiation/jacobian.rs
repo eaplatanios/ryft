@@ -766,12 +766,10 @@ pub(crate) fn jacobian_forward_in_context<
 
     // Evaluate and linearize the differentiated output once. `linearize` returns only the differentiated output,
     // so capture the auxiliary primals while its closure runs and move them back out after constructing the Jacobian.
-    // Output types are validated inside the closure, before linearization materializes boundary tangents, so that a
-    // non-finite output coordinate space surfaces the precise Jacobian diagnostic instead of the identity-bearing
-    // nullary-constructor error that materializing its zero tangent would otherwise raise first.
-    // TODO(eaplatanios): This in-closure validation is transitional duplication caused by dynamic nullary tangent
-    //  materialization at the linearize boundary. Phase 6's structural-zero preservation and explicit extent
-    //  residuals should remove the need to pre-validate here; revisit and minimize it in that phase.
+    // Output types are validated inside the closure, before linearization materializes a structural zero in a nonzero
+    // dynamic array differential space, so a non-finite coordinate space retains the precise Jacobian diagnostic.
+    // TODO(eaplatanios): Phase 6's later `zero_like` migration should remove this duplicate validation once dynamic
+    //  structural zeros no longer require a nullary type-only constructor.
     let mut auxiliary = None;
     let (output, pushforward) = context.linearize(
         |input| {

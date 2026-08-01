@@ -84,6 +84,7 @@ pub mod elementwise;
 pub mod forward;
 pub mod hessian;
 pub mod jacobian;
+pub mod linear;
 pub mod reverse;
 pub mod types;
 
@@ -112,6 +113,7 @@ pub use jacobian::{
     jacobian_forward_holomorphic_with_aux, jacobian_forward_with_aux, jacobian_reverse, jacobian_reverse_holomorphic,
     jacobian_reverse_holomorphic_with_aux, jacobian_reverse_with_aux,
 };
+pub use linear::LinearCallOperation;
 pub use reverse::{
     Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, gradient, gradient_holomorphic,
     gradient_holomorphic_with_aux, gradient_with_aux, value_and_gradient, value_and_gradient_holomorphic,

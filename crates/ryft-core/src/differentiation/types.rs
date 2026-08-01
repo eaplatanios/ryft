@@ -30,8 +30,11 @@ pub trait DifferentiableType: Type {
     /// differentiable types use themselves, but specialized storage representations may use a wider differential
     /// representation. For example, [`DataType::F8E8M0FNU`] uses [`DataType::F32`] because its unsigned power-of-two
     /// representation cannot represent zero or negative linear contributions. Non-differentiable types return a
-    /// first-class zero-space type, such as [`DataType::Zero`], preserving leaf-for-leaf transform boundaries without
-    /// assigning an ordinary Boolean or numeric carrier type.
+    /// first-class zero-space type, such as [`DataType::Zero`]. Generated linear programs are compact with respect to
+    /// such types (i.e., where a program boundary would carry one tangent input or output per primal leaf, leaves whose
+    /// tangent type [`is_zero_space`](Self::is_zero_space) get no boundary input or output at all). Structured callable
+    /// transforms such as [`Pushforward`](crate::Pushforward) still expose the complete leaf-for-leaf public derivative
+    /// tree and restore each omitted leaf as a typed zero at their public boundaries.
     fn tangent(&self) -> Self;
 
     /// Returns the [`Type`] that reverse-mode cotangents of values of this [`Type`] carry. The returned type is the
@@ -42,8 +45,12 @@ pub trait DifferentiableType: Type {
     /// of its [`Sharding`]. Refer to [`Sharding::cotangent`] for more information. This mapping is not required to be
     /// an _involution_ (i.e., a specialized primal representation may map to a general-purpose cotangent representation
     /// that is itself a fixed point). Non-differentiable types return a first-class zero-space type. Reverse mode
-    /// accumulates no live adjoint for values of those types, while fixed-structure boundaries retain the corresponding
-    /// zero-space leaf.
+    /// accumulates no live adjoint for values of those types, and generated linear programs are compact with respect
+    /// to them (i.e., where a pullback boundary would carry one cotangent input per primal output and one cotangent
+    /// output per primal input, leaves whose cotangent type [`is_zero_space`](Self::is_zero_space) get no boundary
+    /// input or output at all). Structured callable transforms such as [`Pullback`](crate::Pullback) still expose the
+    /// complete leaf-for-leaf public derivative tree and restore each omitted leaf as a typed zero at their public
+    /// boundaries.
     fn cotangent(&self) -> Self;
 }
 
