@@ -291,8 +291,6 @@ impl<C: Context<Type: DifferentiableType, Operation: From<LinearCallOperation<C:
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for LinearCallOperation<ArrayType>
 {
@@ -302,6 +300,7 @@ impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // TODO(eaplatanios): Fix this in phase 6.
         // Batching a linear call admits a principled rule (batch the attached forward and transpose regions and
         // replicate residual extents), which the Phase 6 extent-residual operation sweep owns; until then, `vmap`
         // over a linearized program containing an executable call reports this exact boundary.
@@ -309,9 +308,8 @@ impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation
     }
 }
 
-impl<C> DifferentiableOperation<C> for LinearCallOperation<C::Type>
-where
-    C: Context<Type: DifferentiableType> + Zero<C::Value>,
+impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
+    for LinearCallOperation<C::Type>
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -321,12 +319,13 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         if self.is_transpose_only() {
             return Err(ProgramError::UnsupportedOperation {
-                message: "a transpose-only linear call has no forward-mode (jvp) rule; it supports only \
+                message: "a transpose-only linear call has no forward-mode (JVP) rule; it supports only \
                           reverse-mode differentiation"
                     .to_string(),
             }
             .into());
         }
+
         inputs.len().checked_sub(self.residual_count).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "linear call residual count {} exceeds input count {}",
@@ -334,6 +333,7 @@ where
                 inputs.len(),
             ))
         })?;
+
         let forward = driver.region(0)?;
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         if inputs.iter().all(|input| input.tangent().is_zero()) {
@@ -350,6 +350,7 @@ where
                 jvp_inputs.push(input.tangent().clone().materialize(context)?);
             }
         }
+
         let mut outputs = jvp.interpret_in_context(context, jvp_inputs)?;
         let output_types = forward.output_types();
         let tangent_outputs = outputs.split_off(output_types.len());
@@ -369,10 +370,8 @@ where
     }
 }
 
-impl<V, O> TransposableOperation<V, O> for LinearCallOperation<V::Type>
-where
-    V: Value<Type: DifferentiableType>,
-    O: Operation<V::Type> + From<ZeroOperation<V::Type>>,
+impl<V: Value<Type: DifferentiableType>, O: Operation<V::Type> + From<ZeroOperation<V::Type>>>
+    TransposableOperation<V, O> for LinearCallOperation<V::Type>
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -388,6 +387,7 @@ where
                 inputs.len(),
             ))
         })?;
+
         let residuals = inputs[linear_count..]
             .iter()
             .enumerate()
@@ -399,17 +399,20 @@ where
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+
         if outputs.iter().all(MaybeZero::is_zero) {
             return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
         }
-        // The transpose region follows the forward-and-transpose form's leading forward region (index 1) and is
-        // the transpose-only form's only region (index 0).
+
+        // The transpose region follows the forward-and-transpose form's leading forward region (index 1)
+        // and is the transpose-only form's only region (index 0).
         let transpose = driver.region(if self.is_transpose_only() { 0 } else { 1 })?;
         let mut transpose_inputs = residuals;
         transpose_inputs
             .extend(outputs.iter().cloned().map(|output| output.materialize(context)).collect::<Result<Vec<_>, _>>()?);
         let input_cotangents = transpose.interpret_in_context(context, transpose_inputs)?;
         check_count!("output", input_cotangents, linear_count, ProgramError);
+
         // Classify each transpose output as structurally zero by inspecting its producing instruction in the source
         // region, so zero cotangents stay symbolic instead of accumulating. Outputs with no producing instruction
         // (forwarded region inputs and constants) conservatively classify as nonzero.
@@ -430,6 +433,7 @@ where
                     .unwrap_or(false)
             })
             .collect::<Vec<_>>();
+
         let mut cotangents = inputs[..linear_count]
             .iter()
             .zip(input_cotangents.into_iter().zip(output_is_zero))
@@ -445,6 +449,8 @@ where
         Ok(cotangents)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
