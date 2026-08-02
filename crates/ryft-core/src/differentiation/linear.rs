@@ -12,18 +12,132 @@ use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{Zero, ZeroOperationProvider};
+use crate::operations::constants::{Zero, ZeroOperation, ZeroOperationProvider};
 use crate::operations::math::{Reduce, ReduceOperation, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
+use crate::programs::atoms::{AtomId, MaybeZero};
+use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionSlot};
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 use crate::types::ArrayType;
+
+/// Differentiation-owned protocol through which an operation family materializes zeros whose runtime geometry must
+/// be supplied by explicitly captured _residual_ values, because it is not derivable from the zero's [`Type`] alone.
+///
+/// # Why this Protocol Exists
+///
+/// Differentiation is the one transform that must synthesize values with no data edge to derive them from. For example,
+/// transposition is *defined* to return a cotangent for every differentiated input, including inputs that are
+/// disconnected from every output, and the mathematically determined value for such an input is a zero of its cotangent
+/// type. For a static type this is easy as [`ZeroOperationProvider::zero_operation`] constructs the zero from the type,
+/// with no operands. For a type with dynamic axes it is impossible as a [`Type`] carries only dimension _identities_
+/// and bounds, never defining values, and so the zero operation needs one explicit dimension operand per dynamic axis.
+/// Also, the value that could supply those operands (i.e., the primal input the cotangent corresponds to) is _not an
+/// input of the pullback program_ where the zero must be staged. The only moment both the need and the geometry are in
+/// scope is during linearization, and so the required extents must be captured then and threaded to transposition as
+/// ordinary residuals. This trait is that capture/spend contract, expressed once per operation *family*. It is a set of
+/// associated functions with no receiver (i.e., `self` argument), because it is invoked precisely when no [`Operation`]
+/// instance exists.
+///
+/// # How to Use It
+///
+/// The protocol has three steps, executed by the differentiation machinery rather than by implementors:
+///
+///   1. **Declare:** When linearization finds a differentiated input whose cotangent will be disconnected, it calls
+///      [`Self::zero_residual_types`] with the zero's type to learn which residual values the eventual zero needs
+///      (e.g., one first-class dimension per *distinct* dynamic identity for a composite array type, and nothing for
+///      a static type).
+///   2. **Capture:** While the primal value is still in scope, linearization records those residuals from it.
+///      [`Self::capture_zero_residuals`] stages the reads into the program being built (i.e., the program-level
+///      [`Program::linearize`](crate::Program::linearize) path), and [`Self::capture_zero_residual_values`] is its
+///      value-level counterpart for reusable pullback callables that close over concrete or tracer values. The captured
+///      residuals ride the tangent program's ordinary trailing residual suffix.
+///   3. **Spend:** During transposition, [`Self::add_zero_from_residuals`] stages the zero inside the pullback
+///      program, consuming exactly the residuals captured in step 2 as its explicit operands.
+///
+/// The three steps must agree on residual count and order. Every mismatch is a loud typed error (the capture sites
+/// validate against the declared types, and the spend site validates the residual count), never a silently wrong-shaped
+/// zero.
+///
+/// # Who Implements It
+///
+/// Almost nobody needs to implement this trait, by design. Every operation family with an input-free zero (i.e., every
+/// family with a `From<ZeroOperation<T>>` conversion) receives the whole protocol through a blanket implementation that
+/// declares nothing, captures nothing, and spends by constructing the type-only zero (i.e., the fail-loud default
+/// rejects unexpected residuals rather than ignoring them, so a mismatched linearize/transpose pairing cannot be
+/// silently accepted). Only families whose zero genuinely consumes runtime-geometry operands (e.g., the composite
+/// program family and its XLA counterpart) override all four methods coherently.
+///
+/// [`LinearCallOperation`] below is this protocol's sibling. It retains residual geometry for the transpose of a
+/// *non-trivial* residual-parameterized linear map by attaching explicit forward/transpose regions to an instruction,
+/// while this trait retains it for the degenerate zero map, which has no instruction to attach anything to. Both exist
+/// for the same reason (i.e., reverse mode needs geometry at a moment when its defining values would otherwise be out
+/// of scope) and both keep residual selection and threading owned by the differentiation transform rather than leaking
+/// into primal operation payloads.
+pub trait ResidualZeroProvider<T: Type>: ZeroOperationProvider<T> {
+    /// Returns the types of the residual values that a zero of `r#type` needs, in the exact order in which
+    /// [`Self::capture_zero_residuals`] captures them and [`Self::add_zero_from_residuals`] consumes them. Input-free
+    /// [`Operation`] families use the empty default. The array-dimension composite family returns one dimension type
+    /// per _distinct_ dynamic identity of `r#type`, in first-occurrence order, so repeated axes share one residual.
+    #[inline]
+    fn zero_residual_types(_type: &T) -> Vec<T> {
+        Vec::new()
+    }
+
+    /// Stages instructions into `builder` that read the residual values declared by [`Self::zero_residual_types`] from
+    /// the primal value `source` (e.g., one `dimension_size` read per declared residual), returning the new atoms in
+    /// declaration order. Linearization calls this while `source` is still in scope of the program being built. The
+    /// returned atoms are then threaded to transposition as ordinary residuals. Input-free [`Operation`] families
+    /// capture nothing.
+    #[inline]
+    fn capture_zero_residuals<V: Value<Type = T>>(
+        _builder: &mut ProgramBuilder<V, Self>,
+        _source: AtomId,
+        _type: &T,
+    ) -> Result<Vec<AtomId>, ProgramError> {
+        Ok(Vec::new())
+    }
+
+    /// Captures the residual values declared by [`Self::zero_residual_types`] from the primal value `source`
+    /// in a live `context`, returning them in declaration order. This is the value-level counterpart of
+    /// [`Self::capture_zero_residuals`] used by reusable pullback callables, whose captured residuals are
+    /// concrete values or tracers closed over by the callable rather than atoms of a program under construction.
+    #[inline]
+    fn capture_zero_residual_values<C: Context<Type = T, Operation = Self>>(
+        _context: &C,
+        _source: &C::Value,
+        _type: &T,
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        Ok(Vec::new())
+    }
+
+    /// Stages a zero of `r#type` into `builder`, consuming the `residuals` captured by [`Self::capture_zero_residuals`]
+    /// as its explicit operands, in declaration order. Transposition calls this inside the pullback program, where the
+    /// primal that supplied the residuals is no longer an input.
+    fn add_zero_from_residuals<V: Value<Type = T>>(
+        builder: &mut ProgramBuilder<V, Self>,
+        r#type: T,
+        residuals: &[AtomId],
+    ) -> Result<AtomId, ProgramError> {
+        // The default represents genuinely input-free zero families. Rejecting residuals rather than ignoring them
+        // keeps a mismatched linearization/transposition boundary from being silently accepted.
+        if !residuals.is_empty() {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("input-free zero expected 0 residuals but got {}", residuals.len()),
+            });
+        }
+        Ok(builder.add_instruction(Self::zero_operation(r#type)?, Vec::new(), Vec::new())?[0])
+    }
+}
+
+// Every operation family that absorbs a type-only `ZeroOperation` has an input-free zero, and so the defaulted
+// residual protocol applies verbatim. Composite families without that conversion implement the protocol directly.
+impl<T: Type, O: Operation<T> + From<ZeroOperation<T>>> ResidualZeroProvider<T> for O {}
 
 /// Interface form implemented by a [`LinearCallOperation`].
 #[derive(Clone, Debug, PartialEq)]

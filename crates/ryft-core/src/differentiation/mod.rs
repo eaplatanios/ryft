@@ -113,7 +113,7 @@ pub use jacobian::{
     jacobian_forward_holomorphic_with_aux, jacobian_forward_with_aux, jacobian_reverse, jacobian_reverse_holomorphic,
     jacobian_reverse_holomorphic_with_aux, jacobian_reverse_with_aux,
 };
-pub use linear::LinearCallOperation;
+pub use linear::{LinearCallOperation, ResidualZeroProvider};
 pub use reverse::{
     Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, gradient, gradient_holomorphic,
     gradient_holomorphic_with_aux, gradient_with_aux, transpose_projected_operation, value_and_gradient,

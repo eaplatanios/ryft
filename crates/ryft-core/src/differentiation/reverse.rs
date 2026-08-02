@@ -3,12 +3,13 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::contexts::{Context, Domain, StagingContext};
+use crate::differentiation::linear::ResidualZeroProvider;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, ForwardModeDifferentiate, LinearizationTracer,
 };
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
-use crate::operations::constants::{OneOperation, Zero, ZeroOperationProvider};
+use crate::operations::constants::{OneOperation, Zero};
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
@@ -337,7 +338,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for RecursiveTransposit
 
 impl<
     V: Value<Type: DifferentiableType>,
-    O: TransposableOperation<V, O> + ZeroOperationProvider<V::Type> + From<AddOperation>,
+    O: TransposableOperation<V, O> + ResidualZeroProvider<V::Type> + From<AddOperation>,
 > TranspositionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O>
 {
     #[inline]
@@ -457,7 +458,7 @@ pub trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::T
 impl<
     T: DifferentiableType,
     V: Value<Type = T>,
-    O: TransposableOperation<V, O> + ZeroOperationProvider<T> + From<AddOperation>,
+    O: TransposableOperation<V, O> + ResidualZeroProvider<T> + From<AddOperation>,
 > RegionRef<'_, V, O>
 {
     /// Transposes this borrowed linear _pushforward_ [`Region`](crate::Region) into its reverse-mode _pullback_.
@@ -947,7 +948,7 @@ impl<
                                 })
                             })
                             .collect::<Result<Vec<_>, _>>()?;
-                        O::add_transposition_zero(&mut builder_borrow, cotangent_type, residuals.as_slice())
+                        O::add_zero_from_residuals(&mut builder_borrow, cotangent_type, residuals.as_slice())
                     }
                 }
             })
@@ -977,7 +978,7 @@ impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where
     T: DifferentiableType,
     V: Value<Type = T>,
-    O: TransposableOperation<V, O> + ZeroOperationProvider<T> + From<AddOperation>,
+    O: TransposableOperation<V, O> + ResidualZeroProvider<T> + From<AddOperation>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -1009,11 +1010,12 @@ where
     /// the gradient entry points: the holomorphic ones return the complex derivative `∂f/∂z`, and the plain ones return
     /// `2 · ∂f/∂z̄` for ℂ → ℝ functions.
     ///
-    /// Disconnected primal inputs are emitted as [`ZeroOperation`]s, which the value type's [`Zero`] implementation
-    /// evaluates at interpretation time. This applies uniformly to linear programs whose values are [`Tracer`]s from
-    /// an outer trace. Interpreting such a pullback [`ZeroOperation`] over outer-trace [`Tracer`]s stages a typed zero
-    /// into the surrounding tracing context, so that backends whose traced constants are abstract metadata do not need
-    /// to materialize a runtime value just to transpose an enclosing traced program.
+    /// Disconnected primal inputs are emitted as [`ZeroOperation`](crate::ZeroOperation)s, which the value type's
+    /// [`Zero`] implementation evaluates at interpretation time. This applies uniformly to linear programs whose values
+    /// are [`Tracer`]s from an outer trace. Interpreting such a pullback [`ZeroOperation`](crate::ZeroOperation) over
+    /// outer-trace [`Tracer`]s stages a typed zero into the surrounding tracing context, so that backends whose traced
+    /// constants are abstract metadata do not need to materialize a runtime value just to transpose an enclosing traced
+    /// program.
     ///
     /// `input_indices` selects the inputs to transpose with respect to, while the remaining inputs are held as constant
     /// parameters of the linear map. The program must be linear in the selected inputs, but it can depend arbitrarily
@@ -1029,7 +1031,7 @@ where
     /// inputs, **in `input_indices` order**. Known inputs receive no cotangent output. Because this layout depends on
     /// `input_indices`, the pullback's inputs and outputs are returned as flat [`Vec`]s rather than reusing this
     /// program's structured input and output types. The fully linear [`Program::transpose`] recovers the structured
-    /// form. Disconnected selected inputs are emitted as [`ZeroOperation`]s in the same way.
+    /// form. Disconnected selected inputs are emitted as [`ZeroOperation`](crate::ZeroOperation)s in the same way.
     ///
     /// # Known Intermediates and Rematerialization
     ///
@@ -1099,7 +1101,7 @@ where
                 if live_sets.atoms()[input.index()] {
                     0
                 } else {
-                    O::transposition_zero_residual_types(self.atoms()[input.index()].r#type().as_ref()).len()
+                    O::zero_residual_types(self.atoms()[input.index()].r#type().as_ref()).len()
                 }
             })
             .collect::<Vec<_>>();
@@ -1226,7 +1228,7 @@ pub trait ReverseModeDifferentiate:
                        + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
                        + DifferentiableOperation<PartialEvaluationContext<Self>>
                        + TransposableOperation<Self::Constant, Self::Operation>
-                       + ZeroOperationProvider<Self::Type>
+                       + ResidualZeroProvider<Self::Type>
                        + From<AddOperation>,
     >
 {
@@ -1397,7 +1399,7 @@ where
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
-        + ZeroOperationProvider<C::Type>
+        + ResidualZeroProvider<C::Type>
         + From<AddOperation>,
 {
 }
@@ -1421,7 +1423,7 @@ pub fn vjp<
                 > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
-                > + ZeroOperationProvider<V::Type>
+                > + ResidualZeroProvider<V::Type>
                                + From<AddOperation>,
             >,
         >,

@@ -5,6 +5,7 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
+use crate::differentiation::linear::ResidualZeroProvider;
 use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroOperationProvider};
@@ -154,11 +155,17 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
     /// Creates a new [`Linearization`] from its parts, validating the boundary contract documented on [`Linearization`]
     /// where `primal` produces its primal outputs followed by its trailing `residual_count` residuals, and `tangent`
     /// consumes one tangent input per non-zero differential input followed by those same residuals and produces one
-    /// tangent output per non-zero differential output. Violations are reported as
-    /// [`MalformedProgram`](ProgramError::MalformedProgram) errors: too few
-    /// primal outputs or tangent inputs to hold the residuals, sub-program boundary counts that disagree with each
-    /// other, or a residual whose primal output type differs from its tangent input type. [`Program::linearize`] is the
-    /// function that typically calls this function and constructs [`Linearization`]s.
+    /// tangent output per non-zero differential output. Violations (e.g., too few primal outputs or tangent inputs to
+    /// hold the residuals, sub-program boundary counts that disagree with each other, or a residual whose primal output
+    /// type differs from its tangent input type) are reported as [`MalformedProgram`](ProgramError::MalformedProgram)
+    /// errors. [`Program::linearize`] is the function that typically calls this function and constructs
+    /// [`Linearization`]s.
+    ///
+    /// Note that the stability of the tangent program's boundary liveness is load-bearing beyond construction.
+    /// Transposition recovers the residual partition and each disconnected input's residual mapping by *recomputing*
+    /// which tangent inputs are live from the stored program, rather than storing that partition here. Any pass that
+    /// rewrites the tangent program between linearization and transposition must therefore preserve its input liveness
+    /// exactly, or the pairing degrades to the residual-count check and typed extent-mismatch errors.
     pub fn new(
         primal: Program<V, O, Vec<V>, Vec<V>>,
         tangent: Program<V, O, Vec<V>, Vec<V>>,
@@ -303,7 +310,7 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
     pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     where
         V::Type: DifferentiableType,
-        O: TransposableOperation<V, O> + ZeroOperationProvider<V::Type> + From<AddOperation>,
+        O: TransposableOperation<V, O> + ResidualZeroProvider<V::Type> + From<AddOperation>,
     {
         // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
         // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are
@@ -711,7 +718,7 @@ where
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + ZeroOperationProvider<C::Type>,
+        + ResidualZeroProvider<C::Type>,
 {
     fn jvp_program(
         &self,
@@ -988,7 +995,7 @@ where
         + DifferentiableOperation<C>
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + ZeroOperationProvider<C::Type>,
+        + ResidualZeroProvider<C::Type>,
 {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
@@ -1086,7 +1093,7 @@ where
     O: PartiallyEvaluatableOperation<TracingContext<V, O>>
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
-        + ZeroOperationProvider<V::Type>,
+        + ResidualZeroProvider<V::Type>,
 {
     /// Builds the *fused* Jacobian-Vector Product (JVP) [`Program`] of this borrowed [`Region`](crate::Region).
     /// Refer to the documentation of [`Program::jvp`] for more information.
@@ -1459,9 +1466,8 @@ where
                 continue;
             }
             let tangent_type = tangent_input.r#type().into_owned();
-            let expected_types = O::transposition_zero_residual_types(&tangent_type);
-            let residuals =
-                O::capture_transposition_zero_residuals(&mut primal_builder.borrow_mut(), primal_input, &tangent_type)?;
+            let expected_types = O::zero_residual_types(&tangent_type);
+            let residuals = O::capture_zero_residuals(&mut primal_builder.borrow_mut(), primal_input, &tangent_type)?;
             if residuals.len() != expected_types.len() {
                 return Err(ProgramError::MalformedProgram(format!(
                     "transposition zero for input type {} captured {} residuals but declared {}",
@@ -1536,7 +1542,7 @@ where
     O: PartiallyEvaluatableOperation<TracingContext<V, O>>
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
-        + ZeroOperationProvider<V::Type>,
+        + ResidualZeroProvider<V::Type>,
 {
     /// Builds the *fused* Jacobian-Vector Product (JVP) [`Program`] of this [`Program`]. Assume the input program
     /// represents a function `f` from its inputs to its outputs, `x ↦ y = f(x)`. This function returns the program that
@@ -1570,9 +1576,9 @@ where
     /// [`MaybeZero::Zero`]s and stage nothing. The shared all-zero fast path short-circuits operations whose every
     /// input tangent is structural zero only when each output zero tangent can be materialized without runtime identity
     /// operands (or by reusing a compatible zero-producing primal). It stages the primal directly and pairs each output
-    /// with a typed structural zero tangent. Structural zeros are materialized as typed [`ZeroOperation`] instructions
-    /// only when a nonzero differential output requires a real value, preserving a compact
-    /// `(primal_outputs ++ live_tangent_outputs)` program contract.
+    /// with a typed structural zero tangent. Structural zeros are materialized as typed
+    /// [`ZeroOperation`](crate::ZeroOperation) instructions only when a nonzero differential output requires a real
+    /// value, preserving a compact `(primal_outputs ++ live_tangent_outputs)` program contract.
     #[inline]
     pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         self.entry_region_ref().jvp()
@@ -1706,7 +1712,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     where
         Self::Operation: PartiallyEvaluatableOperation<Self>
             + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-            + ZeroOperationProvider<Self::Type>,
+            + ResidualZeroProvider<Self::Type>,
     {
         if primals.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
@@ -1847,8 +1853,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
                 continue;
             }
             let tangent_type = tangent_input.r#type().into_owned();
-            let expected_types = Self::Operation::transposition_zero_residual_types(&tangent_type);
-            let values = Self::Operation::capture_transposition_zero_values(self, primal, &tangent_type)?;
+            let expected_types = Self::Operation::zero_residual_types(&tangent_type);
+            let values = Self::Operation::capture_zero_residual_values(self, primal, &tangent_type)?;
             if values.len() != expected_types.len() {
                 return Err(ProgramError::MalformedProgram(format!(
                     "transposition zero for input type {} captured {} residual values but declared {}",
@@ -1989,7 +1995,7 @@ pub fn linearize<
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
                                + PartiallyEvaluatableOperation<
                     TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-                > + ZeroOperationProvider<V::Type>,
+                > + ResidualZeroProvider<V::Type>,
             > + Zero<V>,
         >,
     F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
