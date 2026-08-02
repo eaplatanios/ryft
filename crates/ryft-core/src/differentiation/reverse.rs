@@ -61,10 +61,6 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     /// [`program`](Self::program). Refer to the documentation of [`ZeroSpaceBoundaryResiduals`] for more information.
     input_zero_residuals: ZeroSpaceBoundaryResiduals<C::Value>,
 
-    /// Complete public primal input boundary. The executable pullback omits outputs whose derived cotangent type is a
-    /// zero differential space.
-    primal_input_types: Vec<C::Type>,
-
     /// Complete public primal output boundary. The executable pullback omits inputs whose derived cotangent type is a
     /// zero differential space.
     primal_output_types: Vec<C::Type>,
@@ -89,10 +85,10 @@ impl<
     /// Creates a [`Pullback`] from a compact cotangent [`Program`] and the complete primal boundary from which that
     /// program was derived. The program has the boundary `(live(ȳ), r) ↦ live(x̄)`. It omits every cotangent input and
     /// output whose differential space contains only zero. Its boundary therefore cannot recover the omitted leaves'
-    /// positions or types, and the cotangent-type mapping is not generally invertible. `primal_input_types` and
-    /// `primal_output_types` preserve that complete boundary so [`apply`](Self::apply) can validate all public
-    /// cotangent leaves, remove the zero-space inputs before replay, and insert typed zeros at the correct output
-    /// positions afterward.
+    /// positions or types, and the cotangent-type mapping is not generally invertible. `primal_output_types` preserves
+    /// the complete public input boundary so [`apply`](Self::apply) can validate and filter its cotangent arguments.
+    /// `input_zero_residuals` independently preserves the reconstruction plan for omitted output leaves, while
+    /// `primal_input_types` is needed only here to validate the compact program's output boundary.
     ///
     /// This function validates the relationship among all three boundaries. In particular, the program must consume one
     /// leading input for every nonzero cotangent in `primal_output_types`, followed by one input for every residual,
@@ -113,11 +109,11 @@ impl<
     ///     leaves whose cotangent spaces contain only zero and which are consequently absent from `program` inputs.
     ///   - `input_structure`: Parameter structure used to rebuild the complete public input cotangent after typed
     ///     zeros have been inserted for the omitted leaves.
-    pub fn new(
+    pub(crate) fn new(
         context: C,
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,
-        input_zero_residuals: Vec<C::Value>,
+        input_zero_residuals: ZeroSpaceBoundaryResiduals<C::Value>,
         primal_input_types: Vec<C::Type>,
         primal_output_types: Vec<C::Type>,
         input_structure: Input::ParameterStructure,
@@ -125,12 +121,6 @@ impl<
     where
         C::Operation: ResidualZeroProvider<C::Type>,
     {
-        let input_zero_residuals = ZeroSpaceBoundaryResiduals::new::<C::Operation, _>(
-            "pullback input boundary",
-            primal_input_types.as_slice(),
-            input_zero_residuals,
-            DifferentiableType::cotangent,
-        )?;
         let cotangent_input_count = program.input_ids().len().checked_sub(residuals.len()).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "pullback program consumes {} inputs which is fewer than its {} residuals",
@@ -201,7 +191,6 @@ impl<
             program,
             residuals,
             input_zero_residuals,
-            primal_input_types,
             primal_output_types,
             input_structure,
             marker: PhantomData,
@@ -278,13 +267,8 @@ impl<
 
         // Reconstruct the complete flattened public input boundary. Consume one program result for each nonzero
         // cotangent space and materialize the uniquely determined typed zero for every omitted zero-space leaf.
-        let cotangents = self.input_zero_residuals.rebuild(
-            &self.context,
-            self.primal_input_types.as_slice(),
-            DifferentiableType::cotangent,
-            input_cotangents,
-            "pullback input boundary",
-        )?;
+        let cotangents =
+            self.input_zero_residuals.rebuild(&self.context, input_cotangents, "pullback input boundary")?;
 
         // Restore the closure's original structured input shape after rebuilding every flattened cotangent leaf.
         Ok(Input::To::<C::Value>::from_parameters(self.input_structure.clone(), cotangents)?)
@@ -946,7 +930,9 @@ impl<
                                 })
                             })
                             .collect::<Result<Vec<_>, _>>()?;
-                        O::add_zero_from_residuals(&mut builder_borrow, cotangent_type, residuals.as_slice())
+                        let (operation, operands) =
+                            O::zero_operation_with_residuals(cotangent_type, residuals.as_slice())?;
+                        Ok(builder_borrow.add_instruction(operation, Vec::new(), operands)?[0])
                     }
                 }
             })
@@ -1259,7 +1245,7 @@ pub trait ReverseModeDifferentiate:
                 self.clone(),
                 program,
                 residuals,
-                input_zero_residuals.into_values(),
+                input_zero_residuals,
                 input_types,
                 output_types,
                 input_structure,

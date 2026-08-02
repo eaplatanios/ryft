@@ -161,18 +161,19 @@ impl<T: Type, O: Operation<T> + From<ZeroOperation<T>>> ResidualZeroProvider<T> 
 ///   - `context`: Context in which the provider reads residual values from `source`.
 ///   - `source`: Primal value whose runtime geometry determines the zero.
 ///   - `r#type`: Type of the zero that will eventually consume the captured residuals.
-///   - `label`: Description of the capture site included in malformed-provider diagnostics.
+///   - `site`: Description of the capture site included in malformed-provider diagnostics.
 pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: ResidualZeroProvider<C::Type>>>(
     context: &C,
     source: &C::Value,
     r#type: &C::Type,
-    label: &str,
+    site: &str,
 ) -> Result<Vec<C::Value>, ProgramError> {
     let expected_types = C::Operation::zero_residual_types(r#type);
     let residuals = C::Operation::capture_zero_residual_values(context, source, r#type)?;
     if residuals.len() != expected_types.len() {
         return Err(ProgramError::MalformedProgram(format!(
-            "{label} captured {} zero residuals but declared {}",
+            "{} captured {} zero residuals but declared {}",
+            site,
             residuals.len(),
             expected_types.len(),
         )));
@@ -181,7 +182,7 @@ pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: Re
         if residual.r#type().as_ref() != &expected_type {
             return Err(ProgramError::MalformedProgram(format!(
                 "{} zero residual {} has type {} but expected {}",
-                label,
+                site,
                 index,
                 residual.r#type(),
                 expected_type,
@@ -189,6 +190,44 @@ pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: Re
         }
     }
     Ok(residuals)
+}
+
+/// Role of differential boundary whose [`ZeroSpaceBoundaryLeaf`]s are reconstructed
+/// from [`ZeroSpaceBoundaryResiduals`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ZeroSpaceBoundaryRole {
+    /// Cotangents of the primal input boundary, returned by a _pullback_ function.
+    InputCotangent,
+
+    /// Tangents of the primal output boundary, returned by a _pushforward_ function.
+    OutputTangent,
+}
+
+impl ZeroSpaceBoundaryRole {
+    /// Returns the differential [`Type`] represented by this [`ZeroSpaceBoundaryRole`] for `primal_type`.
+    #[inline]
+    fn differential_type<T: DifferentiableType>(self, primal_type: &T) -> T {
+        match self {
+            Self::InputCotangent => primal_type.cotangent(),
+            Self::OutputTangent => primal_type.tangent(),
+        }
+    }
+
+    /// Returns the concise description of this [`ZeroSpaceBoundaryRole`] to be used in diagnostics.
+    #[inline]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InputCotangent => "input cotangent boundary",
+            Self::OutputTangent => "output tangent boundary",
+        }
+    }
+}
+
+impl Display for ZeroSpaceBoundaryRole {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Reconstruction metadata for one zero-space leaf omitted from a compact derivative boundary.
@@ -227,6 +266,9 @@ pub(crate) struct ZeroSpaceBoundaryLeaf<T: Type> {
 /// every omitted zero, and the range of residuals that reconstructs it. The tangent/cotangent mapping and primal
 /// boundary are therefore consumed exactly once during capture and cannot be changed later during reconstruction.
 pub(crate) struct ZeroSpaceBoundaryResiduals<V: Value> {
+    /// Semantic role of the differential boundary reconstructed by this instance.
+    role: ZeroSpaceBoundaryRole,
+
     /// Flattened runtime-geometry residuals captured in zero-leaf and provider-declaration order.
     residuals: Vec<V>,
 
@@ -240,9 +282,9 @@ pub(crate) struct ZeroSpaceBoundaryResiduals<V: Value> {
 impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
     /// Captures the runtime geometry and reconstruction plan for every zero-space leaf of one differential boundary.
     ///
-    /// For each primal leaf type `Tᵢ`, `differential_type_fn` derives the boundary type `D(Tᵢ)`. A nonzero-space
-    /// `D(Tᵢ)` remains a live input or output of the compact derivative program and needs no entry in the stored plan.
-    /// For a zero-space `D(Tᵢ)`, this function captures and validates the runtime values declared by
+    /// For each primal leaf type `Tᵢ`, `role` determines the boundary type `D(Tᵢ)`. A nonzero-space `D(Tᵢ)` remains a
+    /// live input or output of the compact derivative program and needs no entry in the stored plan. For a zero-space
+    /// `D(Tᵢ)`, this function captures and validates the runtime values declared by
     /// [`ResidualZeroProvider::zero_residual_types`] from the corresponding primal value, then records the leaf index,
     /// differential type, and captured residual range. Reconstruction therefore never needs the primal boundary or
     /// differential mapping again.
@@ -252,28 +294,22 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
     ///   - `context`: Context in which the operation family reads runtime geometry from the primal values.
     ///   - `primal_values`: Complete flattened primal boundary values in leaf order.
     ///   - `primal_types`: Complete flattened primal boundary types in the same order as `primal_values`.
-    ///   - `differential_type_fn`: Type mapping that defines this boundary. Pass [`DifferentiableType::tangent`] for a
-    ///     tangent boundary and [`DifferentiableType::cotangent`] for a cotangent boundary.
-    ///   - `label`: Human-readable name of the derivative boundary, included in capture diagnostics.
+    ///   - `role`: Semantic boundary role that selects the tangent/cotangent mapping and identifies diagnostics.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] if the primal value/type counts differ or if an operation family
     /// captures residual values whose count or types disagree with its declaration.
-    pub(crate) fn capture<
-        C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>,
-        DifferentialTypeFn: Fn(&C::Type) -> C::Type,
-    >(
+    pub(crate) fn capture<C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>>(
         context: &C,
         primal_values: &[C::Value],
         primal_types: &[C::Type],
-        differential_type_fn: DifferentialTypeFn,
-        label: &str,
+        role: ZeroSpaceBoundaryRole,
     ) -> Result<Self, ProgramError> {
         if primal_values.len() != primal_types.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "{} has {} primal values but {} primal types",
-                label,
+                role,
                 primal_values.len(),
                 primal_types.len(),
             )));
@@ -281,10 +317,15 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
         let mut residuals = Vec::new();
         let mut zero_leaves = Vec::new();
         for (index, (value, primal_type)) in primal_values.iter().zip(primal_types).enumerate() {
-            let differential_type = differential_type_fn(primal_type);
+            let differential_type = role.differential_type(primal_type);
             if differential_type.is_zero_space() {
                 let residual_start = residuals.len();
-                residuals.extend(capture_and_validate_zero_residual_values(context, value, &differential_type, label)?);
+                residuals.extend(capture_and_validate_zero_residual_values(
+                    context,
+                    value,
+                    &differential_type,
+                    role.as_str(),
+                )?);
                 zero_leaves.push(ZeroSpaceBoundaryLeaf {
                     index,
                     r#type: differential_type,
@@ -292,7 +333,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
                 });
             }
         }
-        Ok(Self { residuals, boundary_size: primal_types.len(), zero_leaves })
+        Ok(Self { role, residuals, boundary_size: primal_types.len(), zero_leaves })
     }
 
     /// Rebuilds the complete differential boundary described by this instance, interleaving materialized zero-space
@@ -304,7 +345,6 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
     ///
     ///   - `context`: Context in which residual-backed zero operations are bound.
     ///   - `live_values`: Differential values for every nonzero-space boundary leaf, in boundary order.
-    ///   - `label`: Human-readable name of the derivative boundary, included in compact-program count diagnostics.
     ///
     /// # Errors
     ///
@@ -317,7 +357,6 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
         &self,
         context: &C,
         live_values: I,
-        label: &str,
     ) -> Result<Vec<C::Value>, ProgramError> {
         let mut live_values = live_values.into_iter();
         let mut zero_leaves = self.zero_leaves.iter().peekable();
@@ -333,13 +372,14 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
                 values.push(outputs.remove(0));
             } else {
                 values.push(live_values.next().ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!("{label} omitted a nonzero differential value"))
+                    ProgramError::MalformedProgram(format!("{} omitted a nonzero differential value", self.role))
                 })?);
             }
         }
         if live_values.next().is_some() {
             return Err(ProgramError::MalformedProgram(format!(
-                "{label} produced too many nonzero differential values",
+                "{} produced too many nonzero differential values",
+                self.role,
             )));
         }
         Ok(values)
@@ -1033,6 +1073,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::tests::{
@@ -1051,7 +1092,7 @@ mod tests {
     use crate::programs::regions::{RegionDriver, RegionRef, RegionSlot};
     use crate::sharding::ShardingDimension;
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayType, DataType};
+    use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -1104,6 +1145,79 @@ mod tests {
             }),
         );
         assert!(builder.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_zero_space_boundary_residuals_reconstruct_dynamic_zero() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let key_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let accumulator_type = ArrayType::scalar(DataType::F64);
+        let context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let key = context.input(key_type.clone().into());
+        let accumulator = context.input(accumulator_type.clone().into());
+        let primal_values = vec![key, accumulator.clone()];
+        let primal_types = vec![key_type.clone().into(), accumulator_type.into()];
+
+        // Capture retains the key's dynamic extent and records that only the accumulator tangent remains live in the
+        // compact output boundary. Rebuild must recover the omitted key tangent from that stored plan.
+        let residuals = ZeroSpaceBoundaryResiduals::capture(
+            &context,
+            primal_values.as_slice(),
+            primal_types.as_slice(),
+            ZeroSpaceBoundaryRole::OutputTangent,
+        )
+        .unwrap();
+        let outputs = residuals.rebuild(&context, [accumulator.clone()]).unwrap();
+        let key_tangent_type = ArrayProgramType::Array(key_type.tangent());
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].r#type().as_ref(), &key_tangent_type);
+        assert_eq!(outputs[1].atom_id(), accumulator.atom_id());
+
+        // The captured dimension-size result is the sole operand of the dynamic zero constructor, proving that the
+        // stored residual range—not a type-only zero—is used during reconstruction.
+        let builder = context.builder().borrow();
+        assert_eq!(builder.instructions().len(), 2);
+        assert!(matches!(builder.instructions()[0].operation(), ArrayProgramOperation::DimensionSize(_)));
+        assert!(matches!(builder.instructions()[1].operation(), ArrayProgramOperation::Zero(_)));
+        assert_eq!(builder.instructions()[1].inputs(), builder.instructions()[0].outputs());
+    }
+
+    #[test]
+    fn test_zero_space_boundary_residuals_report_stored_boundary() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let primal = Array::scalar(3.0);
+        let primal_type = ArrayType::scalar(DataType::F64);
+
+        // The output-tangent role retained during capture identifies a missing compact-program result without a
+        // caller-supplied diagnostic context.
+        let output_tangent = ZeroSpaceBoundaryResiduals::capture(
+            &context,
+            std::slice::from_ref(&primal),
+            std::slice::from_ref(&primal_type),
+            ZeroSpaceBoundaryRole::OutputTangent,
+        )
+        .unwrap();
+        assert_eq!(
+            output_tangent.rebuild(&context, Vec::new()),
+            Err(ProgramError::MalformedProgram(
+                "output tangent boundary omitted a nonzero differential value".to_string(),
+            )),
+        );
+
+        // The input-cotangent role independently identifies an excessive compact-program result.
+        let input_cotangent = ZeroSpaceBoundaryResiduals::capture(
+            &context,
+            std::slice::from_ref(&primal),
+            std::slice::from_ref(&primal_type),
+            ZeroSpaceBoundaryRole::InputCotangent,
+        )
+        .unwrap();
+        assert_eq!(
+            input_cotangent.rebuild(&context, [Array::scalar(1.0), Array::scalar(2.0)]),
+            Err(ProgramError::MalformedProgram(
+                "input cotangent boundary produced too many nonzero differential values".to_string(),
+            )),
+        );
     }
 
     #[test]
