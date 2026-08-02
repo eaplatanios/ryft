@@ -20,6 +20,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
 use crate::operations::manipulation::{
     LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Reshape, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
@@ -30,9 +31,9 @@ use crate::partial::{
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
 use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
+use crate::programs::atoms::{AtomId, MaybeZero};
 use crate::programs::builders::ProgramBuilder;
-use crate::programs::identities::TypeIdentityRenaming;
+use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRef, RegionSlot};
@@ -363,6 +364,9 @@ pub trait ScanTypeSemantics: Type {
         input_types: &[Self],
     ) -> Result<Vec<Self>, TypeError>;
 
+    /// Returns the boundary type that stores one per-iteration value across the scan length.
+    fn stacked_scan_type(r#type: &Self, length: &Dimension) -> Result<Self, TypeError>;
+
     /// Validates one capture value stored on this scan.
     fn validate_scan_capture<C: Value<Type = Self>>(
         capture: &C,
@@ -455,6 +459,11 @@ impl ScanTypeSemantics for ArrayType {
         scan_output_types(body_input_types, body_output_types, carry_count, length, input_types)
     }
 
+    #[inline]
+    fn stacked_scan_type(r#type: &Self, length: &Dimension) -> Result<Self, TypeError> {
+        Ok(stacked_scan_type(r#type, length))
+    }
+
     fn validate_scan_capture<C: Value<Type = Self>>(
         capture: &C,
         index: usize,
@@ -514,12 +523,34 @@ impl ScanTypeSemantics for DataType {
         scalar_scan_output_types(body_input_types, body_output_types, carry_count, input_types)
     }
 
+    fn stacked_scan_type(r#type: &Self, _length: &Dimension) -> Result<Self, TypeError> {
+        Err(TypeError::invalid(format!("scalar scan cannot stack per-iteration type {}", r#type)))
+    }
+
     fn validate_scan_capture<C: Value<Type = Self>>(
         _capture: &C,
         _index: usize,
         _length: &Dimension,
     ) -> Result<(), TypeError> {
         Err(TypeError::invalid("scalar scan captures require a scalar stack representation".to_string()))
+    }
+}
+
+impl TemporalResidualType for DataType {
+    fn temporal_storage_type(&self) -> Result<Self, TypeError> {
+        Err(TypeError::invalid(format!("scalar scan cannot stack the time-varying residual type {}", self,)))
+    }
+}
+
+impl<O: Operation<DataType>> TemporalResidualOperation<DataType> for O {
+    #[inline]
+    fn residual_to_storage(_residual_type: &DataType) -> Result<Option<Self>, TypeError> {
+        Ok(None)
+    }
+
+    #[inline]
+    fn residual_from_storage(_residual_type: &DataType) -> Result<Option<Self>, TypeError> {
+        Ok(None)
     }
 }
 
@@ -659,6 +690,13 @@ impl ScanTypeSemantics for ArrayProgramType {
             }
         }
         Ok(output_types)
+    }
+
+    fn stacked_scan_type(r#type: &Self, length: &Dimension) -> Result<Self, TypeError> {
+        let Self::Array(r#type) = r#type else {
+            return Err(TypeError::invalid(format!("scan cannot stack first-class dimension type {}", r#type)));
+        };
+        Ok(Self::Array(stacked_scan_type(r#type, length)))
     }
 
     fn validate_scan_capture<C: Value<Type = Self>>(
@@ -995,7 +1033,7 @@ where
     accumulator.update_slice(&expanded, start_indices.as_slice())
 }
 
-/// Partial-evaluation override for a [`ScanOperation`] over [`ArrayType`].
+/// Partial-evaluation override for a [`ScanOperation`].
 ///
 /// A scan's inputs are `[carry_init..., stacked_xs...]` and its body maps `[carry..., x_slice...]` to
 /// `[next_carry..., y_slice...]`. Partial evaluation folds the known value of every *loop-invariant-known* carry into
@@ -1036,10 +1074,10 @@ where
 /// residualize-unchanged behavior.
 impl<V, O, C> PartiallyEvaluatableOperation<C> for ScanOperation<V>
 where
-    V: Value<Type = ArrayType>,
-    C: Context<Type = ArrayType, Constant = V, Operation = O>,
+    V: Value<Type: ScanTypeSemantics + TemporalResidualType>,
+    C: Context<Type = V::Type, Constant = V, Operation = O>,
     C::Value: PartialEq,
-    O: Operation<ArrayType> + From<ScanOperation<V>>,
+    O: Operation<V::Type> + From<ScanOperation<V>> + TemporalResidualOperation<V::Type>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -1249,15 +1287,18 @@ fn split_scan_by_knownness<V, O, C, PartitionRegion>(
     mut partition_region: PartitionRegion,
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
-    V: Value<Type = ArrayType>,
-    C: Context<Type = ArrayType, Constant = V, Operation = O>,
-    O: Operation<ArrayType> + From<ScanOperation<V>>,
+    V: Value<Type: ScanTypeSemantics + TemporalResidualType>,
+    C: Context<Type = V::Type, Constant = V, Operation = O>,
+    O: Operation<V::Type> + From<ScanOperation<V>> + TemporalResidualOperation<V::Type>,
     PartitionRegion: FnMut(&[bool]) -> Result<PartitionedProgram<V, O>, ProgramError>,
 {
     let carry_count = scan.carry_count;
     let body_input_types = body.input_types();
     let body_output_count = body.output_types().len();
-    let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
+    let runtime_length_count = usize::from(scan.length.variable().is_some());
+    check_count!("input", inputs, body_input_types.len() + runtime_length_count, ProgramError);
+    let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_types.len());
+    let input_known = body_inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
 
     // Fixed point over carry known-ness, each round partitioning the borrowed body through a fresh staging context.
     let mut partition_body = |carry_known: &[bool]| -> Result<PartitionedProgram<V, O>, ProgramError> {
@@ -1309,6 +1350,7 @@ where
     // unknown carries). Absolute positions into this list equal positions into the known scan's outputs, because the
     // known scan's outputs are its final carries followed by its stacked per-iteration outputs in the same order.
     let mut known_program_output_indices = Vec::with_capacity(known_program.output_ids().len());
+    let mut known_program_output_edges = Vec::with_capacity(known_program.output_ids().len());
     let mut known_carry_output_positions = vec![None; carry_count];
     for index in 0..carry_count {
         if carry_known[index] {
@@ -1316,6 +1358,7 @@ where
                 PartialEvaluationOutput::Known(output) => {
                     known_carry_output_positions[index] = Some(known_program_output_indices.len());
                     known_program_output_indices.push(*output);
+                    known_program_output_edges.push(None);
                 }
                 PartialEvaluationOutput::Unknown(_) => {
                     return Err(ProgramError::MalformedProgram(
@@ -1331,9 +1374,11 @@ where
         if let PartialEvaluationOutput::Known(output) = output {
             known_y_output_positions[position] = Some(known_program_output_indices.len());
             known_program_output_indices.push(*output);
+            known_program_output_edges.push(None);
         }
     }
     let mut edge_types = Vec::new();
+    let mut edge_carry_sources = Vec::new();
     let mut feeder_edge_positions = Vec::with_capacity(residual_inputs.len());
     for input in residual_inputs.iter() {
         match input {
@@ -1349,9 +1394,23 @@ where
                         "scan body partition residual edge {edge} has no known-program output",
                     ))
                 })?;
-                feeder_edge_positions.push(Some((*edge, known_program_output_indices.len())));
+                let carry_source = (0..carry_count).find(|&index| {
+                    carry_known[index]
+                        && matches!(
+                            &partition_outputs[index],
+                            PartialEvaluationOutput::Known(carry)
+                                if known_program.output_ids()[*carry] == known_program.output_ids()[output]
+                        )
+                });
                 edge_types.push(output_type.clone());
-                known_program_output_indices.push(output);
+                edge_carry_sources.push(carry_source);
+                if carry_source.is_some() {
+                    feeder_edge_positions.push(None);
+                } else {
+                    feeder_edge_positions.push(Some((*edge, known_program_output_indices.len())));
+                    known_program_output_indices.push(output);
+                    known_program_output_edges.push(Some(*edge));
+                }
             }
             PartialEvaluationInput::Unknown(_) => feeder_edge_positions.push(None),
         }
@@ -1366,11 +1425,35 @@ where
                     ))
                 })?;
                 instantiated_edge_positions[index] = Some((edge_types.len(), known_program_output_indices.len()));
+                let edge = edge_types.len();
                 edge_types.push(output_type.clone());
+                edge_carry_sources.push(None);
                 known_program_output_indices.push(*output);
+                known_program_output_edges.push(Some(edge));
             }
         }
     }
+    let mut invariant_carry_sources = Vec::new();
+    let edge_invariant_carry_positions = edge_carry_sources
+        .iter()
+        .map(|source| {
+            source.map(|source| {
+                invariant_carry_sources.iter().position(|&candidate| candidate == source).unwrap_or_else(|| {
+                    invariant_carry_sources.push(source);
+                    invariant_carry_sources.len() - 1
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let edge_storage_types = edge_types
+        .iter()
+        .zip(&edge_invariant_carry_positions)
+        .map(
+            |(edge_type, invariant_position)| {
+                if invariant_position.is_some() { Ok(edge_type.clone()) } else { edge_type.temporal_storage_type() }
+            },
+        )
+        .collect::<Result<Vec<_>, TypeError>>()?;
 
     // An empty known side means the split folds nothing; residualize unchanged through the default rule.
     if known_program_output_indices.is_empty() {
@@ -1382,11 +1465,13 @@ where
     let known_scan_inputs = known_input_indices
         .iter()
         .map(|&index| {
-            inputs.get(index).cloned().ok_or_else(|| {
+            body_inputs.get(index).cloned().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!("scan body partition references missing scan input {index}",))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let mut known_scan_inputs = known_scan_inputs;
+    known_scan_inputs.extend_from_slice(runtime_length_inputs);
     let mut known_body_builder = ProgramBuilder::<V, O>::new();
     let known_body_inputs = known_program
         .input_types()
@@ -1396,12 +1481,18 @@ where
     let known_program_outputs = known_body_builder.splice_program(&known_program, known_body_inputs.as_slice())?;
     let known_output_atoms = known_program_output_indices
         .iter()
-        .map(|&output| {
-            known_program_outputs.get(output).copied().ok_or_else(|| {
+        .zip(&known_program_output_edges)
+        .map(|(&output, &edge)| -> Result<AtomId, ProgramError> {
+            let output = known_program_outputs.get(output).copied().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
                     "scan body partition references missing known-program output {output}",
                 ))
-            })
+            })?;
+            let Some(edge) = edge else { return Ok(output) };
+            let Some(operation) = O::residual_to_storage(&edge_types[edge])? else { return Ok(output) };
+            let converted = known_body_builder.add_instruction(operation, Vec::new(), vec![output])?;
+            check_count!("output", converted, 1, ProgramError);
+            Ok(converted[0])
         })
         .collect::<Result<Vec<_>, _>>()?;
     let known_body = known_body_builder.build::<Vec<V>, Vec<V>>(
@@ -1426,6 +1517,10 @@ where
             || !residual_program.effects().is_pure();
     if needs_unknown_scan {
         let mut builder = ProgramBuilder::<V, O>::new();
+        let invariant_carry_atoms = invariant_carry_sources
+            .iter()
+            .map(|&source| builder.add_input(body_input_types[source].clone()))
+            .collect::<Vec<_>>();
         let mut unknown_body_input_atoms = vec![None; body_input_types.len()];
         for (index, input_type) in body_input_types.iter().enumerate() {
             let known = if index < carry_count { carry_known[index] } else { input_known[index] };
@@ -1433,8 +1528,38 @@ where
                 unknown_body_input_atoms[index] = Some(builder.add_input(input_type.clone()));
             }
         }
-        let edge_input_atoms =
-            edge_types.iter().map(|edge_type| builder.add_input(edge_type.clone())).collect::<Vec<_>>();
+        let mut restored_identity_edges = Vec::new();
+        let mut edge_input_atoms = Vec::with_capacity(edge_types.len());
+        for (edge, edge_type) in edge_types.iter().enumerate() {
+            if let Some(position) = edge_invariant_carry_positions[edge] {
+                edge_input_atoms.push(invariant_carry_atoms[position]);
+                continue;
+            }
+            let storage = builder.add_input(edge_storage_types[edge].clone());
+            let Some(operation) = O::residual_from_storage(edge_type)? else {
+                edge_input_atoms.push(storage);
+                continue;
+            };
+
+            // A residual partition may expose the same identity-bearing value through multiple feeder edges. Restore
+            // that value once so the generated region forwards one SSA definition instead of redefining the nominal
+            // identity for every use.
+            let defines_identity =
+                edge_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
+            if defines_identity
+                && let Some((_, restored)) =
+                    restored_identity_edges.iter().find(|(restored_type, _)| restored_type == edge_type)
+            {
+                edge_input_atoms.push(*restored);
+                continue;
+            }
+            let restored = builder.add_instruction(operation, Vec::new(), vec![storage])?;
+            check_count!("output", restored, 1, ProgramError);
+            edge_input_atoms.push(restored[0]);
+            if defines_identity {
+                restored_identity_edges.push((edge_type.clone(), restored[0]));
+            }
+        }
 
         let mut spliced_inputs = Vec::with_capacity(residual_inputs.len());
         for input in residual_inputs.iter() {
@@ -1455,7 +1580,7 @@ where
         }
         let spliced_outputs = builder.splice_program(&residual_program, &spliced_inputs)?;
 
-        let mut unknown_output_atoms = Vec::new();
+        let mut unknown_output_atoms = invariant_carry_atoms.clone();
         for index in 0..body_output_count {
             let owned_by_unknown_side = if index < carry_count {
                 !carry_known[index]
@@ -1479,23 +1604,25 @@ where
             }
         }
 
-        let unknown_body_input_count =
-            unknown_body_input_atoms.iter().filter(|atom| atom.is_some()).count() + edge_input_atoms.len();
+        let unknown_body_input_count = invariant_carry_atoms.len()
+            + unknown_body_input_atoms.iter().filter(|atom| atom.is_some()).count()
+            + edge_invariant_carry_positions.iter().filter(|position| position.is_none()).count();
         let unknown_output_count = unknown_output_atoms.len();
         let unknown_body = builder.build::<Vec<V>, Vec<V>>(
             unknown_output_atoms,
             vec![Placeholder; unknown_body_input_count],
             vec![Placeholder; unknown_output_count],
         )?;
-        let unknown_carry_count = carry_known.iter().filter(|&&known| !known).count();
+        let unknown_carry_count = invariant_carry_atoms.len() + carry_known.iter().filter(|&&known| !known).count();
         let unknown_scan = ScanOperation::<V>::new(unknown_carry_count, scan.length.clone())
             .with_reverse(scan.reverse)
             .with_unroll(scan.unroll)?;
 
         // The unknown scan consumes the unknown original inputs followed by one stacked edge per residual edge, each
         // edge fed by the known scan's matching stacked output.
-        let mut unknown_scan_inputs = Vec::new();
-        for (index, input) in inputs.iter().enumerate() {
+        let mut unknown_scan_inputs =
+            invariant_carry_sources.iter().map(|&source| body_inputs[source].clone()).collect::<Vec<_>>();
+        for (index, input) in body_inputs.iter().enumerate() {
             let known = if index < carry_count { carry_known[index] } else { input_known[index] };
             if !known {
                 unknown_scan_inputs.push(input.clone());
@@ -1514,6 +1641,7 @@ where
                 )
             })?);
         }
+        unknown_scan_inputs.extend_from_slice(runtime_length_inputs);
         residual_outputs =
             context.residualize(O::from(unknown_scan), vec![unknown_body], unknown_scan_inputs.as_slice())?;
     }
@@ -1935,9 +2063,10 @@ pub(crate) fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
 /// primal scan — stacking exactly the per-iteration known→unknown edges the tangent side consumes — and a residual
 /// tangent scan over `[tangent_carries..., tangent_slices..., edge_slices...]`, the transposable linear-scan shape.
 /// Residual stacks therefore exist only when linearization actually demands them.
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for ScanOperation<C::Constant>
+impl<C: Context<Type: DifferentiableType + ScanTypeSemantics> + Zero<C::Value>> DifferentiableOperation<C>
+    for ScanOperation<C::Constant>
 where
-    C::Operation: From<ZeroOperation<ArrayType>> + From<ScanOperation<C::Constant>>,
+    C::Operation: From<ZeroOperation<C::Type>> + From<ScanOperation<C::Constant>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -1965,7 +2094,9 @@ where
         };
         let body_input_count = input_has_tangent.len();
         let body_output_count = output_has_tangent.len();
-        check_count!("input", inputs, body_input_count, ProgramError);
+        let runtime_length_count = usize::from(length.variable().is_some());
+        check_count!("input", inputs, body_input_count + runtime_length_count, ProgramError);
+        let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_count);
         let live_carry_count = input_has_tangent[..carry_count].iter().filter(|&&live| live).count();
 
         // The fused jvp body is over `[primal_body_inputs..., live(tangent_body_inputs)...]`; permute its compact
@@ -1987,18 +2118,19 @@ where
         // The fused scan takes each live carry and scanned tangent as a real program input, so materialize their
         // structural zeros at this sub-program boundary.
         let mut operands = Vec::with_capacity(fused_body.input_types().len());
-        operands.extend(inputs[..carry_count].iter().map(|input| input.primal().clone()));
-        for (input, &live) in inputs[..carry_count].iter().zip(&input_has_tangent[..carry_count]) {
+        operands.extend(body_inputs[..carry_count].iter().map(|input| input.primal().clone()));
+        for (input, &live) in body_inputs[..carry_count].iter().zip(&input_has_tangent[..carry_count]) {
             if live {
                 operands.push(input.tangent().clone().materialize(context)?);
             }
         }
-        operands.extend(inputs[carry_count..].iter().map(|input| input.primal().clone()));
-        for (input, &live) in inputs[carry_count..].iter().zip(&input_has_tangent[carry_count..]) {
+        operands.extend(body_inputs[carry_count..].iter().map(|input| input.primal().clone()));
+        for (input, &live) in body_inputs[carry_count..].iter().zip(&input_has_tangent[carry_count..]) {
             if live {
                 operands.push(input.tangent().clone().materialize(context)?);
             }
         }
+        operands.extend(runtime_length_inputs.iter().map(|input| input.primal().clone()));
         let outputs = context.bind(C::Operation::from(fused_scan), vec![fused_body], &operands)?;
         let live_scanned_output_count = output_has_tangent[carry_count..].iter().filter(|&&live| live).count();
         check_count!("output", outputs, body_output_count + live_carry_count + live_scanned_output_count, ProgramError,);
@@ -2209,44 +2341,72 @@ where
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
-        // The rule requests all nested-computation work through its driver (region 0 is the body), which keeps
-        // its bounds free of the operation family's own semantic traits.
-        //
-        // A scan with only zero output cotangents is a zero linear map, so every input cotangent is zero.
-        if outputs.iter().all(MaybeZero::is_zero) {
-            return Ok(inputs
-                .iter()
-                .map(|input| {
-                    let input_type = input.r#type();
-                    MaybeZero::Zero(input_type.cotangent())
-                })
-                .collect());
-        }
-        if operation.captures().is_empty() {
-            return transpose_primal_scan(operation, context, driver, inputs, outputs)
-                .map_err(DifferentiationError::from);
-        }
-        let body = driver.region(0)?;
-        let carry_count = operation.carry_count();
-        let length = operation.length();
-        let transposed_body = driver.transpose_program(body, &vec![true; body.input_ids().len()])?;
-        let transposed = ScanOperation::<F>::new(carry_count, length)
-            .with_reverse(!operation.reverse())
-            .with_unroll(operation.unroll())?
-            .with_captures(operation.captures().to_vec());
-        let mut output_types = body.output_types();
-        let y_slice_types = output_types.split_off(carry_count);
-        output_types.extend(y_slice_types.iter().map(|slice_type| stacked_scan_type(slice_type, length)));
-        check_count!("output", outputs, output_types.len(), ProgramError);
-        let materialized = outputs
-            .iter()
-            .map(|cotangent| cotangent.clone().materialize(context))
-            .collect::<Result<Vec<_>, _>>()?;
-        let cotangents =
-            context.stage_operation(Target::from(transposed), vec![transposed_body], materialized.as_slice())?;
-        check_count!("output", cotangents, inputs.len(), ProgramError);
-        Ok(cotangents.into_iter().map(MaybeZero::Value).collect())
+        transpose_array_scan(operation, context, driver, inputs, outputs)
     }
+}
+
+impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayProgramType
+where
+    V: Value<Type = ArrayProgramType>,
+    F: Value<Type = ArrayProgramType>,
+    Target: Operation<ArrayProgramType> + From<ZeroOperation<ArrayProgramType>> + From<ScanOperation<F>>,
+{
+    fn transpose_scan<D: TranspositionDriver<V, Target>>(
+        operation: &ScanOperation<F>,
+        context: &mut TracingContext<V, Target>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
+        transpose_array_scan(operation, context, driver, inputs, outputs)
+    }
+}
+
+/// Applies the shared transpose rule for scan type families that can represent stacked values.
+fn transpose_array_scan<V, F, Target, D>(
+    operation: &ScanOperation<F>,
+    context: &mut TracingContext<V, Target>,
+    driver: &D,
+    inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
+    outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
+) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError>
+where
+    V: Value<Type: DifferentiableType + ScanTypeSemantics>,
+    F: Value<Type = V::Type>,
+    Target: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<ScanOperation<F>>,
+    D: TranspositionDriver<V, Target>,
+{
+    if outputs.iter().all(MaybeZero::is_zero) {
+        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
+    }
+    if operation.captures().is_empty() {
+        return transpose_primal_scan(operation, context, driver, inputs, outputs).map_err(DifferentiationError::from);
+    }
+    let body = driver.region(0)?;
+    let runtime_length_count = usize::from(operation.length().variable().is_some());
+    check_count!("input", inputs, body.input_types().len() + runtime_length_count, ProgramError);
+    let (body_inputs, runtime_length_inputs) = inputs.split_at(body.input_types().len());
+    let transposed_body = driver.transpose_program(body, &vec![true; body.input_ids().len()])?;
+    let transposed = ScanOperation::<F>::new(operation.carry_count(), operation.length())
+        .with_reverse(!operation.reverse())
+        .with_unroll(operation.unroll())?
+        .with_captures(operation.captures().to_vec());
+    check_count!("output", outputs, body.output_types().len(), ProgramError);
+    let mut materialized = outputs
+        .iter()
+        .map(|cotangent| cotangent.clone().materialize(context))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, input) in runtime_length_inputs.iter().enumerate() {
+        materialized.push(input.as_known().cloned().ok_or_else(|| {
+            ProgramError::MalformedProgram(format!("scan transpose runtime length operand {index} is not known"))
+        })?);
+    }
+    let cotangents =
+        context.stage_operation(Target::from(transposed), vec![transposed_body], materialized.as_slice())?;
+    check_count!("output", cotangents, body_inputs.len(), ProgramError);
+    let mut cotangents = cotangents.into_iter().map(MaybeZero::Value).collect::<Vec<_>>();
+    cotangents.extend(runtime_length_inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())));
+    Ok(cotangents)
 }
 
 impl<V, F, Target> ScanTransposition<V, F, Target> for DataType
@@ -2317,16 +2477,13 @@ where
 ///   2. Restores the reversed scan's carry-output arity, which
 ///      [`Program::transpose_with_respect_to`](crate::Program::transpose_with_respect_to) erases for known
 ///      carries (a known carry is not a linear input, so it contributes no carry cotangent output). Each known carry's
-///      cotangent output is re-inserted as a structural zero of that carry output's cotangent type, mirroring how the
-///      split restores pruned tangent outputs, so the reversed body produces one carry cotangent per carry followed
-///      by one scanned-output cotangent per linear scanned input.
+///      actual residual value is inserted into the matching body input and passed through the matching carry output,
+///      so the reversed body preserves one carry slot per forward carry without fabricating a temporal zero stack.
 ///   3. Re-stages a primal [`ScanOperation`] over the restored body with flipped [`reverse`](ScanOperation::reverse)
 ///      and the same carry count, length, and (lowering-only) unroll factor, over `[outputs...,
-///      known_input_value_stacks...]`. The known-input-value stacks are the residual stacks for known scanned inputs
-///      and typed zero stacks for known carries (whose per-iteration values were threaded as a carry rather than
-///      residualized, and which a transposed body only reads when the linear computation depends on them). Flipping
-///      `reverse` pairs cotangent iteration `i` with residual stack iteration `i` exactly when the forward scan
-///      consumed them, making reverse mode through the scan total with no array-reversal operation.
+///      known_scanned_input_stacks...]`. Known carries remain carries; only known scanned inputs consume residual
+///      stacks. Flipping `reverse` pairs cotangent iteration `i` with residual stack iteration `i` exactly when the
+///      forward scan consumed them, making reverse mode through the scan total with no array-reversal operation.
 ///
 /// The returned cotangents place the reversed scan's carry cotangents at the carry-operand positions, its
 /// scanned-output cotangents at the linear scanned-operand positions, and a structural [`MaybeZero::Zero`] at the
@@ -2350,9 +2507,9 @@ pub fn transpose_primal_scan<V, O, F, D: TranspositionDriver<V, O>>(
     outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
-    V: Value<Type = ArrayType>,
-    F: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScanOperation<F>>,
+    V: Value<Type: DifferentiableType + ScanTypeSemantics>,
+    F: Value<Type = V::Type>,
+    O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<ScanOperation<F>>,
 {
     // A scan with only zero output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -2370,10 +2527,13 @@ where
     // reads). Linear operands need not form a leading run: vmapping a bounded `while` threads a non-differentiable
     // Boolean mask as a known *carry*, so a known operand can sit among the linear carries. The leading `carry_count`
     // operands are the carries and the rest are scanned inputs.
-    let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
     let body = driver.region(0)?;
     let carry_count = operation.carry_count();
     let length = operation.length();
+    let runtime_length_count = usize::from(length.variable().is_some());
+    check_count!("input", inputs, body.input_types().len() + runtime_length_count, ProgramError);
+    let (scan_inputs, runtime_length_inputs) = inputs.split_at(body.input_types().len());
+    let operand_linear = scan_inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
     check_count!("input", operand_linear, body.input_types().len(), ProgramError);
     if carry_count > operand_linear.len() {
         return Err(ProgramError::MalformedProgram(format!(
@@ -2392,15 +2552,13 @@ where
             error => ProgramError::UnsupportedOperation { message: error.to_string() },
         })?;
 
-    // `transpose_with_respect_to` emits one cotangent output per linear input, so a known carry contributes no carry
-    // output and the transposed body has fewer carry outputs than the reversed scan's `carry_count` requires. Restore
-    // the carry-output arity exactly as the split restores pruned tangent outputs: walk the carry positions, taking
-    // the next linear-carry cotangent where the carry is linear and inserting a fresh structural zero of that carry
-    // output's cotangent type where it is known. The trailing transposed outputs (the linear scanned-input cotangents)
-    // are carried over unchanged, so the reversed body produces `[carry_cotangent..., scanned_input_cotangent...]`.
+    // A known carry is loop state, not a stacked operand. Move its exposed known-value input into the matching carry
+    // slot and pass it through as the matching body output. Linear carries retain their cotangent slots, while known
+    // scanned inputs remain trailing per-iteration slices. This avoids fabricating a zero stack for a known carry and
+    // lets first-class dimension carries define the identities referenced by dynamic tangent-array carries.
     let linear_carry_count = operand_linear[..carry_count].iter().filter(|&&linear| linear).count();
     if linear_carry_count != carry_count {
-        transposed_body = restore_known_carry_outputs(
+        transposed_body = thread_known_carries(
             transposed_body,
             body.output_types().as_slice(),
             operand_linear.as_slice(),
@@ -2417,38 +2575,45 @@ where
     // per-iteration outputs: the leading carries keep their per-iteration shape while each trailing y-slice output is
     // stacked along the scan length. Using the body's per-iteration y-slice types here would materialize a zero
     // cotangent for a dead y-output with the un-stacked slice type, desyncing the reversed scan's operand signature.
-    let mut output_types = body.output_types();
-    let y_slice_types = output_types.split_off(carry_count);
-    output_types.extend(y_slice_types.iter().map(|slice_type| stacked_scan_type(slice_type, length)));
-    check_count!("output", outputs, output_types.len(), ProgramError);
-    let mut operands = Vec::with_capacity(output_types.len() + operand_linear.len());
-    for cotangent in outputs {
-        operands.push(cotangent.clone().materialize(context)?);
+    check_count!("output", outputs, body.output_types().len(), ProgramError);
+    let mut operands = Vec::with_capacity(outputs.len() + operand_linear.len());
+    for index in 0..carry_count {
+        if operand_linear[index] {
+            operands.push(outputs[index].clone().materialize(context)?);
+        } else {
+            operands.push(scan_inputs[index].as_known().cloned().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "scan transpose carry operand {index} has no known residual value",
+                ))
+            })?);
+        }
+    }
+    for (cotangent, output_type) in outputs[carry_count..].iter().zip(&body.output_types()[carry_count..]) {
+        if !output_type.cotangent().is_zero_space() {
+            operands.push(cotangent.clone().materialize(context)?);
+        }
     }
 
     // Append one scanned operand per known body input, in body order, to feed the transposed body's known-value
-    // inputs. A known *scanned* input is a residual stack read from the pullback; a known *carry* has no stored stack
-    // (its per-iteration values were threaded as a carry, not residualized), but `transpose_with_respect_to` only exposes
-    // its value as a known input when the linear computation actually reads it, so a known carry that survives here is
-    // unused by the transposed body and a typed zero stack of its stacked carry type satisfies the operand signature.
-    // A known intermediate (a known operand with no pullback value) is one the partial-evaluation split never leaves in
-    // a tangent program, so its absence is a malformed program.
+    // inputs. A known *scanned* input is a residual stack read from the pullback; known carries were already placed in
+    // their carry slots above and therefore add no trailing operand here. A known intermediate without a pullback
+    // value is one the partial-evaluation split must never leave in a tangent program, so its absence is malformed.
     for (index, &linear) in operand_linear.iter().enumerate() {
         if linear {
             continue;
         }
-        if index < carry_count {
-            let stacked_type = stacked_scan_type(&body.input_types()[index], length);
-            let mut zeros = context.stage_nullary_operation(ZeroOperation::new(stacked_type))?;
-            check_count!("output", zeros, 1, ProgramError);
-            operands.push(zeros.remove(0));
-        } else {
+        if index >= carry_count {
             // A known scanned operand is a residual stack; the dispatch guarantees it carries its pullback value.
-            let residual = inputs[index].as_known().ok_or_else(|| {
+            let residual = scan_inputs[index].as_known().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!("scan transpose operand {index} has no known residual value"))
             })?;
             operands.push(residual.clone());
         }
+    }
+    for (index, input) in runtime_length_inputs.iter().enumerate() {
+        operands.push(input.as_known().cloned().ok_or_else(|| {
+            ProgramError::MalformedProgram(format!("scan transpose runtime length operand {index} is not known"))
+        })?);
     }
 
     // The reversed scan outputs one carry cotangent per carry and one stacked scanned-output cotangent per *linear*
@@ -2466,38 +2631,91 @@ where
     let mut scan_cotangents = scan_cotangents.into_iter();
     let cotangents = operand_linear
         .iter()
-        .zip(inputs)
+        .zip(scan_inputs)
         .enumerate()
         .map(|(index, (&linear, input))| {
-            if index < carry_count || linear {
+            if index < carry_count {
+                let cotangent = scan_cotangents.next().unwrap();
+                if linear { MaybeZero::Value(cotangent) } else { MaybeZero::Zero(input.r#type().cotangent()) }
+            } else if linear {
                 MaybeZero::Value(scan_cotangents.next().unwrap())
             } else {
-                let input_type = input.r#type();
-                MaybeZero::Zero(input_type.cotangent())
+                MaybeZero::Zero(input.r#type().cotangent())
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let mut cotangents = cotangents;
+    cotangents.extend(runtime_length_inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())));
     Ok(cotangents)
 }
 
-/// Rebuilds a transposed scan body so it produces one carry cotangent output per carry, inserting typed zero
-/// instructions for carries that were known and therefore omitted by transposition.
-fn restore_known_carry_outputs<V, O>(
+/// Rebuilds a transposed scan body so known carry values occupy and pass through their carry slots.
+fn thread_known_carries<V, O>(
     program: Program<V, O, Vec<V>, Vec<V>>,
-    body_output_types: &[ArrayType],
+    body_output_types: &[V::Type],
     operand_linear: &[bool],
     carry_count: usize,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>>,
+    V: Value<Type: DifferentiableType>,
+    O: Operation<V::Type> + From<ZeroOperation<V::Type>>,
 {
     let linear_carry_count = operand_linear[..carry_count].iter().filter(|&&linear| linear).count();
+    let body_output_count = body_output_types.len();
+    let output_cotangent_positions = body_output_types
+        .iter()
+        .enumerate()
+        .map(|(position, output_type)| (!output_type.cotangent().is_zero_space()).then_some(position))
+        .collect::<Vec<_>>();
+    let known_input_positions = operand_linear
+        .iter()
+        .scan(body_output_count, |position, &linear| {
+            let result = (!linear).then_some(*position);
+            *position += usize::from(!linear);
+            Some(result)
+        })
+        .collect::<Vec<_>>();
+    let input_order =
+        operand_linear[..carry_count]
+            .iter()
+            .enumerate()
+            .map(|(index, &linear)| {
+                if linear { output_cotangent_positions[index].unwrap() } else { known_input_positions[index].unwrap() }
+            })
+            .chain(output_cotangent_positions[carry_count..body_output_count].iter().flatten().copied())
+            .chain(known_input_positions[carry_count..].iter().flatten().copied())
+            .collect::<Vec<_>>();
     let input_types = program.input_types();
-    let input_count = input_types.len();
     let mut builder = ProgramBuilder::new();
-    let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
-    let mut outputs = builder.splice_program(&program, inputs.as_slice())?;
+    let inputs = input_order.iter().map(|&index| builder.add_input(input_types[index].clone())).collect::<Vec<_>>();
+    let mut original_inputs = vec![None; input_types.len()];
+    for (new_position, &old_position) in input_order.iter().enumerate() {
+        original_inputs[old_position] = Some(inputs[new_position]);
+    }
+    let original_inputs = original_inputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, input)| {
+            if let Some(input) = input {
+                return Ok(input);
+            }
+
+            // The pullback boundary always has one cotangent input per primal output, including outputs whose
+            // cotangent type is a zero space. Reordering known carries intentionally removes those zero-space carry
+            // cotangents from the reversed scan boundary, so materialize their unique value locally when splicing the
+            // original transposed body. Every other input must remain represented by `input_order`.
+            let r#type = input_types[index].clone();
+            if !r#type.is_zero_space() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "scan transpose boundary reconstruction omitted non-zero-space input {index}",
+                )));
+            }
+            let outputs = builder.add_instruction(O::from(ZeroOperation::new(r#type)), Vec::new(), Vec::new())?;
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(outputs[0])
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut outputs = builder.splice_program(&program, original_inputs.as_slice())?;
     check_count!("output", outputs, program.output_count(), ProgramError);
     let trailing_outputs = outputs.split_off(linear_carry_count);
     let mut linear_carry_outputs = outputs.into_iter();
@@ -2510,18 +2728,12 @@ where
                 ))
             })?);
         } else {
-            // A differentiable carry's cotangent boundary carries its cotangent dual; a non-differentiable carry uses
-            // the first-class zero-space type returned by `cotangent`.
-            let output_type = &body_output_types[carry_index];
-            let cotangent_type = output_type.cotangent();
-            let zero = builder.add_instruction(ZeroOperation::new(cotangent_type), Vec::new(), Vec::new())?;
-            check_count!("output", zero, 1, ProgramError);
-            restored_outputs.push(zero[0]);
+            restored_outputs.push(inputs[carry_index]);
         }
     }
     restored_outputs.extend(trailing_outputs);
     let output_count = restored_outputs.len();
-    builder.build(restored_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
+    builder.build(restored_outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])
 }
 
 #[cfg(test)]

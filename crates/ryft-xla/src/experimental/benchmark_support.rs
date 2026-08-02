@@ -222,9 +222,7 @@ fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 /// Emits the traced reverse-mode-around-`shard_map` benchmark.
 fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     Err(ProgramError::UnsupportedOperation {
-        message:
-            "composite XLA region reverse-mode benchmarks require Phase 6 composite-region differentiation support"
-                .to_string(),
+        message: "reverse-mode shard_map IR benchmarks are not implemented".to_string(),
     }
     .into())
 }
@@ -293,13 +291,9 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_reverse_mode_benchmarks_report_phase_six_deferral() {
+    fn test_reverse_mode_shard_map_benchmarks_report_unsupported_operation() {
         for error in [emit_grad_around_shard_map().unwrap_err(), emit_shard_map_grad_inside().unwrap_err()] {
-            assert_eq!(
-                error.to_string(),
-                "composite XLA region reverse-mode benchmarks require Phase 6 composite-region differentiation \
-                 support",
-            );
+            assert_eq!(error.to_string(), "reverse-mode shard_map IR benchmarks are not implemented");
         }
     }
 }

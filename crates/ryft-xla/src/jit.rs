@@ -17,8 +17,8 @@ use ryft_core::compilation::{
     JittedFunction as CoreJittedFunction, Specialization, StagedFunction, call_function,
     try_jit_with_options as core_try_jit_with_options,
 };
-use ryft_core::contexts::Context;
-use ryft_core::differentiation::{DifferentiableType, ForwardModeDifferentiate};
+use ryft_core::contexts::{Context, ProjectedContext};
+use ryft_core::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};
 use ryft_core::operations::constants::Constant;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::programs::{ProgramError, ProjectedValue, Value, ValueProjection};
@@ -716,7 +716,8 @@ impl<'c, In: Parameterized<ArrayType, To<ArrayType> = In>> CompiledXlaFunction<'
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
         + ParameterizedFamily<ArrayProgramType>
-        + ParameterizedFamily<XlaConstant>,
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<XlaProgramTracer<'c>>,
     In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
 {
     /// Returns a new compiled function that computes the reverse-mode gradient of `self` with
@@ -732,12 +733,74 @@ where
     ) -> Result<CompiledXlaFunction<'c, In, In>, XlaDomainError>
     where
         'c: 'domain,
+        In::Family: ParameterizedFamily<XlaCompileTracer<'c>, To = In::To<XlaCompileTracer<'c>>>,
+        In::To<XlaCompileTracer<'c>>: Parameterized<
+                XlaCompileTracer<'c>,
+                Family = In::Family,
+                ParameterStructure = In::ParameterStructure,
+                To<ArrayType> = In,
+                To<XlaConstant> = In::To<XlaConstant>,
+            >,
+        XlaProgramParameterValues<In, XlaProgramTracer<'c>>: Parameterized<
+                XlaProgramTracer<'c>,
+                To<ArrayProgramType> = XlaProgramParameters<In>,
+                To<XlaConstant> = XlaProgramConstants<In>,
+            >,
     {
-        let _ = (self, domain);
-        Err(ProgramError::UnsupportedOperation {
-            message: "compiled XLA gradients require Phase 6 composite-region differentiation support".to_string(),
-        }
-        .into())
+        let staged = self.function.staged();
+        let input_structure = staged.source_program().program().input_structure().clone();
+        let input_signature = In::from_parameters(
+            input_structure.clone(),
+            staged
+                .input_types()
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned().map_err(ProgramError::from))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .map_err(ProgramError::from)?;
+        let mesh = self.mesh().clone();
+        let captures = self
+            .source_program()
+            .captures()
+            .iter()
+            .cloned()
+            .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        compile_with_flat_captures(
+            move |capture_references, _, primals| {
+                let primals = primals.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
+                let context = primals
+                    .first()
+                    .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
+                    .context()
+                    .clone();
+                let (output, pullback) = context.vjp(
+                    move |inputs| {
+                        let mut outputs =
+                            staged.call_with_flat_capture_references(capture_references.as_slice(), inputs)?;
+                        if outputs.len() != 1 {
+                            return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() });
+                        }
+                        Ok(outputs.remove(0))
+                    },
+                    primals,
+                )?;
+                let output = ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from)?;
+                let seed = ProjectedContext::<_, ArrayType>::new(context).gradient_seed(&output, false)?.into_value();
+                let gradients = pullback.apply(seed)?;
+                let gradients = gradients
+                    .into_iter()
+                    .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
+                    .collect::<Result<Vec<_>, _>>()?;
+                In::To::<XlaCompileTracer<'c>>::from_parameters(input_structure, gradients)
+                    .map_err(ProgramError::from)
+                    .map_err(Into::into)
+            },
+            captures,
+            input_signature,
+            domain,
+            XlaOptions::new(mesh),
+        )
     }
 }
 
@@ -2080,7 +2143,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gradient_method_reports_composite_region_deferral() {
+    fn test_gradient_method_preserves_compiled_function_captures() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -2096,21 +2159,22 @@ mod tests {
         )
         .unwrap();
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
-            |captures, x| x + captures[0].clone(),
+            |captures, x| x * captures[0].clone(),
             vec![bias],
             input_type.clone(),
             &engine,
             mesh.clone(),
         )
         .unwrap();
-        let error = match inner.gradient(&engine) {
-            Ok(_) => panic!("compiled gradients should remain deferred until Phase 6"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error.to_string(),
-            "compiled XLA gradients require Phase 6 composite-region differentiation support",
-        );
+        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.gradient(&engine).unwrap();
+
+        assert_eq!(gradient.source_program().captures().len(), 1);
+
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+        let output = engine.interpret(&gradient.executable_program(), input).unwrap();
+
+        assert_eq!(read_f32_array(&client, &output), vec![2.0]);
     }
 
     #[test]

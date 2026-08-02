@@ -8,17 +8,131 @@
 
 use crate::differentiation::forward::jvp_projected_operation;
 use crate::differentiation::reverse::transpose_projected_operation;
+use crate::operations::control_flow::{
+    TemporalResidualOperation, TemporalResidualType, WhileResidualStackOperation, WhileResidualStackType,
+    jvp_array_program_while,
+};
+use crate::operations::dimensions::RUNTIME_DIMENSION_DATA_TYPE;
+use crate::operations::logical::AndOperation;
 
 use super::*;
+
+impl TemporalResidualType for ArrayProgramType {
+    #[inline]
+    fn temporal_storage_type(&self) -> Result<Self, TypeError> {
+        Ok(match self {
+            Self::Array(r#type) => Self::Array(r#type.clone()),
+            Self::Dimension(_) => Self::Array(ArrayType::scalar(RUNTIME_DIMENSION_DATA_TYPE)),
+        })
+    }
+}
+
+impl<O> TemporalResidualOperation<ArrayProgramType> for O
+where
+    O: Operation<ArrayProgramType> + From<DimensionFromScalarOperation> + From<DimensionToScalarOperation>,
+{
+    fn residual_to_storage(residual_type: &ArrayProgramType) -> Result<Option<Self>, TypeError> {
+        Ok(match residual_type {
+            ArrayProgramType::Array(_) => None,
+            ArrayProgramType::Dimension(_) => Some(Self::from(DimensionToScalarOperation)),
+        })
+    }
+
+    fn residual_from_storage(residual_type: &ArrayProgramType) -> Result<Option<Self>, TypeError> {
+        Ok(match residual_type {
+            ArrayProgramType::Array(_) => None,
+            ArrayProgramType::Dimension(r#type) => {
+                Some(Self::from(DimensionFromScalarOperation::new(r#type.variable().clone())))
+            }
+        })
+    }
+}
+
+impl WhileResidualStackType for ArrayProgramType {
+    #[inline]
+    fn from_array_type(r#type: ArrayType) -> Self {
+        Self::Array(r#type)
+    }
+
+    fn array_type(&self) -> Result<&ArrayType, TypeError> {
+        match self {
+            Self::Array(r#type) => Ok(r#type),
+            Self::Dimension(r#type) => {
+                Err(TypeError::invalid(format!("expected an array-backed bounded-while state type but got {}", r#type)))
+            }
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType>, O> WhileResidualStackOperation<ArrayProgramType, A> for O
+where
+    O: Operation<ArrayProgramType> + From<ArrayProgramOperation<A>> + TemporalResidualOperation<ArrayProgramType>,
+{
+    fn residual_stack_zero(r#type: ArrayProgramType) -> Self {
+        let ArrayProgramType::Array(r#type) = r#type else {
+            unreachable!("bounded-while stack zeros are always arrays")
+        };
+        Self::from(ArrayProgramOperation::<A>::from(ZeroOperation::new(r#type)))
+    }
+
+    fn residual_stack_one(r#type: ArrayProgramType) -> Self {
+        let ArrayProgramType::Array(r#type) = r#type else {
+            unreachable!("bounded-while stack ones are always arrays")
+        };
+        Self::from(ArrayProgramOperation::<A>::from(OneOperation::new(r#type)))
+    }
+
+    #[inline]
+    fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
+        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::Broadcast(LegacyBroadcastOperation::new(
+            output_type,
+            output_axes,
+        ))))
+    }
+
+    #[inline]
+    fn residual_stack_update() -> Self {
+        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation)))
+    }
+
+    #[inline]
+    fn residual_stack_add() -> Self {
+        Self::from(ArrayProgramOperation::<A>::from(AddOperation))
+    }
+
+    #[inline]
+    fn residual_stack_select() -> Self {
+        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::Select(SelectOperation)))
+    }
+
+    #[inline]
+    fn mask_reduce_any(axes: Vec<usize>) -> Self {
+        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::Reduce(ReduceOperation::new(
+            axes,
+            ReductionKind::Any,
+        ))))
+    }
+
+    #[inline]
+    fn mask_and() -> Self {
+        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::And(AndOperation)))
+    }
+}
 
 impl<
     A: Value<Type = ArrayType>,
     C: Context<Type = ArrayProgramType, Constant: ValueProjection<ArrayType, Projected = A>> + Zero<C::Value>,
 > DifferentiableOperation<C> for ArrayProgramOperation<A>
 where
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: Concretizable<bool> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<ArrayProgramOperation<A>>
+        + From<ConditionOperation<C::Constant>>
+        + From<DimensionFromScalarOperation>
+        + From<DimensionToScalarOperation>
         + From<LinearCallOperation<ArrayProgramType>>
+        + From<ScanOperation<C::Constant>>
+        + From<WhileOperation>
+        + From<ZeroOperation<ArrayProgramType>>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>,
     ArrayOperation<A>: DifferentiableOperation<ProjectedContext<C, ArrayType>>,
 {
@@ -323,16 +437,17 @@ where
             }
             .into());
         }
-        if matches!(self, Self::Condition(_) | Self::While(_) | Self::Scan(_)) {
-            return Err(
-                ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "'{}' differentiation requires composite-region differentiation support",
-                        self.name(),
-                    ),
-                }
-                .into(),
-            );
+        if matches!(self, Self::Condition(_)) {
+            return ConditionOperation::<C::Constant>::new().jvp(context, driver, inputs);
+        }
+        if let Self::Scan(operation) = self {
+            let scan = ScanOperation::<C::Constant>::new(operation.carry_count(), operation.length())
+                .with_reverse(operation.reverse())
+                .with_unroll(operation.unroll())?;
+            return scan.jvp(context, driver, inputs);
+        }
+        if let Self::While(operation) = self {
+            return jvp_array_program_while(operation, context, driver, inputs);
         }
         if let Self::Array(ArrayOperation::Slice(operation)) = self {
             let [operand] = inputs else {
@@ -1532,11 +1647,13 @@ where
 
 impl<
     A: Value<Type = ArrayType>,
-    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected = A> + From<DimensionValue>,
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected = A>,
     O: Operation<ArrayProgramType>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + From<ArrayProgramOperation<A>>
+        + From<ConditionOperation<V>>
         + From<LinearCallOperation<ArrayProgramType>>
+        + From<ScanOperation<V>>
         + From<ZeroOperation<ArrayProgramType>>,
 > TransposableOperation<V, O> for ArrayProgramOperation<A>
 where
@@ -1569,11 +1686,26 @@ where
             }
             .into());
         }
-        if matches!(self, Self::Condition(_) | Self::While(_) | Self::Scan(_)) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'{}' transposition requires composite-region differentiation support", self.name()),
-            }
-            .into());
+        if matches!(self, Self::Condition(_)) {
+            return ConditionOperation::<V>::new().transpose(context, driver, inputs, outputs);
+        }
+        if let Self::Scan(operation) = self {
+            let scan = ScanOperation::<V>::new(operation.carry_count(), operation.length())
+                .with_reverse(operation.reverse())
+                .with_unroll(operation.unroll())?
+                .with_captures(
+                    operation
+                        .captures()
+                        .iter()
+                        .map(|capture| match capture {
+                            ArrayProgramValue::Array(value) => V::from_projected(value.clone()),
+                            ArrayProgramValue::Dimension(_) => {
+                                unreachable!("validated scan captures are always arrays")
+                            }
+                        })
+                        .collect(),
+                );
+            return scan.transpose(context, driver, inputs, outputs);
         }
         if matches!(self, Self::DynamicZero(_) | Self::DynamicOne(_) | Self::DynamicIota(_)) {
             check_count!("output", outputs, 1, ProgramError);
@@ -1781,5 +1913,546 @@ where
         };
 
         transpose_projected_operation(context, operation, inputs, outputs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::dimensions::DimensionValue;
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
+    use crate::operations::dimensions::DimensionFromScalarOperation;
+    use crate::operations::manipulation::{BroadcastOperation, ReshapeOperation};
+    use crate::operations::math::{AddOperation, MulOperation, ReduceOperation, ReductionKind};
+    use crate::parameters::Placeholder;
+    use crate::programs::{Program, ProgramBuilder};
+    use crate::types::{
+        ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+    };
+
+    type TestValue = ArrayProgramValue<Array>;
+    type TestOperation = ArrayProgramOperation<Array>;
+
+    fn array(value: Array) -> TestValue {
+        TestValue::Array(value)
+    }
+
+    fn dimension(r#type: &DimensionType, extent: usize) -> TestValue {
+        TestValue::Dimension(DimensionValue::new(r#type.clone(), extent).unwrap())
+    }
+
+    fn scale_branch(
+        dimension_type: DimensionType,
+        factor: f64,
+    ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = builder.add_input(ArrayProgramType::Dimension(dimension_type));
+        let operand = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let factor = builder.add_constant(array(Array::scalar(factor)));
+        let output = builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(MulOperation)),
+                Vec::new(),
+                vec![operand, factor],
+            )
+            .unwrap()[0];
+        builder.build(vec![extent, output], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
+    }
+
+    #[test]
+    fn test_composite_condition_jvp_preserves_dimension_outputs_without_tangent_slots() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::Boolean)));
+        let extent = builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
+        let operand = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let true_branch = scale_branch(extent_type.clone(), 2.0);
+        let false_branch = scale_branch(extent_type.clone(), 3.0);
+        let regions = vec![
+            builder.import_region(true_branch.entry_region_ref()),
+            builder.import_region(false_branch.entry_region_ref()),
+        ];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                regions,
+                vec![predicate, extent, operand],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder.build(outputs, vec![Placeholder; 3], vec![Placeholder; 2]).unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_count(), 4);
+        assert_eq!(jvp.output_count(), 3);
+        let outputs = jvp
+            .interpret(vec![
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                dimension(&extent_type, 4),
+                array(Array::scalar(5.0)),
+                array(Array::scalar(7.0)),
+            ])
+            .unwrap();
+        assert!(matches!(&outputs[0], TestValue::Dimension(value) if value.extent() == 4));
+        assert!(matches!(&outputs[1], TestValue::Array(value) if value.to_f64s() == vec![10.0]));
+        assert!(matches!(&outputs[2], TestValue::Array(value) if value.to_f64s() == vec![14.0]));
+
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                dimension(&extent_type, 4),
+                array(Array::scalar(5.0)),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(2);
+        let mut pullback_inputs = vec![array(Array::scalar(1.0))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![array(Array::scalar(2.0))]),);
+    }
+
+    fn product_scan_body(
+        extent_type: DimensionType,
+    ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = builder.add_input(ArrayProgramType::Dimension(extent_type));
+        let carry = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let item = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let product = builder
+            .add_instruction(TestOperation::Array(ArrayOperation::from(MulOperation)), Vec::new(), vec![carry, item])
+            .unwrap()[0];
+        builder.build(vec![extent, product, product], vec![Placeholder; 3], vec![Placeholder; 3]).unwrap()
+    }
+
+    #[test]
+    fn test_composite_scan_jvp_forwards_a_dynamic_length_and_dimension_carry() {
+        let carry_extent_type =
+            DimensionType::new(DimensionVariable::new("carry_extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let length_variable = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
+        let length_type = DimensionType::new(length_variable.clone());
+        let length = Dimension::Dynamic(length_variable);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = builder.add_input(ArrayProgramType::Dimension(carry_extent_type.clone()));
+        let carry = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let values =
+            builder.add_input(ArrayProgramType::Array(ArrayType::new(DataType::F64, Shape::new(vec![length.clone()]))));
+        let runtime_length = builder.add_input(ArrayProgramType::Dimension(length_type.clone()));
+        let body = product_scan_body(carry_extent_type.clone());
+        let region = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(
+                TestOperation::Scan(ScanOperation::new(2, length)),
+                vec![region],
+                vec![extent, carry, values, runtime_length],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder.build(outputs, vec![Placeholder; 4], vec![Placeholder; 3]).unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_count(), 6);
+        assert_eq!(jvp.output_count(), 5);
+        let outputs = jvp
+            .interpret(vec![
+                dimension(&carry_extent_type, 4),
+                array(Array::scalar(1.0)),
+                array(Array::vector(vec![2.0, 3.0, 4.0])),
+                dimension(&length_type, 3),
+                array(Array::scalar(5.0)),
+                array(Array::vector(vec![0.5, 1.0, 1.5])),
+            ])
+            .unwrap();
+        assert!(matches!(&outputs[0], TestValue::Dimension(value) if value.extent() == 4));
+        assert!(matches!(&outputs[1], TestValue::Array(value) if value.to_f64s() == vec![24.0]));
+        assert!(matches!(&outputs[3], TestValue::Array(value) if value.to_f64s() == vec![143.0]));
+
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 3);
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                dimension(&carry_extent_type, 4),
+                array(Array::scalar(1.0)),
+                array(Array::vector(vec![2.0, 3.0, 4.0])),
+                dimension(&length_type, 3),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(3);
+        let mut pullback_inputs = vec![array(Array::scalar(1.0)), array(Array::vector(vec![0.0, 0.0, 0.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::scalar(24.0)), array(Array::vector(vec![12.0, 8.0, 6.0]))]),
+        );
+    }
+
+    #[test]
+    fn test_composite_scan_pullback_stacks_varying_dimension_residuals_through_scalar_gateways() {
+        let iteration_variable = DimensionVariable::new("iteration", DimensionBounds::positive(Some(4)).unwrap());
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let scalar_u64 = ArrayType::scalar(DataType::U64);
+
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let state = body_builder.add_input(ArrayProgramType::Array(scalar_f64.clone()));
+        let counter = body_builder.add_input(ArrayProgramType::Array(scalar_u64.clone()));
+        let iteration = body_builder
+            .add_instruction(
+                TestOperation::from(DimensionFromScalarOperation::new(iteration_variable)),
+                Vec::new(),
+                vec![counter],
+            )
+            .unwrap()[0];
+        let repeated = body_builder
+            .add_instruction(
+                TestOperation::from(BroadcastOperation::new(Vec::new())),
+                Vec::new(),
+                vec![state, iteration],
+            )
+            .unwrap()[0];
+        let next_state = body_builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum))),
+                Vec::new(),
+                vec![repeated],
+            )
+            .unwrap()[0];
+        let one = body_builder.add_constant(array(Array::scalar(1_u64)));
+        let next_counter = body_builder
+            .add_instruction(TestOperation::Array(ArrayOperation::from(AddOperation)), Vec::new(), vec![counter, one])
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![next_state, next_counter, next_state],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let state = builder.add_input(ArrayProgramType::Array(scalar_f64));
+        let counter = builder.add_input(ArrayProgramType::Array(scalar_u64));
+        let region = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(TestOperation::Scan(ScanOperation::new(2, 2)), vec![region], vec![state, counter])
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 3])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 2);
+        let rendered_primal = linearization.primal().to_string();
+        let rendered_tangent = linearization.tangent().to_string();
+        assert!(rendered_primal.contains("dimension_to_scalar"), "{rendered_primal}");
+        assert!(rendered_tangent.contains("dimension_from_scalar"), "{rendered_tangent}");
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![array(Array::scalar(2.0)), array(Array::scalar(1_u64))])
+            .unwrap();
+        let residuals = primal_outputs.split_off(3);
+        let mut pullback_inputs = vec![array(Array::scalar(1.0)), array(Array::vector(vec![0.0, 0.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![array(Array::scalar(2.0))]));
+    }
+
+    fn doubling_while_regions(
+        extent_type: DimensionType,
+    ) -> Vec<Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>> {
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        condition_builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
+        let state = condition_builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let limit = condition_builder.add_constant(array(Array::scalar(8.0)));
+        let predicate = condition_builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![state, limit],
+            )
+            .unwrap()[0];
+        let condition = condition_builder.build(vec![predicate], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = body_builder.add_input(ArrayProgramType::Dimension(extent_type));
+        let state = body_builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let doubled = body_builder
+            .add_instruction(TestOperation::Array(ArrayOperation::from(AddOperation)), Vec::new(), vec![state, state])
+            .unwrap()[0];
+        let body = body_builder.build(vec![extent, doubled], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+        vec![condition, body]
+    }
+
+    #[test]
+    fn test_composite_while_jvp_omits_the_dimension_state_tangent() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
+        let state = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let regions = doubling_while_regions(extent_type.clone());
+        let regions = regions.iter().map(|region| builder.import_region(region.entry_region_ref())).collect();
+        let outputs = builder
+            .add_instruction(
+                TestOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                regions,
+                vec![extent, state],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder.build(outputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_count(), 3);
+        assert_eq!(jvp.output_count(), 3);
+        let outputs = jvp
+            .interpret(vec![dimension(&extent_type, 4), array(Array::scalar(1.0)), array(Array::scalar(3.0))])
+            .unwrap();
+        assert!(matches!(&outputs[0], TestValue::Dimension(value) if value.extent() == 4));
+        assert!(matches!(&outputs[1], TestValue::Array(value) if value.to_f64s() == vec![8.0]));
+        assert!(matches!(&outputs[2], TestValue::Array(value) if value.to_f64s() == vec![24.0]));
+
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![dimension(&extent_type, 4), array(Array::scalar(1.0))])
+            .unwrap();
+        let residuals = primal_outputs.split_off(2);
+        let mut pullback_inputs = vec![array(Array::scalar(1.0))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![array(Array::scalar(8.0))]),);
+    }
+
+    #[test]
+    fn test_composite_bounded_while_pullback_supports_batched_predicates() {
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let state = condition_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
+        let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0])));
+        let predicate = condition_builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![state, limits],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let state = body_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
+        let doubled = body_builder
+            .add_instruction(TestOperation::Array(ArrayOperation::from(AddOperation)), Vec::new(), vec![state, state])
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let state = builder.add_input(ArrayProgramType::Array(vector_type));
+        let regions =
+            vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                regions,
+                vec![state],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs =
+            linearization.primal().interpret(vec![array(Array::vector(vec![1.0, 1.0, 1.0]))]).unwrap();
+        assert_eq!(primal_outputs[0], array(Array::vector(vec![2.0, 4.0, 8.0])));
+        let residuals = primal_outputs.split_off(1);
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]))]),
+        );
+    }
+
+    #[test]
+    fn test_composite_bounded_while_pullback_threads_invariant_dimension_residuals_as_scan_carries() {
+        let extent_variable = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let extent_type = DimensionType::new(extent_variable.clone());
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_variable)]));
+
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        condition_builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
+        condition_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
+        let counter = condition_builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::I64)));
+        let limit = condition_builder.add_constant(array(Array::scalar(2_i64)));
+        let predicate = condition_builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![counter, limit],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = body_builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
+        let vector = body_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
+        let counter = body_builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::I64)));
+        let reshaped = body_builder
+            .add_instruction(TestOperation::from(ReshapeOperation::new()), Vec::new(), vec![vector, extent])
+            .unwrap()[0];
+        let one = body_builder.add_constant(array(Array::scalar(1_i64)));
+        let next_counter = body_builder
+            .add_instruction(TestOperation::Array(ArrayOperation::from(AddOperation)), Vec::new(), vec![counter, one])
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![extent, reshaped, next_counter],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
+        let vector = builder.add_input(ArrayProgramType::Array(vector_type));
+        let counter = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::I64)));
+        let regions =
+            vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                regions,
+                vec![extent, vector, counter],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let rendered_primal = linearization.primal().to_string();
+        let rendered_tangent = linearization.tangent().to_string();
+        assert!(rendered_primal.contains("scan [carry_count=1"), "{rendered_primal}");
+        assert!(!rendered_primal.contains("dimension_to_scalar"), "{rendered_primal}");
+        assert!(!rendered_tangent.contains("dimension_from_scalar"), "{rendered_tangent}");
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                dimension(&extent_type, 3),
+                array(Array::vector(vec![1.0, 2.0, 3.0])),
+                array(Array::scalar(0_i64)),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(3);
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::vector(vec![1.0, 1.0, 1.0]))]),
+        );
+    }
+
+    #[test]
+    fn test_composite_bounded_while_pullback_stacks_varying_dimension_residuals_through_scalar_gateways() {
+        let iteration_variable = DimensionVariable::new("iteration", DimensionBounds::positive(Some(4)).unwrap());
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let scalar_u64 = ArrayType::scalar(DataType::U64);
+
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        condition_builder.add_input(ArrayProgramType::Array(scalar_f64.clone()));
+        let counter = condition_builder.add_input(ArrayProgramType::Array(scalar_u64.clone()));
+        let limit = condition_builder.add_constant(array(Array::scalar(3_u64)));
+        let predicate = condition_builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![counter, limit],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let state = body_builder.add_input(ArrayProgramType::Array(scalar_f64.clone()));
+        let counter = body_builder.add_input(ArrayProgramType::Array(scalar_u64.clone()));
+        let iteration = body_builder
+            .add_instruction(
+                TestOperation::from(DimensionFromScalarOperation::new(iteration_variable)),
+                Vec::new(),
+                vec![counter],
+            )
+            .unwrap()[0];
+        let repeated = body_builder
+            .add_instruction(
+                TestOperation::from(BroadcastOperation::new(Vec::new())),
+                Vec::new(),
+                vec![state, iteration],
+            )
+            .unwrap()[0];
+        let next_state = body_builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum))),
+                Vec::new(),
+                vec![repeated],
+            )
+            .unwrap()[0];
+        let one = body_builder.add_constant(array(Array::scalar(1_u64)));
+        let next_counter = body_builder
+            .add_instruction(TestOperation::Array(ArrayOperation::from(AddOperation)), Vec::new(), vec![counter, one])
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![next_state, next_counter],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let state = builder.add_input(ArrayProgramType::Array(scalar_f64));
+        let counter = builder.add_input(ArrayProgramType::Array(scalar_u64));
+        let regions =
+            vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                regions,
+                vec![state, counter],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let rendered_primal = linearization.primal().to_string();
+        let rendered_tangent = linearization.tangent().to_string();
+        assert!(rendered_primal.contains("dimension_to_scalar"), "{rendered_primal}");
+        assert!(rendered_tangent.contains("dimension_from_scalar"), "{rendered_tangent}");
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![array(Array::scalar(2.0)), array(Array::scalar(1_u64))])
+            .unwrap();
+        let residuals = primal_outputs.split_off(2);
+        let mut pullback_inputs = vec![array(Array::scalar(1.0))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![array(Array::scalar(2.0))]));
     }
 }

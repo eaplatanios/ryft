@@ -1514,8 +1514,22 @@ where
     }
 }
 
-impl<A: Value<Type = ArrayType>, C: Context<Type = ArrayProgramType, Operation: From<ArrayProgramOperation<A>>>>
-    PartiallyEvaluatableOperation<C> for ArrayProgramOperation<A>
+impl<
+    A: Value<Type = ArrayType>,
+    C: Context<
+            Type = ArrayProgramType,
+            Constant: Concretizable<bool>,
+            Operation: From<ArrayProgramOperation<A>>
+                           + From<ConditionOperation<C::Constant>>
+                           + From<DimensionFromScalarOperation>
+                           + From<DimensionToScalarOperation>
+                           + From<ScanOperation<C::Constant>>
+                           + From<WhileOperation>
+                           + From<ZeroOperation<ArrayProgramType>>,
+        >,
+> PartiallyEvaluatableOperation<C> for ArrayProgramOperation<A>
+where
+    C::Value: PartialEq,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -1523,6 +1537,18 @@ impl<A: Value<Type = ArrayType>, C: Context<Type = ArrayProgramType, Operation: 
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        if matches!(self, Self::Condition(_)) {
+            return ConditionOperation::<C::Constant>::new().partially_evaluate(context, driver, inputs);
+        }
+        if let Self::Scan(operation) = self {
+            let scan = ScanOperation::<C::Constant>::new(operation.carry_count(), operation.length())
+                .with_reverse(operation.reverse())
+                .with_unroll(operation.unroll())?;
+            return scan.partially_evaluate(context, driver, inputs);
+        }
+        if let Self::While(operation) = self {
+            return operation.partially_evaluate(context, driver, inputs);
+        }
         if let Self::Reshape(operation) = self
             && operation.output_sharding().is_none()
             && driver.region_count() == 0

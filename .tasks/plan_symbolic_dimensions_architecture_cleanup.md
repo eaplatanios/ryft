@@ -1663,6 +1663,11 @@ searches. The complete source ledger and verification record are in
 - [x] P6c — execute `.tasks/plan_p6c_generic_outer_differentiation_dispatch.md` as the next isolated Phase 6 review
       unit. Make generic outer dispatch project/lift array-only JVP and transpose rules, let VJP reuse their existing
       composition, and exercise the shared toy composite fixture for member-kind-agnostic dispatch tests.
+- [x] P6d — execute `.tasks/plan_p6d_composite_region_differentiation.md` as three review-sized vertical slices:
+      condition, scan, and while. Reuse the existing control-flow algorithms over `ArrayProgramType` regions, preserve
+      dimensions as primal/residual SSA without differential slots, compact only time-varying dimension residuals
+      through the checked scalar gateway when iteration storage requires it, and reach full JAX parity plus Ryft's
+      bounded-dynamic extensions before beginning composite-zero deletion.
 - [x] Preserve dimension values as ordinary structural residuals without tangent slots.
 - [x] Keep explicit mixed rules only where primal dimension operands control array results or region interfaces.
 - [x] Remove temporary homogeneous differentiation programs and dimension recovery.
@@ -1779,8 +1784,33 @@ re-exported from their owning facades so composite backends can reuse the single
 no-op from 0.28 to 0.11 seconds. The full 1,089-test core suite, 407-test XLA suite plus one intentional ignore, macro
 unit/integration/compile-fail suites,
 doctests, formatting, source closure, and JAX extent/collective parity gates pass. Full evidence is in
-`.tasks/plan_p6c_generic_outer_differentiation_dispatch.md`. Composite-region differentiation is the next isolated
-Phase 6 unit; composite-zero deletion remains afterward.
+`.tasks/plan_p6c_generic_outer_differentiation_dispatch.md`. P6d completion is recorded below; composite-zero deletion
+remains afterward.
+
+P6d is complete as one combined condition/scan/while review unit. All three operations now reuse their shared
+partial-evaluation, JVP, and transpose algorithms for `ArrayProgramType`, and the final abstraction pass removed the
+duplicated homogeneous/composite bounded-while dispatcher. Dimensions remain primal-only boundary leaves; invariant
+dimension residuals thread directly as scan carries, while only time-varying residuals use the visible checked scalar
+gateway pair. Dynamic scan lengths, batched-predicate bounded loops, early exit, structural zeros, identity closure,
+direct transpose, VJP, batching/rematerialization/custom-derivative nesting, import, StableHLO lowering, and CPU
+execution are covered. The public compiled-gradient facade now stages VJP through the retained `jit_call`, reuses the
+canonical projected-array gradient seed, and executes captured compiled functions without an XLA-local AD algorithm.
+XLA otherwise owns only thin dispatch and consumes the shared core algorithms.
+
+The retained delta is +941 production and +713 Rust test lines across core/XLA, plus a 96-line Python JAX parity
+fixture. Representative residual counts are pinned at one, two, or three; the combined condition/scan/bounded-while
+lowering preserves two primal and one pullback top-level `jit_call` instructions and measures 5,504/3,258 StableHLO
+bytes after lowering their callees. A warmed
+non-incremental core check took 7.50 seconds, an isolated no-op check reported 0.24 seconds, and a fresh isolated target
+including dependencies took 14.52 seconds. Final gates pass 1,096 core tests, 409 XLA tests plus one intentional
+ignore, 52 core doctests plus 16 intentional ignores, all seven focused composite regressions, all three JAX parity
+fixtures, compact zero-space `jit_call` boundary coverage, compiled-gradient capture/execution coverage, formatting,
+diff hygiene, and deletion/ownership searches.
+No generated contract changed. The old
+condition/scan/while composite diagnostics and backend algorithm copies are gone; no direct type-only composite-zero
+construction was added. The pre-existing generic composite-zero representation/materialization references remain the
+next isolated Phase 6 deletion unit exactly as listed below. Full evidence and the source ledger are in
+`.tasks/plan_p6d_composite_region_differentiation.md`.
 
 ### Phase 7: backend execution and lowering
 

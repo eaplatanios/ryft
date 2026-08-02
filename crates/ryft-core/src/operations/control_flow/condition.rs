@@ -259,9 +259,9 @@ where
 /// `k + 1`.
 impl<V, O, C> PartiallyEvaluatableOperation<C> for ConditionOperation<V>
 where
-    V: Value<Type = ArrayType> + Concretizable<bool>,
-    C: Context<Type = ArrayType, Constant = V, Operation = O>,
-    O: Operation<ArrayType> + From<ConditionOperation<V>> + From<ZeroOperation<ArrayType>>,
+    V: Value + Concretizable<bool>,
+    C: Context<Type = V::Type, Constant = V, Operation = O>,
+    O: Operation<V::Type> + From<ConditionOperation<V>> + From<ZeroOperation<V::Type>>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -368,7 +368,7 @@ where
 
 /// Bookkeeping for one branch of [`split_condition_by_knownness`]: the branch's partitioned programs, boundary
 /// mappings, and residual edges.
-struct ConditionBranchSplit<V: Value<Type = ArrayType>, O: Operation<ArrayType>> {
+struct ConditionBranchSplit<V: Value, O: Operation<V::Type>> {
     /// Known-side program reified by partitioning the branch through a fresh staging context.
     known_program: Program<V, O, Vec<V>, Vec<V>>,
 
@@ -382,7 +382,7 @@ struct ConditionBranchSplit<V: Value<Type = ArrayType>, O: Operation<ArrayType>>
     outputs: Vec<PartialEvaluationOutput<usize>>,
 
     /// Per-edge local types, in edge order (feeders first, then instantiated known outputs of residual-owned slots).
-    edge_types: Vec<ArrayType>,
+    edge_types: Vec<V::Type>,
 
     /// Known-program output providing each edge, in edge order.
     edge_program_outputs: Vec<usize>,
@@ -413,9 +413,9 @@ fn split_condition_by_knownness<V, O, C, D: PartialEvaluationDriver<C>>(
     inputs: &[PartialEvaluationValue<C::Value>],
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
-    V: Value<Type = ArrayType>,
-    C: Context<Type = ArrayType, Constant = V, Operation = O>,
-    O: Operation<ArrayType> + From<ConditionOperation<V>> + From<ZeroOperation<ArrayType>>,
+    V: Value,
+    C: Context<Type = V::Type, Constant = V, Operation = O>,
+    O: Operation<V::Type> + From<ConditionOperation<V>> + From<ZeroOperation<V::Type>>,
 {
     let true_branch = driver.region(0)?;
     let false_branch = driver.region(1)?;
@@ -517,6 +517,23 @@ where
         && true_split.edge_program_outputs.is_empty()
         && false_split.edge_program_outputs.is_empty();
     if known_side_is_empty {
+        return context.fold_or_residualize(
+            O::from(condition.clone()),
+            vec![true_branch.to_program(), false_branch.to_program()],
+            inputs,
+        );
+    }
+
+    // Reconciling the known branches requires each branch to produce placeholder zeros for the other branch's
+    // residual edges. A type that carries an identity cannot be constructed from its type alone: a dimension needs a
+    // real producer and a dynamic array needs explicit extent values. Keep the original condition residual in that
+    // case; its known operands become ordinary residual inputs and no placeholder value is needed.
+    if true_split
+        .edge_types
+        .iter()
+        .chain(&false_split.edge_types)
+        .any(|r#type| r#type.identities().next().is_some())
+    {
         return context.fold_or_residualize(
             O::from(condition.clone()),
             vec![true_branch.to_program(), false_branch.to_program()],
@@ -981,9 +998,10 @@ where
 ///
 /// The predicate is the first operand and carries no tangent (Boolean predicates have no tangent space); the fused
 /// conditional selects the same branch for both halves because they share the same primal predicate edge.
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for ConditionOperation<C::Constant>
+impl<C: Context<Type: ConditionTypeSemantics + DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
+    for ConditionOperation<C::Constant>
 where
-    C::Operation: From<ZeroOperation<ArrayType>> + From<ConditionOperation<C::Constant>>,
+    C::Operation: From<ZeroOperation<C::Type>> + From<ConditionOperation<C::Constant>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -1042,8 +1060,8 @@ where
 /// implementation for a closed operation enum introduces no recursive [`TransposableOperation`] obligation on `O`.
 impl<V, O> TransposableOperation<V, O> for ConditionOperation<V>
 where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ConditionOperation<V>>,
+    V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
+    O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<ConditionOperation<V>>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1095,8 +1113,8 @@ pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
     outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ConditionOperation<V>>,
+    V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
+    O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<ConditionOperation<V>>,
 {
     // A condition with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {

@@ -522,6 +522,22 @@ where
     }
 }
 
+impl<'operation, C> TryFrom<&'operation XlaOperation<C>> for &'operation WhileOperation
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    type Error = ProgramError;
+
+    fn try_from(operation: &'operation XlaOperation<C>) -> Result<Self, Self::Error> {
+        let XlaOperation::While(operation) = operation else {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("expected a while operation but got '{}'", operation.name()),
+            });
+        };
+        Ok(operation)
+    }
+}
+
 macro_rules! dispatch_operation {
     // Delegates one borrowed `Operation` method to the active payload without materializing the canonical core
     // operation, so cheap per-instruction accessors (e.g., names, effects, and region slots) never clone payload
@@ -725,6 +741,7 @@ where
         + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + Concretizable<bool>,
     C: Context<Type = ArrayProgramType, Constant = Constant, Operation = XlaOperation<Constant>>,
+    C::Value: PartialEq,
     ArrayProgramOperation<Constant::Projected>: PartiallyEvaluatableOperation<C>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
@@ -737,6 +754,9 @@ where
             return operation.partially_evaluate(context, driver, inputs);
         }
         match self {
+            Self::Condition(operation) => operation.partially_evaluate(context, driver, inputs),
+            Self::Scan(operation) => operation.partially_evaluate(context, driver, inputs),
+            Self::While(operation) => operation.partially_evaluate(context, driver, inputs),
             Self::JitCall(operation) => operation.partially_evaluate(context, driver, inputs),
             Self::ShardMap(operation) => operation.partially_evaluate(context, driver, inputs),
             _ => context.fold_or_residualize(
@@ -755,6 +775,7 @@ where
         + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + Concretizable<bool>,
     C: Context<Type = ArrayProgramType, Constant = Constant, Operation = XlaOperation<Constant>> + Zero<C::Value>,
+    C::Value: Concretizable<bool>,
     ArrayProgramOperation<Constant::Projected>: DifferentiableOperation<C>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -767,14 +788,14 @@ where
             return operation.jvp(context, driver, inputs);
         }
         match self {
+            Self::Condition(operation) => operation.jvp(context, driver, inputs),
+            Self::Scan(operation) => operation.jvp(context, driver, inputs),
+            Self::While(operation) => operation.jvp(context, driver, inputs),
             Self::LinearCall(operation) => operation.jvp(context, driver, inputs),
             Self::JitCall(operation) => operation.jvp(context, driver, inputs),
             Self::ShardMap(operation) => operation.jvp(context, driver, inputs),
             _ => Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "differentiation of composite XLA region operation '{}' requires Phase 6 composite-region support",
-                    self.name(),
-                ),
+                message: format!("operation '{}' has no differentiation rule", self.name()),
             }
             .into()),
         }
@@ -796,16 +817,17 @@ where
         if let Some(operation) = self.to_core_operation() {
             return operation.transpose(context, driver, inputs, outputs);
         }
-        if let Self::LinearCall(operation) = self {
-            return operation.transpose(context, driver, inputs, outputs);
+        match self {
+            Self::Condition(operation) => operation.transpose(context, driver, inputs, outputs),
+            Self::Scan(operation) => operation.transpose(context, driver, inputs, outputs),
+            Self::While(operation) => operation.transpose(context, driver, inputs, outputs),
+            Self::LinearCall(operation) => operation.transpose(context, driver, inputs, outputs),
+            Self::JitCall(operation) => operation.transpose(context, driver, inputs, outputs),
+            _ => Err(ProgramError::UnsupportedOperation {
+                message: format!("operation '{}' is not transposable", self.name()),
+            }
+            .into()),
         }
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "transposition of composite XLA region operation '{}' requires Phase 6 composite-region support",
-                self.name(),
-            ),
-        }
-        .into())
     }
 }
 
@@ -1031,13 +1053,15 @@ where
 /// The rule linearizes the callee program capture-free through
 /// [`Program::linearize`](ryft_core::Program::linearize), giving a primal sub-program
 /// `inputs -> [outputs..., residuals...]` and a tangent sub-program
-/// `[input_tangents..., residuals...] -> [output_tangents...]` together with the residual count. It then:
+/// `[live_input_tangents..., residuals...] -> [live_output_tangents...]` together with the residual count. Tangents
+/// for zero differential spaces are omitted from both compact boundaries. It then:
 ///
 ///   1. Wraps the primal sub-program in a fresh `jit_call` and stages it over the operand primals, recovering the
 ///      primal outputs followed by the residual values (program variables produced by the staged primal call).
-///   2. Wraps the tangent sub-program in a fresh `jit_call` and stages it over the operand tangents followed by those
-///      residual values, recovering one output tangent per primal output.
-///   3. Pairs each primal output tracer with its tangent output tracer into a [`DifferentiationDual`].
+///   2. Wraps the tangent sub-program in a fresh `jit_call` and stages it over the live operand tangents followed by
+///      those residual values, recovering the live output tangents.
+///   3. Pairs each primal output tracer with its tangent output tracer, restoring structural zeros for omitted
+///      zero-space outputs, into a [`DifferentiationDual`].
 ///
 /// The callee program is materialized from the instruction's callee region in the context's constant universe `V`
 /// (concretely [`XlaConstant`] for staged XLA programs), so the split halves ride the fresh primal and tangent calls
@@ -1064,8 +1088,10 @@ where
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let callee = driver.region(0)?;
-        let output_count = callee.output_types().len();
-        check_count!("input", inputs, callee.input_types().len(), ProgramError);
+        let input_types = callee.input_types();
+        let output_types = callee.output_types();
+        let output_count = output_types.len();
+        check_count!("input", inputs, input_types.len(), ProgramError);
 
         // Linearize the callee capture-free. The primal sub-program produces `[outputs..., residuals...]` and the
         // tangent sub-program consumes `[input_tangents..., residuals...]`; the residual count is the number of
@@ -1089,24 +1115,32 @@ where
         let residuals = primal_call_outputs.split_off(output_count);
         let primal_outputs = primal_call_outputs;
 
-        // Wrap the tangent sub-program in a fresh `jit_call` and bind it over the operand tangents followed by the
-        // residual values, recovering one output tangent per primal output.
-        // The tangent `jit_call` takes every operand tangent as a real program input, so materialize structural
-        // zeros at this sub-program boundary.
+        // Wrap the tangent sub-program in a fresh `jit_call` and bind it over only the live operand tangents followed
+        // by the residual values. Zero-space tangents have no compact callee boundary slot.
         let mut tangent_operands = inputs
             .iter()
-            .map(|input| input.tangent().clone().materialize(context))
+            .zip(input_types)
+            .filter(|(_, input_type)| !input_type.tangent().is_zero_space())
+            .map(|(input, _)| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
         let tangent_call = XlaOperation::JitCall(JitCallOperation::new());
         let tangent_outputs =
             context.bind(tangent_call, CalleeRegionDriver::new(&[Rc::new(tangent_program)]), &tangent_operands)?;
-        check_count!("output", tangent_outputs, output_count, ProgramError);
+        let tangent_output_count = output_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
+        check_count!("output", tangent_outputs, tangent_output_count, ProgramError);
 
+        let mut tangent_outputs = tangent_outputs.into_iter();
         Ok(primal_outputs
             .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .zip(output_types)
+            .map(|(primal, output_type)| {
+                if output_type.tangent().is_zero_space() {
+                    Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                } else {
+                    DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?)
     }
 }
@@ -1349,6 +1383,42 @@ mod tests {
             .unwrap(),
             vec![array_type, dimension_type],
         );
+    }
+
+    #[test]
+    fn test_jit_call_jvp_omits_zero_space_boundary_tangents() {
+        let dimension_type = ArrayProgramType::Dimension(DimensionType::new(DimensionVariable::new(
+            "size",
+            DimensionBounds::positive(Some(9)).unwrap(),
+        )));
+        let array_type = ArrayProgramType::Array(ArrayType::scalar(DataType::F64));
+
+        let mut callee_builder = XlaProgramBuilder::new();
+        let dimension = callee_builder.add_input(dimension_type.clone());
+        let array = callee_builder.add_input(array_type.clone());
+        let callee = callee_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![dimension, array],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = XlaProgramBuilder::new();
+        let dimension = builder.add_input(dimension_type.clone());
+        let array = builder.add_input(array_type.clone());
+        let callee = builder.import_region(callee.entry_region_ref());
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new()), vec![callee], vec![dimension, array])
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_types(), vec![dimension_type.clone(), array_type.clone(), array_type.clone()]);
+        assert_eq!(jvp.output_types(), vec![dimension_type, array_type.clone(), array_type]);
     }
 
     #[test]

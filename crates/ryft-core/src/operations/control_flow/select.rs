@@ -8,13 +8,13 @@ use crate::differentiation::forward::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::ElementwiseOperation;
-use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::constants::{Zero, ZeroLikeOperation, ZeroOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
@@ -193,7 +193,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V::Type: DifferentiableType,
-        O: From<ZeroOperation<V::Type>> + From<SelectOperation>,
+        O: From<ZeroLikeOperation> + From<ZeroOperation<V::Type>> + From<SelectOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, context, _driver, inputs, outputs| {
@@ -222,7 +222,21 @@ impl_differentiable_operation! {
                         .as_known()
                         .expect("dispatch guarantees a known operand carries its pullback value")
                         .clone();
-                    let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
+                    let cotangent_type = cotangent.r#type().into_owned();
+                    let zero = if cotangent_type.identities().next().is_some() {
+                        // An identity-bearing type does not contain concrete runtime extents, so use the live
+                        // cotangent as the shape exemplar. Identity-free types retain the canonical nullary zero,
+                        // whose zero-producing marker keeps higher-order partial evaluation structural.
+                        let mut zero = context.stage_operation(
+                            ZeroLikeOperation,
+                            Vec::new(),
+                            std::slice::from_ref(cotangent),
+                        )?;
+                        check_count!("output", zero, 1, ProgramError);
+                        zero.remove(0)
+                    } else {
+                        MaybeZero::Zero(cotangent_type).materialize(context)?
+                    };
                     let on_true = context.stage_operation(
                         SelectOperation,
                         Vec::new(),

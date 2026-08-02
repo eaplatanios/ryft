@@ -19,8 +19,6 @@ use ryft_core::operations::collectives::{
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{ConstantOperation, IotaOperation};
-#[cfg(test)]
-use ryft_core::operations::control_flow::ConditionOperation;
 use ryft_core::operations::control_flow::{ScanOperation, WhileOperation};
 use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
 use ryft_core::operations::differentiation::CoordinateBasisOperation;
@@ -7936,7 +7934,7 @@ mod tests {
     use ryft_core::operations::constants::{
         ConstantOperation, Fill, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroOperation,
     };
-    use ryft_core::operations::control_flow::SelectOperation;
+    use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
     use ryft_core::operations::dimensions::DimensionSizeOperation;
     use ryft_core::operations::logical::{AndOperation, OrOperation, XorOperation};
     use ryft_core::operations::manipulation::{
@@ -9863,6 +9861,147 @@ mod tests {
         assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_differentiated_composite_control_flow() {
+        let scalar_boolean = ArrayType::scalar(DataType::Boolean);
+        let scalar_f32 = ArrayType::scalar(DataType::F32);
+        let vector_f32 = test_vector_type(2);
+
+        let branch = |double: bool| {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let operand = builder.add_input(scalar_f32.clone());
+            let output = if double {
+                builder.add_instruction(AddOperation, Vec::new(), vec![operand, operand]).unwrap()[0]
+            } else {
+                operand
+            };
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut scan_body_builder = CompositeXlaProgramBuilder::new();
+        let carry = scan_body_builder.add_input(scalar_f32.clone());
+        let item = scan_body_builder.add_input(scalar_f32.clone());
+        let next_carry = scan_body_builder.add_instruction(AddOperation, Vec::new(), vec![carry, item]).unwrap()[0];
+        let scan_body = scan_body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![next_carry, next_carry],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut while_condition_builder = CompositeXlaProgramBuilder::new();
+        let state = while_condition_builder.add_input(scalar_f32.clone());
+        let while_predicate = while_condition_builder
+            .add_instruction(
+                XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![state, state],
+            )
+            .unwrap()[0];
+        let while_condition = while_condition_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![while_predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut while_body_builder = CompositeXlaProgramBuilder::new();
+        let state = while_body_builder.add_input(scalar_f32.clone());
+        let next_state = while_body_builder.add_instruction(AddOperation, Vec::new(), vec![state, state]).unwrap()[0];
+        let while_body = while_body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next_state], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_region = builder.import_region(branch(true).entry_region_ref());
+        let false_region = builder.import_region(branch(false).entry_region_ref());
+        let scan_region = builder.import_region(scan_body.entry_region_ref());
+        let while_condition_region = builder.import_region(while_condition.entry_region_ref());
+        let while_body_region = builder.import_region(while_body.entry_region_ref());
+        let predicate = builder.add_input(scalar_boolean.clone());
+        let operand = builder.add_input(scalar_f32.clone());
+        let items = builder.add_input(vector_f32.clone());
+        let selected = builder
+            .add_instruction(
+                XlaOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, operand],
+            )
+            .unwrap()[0];
+        let scan_outputs = builder
+            .add_instruction(XlaOperation::Scan(ScanOperation::new(1, 2)), vec![scan_region], vec![selected, items])
+            .unwrap()
+            .to_vec();
+        let final_state = builder
+            .add_instruction(
+                XlaOperation::While(WhileOperation::new().with_iteration_bound(2).unwrap()),
+                vec![while_condition_region, while_body_region],
+                vec![scan_outputs[0]],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![final_state, scan_outputs[1]],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // Keep the complete mixed control-flow program behind one compiled-call boundary. Linearization must preserve
+        // that boundary while deriving its primal and pullback callees, and lowering must still reach the nested
+        // condition and loop operations.
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let callee = builder.import_region(program.entry_region_ref());
+        let predicate = builder.add_input(scalar_boolean.clone());
+        let operand = builder.add_input(scalar_f32.clone());
+        let items = builder.add_input(vector_f32.clone());
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::JitCall(crate::experimental::ops::JitCallOperation::new()),
+                vec![callee],
+                vec![predicate, operand, items],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let primal = linearization.primal();
+        assert_eq!(linearization.residual_count(), 2);
+        assert_eq!(primal.instructions().len(), 2);
+        let primal_inputs = vec![scalar_boolean, scalar_f32.clone(), vector_f32.clone()];
+        let primal_outputs = primal
+            .output_types()
+            .iter()
+            .map(|r#type| match r#type {
+                ArrayProgramType::Array(r#type) => r#type.clone(),
+                ArrayProgramType::Dimension(_) => panic!("this fixture has only array residuals"),
+            })
+            .collect::<Vec<_>>();
+        let primal_stablehlo =
+            to_mlir_module_for_program(primal, &[], &primal_inputs, &primal_outputs, "main", None, None).unwrap();
+        assert!(primal_stablehlo.contains("\"stablehlo.if\""), "{primal_stablehlo}");
+        assert!(primal_stablehlo.matches("stablehlo.while").count() >= 2, "{primal_stablehlo}");
+
+        let pullback = linearization.pullback().unwrap();
+        let pullback_inputs = pullback
+            .input_types()
+            .iter()
+            .map(|r#type| match r#type {
+                ArrayProgramType::Array(r#type) => r#type.clone(),
+                ArrayProgramType::Dimension(_) => panic!("this fixture has only array residuals"),
+            })
+            .collect::<Vec<_>>();
+        let pullback_outputs = vec![scalar_f32, vector_f32];
+        let pullback_stablehlo =
+            to_mlir_module_for_program(&pullback, &[], &pullback_inputs, &pullback_outputs, "main", None, None)
+                .unwrap();
+        assert_eq!(pullback.instructions().len(), 1);
+        assert!(pullback_stablehlo.contains("\"stablehlo.if\""), "{pullback_stablehlo}");
+        assert!(pullback_stablehlo.contains("stablehlo.while"), "{pullback_stablehlo}");
     }
 
     #[test]

@@ -23,15 +23,18 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{One, OneOperation, Zero, ZeroOperation};
+#[cfg(test)]
+use crate::operations::constants::One;
+use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::scan::stacked_scan_type;
-use crate::operations::control_flow::{ScanOperation, Select, SelectOperation};
+use crate::operations::control_flow::{
+    ConditionOperation, ScanOperation, SelectOperation, TemporalResidualOperation, TemporalResidualType,
+};
 use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
-    DynamicUpdateSlice, DynamicUpdateSliceOperation, LegacyBroadcast, LegacyBroadcastOperation, Transpose,
-    TransposeOperation,
+    DynamicUpdateSliceOperation, LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation,
 };
-use crate::operations::math::{Add, AddOperation, Reduce, ReduceOperation, ReductionKind};
+use crate::operations::math::{AddOperation, ReduceOperation, ReductionKind};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
@@ -42,7 +45,7 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::{RegionInterface, RegionRef, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Concretizable, Value};
+use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::programs::{MaybeZero, Program, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayProgramType, ArrayType, DataType};
@@ -652,24 +655,46 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        let condition = driver.region(0)?;
-        let body = driver.region(1)?;
-        // The split's known loop re-runs the known part of every iteration, so it is only sound for pure loops (see
-        // the effect placement contract on `PartialEvaluationContext::fold_or_residualize`).
-        if inputs.iter().any(PartialEvaluationValue::is_known)
-            && !inputs.iter().all(PartialEvaluationValue::is_known)
-            && condition.effects().is_pure()
-            && body.effects().is_pure()
-            && let Some(outputs) = split_while_by_closed_knownness(context, operation, condition, body, inputs, driver)?
-        {
-            return Ok(outputs);
-        }
-        context.fold_or_residualize(
-            C::Operation::from(*operation),
-            vec![condition.to_program(), body.to_program()],
-            inputs,
-        )
+        partially_evaluate_while_by_closed_knownness(operation, context, driver, inputs)
     }
+}
+
+impl<C: Context<Type = ArrayProgramType>> WhilePartialEvaluation<C> for ArrayProgramType
+where
+    C::Operation: From<WhileOperation>,
+{
+    fn partially_evaluate_while<D: PartialEvaluationDriver<C>>(
+        operation: &WhileOperation,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        partially_evaluate_while_by_closed_knownness(operation, context, driver, inputs)
+    }
+}
+
+/// Partially evaluates a loop type family that supports the closed-knownness split but no invariant-state rewrite.
+fn partially_evaluate_while_by_closed_knownness<C: Context, D: PartialEvaluationDriver<C>>(
+    operation: &WhileOperation,
+    context: &PartialEvaluationContext<C>,
+    driver: &D,
+    inputs: &[PartialEvaluationValue<C::Value>],
+) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
+where
+    C::Operation: From<WhileOperation>,
+{
+    let condition = driver.region(0)?;
+    let body = driver.region(1)?;
+    // The split's known loop re-runs the known part of every iteration, so it is only sound for pure loops.
+    if inputs.iter().any(PartialEvaluationValue::is_known)
+        && !inputs.iter().all(PartialEvaluationValue::is_known)
+        && condition.effects().is_pure()
+        && body.effects().is_pure()
+        && let Some(outputs) = split_while_by_closed_knownness(context, operation, condition, body, inputs, driver)?
+    {
+        return Ok(outputs);
+    }
+    context.fold_or_residualize(C::Operation::from(*operation), vec![condition.to_program(), body.to_program()], inputs)
 }
 
 /// Rebuilds one partially-evaluated nested `while` program (the condition or the body) over the loop's full state
@@ -1124,6 +1149,139 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
 }
 
+/// Array-backed storage semantics used by bounded `while` differentiation.
+///
+/// A bounded loop stores each per-iteration residual in an ordinary leading-axis array stack. Homogeneous array
+/// programs use their residual type directly. Composite array programs additionally map first-class dimension
+/// residuals to checked scalar-array storage and restore them at the tangent-body boundary. Keeping this contract at
+/// the type-family boundary lets both operation families share the bounded-loop algorithm without making the generic
+/// control-flow rule inspect composite variants.
+pub(crate) trait WhileResidualStackType: DifferentiableType + TemporalResidualType + WhileTypeSemantics {
+    /// Wraps an array type in this type family.
+    fn from_array_type(r#type: ArrayType) -> Self;
+
+    /// Projects an array member from this type family.
+    fn array_type(&self) -> Result<&ArrayType, TypeError>;
+}
+
+/// Operation-family constructors required by the shared bounded-`while` residual-stack algorithm.
+///
+/// The methods return operations rather than binding values, so the same contract works in the parent
+/// differentiation context and in the nested tracing contexts used to build the augmented primal body and masked
+/// tangent scan body. Composite implementations own the visible dimension/scalar gateway operations; homogeneous
+/// array implementations return `None` for both gateway hooks.
+pub(crate) trait WhileResidualStackOperation<T: WhileResidualStackType, A>:
+    Operation<T> + TemporalResidualOperation<T>
+{
+    /// Constructs a zero for a statically shaped array-backed state type.
+    fn residual_stack_zero(r#type: T) -> Self;
+
+    /// Constructs a one for a scalar array-backed state type.
+    fn residual_stack_one(r#type: T) -> Self;
+
+    /// Constructs an array broadcast used to insert a leading stack axis or expand a mask.
+    fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self;
+
+    /// Constructs an array dynamic-update-slice operation.
+    fn residual_stack_update() -> Self;
+
+    /// Constructs an array addition operation.
+    fn residual_stack_add() -> Self;
+
+    /// Constructs an array selection operation.
+    fn residual_stack_select() -> Self;
+
+    /// Constructs a Boolean `any` reduction used to scalarize a batched loop predicate.
+    fn mask_reduce_any(axes: Vec<usize>) -> Self;
+
+    /// Constructs a Boolean conjunction used to retain only active loop items.
+    fn mask_and() -> Self;
+}
+
+impl TemporalResidualType for ArrayType {
+    #[inline]
+    fn temporal_storage_type(&self) -> Result<Self, TypeError> {
+        Ok(self.clone())
+    }
+}
+
+impl<O: Operation<ArrayType>> TemporalResidualOperation<ArrayType> for O {
+    #[inline]
+    fn residual_to_storage(_residual_type: &ArrayType) -> Result<Option<Self>, TypeError> {
+        Ok(None)
+    }
+
+    #[inline]
+    fn residual_from_storage(_residual_type: &ArrayType) -> Result<Option<Self>, TypeError> {
+        Ok(None)
+    }
+}
+
+impl WhileResidualStackType for ArrayType {
+    #[inline]
+    fn from_array_type(r#type: ArrayType) -> Self {
+        r#type
+    }
+
+    #[inline]
+    fn array_type(&self) -> Result<&ArrayType, TypeError> {
+        Ok(self)
+    }
+}
+
+impl<A, O> WhileResidualStackOperation<ArrayType, A> for O
+where
+    O: Operation<ArrayType>
+        + From<ZeroOperation<ArrayType>>
+        + From<OneOperation<ArrayType>>
+        + From<AddOperation>
+        + From<LegacyBroadcastOperation>
+        + From<DynamicUpdateSliceOperation>
+        + From<SelectOperation>
+        + From<ReduceOperation>
+        + From<AndOperation>,
+{
+    #[inline]
+    fn residual_stack_zero(r#type: ArrayType) -> Self {
+        Self::from(ZeroOperation::new(r#type))
+    }
+
+    #[inline]
+    fn residual_stack_one(r#type: ArrayType) -> Self {
+        Self::from(OneOperation::new(r#type))
+    }
+
+    #[inline]
+    fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
+        Self::from(LegacyBroadcastOperation::new(output_type, output_axes))
+    }
+
+    #[inline]
+    fn residual_stack_update() -> Self {
+        Self::from(DynamicUpdateSliceOperation)
+    }
+
+    #[inline]
+    fn residual_stack_add() -> Self {
+        Self::from(AddOperation)
+    }
+
+    #[inline]
+    fn residual_stack_select() -> Self {
+        Self::from(SelectOperation)
+    }
+
+    #[inline]
+    fn mask_reduce_any(axes: Vec<usize>) -> Self {
+        Self::from(ReduceOperation::new(axes, ReductionKind::Any))
+    }
+
+    #[inline]
+    fn mask_and() -> Self {
+        Self::from(AndOperation)
+    }
+}
+
 /// Capture-free forward-mode (JVP) rule for the bounded [`WhileOperation`], staging an augmented primal `while`
 /// and one masked length-`bound` tangent `scan` as ordinary primal-enum operations over the shared builder.
 ///
@@ -1151,14 +1309,12 @@ where
 ///      the per-item writes can never clamp, and stages it over the operand primals followed by the staged counter and
 ///      stack zeros. Its outputs split into the original state outputs (the primal outputs), the dropped counter, the
 ///      stacked residual outputs, and the mask stack.
-///   2. Stages a length-`B` tangent [`ScanOperation`] whose body is the tangent body extended so each per-iteration
-///      output is wrapped in a [`SelectOperation`] over that state element's mask item, choosing the pushforward output
-///      on valid batch items and the carried tangent input on batch items beyond the actual trip count. Because
-///      [`SelectOperation`] requires a shape-congruent condition, the Boolean `[B]` mask stack is broadcast to a
-///      `[B, ...state_shape]` stack per state element outside the loop, and each broadcast stack is appended as an
-///      extra scanned input, so iteration `item` reads its own shape-congruent mask slice. The scan body input order is
-///      therefore `[state_tangent..., residual_slice..., mask_slice...]`, with the leading `state_count` carry tangents
-///      linear and the trailing residual and mask slices treated as scanned (known) operand edges.
+///   2. Stages a length-`B` tangent [`ScanOperation`] over the live tangent carries, residual storage stacks, and one
+///      Boolean validity stack. Each iteration reads one scalar validity item and selects between the pushforward
+///      output and the carried tangent, relying on ordinary scalar broadcasting. Dimension residuals that vary across
+///      iterations cross the scan boundary through checked scalar-array gateways; forwarded invariant dimensions are
+///      threaded directly as known carries. Gateway restoration is placed behind a condition so inactive placeholder
+///      storage after early exit is never interpreted as a dimension value.
 ///   3. Pairs each primal output tracer with its tangent output tracer into a [`DifferentiationDual`].
 ///
 /// Reverse mode is total with no while-specific transpose code: the staged tangent scan re-keys through the existing
@@ -1166,20 +1322,72 @@ where
 /// capture, and the single outer transpose flips the scan direction and transposes the body — the masked pushforward
 /// side receives a zero cotangent on inactive batch items while the carried side receives the full cotangent, so
 /// cotangents pass through inactive batch items unchanged.
+fn jvp_array_backed_while<C, D: DifferentiationDriver<C>, A>(
+    operation: &WhileOperation,
+    condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+    body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+    context: &C,
+    driver: &D,
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+where
+    C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
+    C::Value: Concretizable<bool>,
+    C::Operation: From<ZeroOperation<C::Type>>
+        + From<ConditionOperation<C::Constant>>
+        + From<WhileOperation>
+        + From<ScanOperation<C::Constant>>
+        + WhileResidualStackOperation<C::Type, A>,
+{
+    let state_count = body.input_count();
+    check_count!("input", inputs, state_count, ProgramError);
+
+    // An unbounded loop has no statically shaped residual stacks for the bounded hybrid rule below, so it stages
+    // the fused doubled-state loop instead (see `jvp_while_fused`). The fused path needs no batched-predicate
+    // rewrite: the fused state doubles every prefix-shaped state element, so a per-item predicate still satisfies
+    // the relaxed predicate contract over the doubled state.
+    let Some(bound) = operation.iteration_bound() else {
+        return jvp_while_fused(operation, condition, context, driver, inputs);
+    };
+
+    // A batched (per-item) predicate cannot thread the bounded rule's augmented differentiation state through the
+    // predicate-prefix contract (the scalar iteration counter and the `[bound, ...]` residual stacks are not
+    // predicate-prefixed), so the loop is first rewritten into its scalar-predicate masked normal form over
+    // `[state..., active_mask]` (see `masked_while_programs`) and differentiated recursively — the masked loop's
+    // forward mode is this same rule. The initial mask is the condition replayed on the operand primals, carried
+    // with a zero tangent since a Boolean mask has no derivative.
+    if C::Type::is_batched_predicate(&condition.output_types()[0]) {
+        let (masked_condition, masked_body) = masked_while_programs::<_, _, A>(condition, body)?;
+        let masked_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
+        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let mut initial_mask = condition.interpret_in_context(context, primal_operands)?;
+        check_count!("output", initial_mask, 1, ProgramError);
+        let mut extended_inputs = inputs.to_vec();
+        extended_inputs.push(DifferentiationDual::new_with_zero_tangent(initial_mask.remove(0)));
+        // The masked loop's condition and body are freshly built region programs, so the recursive `jvp` is
+        // requested through the instruction-scoped driver over them.
+        let mut outputs = driver.jvp_operation(
+            &C::Operation::from(masked_while),
+            vec![masked_condition, masked_body],
+            context,
+            extended_inputs.as_slice(),
+        )?;
+        check_count!("output", outputs, state_count + 1, ProgramError);
+        outputs.truncate(state_count);
+        return Ok(outputs);
+    }
+
+    jvp_while_bounded::<_, _, A>(condition, context, driver, inputs, bound)
+}
+
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> WhileJvp<C> for ArrayType
 where
     C::Value: Concretizable<bool>,
     C::Operation: From<ZeroOperation<ArrayType>>
-        + From<OneOperation<ArrayType>>
-        + From<AddOperation>
-        + From<LegacyBroadcastOperation>
-        + From<DynamicUpdateSliceOperation>
-        + From<SelectOperation>
-        + From<ReduceOperation>
-        + From<AndOperation>
+        + From<ConditionOperation<C::Constant>>
         + From<WhileOperation>
-        + From<ScanOperation<C::Constant>>,
-    for<'operation> &'operation WhileOperation: TryFrom<&'operation C::Operation>,
+        + From<ScanOperation<C::Constant>>
+        + WhileResidualStackOperation<ArrayType, C::Constant>,
 {
     fn jvp_while<D: DifferentiationDriver<C>>(
         operation: &WhileOperation,
@@ -1189,185 +1397,286 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let state_types = body.input_types();
-        let state_count = state_types.len();
-        check_count!("input", inputs, state_count, ProgramError);
+        jvp_array_backed_while::<_, _, C::Constant>(operation, condition, body, context, driver, inputs)
+    }
+}
 
-        // An unbounded loop has no statically shaped residual stacks for the bounded hybrid rule below, so it stages
-        // the fused doubled-state loop instead (see `jvp_while_fused`). The fused path needs no batched-predicate
-        // rewrite: the fused state doubles every prefix-shaped state element, so a per-item predicate still satisfies
-        // the relaxed predicate contract over the doubled state.
-        let Some(bound) = operation.iteration_bound() else {
-            return jvp_while_fused(operation, condition, context, driver, inputs);
-        };
+/// Shared reverse-capable forward rule for a bounded, scalar-predicate, array-backed `while` loop.
+fn jvp_while_bounded<C, D: DifferentiationDriver<C>, A>(
+    condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+    context: &C,
+    driver: &D,
+    inputs: &[DifferentiationDual<C::Value>],
+    bound: usize,
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+where
+    C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
+    C::Operation: WhileResidualStackOperation<C::Type, A>
+        + From<ConditionOperation<C::Constant>>
+        + From<WhileOperation>
+        + From<ScanOperation<C::Constant>>,
+{
+    let state_types = driver.region(1)?.input_types();
+    let state_count = state_types.len();
 
-        // A batched (per-item) predicate cannot thread the bounded rule's augmented differentiation state through the
-        // predicate-prefix contract (the scalar iteration counter and the `[bound, ...]` residual stacks are not
-        // predicate-prefixed), so the loop is first rewritten into its scalar-predicate masked normal form over
-        // `[state..., active_mask]` (see `masked_while_programs`) and differentiated recursively — the masked loop's
-        // forward mode is this same rule. The initial mask is the condition replayed on the operand primals, carried
-        // with a zero tangent since a Boolean mask has no derivative.
-        let predicate_type = condition.output_types()[0].clone();
-        if predicate_type.rank() > 0 {
-            let (masked_condition, masked_body) = masked_while_programs(condition, body)?;
-            let masked_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
-            let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            let mut initial_mask = condition.interpret_in_context(context, primal_operands)?;
-            check_count!("output", initial_mask, 1, ProgramError);
-            let mut extended_inputs = inputs.to_vec();
-            extended_inputs.push(DifferentiationDual::new_with_zero_tangent(initial_mask.remove(0)));
-            // The masked loop's condition and body are freshly built region programs, so the recursive `jvp` is
-            // requested through the instruction-scoped driver over them.
-            let mut outputs = driver.jvp_operation(
-                &C::Operation::from(masked_while),
-                vec![masked_condition, masked_body],
-                context,
-                extended_inputs.as_slice(),
-            )?;
-            check_count!("output", outputs, state_count + 1, ProgramError);
-            outputs.truncate(state_count);
-            return Ok(outputs);
-        }
+    // Linearize the body once. The nonlinear half returns the next state followed by ordinary residuals, and the
+    // linear half consumes the live state tangents followed by those residuals.
+    let (primal_program, tangent_program, residual_count) = driver.linearize_program(driver.region(1)?)?.into_parts();
+    let residual_types = primal_program.output_types().split_off(state_count);
+    check_count!("output", residual_types, residual_count, ProgramError);
 
-        // Linearize the body capture-free. The primal body produces `[next_state..., residuals...]` and the
-        // tangent body consumes `[state_tangent..., residuals...]`; the residual count is the number of trailing
-        // outputs of the primal body beyond the loop state.
-        let (primal_program, tangent_program, residual_count) =
-            driver.linearize_program(driver.region(1)?)?.into_parts();
-        let residual_types = primal_program.output_types().split_off(state_count);
-
-        // Build and bind the augmented primal while over `[state..., counter, residual_stacks..., mask_stack]`, with
-        // the counter starting at zero and the stacks (including the Boolean mask, whose zero is false) starting at
-        // typed zeros staged in the shared builder.
-        let counter_type = ArrayType::scalar(DataType::I64);
-        let boolean_scalar_type = ArrayType::scalar(DataType::Boolean);
-        let mask_stack_type = stacked_scan_type(&boolean_scalar_type, bound);
-        let (extended_condition, augmented_body, stack_types) =
-            build_bounded_while_programs(condition, &primal_program, residual_types.as_slice(), bound)?;
-        let augmented_while = WhileOperation::new().with_iteration_bound(bound)?;
-        let mut primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let zero_state_types =
-            std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type));
-        for zero_state_type in zero_state_types {
-            let mut zeros = context.bind(ZeroOperation::new(zero_state_type.clone()), Vec::new(), &[])?;
-            check_count!("output", zeros, 1, ProgramError);
-            primal_operands.push(zeros.remove(0));
-        }
-        let mut while_outputs = context.bind(
-            C::Operation::from(augmented_while),
-            vec![extended_condition, augmented_body],
-            &primal_operands,
-        )?;
-        check_count!("output", while_outputs, state_count + 2 + stack_types.len(), ProgramError);
-        let mask_stack = while_outputs.pop().unwrap();
-        let residual_stacks = while_outputs.split_off(state_count + 1);
-        // Drop the internal iteration counter output; the rule's primal outputs are the original loop state.
-        while_outputs.truncate(state_count);
-        let primal_outputs = while_outputs;
-
-        // Only state elements with a tangent space receive a masked per-iteration update. A state element without one
-        // (such as batching's Boolean active-mask carry) has a structural-zero tangent,
-        // so masking it with `select(mask_item, pushforward, carried)` would be an all-known select that contributes
-        // no linear computation. Following JAX's structure, such an element instead passes its pushforward tangent
-        // through directly, so the tangent body stays genuinely linear (no all-known select) and reverse mode does no
-        // dead work. Mask stacks and mask items are therefore produced only for tangent-carrying elements, keeping the
-        // scanned mask operands and the body's appended mask-item inputs aligned.
-        let element_has_tangent =
-            state_types.iter().map(|state_type| !state_type.tangent().is_zero_space()).collect::<Vec<_>>();
-
-        // LegacyBroadcast the Boolean `[B]` mask stack to a shape-congruent `[B, ...state_shape]` stack per tangent-carrying
-        // state element, so each per-iteration select reads a mask slice that matches that element's shape (select
-        // requires a shape-congruent condition). Scalar state elements reuse the `[B]` mask stack directly.
-        let mut mask_stacks = Vec::new();
-        for (state_type, &has_tangent) in state_types.iter().zip(element_has_tangent.iter()) {
-            if !has_tangent {
-                continue;
+    // A dimension residual that is exactly a forwarded dimension-state input is invariant across the loop. Thread
+    // it directly as known tangent-scan state instead of storing one scalar copy per iteration. This preserves its
+    // boundary identity for dynamic tangent-array carries and limits scalar gateway storage to varying dimensions.
+    let primal_input_ids = primal_program.input_ids().to_vec();
+    let primal_output_ids = primal_program.output_ids().to_vec();
+    let invariant_residual_sources = (0..residual_count)
+        .map(|residual_index| {
+            if C::Operation::residual_from_storage(&residual_types[residual_index])?.is_none() {
+                return Ok(None);
             }
-            if state_type.rank() == 0 {
-                mask_stacks.push(mask_stack.clone());
-                continue;
-            }
-            let condition_type = ArrayType::new(DataType::Boolean, state_type.shape().clone());
-            let stacked_condition_type = stacked_scan_type(&condition_type, bound);
-            let mut broadcasted = context.bind(
-                C::Operation::from(LegacyBroadcastOperation::new(stacked_condition_type, vec![0])),
-                Vec::new(),
-                std::slice::from_ref(&mask_stack),
-            )?;
-            check_count!("output", broadcasted, 1, ProgramError);
-            mask_stacks.push(broadcasted.remove(0));
-        }
-
-        // Build the masked tangent scan body over only the state elements with nonzero differential spaces. Omitting
-        // zero-space carries keeps the generated linear program free of fake values while the dual boundary below
-        // restores their structural zeros.
-        let tangent_state_count = element_has_tangent.iter().filter(|&&has_tangent| has_tangent).count();
-        check_count!("input", tangent_program.input_ids(), tangent_state_count + residual_count, ProgramError);
-        check_count!("output", tangent_program.output_ids(), tangent_state_count, ProgramError);
-        let mask_item_types = state_types
+            let residual = primal_output_ids[state_count + residual_index];
+            Ok((0..state_count).find(|&state_index| {
+                primal_input_ids[state_index] == residual && primal_output_ids[state_index] == residual
+            }))
+        })
+        .collect::<Result<Vec<Option<usize>>, TypeError>>()?;
+    let stacked_residual_indices = invariant_residual_sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| source.is_none().then_some(index))
+        .collect::<Vec<_>>();
+    let stacked_residual_types =
+        stacked_residual_indices.iter().map(|&index| residual_types[index].clone()).collect::<Vec<_>>();
+    let stacked_primal_program = if stacked_residual_indices.len() == residual_count {
+        primal_program
+    } else {
+        let input_types = primal_program.input_types();
+        let mut builder = ProgramBuilder::new();
+        let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let outputs = builder.splice_program(&primal_program, inputs.as_slice())?;
+        let selected_outputs = outputs[..state_count]
             .iter()
-            .zip(element_has_tangent.iter())
-            .filter_map(|(state_type, &has_tangent)| {
-                has_tangent.then(|| ArrayType::new(DataType::Boolean, state_type.shape().clone()))
-            })
+            .copied()
+            .chain(stacked_residual_indices.iter().map(|&index| outputs[state_count + index]))
             .collect::<Vec<_>>();
-        let scan_body_input_types =
-            tangent_program.input_types().into_iter().chain(mask_item_types).collect::<Vec<_>>();
-        let scan_body = if scan_body_input_types.is_empty() {
-            tangent_program
-        } else {
-            TracingContext::<C::Constant, C::Operation>::trace(
-                |inputs| {
-                    let context = inputs[0].context().clone();
-                    let tangent_input_count = tangent_program.input_ids().len();
-                    let carried_inputs = inputs[..tangent_state_count].to_vec();
-                    let mut mask_items = inputs[tangent_input_count..].iter();
-                    let pushforward_outputs =
-                        tangent_program.interpret_in_context(&context, inputs[..tangent_input_count].to_vec())?;
-                    check_count!("output", pushforward_outputs, tangent_state_count, ProgramError);
-                    let mut masked_outputs = Vec::with_capacity(tangent_state_count);
-                    for (pushforward_output, carried_input) in pushforward_outputs.into_iter().zip(carried_inputs) {
-                        let mask_item = mask_items.next().cloned().ok_or_else(|| {
-                            ProgramError::MalformedProgram(
-                                "masked tangent scan body adapter is missing a mask input".to_string(),
-                            )
-                        })?;
-                        masked_outputs.push(Select::select(&mask_item, &pushforward_output, &carried_input)?);
-                    }
-                    Ok(masked_outputs)
-                },
-                scan_body_input_types,
-            )?
-            .1
-        };
+        builder.build(
+            selected_outputs,
+            vec![Placeholder; inputs.len()],
+            vec![Placeholder; state_count + stacked_residual_indices.len()],
+        )?
+    };
 
-        // Stage the length-`bound` tangent scan over the carry tangents followed by the stacked residuals and then the
-        // per-tangent-carrying-state-element mask stacks. Iteration `item` reads residual slice `item` and mask slice
-        // `item`.
-        let tangent_scan = ScanOperation::<C::Constant>::new(tangent_state_count, bound);
-        let mut tangent_operands = inputs
+    // Run the primal loop over its original state plus a counter, one stack per stored residual, and a validity mask.
+    let counter_type = C::Type::from_array_type(ArrayType::scalar(DataType::I64));
+    let boolean_scalar_type = C::Type::from_array_type(ArrayType::scalar(DataType::Boolean));
+    let mask_stack_type = C::Type::from_array_type(stacked_scan_type(boolean_scalar_type.array_type()?, bound));
+    let (extended_condition, augmented_body, stack_types) = build_bounded_while_programs::<_, _, A>(
+        condition,
+        &stacked_primal_program,
+        stacked_residual_types.as_slice(),
+        bound,
+    )?;
+    let mut primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+    for zero_state_type in
+        std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type))
+    {
+        let mut zeros = context.bind(C::Operation::residual_stack_zero(zero_state_type.clone()), Vec::new(), &[])?;
+        check_count!("output", zeros, 1, ProgramError);
+        primal_operands.push(zeros.remove(0));
+    }
+    let mut while_outputs = context.bind(
+        C::Operation::from(WhileOperation::new().with_iteration_bound(bound)?),
+        vec![extended_condition, augmented_body],
+        primal_operands.as_slice(),
+    )?;
+    check_count!("output", while_outputs, state_count + 2 + stack_types.len(), ProgramError);
+    let mask_stack = while_outputs.pop().unwrap();
+    let residual_stacks = while_outputs.split_off(state_count + 1);
+    while_outputs.truncate(state_count);
+    let primal_outputs = while_outputs;
+
+    let element_has_tangent =
+        state_types.iter().map(|state_type| !state_type.tangent().is_zero_space()).collect::<Vec<_>>();
+    let tangent_state_count = element_has_tangent.iter().filter(|&&has_tangent| has_tangent).count();
+    if tangent_state_count == 0 {
+        return Ok(primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect());
+    }
+
+    check_count!("input", tangent_program.input_ids(), tangent_state_count + residual_count, ProgramError);
+    check_count!("output", tangent_program.output_ids(), tangent_state_count, ProgramError);
+    let storage_types = stacked_residual_types
+        .iter()
+        .map(TemporalResidualType::temporal_storage_type)
+        .collect::<Result<Vec<_>, _>>()?;
+    let invariant_residual_indices = invariant_residual_sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| source.is_some().then_some(index))
+        .collect::<Vec<_>>();
+    let invariant_residual_count = invariant_residual_indices.len();
+    let tangent_input_types = tangent_program.input_types();
+    let iteration_input_types = invariant_residual_indices
+        .iter()
+        .map(|&index| residual_types[index].clone())
+        .chain(tangent_input_types[..tangent_state_count].iter().cloned())
+        .chain(storage_types.iter().cloned())
+        .collect::<Vec<_>>();
+    let uses_gateway = stacked_residual_types
+        .iter()
+        .map(C::Operation::residual_from_storage)
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(Option::is_some);
+    let active_body = TracingContext::<C::Constant, C::Operation>::trace(
+        |inputs| -> Result<Vec<_>, ProgramError> {
+            let trace_context = inputs[0].context().clone();
+            let invariant_inputs = &inputs[..invariant_residual_count];
+            let tangent_carry_start = invariant_residual_count;
+            let tangent_carry_end = tangent_carry_start + tangent_state_count;
+            let carried_tangents = &inputs[tangent_carry_start..tangent_carry_end];
+            let mut tangent_inputs = carried_tangents.to_vec();
+            let mut restored_residuals: Vec<(C::Type, Tracer<TracingContext<C::Constant, C::Operation>>)> = Vec::new();
+            let storage_inputs = &inputs[tangent_carry_end..tangent_carry_end + stacked_residual_indices.len()];
+            let mut invariant_residuals = invariant_inputs.iter();
+            let mut storage_inputs = storage_inputs.iter().zip(storage_types.iter());
+            for (residual_index, residual_type) in residual_types.iter().enumerate() {
+                if invariant_residual_sources[residual_index].is_some() {
+                    tangent_inputs.push(invariant_residuals.next().unwrap().clone());
+                    continue;
+                }
+                let (storage_input, storage_type) = storage_inputs.next().unwrap();
+                if storage_input.r#type().as_ref() != storage_type {
+                    return Err(TypeError::invalid(format!(
+                        "bounded while residual stack item has type {} but expected {}",
+                        storage_input.r#type(),
+                        storage_type,
+                    ))
+                    .into());
+                }
+                if let Some(operation) = C::Operation::residual_from_storage(residual_type)? {
+                    if let Some((_, restored)) =
+                        restored_residuals.iter().find(|(restored_type, _)| restored_type == residual_type)
+                    {
+                        tangent_inputs.push(restored.clone());
+                        continue;
+                    }
+                    let mut restored =
+                        trace_context.bind(operation, Vec::new(), std::slice::from_ref(storage_input))?;
+                    check_count!("output", restored, 1, ProgramError);
+                    let restored = restored.remove(0);
+                    restored_residuals.push((residual_type.clone(), restored.clone()));
+                    tangent_inputs.push(restored);
+                } else {
+                    tangent_inputs.push(storage_input.clone());
+                }
+            }
+            let pushforward_outputs = tangent_program.interpret_in_context(&trace_context, tangent_inputs)?;
+            check_count!("output", pushforward_outputs, tangent_state_count, ProgramError);
+            let mut outputs = invariant_inputs.to_vec();
+            outputs.extend(pushforward_outputs);
+            Ok(outputs)
+        },
+        iteration_input_types.clone(),
+    )?
+    .1;
+    let mut scan_body_input_types = iteration_input_types.clone();
+    scan_body_input_types.push(boolean_scalar_type);
+    let scan_body = if uses_gateway {
+        // Inactive bounded iterations contain only placeholder storage. Guard the restoration branch itself so a
+        // checked dimension gateway never observes an unused out-of-bounds placeholder value.
+        let mut passive_builder = ProgramBuilder::new();
+        let passive_inputs = iteration_input_types
+            .iter()
+            .map(|r#type| passive_builder.add_input(r#type.clone()))
+            .collect::<Vec<_>>();
+        let passive_output_count = invariant_residual_count + tangent_state_count;
+        let passive_body = passive_builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+            passive_inputs[..passive_output_count].to_vec(),
+            vec![Placeholder; passive_inputs.len()],
+            vec![Placeholder; passive_output_count],
+        )?;
+        TracingContext::<C::Constant, C::Operation>::trace(
+            |inputs| {
+                let trace_context = inputs[0].context().clone();
+                let (iteration_inputs, mask) = inputs.split_at(inputs.len() - 1);
+                let mut operands = Vec::with_capacity(inputs.len());
+                operands.push(mask[0].clone());
+                operands.extend_from_slice(iteration_inputs);
+                trace_context.bind(
+                    C::Operation::from(ConditionOperation::new()),
+                    vec![active_body, passive_body],
+                    operands.as_slice(),
+                )
+            },
+            scan_body_input_types,
+        )?
+        .1
+    } else {
+        TracingContext::<C::Constant, C::Operation>::trace(
+            |inputs| -> Result<Vec<_>, ProgramError> {
+                let trace_context = inputs[0].context().clone();
+                let (iteration_inputs, mask) = inputs.split_at(inputs.len() - 1);
+                let active_outputs = active_body.interpret_in_context(&trace_context, iteration_inputs.to_vec())?;
+                let mut outputs = active_outputs[..invariant_residual_count].to_vec();
+                outputs.extend(
+                    active_outputs[invariant_residual_count..]
+                        .iter()
+                        .zip(
+                            &iteration_inputs[invariant_residual_count..invariant_residual_count + tangent_state_count],
+                        )
+                        .map(|(pushforward_output, carried_input)| {
+                            let mut selected = trace_context.bind(
+                                C::Operation::residual_stack_select(),
+                                Vec::new(),
+                                &[mask[0].clone(), pushforward_output.clone(), carried_input.clone()],
+                            )?;
+                            check_count!("output", selected, 1, ProgramError);
+                            Ok(selected.remove(0))
+                        })
+                        .collect::<Result<Vec<_>, ProgramError>>()?,
+                );
+                Ok(outputs)
+            },
+            scan_body_input_types,
+        )?
+        .1
+    };
+
+    // The tangent scan consumes invariant dimension residuals, live tangent carries, stored residual stacks, and one
+    // scalar validity stack.
+    let mut tangent_operands = invariant_residual_sources
+        .iter()
+        .flatten()
+        .map(|&state_index| inputs[state_index].primal().clone())
+        .collect::<Vec<_>>();
+    tangent_operands.extend(
+        inputs
             .iter()
             .zip(&element_has_tangent)
             .filter_map(|(input, &has_tangent)| has_tangent.then(|| input.tangent().clone().materialize(context)))
-            .collect::<Result<Vec<_>, _>>()?;
-        tangent_operands.extend(residual_stacks);
-        tangent_operands.extend(mask_stacks);
-        let tangent_outputs = context.bind(C::Operation::from(tangent_scan), vec![scan_body], &tangent_operands)?;
-        check_count!("output", tangent_outputs, tangent_state_count, ProgramError);
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    tangent_operands.extend(residual_stacks);
+    tangent_operands.push(mask_stack);
+    let tangent_scan = ScanOperation::<C::Constant>::new(invariant_residual_count + tangent_state_count, bound);
+    let tangent_outputs =
+        context.bind(C::Operation::from(tangent_scan), vec![scan_body], tangent_operands.as_slice())?;
+    check_count!("output", tangent_outputs, invariant_residual_count + tangent_state_count, ProgramError);
 
-        let mut tangent_outputs = tangent_outputs.into_iter();
-        Ok(primal_outputs
-            .into_iter()
-            .zip(element_has_tangent)
-            .map(|(primal, has_tangent)| {
-                if has_tangent {
-                    DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
-                } else {
-                    Ok(DifferentiationDual::new_with_zero_tangent(primal))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?)
-    }
+    let mut tangent_outputs = tangent_outputs.into_iter().skip(invariant_residual_count);
+    primal_outputs
+        .into_iter()
+        .zip(element_has_tangent)
+        .map(|(primal, has_tangent)| {
+            if has_tangent {
+                DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
+            } else {
+                Ok(DifferentiationDual::new_with_zero_tangent(primal))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// Forward-mode (JVP) rule for the scalar [`WhileOperation`]: scalar `DataType` has no array-stack representation
@@ -1387,6 +1696,54 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         jvp_while_fused(operation, condition, context, driver, inputs)
     }
+}
+
+impl<C: Context<Type = ArrayProgramType> + Zero<C::Value>> WhileJvp<C> for ArrayProgramType
+where
+    C::Constant: ValueProjection<ArrayType>,
+    C::Value: Concretizable<bool>,
+    C::Operation: From<ZeroOperation<ArrayProgramType>>
+        + From<ConditionOperation<C::Constant>>
+        + From<WhileOperation>
+        + From<ScanOperation<C::Constant>>
+        + WhileResidualStackOperation<ArrayProgramType, <C::Constant as ValueProjection<ArrayType>>::Projected>,
+{
+    fn jvp_while<D: DifferentiationDriver<C>>(
+        operation: &WhileOperation,
+        condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+        body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+        context: &C,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        jvp_array_backed_while::<_, _, <C::Constant as ValueProjection<ArrayType>>::Projected>(
+            operation, condition, body, context, driver, inputs,
+        )
+    }
+}
+
+/// Applies the composite array-program `while` JVP policy without requiring the enclosing operation family to expose
+/// a borrowed `WhileOperation` projection. Composite dispatch already owns the concrete operation payload, so the
+/// recursive projection used by the generic eager shortcut would be redundant.
+pub(crate) fn jvp_array_program_while<C, D: DifferentiationDriver<C>>(
+    operation: &WhileOperation,
+    context: &C,
+    driver: &D,
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+where
+    C: Context<Type = ArrayProgramType> + Zero<C::Value>,
+    C::Constant: ValueProjection<ArrayType>,
+    C::Value: Concretizable<bool>,
+    C::Operation: From<ZeroOperation<ArrayProgramType>>
+        + From<ConditionOperation<C::Constant>>
+        + From<WhileOperation>
+        + From<ScanOperation<C::Constant>>
+        + WhileResidualStackOperation<ArrayProgramType, <C::Constant as ValueProjection<ArrayType>>::Projected>,
+{
+    let condition = driver.region(0)?.to_program();
+    let body = driver.region(1)?.to_program();
+    <ArrayProgramType as WhileJvp<C>>::jvp_while(operation, &condition, &body, context, driver, inputs)
 }
 
 /// Stages **one fused** doubled-state forward-mode `while` as an ordinary primal-enum operation over the shared
@@ -1608,37 +1965,41 @@ where
 ///   - The condition is the original loop condition extended with ignored extra-state inputs.
 ///
 /// Returns the extended condition, the augmented body, and the `[bound, …]` residual stack types.
-fn build_bounded_while_programs<V, O>(
+fn build_bounded_while_programs<V, O, A>(
     condition: &Program<V, O, Vec<V>, Vec<V>>,
     primal_body: &Program<V, O, Vec<V>, Vec<V>>,
-    residual_types: &[ArrayType],
+    residual_types: &[V::Type],
     bound: usize,
-) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, Vec<ArrayType>), ProgramError>
+) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, Vec<V::Type>), ProgramError>
 where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType>
-        + From<ZeroOperation<ArrayType>>
-        + From<OneOperation<ArrayType>>
-        + From<AddOperation>
-        + From<LegacyBroadcastOperation>
-        + From<DynamicUpdateSliceOperation>,
+    V: Value<Type: WhileResidualStackType>,
+    O: WhileResidualStackOperation<V::Type, A>,
 {
     let state_count = condition.input_types().len();
-    let counter_type = ArrayType::scalar(DataType::I64);
-    let boolean_scalar_type = ArrayType::scalar(DataType::Boolean);
-    let mask_stack_type = stacked_scan_type(&boolean_scalar_type, bound);
-    for residual_type in residual_types {
-        if residual_type.static_shape().is_none() {
+    let counter_type = V::Type::from_array_type(ArrayType::scalar(DataType::I64));
+    let boolean_scalar_type = V::Type::from_array_type(ArrayType::scalar(DataType::Boolean));
+    let mask_stack_type = V::Type::from_array_type(stacked_scan_type(boolean_scalar_type.array_type()?, bound));
+    let storage_types = residual_types
+        .iter()
+        .map(TemporalResidualType::temporal_storage_type)
+        .collect::<Result<Vec<_>, _>>()?;
+    for storage_type in &storage_types {
+        let storage_type = storage_type.array_type()?;
+        if storage_type.static_shape().is_none() {
             return Err(TypeError::invalid(format!(
-                "jvp of a bounded while loop requires statically shaped body residuals but got {residual_type}",
+                "jvp of a bounded while loop requires statically shaped residual storage but got {storage_type}",
             ))
             .into());
         }
     }
-    let stack_types = residual_types
+    let stack_types = storage_types
         .iter()
-        .map(|residual_type| stacked_scan_type(residual_type, bound))
-        .collect::<Vec<_>>();
+        .map(|storage_type| {
+            storage_type
+                .array_type()
+                .map(|storage_type| V::Type::from_array_type(stacked_scan_type(storage_type, bound)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let body_input_types = primal_body
         .input_types()
@@ -1664,33 +2025,74 @@ where
                 primal_body.interpret_in_context(&context, inputs[..original_input_count].to_vec())?;
             let residual_outputs = body_outputs.split_off(state_count);
             check_count!("output", residual_outputs, residual_types.len(), ProgramError);
-            let zero_index = if residual_types.iter().any(|residual_type| residual_type.rank() > 0) {
-                Some(context.zero(&counter_type)?)
+            let zero_index = if storage_types
+                .iter()
+                .any(|storage_type| storage_type.array_type().map(ArrayType::rank).unwrap_or_default() > 0)
+            {
+                let mut outputs = context.bind(O::residual_stack_zero(counter_type.clone()), Vec::new(), &[])?;
+                check_count!("output", outputs, 1, ProgramError);
+                Some(outputs.remove(0))
             } else {
                 None
             };
             let mut next_stacks = Vec::with_capacity(stack_types.len());
-            for ((residual_output, residual_type), stack_input) in
-                residual_outputs.iter().zip(residual_types).zip(stack_inputs.iter())
+            for (((residual_output, residual_type), storage_type), stack_input) in
+                residual_outputs.iter().zip(residual_types).zip(storage_types.iter()).zip(stack_inputs.iter())
             {
-                let batch_item_type = stacked_scan_type(residual_type, 1);
-                let output_axes = (1..=residual_type.rank()).collect::<Vec<_>>();
-                let expanded = residual_output.legacy_broadcast(batch_item_type, output_axes.as_slice())?;
+                let storage_output = if let Some(operation) = O::residual_to_storage(residual_type)? {
+                    let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(residual_output))?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    outputs.remove(0)
+                } else {
+                    residual_output.clone()
+                };
+                let storage_array_type = storage_type.array_type()?;
+                let batch_item_type = stacked_scan_type(storage_array_type, 1);
+                let output_axes = (1..=storage_array_type.rank()).collect::<Vec<_>>();
+                let mut expanded = context.bind(
+                    O::residual_stack_broadcast(batch_item_type, output_axes),
+                    Vec::new(),
+                    std::slice::from_ref(&storage_output),
+                )?;
+                check_count!("output", expanded, 1, ProgramError);
                 let mut start_indices = vec![counter_input.clone()];
                 if let Some(zero_index) = &zero_index {
-                    start_indices.extend((0..residual_type.rank()).map(|_| zero_index.clone()));
+                    start_indices.extend((0..storage_array_type.rank()).map(|_| zero_index.clone()));
                 }
-                next_stacks.push(stack_input.dynamic_update_slice(&expanded, start_indices.as_slice())?);
+                let mut next_stack = context.bind(
+                    O::residual_stack_update(),
+                    Vec::new(),
+                    &std::iter::once(stack_input.clone())
+                        .chain(expanded.drain(..))
+                        .chain(start_indices)
+                        .collect::<Vec<_>>(),
+                )?;
+                check_count!("output", next_stack, 1, ProgramError);
+                next_stacks.push(next_stack.remove(0));
             }
-            let true_scalar = context.one(&boolean_scalar_type)?;
-            let true_item_type = stacked_scan_type(&boolean_scalar_type, 1);
-            let true_item = true_scalar.legacy_broadcast(true_item_type, &[])?;
-            let next_mask = mask_input.dynamic_update_slice(&true_item, std::slice::from_ref(&counter_input))?;
-            let one_i64 = context.one(&counter_type)?;
-            let next_counter = Add::add(&counter_input, &one_i64)?;
-            body_outputs.push(next_counter);
+            let true_scalar = context.bind(O::residual_stack_one(boolean_scalar_type.clone()), Vec::new(), &[])?;
+            check_count!("output", true_scalar, 1, ProgramError);
+            let true_item_type = stacked_scan_type(boolean_scalar_type.array_type()?, 1);
+            let mut true_item = context.bind(
+                O::residual_stack_broadcast(true_item_type, Vec::new()),
+                Vec::new(),
+                std::slice::from_ref(&true_scalar[0]),
+            )?;
+            check_count!("output", true_item, 1, ProgramError);
+            let mut next_mask = context.bind(
+                O::residual_stack_update(),
+                Vec::new(),
+                &[mask_input.clone(), true_item.remove(0), counter_input.clone()],
+            )?;
+            check_count!("output", next_mask, 1, ProgramError);
+            let mut one_i64 = context.bind(O::residual_stack_one(counter_type.clone()), Vec::new(), &[])?;
+            check_count!("output", one_i64, 1, ProgramError);
+            let mut next_counter =
+                context.bind(O::residual_stack_add(), Vec::new(), &[counter_input, one_i64.remove(0)])?;
+            check_count!("output", next_counter, 1, ProgramError);
+            body_outputs.push(next_counter.remove(0));
             body_outputs.extend(next_stacks);
-            body_outputs.push(next_mask);
+            body_outputs.push(next_mask.remove(0));
             Ok(body_outputs)
         },
         body_input_types,
@@ -1728,28 +2130,28 @@ where
 /// and ANDs it into the mask. The bounded while forward-mode rule uses this normal form for batched-predicate loops,
 /// whose counter- and stack-augmented differentiation state is not predicate-prefixed and therefore needs the loop's
 /// masking made explicit as program data hanging off a scalar predicate.
-fn masked_while_programs<V, O>(
+fn masked_while_programs<V, O, A>(
     condition: &Program<V, O, Vec<V>, Vec<V>>,
     body: &Program<V, O, Vec<V>, Vec<V>>,
 ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>), ProgramError>
 where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType>
-        + From<ReduceOperation>
-        + From<SelectOperation>
-        + From<AndOperation>
-        + From<LegacyBroadcastOperation>,
+    V: Value<Type: WhileResidualStackType>,
+    O: WhileResidualStackOperation<V::Type, A>,
 {
     let state_types = body.input_types();
     let state_count = state_types.len();
     let mask_type = condition.output_types()[0].clone();
-    let mask_axes: Vec<usize> = (0..mask_type.rank()).collect();
+    let mask_axes = (0..mask_type.array_type()?.rank()).collect::<Vec<_>>();
     let mut masked_state_types = state_types.clone();
     masked_state_types.push(mask_type.clone());
 
     // Masked condition: `any(active_mask)` over every predicate axis, ignoring the state inputs.
     let (_, masked_condition) = TracingContext::<V, O>::trace(
-        |inputs| Ok(vec![inputs[state_count].reduce(mask_axes.as_slice(), ReductionKind::Any)]),
+        |inputs| {
+            inputs[0]
+                .context()
+                .bind(O::mask_reduce_any(mask_axes.clone()), Vec::new(), &[inputs[state_count].clone()])
+        },
         masked_state_types.clone(),
     )?;
 
@@ -1766,18 +2168,36 @@ where
             for ((candidate, carried), state_type) in candidates.iter().zip(state).zip(state_types.iter()) {
                 // The mask broadcasts to each state element's shape so the selection is per predicate item; a state
                 // element already shaped like the mask reuses it directly.
-                let element_mask_type = ArrayType::new(DataType::Boolean, state_type.shape().clone());
-                let element_mask = if element_mask_type == mask_type {
+                let element_mask_type = ArrayType::new(DataType::Boolean, state_type.array_type()?.shape().clone());
+                let element_mask = if element_mask_type == *mask_type.array_type()? {
                     mask.clone()
                 } else {
-                    mask.legacy_broadcast(element_mask_type, mask_axes.as_slice())?
+                    trace_context
+                        .bind(
+                            O::residual_stack_broadcast(element_mask_type, mask_axes.clone()),
+                            Vec::new(),
+                            std::slice::from_ref(mask),
+                        )?
+                        .remove(0)
                 };
-                next_state.push(Select::select(&element_mask, candidate, carried)?);
+                next_state.push(
+                    trace_context
+                        .bind(
+                            O::residual_stack_select(),
+                            Vec::new(),
+                            &[element_mask, candidate.clone(), carried.clone()],
+                        )?
+                        .remove(0),
+                );
             }
             let next_predicate = condition.interpret_in_context(&trace_context, next_state.clone())?;
             check_count!("output", next_predicate, 1, ProgramError);
             let mut outputs = next_state;
-            outputs.push(mask.clone() & next_predicate.into_iter().next().unwrap());
+            outputs.extend(trace_context.bind(
+                O::mask_and(),
+                Vec::new(),
+                &[mask.clone(), next_predicate.into_iter().next().unwrap()],
+            )?);
             Ok(outputs)
         },
         masked_state_types,
@@ -3158,8 +3578,8 @@ mod tests {
     #[test]
     fn test_bounded_while_value_and_grad_supports_vector_state() {
         // Vector-state coverage for the bounded staged path: the residual stacks gain trailing axes (written at
-        // `[counter, 0]` through the staged zero index) and the per-item select conditions come from a broadcast of
-        // the Boolean `[bound]` mask stack to `[bound, 2]`, staged outside the loop. The loop
+        // `[counter, 0]` through the staged zero index), while each scan iteration uses its scalar validity item as a
+        // broadcastable select condition for the vector tangent. The loop
         // `while (sum(x) < 20, iteration_bound = 4) { x = x * x }` at `x = [1.5, 2]` squares twice (sums visit 3.5
         // and 6.25 before reaching 21.0625), so `f(x) = sum(x⁴)` locally: value `1.5⁴ + 2⁴ = 21.0625` and gradient
         // `4 x³ = [13.5, 32]`, with trip count 2 strictly below the bound 4.
