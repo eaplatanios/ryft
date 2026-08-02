@@ -10,7 +10,7 @@ use crate::contexts::{Context, EagerContext, ProjectedContext};
 use crate::differentiation::{
     BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment, LinearCallOperation,
-    TransposableOperation, TranspositionDriver,
+    ResidualZeroProvider, TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -24,7 +24,8 @@ use crate::operations::collectives::{
 };
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::{
-    ConstantOperation, Iota, IotaOperation, One, OneOperation, Zero, ZeroOperation,
+    ConstantOperation, Iota, IotaOperation, One, OneOperation, ZERO_OPERATION_NAME, Zero, ZeroLikeOperation,
+    ZeroOperation, ZeroOperationProvider, check_constructor_type_has_no_identity_references,
     infer_dynamic_constructor_output_types,
 };
 use crate::operations::control_flow::scan::{
@@ -54,7 +55,6 @@ use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::effects::Effects;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
@@ -62,6 +62,7 @@ use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::regions::{EmptyRegionDriver, OutputRegionProvenance, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, ProjectedValue, Value, ValueProjection};
+use crate::programs::{AtomId, ProgramBuilder, ProgramError};
 use crate::sharding::Sharding;
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 use crate::types::{
@@ -87,6 +88,31 @@ enum ExactShapeDimension {
 struct ExactShape(Vec<ExactShapeDimension>);
 
 impl ExactShape {
+    /// Builds the canonical disconnected-cotangent shape plan and records each dynamic identity's first source axis.
+    fn for_residual_zero(shape: &Shape) -> (Self, Vec<(usize, DimensionVariable)>) {
+        let mut first_axes = Vec::new();
+        // Residual slots are assigned by first axis occurrence. Repeated uses of one dimension identity reuse that
+        // slot, preserving equality between axes without retaining duplicate scalar values.
+        let dimensions = shape
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(axis, dimension)| match dimension {
+                Dimension::Static(extent) => ExactShapeDimension::Static(*extent),
+                Dimension::Dynamic(variable) => {
+                    let residual =
+                        first_axes.iter().position(|(_, candidate)| candidate == variable).unwrap_or_else(|| {
+                            let residual = first_axes.len();
+                            first_axes.push((axis, variable.clone()));
+                            residual
+                        });
+                    ExactShapeDimension::Residual(residual)
+                }
+            })
+            .collect();
+        (Self(dimensions), first_axes)
+    }
+
     /// Materializes one first-class dimension value per axis in this shape.
     fn dimensions<A, C>(&self, context: &C, residuals: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
     where
@@ -104,6 +130,8 @@ impl ExactShape {
 
     /// Returns the residual values required by dynamic array constructors, in dynamic-axis order.
     fn dynamic_dimensions<V: Clone>(&self, residuals: &[V]) -> Vec<V> {
+        // Mixed array constructors consume one operand per dynamic axis. Expand deduplicated residual slots back into
+        // axis order here, so repeated identities intentionally produce repeated operands.
         self.0
             .iter()
             .filter_map(|dimension| match dimension {
@@ -236,15 +264,12 @@ where
 /// a first-class dimension without changing either homogeneous family.
 #[derive(Clone, Debug)]
 pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
-    /// Array-member zero constructor used for structural tangent and cotangent materialization.
-    ///
-    /// Its composite type parameter lets generic differentiation code request a zero, while outer inference rejects
-    /// dimension-member result types so a zero constructor can never create a first-class dimension value.
-    Zero(ZeroOperation<ArrayProgramType>),
-
-    /// Mixed zero constructor whose stored [`ArrayType`] fully defines the output type and whose dynamic
-    /// dimensions are consumed as explicit first-class dimension operands, one per dynamic axis in axis order.
-    DynamicZero(ZeroOperation<ArrayType>),
+    /// Mixed zero constructor whose stored [`ArrayType`] defines the array result and whose dynamic dimensions are
+    /// consumed as explicit first-class dimension operands, one per dynamic axis in axis order. This constructor
+    /// lives at the composite-family level because its signature crosses member kinds: a homogeneous
+    /// [`ArrayOperation`] cannot consume dimension operands, while the stored structural type carries identities and
+    /// bounds but not the concrete runtime extents required to materialize the result.
+    Zero(ZeroOperation<ArrayType>),
 
     /// Mixed one constructor whose stored [`ArrayType`] fully defines the output type and whose dynamic dimensions
     /// are consumed as explicit first-class dimension operands, one per dynamic axis in axis order.
@@ -338,6 +363,7 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayProgramOperati
     #[inline]
     fn from(operation: ArrayOperation<A>) -> Self {
         match operation {
+            ArrayOperation::Zero(operation) => Self::from(operation),
             ArrayOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
             ArrayOperation::While(operation) => Self::While(operation),
             ArrayOperation::Scan(operation) => {
@@ -475,13 +501,6 @@ impl<A: Value<Type = ArrayType>> From<AllToAllOperation> for ArrayProgramOperati
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: ZeroOperation<ArrayProgramType>) -> Self {
-        Self::Zero(operation)
-    }
-}
-
 impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayProgramOperation<A> {
     #[inline]
     fn from(operation: ZeroOperation<ArrayType>) -> Self {
@@ -494,10 +513,145 @@ impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayProgram
             .iter()
             .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
         {
-            Self::DynamicZero(operation)
+            Self::Zero(operation)
         } else {
             Self::Array(ArrayOperation::Zero(operation))
         }
+    }
+}
+
+// These residual-protocol algorithms are deliberately inherent methods duplicated by thin trait-impl delegations
+// below rather than living only on the trait: the `XlaOperation` provider reuses them across operation families,
+// which their `Self`-typed builder and context parameters cannot express. Do not fold them into the trait impl.
+impl<A: Value<Type = ArrayType>> ArrayProgramOperation<A> {
+    /// Captures the runtime extents needed to materialize a disconnected cotangent zero from the primal `source`.
+    pub fn capture_zero_residuals<
+        V: Value<Type = ArrayProgramType>,
+        O: Operation<ArrayProgramType> + From<DimensionSizeOperation>,
+    >(
+        builder: &mut ProgramBuilder<V, O>,
+        source: AtomId,
+        r#type: &ArrayProgramType,
+    ) -> Result<Vec<AtomId>, ProgramError> {
+        let r#type = <&ArrayType>::try_from(r#type)?;
+        let source_type = builder
+            .atoms()
+            .get(source.index())
+            .ok_or(ProgramError::UnboundAtomId { id: source })?
+            .r#type()
+            .into_owned();
+        let source_type = <&ArrayType>::try_from(&source_type)?;
+        let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
+        // Reading only each identity's first source axis establishes the same deduplicated residual ordering used by
+        // zero construction, including when several axes share one identity.
+        first_axes
+            .into_iter()
+            .map(|(axis, _)| {
+                Ok(builder.add_instruction(
+                    DimensionSizeOperation::new(source_type, axis)?,
+                    Vec::new(),
+                    vec![source],
+                )?[0])
+            })
+            .collect()
+    }
+
+    /// Captures the value-level counterpart of
+    /// [`capture_zero_residuals`](Self::capture_zero_residuals) in `context`.
+    pub fn capture_zero_residual_values<C>(
+        context: &C,
+        source: &C::Value,
+        r#type: &ArrayProgramType,
+    ) -> Result<Vec<C::Value>, ProgramError>
+    where
+        C: Context<Type = ArrayProgramType>,
+        C::Operation: From<DimensionSizeOperation>,
+    {
+        let r#type = <&ArrayType>::try_from(r#type)?;
+        let source_type = source.r#type();
+        let source_type = <&ArrayType>::try_from(source_type.as_ref())?;
+        let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
+        // Capture one concrete extent per identity from its first source axis; repeated axes reuse that value when the
+        // dynamic zero's per-axis operand list is reconstructed.
+        first_axes
+            .into_iter()
+            .map(|(axis, _)| {
+                Ok(context
+                    .bind(DimensionSizeOperation::new(source_type, axis)?, Vec::new(), std::slice::from_ref(source))?
+                    .remove(0))
+            })
+            .collect()
+    }
+
+    /// Adds the canonical zero for `r#type`, consuming one explicit extent residual per distinct dynamic identity in
+    /// first-occurrence order and reusing it for repeated axes.
+    pub fn add_zero_from_residuals<
+        V: Value<Type = ArrayProgramType>,
+        O: Operation<ArrayProgramType> + From<ZeroOperation<ArrayType>>,
+    >(
+        builder: &mut ProgramBuilder<V, O>,
+        r#type: ArrayProgramType,
+        residuals: &[AtomId],
+    ) -> Result<AtomId, ProgramError> {
+        let r#type = <&ArrayType>::try_from(&r#type)?.clone();
+        let (shape, first_axes) = ExactShape::for_residual_zero(r#type.shape());
+        let expected_residual_count = first_axes.len();
+        if residuals.len() != expected_residual_count {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "dynamic zero expected {expected_residual_count} extent residuals but got {}",
+                    residuals.len(),
+                ),
+            });
+        }
+        let operands = shape.dynamic_dimensions(residuals);
+        Ok(builder.add_instruction(ZeroOperation::new(r#type), Vec::new(), operands)?[0])
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ZeroOperationProvider<ArrayProgramType> for ArrayProgramOperation<A> {
+    fn zero_operation(r#type: ArrayProgramType) -> Result<Self, ProgramError> {
+        let ArrayProgramType::Array(r#type) = r#type else {
+            return Err(TypeError::invalid("cannot materialize a zero for a first-class dimension type").into());
+        };
+        check_constructor_type_has_no_identity_references(ZERO_OPERATION_NAME, &r#type)?;
+        Ok(Self::Array(ArrayOperation::Zero(ZeroOperation::new(r#type))))
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayProgramType> for ArrayProgramOperation<A> {
+    fn zero_residual_types(r#type: &ArrayProgramType) -> Vec<ArrayProgramType> {
+        match r#type {
+            ArrayProgramType::Array(r#type) => {
+                let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
+                first_axes.into_iter().map(|(_, variable)| DimensionType::new(variable).into()).collect()
+            }
+            ArrayProgramType::Dimension(_) => Vec::new(),
+        }
+    }
+
+    fn capture_zero_residuals<V: Value<Type = ArrayProgramType>>(
+        builder: &mut ProgramBuilder<V, Self>,
+        source: AtomId,
+        r#type: &ArrayProgramType,
+    ) -> Result<Vec<AtomId>, ProgramError> {
+        ArrayProgramOperation::<A>::capture_zero_residuals(builder, source, r#type)
+    }
+
+    fn capture_zero_residual_values<C: Context<Type = ArrayProgramType, Operation = Self>>(
+        context: &C,
+        source: &C::Value,
+        r#type: &ArrayProgramType,
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        ArrayProgramOperation::<A>::capture_zero_residual_values(context, source, r#type)
+    }
+
+    fn add_zero_from_residuals<V: Value<Type = ArrayProgramType>>(
+        builder: &mut ProgramBuilder<V, Self>,
+        r#type: ArrayProgramType,
+        residuals: &[AtomId],
+    ) -> Result<AtomId, ProgramError> {
+        ArrayProgramOperation::<A>::add_zero_from_residuals(builder, r#type, residuals)
     }
 }
 
@@ -602,7 +756,6 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn name(&self) -> &'static str {
         match self {
             Self::Zero(operation) => operation.name(),
-            Self::DynamicZero(operation) => operation.name(),
             Self::DynamicOne(operation) => operation.name(),
             Self::DynamicIota(operation) => operation.name(),
             Self::Array(operation) => operation.name(),
@@ -632,7 +785,6 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn region_slots(&self) -> &'static [RegionSlot] {
         match self {
             Self::Zero(operation) => operation.region_slots(),
-            Self::DynamicZero(operation) => operation.region_slots(),
             Self::DynamicOne(operation) => operation.region_slots(),
             Self::DynamicIota(operation) => operation.region_slots(),
             Self::Array(operation) => operation.region_slots(),
@@ -664,10 +816,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         region_interfaces: &[RegionInterface<ArrayProgramType>],
     ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
         match self {
-            Self::Zero(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::DynamicZero(_) | Self::DynamicOne(_) | Self::DynamicIota(_) => {
-                Ok(vec![None; region_interfaces.len()])
-            }
+            Self::Zero(_) | Self::DynamicOne(_) | Self::DynamicIota(_) => Ok(vec![None; region_interfaces.len()]),
             Self::Array(operation) => {
                 let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
                 Ok(operation
@@ -709,14 +858,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
         region_interfaces: &[RegionInterface<ArrayProgramType>],
     ) -> Result<Vec<ArrayProgramType>, TypeError> {
         match self {
-            Self::Zero(operation) => {
-                // Differential zeros always use the ordinary array member. Rejecting a dimension result here prevents
-                // this generic constructor from bypassing the checked gateways that alone may create first-class
-                // dimensions.
-                <&ArrayType>::try_from(operation.r#type())?;
-                operation.infer_output_types(input_types, region_interfaces)
-            }
-            Self::DynamicZero(operation) => infer_dynamic_constructor_output_types(
+            Self::Zero(operation) => infer_dynamic_constructor_output_types(
                 operation.name(),
                 operation.r#type(),
                 input_types,
@@ -784,7 +926,6 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         match self {
             Self::Zero(operation) => operation.output_region_provenance(output_index),
-            Self::DynamicZero(operation) => operation.output_region_provenance(output_index),
             Self::DynamicOne(operation) => operation.output_region_provenance(output_index),
             Self::DynamicIota(operation) => operation.output_region_provenance(output_index),
             Self::Array(operation) => operation.output_region_provenance(output_index),
@@ -822,7 +963,6 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn is_zero(&self, output_index: usize) -> bool {
         match self {
             Self::Zero(operation) => operation.is_zero(output_index),
-            Self::DynamicZero(operation) => operation.is_zero(output_index),
             Self::DynamicOne(operation) => operation.is_zero(output_index),
             Self::DynamicIota(operation) => operation.is_zero(output_index),
             Self::Array(operation) => operation.is_zero(output_index),
@@ -852,7 +992,6 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn effects(&self) -> Effects {
         match self {
             Self::Zero(operation) => operation.effects(),
-            Self::DynamicZero(operation) => operation.effects(),
             Self::DynamicOne(operation) => operation.effects(),
             Self::DynamicIota(operation) => operation.effects(),
             Self::Array(operation) => operation.effects(),
@@ -881,7 +1020,6 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         match self {
             Self::Zero(operation) => Ok(Self::Zero(operation.rename_type_identities(renaming)?)),
-            Self::DynamicZero(operation) => Ok(Self::DynamicZero(operation.rename_type_identities(renaming)?)),
             Self::DynamicOne(operation) => Ok(Self::DynamicOne(operation.rename_type_identities(renaming)?)),
             Self::DynamicIota(operation) => Ok(Self::DynamicIota(operation.rename_type_identities(renaming)?)),
             Self::Array(operation) => Ok(Self::Array(operation.rename_type_identities(renaming)?)),
@@ -935,7 +1073,6 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         match self {
             Self::Zero(operation) => operation.render(formatter, indentation),
-            Self::DynamicZero(operation) => operation.render(formatter, indentation),
             Self::DynamicOne(operation) => operation.render(formatter, indentation),
             Self::DynamicIota(operation) => operation.render(formatter, indentation),
             Self::Array(operation) => operation.render(formatter, indentation),
@@ -1124,12 +1261,7 @@ where
             )));
         }
         match self {
-            Self::Zero(operation) => operation.interpret(
-                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
-                &EmptyRegionDriver,
-                inputs,
-            ),
-            Self::DynamicZero(operation) => {
+            Self::Zero(operation) => {
                 let output_type = materialize_dynamic_constructor_type(operation.name(), operation.r#type(), inputs)?;
                 Ok(vec![ArrayProgramValue::Array(EagerContext::<A, ArrayOperation<A>>::new().zero(&output_type)?)])
             }
@@ -1525,7 +1657,7 @@ impl<
                            + From<DimensionToScalarOperation>
                            + From<ScanOperation<C::Constant>>
                            + From<WhileOperation>
-                           + From<ZeroOperation<ArrayProgramType>>,
+                           + ZeroOperationProvider<ArrayProgramType>,
         >,
 > PartiallyEvaluatableOperation<C> for ArrayProgramOperation<A>
 where
@@ -1588,7 +1720,7 @@ where
 /// dimension arithmetic remains host integer work and does not allocate arrays or dispatch to device backends.
 ///
 /// This type allows us to keep arrays and checked host-side dimensions in one storage universe while
-/// [`ValueProjection`] lets homogeneous [`Operation`](crate::Operation) machinery borrow or consume only
+/// [`ValueProjection`] lets homogeneous [`Operation`] machinery borrow or consume only
 /// the member that it understands.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayProgramValue<A: Value<Type = ArrayType>> {
@@ -2002,6 +2134,7 @@ mod tests {
     };
     use crate::operations::constants::{ConstantOperation, ZeroOperation};
     use crate::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
+    use crate::operations::differentiation::StopGradientOperation;
     use crate::operations::dimensions::{
         DimensionAddOperation, DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation,
     };
@@ -2714,11 +2847,9 @@ mod tests {
             dimension_operation.infer_output_types(&[array_type.clone().into(), array_type.clone().into()], &[]),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
-        let dimension_zero =
-            ArrayProgramOperation::<Array>::from(ZeroOperation::new(ArrayProgramType::Dimension(left_type.clone())));
         assert_eq!(
-            dimension_zero.infer_output_types(&[], &[]),
-            Err(TypeError::invalid("expected array type but got dimension type")),
+            ArrayProgramOperation::<Array>::zero_operation(left_type.clone().into()).unwrap_err(),
+            ProgramError::Type(TypeError::invalid("cannot materialize a zero for a first-class dimension type")),
         );
 
         // The direct composite condition preserves the complete higher-order interface, including effects.
@@ -2753,18 +2884,20 @@ mod tests {
             ConditionOperation::<ArrayProgramValue<Array>>::new().output_region_provenance(0),
         );
 
-        // Identity-bearing payloads are renamed by their owning homogeneous family.
+        // Identity-bearing zeros promote to the mixed constructor and retain ordinary identity renaming.
         let source = DimensionVariable::new("source", bounds);
         let target = DimensionVariable::new("target", bounds);
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
         let zero = ArrayProgramOperation::<Array>::from(ArrayOperation::Zero(ZeroOperation::new(dynamic_type)));
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(source.clone(), target.clone()).unwrap();
-        let ArrayProgramOperation::Array(ArrayOperation::Zero(zero)) = zero.rename_type_identities(&renaming).unwrap()
-        else {
-            panic!("expected a renamed array zero operation");
+        let ArrayProgramOperation::Zero(zero) = zero.rename_type_identities(&renaming).unwrap() else {
+            panic!("expected a renamed mixed zero operation");
         };
         assert_eq!(zero.r#type().shape().dimensions(), &[Dimension::Dynamic(target)]);
+
+        let static_zero = ArrayProgramOperation::<Array>::from(ZeroOperation::new(ArrayType::scalar(DataType::F32)));
+        assert!(matches!(static_zero, ArrayProgramOperation::Array(ArrayOperation::Zero(_))));
 
         // Identity-free ones remain homogeneous, while identity-bearing ones use the explicit mixed constructor.
         let static_one = ArrayProgramOperation::<Array>::from(OneOperation::new(ArrayType::scalar(DataType::F32)));
@@ -3225,7 +3358,7 @@ mod tests {
             panic!("expected one shaped-zero instruction");
         };
         assert_eq!(zero_instruction.inputs(), &[rows_atom, columns_atom]);
-        assert!(matches!(zero_instruction.operation(), ArrayProgramOperation::DynamicZero(_)));
+        assert!(matches!(zero_instruction.operation(), ArrayProgramOperation::Zero(_)));
         drop(zero_builder);
         let zero_program = zero_context
             .builder()
@@ -3613,7 +3746,7 @@ mod tests {
         let [instruction] = builder.instructions() else {
             panic!("expected one dynamic-zero instruction");
         };
-        assert!(matches!(instruction.operation(), ArrayProgramOperation::DynamicZero(_)));
+        assert!(matches!(instruction.operation(), ArrayProgramOperation::Zero(_)));
     }
 
     #[test]
@@ -3651,7 +3784,7 @@ mod tests {
         );
         assert_eq!(jvp.instructions().len(), 2);
         assert!(matches!(jvp.instructions()[0].operation(), ArrayProgramOperation::DynamicOne(_)));
-        assert!(matches!(jvp.instructions()[1].operation(), ArrayProgramOperation::DynamicZero(_)));
+        assert!(matches!(jvp.instructions()[1].operation(), ArrayProgramOperation::Zero(_)));
         assert_eq!(jvp.instructions()[0].inputs(), jvp.instructions()[1].inputs());
 
         // The direct transform context must likewise run the explicit rule rather than taking its all-structural-zero
@@ -3711,7 +3844,7 @@ mod tests {
         );
         assert_eq!(jvp.instructions().len(), 2);
         assert!(matches!(jvp.instructions()[0].operation(), ArrayProgramOperation::DynamicIota(_)));
-        assert!(matches!(jvp.instructions()[1].operation(), ArrayProgramOperation::DynamicZero(_)));
+        assert!(matches!(jvp.instructions()[1].operation(), ArrayProgramOperation::Zero(_)));
         assert_eq!(jvp.instructions()[0].inputs(), jvp.instructions()[1].inputs());
     }
 
@@ -3752,7 +3885,7 @@ mod tests {
         let [instruction] = instantiated.instructions() else {
             panic!("expected one instantiated instruction");
         };
-        let ArrayProgramOperation::DynamicZero(instantiated_zero) = instruction.operation() else {
+        let ArrayProgramOperation::Zero(instantiated_zero) = instruction.operation() else {
             panic!("expected the instantiated operation to remain a dynamic zero");
         };
         assert_eq!(
@@ -5312,9 +5445,132 @@ in (%4)
         let dynamic_zero = jvp
             .instructions()
             .iter()
-            .find(|instruction| matches!(instruction.operation(), ArrayProgramOperation::DynamicZero(_)))
+            .find(|instruction| matches!(instruction.operation(), ArrayProgramOperation::Zero(_)))
             .unwrap();
         assert_eq!(dynamic_zero.inputs(), &[AtomId::new(0)]);
+    }
+
+    #[test]
+    fn test_array_program_dynamic_projected_jvp_materializes_source_relative_widened_zero() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::StopGradient(StopGradientOperation)),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The projected constant derivative uses its primal result as the runtime-shape exemplar, then widens the
+        // element type to the tangent representation. No type-only dynamic zero is present in the fused JVP.
+        let jvp = program.jvp().unwrap();
+        assert!(jvp.instructions().iter().any(|instruction| matches!(
+            instruction.operation(),
+            ArrayProgramOperation::Array(ArrayOperation::ZeroLike(_))
+        )));
+        assert!(jvp.instructions().iter().any(|instruction| matches!(
+            instruction.operation(),
+            ArrayProgramOperation::Array(ArrayOperation::ConvertElementType(_))
+        )));
+        assert!(
+            !jvp.instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), ArrayProgramOperation::Zero(_)))
+        );
+
+        let primal = Array::from_f64s(
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)])),
+            vec![1.0, 2.0, 4.0],
+        );
+        let tangent = Array::vector(vec![1.0_f32, 1.0, 1.0]);
+        let expected_primal = primal.clone();
+        assert_eq!(
+            jvp.interpret(vec![ArrayProgramValue::Array(primal), ArrayProgramValue::Array(tangent)]),
+            Ok(vec![
+                ArrayProgramValue::Array(expected_primal),
+                ArrayProgramValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0])),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_program_dynamic_disconnected_pullback_uses_explicit_extent_residual() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let dynamic_type = ArrayType::new(
+            DataType::F8E8M0FNU,
+            Shape::new(vec![
+                Dimension::Dynamic(extent_type.variable().clone()),
+                Dimension::Dynamic(extent_type.variable().clone()),
+            ]),
+        );
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        builder.add_input(dynamic_type.into());
+        let scalar = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![scalar],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The dynamic input is disconnected from the output, so linearization retains its observed extent as one
+        // ordinary residual and the pullback feeds that residual to the mixed zero constructor.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert!(matches!(
+            linearization.primal().instructions().last().unwrap().operation(),
+            ArrayProgramOperation::DimensionSize(_)
+        ));
+        let pullback = linearization.pullback().unwrap();
+        let zero = pullback.instructions().last().unwrap();
+        assert!(matches!(zero.operation(), ArrayProgramOperation::Zero(_)));
+        assert_eq!(zero.inputs(), &[AtomId::new(1), AtomId::new(1)]);
+        assert_eq!(
+            pullback.interpret(vec![
+                ArrayProgramValue::Array(Array::scalar(2.0_f64)),
+                ArrayProgramValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
+            ]),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::matrix(3, 3, vec![0.0_f32; 9])),
+                ArrayProgramValue::Array(Array::scalar(2.0_f64)),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_program_nested_dynamic_disconnected_pullback_uses_explicit_extent_residual() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let dynamic = context.input(dynamic_type.clone().into());
+        let scalar = context.input(scalar_type.clone().into());
+
+        // Value-level reverse mode runs inside the outer trace. It saves only the disconnected array's extent, and
+        // the reusable pullback consumes that dimension residual through the mixed zero constructor.
+        let (_, pullback) = context.vjp(|inputs: Vec<_>| Ok(vec![inputs[1].clone()]), vec![dynamic, scalar]).unwrap();
+        assert_eq!(pullback.residuals().len(), 1);
+        assert!(matches!(pullback.residuals()[0].r#type().as_ref(), ArrayProgramType::Dimension(_)));
+        let zero = pullback.program().instructions().last().unwrap();
+        assert!(matches!(zero.operation(), ArrayProgramOperation::Zero(_)));
+        assert_eq!(zero.inputs(), &[AtomId::new(1)]);
+
+        let cotangent = context.input(scalar_type.into());
+        let cotangents = pullback.apply(vec![cotangent]).unwrap();
+        assert_eq!(cotangents[0].r#type().as_ref(), &ArrayProgramType::Array(dynamic_type.cotangent()));
+        assert_eq!(cotangents[1].r#type().as_ref(), &ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
     }
 
     #[test]

@@ -315,7 +315,7 @@ mod tests {
     use ryft_core::backends::dimensions::DimensionValue;
     use ryft_core::operations::dimensions::DimensionPow;
     use ryft_core::types::{DimensionBounds, DimensionType, DimensionVariable};
-    use ryft_core::{Add, DimensionError, Div, ProgramError, Rem, Sub};
+    use ryft_core::{DimensionError, Div, ProgramError, Rem, Sub};
 
     use super::*;
 

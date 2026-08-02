@@ -258,7 +258,8 @@ macro_rules! check_builders {
 ///   - `$result_name`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
 ///     the fresh result identity's diagnostic name.
 ///   - `$infer_bounds`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
-///     the result [`DimensionBounds`](crate::DimensionBounds) or a [`DimensionError`](crate::DimensionError).
+///     a `Result<(DimensionBounds, bool), DimensionError>`. The Boolean reports whether their bounds leave a checked
+///     runtime failure possible.
 #[macro_export]
 macro_rules! define_arithmetic_dimension_operation {
     // This public branch defines one nominal binary dimension primitive and its shared operation machinery.
@@ -283,13 +284,14 @@ macro_rules! define_arithmetic_dimension_operation {
                 right: &$crate::types::DimensionType,
             ) -> Result<Self, $crate::types::DimensionError> {
                 let result_name = ($result_name)(left, right);
-                let result_bounds = ($infer_bounds)(left, right)?;
+                let (result_bounds, requires_runtime_assertion) = ($infer_bounds)(left, right)?;
                 Ok(Self {
                     metadata: $crate::operations::dimensions::ArithmeticDimensionOperationMetadata::new(
                         left,
                         right,
                         result_name,
                         result_bounds,
+                        requires_runtime_assertion,
                     ),
                 })
             }
@@ -343,6 +345,15 @@ macro_rules! define_arithmetic_dimension_operation {
                 _region_interfaces: &[$crate::programs::regions::RegionInterface<$crate::types::DimensionType>],
             ) -> Result<Vec<$crate::types::DimensionType>, $crate::programs::types::TypeError> {
                 $crate::operations::dimensions::ArithmeticDimensionOperation::infer_output_types(self, input_types)
+            }
+
+            #[inline]
+            fn effects(&self) -> $crate::programs::effects::Effects {
+                if self.metadata.requires_runtime_assertion() {
+                    $crate::programs::effects::Effects::single($crate::programs::effects::Effect::OrderedAssertion)
+                } else {
+                    $crate::programs::effects::Effects::PURE
+                }
             }
 
             #[inline]
@@ -4324,7 +4335,7 @@ mod tests {
                 (Some(left), Some(right)) => left.checked_add(right).and_then(|sum| sum.checked_sub(1)),
                 _ => None,
             };
-            DimensionBounds::new(lower, upper)
+            Ok((DimensionBounds::new(lower, upper)?, false))
         },
     );
 

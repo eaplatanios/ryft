@@ -10,10 +10,11 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
+use crate::differentiation::linear::ResidualZeroProvider;
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::constants::{IotaOperation, ZeroOperation};
+use crate::operations::constants::IotaOperation;
 use crate::operations::manipulation::{LegacyBroadcastOperation, TransposeOperation};
 use crate::parameters::Parameter;
 use crate::partial::{
@@ -335,7 +336,7 @@ where
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + From<ZeroOperation<C::Type>>,
+        + ResidualZeroProvider<C::Type>,
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {

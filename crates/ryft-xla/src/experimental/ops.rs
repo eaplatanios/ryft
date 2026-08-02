@@ -10,7 +10,7 @@ use ryft_core::compilation::function::CompiledCallOperation;
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationError, LinearCallOperation,
-    TransposableOperation, TranspositionDriver, TranspositionZeroProvider,
+    ResidualZeroProvider, TransposableOperation, TranspositionDriver,
 };
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
@@ -496,36 +496,38 @@ where
     }
 }
 
-impl<Capture> TranspositionZeroProvider<ArrayProgramType> for XlaOperation<Capture>
+impl<Capture> ResidualZeroProvider<ArrayProgramType> for XlaOperation<Capture>
 where
     Capture: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    fn transposition_zero_residual_types(r#type: &ArrayProgramType) -> Vec<ArrayProgramType> {
-        ArrayProgramOperation::<Capture::Projected>::transposition_zero_residual_types(r#type)
+    fn zero_residual_types(r#type: &ArrayProgramType) -> Vec<ArrayProgramType> {
+        <ArrayProgramOperation<Capture::Projected> as ResidualZeroProvider<ArrayProgramType>>::zero_residual_types(
+            r#type,
+        )
     }
 
-    fn capture_transposition_zero_residuals<V: Value<Type = ArrayProgramType>>(
+    fn capture_zero_residuals<V: Value<Type = ArrayProgramType>>(
         builder: &mut ProgramBuilder<V, Self>,
         source: ryft_core::AtomId,
         r#type: &ArrayProgramType,
     ) -> Result<Vec<ryft_core::AtomId>, ProgramError> {
-        ArrayProgramOperation::<Capture::Projected>::capture_transposition_zero_residuals(builder, source, r#type)
+        ArrayProgramOperation::<Capture::Projected>::capture_zero_residuals(builder, source, r#type)
     }
 
-    fn capture_transposition_zero_values<C: Context<Type = ArrayProgramType, Operation = Self>>(
+    fn capture_zero_residual_values<C: Context<Type = ArrayProgramType, Operation = Self>>(
         context: &C,
         source: &C::Value,
         r#type: &ArrayProgramType,
     ) -> Result<Vec<C::Value>, ProgramError> {
-        ArrayProgramOperation::<Capture::Projected>::capture_transposition_zero_values(context, source, r#type)
+        ArrayProgramOperation::<Capture::Projected>::capture_zero_residual_values(context, source, r#type)
     }
 
-    fn add_transposition_zero<V: Value<Type = ArrayProgramType>>(
+    fn add_zero_from_residuals<V: Value<Type = ArrayProgramType>>(
         builder: &mut ProgramBuilder<V, Self>,
         r#type: ArrayProgramType,
         residuals: &[ryft_core::AtomId],
     ) -> Result<ryft_core::AtomId, ProgramError> {
-        ArrayProgramOperation::<Capture::Projected>::add_transposition_zero(builder, r#type, residuals)
+        ArrayProgramOperation::<Capture::Projected>::add_zero_from_residuals(builder, r#type, residuals)
     }
 }
 

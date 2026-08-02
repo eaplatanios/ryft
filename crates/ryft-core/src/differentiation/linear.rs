@@ -828,10 +828,10 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
-    use crate::contexts::StagingContext;
     use crate::contexts::tests::{
         ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue,
     };
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::DifferentiationError;
     use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
     use crate::operations::math::{AddOperation, MulOperation};
@@ -858,6 +858,43 @@ mod tests {
         builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()
+    }
+
+    #[test]
+    fn test_residual_zero_provider_input_free_defaults() {
+        let r#type = ArrayType::scalar(DataType::F64);
+
+        // An input-free operation family (reached through the blanket implementation) declares no residuals, and
+        // both capture hooks record nothing: the builder-level hook stages no instructions and the value-level hook
+        // returns no values.
+        assert_eq!(ArrayOperation::<Array>::zero_residual_types(&r#type), Vec::<ArrayType>::new());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let source = builder.add_input(r#type.clone());
+        assert_eq!(ArrayOperation::<Array>::capture_zero_residuals(&mut builder, source, &r#type), Ok(Vec::new()));
+        assert!(builder.instructions().is_empty());
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        assert_eq!(
+            ArrayOperation::<Array>::capture_zero_residual_values(&context, &Array::scalar(3.0), &r#type),
+            Ok(Vec::new()),
+        );
+
+        // Spending no residuals stages the type-only zero.
+        let zero = ArrayOperation::<Array>::add_zero_from_residuals(&mut builder, r#type.clone(), &[]).unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(program.interpret(vec![Array::scalar(3.0)]), Ok(vec![Array::scalar(0.0)]));
+
+        // The fail-loud default rejects unexpected residuals instead of ignoring them, so a mismatched
+        // linearize/transpose pairing cannot be silently accepted.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let residual = builder.add_input(r#type.clone());
+        assert_eq!(
+            ArrayOperation::<Array>::add_zero_from_residuals(&mut builder, r#type, &[residual]).map(|_| ()),
+            Err(ProgramError::InvalidArgument {
+                message: "input-free zero expected 0 residuals but got 1".to_string(),
+            }),
+        );
+        assert!(builder.instructions().is_empty());
     }
 
     #[test]

@@ -2,13 +2,13 @@ use std::marker::PhantomData;
 
 use ryft_macros::Parameterized;
 
-use crate::contexts::{Context, Domain};
+use crate::contexts::Context;
 use crate::differentiation::DifferentiationError;
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext, LinearizationTracer};
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
+use crate::differentiation::linear::ResidualZeroProvider;
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DenseDifferentiableType;
-use crate::operations::constants::ZeroOperationProvider;
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
@@ -411,7 +411,7 @@ pub trait HessianDifferentiate:
         > + DifferentiableOperation<
             PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<Self>>>,
         > + TransposableOperation<Self::Constant, Self::Operation>
-                       + ZeroOperationProvider<Self::Type>
+                       + ResidualZeroProvider<Self::Type>
                        + From<AddOperation>,
     >
 {
@@ -456,12 +456,10 @@ where
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
         + DifferentiableOperation<PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<C>>>>
         + TransposableOperation<C::Constant, C::Operation>
-        + ZeroOperationProvider<C::Type>
+        + ResidualZeroProvider<C::Type>
         + From<AddOperation>,
 {
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Defines one context-recovering Hessian function without auxiliary outputs. It centralizes the nested structured
 /// generic signature, operation requirements, empty-input handling, and same-named context-method delegation.
@@ -472,83 +470,36 @@ macro_rules! define_hessian_function {
     ) => {
         $(#[doc = $documentation])*
         #[inline]
-        pub fn $function_name<
-            V: Value<
-                    Type: DenseDifferentiableType<V::ExecutionDomain>
-                              + DenseDifferentiableType<
-                        DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>,
-                    >,
-                    ExecutionDomain: Context<
-                        Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-                                       + PartiallyEvaluatableOperation<
-                            DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>,
-                        >
-                                       + PartiallyEvaluatableOperation<
-                            TracingContext<
-                                <V::ExecutionDomain as Domain>::Constant,
-                                <V::ExecutionDomain as Domain>::Operation,
-                            >,
-                        > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-                                       + DifferentiableOperation<
-                            TracingContext<
-                                <V::ExecutionDomain as Domain>::Constant,
-                                <V::ExecutionDomain as Domain>::Operation,
-                            >,
-                        > + DifferentiableOperation<
-                            PartialEvaluationContext<
-                                TracingContext<
-                                    <V::ExecutionDomain as Domain>::Constant,
-                                    <V::ExecutionDomain as Domain>::Operation,
-                                >,
-                            >,
-                        > + DifferentiableOperation<
-                            PartialEvaluationContext<
-                                DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>,
-                            >,
-                        >
-                                       + TransposableOperation<
-                            <V::ExecutionDomain as Domain>::Constant,
-                            <V::ExecutionDomain as Domain>::Operation,
-                        > + ZeroOperationProvider<V::Type>
-                                       + From<AddOperation>,
-                    >,
-                >,
-            F: FnOnce(
-                I::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>>>,
-            ) -> Result<O, ProgramError>,
-            I: Parameterized<
-                    V,
-                    To<V> = I,
-                    To<V::Type>: Clone,
-                    To<LinearizationTracer<V::ExecutionDomain>>: Parameterized<
-                        LinearizationTracer<V::ExecutionDomain>,
-                        To<LinearizationTracer<V::ExecutionDomain>> = I::To<
-                            LinearizationTracer<V::ExecutionDomain>,
-                        >,
-                        To<
-                            LinearizationTracer<
-                                DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>,
-                            >,
-                        > = I::To<
-                            LinearizationTracer<DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>>,
-                        >,
-                        To<V::Type> = I::To<V::Type>,
-                    >,
-                    Family: ParameterizedFamily<V::Type>
-                                + ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>
-                                + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>>,
-                >,
-                >,
-            O: Parameterized<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>>,
-                    To<V::Type>: Clone,
-                    Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>,
-                >,
-        >(
+        pub fn $function_name<D, V, F, I, O>(
             function: F,
             primals: I,
-        ) -> Result<Hessian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
+        ) -> Result<Hessian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
+        where
+            D: HessianDifferentiate<Type = V::Type, Value = V>,
+            V: Value<ExecutionDomain = D>,
+            V::Type: DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<D>>>,
+            D::Operation: ResidualZeroProvider<V::Type>,
+            F: FnOnce(I::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>>)
+                -> Result<O, ProgramError>,
+            I: Parameterized<V, To<V> = I>,
+            I::To<V::Type>: Clone,
+            I::To<LinearizationTracer<D>>: Parameterized<
+                LinearizationTracer<D>,
+                To<LinearizationTracer<D>> = I::To<LinearizationTracer<D>>,
+                To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>> = I::To<
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>,
+                >,
+                To<V::Type> = I::To<V::Type>,
+            >,
+            I::Family: ParameterizedFamily<V::Type>
+                + ParameterizedFamily<LinearizationTracer<D>>
+                + ParameterizedFamily<
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>,
+                >,
+            O: Parameterized<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>>,
+            O::To<V::Type>: Clone,
+            O::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<D>>,
+        {
             let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
                 return Err(DifferentiationError::EmptyInput);
             };
@@ -557,8 +508,8 @@ macro_rules! define_hessian_function {
     };
 }
 
-/// Defines one context-recovering Hessian function with auxiliary outputs. It centralizes the nested structured generic
-/// signature, operation requirements, empty-input handling, and same-named context-method delegation.
+/// Defines one context-recovering Hessian function with auxiliary outputs. It centralizes the nested structured
+/// generic signature, operation requirements, empty-input handling, and same-named context-method delegation.
 macro_rules! define_hessian_auxiliary_function {
     (
         $(#[doc = $documentation:literal])*
@@ -566,91 +517,39 @@ macro_rules! define_hessian_auxiliary_function {
     ) => {
         $(#[doc = $documentation])*
         #[inline]
-        pub fn $function_name<
-            V: Value<
-                    Type: DenseDifferentiableType<V::ExecutionDomain>
-                              + DenseDifferentiableType<
-                        DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>,
-                    >,
-                    ExecutionDomain: Context<
-                        Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-                                       + PartiallyEvaluatableOperation<
-                            DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>,
-                        >
-                                       + PartiallyEvaluatableOperation<
-                            TracingContext<
-                                <V::ExecutionDomain as Domain>::Constant,
-                                <V::ExecutionDomain as Domain>::Operation,
-                            >,
-                        > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-                                       + DifferentiableOperation<
-                            TracingContext<
-                                <V::ExecutionDomain as Domain>::Constant,
-                                <V::ExecutionDomain as Domain>::Operation,
-                            >,
-                        > + DifferentiableOperation<
-                            PartialEvaluationContext<
-                                TracingContext<
-                                    <V::ExecutionDomain as Domain>::Constant,
-                                    <V::ExecutionDomain as Domain>::Operation,
-                                >,
-                            >,
-                        > + DifferentiableOperation<
-                            PartialEvaluationContext<
-                                DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>,
-                            >,
-                        >
-                                       + TransposableOperation<
-                            <V::ExecutionDomain as Domain>::Constant,
-                            <V::ExecutionDomain as Domain>::Operation,
-                        > + ZeroOperationProvider<V::Type>
-                                       + From<AddOperation>,
-                    >,
-                >,
-            F: FnOnce(
-                I::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>>>,
-            ) -> Result<(O, A), ProgramError>,
-            I: Parameterized<
-                    V,
-                    To<V> = I,
-                    To<V::Type>: Clone,
-                    To<LinearizationTracer<V::ExecutionDomain>>: Parameterized<
-                        LinearizationTracer<V::ExecutionDomain>,
-                        To<LinearizationTracer<V::ExecutionDomain>> = I::To<
-                            LinearizationTracer<V::ExecutionDomain>,
-                        >,
-                        To<
-                            LinearizationTracer<
-                                DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>,
-                            >,
-                        > = I::To<
-                            LinearizationTracer<DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>>,
-                        >,
-                        To<V::Type> = I::To<V::Type>,
-                    >,
-                    Family: ParameterizedFamily<V::Type>
-                                + ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>
-                                + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>>,
-                >,
-                >,
-            O: Parameterized<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>>,
-                    To<V::Type>: Clone,
-                    Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>,
-                >,
-            A: Parameterized<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<V::ExecutionDomain>>>,
-                    To<LinearizationTracer<V::ExecutionDomain>>: Parameterized<
-                        LinearizationTracer<V::ExecutionDomain>,
-                        To<V> = A::To<V>,
-                    >,
-                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V>,
-                >,
-        >(
+        pub fn $function_name<D, V, F, I, O, A>(
             function: F,
             primals: I,
-        ) -> Result<(Hessian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, A::To<V>), DifferentiationError> {
+        ) -> Result<(Hessian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, A::To<V>), DifferentiationError>
+        where
+            D: HessianDifferentiate<Type = V::Type, Value = V>,
+            V: Value<ExecutionDomain = D>,
+            V::Type: DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<D>>>,
+            D::Operation: ResidualZeroProvider<V::Type>,
+            F: FnOnce(I::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>>)
+                -> Result<(O, A), ProgramError>,
+            I: Parameterized<V, To<V> = I>,
+            I::To<V::Type>: Clone,
+            I::To<LinearizationTracer<D>>: Parameterized<
+                LinearizationTracer<D>,
+                To<LinearizationTracer<D>> = I::To<LinearizationTracer<D>>,
+                To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>> = I::To<
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>,
+                >,
+                To<V::Type> = I::To<V::Type>,
+            >,
+            I::Family: ParameterizedFamily<V::Type>
+                + ParameterizedFamily<LinearizationTracer<D>>
+                + ParameterizedFamily<
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>,
+                >,
+            O: Parameterized<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>>,
+            O::To<V::Type>: Clone,
+            O::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<D>>,
+            A: Parameterized<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>>,
+            A::To<LinearizationTracer<D>>: Parameterized<LinearizationTracer<D>, To<V> = A::To<V>>,
+            A::Family: ParameterizedFamily<LinearizationTracer<D>> + ParameterizedFamily<V>,
+        {
             let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
                 return Err(DifferentiationError::EmptyInput);
             };
@@ -658,6 +557,8 @@ macro_rules! define_hessian_auxiliary_function {
         }
     };
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 define_hessian_function!(
     /// Computes the [`Hessian`] of `function` at `primals` using forward-over-reverse differentiation.

@@ -2170,18 +2170,7 @@ where
         inputs: &[ArrayProgramBatch<C::Value>],
     ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
         match self {
-            Self::Zero(_) => {
-                if !inputs.is_empty() {
-                    return Err(ProgramError::InvalidInputCount { expected: 0, actual: inputs.len() }.into());
-                }
-                Ok(context
-                    .parent()
-                    .bind(self.clone(), Vec::new(), &[])?
-                    .into_iter()
-                    .map(ArrayProgramBatch::replicated)
-                    .collect())
-            }
-            Self::DynamicZero(_) | Self::DynamicOne(_) | Self::DynamicIota(_) => {
+            Self::Zero(_) | Self::DynamicOne(_) | Self::DynamicIota(_) => {
                 // Output extents are shared shape values. A mapped extent would request a different output shape
                 // for each batch item, which requires a ragged representation that ordinary array batching lacks.
                 for extent in inputs {
@@ -4401,9 +4390,7 @@ mod tests {
             Err(BatchingError::from(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
         );
 
-        let zero = ArrayProgramOperation::<Array>::from(ZeroOperation::new(ArrayProgramType::Array(
-            ArrayType::scalar(DataType::F32),
-        )));
+        let zero = ArrayProgramOperation::<Array>::from(ZeroOperation::new(ArrayType::scalar(DataType::F32)));
         assert_eq!(
             zero.batch(
                 &context,

@@ -132,8 +132,8 @@ where
         + From<LinearCallOperation<ArrayProgramType>>
         + From<ScanOperation<C::Constant>>
         + From<WhileOperation>
-        + From<ZeroOperation<ArrayProgramType>>
-        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>,
+        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+        + ZeroOperationProvider<ArrayProgramType>,
     ArrayOperation<A>: DifferentiableOperation<ProjectedContext<C, ArrayType>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -1614,7 +1614,7 @@ where
             return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
         }
         let dynamic_constant_type = match self {
-            Self::DynamicZero(operation) => Some(operation.r#type()),
+            Self::Zero(operation) => Some(operation.r#type()),
             Self::DynamicOne(operation) => Some(operation.r#type()),
             Self::DynamicIota(operation) => Some(operation.r#type()),
             _ => None,
@@ -1641,7 +1641,47 @@ where
                 .collect());
         };
 
-        jvp_projected_operation(context, operation, inputs)
+        let output_duals = jvp_projected_operation(context, operation, inputs)?;
+        output_duals
+            .into_iter()
+            .map(|output| {
+                let tangent_type = output.tangent().r#type().into_owned();
+                if !output.tangent().is_zero()
+                    || tangent_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference)
+                {
+                    return Ok(output);
+                }
+
+                // A projected array rule can return a structural zero even when its result has runtime extents. Use
+                // the primal result as the geometry exemplar before lifting the dual back into the composite family.
+                // This keeps the zero source-relative and avoids reconstructing dimension values from its type.
+                let (primal, _) = output.into_parts();
+                let tangent_array_type = <&ArrayType>::try_from(&tangent_type)?;
+                let primal_type = primal.r#type();
+                let primal_data_type = <&ArrayType>::try_from(primal_type.as_ref())?.data_type();
+                let exemplar = if tangent_array_type.data_type() == primal_data_type {
+                    primal.clone()
+                } else {
+                    context
+                        .bind(
+                            ArrayProgramOperation::<A>::Array(ArrayOperation::ConvertElementType(
+                                ConvertElementTypeOperation::new(tangent_array_type.data_type()),
+                            )),
+                            Vec::new(),
+                            std::slice::from_ref(&primal),
+                        )?
+                        .remove(0)
+                };
+                let tangent = context
+                    .bind(
+                        ArrayProgramOperation::<A>::Array(ArrayOperation::ZeroLike(ZeroLikeOperation)),
+                        Vec::new(),
+                        &[exemplar],
+                    )?
+                    .remove(0);
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent)).map_err(Into::into)
+            })
+            .collect()
     }
 }
 
@@ -1654,7 +1694,7 @@ impl<
         + From<ConditionOperation<V>>
         + From<LinearCallOperation<ArrayProgramType>>
         + From<ScanOperation<V>>
-        + From<ZeroOperation<ArrayProgramType>>,
+        + ZeroOperationProvider<ArrayProgramType>,
 > TransposableOperation<V, O> for ArrayProgramOperation<A>
 where
     ArrayOperation<A>: TransposableOperation<A, ArrayOperation<A>>,
@@ -1707,7 +1747,7 @@ where
                 );
             return scan.transpose(context, driver, inputs, outputs);
         }
-        if matches!(self, Self::DynamicZero(_) | Self::DynamicOne(_) | Self::DynamicIota(_)) {
+        if matches!(self, Self::Zero(_) | Self::DynamicOne(_) | Self::DynamicIota(_)) {
             check_count!("output", outputs, 1, ProgramError);
             // A shaped constructor depends on its extent operands only as non-differentiable shape inputs. Its
             // array value is constant with respect to those operands, so every extent receives a structural-zero

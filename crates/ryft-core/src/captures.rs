@@ -16,9 +16,9 @@ use ryft_macros::Parameter;
 use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::{Context, EagerContext, ProjectedContext};
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
+use crate::differentiation::linear::ResidualZeroProvider;
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
-use crate::operations::constants::ZeroOperation;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
@@ -228,7 +228,7 @@ where
         + DifferentiableOperation<C>
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + From<ZeroOperation<C::Type>>,
+        + ResidualZeroProvider<C::Type>,
 {
     type Capture = C::Capture;
 

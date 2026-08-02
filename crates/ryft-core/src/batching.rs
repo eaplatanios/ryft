@@ -1011,9 +1011,9 @@ pub enum DimensionSource<V> {
 /// implementation to prove such a blanket disjoint from the genuinely mixed composite-operation rules registered
 /// for other policies.
 ///
-/// Keeping this capability on the batching transform, rather than on [`ProjectedContext`](crate::ProjectedContext),
-/// [`ArrayBatch`], or [`Type`], means that neither the carrier nor the type contract needs to know anything about
-/// dynamic-shape state that only batching needs.
+/// Keeping this capability on the batching transform, rather than on [`ProjectedContext`], [`ArrayBatch`], or [`Type`],
+/// means that neither the carrier nor the type contract needs to know anything about dynamic-shape state that only
+/// batching needs.
 pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>:
     BatchingPolicy<C, Batch = ArrayBatch<C::Value>, BatchedProgram = BatchedProgram<C::Constant, C::Operation>>
 {

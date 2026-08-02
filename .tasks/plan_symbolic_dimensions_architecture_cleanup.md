@@ -10,15 +10,16 @@ supports tiled and untiled shape semantics, validated participant groups, all-ga
 dimension authority through condition, while, scan, eager branch execution, nested-region import, and repeated
 alpha-equivalent program splicing. Arithmetic extents remain ordinary dimension SSA through inference, eager
 execution, PE, batching, JVP/VJP, import, rendering, and native lowering. Phase 6's shape-changing collective
-adjoints are implemented through ordinary linear-call residuals. Checked gateway/public bounded-dynamic shard-map
-execution remains Phase 7 because it requires ordered assertion and `PadToStatic` lowering. The final current-JAX
+adjoints are implemented through ordinary linear-call residuals. Phase 7's compiled gateway, diagnostic assertions,
+and per-class effect-token lowering are implemented and validated on CPU; bounded-dynamic execution remains externally
+gated because CPU PJRT lacks `PadToStatic` and the configured CUDA host is currently unreachable. The final current-JAX
 comparison fixtures remain an explicit P3k gate.
 
 On 2026-08-01 the plan's end state was extended beyond the containment cleanup: after the cleanup closure gates
 (Phases 10–11), Phases 12–14 take Ryft from input-derived (tier-2) dynamism to full data-dependent (tier-3) dynamism.
 The semantic entry point already exists — P3d landed the checked `dimension_from_scalar` provenance gateway with
 eager bounds-checked execution, partial evaluation, and mapped-batching rejection — so the remaining tier-3 work is
-Phase 12 (close the semantics: effects-model decision, cache-identity and transform coverage, fixtures), Phase 13
+Phase 12 (close the semantics: effects-model coverage, cache-identity and transform coverage, fixtures), Phase 13
 (bounded data-dependent compiled execution), and Phase 14 (ragged batching). The tier definitions and the
 representation rationale are recorded at the end of the **Objective** section; the P6a `LinearCallOperation` residual
 contract is deliberately reused unchanged as tier 3's differentiation mechanism, which is the strongest evidence that
@@ -229,9 +230,9 @@ expression language while solving only the algebraic subset of residual needs.
 - `dimension_to_scalar` is the explicit `dimension -> scalar-array` gateway.
 - `dimension_from_scalar` (landed in P3d) is the explicit checked `scalar-array -> dimension` gateway and the *only*
   operation that converts data into dimension authority. It declares a fresh `DimensionVariable` with caller-declared
-  `DimensionBounds`, and eager execution checks every accepted integer payload against them. Its compiled runtime
-  bounds check is deferred to Phase 7 ordered-assertion lowering, and Phase 12 owns the effects-model decision for
-  how that check survives DCE and ordering.
+  `DimensionBounds`, and eager execution checks every accepted integer payload against them. Phase 7 lowers its
+  compiled bounds check on the `OrderedAssertion` chain and declares that effect in core so the check survives DCE and
+  preserves deterministic same-class ordering.
 - A shape-carrying operation is mixed even when a particular invocation happens to have only static dimensions.
 - A static convenience API may omit dimension operands only when the payload's metadata proves there are none; it
   still binds the same mixed operation contract. Constructors are the documented exception: an identity-free
@@ -574,9 +575,9 @@ wrap `TypeError` in `ProgramError` only at outward program boundaries.
 - first-class dimension arithmetic and requirement operations;
 - interval, congruence, order, equality, and constant abstract interpretation;
 - `Effect::OrderedAssertion`;
-- the bounded-input ABI, hidden physical extents, and `PadToStatic`;
-- existing StableHLO dynamic-shape operands; ordered runtime assertion lowering and per-effect token separation remain
-  Phase 7 work;
+- the bounded-tensor ABI: one physical array argument per non-erased logical array leaf, StableHLO bounds and logical
+  size metadata, and plugin-owned `PadToStatic` legalization (Ryft owns no hidden extent arguments);
+- existing StableHLO dynamic-shape operands, diagnostic runtime assertion lowering, and per-effect token separation;
 - behavioral JAX parity tests;
 - exact diagnostics;
 - identity alpha-renaming and cache behavior; and
@@ -1676,38 +1677,48 @@ searches. The complete source ledger and verification record are in
 - [x] Prefer structural zeros over materializing shaped zero arrays within the P6b residual carrier and migrated
       extent-sensitive rules. The complete composite-zero operation deletion remains the separately assigned unit
       below.
-- [ ] Inventory every production construction of `ZeroOperation<ArrayProgramType>` and every composite
+- [x] P6e — execute `.tasks/plan_p6e_composite_zero_deletion.md` as the next isolated Phase 6 unit. Delete the generic
+      type-only composite zero, migrate every caller to structural, operand-relative, homogeneous, or explicit-extent
+      materialization, and rename the sole mixed dynamic-array constructor from `DynamicZero` to `Zero`.
+- [ ] P6f — wire the transposition zero-residual protocol through region-carrying operations. Condition
+      partial-evaluation branch zeros, scan transpose boundary reconstruction, and the region-carrying all-zero JVP
+      fast path currently hard-error with the exact `'zero' cannot construct type ...` diagnostic when an
+      identity-bearing zero type is requested — a deliberate fail-loud surface reduction relative to the deleted
+      unsound escape hatch, acknowledged in code comments. Thread the `ResidualZeroProvider` residual capture
+      through those region boundaries so dynamic zero-space carries and branch edges differentiate instead of
+      rejecting, with dynamic-shape acceptance tests per consumer.
+- [x] Inventory every production construction of `ZeroOperation<ArrayProgramType>` and every composite
       `Zero<ArrayProgramValue<_>>` materialization path, including the retained-linearization residual-zero sites in
       `differentiation/forward.rs`. Classify each as a structural zero that should remain unmaterialized, an
       operand-relative `zero_like`, an identity-free homogeneous array zero, or a genuinely dynamic zero whose
       explicit dimension SSA operands must already be available.
-- [ ] Migrate those callers so generic differentiation and transposition never request a zero from
+- [x] Migrate those callers so generic differentiation and transposition never request a zero from
       `ArrayProgramType` alone. Preserve [`MaybeZero`] structurally for as long as possible; use `zero_like` when an
       array value supplies runtime geometry; stage `Array(ArrayOperation::Zero(ZeroOperation<ArrayType>))` only for
       identity-free array types; and stage the mixed constructor with explicit dimension operands when a dynamic array
       zero truly must be materialized. A dimension-member zero must be unrepresentable rather than constructed and
       rejected later by inference.
-- [ ] Delete `ArrayProgramOperation::Zero(ZeroOperation<ArrayProgramType>)`,
+- [x] Delete `ArrayProgramOperation::Zero(ZeroOperation<ArrayProgramType>)`,
       `From<ZeroOperation<ArrayProgramType>>`, and every dedicated inference, eager, batching, differentiation,
       rendering, identity-renaming, and lowering arm once the generic callers are gone. Do not replace them with
       another type-only composite constructor or a hidden extent-recovery path.
-- [ ] Rename `ArrayProgramOperation::DynamicZero(ZeroOperation<ArrayType>)` to
+- [x] Rename `ArrayProgramOperation::DynamicZero(ZeroOperation<ArrayType>)` to
       `ArrayProgramOperation::Zero(ZeroOperation<ArrayType>)` after deleting the conflicting generic variant. Expand
       its rustdoc to explain that this top-level variant owns the mixed `(Dimension...) -> Array` signature because
       homogeneous `Array(...)` projection cannot accept dimension operands and structural types do not contain
       concrete runtime extents. Update all tests, diagnostics, rendering expectations, and documentation directly
       without a compatibility alias.
-- [ ] Add canonical-representation tests proving identity-free zeros use
+- [x] Add canonical-representation tests proving identity-free zeros use
       `Array(ArrayOperation::Zero(ZeroOperation<ArrayType>))`, identity-bearing zeros use the renamed top-level
       `Zero(ZeroOperation<ArrayType>)` with one explicit operand per dynamic axis, and no operation can encode a
       dimension-member zero. Add residual searches requiring zero source occurrences of
       `ZeroOperation<ArrayProgramType>` and `DynamicZero`.
-- [ ] Preserve proven/disproven/residual requirement behavior and `OrderedAssertion` effects.
-- [ ] Verify nested JVP/VJP, linearization, transpose, rematerialization, custom derivatives, condition, while, and
+- [x] Preserve proven/disproven/residual requirement behavior and `OrderedAssertion` effects.
+- [x] Verify nested JVP/VJP, linearization, transpose, rematerialization, custom derivatives, condition, while, and
       scan.
 - [x] Add exact rendered-IR tests proving residual dimension atoms are explicit dataflow edges shared by the forward
       linearization and transpose, with no type expression or payload witness.
-- [ ] Gate: adding an array-only primitive with ordinary AD/PE rules requires no handwritten composite dispatcher
+- [x] Gate: adding an array-only primitive with ordinary AD/PE rules requires no handwritten composite dispatcher
       case, the generic composite zero escape hatch is gone, and the only top-level zero variant is the explicit mixed
       constructor.
 
@@ -1812,29 +1823,67 @@ construction was added. The pre-existing generic composite-zero representation/m
 next isolated Phase 6 deletion unit exactly as listed below. Full evidence and the source ledger are in
 `.tasks/plan_p6d_composite_region_differentiation.md`.
 
+P6e is complete against frozen boundary `f2bc0dfa5`. The type-only composite
+`ZeroOperation<ArrayProgramType>` representation is gone, and the sole top-level zero variant is now the explicit
+mixed `Zero(ZeroOperation<ArrayType>)` constructor whose dimension operands provide runtime geometry. Identity-free
+array zeros remain canonical homogeneous `Array(ArrayOperation::Zero(...))` operations, while dimension-member zeros
+are unrepresentable. Promotion, inference, eager interpretation, rendering, identity renaming, transforms, and XLA
+lowering all preserve that distinction without a compatibility alias or hidden extent recovery.
+
+`ZeroOperationProvider<T>` now captures the actual capability needed by generic differentiation. Homogeneous
+operation families retain type-only zero construction, while composite families keep zeros structural until they can
+use an exemplar, an identity-free type, or explicit dimension residuals. Projected JVP handles widened tangent element
+types through conversion plus `zero_like`; disconnected dynamic pullbacks retain and deduplicate first-class extent
+residuals, including repeated identities; and XLA call/shard-map transposition resolves dynamic zero extents from
+known dimension inputs. Core owns the residual algorithm and XLA delegates to it.
+
+Focused coverage pins static and dynamic canonical routing, dimension-member rejection, widened projected JVP,
+program-level and nested disconnected pullbacks, repeated-identity residual sharing, XLA pullback execution, and
+dynamic call cotangents. The final source delta and exact verification evidence are recorded in
+`.tasks/plan_p6e_composite_zero_deletion.md`. Phase 7 backend execution and lowering is the next phase.
+
 ### Phase 7: backend execution and lowering
 
-- [ ] Verify every mixed operation lowers explicit dimension operands directly with no reconstruction environment.
-- [ ] Verify eager XLA dimension arithmetic remains host integer computation with zero device dispatch/cache probes.
-- [ ] Verify bounded-input ABI argument counts and `set_dimension_size` behavior are unchanged.
-- [ ] Lower every residual `DimensionRequirementOperation` to a runtime assertion that observes the concrete operand
+- [x] Verify every mixed operation lowers explicit dimension operands directly with no reconstruction environment.
+- [x] Verify eager XLA dimension arithmetic remains host integer computation with zero device dispatch/cache probes.
+- [x] Verify the bounded-tensor ABI retains one physical array argument per non-erased logical array leaf and preserves
+      `set_dimension_size` behavior. Ryft owns no hidden extent arguments; XLA's internal `PadToStatic` ABI is
+      plugin-owned.
+- [x] Lower every residual `DimensionRequirementOperation` to a runtime assertion that observes the concrete operand
       values and preserves its exact actor name, predicate, bounds/divisor, and observed-value diagnostic.
-- [ ] Replace each lowering scope's single shared `Option<ValueRef>` token with one deterministic token slot per
+- [x] Replace each lowering scope's single shared `Option<ValueRef>` token with one deterministic token slot per
       ordered `Effect` class. Assertions advance only `OrderedAssertion`; prints advance only `OrderedIo`; unordered
       I/O does not acquire an ordered chain merely because another effect exists.
-- [ ] Thread the active ordered-effect token set through condition results, while/scan state, rematerialization,
+- [x] Thread the active ordered-effect token set through condition results, while/scan state, rematerialization,
       custom derivatives, and effectful inlined calls. Pure regions add no token state, and a region containing only
       one ordered class carries only that class.
-- [ ] Add structural MLIR tests for assertion→assertion, print→print, assertion interleaved with print, pure/effectful
+- [x] Add structural MLIR tests for assertion→assertion, print→print, assertion interleaved with print, pure/effectful
       branches, loops, scan, rematerialization, and repeated inlined calls. Add CPU execution tests proving
       deterministic first-failure order within the assertion class and independence from ordered I/O.
-- [ ] Verify ordered runtime assertions preserve exact actor-named diagnostics and deterministic same-class order.
+- [x] Verify ordered runtime assertions preserve exact actor-named diagnostics and deterministic same-class order.
 - [ ] Run CPU and CUDA eager/JIT parity for the full dynamic operation matrix, including `PadToStatic`.
-- [ ] While sweeping mixed-operation lowering above, record an initial per-operation padding-discipline inventory
+- [x] While sweeping mixed-operation lowering above, record an initial per-operation padding-discipline inventory
       (padding-oblivious versus mask-required versus zero-padding-required under bound-shaped physical storage) as
       Phase 13 input. This is classification only — no behavior changes in this phase — but capturing it during the
       lowering sweep avoids a second complete pass over the same operations later.
 - [ ] Gate: backend behavior, diagnostics, and bounded physical storage match or exceed the archived golden evidence.
+
+Phase 7 implementation and CPU validation are complete. The exact lowering/eager/ABI inventories, padding
+classification, assertion architecture, and command ledger are recorded in
+`.tasks/plan_p7_backend_execution_and_lowering.md`. The only open gate is external: CPU PJRT does not provide bounded
+dynamic `PadToStatic`, and `spark-9460.local` was not resolvable from this environment for the CUDA matrix. Dynamic RNG
+also retains its exact semantic rejection because upper-bound generation would advance its functional state by the
+physical rather than logical element count; Phase 13 owns that padding-sensitive design. Effectful shard-map bodies
+also reject exactly because `sdy.manual_computation` cannot thread StableHLO effect tokens across its boundary; pure
+shard-map bodies are unchanged.
+
+The next isolated review unit is therefore the external Phase 7 CUDA/`PadToStatic` closure as soon as the host is
+reachable. Phase 8 must not begin until that gate is either executed successfully or explicitly re-scoped by the
+owner. The post-review correction pass moved every checked failure into the core effect model, deleted the backend
+effect overlay, made division/remainder and concatenate checks scheduling-safe, and carried assertion-runtime
+requirements through persistent cache restoration. Local verification passed 1,100 `ryft-core` unit tests plus its
+integration/compile-fail/doctest suites, 424 `ryft-xla` tests (1 ignored benchmark), both macro integration/trybuild
+suites, formatting, diff hygiene, and residual searches; the exact ledger is in the P7 plan.
 
 ### Phase 8: enforce contracts and consolidate operation declarations
 
@@ -1875,7 +1924,12 @@ next isolated Phase 6 deletion unit exactly as listed below. Full evidence and t
       generator syntax. Prerequisites, both scheduled elsewhere: every semantic rule has moved off the enum match onto
       a colocated payload implementation (the P6 differentiation relocation plus the existing composite-`jvp` TODO),
       and each dual-contract variant wraps a dedicated newtype payload (e.g. `DynamicZero(DynamicZeroOperation)` over
-      `ZeroOperation<ArrayType>`) so one payload never carries two semantic contracts. Extend the derive itself in
+      `ZeroOperation<ArrayType>`) so one payload never carries two semantic contracts. The mixed concatenate newtype
+      additionally owns its extent signature the way the dimension arithmetic payloads do, making its
+      `OrderedAssertion` effect conditional on the same bounds-proof predicate so bounds-proven concatenates stop
+      being permanently effectful (today's shared `{ axis }` payload cannot express that without duplicating
+      operand-derived shape metadata; the over-approximation is documented at the payload's `effects`). Extend the
+      derive itself in
       exactly two ways: a variant-level member marker (e.g. `#[ryft(member(ArrayType))]`) that emits the
       project-delegate-lift arm by calling the existing projection helpers rather than inlining boundary logic, and
       batching-policy selection through `<PrimaryType as BatchableType>::Policy` instead of the hard-coded homogeneous
@@ -1964,17 +2018,16 @@ with a declared fresh identity plus bounds, eager bounds-checked execution, part
 behavior, and the mapped-batching rejection diagnostic. A gateway output types exactly like a derived arithmetic
 dimension (fresh identity plus bounds), and the P6a `LinearCallOperation` residual contract threads dimension values
 through differentiation without caring where they came from. This phase turns those properties from
-believed-by-construction into verified-by-fixture, and makes the one open design decision the gateway deferred. The
+believed-by-construction into verified-by-fixture and extends the effects-model decision completed in Phase 7 across
+the remaining tier-3 transforms and fixtures. The
 non-negotiable invariants are unchanged: rank stays static, no expression trees or witnesses, no side tables, no
 ambient environments, and the graph remains the complete source of data dependencies.
 
-- [ ] Decide the gateway's effects model. The operation is currently pure and P3d deferred its compiled range check
-      to Phase 7. Under the requirement effects model the check is trace-time-inconclusive whenever the operand range
-      is unproven, which argues for retaining `Effect::OrderedAssertion` on the unproven path (matching
-      `DimensionRequirementOperation`) so the bounds check survives DCE and keeps deterministic ordering; the
-      alternative is lowering through a staged requirement operation. Decide once, with fixtures for DCE survival,
-      PE erasure when the operand range is proven, and deterministic assertion order; do not leave the check droppable
-      by dead-code elimination.
+- [x] Decide the gateway's effects model. `DimensionFromScalarOperation` declares `Effect::OrderedAssertion` in core,
+      matching residual requirements and ensuring unknown bounds checks survive DCE with deterministic same-class
+      ordering. Partial evaluation may still fold a known valid conversion or report a known invalid conversion before
+      lowering. Generated scan/while pullbacks remain valid because transposition treats assertion checks as replayable
+      primal preconditions rather than rejecting them as I/O.
 - [ ] Add a retained-JIT cache-identity test proving one compiled specialization serves multiple runtime extents of a
       data-derived dimension: structural equality, hashing, and cache identity must not observe the data dependence.
 - [ ] Verify gateway-defined variables need no boundary `TypeRefinements` entry: they are internal identities
@@ -2007,8 +2060,8 @@ ambient environments, and the graph remains the complete source of data dependen
 This is the dominant tier-3 cost and the piece most exposed to backend maturity: XLA's support for data-dependent
 dynamism is uneven, which is part of why JAX's own effort stalled. The physical model is fixed — bound-shaped buffers
 carrying smaller logical extents — but the encoding route is an explicit measured decision, not an assumption. Phase 7
-already owns the gateway's own compiled lowering (its range check as an ordered assertion plus the checked
-`PadToStatic` boundary); this phase makes the *rest of the operation set* correct over data-derived extents.
+already owns the gateway's own compiled lowering (its range check as an ordered assertion); this phase makes the
+*rest of the operation set* correct over data-derived extents and validates the plugin-owned `PadToStatic` boundary.
 
 - [ ] Decide the compiled route for operations consuming data-derived extents, on measured evidence: (a) XLA bounded
       dynamism through the existing bounded-input ABI, `set_dimension_size`, and `PadToStatic` machinery; or (b) fully
@@ -2017,7 +2070,7 @@ already owns the gateway's own compiled lowering (its range check as an ordered 
       unsupported rather than globally.
 - [ ] Require a finite upper bound at the gateway for any program that reaches compilation; reject unbounded
       data-derived dimensions at lowering with an exact diagnostic naming the variable and its bounds.
-- [ ] Confirm the Phase 7 gateway lowering composes with the Phase 12 effects-model decision: the range check rides
+- [x] Confirm the Phase 7 gateway lowering composes with the Phase 12 effects-model coverage: the range check rides
       the per-class `OrderedAssertion` token chain with its exact diagnostic and deterministic same-class ordering.
 - [ ] Complete the per-operation padding-discipline inventory started in Phase 7 and record it in this plan as the
       authoritative table: padding-oblivious (elementwise, reshape-within-bounds), mask-required (reductions,
@@ -3265,7 +3318,7 @@ formatting, and diff hygiene. The complete fixture and implementation ledger is 
 The plan's end state was extended from the containment cleanup to full data-dependent (tier-3) dynamism. The tier
 vocabulary (tier 1 static, tier 2 input-derived, tier 3 data-dependent within declared bounds) is now defined in the
 **Objective** section, and Phases 12–14 were added after the cleanup closure gates: Phase 12 closes tier-3 semantics
-around the existing P3d `dimension_from_scalar` gateway (effects-model decision for DCE-surviving bounds checks,
+around the existing P3d `dimension_from_scalar` gateway (effects-model coverage for DCE-surviving bounds checks,
 cache-identity and closure coverage, linear-call residual and control-flow fixtures, JAX-rejection comparison
 fixtures), Phase 13 owns bounded data-dependent compiled execution (measured route decision between XLA bounded
 dynamism and static-bound-plus-masks, the authoritative per-operation padding-discipline table, exact rejection
