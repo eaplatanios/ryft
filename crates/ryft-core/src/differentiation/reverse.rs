@@ -8,13 +8,14 @@ use crate::differentiation::{
 };
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
-use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
+use crate::operations::constants::{OneOperation, Zero, ZeroOperationProvider};
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId, MaybeZero};
 use crate::programs::builders::ProgramBuilder;
+use crate::programs::effects::Effect;
 use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::programs::Program;
 use crate::programs::regions::{
@@ -336,7 +337,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for RecursiveTransposit
 
 impl<
     V: Value<Type: DifferentiableType>,
-    O: TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
+    O: TransposableOperation<V, O> + ZeroOperationProvider<V::Type> + From<AddOperation>,
 > TranspositionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O>
 {
     #[inline]
@@ -456,15 +457,39 @@ pub trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::T
 impl<
     T: DifferentiableType,
     V: Value<Type = T>,
-    O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: TransposableOperation<V, O> + ZeroOperationProvider<T> + From<AddOperation>,
 > RegionRef<'_, V, O>
 {
     /// Transposes this borrowed linear _pushforward_ [`Region`](crate::Region) into its reverse-mode _pullback_.
     /// Refer to the documentation of [`Program::transpose_with_respect_to`] for more information.
+    #[inline]
     pub fn transpose_with_respect_to(
         &self,
         input_indices: &[usize],
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+        self.transpose_with_respect_to_and_zero_residuals(input_indices, &[])
+    }
+
+    /// Transposes this [`Region`](crate::Region) while mapping the residual inputs that supply runtime geometry
+    /// for each disconnected selected-input cotangent. Linearization uses this internal form after appending those
+    /// residuals to its tangent program. Ordinary transposition uses [`Self::transpose_with_respect_to`] and supplies
+    /// no mappings.
+    pub(crate) fn transpose_with_respect_to_and_zero_residuals(
+        &self,
+        input_indices: &[usize],
+        zero_residual_input_indices: &[Vec<usize>],
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+        if !zero_residual_input_indices.is_empty() && zero_residual_input_indices.len() != input_indices.len() {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "transposition received {} zero-residual mappings for {} selected inputs",
+                    zero_residual_input_indices.len(),
+                    input_indices.len(),
+                ),
+            }
+            .into());
+        }
+
         // Scatter the selected indices into the per-input linearity mask that seeds the forward propagation,
         // rejecting out-of-range and duplicate indices up front.
         let input_count = self.input_ids().len();
@@ -598,8 +623,12 @@ impl<
                             .instructions()
                             .get(instruction_index)
                             .ok_or_else(|| ProgramError::MalformedProgram("known atom producer is missing".into()))?;
+
+                        // Replaying an ordered assertion is safe. It validates the same saved primal value and cannot
+                        // introduce a failure that successful primal execution did not already admit. Other effects
+                        // could be duplicated or reordered and therefore require prior residualization.
                         let effects = program.instruction_effects(instruction_index)?;
-                        if !effects.is_pure() {
+                        if effects.into_iter().any(|effect| effect != Effect::OrderedAssertion) {
                             return Err(ProgramError::UnsupportedOperation {
                                 message: format!(
                                     "partition-aware transpose cannot replay effectful known intermediate producer \
@@ -608,6 +637,7 @@ impl<
                                 ),
                             });
                         }
+
                         match materialization_state.get_mut(instruction_index).ok_or_else(|| {
                             ProgramError::MalformedProgram("known atom producer state is missing".into())
                         })? {
@@ -765,8 +795,11 @@ impl<
                 .into_iter()
                 .any(|is_linear| is_linear);
             if has_linear_output {
+                // Ordered assertions are primal preconditions. The primal/forward program executes them before its
+                // pullback is applied, so transposition must not replay them in reverse order. Other observable effects
+                // cannot be omitted from or replayed by the transposed linear program.
                 let effects = self.instruction_effects(instruction_index)?;
-                if !effects.is_pure() {
+                if effects.into_iter().any(|effect| effect != Effect::OrderedAssertion) {
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
                             "partition-aware transpose cannot transpose effectful linear instruction `{}`; \
@@ -874,13 +907,13 @@ impl<
         instruction_output_cotangents.clear();
 
         // The pullback outputs are the accumulated cotangents of the selected inputs, emitted directly in
-        // `input_indices` order. Known inputs receive no cotangent output. Disconnected selected inputs are emitted
-        // as input-free `ZeroOperation` instructions, which the value type's `Zero` implementation evaluates at
-        // interpretation time, typed with the input's cotangent type: a differentiable input's cotangent dual,
-        // or the first-class zero-space type for a non-differentiable selected input.
+        // `input_indices` order. Known inputs receive no cotangent output. A disconnected selected input is
+        // materialized through the operation family's canonical zero representation, using any mapped residual
+        // inputs needed to provide runtime geometry that its cotangent type does not contain.
         let outputs = input_indices
             .iter()
-            .map(|&index| {
+            .enumerate()
+            .map(|(output_index, &index)| {
                 let input = self.input_ids()[index];
                 match adjoints.get(input.index()).copied().ok_or(ProgramError::UnboundAtomId { id: input })? {
                     Some(adjoint) => Ok::<AtomId, ProgramError>(adjoint),
@@ -890,13 +923,31 @@ impl<
                         let input_type = input_atom.r#type();
                         let cotangent_type = input_type.cotangent();
                         let mut builder_borrow = builder.borrow_mut();
-                        let outputs = builder_borrow.add_instruction(
-                            ZeroOperation::new(cotangent_type),
-                            Vec::new(),
-                            Vec::new(),
-                        )?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(outputs[0])
+
+                        // These indices name source-program inputs, but zero construction occurs in the pullback
+                        // builder. Resolve them through `known_map`: geometry residuals are known primal quantities,
+                        // never linear inputs whose cotangents the pullback should compute.
+                        let residuals = zero_residual_input_indices
+                            .get(output_index)
+                            .into_iter()
+                            .flatten()
+                            .map(|&residual_index| {
+                                let residual = *self.input_ids().get(residual_index).ok_or_else(|| {
+                                    ProgramError::InvalidArgument {
+                                        message: format!(
+                                            "transposition zero-residual input index {residual_index} is out of range \
+                                             for a program with {input_count} input(s)",
+                                        ),
+                                    }
+                                })?;
+                                known_map.get(residual.index()).copied().flatten().ok_or_else(|| {
+                                    ProgramError::MalformedProgram(
+                                        "transposition zero residual is not a known pullback input".to_string(),
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        O::add_transposition_zero(&mut builder_borrow, cotangent_type, residuals.as_slice())
                     }
                 }
             })
@@ -926,7 +977,7 @@ impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where
     T: DifferentiableType,
     V: Value<Type = T>,
-    O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: TransposableOperation<V, O> + ZeroOperationProvider<T> + From<AddOperation>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -1019,6 +1070,64 @@ where
         input_indices: &[usize],
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         self.entry_region_ref().transpose_with_respect_to(input_indices)
+    }
+
+    /// Transposes this compact linearization [`Program`] whose trailing `residual_count` inputs are known primal
+    /// residuals. Any residuals reserved for disconnected cotangent zeros occupy the final residual positions in
+    /// per-tangent input order, as established by linearization.
+    pub(crate) fn transpose_with_trailing_residuals(
+        &self,
+        residual_count: usize,
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+        let tangent_input_count = self.input_ids().len().checked_sub(residual_count).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "linearization program consumes {} inputs which is fewer than its {} residuals",
+                self.input_ids().len(),
+                residual_count,
+            ))
+        })?;
+
+        // Linearization appends zero-geometry residuals in dead-tangent-input order. Recompute liveness here to
+        // recover how many trailing residuals belong to each tangent input without storing parallel metadata.
+        let live_sets = self.live_sets();
+        let zero_residual_counts = self
+            .input_ids()
+            .iter()
+            .copied()
+            .take(tangent_input_count)
+            .map(|input| {
+                if live_sets.atoms()[input.index()] {
+                    0
+                } else {
+                    O::transposition_zero_residual_types(self.atoms()[input.index()].r#type().as_ref()).len()
+                }
+            })
+            .collect::<Vec<_>>();
+        let zero_residual_count = zero_residual_counts.iter().sum::<usize>();
+        if zero_residual_count > residual_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "linearization program declares {residual_count} residuals but disconnected cotangent zeros require \
+                 {zero_residual_count}",
+            ))
+            .into());
+        }
+
+        // Ordinary partial-evaluation residuals precede this final zero-geometry suffix. Partition that suffix into
+        // contiguous per-input ranges in the same order used by linearization.
+        let mut next_zero_residual = self.input_ids().len() - zero_residual_count;
+        let zero_residual_input_indices = zero_residual_counts
+            .into_iter()
+            .map(|count| {
+                let indices = (next_zero_residual..next_zero_residual + count).collect::<Vec<_>>();
+                next_zero_residual += count;
+                indices
+            })
+            .collect::<Vec<_>>();
+
+        self.entry_region_ref().transpose_with_respect_to_and_zero_residuals(
+            &(0..tangent_input_count).collect::<Vec<_>>(),
+            zero_residual_input_indices.as_slice(),
+        )
     }
 }
 
@@ -1117,7 +1226,7 @@ pub trait ReverseModeDifferentiate:
                        + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
                        + DifferentiableOperation<PartialEvaluationContext<Self>>
                        + TransposableOperation<Self::Constant, Self::Operation>
-                       + From<ZeroOperation<Self::Type>>
+                       + ZeroOperationProvider<Self::Type>
                        + From<AddOperation>,
     >
 {
@@ -1143,16 +1252,7 @@ pub trait ReverseModeDifferentiate:
         // inputs as known parameters. Partition-aware transposition threads each residual through to the pullback as a
         // pullback input rather than folding it into a captured factor, so the pullback maps
         // `(output_cotangents ++ residuals)` to the input cotangents.
-        let tangent_input_count = program.input_ids().len().checked_sub(residuals.len()).ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "pushforward program consumes {} inputs which is fewer than its {} residuals",
-                program.input_ids().len(),
-                residuals.len(),
-            ))
-        })?;
-
-        let with_respect_to = (0..tangent_input_count).collect::<Vec<_>>();
-        let program = program.transpose_with_respect_to(with_respect_to.as_slice())?;
+        let program = program.transpose_with_trailing_residuals(residuals.len())?;
         Ok((output, Pullback::new(self.clone(), program, residuals, input_types, output_types, input_structure)?))
     }
 
@@ -1297,7 +1397,7 @@ where
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
-        + From<ZeroOperation<C::Type>>
+        + ZeroOperationProvider<C::Type>
         + From<AddOperation>,
 {
 }
@@ -1321,7 +1421,7 @@ pub fn vjp<
                 > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
-                > + From<ZeroOperation<V::Type>>
+                > + ZeroOperationProvider<V::Type>
                                + From<AddOperation>,
             >,
         >,
