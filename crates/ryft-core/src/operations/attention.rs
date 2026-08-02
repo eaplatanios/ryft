@@ -22,7 +22,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::DomainTracer;
-use crate::tracing_v2::custom_derivatives::{CustomVjp, custom_vjp};
+use crate::tracing_v2::{CustomVjp, custom_vjp};
 use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.

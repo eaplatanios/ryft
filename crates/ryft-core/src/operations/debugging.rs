@@ -34,6 +34,9 @@ pub const PRINT_OPERATION_NAME: &str = "print";
 /// call (`@ryft.print`) threaded on a token chain that preserves ordered-I/O execution order within one dispatch,
 /// including through `while`/`if` regions; refer to `ryft-xla`'s `experimental::debugging` module for the calling
 /// convention and the capturable output sink.
+///
+/// The `T` parameter fixes this payload's type universe, so each concrete [`PrintOperation`] implements exactly one
+/// [`Operation`] contract.
 #[derive(Clone, Debug)]
 pub struct PrintOperation<T: Type> {
     /// Label printed before the value.
@@ -129,7 +132,7 @@ pub trait Print: Sized {
 }
 
 /// Any context-carrying value prints by binding a [`PrintOperation`] through its own context. The
-/// `From<PrintOperation>` bound makes this disjoint from the eager value types (whose context operation is
+/// `From<PrintOperation<V::Type>>` bound makes this disjoint from the eager value types (whose context operation is
 /// [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the transform tracers
 /// without conflicting with concrete implementations.
 impl<V: Value> Print for V

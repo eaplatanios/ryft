@@ -3577,11 +3577,15 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     lowerer,
                 )
             }
-            ArrayOperation::ConvertElementType(operation) => <ConvertElementTypeOperation<ArrayType> as LowerableXlaOperation<
-                V,
-            >>::lower_to_mlir(
-                operation, input_values, output_types, mode, lowerer
-            ),
+            ArrayOperation::ConvertElementType(operation) => {
+                <ConvertElementTypeOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             ArrayOperation::Iota(iota) => <IotaOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 iota,
                 input_values,
@@ -9711,7 +9715,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let operation = CustomJvpOperation::new();
+        let operation = CustomJvpOperation;
         let mut builder = CompositeXlaProgramBuilder::new();
         let primal_region = builder.import_region(primal.entry_region_ref());
         let jvp_region = builder.import_region(jvp.entry_region_ref());

@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::contexts::{Context, Domain};
 use crate::differentiation::forward::DifferentiationDual;
@@ -16,21 +17,30 @@ use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
 
+// TODO(eaplatanios): Review this.
+
 /// Canonical operation name for [`ConvertElementTypeOperation`].
 pub const CONVERT_ELEMENT_TYPE_OPERATION_NAME: &str = "convert_element_type";
 
 /// Unary operation that converts the element [`DataType`] of a value while preserving its shape and placement metadata.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ConvertElementTypeOperation {
+/// The `T` parameter fixes its type universe, so each concrete payload instantiation implements exactly one
+/// [`Operation`] contract.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ConvertElementTypeOperation<T: ElementType> {
     /// Element [`DataType`] produced by this [`ConvertElementTypeOperation`].
     data_type: DataType,
+
+    /// Type universe in which this operation is valid.
+    marker: PhantomData<fn() -> T>,
 }
 
-impl ConvertElementTypeOperation {
+impl<T: ElementType> Copy for ConvertElementTypeOperation<T> {}
+
+impl<T: ElementType> ConvertElementTypeOperation<T> {
     /// Creates a new [`ConvertElementTypeOperation`].
     #[inline]
     pub fn new(data_type: DataType) -> Self {
-        Self { data_type }
+        Self { data_type, marker: PhantomData }
     }
 
     /// Returns the output element [`DataType`] of this [`ConvertElementTypeOperation`].
@@ -40,7 +50,7 @@ impl ConvertElementTypeOperation {
     }
 }
 
-impl Display for ConvertElementTypeOperation {
+impl<T: ElementType> Display for ConvertElementTypeOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         OperationFormatter::new(formatter, 0, CONVERT_ELEMENT_TYPE_OPERATION_NAME)?
@@ -48,7 +58,7 @@ impl Display for ConvertElementTypeOperation {
     }
 }
 
-impl<T: ElementType> Operation<T> for ConvertElementTypeOperation {
+impl<T: ElementType> Operation<T> for ConvertElementTypeOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         CONVERT_ELEMENT_TYPE_OPERATION_NAME
@@ -77,7 +87,7 @@ impl<T: ElementType> Operation<T> for ConvertElementTypeOperation {
 // Element-type conversion is unary elementwise even though it changes the result data type. Its custom
 // inference preserves the input's structure and placement while replacing only that data type. Implementing
 // `ElementwiseOperation` also gives it the shared elementwise `BatchableOperation` implementation.
-impl ElementwiseOperation for ConvertElementTypeOperation {
+impl ElementwiseOperation for ConvertElementTypeOperation<ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         1
@@ -90,7 +100,7 @@ impl ElementwiseOperation for ConvertElementTypeOperation {
 }
 
 impl<C: Domain<Type: ElementType, Value: ConvertElementType>> InterpretableOperation<C>
-    for ConvertElementTypeOperation
+    for ConvertElementTypeOperation<C::Type>
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -104,22 +114,22 @@ impl<C: Domain<Type: ElementType, Value: ConvertElementType>> InterpretableOpera
     }
 }
 
-impl<C: Context<Type: ElementType, Operation: From<ConvertElementTypeOperation>>> PartiallyEvaluatableOperation<C>
-    for ConvertElementTypeOperation
+impl<C: Context<Type: ElementType, Operation: From<ConvertElementTypeOperation<C::Type>>>>
+    PartiallyEvaluatableOperation<C> for ConvertElementTypeOperation<C::Type>
 {
 }
 
 impl_differentiable_operation! {
-    ConvertElementTypeOperation,
+    <T> ConvertElementTypeOperation<T>,
     jvp<C>
     where
-        C::Type: DifferentiableType + ElementType,
-        C::Value: ConvertElementType + ElementwiseDerivativeAlignment<C::Type>,
+        T: DifferentiableType + ElementType,
+        C: Context<Type = T>,
+        C::Value: ConvertElementType + ElementwiseDerivativeAlignment<T>,
     {
         |operation, _context, _driver, inputs| {
-            // Forward-mode differentiation rule for `ConvertElementTypeOperation`. The primal is converted to the
-            // requested element data type, while a live tangent is converted to the output's differential element
-            // data type. Converting into a type with no tangent space produces a structural zero tangent.
+            // Convert the primal to the requested element data type and align a live tangent to the resulting
+            // differential data type. Converting into a type with no tangent space produces a structural zero tangent.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().convert_element_type(operation.data_type)?;
             let output_tangent_type = primal.r#type().tangent();
@@ -133,14 +143,14 @@ impl_differentiable_operation! {
     },
     transpose<V, O>
     where
-        V::Type: DifferentiableType + ElementType,
-        O: From<ConvertElementTypeOperation>,
-        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
+        T: DifferentiableType + ElementType,
+        V: Value<Type = T>,
+        O: From<ConvertElementTypeOperation<T>>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<T>,
     {
         |_operation, _context, _driver, inputs, outputs| {
-            // Transposition rule for `ConvertElementTypeOperation`. A live output cotangent is converted back to the
-            // input's complete cotangent type, while a structural zero remains structural. An input with no cotangent
-            // space receives the structural zero of that space.
+            // Convert a live output cotangent back to the input's complete cotangent type. Structural zeros remain
+            // structural, and an input with no cotangent space receives the structural zero of that space.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             let input_cotangent_type = inputs[0].r#type().cotangent();
@@ -220,7 +230,7 @@ pub trait ConvertElementType: Sized {
     }
 }
 
-impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<ConvertElementTypeOperation>>>>
+impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<ConvertElementTypeOperation<V::Type>>>>>
     ConvertElementType for V
 {
     #[inline]
@@ -244,35 +254,46 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::programs::types::Typed;
-    use crate::types::{ArrayType, DataType, Dimension, Layout, Shape, StridedLayout};
+    use crate::types::{ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout};
 
     use super::*;
 
     #[test]
     fn test_convert_element_type() {
         // Check operation metadata and exact inference, including structural array metadata and token rejection.
-        let operation = ConvertElementTypeOperation::new(DataType::F32);
-        assert_eq!(Operation::<DataType>::name(&operation), CONVERT_ELEMENT_TYPE_OPERATION_NAME);
-        assert_eq!(operation.data_type(), DataType::F32);
-        assert_eq!(operation.to_string(), "convert_element_type [data_type=f32]");
+        let scalar_operation = ConvertElementTypeOperation::<DataType>::new(DataType::F32);
+        let array_operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32);
+        assert_eq!(Operation::<DataType>::name(&scalar_operation), CONVERT_ELEMENT_TYPE_OPERATION_NAME);
+        assert_eq!(scalar_operation.data_type(), DataType::F32);
+        assert_eq!(scalar_operation.to_string(), "convert_element_type [data_type=f32]");
 
         check_operation_type_inference!(
-            @elementwise @unary,
-            operation = operation,
+            operation = scalar_operation,
             cases = [
                 {
-                    input_data_types = [DataType::F64],
-                    output_data_types = [DataType::F32],
+                    input_types = [DataType::F64],
+                    output_types = [DataType::F32],
                 },
                 {
-                    input_data_types = [DataType::Token],
+                    input_types = [DataType::Token],
                     error = "cannot convert values to or from the token data type",
                 },
             ],
         );
 
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
+            .with_memory(Memory::Host { pinned: true });
         check_operation_type_inference!(
-            operation = ConvertElementTypeOperation::new(DataType::Token),
+            operation = array_operation,
+            cases = [{
+                input_types = [input_type.clone()],
+                output_types = [input_type.with_data_type(DataType::F32)],
+            }],
+        );
+
+        check_operation_type_inference!(
+            operation = ConvertElementTypeOperation::<DataType>::new(DataType::Token),
             cases = [{
                 input_types = [DataType::F64],
                 error = "cannot convert values to or from the token data type",
@@ -281,14 +302,14 @@ mod tests {
 
         // Check the default fold-or-residualize rule and preservation of mapped batch placement.
         check_operation_partial_evaluation!(
-            operation = operation,
+            operation = scalar_operation,
             inputs = [Scalar::from(2.0_f64)],
             expected = Scalar::from(2.0_f32),
         );
 
         check_operation_batching!(
             @exact,
-            operation = operation,
+            operation = array_operation,
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]))],

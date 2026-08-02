@@ -2568,7 +2568,7 @@ mod tests {
 
     #[test]
     fn test_rematerialization_preserves_custom_vjp_semantics_and_keeps_the_boundary_opaque() {
-        use crate::tracing_v2::custom_derivatives::custom_vjp;
+        use crate::tracing_v2::custom_vjp;
 
         // The custom backward rule triples the true gradient (expressed through addition to avoid constant lifting),
         // so a matching gradient proves the user-authored rule — not the true derivative — governs reverse mode
@@ -3841,7 +3841,7 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_residual_candidates_expose_the_replayed_forward_producer() {
-        use crate::tracing_v2::custom_derivatives::custom_vjp;
+        use crate::tracing_v2::custom_vjp;
 
         // Phase 0 boundary pin: the custom-VJP *forward* program is replayed through the linearization, so the
         // declared residual's producing instruction is the replayed internal `cos` — not the opaque call — while the

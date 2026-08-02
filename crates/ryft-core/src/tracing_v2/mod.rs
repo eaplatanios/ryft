@@ -11,6 +11,7 @@ pub mod rematerialization;
 pub use crate::operations::math::{Cos, Sin};
 pub use crate::operations::tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use crate::tracing::NestedTracer;
+pub use custom_derivatives::{CustomJvp, CustomVjp, custom_jvp, custom_vjp};
 pub use rematerialization::{
     DotsSaveable, DotsWithNoBatchDimsSaveable, EitherStorage, EverythingSaveable, MemoryTransferStorage, NoStorage,
     NothingSaveable, OffloadDotsWithNoBatchDims, PolicyFn, RematerializationCandidate, RematerializationDecision,
