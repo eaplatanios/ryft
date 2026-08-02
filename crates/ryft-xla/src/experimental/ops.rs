@@ -522,12 +522,13 @@ where
         ArrayProgramOperation::<Capture::Projected>::capture_zero_residual_values(context, source, r#type)
     }
 
-    fn add_zero_from_residuals<V: Value<Type = ArrayProgramType>>(
-        builder: &mut ProgramBuilder<V, Self>,
+    fn zero_operation_with_residuals<R: Clone>(
         r#type: ArrayProgramType,
-        residuals: &[ryft_core::AtomId],
-    ) -> Result<ryft_core::AtomId, ProgramError> {
-        ArrayProgramOperation::<Capture::Projected>::add_zero_from_residuals(builder, r#type, residuals)
+        residuals: &[R],
+    ) -> Result<(Self, Vec<R>), ProgramError> {
+        let (operation, operands) =
+            ArrayProgramOperation::<Capture::Projected>::zero_operation_with_residuals(r#type, residuals)?;
+        Ok((operation.into(), operands))
     }
 }
 

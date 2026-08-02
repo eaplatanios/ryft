@@ -534,6 +534,10 @@ impl<A: Value<Type = ArrayType>> ArrayProgramOperation<A> {
         r#type: &ArrayProgramType,
     ) -> Result<Vec<AtomId>, ProgramError> {
         let r#type = <&ArrayType>::try_from(r#type)?;
+        let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
+        if first_axes.is_empty() {
+            return Ok(Vec::new());
+        }
         let source_type = builder
             .atoms()
             .get(source.index())
@@ -541,7 +545,6 @@ impl<A: Value<Type = ArrayType>> ArrayProgramOperation<A> {
             .r#type()
             .into_owned();
         let source_type = <&ArrayType>::try_from(&source_type)?;
-        let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
         // Reading only each identity's first source axis establishes the same deduplicated residual ordering used by
         // zero construction, including when several axes share one identity.
         first_axes
@@ -568,9 +571,12 @@ impl<A: Value<Type = ArrayType>> ArrayProgramOperation<A> {
         C::Operation: From<DimensionSizeOperation>,
     {
         let r#type = <&ArrayType>::try_from(r#type)?;
+        let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
+        if first_axes.is_empty() {
+            return Ok(Vec::new());
+        }
         let source_type = source.r#type();
         let source_type = <&ArrayType>::try_from(source_type.as_ref())?;
-        let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
         // Capture one concrete extent per identity from its first source axis; repeated axes reuse that value when the
         // dynamic zero's per-axis operand list is reconstructed.
         first_axes
@@ -583,16 +589,12 @@ impl<A: Value<Type = ArrayType>> ArrayProgramOperation<A> {
             .collect()
     }
 
-    /// Adds the canonical zero for `r#type`, consuming one explicit extent residual per distinct dynamic identity in
-    /// first-occurrence order and reusing it for repeated axes.
-    pub fn add_zero_from_residuals<
-        V: Value<Type = ArrayProgramType>,
-        O: Operation<ArrayProgramType> + From<ZeroOperation<ArrayType>>,
-    >(
-        builder: &mut ProgramBuilder<V, O>,
+    /// Returns the canonical zero operation for `r#type` and expands one explicit extent residual per distinct dynamic
+    /// identity into the mixed constructor's per-axis operand order.
+    pub fn zero_operation_with_residuals<R: Clone>(
         r#type: ArrayProgramType,
-        residuals: &[AtomId],
-    ) -> Result<AtomId, ProgramError> {
+        residuals: &[R],
+    ) -> Result<(Self, Vec<R>), ProgramError> {
         let r#type = <&ArrayType>::try_from(&r#type)?.clone();
         let (shape, first_axes) = ExactShape::for_residual_zero(r#type.shape());
         let expected_residual_count = first_axes.len();
@@ -604,8 +606,11 @@ impl<A: Value<Type = ArrayType>> ArrayProgramOperation<A> {
                 ),
             });
         }
+        if first_axes.is_empty() {
+            return Ok((Self::zero_operation(r#type.into())?, Vec::new()));
+        }
         let operands = shape.dynamic_dimensions(residuals);
-        Ok(builder.add_instruction(ZeroOperation::new(r#type), Vec::new(), operands)?[0])
+        Ok((Self::Zero(ZeroOperation::new(r#type)), operands))
     }
 }
 
@@ -646,12 +651,11 @@ impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayProgramType> for Arra
         ArrayProgramOperation::<A>::capture_zero_residual_values(context, source, r#type)
     }
 
-    fn add_zero_from_residuals<V: Value<Type = ArrayProgramType>>(
-        builder: &mut ProgramBuilder<V, Self>,
+    fn zero_operation_with_residuals<R: Clone>(
         r#type: ArrayProgramType,
-        residuals: &[AtomId],
-    ) -> Result<AtomId, ProgramError> {
-        ArrayProgramOperation::<A>::add_zero_from_residuals(builder, r#type, residuals)
+        residuals: &[R],
+    ) -> Result<(Self, Vec<R>), ProgramError> {
+        ArrayProgramOperation::<A>::zero_operation_with_residuals(r#type, residuals)
     }
 }
 

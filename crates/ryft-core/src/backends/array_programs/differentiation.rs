@@ -1963,13 +1963,19 @@ mod tests {
     use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
+    use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::constants::ZeroOperation;
     use crate::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
     use crate::operations::dimensions::DimensionFromScalarOperation;
     use crate::operations::manipulation::{BroadcastOperation, ReshapeOperation};
     use crate::operations::math::{AddOperation, MulOperation, ReduceOperation, ReductionKind};
     use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationOutput, PartialValue};
+    use crate::programs::types::Typed;
     use crate::programs::{Program, ProgramBuilder};
+    use crate::tracing::TracingContext;
     use crate::types::{
         ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
     };
@@ -2056,6 +2062,170 @@ mod tests {
         let mut pullback_inputs = vec![array(Array::scalar(1.0))];
         pullback_inputs.extend(residuals);
         assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![array(Array::scalar(2.0))]),);
+    }
+
+    #[test]
+    fn test_composite_condition_all_zero_jvp_materializes_a_dynamic_output_tangent() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let extent = builder.add_input(extent_type.clone().into());
+            let output =
+                builder.add_instruction(ZeroOperation::new(output_type.clone()), Vec::new(), vec![extent]).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let extent = builder.add_input(extent_type.clone().into());
+        let regions = vec![
+            builder.import_region(branch().entry_region_ref()),
+            builder.import_region(branch().entry_region_ref()),
+        ];
+        let output = builder.add_instruction(ConditionOperation::new(), regions, vec![predicate, extent]).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Both inputs have zero tangent spaces, but the dynamic floating-point result does not. Its zero tangent must
+        // therefore consume the selected primal result's explicit runtime extent instead of using a nullary zero.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_count(), 2);
+        assert_eq!(jvp.output_count(), 2);
+        assert_eq!(
+            jvp.interpret(vec![
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                dimension(&extent_type, 3),
+            ]),
+            Ok(vec![array(Array::vector(vec![0.0_f64; 3])), array(Array::vector(vec![0.0_f64; 3])),]),
+        );
+
+        // Eager direct JVP keeps the operation's all-zero region fast path and derives the concrete output tangent
+        // extent from the selected primal result at the public boundary.
+        let eager = EagerContext::<TestValue, TestOperation>::new();
+        let (primal, tangent) = eager
+            .jvp(
+                |inputs| {
+                    let context = inputs[0].context().clone();
+                    context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())
+                },
+                vec![
+                    array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                    dimension(&extent_type, 3),
+                ],
+                vec![
+                    array(Array::new(ArrayType::scalar(DataType::Zero), vec![crate::Scalar::Zero]).unwrap()),
+                    array(Array::new(ArrayType::scalar(DataType::Zero), vec![crate::Scalar::Zero]).unwrap()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(primal, vec![array(Array::vector(vec![0.0_f64; 3]))]);
+        assert_eq!(tangent, vec![array(Array::vector(vec![0.0_f64; 3]))]);
+
+        // Split program linearization stages the same extent read on the primal side and forces the shaped zero into
+        // the tangent program, rather than folding it into an affine known tangent.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                dimension(&extent_type, 3),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        assert_eq!(linearization.tangent().interpret(residuals), Ok(vec![array(Array::vector(vec![0.0_f64; 3]))]),);
+
+        // A known symbolic predicate cannot select a branch during partial evaluation. Because the dynamic output
+        // edge refers to the extent identity, the condition remains whole instead of fabricating an opposite-branch
+        // placeholder with arbitrary geometry.
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let symbolic_predicate = outer.input(ArrayType::scalar(DataType::Boolean).into());
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &outer,
+                &[PartialValue::Known(symbolic_predicate), PartialValue::Unknown(extent_type.clone().into())],
+            )
+            .unwrap();
+        assert!(matches!(evaluation.outputs.as_slice(), [PartialEvaluationOutput::Unknown(0)]));
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayProgramOperation::Condition(_),));
+
+        // Direct transform dispatch must make the same decision before it has a staged instruction whose result type
+        // it can inspect. The condition rule retains the selected branch's extent and constructs the tangent there.
+        let context = TracingContext::<TestValue, TestOperation>::new();
+        let predicate = context.input(ArrayType::scalar(DataType::Boolean).into());
+        let extent = context.input(extent_type.clone().into());
+        let predicate_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        let (_, tangent) = context
+            .jvp(
+                |inputs| {
+                    let context = inputs[0].context().clone();
+                    Ok(context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())?.remove(0))
+                },
+                vec![predicate, extent],
+                vec![predicate_tangent, extent_tangent],
+            )
+            .unwrap();
+        assert_eq!(tangent.r#type().as_ref(), &ArrayProgramType::Array(output_type.clone()));
+
+        // Reusable linearization follows the same ordinary region rule and closes over the dynamic result geometry;
+        // applying its null linear map therefore reconstructs the shaped tangent without a type-only zero.
+        let predicate = context.input(ArrayType::scalar(DataType::Boolean).into());
+        let extent = context.input(extent_type.clone().into());
+        let (_, pushforward) = context
+            .linearize(
+                |inputs| {
+                    let context = inputs[0].context().clone();
+                    Ok(context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())?.remove(0))
+                },
+                vec![predicate, extent],
+            )
+            .unwrap();
+        let predicate_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        assert_eq!(pushforward.apply(vec![predicate_tangent, extent_tangent]).unwrap().r#type(), tangent.r#type(),);
+    }
+
+    #[test]
+    fn test_composite_pullback_materializes_a_dynamic_zero_space_input_cotangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let key_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let context = TracingContext::<TestValue, TestOperation>::new();
+        let key = context.input(key_type.clone().into());
+        let accumulator = context.input(ArrayType::scalar(DataType::F64).into());
+        let (_, pullback) = context.vjp(|inputs: Vec<_>| Ok(inputs[1].clone()), vec![key, accumulator]).unwrap();
+        let cotangent = context.input(ArrayType::scalar(DataType::F64).into());
+
+        // The compact pullback has no result slot for the key's zero differential space. Rebuilding the public result
+        // must use the key extent captured at linearization time rather than attempt a nullary dynamic zero.
+        let cotangents = pullback.apply(cotangent).unwrap();
+        assert_eq!(cotangents[0].r#type().as_ref(), &ArrayProgramType::Array(key_type.tangent()));
+        assert_eq!(cotangents[1].r#type().as_ref(), &ArrayType::scalar(DataType::F64).into());
+    }
+
+    #[test]
+    fn test_composite_pushforward_materializes_a_dynamic_zero_space_output_tangent() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let key_type =
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let context = TracingContext::<TestValue, TestOperation>::new();
+        let extent = context.input(extent_type.into());
+        let key = context.input(key_type.clone().into());
+        let (_, pushforward) = context.linearize(|inputs: Vec<_>| Ok(inputs[1].clone()), vec![extent, key]).unwrap();
+        let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        let key_tangent = context.input(key_type.tangent().into());
+
+        // The compact pushforward has no output slot for the key's zero differential space. Rebuilding its public
+        // result must consume the key extent captured at linearization time.
+        let tangent = pushforward.apply(vec![extent_tangent, key_tangent]).unwrap();
+        assert_eq!(tangent.r#type().as_ref(), &ArrayProgramType::Array(key_type.tangent()));
     }
 
     fn product_scan_body(

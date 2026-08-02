@@ -1680,13 +1680,12 @@ searches. The complete source ledger and verification record are in
 - [x] P6e — execute `.tasks/plan_p6e_composite_zero_deletion.md` as the next isolated Phase 6 unit. Delete the generic
       type-only composite zero, migrate every caller to structural, operand-relative, homogeneous, or explicit-extent
       materialization, and rename the sole mixed dynamic-array constructor from `DynamicZero` to `Zero`.
-- [ ] P6f — wire the transposition zero-residual protocol through region-carrying operations. Condition
-      partial-evaluation branch zeros, scan transpose boundary reconstruction, and the region-carrying all-zero JVP
-      fast path currently hard-error with the exact `'zero' cannot construct type ...` diagnostic when an
-      identity-bearing zero type is requested — a deliberate fail-loud surface reduction relative to the deleted
-      unsound escape hatch, acknowledged in code comments. Thread the `ResidualZeroProvider` residual capture
-      through those region boundaries so dynamic zero-space carries and branch edges differentiate instead of
-      rejecting, with dynamic-shape acceptance tests per consumer.
+- [x] P6f — execute `.tasks/plan_p6f_region_zero_residuals.md` to complete the residual-zero protocol at direct JVP,
+      split linearization, reusable derivative-callable, and scan-transpose boundaries. Materialize structural zeros
+      from their primal results' explicit geometry; share one canonical operation/operand assembly hook across
+      value-level and builder-level spending; project unused zero-space scan inputs out instead of constructing them;
+      and retain condition partial evaluation's conservative whole-condition fallback for identity-bearing branch
+      edges.
 - [x] Inventory every production construction of `ZeroOperation<ArrayProgramType>` and every composite
       `Zero<ArrayProgramValue<_>>` materialization path, including the retained-linearization residual-zero sites in
       `differentiation/forward.rs`. Classify each as a structural zero that should remain unmaterialized, an
@@ -1841,6 +1840,21 @@ Focused coverage pins static and dynamic canonical routing, dimension-member rej
 program-level and nested disconnected pullbacks, repeated-identity residual sharing, XLA pullback execution, and
 dynamic call cotangents. The final source delta and exact verification evidence are recorded in
 `.tasks/plan_p6e_composite_zero_deletion.md`. Phase 7 backend execution and lowering is the next phase.
+
+P6f is complete against frozen boundary `6471cc9cc`. `ResidualZeroProvider` now has one canonical
+`zero_operation_with_residuals` assembly hook; its value-level binding and builder-level insertion are shared defaults,
+and XLA delegates assembly to core. Direct JVP captures geometry from the corresponding primal output before
+materializing a structural zero. Both split linearization paths force residual-backed zeros into their tangent
+programs, preserving the existing guard against arbitrary known/affine tangent outputs. Reusable pushforwards and
+pullbacks retain only the dimension residuals required to rebuild omitted zero-space public boundary leaves.
+
+Scan transpose is simpler: its omitted zero-space cotangent input is semantically unused, so the transposed body is
+projected to the live boundary instead of receiving a fabricated zero. Condition partial evaluation retains the whole
+condition when branch-edge types carry identities; this remains a deliberate non-optimization because no
+opposite-branch geometry source exists. Focused eager/staged JVP, program/callable linearization, pushforward,
+pullback, condition-fallback, and scan-projection fixtures pass, together with all 1,105 core tests, all 426 passing XLA
+tests plus one intentional ignore, strict core doctests, and the three pinned JAX control-flow parity fixtures. The
+complete source ledger and verification record are in `.tasks/plan_p6f_region_zero_residuals.md`.
 
 ### Phase 7: backend execution and lowering
 

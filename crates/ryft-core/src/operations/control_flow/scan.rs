@@ -2658,7 +2658,7 @@ fn thread_known_carries<V, O>(
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value<Type: DifferentiableType>,
-    O: Operation<V::Type> + ZeroOperationProvider<V::Type>,
+    O: Operation<V::Type>,
 {
     let linear_carry_count = operand_linear[..carry_count].iter().filter(|&&linear| linear).count();
     let body_output_count = body_output_types.len();
@@ -2685,37 +2685,34 @@ where
             .chain(output_cotangent_positions[carry_count..body_output_count].iter().flatten().copied())
             .chain(known_input_positions[carry_count..].iter().flatten().copied())
             .collect::<Vec<_>>();
-    let input_types = program.input_types();
-    let mut builder = ProgramBuilder::new();
-    let inputs = input_order.iter().map(|&index| builder.add_input(input_types[index].clone())).collect::<Vec<_>>();
-    let mut original_inputs = vec![None; input_types.len()];
-    for (new_position, &old_position) in input_order.iter().enumerate() {
-        original_inputs[old_position] = Some(inputs[new_position]);
-    }
-    let original_inputs = original_inputs
-        .into_iter()
-        .enumerate()
-        .map(|(index, input)| {
-            if let Some(input) = input {
-                return Ok(input);
-            }
 
-            // The pullback boundary always has one cotangent input per primal output, including outputs whose
-            // cotangent type is a zero space. Reordering known carries intentionally removes those zero-space carry
-            // cotangents from the reversed scan boundary, so materialize their unique value locally when splicing the
-            // original transposed body. Every other input must remain represented by `input_order`.
-            let r#type = input_types[index].clone();
-            if !r#type.is_zero_space() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "scan transpose boundary reconstruction omitted non-zero-space input {index}",
-                )));
-            }
-            let outputs = builder.add_instruction(O::zero_operation(r#type)?, Vec::new(), Vec::new())?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok(outputs[0])
+    // Zero-space output-cotangent inputs carry no information and cannot affect a well-formed transposed body. Project
+    // them out instead of fabricating typed values merely to satisfy the old boundary while splicing. Keeping every
+    // selected input alive preserves known carry slots even when the derivative body does not otherwise read them.
+    let selected_inputs = input_order
+        .iter()
+        .map(|&index| {
+            program.input_ids().get(index).copied().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "scan transpose boundary references missing input position {index}",
+                ))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut outputs = builder.splice_program(&program, original_inputs.as_slice())?;
+    let output_ids = program.output_ids().to_vec();
+    let selected_input_count = selected_inputs.len();
+    let (program, live_inputs) =
+        program.into_filtered(selected_inputs.as_slice(), output_ids.as_slice(), selected_inputs.as_slice())?;
+    if !live_inputs.iter().copied().eq(0..selected_input_count) {
+        return Err(ProgramError::MalformedProgram(
+            "scan transpose boundary projection dropped a retained input".to_string(),
+        ));
+    }
+
+    let input_types = program.input_types();
+    let mut builder = ProgramBuilder::new();
+    let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+    let mut outputs = builder.splice_program(&program, inputs.as_slice())?;
     check_count!("output", outputs, program.output_count(), ProgramError);
     let trailing_outputs = outputs.split_off(linear_carry_count);
     let mut linear_carry_outputs = outputs.into_iter();
@@ -2741,6 +2738,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::CaptureReference;
@@ -3835,6 +3833,36 @@ mod tests {
             reordered.outputs().map(|output| output.as_constant().unwrap().to_f64s()).collect::<Vec<_>>(),
             vec![vec![2.0], vec![1.0]],
         );
+    }
+
+    #[test]
+    fn test_scan_thread_known_carries_projects_out_dynamic_zero_space_inputs() {
+        type CompositeValue = ArrayProgramValue<Array>;
+        type CompositeOperation = ArrayProgramOperation<Array>;
+
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let key_type =
+            ArrayProgramType::Array(ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)])));
+        let accumulator_type = ArrayProgramType::Array(ArrayType::scalar(DataType::F64));
+        let mut builder = ProgramBuilder::<CompositeValue, CompositeOperation>::new();
+        let _key_cotangent = builder.add_input(key_type.cotangent());
+        let accumulator_cotangent = builder.add_input(accumulator_type.cotangent());
+        let _known_key = builder.add_input(key_type.clone());
+        let transposed = builder
+            .build::<Vec<CompositeValue>, Vec<CompositeValue>>(
+                vec![accumulator_cotangent],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The zero-space key cotangent is an unused transpose-boundary input. The reversed scan body should erase
+        // that slot and thread the real key value through its carry slot without constructing a dynamic zero.
+        let threaded =
+            thread_known_carries(transposed, &[key_type.clone(), accumulator_type.clone()], &[false, true], 2).unwrap();
+        assert_eq!(threaded.input_types(), vec![key_type.clone(), accumulator_type.clone()]);
+        assert_eq!(threaded.output_types(), vec![key_type, accumulator_type]);
+        assert_eq!(threaded.instructions().len(), 0);
     }
 
     /// The fused JVP rule stages exactly one scan with doubled carries and **no** per-iteration residual stacks:
