@@ -562,7 +562,7 @@ pub(crate) trait LowerableXlaOperation<V: MlirLowerableValue>: Operation<ArrayTy
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>;
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -3577,7 +3577,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     lowerer,
                 )
             }
-            ArrayOperation::ConvertElementType(operation) => <ConvertElementTypeOperation as LowerableXlaOperation<
+            ArrayOperation::ConvertElementType(operation) => <ConvertElementTypeOperation<ArrayType> as LowerableXlaOperation<
                 V,
             >>::lower_to_mlir(
                 operation, input_values, output_types, mode, lowerer
@@ -11025,7 +11025,7 @@ mod tests {
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
-            let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![state]).unwrap()[0];
+            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
             let predicate = builder
                 .add_instruction(
                     XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(
@@ -11041,7 +11041,7 @@ mod tests {
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
-            let one = builder.add_instruction(OneLikeOperation, Vec::new(), vec![state]).unwrap()[0];
+            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
             let next = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
@@ -13132,7 +13132,7 @@ mod tests {
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
-            let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![state]).unwrap()[0];
+            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
             let predicate = builder
                 .add_instruction(
                     XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(
@@ -13148,7 +13148,7 @@ mod tests {
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
-            let one = builder.add_instruction(OneLikeOperation, Vec::new(), vec![state]).unwrap()[0];
+            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
             let next = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
@@ -13890,7 +13890,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
-        let output = builder.add_instruction(OneLikeOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();

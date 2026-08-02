@@ -409,8 +409,8 @@ macro_rules! impl_array_operation_conversion {
 }
 
 impl_array_operation_conversion!(
-    ZeroLikeOperation,
-    OneLikeOperation,
+    ZeroLikeOperation<ArrayType>,
+    OneLikeOperation<ArrayType>,
     ConstantOperation<ReferenceArray>,
     CoordinateBasisOperation<ArrayType>,
     AbsOperation,
@@ -464,13 +464,13 @@ impl_array_operation_conversion!(
     DynamicSliceOperation,
     DynamicUpdateSliceOperation,
     SelectOperation<ArrayType>,
-    ConvertElementTypeOperation,
+    ConvertElementTypeOperation<ArrayType>,
     TransferToMemoryOperation,
     ReshardOperation,
     ShardingConstraintOperation,
     StopGradientOperation<ArrayType>,
-    TagOperation,
-    PrintOperation,
+    TagOperation<ArrayType>,
+    PrintOperation<ArrayType>,
 );
 
 impl<C> OperationProjection<ArrayType> for XlaOperation<C>
