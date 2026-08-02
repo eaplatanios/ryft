@@ -162,7 +162,11 @@ impl<'o> Array<'o> {
         ExecuteArguments::from_arrays_with_donation(arrays, addressable_device_ids, donation_flags.as_slice())
     }
 
-    /// Same as [`Array::into_execute_arguments`] but with explicit per-input donation flags.
+    /// Same as [`Array::into_execute_arguments`] but with explicit per-input donation requests.
+    ///
+    /// A requested donation is effective only when the consumed logical array uniquely owns every shard buffer.
+    /// Donation is disabled for the whole input when any shard is shared by an ordinary clone or a retained bounded
+    /// materialization, preventing PJRT from invalidating storage that another value can still observe.
     pub fn into_execute_arguments_with_donation(
         arrays: Vec<Self>,
         addressable_device_ids: &[DeviceId],

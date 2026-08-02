@@ -1,8 +1,8 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Display};
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ryft_core::compilation::CompilationContext;
 use ryft_core::programs::Value;
@@ -13,6 +13,10 @@ use ryft_core::{
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
 
+use crate::arrays_v0::{
+    BoundedMaterializationCache, BoundedMaterializationKey, BoundedMaterializationProbe,
+    LOGICAL_EXTENT_SCALAR_CACHE_CAPACITY,
+};
 use crate::{ArrayError, Error, FromPjrt, ToPjrt, XlaDomain};
 
 // TODO(eaplatanios): Is `ArrayType::memory` being set, handled, and propagated correctly throughout this crate?
@@ -59,6 +63,12 @@ pub struct Array<'o> {
     /// array (or from values derived from it) keeps hitting one shared dispatch cache instead of recompiling
     /// repeated operation signatures.
     compilation_cache: OnceLock<Arc<CompilationContext<XlaDomain<'o>>>>,
+
+    /// Value-local, clone-shared cache of lazily padded bound-shaped device materializations.
+    bounded_materializations: Arc<BoundedMaterializationCache<'o>>,
+
+    /// Value-local, clone-shared LRU of device-resident scalar arguments for bounded logical extents.
+    logical_extent_scalars: Arc<Mutex<VecDeque<(i32, Array<'o>)>>>,
 }
 
 // `Array` equality is *storage identity*, not element-wise value equality: ordinary arrays are equal only when they
@@ -88,6 +98,8 @@ impl<'o> Clone for Array<'o> {
             execution_fence: self.execution_fence.clone(),
             client: self.client,
             compilation_cache: self.compilation_cache.clone(),
+            bounded_materializations: Arc::clone(&self.bounded_materializations),
+            logical_extent_scalars: Arc::clone(&self.logical_extent_scalars),
         }
     }
 }
@@ -208,7 +220,7 @@ impl<'o> Array<'o> {
             };
             let shape = StaticShape::new(
                 buffer
-                    .dimensions()?
+                    .unpadded_dimensions()?
                     .iter()
                     .map(|size| {
                         usize::try_from(*size).map_err(|_| Error::SizeLimitExceeded {
@@ -259,6 +271,8 @@ impl<'o> Array<'o> {
             execution_fence: None,
             client: None,
             compilation_cache: OnceLock::new(),
+            bounded_materializations: Arc::new(BoundedMaterializationCache::default()),
+            logical_extent_scalars: Arc::new(Mutex::new(VecDeque::new())),
         };
         match client.into() {
             Some(client) => array.with_client(client),
@@ -309,6 +323,8 @@ impl<'o> Array<'o> {
             execution_fence: None,
             client: Some(client),
             compilation_cache: OnceLock::new(),
+            bounded_materializations: Arc::new(BoundedMaterializationCache::default()),
+            logical_extent_scalars: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -608,6 +624,70 @@ impl<'o> Array<'o> {
     #[inline]
     pub fn size_in_bytes(&self) -> Result<usize, Error> {
         self.r#type.size_in_bytes()
+    }
+
+    /// Returns whether every global shard has process-local storage and can therefore retain a bounded materialization.
+    pub(crate) fn supports_bounded_materialization_cache(&self) -> bool {
+        self.shards.iter().all(ArrayShard::is_addressable)
+    }
+
+    /// Probes the clone-shared cache for one structural bound-shaped materialization key.
+    pub(crate) fn probe_bounded_materialization(
+        &self,
+        key: BoundedMaterializationKey,
+    ) -> BoundedMaterializationProbe<'o> {
+        self.bounded_materializations.probe(key)
+    }
+
+    /// Returns the replicated device-resident `i32` scalar for `extent` and whether this call uploaded it.
+    pub(crate) fn logical_extent_scalar(
+        &self,
+        client: &'o Client<'o>,
+        extent: i32,
+    ) -> Result<(Array<'o>, bool), ArrayError> {
+        let mut scalars = self.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
+        if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
+            let entry = scalars.remove(index).unwrap();
+            let scalar = entry.1.clone();
+            scalars.push_back(entry);
+            return Ok((scalar, false));
+        }
+        drop(scalars);
+
+        let scalar_type = ArrayType::scalar(DataType::I32)
+            .with_sharding(Sharding::replicated(self.sharding().mesh().clone(), 0))
+            .map_err(Error::from)?;
+        let scalar = Array::from_host_buffer(client, scalar_type, self.mesh(), extent.to_ne_bytes())?;
+        let mut scalars = self.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
+        if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
+            let entry = scalars.remove(index).unwrap();
+            let cached = entry.1.clone();
+            scalars.push_back(entry);
+            return Ok((cached, true));
+        }
+        scalars.push_back((extent, scalar.clone()));
+        while scalars.len() > LOGICAL_EXTENT_SCALAR_CACHE_CAPACITY {
+            scalars.pop_front();
+        }
+        Ok((scalar, true))
+    }
+
+    /// Returns whether every addressable shard buffer is uniquely owned by this array.
+    ///
+    /// Donation is all-or-nothing across shards: any shared buffer disables donation for the complete logical input.
+    /// The check is sound rather than best-effort when the caller owns `self` by value: a strong count of one means
+    /// this array holds the only reference to the buffer, so no concurrent clone can appear between this check and the
+    /// buffer's consumption. Note that clone-shared caches (for example, retained bounded materializations) keep their
+    /// own references, so cached arrays are never donated.
+    pub(crate) fn has_unique_shard_buffers(&self) -> bool {
+        let mut buffer_count = 0usize;
+        for buffer in self.shards.iter().filter_map(ArrayShard::buffer) {
+            if Arc::strong_count(buffer) != 1 {
+                return false;
+            }
+            buffer_count += 1;
+        }
+        buffer_count > 0
     }
 
     /// Waits asynchronously for every addressable shard buffer to become ready, then checks the whole-execution

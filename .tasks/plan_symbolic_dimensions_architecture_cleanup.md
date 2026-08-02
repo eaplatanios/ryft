@@ -11,9 +11,8 @@ dimension authority through condition, while, scan, eager branch execution, nest
 alpha-equivalent program splicing. Arithmetic extents remain ordinary dimension SSA through inference, eager
 execution, PE, batching, JVP/VJP, import, rendering, and native lowering. Phase 6's shape-changing collective
 adjoints are implemented through ordinary linear-call residuals. Phase 7's compiled gateway, diagnostic assertions,
-and per-class effect-token lowering are implemented and validated on CPU; bounded-dynamic execution remains externally
-gated because CPU PJRT lacks `PadToStatic` and the configured CUDA host is currently unreachable. The final current-JAX
-comparison fixtures remain an explicit P3k gate.
+per-class effect-token lowering, explicit bounded physical ABI, and CUDA `PadToStatic` execution are complete. The
+final current-JAX comparison fixtures remain an explicit P3k gate.
 
 On 2026-08-01 the plan's end state was extended beyond the containment cleanup: after the cleanup closure gates
 (Phases 10–11), Phases 12–14 take Ryft from input-derived (tier-2) dynamism to full data-dependent (tier-3) dynamism.
@@ -575,8 +574,9 @@ wrap `TypeError` in `ProgramError` only at outward program boundaries.
 - first-class dimension arithmetic and requirement operations;
 - interval, congruence, order, equality, and constant abstract interpretation;
 - `Effect::OrderedAssertion`;
-- the bounded-tensor ABI: one physical array argument per non-erased logical array leaf, StableHLO bounds and logical
-  size metadata, and plugin-owned `PadToStatic` legalization (Ryft owns no hidden extent arguments);
+- the bounded-tensor ABI: one public array leaf lowered to bound-shaped physical storage plus hidden replicated extent
+  scalars, logical reconstruction with `set_dimension_size`, hidden output extents, and plugin `PadToStatic`
+  legalization;
 - existing StableHLO dynamic-shape operands, diagnostic runtime assertion lowering, and per-effect token separation;
 - behavioral JAX parity tests;
 - exact diagnostics;
@@ -1839,7 +1839,8 @@ known dimension inputs. Core owns the residual algorithm and XLA delegates to it
 Focused coverage pins static and dynamic canonical routing, dimension-member rejection, widened projected JVP,
 program-level and nested disconnected pullbacks, repeated-identity residual sharing, XLA pullback execution, and
 dynamic call cotangents. The final source delta and exact verification evidence are recorded in
-`.tasks/plan_p6e_composite_zero_deletion.md`. Phase 7 backend execution and lowering is the next phase.
+`.tasks/plan_p6e_composite_zero_deletion.md`. Phase 7 backend execution and lowering was the next phase at this review
+boundary and is now complete above.
 
 P6f is complete against frozen boundary `6471cc9cc`. `ResidualZeroProvider` now has one canonical
 `zero_operation_with_residuals` assembly hook; its value-level binding and builder-level insertion are shared defaults,
@@ -1860,9 +1861,9 @@ complete source ledger and verification record are in `.tasks/plan_p6f_region_ze
 
 - [x] Verify every mixed operation lowers explicit dimension operands directly with no reconstruction environment.
 - [x] Verify eager XLA dimension arithmetic remains host integer computation with zero device dispatch/cache probes.
-- [x] Verify the bounded-tensor ABI retains one physical array argument per non-erased logical array leaf and preserves
-      `set_dimension_size` behavior. Ryft owns no hidden extent arguments; XLA's internal `PadToStatic` ABI is
-      plugin-owned.
+- [x] Verify the logical boundary remains unchanged while the physical executable ABI represents every bounded dynamic
+      input with bound-shaped storage plus hidden replicated extents, reconstructs it with `set_dimension_size`, and
+      returns hidden output extents used to recover concrete logical result shapes.
 - [x] Lower every residual `DimensionRequirementOperation` to a runtime assertion that observes the concrete operand
       values and preserves its exact actor name, predicate, bounds/divisor, and observed-value diagnostic.
 - [x] Replace each lowering scope's single shared `Option<ValueRef>` token with one deterministic token slot per
@@ -1875,28 +1876,37 @@ complete source ledger and verification record are in `.tasks/plan_p6f_region_ze
       branches, loops, scan, rematerialization, and repeated inlined calls. Add CPU execution tests proving
       deterministic first-failure order within the assertion class and independence from ordered I/O.
 - [x] Verify ordered runtime assertions preserve exact actor-named diagnostics and deterministic same-class order.
-- [ ] Run CPU and CUDA eager/JIT parity for the full dynamic operation matrix, including `PadToStatic`.
+- [x] Restore a permanent CUDA-13 bounded-dynamic execution regression in the production composite XLA domain. One
+      executable covers logical sizes 4 and 7, repeated execution, exact device values and logical shapes, and the
+      absence of concrete-size recompilation.
+- [x] Run the complete serialized local XLA suite, the focused CUDA bounded-dynamic two-size execution regression, and
+      the complete serialized CUDA-13 feature suite, including the plugin's `PadToStatic` path.
 - [x] While sweeping mixed-operation lowering above, record an initial per-operation padding-discipline inventory
       (padding-oblivious versus mask-required versus zero-padding-required under bound-shaped physical storage) as
       Phase 13 input. This is classification only — no behavior changes in this phase — but capturing it during the
       lowering sweep avoids a second complete pass over the same operations later.
-- [ ] Gate: backend behavior, diagnostics, and bounded physical storage match or exceed the archived golden evidence.
+- [x] Gate: backend behavior, diagnostics, and bounded physical storage match or exceed the archived golden evidence.
 
-Phase 7 implementation and CPU validation are complete. The exact lowering/eager/ABI inventories, padding
-classification, assertion architecture, and command ledger are recorded in
-`.tasks/plan_p7_backend_execution_and_lowering.md`. The only open gate is external: CPU PJRT does not provide bounded
-dynamic `PadToStatic`, and `spark-9460.local` was not resolvable from this environment for the CUDA matrix. Dynamic RNG
-also retains its exact semantic rejection because upper-bound generation would advance its functional state by the
-physical rather than logical element count; Phase 13 owns that padding-sensitive design. Effectful shard-map bodies
-also reject exactly because `sdy.manual_computation` cannot thread StableHLO effect tokens across its boundary; pure
-shard-map bodies are unchanged.
+Phase 7 is complete. The exact lowering/eager/ABI inventories, padding classification, assertion architecture, and
+command ledger are recorded in `.tasks/plan_p7_backend_execution_and_lowering.md`. The first focused GB10 execution
+disproved the prior plugin-owned-boundary assumption: a compact logical size-4 input could not satisfy the executable's
+bound-sized allocation. Ryft now owns an explicit physical ABI with bound-shaped data arguments, hidden replicated
+input extents, hidden output extents, and concrete logical result reconstruction. The restored three-tier input
+materialization path preserves at-bound reuse, clone-shared retained caching, uncached fallback, single-flight
+publication, bounded LRU storage, and cached extent scalars. Schema-versioned compilation keys and persistent metadata
+encode the physical mappings exactly.
 
-The next isolated review unit is therefore the external Phase 7 CUDA/`PadToStatic` closure as soon as the host is
-reachable. Phase 8 must not begin until that gate is either executed successfully or explicitly re-scoped by the
-owner. The post-review correction pass moved every checked failure into the core effect model, deleted the backend
+The focused CUDA regression ran logical sizes 4 and 7 twice through one compiled executable with exact values and
+logical shapes. On `spark-9460.local` (NVIDIA GB10, CUDA 13.0), the complete serialized CUDA-13 `ryft-xla` feature
+suite passed 433 tests with 1 intentional ignore; the serialized local suite passed 432 tests with 1 intentional
+ignore. Dynamic RNG retains its exact semantic rejection because upper-bound generation would advance its functional
+state by the physical rather than logical element count; Phase 13 owns that padding-sensitive design. Effectful
+shard-map bodies also reject exactly because `sdy.manual_computation` cannot thread StableHLO effect tokens across its
+boundary; pure shard-map bodies are unchanged. The next isolated review unit is Phase 8. The post-review correction
+pass moved every checked failure into the core effect model, deleted the backend
 effect overlay, made division/remainder and concatenate checks scheduling-safe, and carried assertion-runtime
 requirements through persistent cache restoration. Local verification passed 1,100 `ryft-core` unit tests plus its
-integration/compile-fail/doctest suites, 424 `ryft-xla` tests (1 ignored benchmark), both macro integration/trybuild
+integration/compile-fail/doctest suites, 432 `ryft-xla` tests (1 ignored benchmark), both macro integration/trybuild
 suites, formatting, diff hygiene, and residual searches; the exact ledger is in the P7 plan.
 
 ### Phase 8: enforce contracts and consolidate operation declarations
@@ -2075,7 +2085,8 @@ This is the dominant tier-3 cost and the piece most exposed to backend maturity:
 dynamism is uneven, which is part of why JAX's own effort stalled. The physical model is fixed — bound-shaped buffers
 carrying smaller logical extents — but the encoding route is an explicit measured decision, not an assumption. Phase 7
 already owns the gateway's own compiled lowering (its range check as an ordered assertion); this phase makes the
-*rest of the operation set* correct over data-derived extents and validates the plugin-owned `PadToStatic` boundary.
+*rest of the operation set* correct over data-derived extents and validates the explicit bounded physical ABI through
+the plugin's `PadToStatic` legalization.
 
 - [ ] Decide the compiled route for operations consuming data-derived extents, on measured evidence: (a) XLA bounded
       dynamism through the existing bounded-input ABI, `set_dimension_size`, and `PadToStatic` machinery; or (b) fully
@@ -2150,7 +2161,7 @@ composes nested axes already, and the relaxed-while-predicate work established t
 - [ ] Fresh internal dimensions have one producer and dominate every reference.
 - [ ] Alpha-equivalent programs share cache identity; live permutations and different graphs do not.
 - [ ] Exact diagnostics match the baseline.
-- [ ] Bounded dynamic ABI, CPU, and CUDA behavior match the baseline.
+- [x] Bounded dynamic ABI, CPU, and CUDA behavior match the baseline.
 - [ ] Behavioral JAX parity and Ryft-exceeds-JAX cases remain intact.
 - [x] Toy third-kind tests demonstrate that generic program/context/projection machinery is closed to modification.
 - [ ] (Tier 3) Data-to-dimension conversion occurs only through the checked `dimension_from_scalar` gateway.
@@ -3170,7 +3181,8 @@ witness, or transform-residual metadata in any collective payload and no payload
 The direct composite XLA dispatcher accepts the same explicit manual-binder state used by production shard-map
 lowering, and a fixture proves the canonical dimension SSA graph reaches the shared native collective lowerer without
 reconstructing dimensions. Phase 4 subsequently migrated production attached-region storage and tracing to that
-composite graph. Checked bounded-dynamic public execution remains Phase 7 boundary-materialization work.
+composite graph. At this review boundary, checked bounded-dynamic public execution remained Phase 7
+boundary-materialization work; Phase 7 has now completed it.
 
 The complete implementation ledger and remaining JAX-parity continuation are in
 `.tasks/plan_p3k_collective_dimensions.md`.
@@ -3293,9 +3305,10 @@ duplicate test suite were deleted. The retained diff removes more code than it a
 Production coverage executes dimension-size arithmetic followed by dynamic broadcast and reshape, pins eager cache
 behavior, retains the static eager/JIT/reshard/sharding/cache/profile-guided suites, and keeps exact Phase 5/6
 diagnostics where composite higher-order batching or reverse differentiation remains deliberately deferred.
-Inconclusive compiled requirement assertions remain Phase 7. Public bounded-dynamic shard-map execution and
-plugin-specific `PadToStatic` validation remain the named P3k/P7 continuation; static/manual shard-map production
-reachability is complete.
+At the P4b boundary, inconclusive compiled requirement assertions remained Phase 7 work, and public bounded-dynamic
+shard-map execution plus plugin-specific `PadToStatic` validation remained the named P3k/P7 continuation.
+Static/manual shard-map production reachability was already complete; Phase 7 has since closed its assertion and
+plugin-validation work.
 
 Verification passed all 1,019 core library tests, all 396 runnable XLA library tests (one timing benchmark ignored),
 the benchmark-feature all-target compile gate, focused benchmark-feature tests, the compilation benchmark smoke run,
@@ -3318,9 +3331,10 @@ destination identities and all replacements generated earlier in the same splice
 rejection and distinct imported identities with the same diagnostic names and bounds, exact gateway-to-condition
 operand edges, and matching nested-region interfaces.
 
-Compiled `dimension_from_scalar` and public bounded-dynamic shard-map execution remain Phase 7 work because their
-range checks must lower as ordered assertions and their physical boundary requires the checked `PadToStatic` path.
-P4c did not weaken those contracts or add an unchecked temporary lowering.
+At the P4c boundary, compiled `dimension_from_scalar` and public bounded-dynamic shard-map execution remained Phase 7
+work because their range checks had to lower as ordered assertions and their physical boundary required the checked
+`PadToStatic` path. P4c did not weaken those contracts or add an unchecked temporary lowering; Phase 7 has since
+completed the gateway lowering and bounded physical boundary.
 
 Verification passed all 1,020 core library tests, all 57 runnable core doctests (16 examples ignored), all 401
 runnable XLA library tests (one timing benchmark ignored), both macro integration suites, the XLA all-target check,
@@ -3349,6 +3363,6 @@ signature) validates dimensions-as-SSA-values as the tier-3-capable representati
 Ryft avoids by being greenfield. The audit for this revision also found that the semantic entry point was further
 along than the drafted phases assumed: P3d had already landed the gateway with eager checked execution, partial
 evaluation, and the mapped-batching rejection, so Phase 12 was scoped as verification-and-closure rather than
-introduction, and the gateway's own compiled lowering remains Phase 7 work as recorded by P4c. The `DimensionType`
-motivation rustdoc added earlier the same day overstated the provenance restriction ("never from array data") and was
-corrected in the same session to name the gateway as the single checked exception.
+introduction, and the gateway's own compiled lowering was assigned to Phase 7 as recorded by P4c and is now complete.
+The `DimensionType` motivation rustdoc added earlier the same day overstated the provenance restriction ("never from
+array data") and was corrected in the same session to name the gateway as the single checked exception.

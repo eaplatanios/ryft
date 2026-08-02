@@ -176,6 +176,78 @@ pub(crate) struct XlaExecutableSignature {
 
     /// Physical result ordinal for each logical flattened output.
     output_mapping: Arc<[Option<usize>]>,
+
+    /// Hidden scalar arguments that restore bounded dynamic dimensions on physicalized input tensors.
+    input_dimensions: Arc<[XlaInputDimension]>,
+
+    /// Hidden scalar results that report bounded dynamic logical output extents.
+    output_dimensions: Arc<[XlaOutputDimension]>,
+}
+
+/// One bounded dynamic input axis transported as a hidden scalar executable argument.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct XlaInputDimension {
+    /// Logical flattened input containing the dynamic axis.
+    logical_input_index: usize,
+
+    /// Axis within the logical input.
+    axis: usize,
+
+    /// Physical executable argument containing the runtime axis extent.
+    physical_input_index: usize,
+}
+
+impl XlaInputDimension {
+    /// Returns the logical flattened input containing this dynamic axis.
+    #[inline]
+    pub(crate) fn logical_input_index(self) -> usize {
+        self.logical_input_index
+    }
+
+    /// Returns the dynamic axis within the logical input.
+    #[inline]
+    pub(crate) fn axis(self) -> usize {
+        self.axis
+    }
+
+    /// Returns the physical executable argument containing the runtime extent.
+    #[inline]
+    pub(crate) fn physical_input_index(self) -> usize {
+        self.physical_input_index
+    }
+}
+
+/// One bounded dynamic output axis transported as a hidden scalar executable result.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct XlaOutputDimension {
+    /// Logical flattened output containing the dynamic axis.
+    logical_output_index: usize,
+
+    /// Axis within the logical output.
+    axis: usize,
+
+    /// Physical executable result containing the runtime axis extent.
+    physical_output_index: usize,
+}
+
+impl XlaOutputDimension {
+    /// Returns the logical flattened output containing this dynamic axis.
+    #[inline]
+    pub(crate) fn logical_output_index(self) -> usize {
+        self.logical_output_index
+    }
+
+    /// Returns the dynamic axis within the logical output.
+    #[inline]
+    pub(crate) fn axis(self) -> usize {
+        self.axis
+    }
+
+    /// Returns the physical executable result containing the runtime extent.
+    #[inline]
+    pub(crate) fn physical_output_index(self) -> usize {
+        self.physical_output_index
+    }
 }
 
 impl XlaExecutableSignature {
@@ -196,7 +268,34 @@ impl XlaExecutableSignature {
                 })
                 .collect()
         }
-        Self { input_mapping: mapping(input_types), output_mapping: mapping(output_types) }
+        let input_mapping = mapping(input_types);
+        let mut physical_input_index = input_mapping.iter().flatten().count();
+        let mut input_dimensions = Vec::new();
+        for (logical_input_index, input_type) in input_types.iter().enumerate() {
+            for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
+                if dimension.value().is_none() && dimension.upper_bound().is_some() {
+                    input_dimensions.push(XlaInputDimension { logical_input_index, axis, physical_input_index });
+                    physical_input_index += 1;
+                }
+            }
+        }
+        let output_mapping = mapping(output_types);
+        let mut physical_output_index = output_mapping.iter().flatten().count();
+        let mut output_dimensions = Vec::new();
+        for (logical_output_index, output_type) in output_types.iter().enumerate() {
+            for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
+                if dimension.value().is_none() && dimension.upper_bound().is_some() {
+                    output_dimensions.push(XlaOutputDimension { logical_output_index, axis, physical_output_index });
+                    physical_output_index += 1;
+                }
+            }
+        }
+        Self {
+            input_mapping,
+            output_mapping,
+            input_dimensions: input_dimensions.into(),
+            output_dimensions: output_dimensions.into(),
+        }
     }
 
     /// Returns the per-logical-input physical argument mapping.
@@ -211,6 +310,24 @@ impl XlaExecutableSignature {
         &self.output_mapping
     }
 
+    /// Returns hidden bounded-dimension scalar arguments in physical executable order.
+    #[inline]
+    pub(crate) fn input_dimensions(&self) -> &[XlaInputDimension] {
+        &self.input_dimensions
+    }
+
+    /// Returns hidden bounded dynamic-output extent results in physical executable order.
+    #[inline]
+    pub(crate) fn output_dimensions(&self) -> &[XlaOutputDimension] {
+        &self.output_dimensions
+    }
+
+    /// Returns the total number of physical executable arguments.
+    #[inline]
+    pub(crate) fn physical_input_count(&self) -> usize {
+        self.input_mapping.iter().flatten().count() + self.input_dimensions.len()
+    }
+
     /// Projects logical inputs into physical executable order.
     pub(crate) fn project_inputs<T: Clone>(&self, inputs: &[T]) -> Vec<T> {
         Self::project(&self.input_mapping, inputs)
@@ -219,6 +336,68 @@ impl XlaExecutableSignature {
     /// Projects logical outputs into physical executable order.
     pub(crate) fn project_outputs<T: Clone>(&self, outputs: &[T]) -> Vec<T> {
         Self::project(&self.output_mapping, outputs)
+    }
+
+    /// Projects logical data inputs to bounded physical tensor types and appends hidden extent scalars.
+    pub(crate) fn physical_input_types(&self, inputs: &[ArrayType]) -> Vec<ArrayType> {
+        let mut physical = Self::project(&self.input_mapping, inputs);
+        let mut converted = vec![false; physical.len()];
+        for input_dimension in self.input_dimensions.iter() {
+            // The conversion rewrites every axis of the owning tensor at once, so an input with several dynamic axes
+            // is converted only for its first hidden extent entry.
+            let physical_index = self.input_mapping[input_dimension.logical_input_index].unwrap();
+            if std::mem::replace(&mut converted[physical_index], true) {
+                continue;
+            }
+            let dimensions = physical[physical_index]
+                .shape()
+                .dimensions()
+                .iter()
+                .map(|dimension| {
+                    // Dimension bounds validate an exclusive upper above a non-negative lower, so a bounded dynamic
+                    // axis always yields a static bound here; only an unbounded axis stays dynamic, and bounded-input
+                    // materialization rejects it as having no static upper shape.
+                    dimension
+                        .upper_bound()
+                        .and_then(|upper| upper.checked_sub(1))
+                        .map_or_else(|| dimension.clone(), Dimension::Static)
+                })
+                .collect::<Vec<_>>();
+            physical[physical_index] = physical[physical_index].clone().with_shape(Shape::new(dimensions));
+        }
+        physical.extend(self.input_dimensions.iter().map(|_| ArrayType::scalar(DataType::I32)));
+        physical
+    }
+
+    /// Projects logical outputs and appends hidden output-extent scalar types.
+    pub(crate) fn physical_output_types(&self, outputs: &[ArrayType]) -> Vec<ArrayType> {
+        let mut physical = Self::project(&self.output_mapping, outputs);
+        physical.extend(self.output_dimensions.iter().map(|_| ArrayType::scalar(DataType::I64)));
+        physical
+    }
+
+    /// Projects logical input shardings and appends a replicated scalar sharding per hidden extent argument, on the
+    /// mesh of the argument that owns the extent.
+    pub(crate) fn physical_input_shardings(&self, shardings: &[Sharding]) -> Vec<Sharding> {
+        let mut physical = Self::project(&self.input_mapping, shardings);
+        physical.extend(
+            self.input_dimensions
+                .iter()
+                .map(|dimension| Sharding::replicated(shardings[dimension.logical_input_index].mesh().clone(), 0)),
+        );
+        physical
+    }
+
+    /// Projects logical output shardings and appends a replicated scalar sharding per hidden extent result, on the
+    /// mesh of the output that owns the extent.
+    pub(crate) fn physical_output_shardings(&self, shardings: &[Sharding]) -> Vec<Sharding> {
+        let mut physical = Self::project(&self.output_mapping, shardings);
+        physical.extend(
+            self.output_dimensions
+                .iter()
+                .map(|dimension| Sharding::replicated(shardings[dimension.logical_output_index].mesh().clone(), 0)),
+        );
+        physical
     }
 
     /// Projects one logical sequence according to `mapping`.
@@ -1328,6 +1507,21 @@ fn lower_reshape_dimension_expression<'b, 'c: 'b, 't: 'c>(
             Ok(divide.result(0).expect("stablehlo.divide should return one result").as_ref())
         }
     }
+}
+
+/// Reads one runtime tensor dimension and widens StableHLO's `i32` size result to Ryft's `i64` dimension ABI.
+fn lower_runtime_dimension_size_i64<'b, 'c: 'b, 't: 'c>(
+    input: ValueRef<'b, 'c, 't>,
+    axis: usize,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let size = block.append_operation(stable_hlo::get_dimension_size(input, axis, location)?)?;
+    let size = size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
+    let i64_scalar = context.tensor_type(context.signless_integer_type(64), &[], None, location)?;
+    let size = block.append_operation(stable_hlo::convert(size, i64_scalar, location)?)?;
+    Ok(size.result(0).expect("stablehlo.convert should return one result").as_ref())
 }
 
 /// Converts one Ryft reshape dimension to StableHLO's signed shape element type.
@@ -4432,8 +4626,8 @@ where
     let logical_argument_types =
         capture_types.iter().cloned().chain(global_input_types.iter().cloned()).collect::<Vec<_>>();
     let signature = XlaExecutableSignature::new(logical_argument_types.as_slice(), global_output_types.as_slice());
-    let physical_argument_types = signature.project_inputs(logical_argument_types.as_slice());
-    let physical_output_types = signature.project_outputs(global_output_types.as_slice());
+    let physical_argument_types = signature.physical_input_types(logical_argument_types.as_slice());
+    let physical_output_types = signature.physical_output_types(global_output_types.as_slice());
 
     let context = MlirContext::new();
     let location = context.unknown_location();
@@ -4499,9 +4693,9 @@ where
                     actual: shardings.len(),
                 });
             }
+            let physical_shardings = signature.physical_input_shardings(shardings);
             Some(
-                signature
-                    .project_inputs(shardings)
+                physical_shardings
                     .iter()
                     .map(|sharding| sharding.to_mlir(location))
                     .collect::<Result<Vec<_>, _>>()?,
@@ -4518,9 +4712,9 @@ where
                     actual: shardings.len(),
                 });
             }
+            let physical_shardings = signature.physical_output_shardings(shardings);
             Some(
-                signature
-                    .project_outputs(shardings)
+                physical_shardings
                     .iter()
                     .map(|sharding| sharding.to_mlir(location))
                     .collect::<Result<Vec<_>, _>>()?,
@@ -4564,10 +4758,39 @@ where
                 logical_argument_types.iter().zip(logical_argument_tensor_types.iter()).enumerate()
             {
                 let value = match signature.input_mapping()[logical_index] {
-                    Some(physical_index) => function_block
-                        .argument(physical_index)
-                        .expect("physical function block arguments should exist")
-                        .as_ref(),
+                    Some(physical_index) => {
+                        let mut value = function_block
+                            .argument(physical_index)
+                            .expect("physical function block arguments should exist")
+                            .as_ref();
+                        let mut refined_type = physical_argument_types[physical_index].clone();
+                        for input_dimension in signature
+                            .input_dimensions()
+                            .iter()
+                            .filter(|dimension| dimension.logical_input_index() == logical_index)
+                        {
+                            let mut dimensions = refined_type.shape().dimensions().to_vec();
+                            dimensions[input_dimension.axis()] =
+                                array_type.shape().dimensions()[input_dimension.axis()].clone();
+                            refined_type = refined_type.with_shape(Shape::new(dimensions));
+                            let size = function_block
+                                .argument(input_dimension.physical_input_index())
+                                .expect("hidden input dimension arguments should exist")
+                                .as_ref();
+                            let operation = function_block_ref.append_operation(stable_hlo::set_dimension_size(
+                                value,
+                                size,
+                                lower_tensor_type(&refined_type, &context, location)?,
+                                input_dimension.axis(),
+                                location,
+                            )?)?;
+                            value = operation
+                                .result(0)
+                                .expect("stablehlo.set_dimension_size should return one result")
+                                .as_ref();
+                        }
+                        value
+                    }
                     None => lower_unplaced_constant_output(
                         std::slice::from_ref(array_type),
                         0,
@@ -4593,7 +4816,16 @@ where
                 Some(&nested_functions),
                 &collective_state,
             )?;
-            let physical_outputs = signature.project_outputs(logical_outputs.as_slice());
+            let mut physical_outputs = signature.project_outputs(logical_outputs.as_slice());
+            for output_dimension in signature.output_dimensions() {
+                physical_outputs.push(lower_runtime_dimension_size_i64(
+                    logical_outputs[output_dimension.logical_output_index()],
+                    output_dimension.axis(),
+                    &mut function_block_ref,
+                    &context,
+                    location.as_ref(),
+                )?);
+            }
             function_block_ref.append_operation(func::r#return(physical_outputs.as_slice(), location)?)?;
         }
         let mut function_region = context.region();
@@ -10607,7 +10839,7 @@ mod tests {
 
         assert!(stablehlo.contains("stablehlo.get_dimension_size"), "{stablehlo}");
         assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.set_dimension_size").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.set_dimension_size").count(), 3, "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
     }
 
@@ -11051,7 +11283,7 @@ mod tests {
         assert!(stablehlo.contains("stablehlo.rng_bit_generator"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.set_dimension_size").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.set_dimension_size").count(), 3, "{stablehlo}");
     }
 
     #[test]
@@ -13228,7 +13460,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(stablehlo.matches("stablehlo.get_dimension_size").count(), 4, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.get_dimension_size").count(), 5, "{stablehlo}");
         assert_eq!(stablehlo.matches("@ryft.assert").count(), 1, "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.concatenate"), "{stablehlo}");
 
@@ -13683,6 +13915,15 @@ mod tests {
         assert_eq!(signature.output_mapping(), &[Some(0), None]);
         assert_eq!(signature.project_inputs(&[0, 1, 2]), vec![1, 2]);
         assert_eq!(signature.project_outputs(&[0, 1]), vec![0]);
+        assert_eq!(signature.physical_input_count(), 3);
+        assert_eq!(signature.input_dimensions().len(), 1);
+        assert_eq!(signature.input_dimensions()[0].logical_input_index(), 2);
+        assert_eq!(signature.input_dimensions()[0].axis(), 0);
+        assert_eq!(signature.input_dimensions()[0].physical_input_index(), 2);
+        assert_eq!(signature.output_dimensions().len(), 1);
+        assert_eq!(signature.output_dimensions()[0].logical_output_index(), 0);
+        assert_eq!(signature.output_dimensions()[0].axis(), 0);
+        assert_eq!(signature.output_dimensions()[0].physical_output_index(), 1);
     }
 
     #[test]
@@ -13738,8 +13979,11 @@ mod tests {
             stablehlo,
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<?xi1, #stablehlo.bounds<2>>) -> tensor<?xi1, #stablehlo.bounds<2>> {
-                    return %arg0 : tensor<?xi1, #stablehlo.bounds<2>>
+                  func.func @main(%arg0: tensor<2xi1>, %arg1: tensor<i32>) -> (tensor<?xi1, #stablehlo.bounds<2>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<2xi1>, tensor<i32>) -> tensor<?xi1, #stablehlo.bounds<2>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xi1, #stablehlo.bounds<2>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    return %0, %2 : tensor<?xi1, #stablehlo.bounds<2>>, tensor<i64>
                   }
                 }
             "#},

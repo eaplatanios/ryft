@@ -325,56 +325,6 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// Captures and validates the program-level residuals needed to construct `r#type` as zero.
-fn capture_zero_residual_atoms<V: Value, O: ResidualZeroProvider<V::Type>>(
-    builder: &mut ProgramBuilder<V, O>,
-    source: AtomId,
-    r#type: &V::Type,
-    site: &str,
-) -> Result<Vec<AtomId>, ProgramError> {
-    let expected_types = O::zero_residual_types(r#type);
-    let residuals = O::capture_zero_residuals(builder, source, r#type)?;
-    if residuals.len() != expected_types.len() {
-        return Err(ProgramError::MalformedProgram(format!(
-            "{} captured {} zero residuals but declared {}",
-            site,
-            residuals.len(),
-            expected_types.len(),
-        )));
-    }
-    for (index, (residual, expected_type)) in residuals.iter().copied().zip(expected_types).enumerate() {
-        let actual_type = builder.atoms().get(residual.index()).ok_or(ProgramError::UnboundAtomId { id: residual })?;
-        if actual_type.r#type().as_ref() != &expected_type {
-            return Err(ProgramError::MalformedProgram(format!(
-                "{} zero residual {} has type {} but expected {}",
-                site,
-                index,
-                actual_type.r#type(),
-                expected_type,
-            )));
-        }
-    }
-    Ok(residuals)
-}
-
-// TODO(eaplatanios): Review this.
-/// Forces a residual-backed zero into `context` even when all of its extent operands are known.
-fn residualize_zero<C: Context>(
-    context: &PartialEvaluationContext<C>,
-    r#type: C::Type,
-    residuals: Vec<C::Value>,
-) -> Result<PartialEvaluationValue<C::Value>, ProgramError>
-where
-    C::Operation: ResidualZeroProvider<C::Type>,
-{
-    let residuals = residuals.into_iter().map(PartialEvaluationValue::known_input).collect::<Vec<_>>();
-    let (operation, operands) = C::Operation::zero_operation_with_residuals(r#type, residuals.as_slice())?;
-    let mut outputs = context.residualize(operation, Vec::new(), operands.as_slice())?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
-
 /// Pushforward of a function `f` at a linearization point `x` (i.e., the linear map `ẋ ↦ (∂f/∂x)(x) · ẋ`), packaged
 /// as a reusable callable. This is what [`ForwardModeDifferentiate::linearize`] returns (i.e., the analogue of
 /// [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html)), and it is the forward-mode
@@ -1424,7 +1374,7 @@ where
                     }
                 }
                 MaybeZero::Zero(r#type) => {
-                    let residuals = capture_zero_residual_atoms(
+                    let residuals = capture_and_validate_zero_residual_atoms(
                         &mut primal_builder.borrow_mut(),
                         primal.atom_id()?,
                         &r#type,
@@ -1443,7 +1393,7 @@ where
                             Ok(Tracer::new(primal_context.clone(), TracerState::Live(residual), residual_type))
                         })
                         .collect::<Result<Vec<_>, ProgramError>>()?;
-                    residualize_zero(&evaluation_context, r#type, residuals)?
+                    residualize_zero_from_residual_values(&evaluation_context, r#type, residuals)?
                 }
             };
             tangent_outputs.push(tangent);
@@ -1522,7 +1472,7 @@ where
             }
             let tangent_type = tangent_input.r#type().into_owned();
             let expected_types = O::zero_residual_types(&tangent_type);
-            let residuals = capture_zero_residual_atoms(
+            let residuals = capture_and_validate_zero_residual_atoms(
                 &mut primal_builder.borrow_mut(),
                 primal_input,
                 &tangent_type,
@@ -1858,7 +1808,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
                         &r#type,
                         "pushforward output tangent",
                     )?;
-                    residualize_zero(&evaluation_context, r#type, residuals)?
+                    residualize_zero_from_residual_values(&evaluation_context, r#type, residuals)?
                 }
             };
             primal_outputs.push(primal);
@@ -2116,6 +2066,75 @@ pub fn jvp_projected_operation<
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Captures the program atoms needed to materialize a zero of `r#type` and verifies the provider's declaration.
+/// [`ResidualZeroProvider::zero_residual_types`] declares the runtime values required to construct the zero, while
+/// [`ResidualZeroProvider::capture_zero_residuals`] stages the operations that obtain those values from `source`. This
+/// helper keeps the two methods consistent by checking both the captured atom count and every captured atom's type.
+/// The returned atoms remain in provider-declaration order and can therefore be passed directly to the matching zero
+/// operation.
+///
+/// # Parameters
+///
+///   - `builder`: Program builder in which residual-capture operations are staged.
+///   - `source`: Primal program atom from which the provider obtains runtime geometry.
+///   - `r#type`: Type of the zero that will later be materialized.
+///   - `site`: Description of the capture site included in malformed-program diagnostics.
+fn capture_and_validate_zero_residual_atoms<V: Value, O: ResidualZeroProvider<V::Type>>(
+    builder: &mut ProgramBuilder<V, O>,
+    source: AtomId,
+    r#type: &V::Type,
+    site: &str,
+) -> Result<Vec<AtomId>, ProgramError> {
+    let expected_types = O::zero_residual_types(r#type);
+    let residuals = O::capture_zero_residuals(builder, source, r#type)?;
+    if residuals.len() != expected_types.len() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "{} captured {} zero residuals but declared {}",
+            site,
+            residuals.len(),
+            expected_types.len(),
+        )));
+    }
+    for (index, (residual, expected_type)) in residuals.iter().copied().zip(expected_types).enumerate() {
+        let actual_type = builder.atoms().get(residual.index()).ok_or(ProgramError::UnboundAtomId { id: residual })?;
+        if actual_type.r#type().as_ref() != &expected_type {
+            return Err(ProgramError::MalformedProgram(format!(
+                "{} zero residual {} has type {} but expected {}",
+                site,
+                index,
+                actual_type.r#type(),
+                expected_type,
+            )));
+        }
+    }
+    Ok(residuals)
+}
+
+/// Stages a residual-backed zero as an unknown output of `context`'s residual program. Although `residual_values` are
+/// known during partial evaluation, a reusable linear program must return its non-zero-space tangent outputs as Single
+/// Static Assignment (SSA) values. Binding the zero normally could let partial evaluation fold it into a known value
+/// and remove that output from the program boundary. This helper instead marks the residual values as known inputs to
+/// the zero operation and explicitly residualizes that operation, preserving one unknown program output while retaining
+/// the runtime geometry needed to materialize the zero.
+///
+/// # Parameters
+///
+///   - `context`: Partial-evaluation context whose residual program receives the zero operation.
+///   - `r#type`: Type of the zero to materialize.
+///   - `residual_values`: Runtime geometry values declared by [`ResidualZeroProvider::zero_residual_types`], in
+///     provider-declaration order.
+fn residualize_zero_from_residual_values<C: Context<Operation: ResidualZeroProvider<C::Type>>>(
+    context: &PartialEvaluationContext<C>,
+    r#type: C::Type,
+    residual_values: Vec<C::Value>,
+) -> Result<PartialEvaluationValue<C::Value>, ProgramError> {
+    let residual_values = residual_values.into_iter().map(PartialEvaluationValue::known_input).collect::<Vec<_>>();
+    let (operation, operands) = C::Operation::zero_operation_with_residuals(r#type, residual_values.as_slice())?;
+    let mut outputs = context.residualize(operation, Vec::new(), operands.as_slice())?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
 }
 
 #[cfg(test)]

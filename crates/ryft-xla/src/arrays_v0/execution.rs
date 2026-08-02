@@ -26,6 +26,10 @@ impl<'o> ExecuteArguments<'o> {
         self.inputs_by_device.iter().map(|inputs| ExecutionDeviceInputs::from(inputs.as_slice())).collect()
     }
 
+    /// Creates execution arguments from `arrays`, honoring `donation_flags` only for arrays whose shard buffers are
+    /// uniquely owned. A requested donation is silently downgraded to a non-donating input when any shard buffer is
+    /// shared (for example, by another clone of the array or by a retained materialization cache); callers that need
+    /// to observe the effective decision can inspect [`ExecutionInput::donatable`] on the result.
     pub(crate) fn from_arrays_with_donation(
         arrays: Vec<Array<'o>>,
         addressable_device_ids: &[DeviceId],
@@ -45,6 +49,11 @@ impl<'o> ExecuteArguments<'o> {
             }
         }
 
+        let donation_flags = arrays
+            .iter()
+            .zip(donation_flags)
+            .map(|(array, requested)| *requested && array.has_unique_shard_buffers())
+            .collect::<Vec<_>>();
         let mut buffers_by_array =
             arrays.into_iter().map(Array::into_addressable_buffers_by_device).collect::<Vec<_>>();
 

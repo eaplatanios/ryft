@@ -39,7 +39,7 @@ use ryft_core::operations::dimensions::{DimensionFromScalar, DimensionSize};
 use ryft_core::parameters::{Parameterized, Placeholder};
 use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::BindingRegionDriver;
-use ryft_core::programs::types::{Type, TypeError, Typed};
+use ryft_core::programs::types::{Type, TypeError, TypeRefinements, Typed};
 use ryft_core::programs::{ProgramError, ValueProjection};
 use ryft_core::sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
@@ -49,15 +49,20 @@ use ryft_core::tracing::DomainTracer;
 use ryft_core::types::DimensionType;
 use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
 use ryft_core::types::{
-    ArrayProgramType, ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout, Tile, TileDimension,
-    TiledLayout,
+    ArrayProgramType, ArrayType, DataType, Dimension, Layout, Memory, Shape, StaticShape, StridedLayout, Tile,
+    TileDimension, TiledLayout,
 };
 
 use super::lowering::XlaExecutableSignature;
 use super::operations::ShardMapOperation;
 use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
 use super::shard_map::ShardMapTraceError;
-use crate::arrays_v0::{ArrayError, ShardDescriptor, ShardLayout};
+use crate::arrays::ArrayTypeExtension;
+use crate::arrays_v0::host::{DenseArrayHostCopy, begin_materialize_dense_array_bytes, materialize_dense_array_bytes};
+use crate::arrays_v0::{
+    ArrayError, BoundedMaterializationKey, BoundedMaterializationProbe, BoundedMaterializationProducer,
+    BoundedMaterializationWaiter, ShardDescriptor, ShardLayout,
+};
 use crate::{Array, Error, FromPjrt, ToPjrt};
 
 /// Error type returned by [`XlaDomain`] orchestration helpers.
@@ -1188,10 +1193,10 @@ impl XlaLoweredProgram {
     }
 }
 
-const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA2";
-const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 4;
-const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 1;
-const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 4;
+const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA5";
+const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 5;
+const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 2;
+const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 5;
 static XLA_COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "ryft-xla/{}/openxla/{}/jax/{}",
@@ -1291,13 +1296,15 @@ pub struct XlaOptimizedProgram {
 }
 
 #[derive(Serialize)]
-struct XlaPersistentKeyV4<'a> {
+struct XlaPersistentKeyV5<'a> {
     schema_version: u32,
     stable_hlo: &'a str,
     compilation_options: &'a [u8],
     signature: PersistentCanonicalArraySignatureV3,
     input_mapping: Vec<Option<u64>>,
     output_mapping: Vec<Option<u64>>,
+    input_dimensions: Vec<PersistentBoundaryDimensionV5>,
+    output_dimensions: Vec<PersistentBoundaryDimensionV5>,
     requires_assertion_handler: bool,
     donation_flags: &'a [bool],
     capture_count: u64,
@@ -1311,13 +1318,15 @@ struct XlaPersistentKeyV4<'a> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct XlaPersistentExecutableMetadataV4 {
+struct XlaPersistentExecutableMetadataV5 {
     schema_version: u32,
     feature_flags: u64,
     compilation_options: Vec<u8>,
     signature: PersistentArraySignatureV3,
     input_mapping: Vec<Option<u64>>,
     output_mapping: Vec<Option<u64>>,
+    input_dimensions: Vec<PersistentBoundaryDimensionV5>,
+    output_dimensions: Vec<PersistentBoundaryDimensionV5>,
     requires_assertion_handler: bool,
     donation_flags: Vec<bool>,
     capture_count: u64,
@@ -1332,6 +1341,19 @@ struct XlaPersistentExecutableMetadataV4 {
     compiler_identity: String,
     xla_flags: String,
     compilation_duration_nanoseconds: Option<u64>,
+}
+
+/// Persisted logical-axis-to-hidden-physical-slot mapping for one bounded dynamic dimension.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistentBoundaryDimensionV5 {
+    /// Logical flattened input or output index containing the dynamic axis.
+    logical_index: u64,
+
+    /// Axis within the logical array.
+    axis: u64,
+
+    /// Hidden physical argument or result index carrying the runtime extent.
+    physical_index: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1744,6 +1766,32 @@ fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, Xla
         .collect()
 }
 
+/// Encodes the hidden bounded-input extent slots of one executable signature.
+fn persistent_input_dimensions(signature: &XlaExecutableSignature) -> Vec<PersistentBoundaryDimensionV5> {
+    signature
+        .input_dimensions()
+        .iter()
+        .map(|dimension| PersistentBoundaryDimensionV5 {
+            logical_index: dimension.logical_input_index() as u64,
+            axis: dimension.axis() as u64,
+            physical_index: dimension.physical_input_index() as u64,
+        })
+        .collect()
+}
+
+/// Encodes the hidden bounded-output extent slots of one executable signature.
+fn persistent_output_dimensions(signature: &XlaExecutableSignature) -> Vec<PersistentBoundaryDimensionV5> {
+    signature
+        .output_dimensions()
+        .iter()
+        .map(|dimension| PersistentBoundaryDimensionV5 {
+            logical_index: dimension.logical_output_index() as u64,
+            axis: dimension.axis() as u64,
+            physical_index: dimension.physical_output_index() as u64,
+        })
+        .collect()
+}
+
 /// Encodes `data_type` as a stable one-byte code for persistent executables. These codes are persisted, so new data
 /// types must be appended with fresh codes and existing codes must never be renumbered.
 fn encode_data_type(data_type: DataType) -> u8 {
@@ -1969,6 +2017,12 @@ impl<'c> XlaDomain<'c> {
     }
 
     /// Enqueues `program` and returns its possibly still pending flat outputs together with a whole-execution fence.
+    ///
+    /// For programs without bounded-dynamic boundaries, this call only enqueues device work: the returned arrays and
+    /// fence resolve asynchronously. Bounded-dynamic boundaries weaken that guarantee in two ways: below-bound inputs
+    /// perform blocking device-to-host copies and bound-shaped uploads before the launch, and each bounded-dynamic
+    /// output blocks on the device-to-host readback of its hidden extent scalar because the logical output type cannot
+    /// be constructed without the runtime extent.
     pub(crate) fn execute_compiled_async(
         &self,
         program: &XlaCompiledProgram<'c>,
@@ -1986,41 +2040,136 @@ impl<'c> XlaDomain<'c> {
                 ),
             });
         }
-        let inputs = program.signature.project_inputs(inputs.as_slice());
-        let physical_input_types = program.signature.project_inputs(&program.input_types);
+        let actual_input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let refinement_input_types = program
+            .input_types
+            .iter()
+            .zip(actual_input_types.iter())
+            .map(|(declared, actual)| {
+                // Sharding is normalized separately at the executable boundary. Preserve every other observed type
+                // component so refinement still rejects a wrong data type, layout, memory space, rank, or extent.
+                actual.clone().with_sharding(declared.sharding().cloned()).map_err(ArrayError::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_refinements =
+            <ArrayType as Type>::Refinements::establish(program.input_types.iter(), refinement_input_types.iter())
+                .map_err(ProgramError::from)?;
+        let physical_input_types = program.signature.physical_input_types(&program.input_types);
+        let inputs = materialize_bounded_dynamic_inputs(
+            self.client()?,
+            &program.signature,
+            &program.input_types,
+            actual_input_types.as_slice(),
+            inputs,
+        )?
+        .inputs;
         let inputs = materialize_zero_space_carriers(self.client()?, physical_input_types.as_slice(), inputs)?;
         let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
         let logical_donation_flags = std::iter::repeat_n(false, program.capture_count)
             .chain(program.donation_flags.iter().copied())
             .collect::<Vec<_>>();
         let mut donation_flags = program.signature.project_inputs(logical_donation_flags.as_slice());
-        for (donation, input_type) in donation_flags.iter_mut().zip(physical_input_types) {
+        donation_flags.extend(std::iter::repeat_n(false, program.signature.input_dimensions().len()));
+        for (donation, input_type) in donation_flags.iter_mut().zip(physical_input_types.iter()) {
             if input_type.data_type().is_zero() {
                 *donation = false;
             }
         }
-        let physical_output_types = program.signature.project_outputs(&program.output_types);
-        let execution = execute_pjrt(
-            self.client()?,
-            &program.executable,
-            &program.mesh,
-            inputs,
-            donation_flags.as_slice(),
-            physical_output_types.as_slice(),
-        )?;
+        let physical_output_count =
+            program.signature.output_mapping().iter().flatten().count() + program.signature.output_dimensions().len();
+        let execution =
+            execute_pjrt_buffers(&program.executable, inputs, donation_flags.as_slice(), physical_output_count)?;
         let (physical_outputs, fence) = execution.into_parts();
-        let mut physical_outputs = physical_outputs.into_iter();
+        let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
+        let scalar_type = ArrayType::scalar(DataType::I64).replicated(&program.mesh).map_err(ArrayError::from)?;
+        let mut output_extents = BTreeMap::new();
+        for output_dimension in program.signature.output_dimensions() {
+            let scalar = Array::from_canonical_addressable_buffers(
+                self.client()?,
+                scalar_type.clone(),
+                program.mesh.clone(),
+                physical_outputs[output_dimension.physical_output_index()].take().unwrap(),
+            )?
+            .with_execution_fence(fence.clone());
+            let bytes = materialize_dense_array_bytes(&scalar)?;
+            let extent = bytes
+                .get(..size_of::<i64>())
+                .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+                .and_then(|extent| usize::try_from(extent).ok())
+                .ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!(
+                        "runtime extent for output {} axis {} is negative, missing, or exceeds usize",
+                        output_dimension.logical_output_index(),
+                        output_dimension.axis(),
+                    ),
+                })?;
+            output_extents.insert((output_dimension.logical_output_index(), output_dimension.axis()), extent);
+        }
+
         let mut outputs = Vec::with_capacity(program.output_types.len());
-        for (mapping, output_type) in program.signature.output_mapping().iter().zip(program.output_types.iter()) {
+        for (logical_index, (mapping, output_type)) in
+            program.signature.output_mapping().iter().zip(program.output_types.iter()).enumerate()
+        {
             match mapping {
-                Some(_) => outputs.push(physical_outputs.next().unwrap()),
+                Some(physical_index) => {
+                    let dimensions = output_type
+                        .shape()
+                        .dimensions()
+                        .iter()
+                        .enumerate()
+                        .map(|(axis, dimension)| {
+                            dimension
+                                .value()
+                                .or_else(|| output_extents.get(&(logical_index, axis)).copied())
+                                .map_or_else(
+                                    || {
+                                        Err(ProgramError::MalformedProgram(format!(
+                                            "executable omitted runtime extent for output {logical_index} axis {axis}",
+                                        )))
+                                    },
+                                    |extent| Ok(Dimension::Static(extent)),
+                                )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let output_type = output_type.clone().with_shape(Shape::new(dimensions));
+                    let output_type = match output_type.sharding() {
+                        Some(_) => output_type,
+                        None => output_type.replicated(&program.mesh).map_err(ArrayError::from)?,
+                    };
+                    outputs.push(
+                        Array::from_canonical_addressable_buffers(
+                            self.client()?,
+                            output_type,
+                            program.mesh.clone(),
+                            physical_outputs[*physical_index].take().unwrap(),
+                        )?
+                        .with_execution_fence(fence.clone()),
+                    );
+                }
                 None => outputs.push(
                     Array::from_zero_space(self.client()?, output_type.clone(), program.mesh.clone())?
                         .with_execution_fence(fence.clone()),
                 ),
             }
         }
-        assert!(physical_outputs.next().is_none());
+        if physical_outputs.iter().any(Option::is_some) {
+            return Err(
+                ProgramError::MalformedProgram("executable returned an unclaimed physical output".to_string()).into()
+            );
+        }
+        let mut closed_identities = Vec::new();
+        for (_, identity) in program.input_types.iter().chain(program.output_types.iter()).flat_map(Type::identities) {
+            if !closed_identities.contains(identity) {
+                closed_identities.push(identity.clone());
+            }
+        }
+        input_refinements
+            .validate(
+                program.output_types.iter(),
+                outputs.iter().map(|output| output.r#type().into_owned()),
+                closed_identities.as_slice(),
+            )
+            .map_err(ProgramError::from)?;
         Ok(Execution::new(outputs, fence))
     }
 }
@@ -2195,7 +2344,7 @@ impl<'c> XlaDomain<'c> {
                 *donation = false;
             }
         }
-        let expected_argument_shardings = signature.project_inputs(logical_argument_shardings.as_slice());
+        let expected_argument_shardings = signature.physical_input_shardings(logical_argument_shardings.as_slice());
         let client = self.client()?;
 
         Ok(XlaLoweredProgram {
@@ -2219,13 +2368,15 @@ impl<'c> XlaDomain<'c> {
 
     fn xla_compilation_key(program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
         let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
-        let key = XlaPersistentKeyV4 {
+        let key = XlaPersistentKeyV5 {
             schema_version: XLA_PERSISTENT_KEY_SCHEMA_VERSION,
             stable_hlo: &program.stable_hlo,
             compilation_options: compilation_options.as_slice(),
             signature: PersistentArraySignatureV3::encode(&program.input_types, &program.output_types).into_canonical(),
             input_mapping: persistent_mapping(program.signature.input_mapping())?,
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
+            input_dimensions: persistent_input_dimensions(&program.signature),
+            output_dimensions: persistent_output_dimensions(&program.signature),
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count as u64,
@@ -2313,13 +2464,15 @@ impl<'c> XlaDomain<'c> {
             Err(error) => return Err(error.into()),
         };
         let device_assignment = program.executable.device_assignment()?;
-        let metadata = XlaPersistentExecutableMetadataV4 {
+        let metadata = XlaPersistentExecutableMetadataV5 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
             feature_flags: XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: program.compilation_options.encode_to_vec(),
             signature: PersistentArraySignatureV3::encode(&program.input_types, &program.output_types),
             input_mapping: persistent_mapping(program.signature.input_mapping())?,
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
+            input_dimensions: persistent_input_dimensions(&program.signature),
+            output_dimensions: persistent_output_dimensions(&program.signature),
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: program.donation_flags.to_vec(),
             capture_count: program.capture_count as u64,
@@ -2372,7 +2525,7 @@ impl<'c> XlaDomain<'c> {
             .checked_add(metadata_size)
             .filter(|metadata_end| *metadata_end <= bytes.len())
             .ok_or_else(|| persistent_error("persistent executable metadata is truncated"))?;
-        let metadata: XlaPersistentExecutableMetadataV4 = serde_json::from_slice(&bytes[header_size..metadata_end])
+        let metadata: XlaPersistentExecutableMetadataV5 = serde_json::from_slice(&bytes[header_size..metadata_end])
             .map_err(|error| persistent_error(format!("failed to decode metadata: {error}")))?;
         if metadata.schema_version != XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION
             || metadata.feature_flags != XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS
@@ -2400,6 +2553,8 @@ impl<'c> XlaDomain<'c> {
         let signature = XlaExecutableSignature::new(input_types.as_slice(), output_types.as_slice());
         if persistent_mapping(signature.input_mapping())? != metadata.input_mapping
             || persistent_mapping(signature.output_mapping())? != metadata.output_mapping
+            || persistent_input_dimensions(&signature) != metadata.input_dimensions
+            || persistent_output_dimensions(&signature) != metadata.output_dimensions
         {
             return Err(persistent_error("executable signature does not match logical input and output types"));
         }
@@ -2427,7 +2582,7 @@ impl<'c> XlaDomain<'c> {
         {
             return Err(persistent_error("device assignment does not match executable mesh"));
         }
-        let physical_input_count = signature.input_mapping().iter().filter(|index| index.is_some()).count();
+        let physical_input_count = signature.physical_input_count();
         if capture_count > input_types.len()
             || expected_argument_shardings.len() != physical_input_count
             || metadata.donation_flags.len() != input_types.len() - capture_count
@@ -2861,44 +3016,492 @@ fn reshard_inputs_if_needed<'c>(
         .collect()
 }
 
+/// Host copy that has been issued for one bounded input requiring padding.
+struct PendingBoundedInputHostCopy<'c> {
+    /// Logical input index used to recover the runtime array metadata.
+    logical_input_index: usize,
+
+    /// Physical executable input slot to populate.
+    physical_input_index: usize,
+
+    /// Static executable type defining the padding target.
+    physical_type: ArrayType,
+
+    /// Concrete logical shape copied from the runtime input.
+    actual_shape: StaticShape,
+
+    /// Static executable-bound shape used for physical storage.
+    physical_shape: StaticShape,
+
+    /// Already-issued host copy for the logical input.
+    host_copy: DenseArrayHostCopy,
+
+    /// Single-flight reservation that retains success.
+    producer: BoundedMaterializationProducer<'c>,
+}
+
+/// Bound-shaped upload issued for one padded input but not yet published to its cache or executable slot.
+struct PendingBoundedInputPublication<'c> {
+    /// Physical executable input slot to populate after readiness succeeds.
+    physical_input_index: usize,
+
+    /// Uploaded physical array whose asynchronous transfer must become ready before publication.
+    physical: Array<'c>,
+
+    /// Single-flight reservation that retains ready success.
+    producer: BoundedMaterializationProducer<'c>,
+}
+
+/// Cache waiter retained until all producer copies in this call have completed.
+struct WaitingBoundedInputMaterialization<'c> {
+    /// Logical input index used to retry production if the prior producer fails.
+    logical_input_index: usize,
+
+    /// Physical executable input slot to populate.
+    physical_input_index: usize,
+
+    /// Static executable type defining the cache key and padding target.
+    physical_type: ArrayType,
+
+    /// Concrete logical shape copied from the runtime input on a retry.
+    actual_shape: StaticShape,
+
+    /// Static executable-bound shape used for physical storage on a retry.
+    physical_shape: StaticShape,
+
+    /// Non-spinning single-flight wait handle.
+    waiter: BoundedMaterializationWaiter<'c>,
+}
+
+/// Deterministic work and transport report for one bounded-input materialization boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BoundedInputMaterializationReport {
+    /// Inputs that reused original device buffers because the runtime shape equaled the bound.
+    at_bound_reuses: usize,
+
+    /// Ready retained materializations reused without padding work or transport.
+    cache_hits: usize,
+
+    /// Missing cache entries whose successful production was retained.
+    retained_misses: usize,
+
+    /// Device-to-host shard copies issued by padding work.
+    device_to_host_shard_copies: usize,
+
+    /// Full-global host merge buffers allocated after shard copies.
+    host_merge_buffer_allocations: usize,
+
+    /// O(bound) host padding payloads allocated.
+    host_padding_payload_allocations: usize,
+
+    /// Bound-shaped host-to-device shard uploads.
+    host_to_device_shard_uploads: usize,
+
+    /// Hidden logical-extent scalar host-to-device uploads.
+    extent_scalar_uploads: usize,
+
+    /// Sum of logical payload bytes for bounded inputs.
+    actual_bytes: usize,
+
+    /// Sum of physical-bound payload bytes for bounded inputs.
+    bound_bytes: usize,
+}
+
+/// Physical inputs and their deterministic bounded-materialization work report.
+struct MaterializedBoundedInputs<'c> {
+    /// Physical executable inputs, including hidden extent scalars.
+    inputs: Vec<Array<'c>>,
+
+    /// Path-local work and transport counts.
+    #[cfg_attr(not(test), allow(dead_code))]
+    report: BoundedInputMaterializationReport,
+}
+
+/// Selects whether a bounded input can reuse its device buffer or requires host padding.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BoundedInputPacking {
+    /// The runtime shape already equals the executable's physical bound.
+    Reuse,
+
+    /// At least one runtime extent is smaller than its executable bound.
+    Pad,
+}
+
+/// Determines the bounded-input packing tier from concrete runtime and executable shapes.
+fn bounded_input_packing(actual_shape: &StaticShape, physical_shape: &StaticShape) -> BoundedInputPacking {
+    if actual_shape == physical_shape { BoundedInputPacking::Reuse } else { BoundedInputPacking::Pad }
+}
+
+/// Completes one already-issued host copy and issues its bound-shaped upload without publishing it.
+fn upload_bounded_input_host_copy<'c>(
+    client: &'c Client<'c>,
+    input: &Array<'c>,
+    pending: PendingBoundedInputHostCopy<'c>,
+    report: &mut BoundedInputMaterializationReport,
+) -> Result<PendingBoundedInputPublication<'c>, XlaDomainError> {
+    report.device_to_host_shard_copies += pending.host_copy.shard_copy_count();
+    let (source_bytes, allocated_merge_buffer) = pending.host_copy.finish_with_measurements()?;
+    report.host_merge_buffer_allocations += usize::from(allocated_merge_buffer);
+    let (padded_bytes, padding_payload_allocations) = pad_dense_array_bytes_with_target_allocation_count(
+        source_bytes.as_slice(),
+        pending.actual_shape.as_slice(),
+        pending.physical_shape.as_slice(),
+        pending.physical_type.data_type(),
+    )?;
+    report.host_padding_payload_allocations += padding_payload_allocations;
+    let physical = Array::from_host_buffer(client, pending.physical_type, input.mesh(), padded_bytes)?;
+    report.host_to_device_shard_uploads += physical.shards().iter().filter(|shard| shard.buffer().is_some()).count();
+    Ok(PendingBoundedInputPublication {
+        physical_input_index: pending.physical_input_index,
+        physical,
+        producer: pending.producer,
+    })
+}
+
+/// Publishes one batch only after every asynchronously uploaded physical array passes `check_readiness`.
+fn publish_bounded_input_uploads<'c>(
+    publications: Vec<PendingBoundedInputPublication<'c>>,
+    physical_inputs: &mut [Array<'c>],
+    check_readiness: &mut impl FnMut(&[PendingBoundedInputPublication<'c>]) -> Result<(), XlaDomainError>,
+) -> Result<(), XlaDomainError> {
+    // Readiness is checked for the complete batch before any producer publishes. An error therefore drops every
+    // reservation in the batch, caches no failed upload, and leaves all concurrent H2D work issued.
+    check_readiness(publications.as_slice())?;
+    for publication in publications {
+        physical_inputs[publication.physical_input_index] = publication.producer.complete(publication.physical);
+    }
+    Ok(())
+}
+
+/// Pads bounded-dynamic inputs to static executable storage and appends their logical extents.
+///
+/// Dispatch has two tiers in this boundary: (1) an actual shape equal to the physical bound reuses the source array;
+/// and (2) a smaller value uses a clone-shared retained materialization, with one single-flight producer per
+/// structural `(ZeroOriginV1, physical ArrayType)` key. Below-bound zero-space values are deferred to
+/// [`materialize_zero_space_carriers`], which synthesizes their bound-shaped carriers directly, and below-bound values
+/// with non-addressable shards are rejected because padding must read every shard's bytes on this process. Every
+/// producer D2H copy is issued during the first scan. The resulting H2D uploads are also all issued before any upload
+/// readiness wait, and retained values are published only after the complete batch succeeds. Cold work is O(bound)
+/// bytes plus O(shard-segment-count) overlap bookkeeping; ready hits perform no pad-path allocation or transport. A
+/// failed asynchronous upload stores no cache entry and a later call retries the ordinary cold path.
+fn materialize_bounded_dynamic_inputs<'c>(
+    client: &'c Client<'c>,
+    signature: &XlaExecutableSignature,
+    declared_types: &[ArrayType],
+    actual_types: &[ArrayType],
+    inputs: Vec<Array<'c>>,
+) -> Result<MaterializedBoundedInputs<'c>, XlaDomainError> {
+    materialize_bounded_dynamic_inputs_with_readiness(
+        client,
+        signature,
+        declared_types,
+        actual_types,
+        inputs,
+        |publications| {
+            for publication in publications {
+                publication.physical.block_until_ready()?;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Implements bounded-input materialization with an injectable batch readiness check for deterministic failure tests.
+fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
+    client: &'c Client<'c>,
+    signature: &XlaExecutableSignature,
+    declared_types: &[ArrayType],
+    actual_types: &[ArrayType],
+    inputs: Vec<Array<'c>>,
+    mut check_readiness: impl FnMut(&[PendingBoundedInputPublication<'c>]) -> Result<(), XlaDomainError>,
+) -> Result<MaterializedBoundedInputs<'c>, XlaDomainError> {
+    assert_eq!(declared_types.len(), inputs.len());
+    assert_eq!(actual_types.len(), inputs.len());
+    let physical_types = signature.physical_input_types(declared_types);
+    let mut physical_inputs = signature.project_inputs(inputs.as_slice());
+    let mut pending_host_copies = Vec::new();
+    let mut waiting_materializations = Vec::new();
+    let mut report = BoundedInputMaterializationReport::default();
+    for logical_input_index in 0..inputs.len() {
+        if !signature
+            .input_dimensions()
+            .iter()
+            .any(|input_dimension| input_dimension.logical_input_index() == logical_input_index)
+        {
+            continue;
+        }
+        let physical_input_index = signature.input_mapping()[logical_input_index].unwrap();
+        let physical_type = physical_types[physical_input_index].clone();
+        let physical_shape = physical_type.static_shape().ok_or_else(|| ProgramError::InvalidArgument {
+            message: format!("bounded-dynamic executable input {logical_input_index} has no static upper shape"),
+        })?;
+        let actual_shape =
+            actual_types[logical_input_index].static_shape().ok_or_else(|| ProgramError::InvalidArgument {
+                message: format!("runtime executable input {logical_input_index} must have a static shape"),
+            })?;
+        report.actual_bytes += actual_types[logical_input_index].size_in_bytes()?;
+        report.bound_bytes += physical_type.size_in_bytes()?;
+        if bounded_input_packing(&actual_shape, &physical_shape) == BoundedInputPacking::Reuse {
+            report.at_bound_reuses += 1;
+            continue;
+        }
+
+        // A below-bound zero-space input carries no payload bytes to pad or cache: its dense host copy is empty, so
+        // the retained-cache and byte-pad tiers below must not run. The zero-space carrier materialization that
+        // follows this boundary synthesizes its bound-shaped all-false predicate directly instead.
+        if physical_type.data_type().is_zero() {
+            continue;
+        }
+
+        let input = &inputs[logical_input_index];
+        if input.supports_bounded_materialization_cache() {
+            match input.probe_bounded_materialization(BoundedMaterializationKey::new(physical_type.clone())) {
+                BoundedMaterializationProbe::Hit(physical) => {
+                    report.cache_hits += 1;
+                    physical_inputs[physical_input_index] = physical;
+                }
+                BoundedMaterializationProbe::Produce(producer) => {
+                    report.retained_misses += 1;
+                    pending_host_copies.push(PendingBoundedInputHostCopy {
+                        logical_input_index,
+                        physical_input_index,
+                        physical_type,
+                        actual_shape,
+                        physical_shape,
+                        host_copy: begin_materialize_dense_array_bytes(input)?,
+                        producer,
+                    });
+                }
+                BoundedMaterializationProbe::Wait(waiter) => {
+                    waiting_materializations.push(WaitingBoundedInputMaterialization {
+                        logical_input_index,
+                        physical_input_index,
+                        physical_type,
+                        actual_shape,
+                        physical_shape,
+                        waiter,
+                    });
+                }
+            }
+        } else {
+            // Padding reads every shard's bytes on this process, so an input with a non-addressable shard cannot be
+            // materialized here at all; reject it explicitly instead of failing deep inside the host copy.
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "bounded-dynamic executable input {logical_input_index} is below its bound but has \
+                     non-addressable shards, so it cannot be padded on this process",
+                ),
+            }
+            .into());
+        }
+    }
+
+    let mut pending_publications = Vec::with_capacity(pending_host_copies.len());
+    for pending in pending_host_copies {
+        let input = &inputs[pending.logical_input_index];
+        pending_publications.push(upload_bounded_input_host_copy(client, input, pending, &mut report)?);
+    }
+    publish_bounded_input_uploads(pending_publications, &mut physical_inputs, &mut check_readiness)?;
+
+    for waiting in waiting_materializations {
+        let WaitingBoundedInputMaterialization {
+            logical_input_index,
+            physical_input_index,
+            physical_type,
+            actual_shape,
+            physical_shape,
+            waiter,
+        } = waiting;
+        match waiter.resolve() {
+            Ok(physical) => {
+                report.cache_hits += 1;
+                physical_inputs[physical_input_index] = physical;
+            }
+            Err(producer) => {
+                // The prior producer failed and removed its reservation. This waiter is now the retry producer. Its
+                // copy necessarily starts after that failure; the ordinary all-miss path above stays fully concurrent.
+                report.retained_misses += 1;
+                let input = &inputs[logical_input_index];
+                let pending = PendingBoundedInputHostCopy {
+                    logical_input_index,
+                    physical_input_index,
+                    physical_type,
+                    actual_shape,
+                    physical_shape,
+                    host_copy: begin_materialize_dense_array_bytes(input)?,
+                    producer,
+                };
+                let publication = upload_bounded_input_host_copy(client, input, pending, &mut report)?;
+                publish_bounded_input_uploads(vec![publication], &mut physical_inputs, &mut check_readiness)?;
+            }
+        }
+    }
+
+    for input_dimension in signature.input_dimensions() {
+        let input = &inputs[input_dimension.logical_input_index()];
+        let extent = actual_types[input_dimension.logical_input_index()].shape().dimensions()[input_dimension.axis()]
+            .value()
+            .unwrap();
+        let extent = i32::try_from(extent).map_err(|_| ProgramError::InvalidArgument {
+            message: format!("runtime dimension extent {extent} does not fit in a StableHLO i32 scalar"),
+        })?;
+        let (extent_scalar, uploaded) = input.logical_extent_scalar(client, extent)?;
+        report.extent_scalar_uploads += usize::from(uploaded);
+        physical_inputs.push(extent_scalar);
+    }
+    assert_eq!(physical_inputs.len(), signature.physical_input_count());
+    Ok(MaterializedBoundedInputs { inputs: physical_inputs, report })
+}
+
+/// Zero-pads one dense row-major array into a larger shape of the same rank.
+#[cfg(test)]
+fn pad_dense_array_bytes(
+    source: &[u8],
+    source_shape: &[usize],
+    target_shape: &[usize],
+    data_type: DataType,
+) -> Result<Vec<u8>, XlaDomainError> {
+    pad_dense_array_bytes_with_target_allocation_count(source, source_shape, target_shape, data_type)
+        .map(|(bytes, _)| bytes)
+}
+
+/// Zero-pads one dense row-major array and reports the number of target payload allocations.
+///
+/// The count deliberately covers the O(bound) payload allocation, which dominates this path. Small O(rank) stride
+/// vectors are implementation metadata and are not included.
+fn pad_dense_array_bytes_with_target_allocation_count(
+    source: &[u8],
+    source_shape: &[usize],
+    target_shape: &[usize],
+    data_type: DataType,
+) -> Result<(Vec<u8>, usize), XlaDomainError> {
+    if source_shape.len() != target_shape.len()
+        || source_shape.iter().zip(target_shape).any(|(source, target)| source > target)
+    {
+        return Err(ProgramError::InvalidArgument {
+            message: format!(
+                "cannot pad runtime shape {:?} into bounded physical shape {:?}",
+                source_shape, target_shape,
+            ),
+        }
+        .into());
+    }
+    let element_size = data_type.to_pjrt().element_size_in_bytes()?;
+    let mut source_strides = vec![1usize; source_shape.len()];
+    let mut target_strides = vec![1usize; target_shape.len()];
+    for axis in (0..source_shape.len().saturating_sub(1)).rev() {
+        source_strides[axis] = source_strides[axis + 1].checked_mul(source_shape[axis + 1]).ok_or_else(|| {
+            ProgramError::InvalidArgument { message: "runtime input shape strides exceed usize".to_string() }
+        })?;
+        target_strides[axis] = target_strides[axis + 1].checked_mul(target_shape[axis + 1]).ok_or_else(|| {
+            ProgramError::InvalidArgument { message: "bounded physical shape strides exceed usize".to_string() }
+        })?;
+    }
+    let target_elements = target_shape.iter().try_fold(1usize, |count, dimension| {
+        count.checked_mul(*dimension).ok_or_else(|| ProgramError::InvalidArgument {
+            message: "bounded physical input element count exceeds usize".to_string(),
+        })
+    })?;
+    let mut target = vec![
+        0u8;
+        target_elements.checked_mul(element_size).ok_or_else(|| ProgramError::InvalidArgument {
+            message: "bounded physical input byte count exceeds usize".to_string(),
+        })?
+    ];
+    if source_shape.is_empty() {
+        target.copy_from_slice(source);
+        let allocation_count = usize::from(!target.is_empty());
+        return Ok((target, allocation_count));
+    }
+    copy_dense_array_into_padding(
+        source,
+        &mut target,
+        source_shape,
+        source_strides.as_slice(),
+        target_strides.as_slice(),
+        element_size,
+        0,
+        0,
+        0,
+    );
+    let allocation_count = usize::from(!target.is_empty());
+    Ok((target, allocation_count))
+}
+
+/// Recursively copies one dense row-major source into the origin-aligned region of a padded target.
+#[allow(clippy::too_many_arguments)]
+fn copy_dense_array_into_padding(
+    source: &[u8],
+    target: &mut [u8],
+    source_shape: &[usize],
+    source_strides: &[usize],
+    target_strides: &[usize],
+    element_size: usize,
+    axis: usize,
+    source_offset: usize,
+    target_offset: usize,
+) {
+    if axis + 1 == source_shape.len() {
+        let byte_count = source_shape[axis] * element_size;
+        let source_offset = source_offset * element_size;
+        let target_offset = target_offset * element_size;
+        target[target_offset..target_offset + byte_count]
+            .copy_from_slice(&source[source_offset..source_offset + byte_count]);
+        return;
+    }
+    for index in 0..source_shape[axis] {
+        copy_dense_array_into_padding(
+            source,
+            target,
+            source_shape,
+            source_strides,
+            target_strides,
+            element_size,
+            axis + 1,
+            source_offset + index * source_strides[axis],
+            target_offset + index * target_strides[axis],
+        );
+    }
+}
+
 /// Materializes private false-predicate carriers for zero-space inputs that remain in the physical executable
 /// signature, currently because their declared type contains dynamic dimensions. Static zero-space inputs are erased
 /// before this point and never allocate a carrier.
+///
+/// Each carrier is allocated at the input's *physical* (bound-shaped) type from `physical_input_types`, not at the
+/// value's runtime type: the compiled module declares the bound-shaped `i1` argument, and the hidden extent scalar
+/// transports the logical size, so a below-bound zero-space input must still hand PJRT a bound-shaped buffer.
 fn materialize_zero_space_carriers<'c>(
     client: &'c Client<'c>,
-    input_types: &[ArrayType],
+    physical_input_types: &[ArrayType],
     inputs: Vec<Array<'c>>,
 ) -> Result<Vec<Array<'c>>, XlaDomainError> {
-    assert_eq!(input_types.len(), inputs.len());
-    input_types
+    assert_eq!(physical_input_types.len(), inputs.len());
+    physical_input_types
         .iter()
         .zip(inputs)
-        .map(|(input_type, input)| {
-            if !input_type.data_type().is_zero() {
+        .map(|(physical_type, input)| {
+            if !physical_type.data_type().is_zero() {
                 return Ok(input);
             }
             input.block_until_ready()?;
-            let carrier_type = input.r#type().into_owned().with_data_type(DataType::Boolean);
+            let carrier_type = physical_type.clone().with_data_type(DataType::Boolean);
             let element_count = carrier_type
                 .element_count()
                 .map_err(Error::from)?
-                .expect("runtime arrays should only have static shapes");
+                .expect("physical bounded input types should only have static shapes");
             Ok(Array::from_host_buffer(client, carrier_type, input.mesh(), vec![0u8; element_count])?)
         })
         .collect()
 }
 
-/// Executes a compiled PJRT executable against `mesh` and reassembles per-device output buffers into distributed
-/// [`Array`] values carrying `client`, so eager execution and free transforms over the outputs can recover their
-/// execution domain. Mirrors `XlaDomain::execute_with_donation`.
-fn execute_pjrt<'c>(
-    client: &'c Client<'c>,
+/// Executes one PJRT executable and transposes device-major results into one buffer vector per physical output.
+fn execute_pjrt_buffers<'c>(
     executable: &LoadedExecutable<'c>,
-    mesh: &DeviceMesh,
     inputs: Vec<Array<'c>>,
     donation_flags: &[bool],
-    output_types: &[ArrayType],
-) -> Result<Execution<Vec<Array<'c>>>, XlaDomainError> {
+    output_count: usize,
+) -> Result<Execution<Vec<Vec<Buffer<'c>>>>, XlaDomainError> {
     let addressable_device_ids = executable
         .addressable_devices()?
         .iter()
@@ -2910,7 +3513,6 @@ fn execute_pjrt<'c>(
         .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)?
         .into_parts();
 
-    let output_count = output_types.len();
     for outputs in &device_outputs {
         if outputs.outputs.len() != output_count {
             return Err(XlaDomainError::Pjrt(ryft_pjrt::Error::invalid_argument(format!(
@@ -2927,20 +3529,7 @@ fn execute_pjrt<'c>(
             per_output_buffers[output_index].push(buffer);
         }
     }
-
-    let mut outputs = Vec::with_capacity(output_count);
-    for (output_index, addressable_buffers) in per_output_buffers.into_iter().enumerate() {
-        let output_type = output_types[output_index].clone();
-        let resolved_type = match output_type.sharding() {
-            Some(_) => output_type,
-            None => output_type.replicated(mesh).map_err(ArrayError::from)?,
-        };
-        outputs.push(
-            Array::from_canonical_addressable_buffers(client, resolved_type, mesh.clone(), addressable_buffers)?
-                .with_execution_fence(fence.clone()),
-        );
-    }
-    Ok(Execution::new(outputs, fence))
+    Ok(Execution::new(per_output_buffers, fence))
 }
 
 #[cfg(test)]
@@ -2964,12 +3553,14 @@ mod tests {
     use ryft_core::sharding::ShardingDimension;
     use ryft_core::types::{Dimension, StaticShape};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+    #[cfg(feature = "cuda-13")]
+    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::tests::{values_from_bytes, values_to_bytes};
 
     use super::*;
 
-    fn cpu_domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
+    fn domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, axis_size, MeshAxisType::Auto).unwrap()]).unwrap();
         let devices = client
             .addressable_devices()
@@ -3126,7 +3717,7 @@ mod tests {
     fn test_replacement_metadata_rejects_changed_invocation_contract() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let signature = XlaExecutableSignature::new(&[], &[]);
         let current = XlaInvocationMetadata {
             input_types: &[],
@@ -3178,7 +3769,7 @@ mod tests {
     fn test_domain_zero_defaults_missing_sharding_to_replicated() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 2);
+        let mesh = domain_mesh(&client, "x", 2);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
 
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
@@ -3199,7 +3790,7 @@ mod tests {
     fn test_domain_zero_constructs_a_bufferless_logical_zero_space_array() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh);
         let array_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
@@ -3213,7 +3804,7 @@ mod tests {
     fn test_domain_one_fills_sharded_array_with_ones() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 2);
+        let mesh = domain_mesh(&client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding)
@@ -3250,7 +3841,7 @@ mod tests {
     fn test_domain_accessors_return_constructor_arguments() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let cloned = domain.clone();
 
@@ -3264,7 +3855,7 @@ mod tests {
     fn test_eager_dimension_dispatch_runs_on_the_host_without_compilation() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh);
         let left = DimensionValue::constant(2).unwrap();
         let right = DimensionValue::constant(3).unwrap();
@@ -3313,7 +3904,7 @@ mod tests {
     fn test_compiled_dimension_from_scalar_reports_observed_bounds_failure_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
@@ -3357,7 +3948,7 @@ mod tests {
     fn test_compiled_dimension_requirements_report_the_first_same_class_failure_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
@@ -3433,7 +4024,7 @@ mod tests {
     fn test_compiled_dimension_requirement_predicates_preserve_diagnostics_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(20)).unwrap();
@@ -3501,7 +4092,7 @@ mod tests {
     fn test_compiled_dimension_arithmetic_preserves_checked_host_diagnostics_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
@@ -3586,7 +4177,7 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         ensure_print_handler_registered(&client).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
@@ -3648,7 +4239,7 @@ mod tests {
     fn test_eager_mixed_shape_operations_specialize_dimensions_and_share_the_array_kernel_cache() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
@@ -3714,7 +4305,7 @@ mod tests {
     fn test_production_composite_lowering_executes_dynamic_dimension_arithmetic_broadcast_and_reshape() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
@@ -3784,11 +4375,70 @@ mod tests {
         assert_eq!(read_f32s(&client, &outputs[0]), vec![7.0; 4]);
     }
 
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_cuda_13_plugin_executes_bounded_dynamic_program_at_two_sizes() {
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            dynamic_type,
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> =
+            domain.compile(domain.lower(staged).unwrap()).unwrap();
+        assert_eq!(domain.cache_size(), 1);
+
+        for size in [4usize, 7] {
+            let input_type = replicated_vector_type(&mesh, size);
+            let values = (0..size).map(|value| value as f32).collect::<Vec<_>>();
+            let input = Array::from_host_buffer(
+                &client,
+                input_type,
+                mesh.clone(),
+                values_to_bytes(values.as_slice()).as_slice(),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                // Both launches use the same bounded executable. The second also proves that replay does not
+                // accidentally specialize or recompile the program for the concrete logical size.
+                let output = ryft_core::compilation::call_function(
+                    &domain,
+                    compiled.executable_program(),
+                    ArrayProgramValue::Array(input.clone()),
+                )
+                .unwrap();
+                let ArrayProgramValue::Array(output) = output else {
+                    panic!("array-only compiled function returned a first-class dimension");
+                };
+                output.block_until_ready().unwrap();
+                assert_eq!(output.shape().as_slice(), &[size]);
+                assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
+                assert_eq!(domain.cache_size(), 1, "executing a loaded executable must not trigger recompilation");
+            }
+        }
+    }
+
     #[test]
     fn test_production_composite_lowering_executes_dynamic_shape_slice() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
         let mut builder = XlaProgramBuilder::new();
@@ -3842,7 +4492,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let engine = XlaDomain::with_mesh(&client, mesh.clone());
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -3916,7 +4566,7 @@ mod tests {
     fn test_compiled_zero_space_identity_preserves_logical_type_and_canonical_value() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -3985,7 +4635,7 @@ mod tests {
     fn test_compiled_mixed_zero_space_signature_projects_and_reconstructs_logical_values() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))
@@ -4049,25 +4699,398 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_zero_space_carriers_preserves_the_concrete_runtime_shape() {
+    fn test_bounded_dynamic_input_padding_is_dense_row_major() {
+        let source = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
+
+        let padded = pad_dense_array_bytes(source.as_slice(), &[2, 2], &[3, 4], DataType::F32).unwrap();
+
+        assert_eq!(
+            values_from_bytes::<f32>(padded.as_slice()),
+            vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+    }
+
+    #[test]
+    fn test_bounded_dynamic_input_packing_cost_guard() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let dynamic_zero_type = ArrayType::new(
-            DataType::Zero,
-            Shape::new(vec![
-                DimensionVariable::new("dynamic_zero", DimensionBounds::non_negative(Some(3)).unwrap()).into(),
-            ]),
+        let mesh = domain_mesh(&client, "x", 1);
+        let declared_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
+        )
+        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+        .unwrap();
+        let signature = XlaExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
+
+        // An input already at its bound takes the reuse tier: the physical payload preserves storage identity and the
+        // only new value is its hidden logical-extent scalar.
+        let exact_type = replicated_vector_type(&mesh, 8);
+        let exact = Array::from_host_buffer(
+            &client,
+            exact_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[0.0; 8]).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            bounded_input_packing(&exact_type.static_shape().unwrap(), &StaticShape::new(vec![8])),
+            BoundedInputPacking::Reuse,
+        );
+        let exact_storage = exact.clone();
+        let at_bound = materialize_bounded_dynamic_inputs(
+            &client,
+            &signature,
+            std::slice::from_ref(&declared_type),
+            std::slice::from_ref(&exact_type),
+            vec![exact],
+        )
+        .unwrap();
+        assert_eq!(at_bound.inputs.len(), 2);
+        assert_eq!(at_bound.inputs[0], exact_storage);
+        assert_eq!(
+            at_bound.report,
+            BoundedInputMaterializationReport {
+                at_bound_reuses: 1,
+                extent_scalar_uploads: 1,
+                actual_bytes: 32,
+                bound_bytes: 32,
+                ..Default::default()
+            },
+        );
+
+        // A smaller single-shard input pays the cold padding cost exactly once and retains the physical buffer. The
+        // second call reuses identical PJRT buffer Arcs and reports zero pad-path allocation and transport. Explicit
+        // path-local counts avoid process-global allocator noise from PJRT and Rust's parallel test runner.
+        let smaller_type = replicated_vector_type(&mesh, 4);
+        assert_eq!(
+            bounded_input_packing(&smaller_type.static_shape().unwrap(), &StaticShape::new(vec![8])),
+            BoundedInputPacking::Pad,
+        );
+        let smaller = Array::from_host_buffer(
+            &client,
+            smaller_type.clone(),
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let cold = materialize_bounded_dynamic_inputs(
+            &client,
+            &signature,
+            std::slice::from_ref(&declared_type),
+            std::slice::from_ref(&smaller_type),
+            vec![smaller.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            cold.report,
+            BoundedInputMaterializationReport {
+                retained_misses: 1,
+                device_to_host_shard_copies: 1,
+                host_padding_payload_allocations: 1,
+                host_to_device_shard_uploads: 1,
+                extent_scalar_uploads: 1,
+                actual_bytes: 16,
+                bound_bytes: 32,
+                ..Default::default()
+            },
+        );
+        let retained_storage = cold.inputs[0].clone();
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let donation_arguments =
+            Array::into_execute_arguments_with_donation(vec![cold.inputs[0].clone()], &[device_id], &[true]).unwrap();
+        assert!(!donation_arguments.inputs_by_device()[0][0].donatable);
+        let warm =
+            materialize_bounded_dynamic_inputs(&client, &signature, &[declared_type], &[smaller_type], vec![smaller])
+                .unwrap();
+        assert_eq!(warm.inputs[0], retained_storage);
+        assert_eq!(
+            warm.report,
+            BoundedInputMaterializationReport {
+                cache_hits: 1,
+                extent_scalar_uploads: 0,
+                actual_bytes: 16,
+                bound_bytes: 32,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn test_independent_bounded_materialization_misses_share_one_issue_phase() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let declared_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
+        )
+        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+        .unwrap();
+        let actual_type = replicated_vector_type(&mesh, 4);
+        let left = Array::from_host_buffer(
+            &client,
+            actual_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let right = Array::from_host_buffer(
+            &client,
+            actual_type.clone(),
+            mesh,
+            values_to_bytes::<f32>(&[5.0, 6.0, 7.0, 8.0]).as_slice(),
+        )
+        .unwrap();
+        let declared_types = [declared_type.clone(), declared_type];
+        let actual_types = [actual_type.clone(), actual_type];
+        let signature = XlaExecutableSignature::new(&declared_types, &[]);
+
+        // The materializer's first scan reserves both cache entries and issues both D2H copies before its completion
+        // loop awaits either one. The path-local report guards the two independent cold jobs and the warm zero-work
+        // result without relying on scheduler timing.
+        let cold = materialize_bounded_dynamic_inputs(
+            &client,
+            &signature,
+            &declared_types,
+            &actual_types,
+            vec![left.clone(), right.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            cold.report,
+            BoundedInputMaterializationReport {
+                retained_misses: 2,
+                device_to_host_shard_copies: 2,
+                host_padding_payload_allocations: 2,
+                host_to_device_shard_uploads: 2,
+                extent_scalar_uploads: 2,
+                actual_bytes: 32,
+                bound_bytes: 64,
+                ..Default::default()
+            },
+        );
+        let retained = [cold.inputs[0].clone(), cold.inputs[1].clone()];
+
+        let warm =
+            materialize_bounded_dynamic_inputs(&client, &signature, &declared_types, &actual_types, vec![left, right])
+                .unwrap();
+        assert_eq!(warm.inputs[0], retained[0]);
+        assert_eq!(warm.inputs[1], retained[1]);
+        assert_eq!(
+            warm.report,
+            BoundedInputMaterializationReport {
+                cache_hits: 2,
+                actual_bytes: 32,
+                bound_bytes: 64,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn test_failed_bounded_upload_batch_is_not_published_and_retries() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let declared_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
+        )
+        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+        .unwrap();
+        let actual_type = replicated_vector_type(&mesh, 4);
+        let left = Array::from_host_buffer(
+            &client,
+            actual_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let right = Array::from_host_buffer(
+            &client,
+            actual_type.clone(),
+            mesh,
+            values_to_bytes::<f32>(&[5.0, 6.0, 7.0, 8.0]).as_slice(),
+        )
+        .unwrap();
+        let declared_types = [declared_type.clone(), declared_type];
+        let actual_types = [actual_type.clone(), actual_type];
+        let signature = XlaExecutableSignature::new(&declared_types, &[]);
+        let mut observed_publications = 0usize;
+        let mut observed_uploads = 0usize;
+
+        // The injected failure runs only after both physical arrays and their H2D uploads exist. Returning the error
+        // before publication drops both producer reservations, so neither failed result can become a warm cache hit.
+        let error = match materialize_bounded_dynamic_inputs_with_readiness(
+            &client,
+            &signature,
+            &declared_types,
+            &actual_types,
+            vec![left.clone(), right.clone()],
+            |publications| {
+                observed_publications = publications.len();
+                observed_uploads = publications
+                    .iter()
+                    .flat_map(|publication| publication.physical.shards())
+                    .filter(|shard| shard.buffer().is_some())
+                    .count();
+                Err(ProgramError::InvalidArgument { message: "injected bounded upload readiness failure".to_string() }
+                    .into())
+            },
+        ) {
+            Ok(_) => panic!("injected upload readiness failure must reject materialization"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("injected bounded upload readiness failure"));
+        assert_eq!(observed_publications, 2);
+        assert_eq!(observed_uploads, 2);
+
+        let retry = materialize_bounded_dynamic_inputs(
+            &client,
+            &signature,
+            &declared_types,
+            &actual_types,
+            vec![left.clone(), right.clone()],
+        )
+        .unwrap();
+        assert_eq!(retry.report.retained_misses, 2);
+        assert_eq!(retry.report.cache_hits, 0);
+        assert_eq!(retry.report.device_to_host_shard_copies, 2);
+        assert_eq!(retry.report.host_to_device_shard_uploads, 2);
+        let retained = [retry.inputs[0].clone(), retry.inputs[1].clone()];
+
+        let warm =
+            materialize_bounded_dynamic_inputs(&client, &signature, &declared_types, &actual_types, vec![left, right])
+                .unwrap();
+        assert_eq!(warm.inputs[0], retained[0]);
+        assert_eq!(warm.inputs[1], retained[1]);
+        assert_eq!(warm.report.cache_hits, 2);
+        assert_eq!(warm.report.device_to_host_shard_copies, 0);
+        assert_eq!(warm.report.host_to_device_shard_uploads, 0);
+    }
+
+    #[test]
+    fn test_sharded_bounded_materialization_reuses_every_device_buffer() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 4);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let declared_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
         )
         .with_sharding(sharding.clone())
         .unwrap();
-        let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
+        let actual_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(sharding)
+            .unwrap();
+        let source = Array::from_host_buffer(
+            &client,
+            actual_type.clone(),
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let signature = XlaExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
+
+        let cold = materialize_bounded_dynamic_inputs(
+            &client,
+            &signature,
+            std::slice::from_ref(&declared_type),
+            std::slice::from_ref(&actual_type),
+            vec![source.clone()],
+        )
+        .unwrap();
+        assert_eq!(cold.report.device_to_host_shard_copies, 4);
+        assert_eq!(cold.report.host_merge_buffer_allocations, 1);
+        assert_eq!(cold.report.host_padding_payload_allocations, 1);
+        assert_eq!(cold.report.host_to_device_shard_uploads, 4);
+        let retained = cold.inputs[0].clone();
+
+        let warm =
+            materialize_bounded_dynamic_inputs(&client, &signature, &[declared_type], &[actual_type], vec![source])
+                .unwrap();
+        assert_eq!(warm.inputs[0], retained);
+        assert_eq!(warm.report.cache_hits, 1);
+        assert_eq!(warm.report.device_to_host_shard_copies, 0);
+        assert_eq!(warm.report.host_to_device_shard_uploads, 0);
+    }
+
+    #[test]
+    fn test_concurrent_bounded_materialization_is_single_flight() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let declared_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
+        )
+        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+        .unwrap();
+        let actual_type = replicated_vector_type(&mesh, 4);
+        let source = Array::from_host_buffer(
+            &client,
+            actual_type.clone(),
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let signature = XlaExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
+
+        let (left, right) = std::thread::scope(|scope| {
+            let left_source = source.clone();
+            let left_declared_type = declared_type.clone();
+            let left_actual_type = actual_type.clone();
+            let left = scope.spawn(|| {
+                materialize_bounded_dynamic_inputs(
+                    &client,
+                    &signature,
+                    &[left_declared_type],
+                    &[left_actual_type],
+                    vec![left_source],
+                )
+                .unwrap()
+            });
+            let right = scope.spawn(|| {
+                materialize_bounded_dynamic_inputs(
+                    &client,
+                    &signature,
+                    std::slice::from_ref(&declared_type),
+                    std::slice::from_ref(&actual_type),
+                    vec![source],
+                )
+                .unwrap()
+            });
+            (left.join().unwrap(), right.join().unwrap())
+        });
+
+        assert_eq!(left.inputs[0], right.inputs[0]);
+        let retained_misses = left.report.retained_misses + right.report.retained_misses;
+        let cache_hits = left.report.cache_hits + right.report.cache_hits;
+        assert_eq!(retained_misses, 1);
+        assert_eq!(cache_hits, 1);
+        assert_eq!(left.report.device_to_host_shard_copies + right.report.device_to_host_shard_copies, 1);
+        assert_eq!(left.report.host_to_device_shard_uploads + right.report.host_to_device_shard_uploads, 1);
+    }
+
+    #[test]
+    fn test_materialize_zero_space_carriers_allocate_the_bounded_physical_shape() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        // The compiled module declares the bound-shaped `[3]` argument, so a below-bound `[2]` runtime value must
+        // still produce a `[3]` carrier; the hidden extent scalar transports the logical size.
+        let physical_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
         let zero = Array::from_host_buffer(&client, runtime_zero_type, mesh, []).unwrap();
 
-        let carriers = materialize_zero_space_carriers(&client, &[dynamic_zero_type], vec![zero]).unwrap();
+        let carriers = materialize_zero_space_carriers(&client, &[physical_zero_type], vec![zero]).unwrap();
 
         assert_eq!(carriers.len(), 1);
         assert_eq!(carriers[0].data_type(), DataType::Boolean);
@@ -4086,12 +5109,53 @@ mod tests {
     }
 
     #[test]
+    fn test_below_bound_zero_space_inputs_skip_the_padding_tiers_and_carry_the_bounded_shape() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let declared_type = ArrayType::new(
+            DataType::Zero,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::non_negative(Some(4)).unwrap()).into()]),
+        )
+        .with_sharding(sharding.clone())
+        .unwrap();
+        let signature = XlaExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2)]))
+            .with_sharding(sharding)
+            .unwrap();
+        let zero = Array::from_host_buffer(&client, actual_type.clone(), mesh, []).unwrap();
+
+        // The below-bound zero-space input must bypass the retained-cache and byte-pad tiers (its dense host copy is
+        // empty) and rely on the carrier materialization to synthesize the bound-shaped predicate argument.
+        let materialized = materialize_bounded_dynamic_inputs(
+            &client,
+            &signature,
+            std::slice::from_ref(&declared_type),
+            std::slice::from_ref(&actual_type),
+            vec![zero],
+        )
+        .unwrap();
+        assert_eq!(materialized.inputs.len(), 2);
+        assert_eq!(
+            materialized.report,
+            BoundedInputMaterializationReport { extent_scalar_uploads: 1, ..Default::default() },
+        );
+
+        let physical_types = signature.physical_input_types(std::slice::from_ref(&declared_type));
+        let carriers = materialize_zero_space_carriers(&client, &physical_types, materialized.inputs).unwrap();
+        assert_eq!(carriers[0].data_type(), DataType::Boolean);
+        assert_eq!(carriers[0].shape().as_slice(), &[3]);
+        assert_eq!(carriers[1].data_type(), DataType::I32);
+    }
+
+    #[test]
     fn test_xla_compilation_key_is_canonical_and_stable() {
         use ryft_core::operations::math::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4128,7 +5192,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4181,7 +5245,7 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV4 =
+        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV5 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_signature_metadata.input_mapping[0] = None;
         let invalid_signature_metadata = serde_json::to_vec(&invalid_signature_metadata).unwrap();
@@ -4194,7 +5258,7 @@ mod tests {
             Err(XlaDomainError::InvalidPersistentExecutable { .. }),
         ));
 
-        let mut incompatible_metadata: XlaPersistentExecutableMetadataV4 =
+        let mut incompatible_metadata: XlaPersistentExecutableMetadataV5 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         incompatible_metadata.platform_version.push_str("-incompatible");
         let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
@@ -4228,7 +5292,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -4285,13 +5349,15 @@ mod tests {
         legacy.extend_from_slice(&0u64.to_le_bytes());
         assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
-        let metadata = XlaPersistentExecutableMetadataV4 {
+        let metadata = XlaPersistentExecutableMetadataV5 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
             feature_flags: 0,
             compilation_options: CompilationOptions::default().encode_to_vec(),
             signature: PersistentArraySignatureV3::encode(&[], &[]),
             input_mapping: Vec::new(),
             output_mapping: Vec::new(),
+            input_dimensions: Vec::new(),
+            output_dimensions: Vec::new(),
             requires_assertion_handler: false,
             donation_flags: Vec::new(),
             capture_count: 0,
@@ -4321,7 +5387,7 @@ mod tests {
     fn test_eager_bind_executes_binary_operation() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
         let left = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
@@ -4336,7 +5402,7 @@ mod tests {
     fn test_eager_bind_executes_promoted_and_broadcast_elementwise_operations() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
         let scalar = f32_scalar(&client, &mesh, 2.0);
@@ -4376,7 +5442,7 @@ mod tests {
     fn test_eager_bind_executes_unary_operation() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
         let input = f32_vector(&client, &mesh, &[1.0, -2.0, 3.5, 0.0]);
@@ -4427,7 +5493,7 @@ mod tests {
     fn test_eager_bind_reuses_cached_executable_for_repeated_operations() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
         assert_eq!(domain.parent().cache_size(), 0);
 
@@ -4452,7 +5518,7 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let domain_client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let foreign_client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let foreign_mesh = cpu_domain_mesh(&foreign_client, "x", 2);
+        let foreign_mesh = domain_mesh(&foreign_client, "x", 2);
         let domain = array_domain(&domain_client);
 
         // An input that carries an attached client is rejected by client identity.
@@ -4479,7 +5545,7 @@ mod tests {
     fn test_eager_bind_executes_condition_with_concrete_predicate() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let vector_type = replicated_vector_type(&mesh, 4);
 
@@ -4529,7 +5595,7 @@ mod tests {
     fn test_eager_bind_condition_branches_consume_forwarded_dimension_authority() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let extent = DimensionValue::constant(3).unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -4590,7 +5656,7 @@ mod tests {
     fn test_eager_bind_executes_bounded_while() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
@@ -4637,7 +5703,7 @@ mod tests {
     fn test_eager_bind_executes_elementwise_operation_on_sharded_inputs() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 2);
+        let mesh = domain_mesh(&client, "x", 2);
         let domain = array_domain(&client);
 
         // A vector sharded over a 2-device mesh executes eagerly through per-operation SPMD compilation: each device
@@ -4677,7 +5743,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
@@ -4713,7 +5779,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let length = DimensionValue::new(
@@ -4750,7 +5816,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = ArrayType::scalar(DataType::F32);
 
@@ -4790,7 +5856,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 2);
+        let mesh = domain_mesh(&client, "x", 2);
         let domain = XlaDomain::new(&client);
         let scalar_type = ArrayType::scalar(DataType::F32);
 
@@ -4840,7 +5906,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let vector_type = replicated_vector_type(&mesh, 4);
 
@@ -4955,7 +6021,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
         // A collective on a concrete array outside any `batch` / `shard_map` binder has no axis to resolve against,
@@ -4978,7 +6044,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
         assert_eq!(ensure_print_handler_registered(&client), Ok(()));
 
@@ -5012,7 +6078,7 @@ mod tests {
     fn test_eager_bind_surfaces_shape_mismatch_as_type_error() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
         // Mismatched operand shapes fail at bind time through type inference on the traced single-instruction

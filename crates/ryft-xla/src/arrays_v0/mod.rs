@@ -21,6 +21,7 @@ pub mod device_put;
 pub mod error;
 pub mod execution;
 pub mod host;
+mod materialization;
 pub mod placement;
 pub mod transfers;
 
@@ -32,6 +33,10 @@ pub use device_put::{DevicePutLeaf, device_put};
 pub use error::ArrayError;
 pub use execution::ExecuteArguments;
 pub(crate) use host::DenseHostDevicePutLeaf;
+pub(crate) use materialization::{
+    BoundedMaterializationCache, BoundedMaterializationKey, BoundedMaterializationProbe,
+    BoundedMaterializationProducer, BoundedMaterializationWaiter, LOGICAL_EXTENT_SCALAR_CACHE_CAPACITY,
+};
 pub use placement::{DevicePutOptions, DevicePutTarget};
 
 pub(crate) use transfers::copy_addressable_destination_shards_from_exact_source_shards;

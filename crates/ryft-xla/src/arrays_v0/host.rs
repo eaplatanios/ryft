@@ -1,3 +1,7 @@
+use std::ops::Range;
+
+use ryft_pjrt::Event;
+
 use ryft_core::Typed;
 use ryft_core::types::ArrayType;
 
@@ -24,51 +28,155 @@ fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> 
     Ok(strides)
 }
 
-/// Copies every addressable shard of `array` to host and merges them into one dense row-major
-/// byte buffer. Errors when any global shard is not addressable from the current process.
+/// One in-flight device-to-host shard copy and the metadata needed to merge it.
+struct PendingDenseShardHostCopy {
+    /// Completion event carrying the copied shard bytes.
+    event: Event<Vec<u8>>,
+
+    /// Stable global shard index used in diagnostics.
+    shard_index: ShardIndex,
+
+    /// Device identifier used in diagnostics.
+    device_id: DeviceId,
+
+    /// Expected byte count derived from the shard's logical shape.
+    expected_byte_count: usize,
+
+    /// Global slices covered by the shard.
+    slices: Vec<Range<usize>>,
+}
+
+/// In-flight copies for materializing one array as dense row-major host bytes.
 ///
-/// Used by [`Array::to`](crate::Array::to)'s last-resort host fallback when the fast and
-/// compiled paths can't satisfy the requested placement.
-pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayError> {
-    if array.data_type().is_zero() {
-        return Ok(Vec::new());
+/// Construction starts every addressable shard copy without waiting. [`Self::finish`] then awaits the already-issued
+/// transfers and merges multi-shard layouts. This separation lets callers issue copies for several arrays before
+/// blocking on any one transfer.
+pub(crate) struct DenseArrayHostCopy {
+    /// Global logical shape of the source array.
+    global_shape: StaticShape,
+
+    /// Element type of the source array.
+    element_type: DataType,
+
+    /// Total byte count of the global dense representation.
+    total_byte_count: usize,
+
+    /// In-flight copies, one per global shard.
+    shards: Vec<PendingDenseShardHostCopy>,
+}
+
+impl DenseArrayHostCopy {
+    /// Waits for every previously issued copy and produces one dense row-major byte buffer.
+    pub(crate) fn finish(self) -> Result<Vec<u8>, ArrayError> {
+        self.finish_with_measurements().map(|(bytes, _)| bytes)
     }
+
+    /// Finishes this copy and reports whether a global merge buffer was allocated.
+    pub(crate) fn finish_with_measurements(self) -> Result<(Vec<u8>, bool), ArrayError> {
+        if self.shards.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+
+        let mut shards = self
+            .shards
+            .into_iter()
+            .map(|shard| {
+                let PendingDenseShardHostCopy { event, shard_index, device_id, expected_byte_count, slices } = shard;
+                let bytes = event.r#await()?;
+                if bytes.len() != expected_byte_count {
+                    return Err(ArrayError::CopiedShardByteCountMismatch {
+                        shard_index,
+                        device_id,
+                        expected_byte_count,
+                        actual_byte_count: bytes.len(),
+                    });
+                }
+                Ok((shard_index, slices, bytes))
+            })
+            .collect::<Result<Vec<_>, ArrayError>>()?;
+
+        if shards.len() == 1 {
+            let (shard_index, slices, bytes) = shards.pop().unwrap();
+            let covers_global_shape = (slices.is_empty() && self.global_shape.rank() == 0)
+                || (slices.len() == self.global_shape.rank()
+                    && slices
+                        .iter()
+                        .zip(self.global_shape.as_slice())
+                        .all(|(slice, extent)| slice.start == 0 && slice.end == *extent));
+            if covers_global_shape && bytes.len() == self.total_byte_count {
+                return Ok((bytes, false));
+            }
+            shards.push((shard_index, slices, bytes));
+        }
+
+        let mut global_bytes = vec![0u8; self.total_byte_count];
+        let mut written_intervals = Vec::new();
+        for (shard_index, slices, bytes) in shards {
+            merge_dense_shard_bytes(
+                bytes.as_slice(),
+                self.global_shape.as_slice(),
+                slices.as_slice(),
+                self.element_type,
+                shard_index,
+                &mut global_bytes,
+                &mut written_intervals,
+            )?;
+        }
+        Ok((global_bytes, true))
+    }
+
+    /// Returns the number of already-issued device-to-host shard copies represented by this materialization.
+    #[inline]
+    pub(crate) fn shard_copy_count(&self) -> usize {
+        self.shards.len()
+    }
+}
+
+/// Starts copies for every addressable shard of `array` without awaiting them. Errors when any global shard is not
+/// addressable from the current process.
+pub(crate) fn begin_materialize_dense_array_bytes(array: &Array<'_>) -> Result<DenseArrayHostCopy, ArrayError> {
+    if array.data_type().is_zero() {
+        return Ok(DenseArrayHostCopy {
+            global_shape: array.shape(),
+            element_type: array.data_type(),
+            total_byte_count: 0,
+            shards: Vec::new(),
+        });
+    }
+
     let global_shape = array.shape();
     let element_type = array.data_type();
     let total_byte_count = array.r#type().size_in_bytes()?;
-    let mut global_bytes = vec![0u8; total_byte_count];
-    let mut written = vec![false; total_byte_count];
-
-    for shard in array.shards() {
-        let device = shard.device();
-        let shard_index = shard.index();
-        let buffer = shard
-            .buffer()
-            .map(|buffer| buffer.as_ref())
-            .ok_or(ArrayError::MissingAddressableShardForMove { shard_index, device_id: device.id() })?;
-        let shard_bytes = buffer.copy_to_host(None)?.r#await()?;
-        let shard_shape = shard.shape();
-        let expected_byte_count = ArrayType::new(element_type, shard_shape.into()).size_in_bytes()?;
-        if shard_bytes.len() != expected_byte_count {
-            return Err(ArrayError::CopiedShardByteCountMismatch {
+    let shards = array
+        .shards()
+        .iter()
+        .map(|shard| {
+            let device = shard.device();
+            let shard_index = shard.index();
+            let buffer = shard
+                .buffer()
+                .map(|buffer| buffer.as_ref())
+                .ok_or(ArrayError::MissingAddressableShardForMove { shard_index, device_id: device.id() })?;
+            let shard_shape = shard.shape();
+            Ok(PendingDenseShardHostCopy {
+                event: buffer.copy_to_host(None)?,
                 shard_index,
                 device_id: device.id(),
-                expected_byte_count,
-                actual_byte_count: shard_bytes.len(),
-            });
-        }
-        merge_dense_shard_bytes(
-            shard_bytes.as_slice(),
-            global_shape.as_slice(),
-            shard.slice(),
-            element_type,
-            shard_index,
-            &mut global_bytes,
-            &mut written,
-        )?;
-    }
+                expected_byte_count: ArrayType::new(element_type, shard_shape.into()).size_in_bytes()?,
+                slices: shard.slice().to_vec(),
+            })
+        })
+        .collect::<Result<Vec<_>, ArrayError>>()?;
+    Ok(DenseArrayHostCopy { global_shape, element_type, total_byte_count, shards })
+}
 
-    Ok(global_bytes)
+/// Copies every addressable shard of `array` to host and merges them into one dense row-major byte buffer. Errors when
+/// any global shard is not addressable from the current process.
+///
+/// Used by [`Array::to`](crate::Array::to)'s last-resort host fallback when the fast and compiled paths cannot satisfy
+/// the requested placement.
+pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayError> {
+    begin_materialize_dense_array_bytes(array)?.finish()
 }
 
 /// Merges one shard's dense row-major host bytes into `global_bytes`.
@@ -79,10 +187,10 @@ fn merge_dense_shard_bytes(
     element_type: DataType,
     shard_index: ShardIndex,
     global_bytes: &mut [u8],
-    written: &mut [bool],
+    written_intervals: &mut Vec<Range<usize>>,
 ) -> Result<(), ArrayError> {
     if shard_slices.is_empty() {
-        return merge_dense_byte_segment(shard_bytes, 0, shard_index, global_bytes, written);
+        return merge_dense_byte_segment(shard_bytes, 0, shard_index, global_bytes, written_intervals);
     }
 
     let global_strides = row_major_element_strides(global_shape, element_type)?;
@@ -100,7 +208,7 @@ fn merge_dense_shard_bytes(
         element_size_in_bytes,
         shard_index,
         global_bytes,
-        written,
+        written_intervals,
     )
 }
 
@@ -116,7 +224,7 @@ fn merge_dense_shard_bytes_recursive(
     element_size_in_bytes: usize,
     shard_index: ShardIndex,
     global_bytes: &mut [u8],
-    written: &mut [bool],
+    written_intervals: &mut Vec<Range<usize>>,
 ) -> Result<(), ArrayError> {
     let slice = &shard_slices[dimension];
     if dimension + 1 == shard_slices.len() {
@@ -133,7 +241,7 @@ fn merge_dense_shard_bytes_recursive(
             global_byte_offset,
             shard_index,
             global_bytes,
-            written,
+            written_intervals,
         );
     }
 
@@ -153,7 +261,7 @@ fn merge_dense_shard_bytes_recursive(
             element_size_in_bytes,
             shard_index,
             global_bytes,
-            written,
+            written_intervals,
         )?;
     }
     Ok(())
@@ -166,19 +274,47 @@ fn merge_dense_byte_segment(
     global_byte_offset: usize,
     shard_index: ShardIndex,
     global_bytes: &mut [u8],
-    written: &mut [bool],
+    written_intervals: &mut Vec<Range<usize>>,
 ) -> Result<(), ArrayError> {
-    for (offset, &byte) in source_bytes.iter().enumerate() {
-        let index = global_byte_offset + offset;
-        if written[index] {
-            if global_bytes[index] != byte {
+    // Zero-extent shard slices produce empty segments; recording their degenerate `[x, x)` intervals would only
+    // bloat the overlap bookkeeping without ever contributing bytes.
+    if source_bytes.is_empty() {
+        return Ok(());
+    }
+    let range = global_byte_offset..global_byte_offset + source_bytes.len();
+    let insertion_index = written_intervals.partition_point(|written| written.start <= range.start);
+    let mut first_overlap = insertion_index.saturating_sub(1);
+    while first_overlap < written_intervals.len() && written_intervals[first_overlap].end <= range.start {
+        first_overlap += 1;
+    }
+    let mut overlap_index = first_overlap;
+    while overlap_index < written_intervals.len() && written_intervals[overlap_index].start < range.end {
+        let written = &written_intervals[overlap_index];
+        let overlap = written.start.max(range.start)..written.end.min(range.end);
+        if overlap.start < overlap.end {
+            let source_offset = overlap.start - range.start;
+            if global_bytes[overlap.clone()] != source_bytes[source_offset..source_offset + overlap.len()] {
                 return Err(ArrayError::InconsistentOverlappingShardData { shard_index });
             }
-        } else {
-            global_bytes[index] = byte;
-            written[index] = true;
         }
+        overlap_index += 1;
     }
+    global_bytes[range.clone()].copy_from_slice(source_bytes);
+
+    let mut merged_start = range.start;
+    let mut merged_end = range.end;
+    let mut remove_start = insertion_index;
+    if remove_start > 0 && written_intervals[remove_start - 1].end >= merged_start {
+        remove_start -= 1;
+        merged_start = merged_start.min(written_intervals[remove_start].start);
+        merged_end = merged_end.max(written_intervals[remove_start].end);
+    }
+    let mut remove_end = remove_start;
+    while remove_end < written_intervals.len() && written_intervals[remove_end].start <= merged_end {
+        merged_end = merged_end.max(written_intervals[remove_end].end);
+        remove_end += 1;
+    }
+    written_intervals.splice(remove_start..remove_end, [merged_start..merged_end]);
     Ok(())
 }
 
