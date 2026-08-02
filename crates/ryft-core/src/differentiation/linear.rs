@@ -193,7 +193,7 @@ pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: Re
 }
 
 /// Role of differential boundary whose [`ZeroSpaceBoundaryLeaf`]s are reconstructed
-/// from [`ZeroSpaceBoundaryResiduals`].
+/// from [`ZeroSpaceBoundaryReconstruction`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ZeroSpaceBoundaryRole {
     /// Cotangents of the primal input boundary, returned by a _pullback_ function.
@@ -231,7 +231,7 @@ impl Display for ZeroSpaceBoundaryRole {
 }
 
 /// Reconstruction metadata for one zero-space leaf omitted from a compact derivative boundary.
-/// This is only used as part of [`ZeroSpaceBoundaryResiduals`].
+/// This is only used as part of [`ZeroSpaceBoundaryReconstruction`].
 pub(crate) struct ZeroSpaceBoundaryLeaf<T: Type> {
     /// Position of the omitted zero in the complete public differential boundary.
     index: usize,
@@ -265,7 +265,7 @@ pub(crate) struct ZeroSpaceBoundaryLeaf<T: Type> {
 /// otherwise-unused inputs of the derivative program. The wrapper retains the boundary size, the position and type of
 /// every omitted zero, and the range of residuals that reconstructs it. The tangent/cotangent mapping and primal
 /// boundary are therefore consumed exactly once during capture and cannot be changed later during reconstruction.
-pub(crate) struct ZeroSpaceBoundaryResiduals<V: Value> {
+pub(crate) struct ZeroSpaceBoundaryReconstruction<V: Value> {
     /// Semantic role of the differential boundary reconstructed by this instance.
     role: ZeroSpaceBoundaryRole,
 
@@ -279,7 +279,7 @@ pub(crate) struct ZeroSpaceBoundaryResiduals<V: Value> {
     zero_leaves: Vec<ZeroSpaceBoundaryLeaf<V::Type>>,
 }
 
-impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
+impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     /// Captures the runtime geometry and reconstruction plan for every zero-space leaf of one differential boundary.
     ///
     /// For each primal leaf type `Tᵢ`, `role` determines the boundary type `D(Tᵢ)`. A nonzero-space `D(Tᵢ)` remains a
@@ -1148,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_space_boundary_residuals_reconstruct_dynamic_zero() {
+    fn test_zero_space_boundary_reconstruction_reconstructs_dynamic_zero() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let key_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)]));
         let accumulator_type = ArrayType::scalar(DataType::F64);
@@ -1160,14 +1160,14 @@ mod tests {
 
         // Capture retains the key's dynamic extent and records that only the accumulator tangent remains live in the
         // compact output boundary. Rebuild must recover the omitted key tangent from that stored plan.
-        let residuals = ZeroSpaceBoundaryResiduals::capture(
+        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(
             &context,
             primal_values.as_slice(),
             primal_types.as_slice(),
             ZeroSpaceBoundaryRole::OutputTangent,
         )
         .unwrap();
-        let outputs = residuals.rebuild(&context, [accumulator.clone()]).unwrap();
+        let outputs = reconstruction.rebuild(&context, [accumulator.clone()]).unwrap();
         let key_tangent_type = ArrayProgramType::Array(key_type.tangent());
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].r#type().as_ref(), &key_tangent_type);
@@ -1183,14 +1183,14 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_space_boundary_residuals_report_stored_boundary() {
+    fn test_zero_space_boundary_reconstruction_reports_stored_boundary() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let primal = Array::scalar(3.0);
         let primal_type = ArrayType::scalar(DataType::F64);
 
         // The output-tangent role retained during capture identifies a missing compact-program result without a
         // caller-supplied diagnostic context.
-        let output_tangent = ZeroSpaceBoundaryResiduals::capture(
+        let output_tangent = ZeroSpaceBoundaryReconstruction::capture(
             &context,
             std::slice::from_ref(&primal),
             std::slice::from_ref(&primal_type),
@@ -1205,7 +1205,7 @@ mod tests {
         );
 
         // The input-cotangent role independently identifies an excessive compact-program result.
-        let input_cotangent = ZeroSpaceBoundaryResiduals::capture(
+        let input_cotangent = ZeroSpaceBoundaryReconstruction::capture(
             &context,
             std::slice::from_ref(&primal),
             std::slice::from_ref(&primal_type),

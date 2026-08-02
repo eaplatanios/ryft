@@ -3,10 +3,10 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::linear::{ResidualZeroProvider, ZeroSpaceBoundaryResiduals};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationError, ForwardModeDifferentiate, LinearizationTracer,
-};
+use crate::differentiation::DifferentiationError;
+use crate::differentiation::forward::{DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer};
+use crate::differentiation::linear::{ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole};
+use crate::differentiation::types::DifferentiableType;
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
 use crate::operations::constants::{OneOperation, Zero};
@@ -57,9 +57,9 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     /// when interpreting it.
     residuals: Vec<C::Value>,
 
-    /// Runtime-geometry residuals used by [`apply`](Self::apply) to rebuild zero-space input cotangents omitted from
-    /// [`program`](Self::program). Refer to the documentation of [`ZeroSpaceBoundaryResiduals`] for more information.
-    input_zero_residuals: ZeroSpaceBoundaryResiduals<C::Value>,
+    /// Reconstruction plan used by [`apply`](Self::apply) to restore zero-space input cotangents omitted from
+    /// [`program`](Self::program).
+    input_cotangent_reconstruction: ZeroSpaceBoundaryReconstruction<C::Value>,
 
     /// Complete public primal output boundary. The executable pullback omits inputs whose derived cotangent type is a
     /// zero differential space.
@@ -87,8 +87,8 @@ impl<
     /// output whose differential space contains only zero. Its boundary therefore cannot recover the omitted leaves'
     /// positions or types, and the cotangent-type mapping is not generally invertible. `primal_output_types` preserves
     /// the complete public input boundary so [`apply`](Self::apply) can validate and filter its cotangent arguments.
-    /// `input_zero_residuals` independently preserves the reconstruction plan for omitted output leaves, while
-    /// `primal_input_types` is needed only here to validate the compact program's output boundary.
+    /// `input_cotangent_reconstruction` independently preserves the reconstruction plan for omitted input leaves,
+    /// while `primal_input_types` is needed only here to validate the compact program's output boundary.
     ///
     /// This function validates the relationship among all three boundaries. In particular, the program must consume one
     /// leading input for every nonzero cotangent in `primal_output_types`, followed by one input for every residual,
@@ -102,7 +102,8 @@ impl<
     ///     values.
     ///   - `residuals`: Primal values `r` captured at the linearization point, in the same order as the program's
     ///     trailing inputs.
-    ///   - `input_zero_residuals`: Runtime geometry for zero-space input cotangents rebuilt by [`apply`](Self::apply).
+    ///   - `input_cotangent_reconstruction`: Reconstruction plan for zero-space input cotangents rebuilt by
+    ///     [`apply`](Self::apply).
     ///   - `primal_input_types`: Complete flattened input-type boundary of the original primal function, including
     ///     leaves whose cotangent spaces contain only zero and which are consequently absent from `program` outputs.
     ///   - `primal_output_types`: Complete flattened output-type boundary of the original primal function, including
@@ -113,7 +114,7 @@ impl<
         context: C,
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,
-        input_zero_residuals: ZeroSpaceBoundaryResiduals<C::Value>,
+        input_cotangent_reconstruction: ZeroSpaceBoundaryReconstruction<C::Value>,
         primal_input_types: Vec<C::Type>,
         primal_output_types: Vec<C::Type>,
         input_structure: Input::ParameterStructure,
@@ -190,7 +191,7 @@ impl<
             context,
             program,
             residuals,
-            input_zero_residuals,
+            input_cotangent_reconstruction,
             primal_output_types,
             input_structure,
             marker: PhantomData,
@@ -267,8 +268,7 @@ impl<
 
         // Reconstruct the complete flattened public input boundary. Consume one program result for each nonzero
         // cotangent space and materialize the uniquely determined typed zero for every omitted zero-space leaf.
-        let cotangents =
-            self.input_zero_residuals.rebuild(&self.context, input_cotangents, "pullback input boundary")?;
+        let cotangents = self.input_cotangent_reconstruction.rebuild(&self.context, input_cotangents)?;
 
         // Restore the closure's original structured input shape after rebuilding every flattened cotangent leaf.
         Ok(Input::To::<C::Value>::from_parameters(self.input_structure.clone(), cotangents)?)
@@ -1229,10 +1229,17 @@ pub trait ReverseModeDifferentiate:
         primals: Input,
     ) -> Result<(Output::To<Self::Value>, Pullback<Self, Input, Output::To<Self::Value>>), DifferentiationError> {
         let input_structure = primals.parameter_structure();
+        let primal_input_values = primals.parameters().cloned().collect::<Vec<_>>();
         let (output, pushforward) = self.linearize(function, primals)?;
         let input_types = pushforward.primal_input_types().to_vec();
         let output_types = pushforward.primal_output_types().to_vec();
-        let (program, residuals, input_zero_residuals) = pushforward.into_pullback_parts();
+        let input_cotangent_reconstruction = ZeroSpaceBoundaryReconstruction::capture(
+            self,
+            primal_input_values.as_slice(),
+            input_types.as_slice(),
+            ZeroSpaceBoundaryRole::InputCotangent,
+        )?;
+        let (program, residuals) = pushforward.into_parts();
 
         // Transpose the pushforward program with respect to its leading tangent inputs, holding the trailing residual
         // inputs as known parameters. Partition-aware transposition threads each residual through to the pullback as a
@@ -1245,7 +1252,7 @@ pub trait ReverseModeDifferentiate:
                 self.clone(),
                 program,
                 residuals,
-                input_zero_residuals,
+                input_cotangent_reconstruction,
                 input_types,
                 output_types,
                 input_structure,
