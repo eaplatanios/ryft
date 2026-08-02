@@ -18,7 +18,6 @@ define_arithmetic_dimension_operation!(
         format!("{} % {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    requires_runtime_assertion = |_: &DimensionType, right: &DimensionType| right.bounds().lower() == 0,
 );
 
 impl OperationProvider<DimensionType> for RemOperation {
@@ -30,12 +29,13 @@ impl OperationProvider<DimensionType> for RemOperation {
     }
 }
 
-/// Derives sound bounds for checked dimension remainder.
-fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<DimensionBounds, DimensionError> {
+/// Derives sound bounds for checked remainder and reports whether a zero runtime divisor remains possible.
+fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
     let (_, left_maximum) = representable_extent_range(left.bounds())?;
     let (_, right_maximum) = representable_extent_range(right.bounds())?;
     positive_divisor_lower_bound(right, right_maximum)?;
-    DimensionBounds::new(0, left_maximum.min(right_maximum - 1).checked_add(1))
+    let bounds = DimensionBounds::new(0, left_maximum.min(right_maximum - 1).checked_add(1))?;
+    Ok((bounds, right.bounds().lower() == 0))
 }
 
 #[cfg(test)]

@@ -123,6 +123,13 @@ impl Operation<ArrayProgramType> for ConcatenateOperation {
 
     #[inline]
     fn effects(&self) -> Effects {
+        // TODO(eaplatanios): Update this in Phase 8.
+        // This is a deliberate over-approximation. A mixed concatenate whose input extents are all static and whose
+        // result extent is a provably equal exact constant needs no runtime check (inference above already rejects
+        // static mismatches), but `effects` sees only the payload and the shared `axis` payload cannot carry the extent
+        // signature without duplicating input/operand-derived shape metadata. The Phase 8 dual-contract resolution
+        // gives the mixed contract its own newtype payload, which owns the extent signature the way the dimension
+        // arithmetic payloads do and makes this effect conditional on the same bounds-proof predicate.
         Effects::single(Effect::OrderedAssertion)
     }
 
@@ -604,7 +611,7 @@ mod tests {
         assert_eq!(operation.axis(), 0);
         assert_eq!(Operation::<ArrayProgramType>::name(&operation), CONCATENATE_OPERATION_NAME);
         assert_eq!(operation.to_string(), "concatenate [axis=0]");
-        assert_eq!(Operation::<ArrayProgramType>::effects(&operation), Effects::single(Effect::OrderedAssertion),);
+        assert_eq!(Operation::<ArrayProgramType>::effects(&operation), Effects::single(Effect::OrderedAssertion));
         assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::PURE);
         let infer = |input_types: &[ArrayProgramType]| {
             Operation::<ArrayProgramType>::infer_output_types(&operation, input_types, &[])
@@ -614,13 +621,13 @@ mod tests {
         let second_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let four = DimensionValue::constant(4).unwrap().r#type().clone();
         assert_eq!(
-            infer(&[first_type.clone().into(), second_type.clone().into(), four.clone().into()],),
+            infer(&[first_type.clone().into(), second_type.clone().into(), four.clone().into()]),
             Ok(vec![
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])).into()
             ]),
         );
         assert_eq!(
-            infer(&[first_type.clone().into(), DimensionValue::constant(1).unwrap().r#type().clone().into()],),
+            infer(&[first_type.clone().into(), DimensionValue::constant(1).unwrap().r#type().clone().into()]),
             Ok(vec![first_type.clone().into()]),
         );
 
@@ -637,7 +644,7 @@ mod tests {
             Shape::new(vec![Dimension::Dynamic(right), Dimension::Dynamic(columns.clone())]),
         );
         assert_eq!(
-            infer(&[dynamic_left.into(), dynamic_right.into(), DimensionType::new(result.clone()).into(),],),
+            infer(&[dynamic_left.into(), dynamic_right.into(), DimensionType::new(result.clone()).into()]),
             Ok(vec![
                 ArrayType::new(
                     DataType::F32,
@@ -702,7 +709,7 @@ mod tests {
                 first_type.clone().into(),
                 second_type.into(),
                 DimensionValue::constant(5).unwrap().r#type().clone().into(),
-            ],),
+            ]),
             Err(TypeError::invalid(format!(
                 "'{}' result extent is 5 but the static input extent sum is 4",
                 CONCATENATE_OPERATION_NAME,

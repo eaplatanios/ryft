@@ -408,6 +408,25 @@ where
                         }
                         _ => unreachable!(),
                     };
+                    // For the same no-data-dependency reason, an unproven subtraction can hand a negative extent to
+                    // consumers such as `set_dimension_size`, and unproven addition/multiplication/power can hand
+                    // them a wrapped negative, failing inside XLA before the host callback reports the original
+                    // operands. Clamping the unproven data path to zero keeps it well-defined so the assertion owns
+                    // the diagnostic.
+                    let result = if requires_runtime_assertion
+                        && matches!(
+                            operation,
+                            DimensionOperation::Add(_)
+                                | DimensionOperation::Sub(_)
+                                | DimensionOperation::Mul(_)
+                                | DimensionOperation::Pow(_)
+                        ) {
+                        let constants = lower_static_index_constants(&[0], block, context, location)?;
+                        let raw = result.result(0).unwrap().as_ref();
+                        block.append_operation(stable_hlo::maximum(raw, constants[0], location)?)?
+                    } else {
+                        result
+                    };
                     Ok(vec![result.result(0).unwrap().as_ref()])
                 }
                 DimensionOperation::Requirement(operation) => {

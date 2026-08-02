@@ -88,7 +88,7 @@ pub trait ArithmeticDimensionOperation: Operation<DimensionType> {
     }
 }
 
-/// Shared identity-bearing metadata stored by every binary dimension arithmetic operation.
+/// Shared identity-bearing inference and effect metadata stored by every binary dimension arithmetic operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
 pub(crate) struct ArithmeticDimensionOperationMetadata {
     /// Expected left operand type.
@@ -102,17 +102,21 @@ pub(crate) struct ArithmeticDimensionOperationMetadata {
 
     /// Authoritative bounds assigned to the result variable when output inference creates it.
     result_bounds: DimensionBounds,
+
+    /// Whether the admitted operand bounds leave a checked runtime arithmetic failure possible.
+    requires_runtime_assertion: bool,
 }
 
 impl ArithmeticDimensionOperationMetadata {
-    /// Constructs shared arithmetic metadata used to infer one fresh result variable.
+    /// Constructs shared arithmetic metadata used to infer one fresh result variable and classify its effects.
     pub(crate) fn new(
         left: &DimensionType,
         right: &DimensionType,
         result_name: String,
         result_bounds: DimensionBounds,
+        requires_runtime_assertion: bool,
     ) -> Self {
-        Self { left: left.clone(), right: right.clone(), result_name, result_bounds }
+        Self { left: left.clone(), right: right.clone(), result_name, result_bounds, requires_runtime_assertion }
     }
 
     /// Returns the expected left operand type.
@@ -139,6 +143,12 @@ impl ArithmeticDimensionOperationMetadata {
         self.result_bounds
     }
 
+    /// Returns whether the admitted operand bounds leave a checked runtime arithmetic failure possible.
+    #[inline]
+    pub(crate) fn requires_runtime_assertion(&self) -> bool {
+        self.requires_runtime_assertion
+    }
+
     /// Applies one simultaneous identity renaming to both operands.
     pub(crate) fn rename_type_identities(
         &self,
@@ -149,6 +159,7 @@ impl ArithmeticDimensionOperationMetadata {
             right: self.right.rename_identities(renaming)?,
             result_name: self.result_name.clone(),
             result_bounds: self.result_bounds,
+            requires_runtime_assertion: self.requires_runtime_assertion,
         })
     }
 }

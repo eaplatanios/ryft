@@ -47,13 +47,14 @@ use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
 use crate::contexts::{Context, Domain};
+use crate::differentiation::reverse::TranspositionZeroProvider;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::constants::Zero;
 use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::operations::math::AddOperation;
 use crate::operations::math::DotOperation;
@@ -1788,7 +1789,7 @@ where
             To<<D as Domain>::Constant> = OT::To<<D as Domain>::Constant>,
         >,
     <D as Domain>::Operation: From<RematerializeOperation>
-        + From<ZeroOperation<D::Type>>
+        + TranspositionZeroProvider<D::Type>
         + From<AddOperation>
         + TransposableOperation<<D as Domain>::Constant, <D as Domain>::Operation>
         + DifferentiableOperation<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>

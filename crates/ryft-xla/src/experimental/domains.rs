@@ -418,7 +418,8 @@ impl<'c> Context for XlaDomain<'c> {
 
 /// Context capability that materializes additive-identity [`Array`]s. Transform machinery over this domain (e.g.,
 /// the batching rules of nullary constant operations and the accumulator seeding of recursive higher-order rules)
-/// synthesizes constants through the active context's type-driven [`Zero`] / [`One`] / [`Fill`] / [`Iota`] leaves.
+/// synthesizes constants through the active context's type-driven [`Zero`], [`One`](ryft_core::One),
+/// [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota) leaves.
 /// The binds below take the constant-materialization fast path on domains constructed with a concrete mesh and the
 /// compiled eager dispatch path (over a derived default mesh) otherwise. Dynamic array zeros are intentionally not
 /// available through this type-only capability because they require explicit first-class extent operands.

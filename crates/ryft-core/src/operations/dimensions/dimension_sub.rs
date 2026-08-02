@@ -18,9 +18,6 @@ define_arithmetic_dimension_operation!(
         format!("{} - {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    requires_runtime_assertion = |left: &DimensionType, right: &DimensionType| {
-        maximum_extent(right).is_none_or(|right| left.bounds().lower() < right)
-    },
 );
 
 impl OperationProvider<DimensionType> for SubOperation {
@@ -32,8 +29,8 @@ impl OperationProvider<DimensionType> for SubOperation {
     }
 }
 
-/// Derives sound bounds for checked dimension subtraction.
-fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<DimensionBounds, DimensionError> {
+/// Derives sound bounds for checked dimension subtraction and reports whether runtime underflow remains possible.
+fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
     let (left_lower, left_maximum) = representable_extent_range(left.bounds())?;
     let (right_lower, right_maximum) = representable_extent_range(right.bounds())?;
     if left_maximum < right_lower {
@@ -41,7 +38,10 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<Dimension
             message: format!("{} >= {} is impossible from declared bounds", left.variable(), right.variable()),
         });
     }
-    DimensionBounds::new(left_lower.saturating_sub(right_maximum), (left_maximum - right_lower).checked_add(1))
+    let bounds =
+        DimensionBounds::new(left_lower.saturating_sub(right_maximum), (left_maximum - right_lower).checked_add(1))?;
+    let requires_runtime_assertion = maximum_extent(right).is_none_or(|right| left.bounds().lower() < right);
+    Ok((bounds, requires_runtime_assertion))
 }
 
 #[cfg(test)]

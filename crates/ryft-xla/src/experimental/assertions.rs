@@ -1,5 +1,3 @@
-//! Runtime assertion support for compiled first-class-dimension programs.
-
 use std::sync::OnceLock;
 
 use ryft_pjrt::extensions::ffi::{
@@ -190,6 +188,10 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiE
 
 /// Evaluates one checked dimension-arithmetic predicate and returns its eager-compatible diagnostic on failure.
 fn validate_arithmetic(kind: &str, left_name: &str, left: i64, right_name: &str, right: i64) -> Result<(), String> {
+    // This deliberately duplicates `ryft-core`'s crate-private `checked_power` rather than widening that helper's
+    // visibility: the eager helper computes over `usize` extents while this one validates the signed 64-bit values
+    // that cross the FFI boundary, and the wording parity between the two paths is pinned by
+    // `test_validate_arithmetic_matches_eager_checked_diagnostics` below.
     let checked_power = |mut base: i64, mut exponent: i64| {
         if base < 0 || exponent < 0 {
             return None;
@@ -310,7 +312,64 @@ fn scalar_i64(buffer: &FfiBuffer<'_>) -> Result<i64, FfiError> {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use ryft_core::backends::dimensions::DimensionValue;
+    use ryft_core::operations::dimensions::DimensionPow;
+    use ryft_core::types::{DimensionBounds, DimensionType, DimensionVariable};
+    use ryft_core::{Add, DimensionError, Div, ProgramError, Rem, Sub};
+
     use super::*;
+
+    /// Builds an eager dimension value whose diagnostic variable name matches the FFI-reported operand name.
+    fn eager_dimension(name: &str, extent: usize) -> DimensionValue {
+        DimensionValue::new(DimensionType::new(DimensionVariable::new(name, DimensionBounds::unbounded())), extent)
+            .unwrap()
+    }
+
+    /// Extracts the checked-arithmetic diagnostic carried by an eager dimension error.
+    fn eager_message(error: ProgramError) -> String {
+        match error.downcast_custom::<DimensionError>() {
+            Some(DimensionError::ArithmeticOverflow { message })
+            | Some(DimensionError::RequirementViolation { message }) => message.clone(),
+            other => panic!("unexpected eager dimension error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_arithmetic_matches_eager_checked_diagnostics() {
+        // The host callback recomputes each checked predicate, so its wording must match the eager path exactly for
+        // the same named operands; these pairs fail on both paths and must render identically.
+        let compiled = |kind, left, right| validate_arithmetic(kind, "left", left, "right", right).unwrap_err();
+        assert_eq!(
+            compiled(ASSERT_SUB_KIND, 2, 5),
+            eager_message(eager_dimension("left", 2).sub(&eager_dimension("right", 5)).unwrap_err()),
+        );
+        assert_eq!(
+            compiled(ASSERT_DIV_FLOOR_KIND, 7, 0),
+            eager_message(eager_dimension("left", 7).div(&eager_dimension("right", 0)).unwrap_err()),
+        );
+        assert_eq!(
+            compiled(ASSERT_REM_KIND, 7, 0),
+            eager_message(eager_dimension("left", 7).rem(&eager_dimension("right", 0)).unwrap_err()),
+        );
+        assert_eq!(
+            compiled(ASSERT_POW_KIND, 3, 64),
+            eager_message(eager_dimension("left", 3).dimension_pow(&eager_dimension("right", 64)).unwrap_err()),
+        );
+
+        // Addition and multiplication of two constructible extents cannot overflow the eager `usize` computation on
+        // 64-bit hosts (the sum of two values at most `i64::MAX` fits in `usize`, and construction already rejects
+        // larger extents with the backend-width diagnostic), so their overflow wording is pinned against the shared
+        // template instead of a reproduced eager error.
+        assert_eq!(
+            compiled(ASSERT_ADD_KIND, i64::MAX - 1, 2),
+            "dimension arithmetic overflow while adding dimensions with operands left=9223372036854775806, right=2",
+        );
+        assert_eq!(
+            compiled(ASSERT_MUL_KIND, i64::MAX / 2, 3),
+            "dimension arithmetic overflow while multiplying dimensions with operands left=4611686018427387903, \
+             right=3",
+        );
+    }
 
     #[test]
     fn test_validate_arithmetic() {

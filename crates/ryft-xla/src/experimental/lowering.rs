@@ -46,7 +46,9 @@ use ryft_core::programs::regions::{RegionId, RegionRef};
 use ryft_core::programs::types::{Type as RyftType, Typed};
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, MAX_DIMENSION_EXTENT, Memory, Shape};
+use ryft_core::types::{
+    ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, MAX_DIMENSION_EXTENT, Memory, Shape,
+};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
 use ryft_mlir::{
@@ -104,6 +106,14 @@ pub(crate) enum LoweringError {
     /// Error returned when lowering encounters a staged op that does not yet have StableHLO support.
     #[error("unsupported staged op '{op}' during XLA lowering")]
     UnsupportedOp { op: String },
+
+    /// Error returned when a shard-map body carries ordered effects, whose tokens `sdy.manual_computation` cannot
+    /// thread across its boundary.
+    #[error(
+        "effectful shard_map bodies are unsupported because sdy.manual_computation cannot preserve effect \
+             ordering across its boundary"
+    )]
+    EffectfulShardMapBody,
 
     /// Error returned when lowering encounters a captured constant reference without a matching hidden argument.
     #[error("missing captured constant #{index} during XLA lowering")]
@@ -1922,11 +1932,25 @@ fn lower_dimension_requirement_to_assertion<'b, 'c: 'b, 't: 'c>(
     )
 }
 
+/// Builds the deliberately false `value < 0` predicate attached to diagnostic assertion custom calls whose safety
+/// condition is evaluated host-side with checked operations: a nonnegative dimension value can never satisfy it, so
+/// the callback always inspects the concrete observed operands, and the side-effecting call cannot be folded away by
+/// a constant-true predicate.
+fn lower_deliberately_false_assertion_predicate<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let zero = lower_static_index_constants(&[0], block, context, location)?[0];
+    lower_compare_to_mlir(ComparisonDirection::LessThan, value, zero, block, location)
+}
+
 /// Lowers one runtime safety check for dimension arithmetic whose declared bounds do not prove totality.
 fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
     operation: &DimensionOperation<DimensionValue>,
-    left_type: &ryft_core::DimensionType,
-    right_type: &ryft_core::DimensionType,
+    left_type: &DimensionType,
+    right_type: &DimensionType,
     left: ValueRef<'b, 'c, 't>,
     right: ValueRef<'b, 'c, 't>,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
@@ -1943,10 +1967,7 @@ fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
         DimensionOperation::Rem(_) => ASSERT_REM_KIND,
         _ => return Ok(()),
     };
-    // Arithmetic safety is evaluated by the CPU callback with checked host operations. This predicate is deliberately
-    // false so the callback always inspects the two concrete operands; the side-effecting call cannot be folded away.
-    let zero = lower_static_index_constants(&[0], block, context, location)?[0];
-    let predicate = lower_compare_to_mlir(ComparisonDirection::LessThan, left, zero, block, location)?;
+    let predicate = lower_deliberately_false_assertion_predicate(left, block, context, location)?;
     let left_name = left_type.variable().to_string();
     let right_name = right_type.variable().to_string();
     let backend_config = context.dictionary_attribute(&[
@@ -1970,8 +1991,7 @@ fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), LoweringError> {
-    let zero = lower_static_index_constants(&[0], block, context, location)?[0];
-    let predicate = lower_compare_to_mlir(ComparisonDirection::LessThan, actual, zero, block, location)?;
+    let predicate = lower_deliberately_false_assertion_predicate(actual, block, context, location)?;
     let axis = axis.to_string();
     let backend_config = context.dictionary_attribute(&[
         context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("concatenate")),
@@ -4442,7 +4462,7 @@ where
     // programs (identical transformer blocks, or the per-block primal and pullback programs produced by `grad`) lower
     // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without repeated
     // calls, in which case every `jit_call` inlines exactly as before.
-    let nested_functions = Rc::new(collect_jit_call_functions(program)?);
+    let nested_functions = Rc::new(collect_jit_call_functions(program));
     {
         let mut module_block = module.body()?;
         for key in &nested_functions.order {
@@ -6088,9 +6108,7 @@ fn count_jit_calls<Input, Output>(
 /// Builds the [`JitCallFunctionMap`] for a module by emitting a shared private function for every `jit_call` callee
 /// that occurs at least twice (per [`JitCallProgramKey`] identity). Single-occurrence callees are left to inline, so
 /// modules without repeated calls lower exactly as before.
-fn collect_jit_call_functions<Input, Output>(
-    program: &XlaProgram<Input, Output>,
-) -> Result<JitCallFunctionMap, LoweringError>
+fn collect_jit_call_functions<Input, Output>(program: &XlaProgram<Input, Output>) -> JitCallFunctionMap
 where
     Input: Parameterized<XlaConstant>,
     Output: Parameterized<XlaConstant>,
@@ -6114,7 +6132,7 @@ where
         map.functions.insert(key.clone(), JitCallFunction { symbol, program, input_types, output_types });
         map.order.push(key);
     }
-    Ok(map)
+    map
 }
 
 /// Emits the shared private `func.func` for one deduplicated callee into `module_block`.
@@ -6884,12 +6902,10 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                     op: format!("shard_map expected 1 attached region but got {}", regions.len()),
                 });
             };
-            if !body.effects().is_pure() {
-                return Err(LoweringError::UnsupportedOp {
-                    op: "effectful shard_map bodies are unsupported because sdy.manual_computation cannot preserve \
-                         effect ordering across its boundary"
-                        .to_string(),
-                });
+            // Only ordered effects need token threading, which `sdy.manual_computation` cannot express; a body
+            // whose effects are all unordered lowers without any token state.
+            if body.effects().is_ordered() {
+                return Err(LoweringError::EffectfulShardMapBody);
             }
             let simplified_body = body
                 .simplified()
@@ -9425,8 +9441,8 @@ mod tests {
         };
         assert_eq!(
             lower_replicated_shard_map_body(effectful_body_program).unwrap_err().to_string(),
-            "unsupported staged op 'effectful shard_map bodies are unsupported because sdy.manual_computation cannot \
-             preserve effect ordering across its boundary' during XLA lowering",
+            "effectful shard_map bodies are unsupported because sdy.manual_computation cannot preserve effect \
+             ordering across its boundary",
         );
     }
 
@@ -12585,6 +12601,71 @@ mod tests {
             .unwrap()
             .1;
         assert_ne!(print_token, assertion_token, "{module}",);
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_clamps_unproven_dimension_arithmetic_data_paths() {
+        use ryft_core::backends::dimensions::DimensionOperation;
+        use ryft_core::operations::dimensions::{
+            DimensionFromScalarOperation, DimensionSubOperation, DimensionToScalarOperation,
+        };
+
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let build = |left_bounds: DimensionBounds, right_bounds: DimensionBounds| {
+            let left_variable = DimensionVariable::new("left", left_bounds);
+            let right_variable = DimensionVariable::new("right", right_bounds);
+            let left_type = DimensionType::new(left_variable.clone());
+            let right_type = DimensionType::new(right_variable.clone());
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let left = builder.add_input(scalar_type.clone());
+            let right = builder.add_input(scalar_type.clone());
+            let left = builder
+                .add_instruction(DimensionFromScalarOperation::new(left_variable), Vec::new(), vec![left])
+                .unwrap()[0];
+            let right = builder
+                .add_instruction(DimensionFromScalarOperation::new(right_variable), Vec::new(), vec![right])
+                .unwrap()[0];
+            let difference = builder
+                .add_instruction(
+                    DimensionOperation::Sub(DimensionSubOperation::new(&left_type, &right_type).unwrap()),
+                    Vec::new(),
+                    vec![left, right],
+                )
+                .unwrap()[0];
+            let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![difference]).unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![scalar_type.clone(), scalar_type.clone()],
+                &vec![scalar_type.clone()],
+                "main",
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        // An unproven subtraction keeps its diagnostic assertion (two gateway checks plus one arithmetic check), and
+        // because the assertion custom call has no StableHLO data dependency on the subtraction, the data path is
+        // clamped to zero so downstream extent consumers cannot fail inside XLA before the host callback reports the
+        // original operands.
+        let unproven = build(DimensionBounds::new(1, Some(9)).unwrap(), DimensionBounds::new(1, Some(9)).unwrap());
+        assert_eq!(unproven.matches("stablehlo.subtract").count(), 1, "{unproven}");
+        assert_eq!(unproven.matches("stablehlo.maximum").count(), 1, "{unproven}");
+        assert_eq!(unproven.matches("@ryft.assert").count(), 3, "{unproven}");
+
+        // A bounds-proven subtraction lowers without an arithmetic assertion and without a clamp.
+        let proven = build(DimensionBounds::new(5, Some(9)).unwrap(), DimensionBounds::new(1, Some(3)).unwrap());
+        assert_eq!(proven.matches("stablehlo.subtract").count(), 1, "{proven}");
+        assert_eq!(proven.matches("stablehlo.maximum").count(), 0, "{proven}");
+        assert_eq!(proven.matches("@ryft.assert").count(), 2, "{proven}");
     }
 
     #[test]

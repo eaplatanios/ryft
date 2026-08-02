@@ -10,7 +10,7 @@ use ryft_core::compilation::function::CompiledCallOperation;
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationError, LinearCallOperation,
-    TransposableOperation, TranspositionDriver,
+    TransposableOperation, TranspositionDriver, TranspositionZeroProvider,
 };
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
@@ -89,8 +89,8 @@ where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     /// Mixed zero constructor whose explicit first-class dimension operands provide its dynamic result extents.
-    /// This variant cannot be represented by the homogeneous array member because its signature consumes both
-    /// dimension members and produces an array member.
+    /// This variant cannot be represented by the homogeneous array member because its signature crosses member
+    /// kinds: it consumes dimension members and produces an array member.
     Zero(ZeroOperation<ArrayType>),
 
     /// Mixed one constructor with explicit dynamic-extent operands.
@@ -494,7 +494,12 @@ where
     fn zero_operation(r#type: ArrayProgramType) -> Result<Self, ProgramError> {
         Ok(ArrayProgramOperation::<Capture::Projected>::zero_operation(r#type)?.into())
     }
+}
 
+impl<Capture> TranspositionZeroProvider<ArrayProgramType> for XlaOperation<Capture>
+where
+    Capture: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
     fn transposition_zero_residual_types(r#type: &ArrayProgramType) -> Vec<ArrayProgramType> {
         ArrayProgramOperation::<Capture::Projected>::transposition_zero_residual_types(r#type)
     }

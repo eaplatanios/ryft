@@ -18,7 +18,6 @@ define_arithmetic_dimension_operation!(
         format!("{} // {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    requires_runtime_assertion = |_: &DimensionType, right: &DimensionType| right.bounds().lower() == 0,
 );
 
 impl OperationProvider<DimensionType> for DivOperation {
@@ -30,12 +29,14 @@ impl OperationProvider<DimensionType> for DivOperation {
     }
 }
 
-/// Derives sound bounds for checked dimension floor division.
-fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<DimensionBounds, DimensionError> {
+/// Derives sound bounds for checked floor division and reports whether a zero runtime divisor remains possible.
+fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
     let (left_lower, left_maximum) = representable_extent_range(left.bounds())?;
     let (_, right_maximum) = representable_extent_range(right.bounds())?;
     let positive_right_lower = positive_divisor_lower_bound(right, right_maximum)?;
-    DimensionBounds::new(left_lower / right_maximum, (left_maximum / positive_right_lower).checked_add(1))
+    let bounds =
+        DimensionBounds::new(left_lower / right_maximum, (left_maximum / positive_right_lower).checked_add(1))?;
+    Ok((bounds, right.bounds().lower() == 0))
 }
 
 #[cfg(test)]

@@ -17,7 +17,6 @@ define_arithmetic_dimension_operation!(
         format!("max(0, {} - {})", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    requires_runtime_assertion = |_, _| false,
 );
 
 define_arithmetic_dimension_capability!(
@@ -40,14 +39,15 @@ define_arithmetic_dimension_capability!(
     DimensionSaturatingSubOperation,
 );
 
-/// Derives sound bounds for saturating dimension subtraction.
-fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<DimensionBounds, DimensionError> {
+/// Derives sound bounds for total, saturating dimension subtraction.
+fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
     let (left_lower, left_maximum) = representable_extent_range(left.bounds())?;
     let (right_lower, right_maximum) = representable_extent_range(right.bounds())?;
-    DimensionBounds::new(
+    let bounds = DimensionBounds::new(
         left_lower.saturating_sub(right_maximum),
         left_maximum.saturating_sub(right_lower).checked_add(1),
-    )
+    )?;
+    Ok((bounds, false))
 }
 
 #[cfg(test)]
