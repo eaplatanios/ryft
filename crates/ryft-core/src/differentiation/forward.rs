@@ -5,10 +5,15 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
-use crate::differentiation::linear::ResidualZeroProvider;
-use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
+use crate::differentiation::DifferentiationError;
+use crate::differentiation::linear::{
+    ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole,
+    capture_and_validate_zero_residual_values,
+};
+use crate::differentiation::reverse::TransposableOperation;
+use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
-use crate::operations::constants::{Zero, ZeroOperationProvider};
+use crate::operations::constants::Zero;
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
@@ -16,7 +21,7 @@ use crate::partial::{
     PartialValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::ProgramError;
-use crate::programs::atoms::{Atom, MaybeZero};
+use crate::programs::atoms::{Atom, AtomId, MaybeZero};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::TypeIdentityPosition;
 use crate::programs::operations::{Operation, OperationProjection};
@@ -26,7 +31,7 @@ use crate::programs::regions::{
 };
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValue, Value, ValueProjection};
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::{Tracer, TracerState, TracingContext};
 
 /// Represents a differentiation _dual_ value which is a _primal_ value paired with a _tangent_ value. In the
 /// context of differentiating a function `f(x)`, the value `y = f(x)` is the primal value and its tangent `ẏ` is
@@ -320,6 +325,56 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
     }
 }
 
+// TODO(eaplatanios): Review this.
+/// Captures and validates the program-level residuals needed to construct `r#type` as zero.
+fn capture_zero_residual_atoms<V: Value, O: ResidualZeroProvider<V::Type>>(
+    builder: &mut ProgramBuilder<V, O>,
+    source: AtomId,
+    r#type: &V::Type,
+    site: &str,
+) -> Result<Vec<AtomId>, ProgramError> {
+    let expected_types = O::zero_residual_types(r#type);
+    let residuals = O::capture_zero_residuals(builder, source, r#type)?;
+    if residuals.len() != expected_types.len() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "{} captured {} zero residuals but declared {}",
+            site,
+            residuals.len(),
+            expected_types.len(),
+        )));
+    }
+    for (index, (residual, expected_type)) in residuals.iter().copied().zip(expected_types).enumerate() {
+        let actual_type = builder.atoms().get(residual.index()).ok_or(ProgramError::UnboundAtomId { id: residual })?;
+        if actual_type.r#type().as_ref() != &expected_type {
+            return Err(ProgramError::MalformedProgram(format!(
+                "{} zero residual {} has type {} but expected {}",
+                site,
+                index,
+                actual_type.r#type(),
+                expected_type,
+            )));
+        }
+    }
+    Ok(residuals)
+}
+
+// TODO(eaplatanios): Review this.
+/// Forces a residual-backed zero into `context` even when all of its extent operands are known.
+fn residualize_zero<C: Context>(
+    context: &PartialEvaluationContext<C>,
+    r#type: C::Type,
+    residuals: Vec<C::Value>,
+) -> Result<PartialEvaluationValue<C::Value>, ProgramError>
+where
+    C::Operation: ResidualZeroProvider<C::Type>,
+{
+    let residuals = residuals.into_iter().map(PartialEvaluationValue::known_input).collect::<Vec<_>>();
+    let (operation, operands) = C::Operation::zero_operation_with_residuals(r#type, residuals.as_slice())?;
+    let mut outputs = context.residualize(operation, Vec::new(), operands.as_slice())?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
+}
+
 /// Pushforward of a function `f` at a linearization point `x` (i.e., the linear map `ẋ ↦ (∂f/∂x)(x) · ẋ`), packaged
 /// as a reusable callable. This is what [`ForwardModeDifferentiate::linearize`] returns (i.e., the analogue of
 /// [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html)), and it is the forward-mode
@@ -352,6 +407,10 @@ pub struct Pushforward<C: Context, Input, Output: Parameterized<C::Value>> {
     /// interpreting it.
     residuals: Vec<C::Value>,
 
+    /// Reconstruction plan used by [`apply`](Self::apply) to restore zero-space output tangents omitted from
+    /// [`program`](Self::program).
+    tangent_reconstruction: ZeroSpaceBoundaryReconstruction<C::Value>,
+
     /// Complete public primal input boundary. The executable pushforward omits inputs whose derived tangent type is a
     /// zero differential space.
     primal_input_types: Vec<C::Type>,
@@ -380,10 +439,10 @@ impl<
     /// Creates a [`Pushforward`] from a compact tangent [`Program`] and the complete primal boundary from which that
     /// program was derived. The program has the boundary `(live(ẋ), r) ↦ live(ẏ)`. It omits every tangent input and
     /// output whose differential space contains only zero. Its boundary therefore cannot recover the omitted leaves'
-    /// positions or types, and the tangent-type mapping is not generally invertible. `primal_input_types` and
-    /// `primal_output_types` preserve that complete boundary so [`apply`](Self::apply) can validate all public tangent
-    /// leaves, remove the zero-space inputs before replay, and insert typed zeros at the correct output positions
-    /// afterward.
+    /// positions or types, and the tangent-type mapping is not generally invertible. `primal_input_types` preserves
+    /// the complete public input boundary so that [`apply`](Self::apply) can validate and filter its tangent arguments.
+    /// `tangent_reconstruction` independently preserves the reconstruction plan for omitted output leaves, while
+    /// `primal_output_types` validates the compact program boundary and remains available to reverse-mode conversion.
     ///
     /// This function validates the relationship among all three boundaries. In particular, the program must consume
     /// one leading input for every nonzero tangent in `primal_input_types`, followed by one input for every residual,
@@ -397,6 +456,8 @@ impl<
     ///     residual values.
     ///   - `residuals`: Primal values `r` captured at the linearization point, in the same order as the program's
     ///     trailing inputs.
+    ///   - `tangent_reconstruction`: Reconstruction plan for zero-space output tangents rebuilt by
+    ///     [`apply`](Self::apply).
     ///   - `primal_input_types`: Complete flattened input-type boundary of the original primal function, including
     ///     leaves whose tangent spaces contain only zero and which are consequently absent from `program`.
     ///   - `primal_output_types`: Complete flattened output-type boundary of the original primal function, including
@@ -407,10 +468,14 @@ impl<
         context: C,
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,
+        tangent_reconstruction: ZeroSpaceBoundaryReconstruction<C::Value>,
         primal_input_types: Vec<C::Type>,
         primal_output_types: Vec<C::Type>,
         output_structure: Output::ParameterStructure,
-    ) -> Result<Self, ProgramError> {
+    ) -> Result<Self, ProgramError>
+    where
+        C::Operation: ResidualZeroProvider<C::Type>,
+    {
         let tangent_input_count = program.input_ids().len().checked_sub(residuals.len()).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "pushforward program consumes {} inputs which is fewer than its {} residuals",
@@ -479,6 +544,7 @@ impl<
             context,
             program,
             residuals,
+            tangent_reconstruction,
             primal_input_types,
             primal_output_types,
             output_structure,
@@ -536,7 +602,7 @@ impl<
     #[inline]
     pub fn apply(&self, tangents: Input::To<C::Value>) -> Result<Output::To<C::Value>, ProgramError>
     where
-        C: Zero<C::Value>,
+        C::Operation: ResidualZeroProvider<C::Type>,
     {
         // Flatten the caller's structured tangent tree and first validate it against the complete primal boundary,
         // including the leaves whose differential spaces contain only zero.
@@ -589,34 +655,11 @@ impl<
 
         // Close the compact tangent boundary over the primal residuals and replay it in the originating context.
         program_inputs.extend(self.residuals.iter().cloned());
-        let mut tangent_outputs = self.program.interpret_in_context(&self.context, program_inputs)?.into_iter();
+        let tangent_outputs = self.program.interpret_in_context(&self.context, program_inputs)?.into_iter();
 
         // Reconstruct the complete flattened public output boundary. Consume one program result for each nonzero
         // tangent space and materialize the uniquely determined typed zero for every omitted zero-space leaf.
-        let outputs = self
-            .primal_output_types
-            .iter()
-            .map(|r#type| {
-                let tangent_type = r#type.tangent();
-                if tangent_type.is_zero_space() {
-                    self.context.zero(&tangent_type)
-                } else {
-                    tangent_outputs.next().ok_or_else(|| {
-                        ProgramError::MalformedProgram(
-                            "pushforward program omitted a nonzero differential output".to_string(),
-                        )
-                    })
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Construction validated the expected output count. Reject a malformed replay rather than silently dropping
-        // an unexpected compact-program result.
-        if tangent_outputs.next().is_some() {
-            return Err(ProgramError::MalformedProgram(
-                "pushforward program produced more nonzero differential outputs than its public boundary".to_string(),
-            ));
-        }
+        let outputs = self.tangent_reconstruction.rebuild(&self.context, tangent_outputs)?;
 
         // Restore the closure's original structured output shape after rebuilding every flattened tangent leaf.
         Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)
@@ -956,10 +999,10 @@ pub type LinearizationTracer<C> = DifferentiationTracer<PartialEvaluationContext
 /// and [`BatchingTracer`](crate::BatchingTracer)s there), with eager-versus-staged behavior absorbed entirely by the
 /// wrapped context. It is what makes [`ForwardModeDifferentiate::jvp`] the single forward-mode entry point. Structural
 /// zero tangents stay symbolic [`MaybeZero::Zero`]s while they flow between rules. When every input tangent is a
-/// structural zero, the [`bind`](Context::bind) fast path skips a region-free operation's rule only if each output
-/// zero tangent can be constructed without runtime identity operands (or the zero-producing primal itself is reusable).
-/// Eligible operations therefore construct no zero values until a boundary [`materialize`](MaybeZero::materialize)s
-/// one through the inner context's [`Zero`] capability.
+/// structural zero, the [`bind`](Context::bind) fast path skips region-carrying operations because the transform
+/// boundary can capture any required runtime geometry from their primal results through [`ResidualZeroProvider`]. It
+/// skips a region-free operation only if each output zero tangent can be constructed without runtime identity operands
+/// (or the zero-producing primal itself is reusable).
 #[derive(Clone)]
 pub struct DifferentiationContext<C: Context> {
     /// Parent [`Context`] that carries the primal and tangent values and executes (or stages) the operations
@@ -1022,34 +1065,30 @@ where
         // primal synthesis and tangent typing.
         let zero_input_tangents = !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero());
 
-        // Dynamic one already relies on this routing to stage an explicit dynamic-zero tangent. Other dynamic output
-        // rules returning structural zeros must retain the extents needed to materialize them. Region-carrying
-        // operations remain on the established fast path until their differentiation rules own that policy.
-        let reusable_zero_outputs = if zero_input_tangents {
-            // Region-free operations can be inspected without reproducing the parent's region-identity instantiation.
-            // Region-carrying rules retain the established fast path here. Their explicit dynamic-output migration
-            // owns the corresponding policy when those operation families move to first-class extent operands.
-            if operation.region_slots().is_empty() {
-                let input_types =
-                    input_duals.iter().map(|dual| dual.primal().r#type().into_owned()).collect::<Vec<_>>();
-                let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
-                let mut reusable_zero_outputs = Vec::new();
-                let can_materialize = output_types.iter().enumerate().all(|(output_index, output_type)| {
-                    let tangent_type = output_type.tangent();
-                    if operation.is_zero(output_index) && output_type == &tangent_type {
-                        reusable_zero_outputs.push(output_index);
-                        true
-                    } else {
-                        tangent_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference)
-                    }
-                });
-                can_materialize.then_some(reusable_zero_outputs)
-            } else {
-                Some(Vec::new())
-            }
-        } else {
+        // Only all-zero applications can skip their differentiation rule. Region-carrying operations retain structural
+        // zero tangents because the transform boundary captures their runtime geometry from the staged primal outputs.
+        // Region-free operations can instead inspect their outputs without reproducing the parent's region-identity
+        // instantiation.
+        let reusable_zero_outputs = if !zero_input_tangents {
             None
+        } else if !operation.region_slots().is_empty() {
+            Some(Vec::new())
+        } else {
+            let input_types = input_duals.iter().map(|dual| dual.primal().r#type().into_owned()).collect::<Vec<_>>();
+            let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
+            let mut reusable_zero_outputs = Vec::new();
+            let can_materialize = output_types.iter().enumerate().all(|(output_index, output_type)| {
+                let tangent_type = output_type.tangent();
+                if operation.is_zero(output_index) && output_type == &tangent_type {
+                    reusable_zero_outputs.push(output_index);
+                    true
+                } else {
+                    tangent_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference)
+                }
+            });
+            can_materialize.then_some(reusable_zero_outputs)
         };
+
         let output_duals = if let Some(reusable_zero_outputs) = reusable_zero_outputs {
             let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
             self.parent
@@ -1343,11 +1382,6 @@ where
         // `Zero` here as partial evaluation could classify that value as known and remove it from the tangent boundary.
         // Forced residualization keeps a structural zero as an unknown Single Static Assignment (SSA) output,
         // preserving the linear program's output arity without admitting an affine constant.
-        let staged_zero = |r#type: V::Type| {
-            let mut outputs = evaluation_context.residualize(O::zero_operation(r#type)?, Vec::new(), &[])?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok::<_, ProgramError>(outputs.remove(0))
-        };
         let mut primal_output_atoms = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
         for dual in output_duals {
@@ -1389,7 +1423,28 @@ where
                         }
                     }
                 }
-                MaybeZero::Zero(r#type) => staged_zero(r#type)?,
+                MaybeZero::Zero(r#type) => {
+                    let residuals = capture_zero_residual_atoms(
+                        &mut primal_builder.borrow_mut(),
+                        primal.atom_id()?,
+                        &r#type,
+                        "linearization output tangent",
+                    )?;
+                    let residuals = residuals
+                        .into_iter()
+                        .map(|residual| {
+                            let residual_type = primal_builder
+                                .borrow()
+                                .atoms()
+                                .get(residual.index())
+                                .ok_or(ProgramError::UnboundAtomId { id: residual })?
+                                .r#type()
+                                .into_owned();
+                            Ok(Tracer::new(primal_context.clone(), TracerState::Live(residual), residual_type))
+                        })
+                        .collect::<Result<Vec<_>, ProgramError>>()?;
+                    residualize_zero(&evaluation_context, r#type, residuals)?
+                }
             };
             tangent_outputs.push(tangent);
         }
@@ -1467,30 +1522,12 @@ where
             }
             let tangent_type = tangent_input.r#type().into_owned();
             let expected_types = O::zero_residual_types(&tangent_type);
-            let residuals = O::capture_zero_residuals(&mut primal_builder.borrow_mut(), primal_input, &tangent_type)?;
-            if residuals.len() != expected_types.len() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "transposition zero for input type {} captured {} residuals but declared {}",
-                    input.r#type(),
-                    residuals.len(),
-                    expected_types.len(),
-                ))
-                .into());
-            }
-            for (residual, expected_type) in residuals.iter().copied().zip(&expected_types) {
-                let builder = primal_builder.borrow();
-                let actual_type =
-                    builder.atoms().get(residual.index()).ok_or(ProgramError::UnboundAtomId { id: residual })?.r#type();
-                if actual_type.as_ref() != expected_type {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "transposition zero residual for input type {} has type {} but expected {}",
-                        input.r#type(),
-                        actual_type,
-                        expected_type,
-                    ))
-                    .into());
-                }
-            }
+            let residuals = capture_zero_residual_atoms(
+                &mut primal_builder.borrow_mut(),
+                primal_input,
+                &tangent_type,
+                &format!("transposition zero for input type {}", input.r#type()),
+            )?;
             residual_output_atoms.extend(residuals);
             zero_residual_types.extend(expected_types);
         }
@@ -1649,8 +1686,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         tangents: Input::To<Self::Value>,
     ) -> Result<(Output::To<Self::Value>, Output::To<Self::Value>), DifferentiationError>
     where
-        Self: Zero<Self::Value>,
-        Self::Operation: DifferentiableOperation<Self>,
+        Self::Operation: DifferentiableOperation<Self> + ResidualZeroProvider<Self::Type>,
     {
         if primals.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
@@ -1682,14 +1718,26 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         let input = Input::To::<DifferentiationTracer<Self>>::from_parameters(primal_structure, input_duals)?;
         let output = function(input)?;
 
-        // Split each output dual into its primal value and its materialized tangent.
+        // Split each output dual into its primal value and its materialized tangent. A structural zero derives its
+        // runtime geometry from the corresponding primal result before the public boundary requires a concrete value.
         let output_structure = output.parameter_structure();
         let output_duals = output.into_parameters().collect::<Vec<_>>();
         let mut primal_outputs = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
         for output_dual in output_duals {
             let (primal, tangent) = output_dual.into_dual().into_parts();
-            tangent_outputs.push(tangent.materialize(self)?);
+            let tangent = match tangent {
+                MaybeZero::Value(tangent) => tangent,
+                MaybeZero::Zero(r#type) => {
+                    let residuals = Self::Operation::capture_zero_residual_values(self, &primal, &r#type)?;
+                    let (operation, operands) =
+                        Self::Operation::zero_operation_with_residuals(r#type, residuals.as_slice())?;
+                    let mut outputs = self.bind(operation, Vec::new(), operands.as_slice())?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    outputs.remove(0)
+                }
+            };
+            tangent_outputs.push(tangent);
             primal_outputs.push(primal);
         }
         let primal_output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
@@ -1723,7 +1771,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
 
         // The dual-seeding pass consumes `input_values` so we retain the primals separately because dead tangent inputs
-        // may later need their concrete runtime shapes captured for disconnected pullback zeros.
+        // may later need their concrete runtime shapes captured as residuals before transposition.
         let primal_input_values = input_values.clone();
         let tangent_input_count = input_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
 
@@ -1766,13 +1814,6 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         // Force structural zeros into the residual program. Calling `Zero` normally would allow partial evaluation to
         // keep the result known, but a reusable pushforward must expose every non-zero-space tangent output as a
         // Single Static Assignment (SSA) value.
-        let staged_zero = |r#type: Self::Type| {
-            let mut outputs =
-                evaluation_context.residualize(Self::Operation::zero_operation(r#type)?, Vec::new(), &[])?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok::<_, ProgramError>(outputs.remove(0))
-        };
-
         let mut primal_outputs = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
         let mut output_types = Vec::with_capacity(output_duals.len());
@@ -1810,11 +1851,25 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
                         }
                     }
                 }
-                MaybeZero::Zero(r#type) => staged_zero(r#type)?,
+                MaybeZero::Zero(r#type) => {
+                    let residuals = capture_and_validate_zero_residual_values(
+                        self,
+                        &primal,
+                        &r#type,
+                        "pushforward output tangent",
+                    )?;
+                    residualize_zero(&evaluation_context, r#type, residuals)?
+                }
             };
             primal_outputs.push(primal);
             tangent_outputs.push(tangent);
         }
+        let tangent_reconstruction = ZeroSpaceBoundaryReconstruction::capture(
+            self,
+            primal_outputs.as_slice(),
+            output_types.as_slice(),
+            ZeroSpaceBoundaryRole::OutputTangent,
+        )?;
         let output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
 
         // All tracer-stamped context clones are dropped here, so the accumulated pushforward program can be finalized.
@@ -1853,28 +1908,12 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
                 continue;
             }
             let tangent_type = tangent_input.r#type().into_owned();
-            let expected_types = Self::Operation::zero_residual_types(&tangent_type);
-            let values = Self::Operation::capture_zero_residual_values(self, primal, &tangent_type)?;
-            if values.len() != expected_types.len() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "transposition zero for input type {} captured {} residual values but declared {}",
-                    primal.r#type(),
-                    values.len(),
-                    expected_types.len(),
-                ))
-                .into());
-            }
-            for (value, expected_type) in values.iter().zip(&expected_types) {
-                if value.r#type().as_ref() != expected_type {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "transposition zero residual for input type {} has type {} but expected {}",
-                        primal.r#type(),
-                        value.r#type(),
-                        expected_type,
-                    ))
-                    .into());
-                }
-            }
+            let values = capture_and_validate_zero_residual_values(
+                self,
+                primal,
+                &tangent_type,
+                &format!("transposition zero for input type {}", primal.r#type()),
+            )?;
             zero_residuals.extend(values);
         }
 
@@ -1896,8 +1935,15 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         }
 
         // Close the pushforward program over the linearization-point residuals behind the reusable callable.
-        let pushforward =
-            Pushforward::new(self.clone(), program, residuals, input_types, output_types, output_structure)?;
+        let pushforward = Pushforward::new(
+            self.clone(),
+            program,
+            residuals,
+            tangent_reconstruction,
+            input_types,
+            output_types,
+            output_structure,
+        )?;
         Ok((output, pushforward))
     }
 }
@@ -1928,10 +1974,11 @@ impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 ///     primal errors because it is a [`Tracer`] with no concrete payload.
 ///
 /// The closure executes exactly as written: no dead code is trimmed, and observable effects fire as the closure runs.
-/// Structural zero tangents stay symbolic between operations and are materialized through the recovered context's
-/// [`Zero`] capability only at the output boundary. Transforms nest. Inside the closure, an inner transform invoked
-/// on a dual's [`DifferentiationContext`] (a [`Context`] carrying these transforms itself) differentiates through the
-/// duals, composing reverse-over-forward and higher-order forward modes.
+/// Structural zero tangents stay symbolic between operations. At the output boundary they are materialized through
+/// [`ResidualZeroProvider`], which uses the corresponding primal result to retain exact runtime geometry when the zero
+/// type is dynamic. Also, transforms nest. Inside the closure, an inner transform invoked on a dual's
+/// [`DifferentiationContext`] (a [`Context`] carrying these transforms itself) differentiates through
+/// the duals, composing reverse-over-forward and higher-order forward modes.
 ///
 /// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error as there is nothing to
 /// recover a context from, and differentiating a function of no inputs is degenerate anyway.
@@ -1940,7 +1987,9 @@ impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 pub fn jvp<
     V: Value<
             Type: DifferentiableType,
-            ExecutionDomain: Context<Operation: DifferentiableOperation<V::ExecutionDomain>> + Zero<V>,
+            ExecutionDomain: Context<
+                Operation: DifferentiableOperation<V::ExecutionDomain> + ResidualZeroProvider<V::Type>,
+            >,
         >,
     F: FnOnce(Input::To<DifferentiationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
     Input: Parameterized<
