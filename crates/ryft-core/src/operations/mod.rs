@@ -89,17 +89,23 @@ pub trait ElementwiseOperation: Operation<ArrayType> {
                 let original_varying_manual_axes = input_types
                     .iter()
                     .filter_map(|input_type| input_type.sharding.as_ref())
-                    .flat_map(|sharding| sharding.varying_manual_axes.iter().cloned())
+                    .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
                     .collect::<BTreeSet<_>>();
                 let mut input_types = input_types.to_vec();
                 for sharding in input_types.iter_mut().filter_map(|input_type| input_type.sharding.as_mut()) {
-                    sharding.varying_manual_axes.clear();
+                    *sharding = sharding
+                        .clone()
+                        .with_varying_manual_axes(std::iter::empty::<String>())
+                        .map_err(TypeError::custom)?;
                 }
                 let mut output = ArrayType::broadcasted(input_types.as_slice()).map_err(|_| {
                     TypeError::invalid(format!("'{}' input types are not broadcast-compatible", self.name()))
                 })?;
                 if let Some(sharding) = &mut output.sharding {
-                    sharding.varying_manual_axes = original_varying_manual_axes;
+                    *sharding = sharding
+                        .clone()
+                        .with_varying_manual_axes(original_varying_manual_axes)
+                        .map_err(TypeError::custom)?;
                 }
                 Ok(output)
             }

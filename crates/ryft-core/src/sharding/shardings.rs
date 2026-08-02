@@ -100,19 +100,19 @@ impl Display for ShardingDimension {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Sharding {
     /// Refer to the documentation of [`Self::mesh`] for information on this field.
-    pub(crate) mesh: LogicalMesh,
+    mesh: LogicalMesh,
 
     /// Refer to the documentation of [`Self::dimensions`] for information on this field.
-    pub(crate) dimensions: Vec<ShardingDimension>,
+    dimensions: Vec<ShardingDimension>,
 
     /// Refer to the documentation of [`Self::unreduced_axes`] for information on this field.
-    pub(crate) unreduced_axes: BTreeSet<String>,
+    unreduced_axes: BTreeSet<String>,
 
     /// Refer to the documentation of [`Self::reduced_axes`] for information on this field.
-    pub(crate) reduced_axes: BTreeSet<String>,
+    reduced_axes: BTreeSet<String>,
 
     /// Refer to the documentation of [`Self::varying_manual_axes`] for information on this field.
-    pub(crate) varying_manual_axes: BTreeSet<String>,
+    varying_manual_axes: BTreeSet<String>,
 }
 
 impl Sharding {
@@ -149,81 +149,6 @@ impl Sharding {
         }
 
         Ok(sharding)
-    }
-
-    /// Returns this [`Sharding`] with its unreduced mesh axes replaced by `unreduced_axes`. Use this when the
-    /// sharding carries partial results along mesh axes that still need cross-device reduction.
-    pub fn with_unreduced_axes<A: Into<String>, I: IntoIterator<Item = A>>(
-        mut self,
-        unreduced_axes: I,
-    ) -> Result<Self, ShardingError> {
-        let unreduced_axes = unreduced_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
-        for axis_name in &unreduced_axes {
-            if self.mesh.axis_index(axis_name).is_none() {
-                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
-            }
-            if self.dimensions.iter().any(|dimension| match dimension {
-                ShardingDimension::Sharded(axis_names) => axis_names.contains(axis_name),
-                ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-            }) || self.reduced_axes.contains(axis_name)
-            {
-                return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
-            }
-            if self.varying_manual_axes.contains(axis_name) {
-                return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.clone() });
-            }
-        }
-        self.unreduced_axes = unreduced_axes;
-        Ok(self)
-    }
-
-    /// Returns this [`Sharding`] with its reduced mesh axes replaced by `reduced_axes`.
-    pub fn with_reduced_axes<A: Into<String>, I: IntoIterator<Item = A>>(
-        mut self,
-        reduced_axes: I,
-    ) -> Result<Self, ShardingError> {
-        let reduced_axes = reduced_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
-        for axis_name in &reduced_axes {
-            if self.mesh.axis_index(axis_name).is_none() {
-                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
-            }
-            if self.dimensions.iter().any(|dimension| match dimension {
-                ShardingDimension::Sharded(axis_names) => axis_names.contains(axis_name),
-                ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-            }) || self.unreduced_axes.contains(axis_name)
-            {
-                return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
-            }
-            if self.varying_manual_axes.contains(axis_name) {
-                return Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name: axis_name.clone() });
-            }
-        }
-        self.reduced_axes = reduced_axes;
-        Ok(self)
-    }
-
-    /// Returns this [`Sharding`] with its varying manual mesh axes replaced by `varying_manual_axes`.
-    pub fn with_varying_manual_axes<A: Into<String>, I: IntoIterator<Item = A>>(
-        mut self,
-        varying_manual_axes: I,
-    ) -> Result<Self, ShardingError> {
-        let varying_manual_axes = varying_manual_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
-        for axis_name in &varying_manual_axes {
-            if self.mesh.axis_index(axis_name).is_none() {
-                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
-            }
-            if self.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
-                return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
-            }
-            if self.unreduced_axes.contains(axis_name) {
-                return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.clone() });
-            }
-            if self.reduced_axes.contains(axis_name) {
-                return Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name: axis_name.clone() });
-            }
-        }
-        self.varying_manual_axes = varying_manual_axes;
-        Ok(self)
     }
 
     /// Creates a new _fully-replicated_ [`Sharding`] for an array with rank `rank`. All dimensions in the resulting
@@ -366,6 +291,102 @@ impl Sharding {
                 Ok(index * self.mesh.axes()[axis_index].size() + device_mesh_coordinates[axis_index])
             }),
         }
+    }
+
+    /// Returns this [`Sharding`] with its per-array dimension assignments replaced by `dimensions`, while preserving
+    /// its mesh and auxiliary axis state. The resulting sharding is revalidated against all preserved axis sets.
+    #[inline]
+    pub fn with_dimensions(self, dimensions: Vec<ShardingDimension>) -> Result<Self, ShardingError> {
+        Self::new(self.mesh, dimensions)?
+            .with_unreduced_axes(self.unreduced_axes)?
+            .with_reduced_axes(self.reduced_axes)?
+            .with_varying_manual_axes(self.varying_manual_axes)
+    }
+
+    /// Returns this [`Sharding`] with its unreduced mesh axes replaced by `unreduced_axes`. Use this when the
+    /// sharding carries partial results along mesh axes that still need cross-device reduction.
+    pub fn with_unreduced_axes<A: Into<String>, I: IntoIterator<Item = A>>(
+        mut self,
+        unreduced_axes: I,
+    ) -> Result<Self, ShardingError> {
+        let unreduced_axes = unreduced_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
+        for axis_name in &unreduced_axes {
+            if self.mesh.axis_index(axis_name).is_none() {
+                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+            }
+            if self.dimensions.iter().any(|dimension| match dimension {
+                ShardingDimension::Sharded(axis_names) => axis_names.contains(axis_name),
+                ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+            }) || self.reduced_axes.contains(axis_name)
+            {
+                return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
+            }
+            if self.varying_manual_axes.contains(axis_name) {
+                return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.clone() });
+            }
+        }
+        self.unreduced_axes = unreduced_axes;
+        Ok(self)
+    }
+
+    /// Returns this [`Sharding`] with its reduced mesh axes replaced by `reduced_axes`.
+    pub fn with_reduced_axes<A: Into<String>, I: IntoIterator<Item = A>>(
+        mut self,
+        reduced_axes: I,
+    ) -> Result<Self, ShardingError> {
+        let reduced_axes = reduced_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
+        for axis_name in &reduced_axes {
+            if self.mesh.axis_index(axis_name).is_none() {
+                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+            }
+            if self.dimensions.iter().any(|dimension| match dimension {
+                ShardingDimension::Sharded(axis_names) => axis_names.contains(axis_name),
+                ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+            }) || self.unreduced_axes.contains(axis_name)
+            {
+                return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
+            }
+            if self.varying_manual_axes.contains(axis_name) {
+                return Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name: axis_name.clone() });
+            }
+        }
+        self.reduced_axes = reduced_axes;
+        Ok(self)
+    }
+
+    /// Returns this [`Sharding`] with its varying manual mesh axes replaced by `varying_manual_axes`.
+    pub fn with_varying_manual_axes<A: Into<String>, I: IntoIterator<Item = A>>(
+        mut self,
+        varying_manual_axes: I,
+    ) -> Result<Self, ShardingError> {
+        let varying_manual_axes = varying_manual_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
+        for axis_name in &varying_manual_axes {
+            if self.mesh.axis_index(axis_name).is_none() {
+                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+            }
+            if self.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
+                return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
+            }
+            if self.unreduced_axes.contains(axis_name) {
+                return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.clone() });
+            }
+            if self.reduced_axes.contains(axis_name) {
+                return Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name: axis_name.clone() });
+            }
+        }
+        self.varying_manual_axes = varying_manual_axes;
+        Ok(self)
+    }
+
+    /// Returns the [`Sharding`] that reverse-mode cotangents of values sharded like this one carry. It swaps
+    /// [`Self::unreduced_axes`] with [`Self::reduced_axes`] and keeps all other state unchanged. The cotangent of a
+    /// value that still carries per-device partial results along an axis is the same value on every device along that
+    /// axis (i.e., marked reduced), while the cotangent of an already-reduced value carries per-device partial results
+    /// that still need a reduction (i.e., marked unreduced). The swap is an **involution**, so that
+    /// `sharding.cotangent().cotangent()` recovers `sharding`.
+    #[inline]
+    pub fn cotangent(&self) -> Self {
+        Self { unreduced_axes: self.reduced_axes.clone(), reduced_axes: self.unreduced_axes.clone(), ..self.clone() }
     }
 
     /// Returns a copy of this [`Sharding`] with all of its [`MeshAxisType::Auto`] mesh axes removed.

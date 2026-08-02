@@ -258,10 +258,10 @@ impl Device {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceMesh {
     /// Logical mesh topology that defines the names, sizes, and types of the mesh axes.
-    pub(crate) logical_mesh: LogicalMesh,
+    logical_mesh: LogicalMesh,
 
     /// Physical devices laid out in row-major order with respect to [`Self::logical_mesh`].
-    pub(crate) devices: Vec<Device>,
+    devices: Vec<Device>,
 }
 
 impl DeviceMesh {

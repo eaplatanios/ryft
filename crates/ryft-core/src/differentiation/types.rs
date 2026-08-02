@@ -161,18 +161,6 @@ impl DifferentiableType for ArrayProgramType {
     }
 }
 
-impl Sharding {
-    /// Returns the [`Sharding`] that reverse-mode cotangents of values sharded like this one carry. It swaps
-    /// [`Self::unreduced_axes`] with [`Self::reduced_axes`] and keeps all other state unchanged. The cotangent of a
-    /// value that still carries per-device partial results along an axis is the same value on every device along that
-    /// axis (i.e., marked reduced), while the cotangent of an already-reduced value carries per-device partial results
-    /// that still need a reduction (i.e., marked unreduced). The swap is an **involution**, so that
-    /// `sharding.cotangent().cotangent()` recovers `sharding`.
-    pub fn cotangent(&self) -> Self {
-        Self { unreduced_axes: self.reduced_axes.clone(), reduced_axes: self.unreduced_axes.clone(), ..self.clone() }
-    }
-}
-
 /// A [`Type`] that is supported by dense differentiation functions that compute [`Jacobian`](crate::Jacobian)s and
 /// [`Hessian`](crate::Hessian)s. [`Type`] and [`DifferentiableType`] describe individual primal and cotangent values,
 /// but they do not state that a leaf (i.e., a [`Parameter`](crate::parameters::Parameter)) has a finite coordinate

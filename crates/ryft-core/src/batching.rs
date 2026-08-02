@@ -1410,28 +1410,28 @@ impl ArrayType {
         // information for regular array dimensions, and so it cannot be used for these batching-specific semantics.
         let mut dimensions = self.shape().dimensions().to_vec();
         dimensions.remove(axis);
-        let sharding = self.sharding().map(|sharding| {
-            let mut sharding_dimensions = sharding.dimensions().to_vec();
-            let removed_dimension = sharding_dimensions.remove(axis);
-            let mut varying_manual_axes = sharding.varying_manual_axes().clone();
+        let sharding = self
+            .sharding()
+            .map(|sharding| {
+                let mut sharding_dimensions = sharding.dimensions().to_vec();
+                let removed_dimension = sharding_dimensions.remove(axis);
+                let mut varying_manual_axes = sharding.varying_manual_axes().clone();
 
-            // Manual axes remain semantically visible after their ranked dimension is removed because values may
-            // still vary across those axes. All other mesh axes are intentionally omitted (they placed the batch
-            // dimension itself, which is outside the unbatched per-item type).
-            if let ShardingDimension::Sharded(axis_names) = removed_dimension {
-                varying_manual_axes.extend(
-                    axis_names.into_iter().filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual)),
-                );
-            }
+                // Manual axes remain semantically visible after their ranked dimension is removed because values may
+                // still vary across those axes. All other mesh axes are intentionally omitted (they placed the batch
+                // dimension itself, which is outside the unbatched per-item type).
+                if let ShardingDimension::Sharded(axis_names) = removed_dimension {
+                    varying_manual_axes.extend(
+                        axis_names
+                            .into_iter()
+                            .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual)),
+                    );
+                }
 
-            Sharding {
-                mesh: sharding.mesh().clone(),
-                dimensions: sharding_dimensions,
-                unreduced_axes: sharding.unreduced_axes().clone(),
-                reduced_axes: sharding.reduced_axes().clone(),
-                varying_manual_axes,
-            }
-        });
+                sharding.clone().with_dimensions(sharding_dimensions)?.with_varying_manual_axes(varying_manual_axes)
+            })
+            .transpose()
+            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
 
         Ok((
             Self {
@@ -1664,7 +1664,7 @@ impl<
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
         let unbatched_types = inputs
             .iter()
-            .map(|input| {
+            .map(|input| -> Result<_, BatchingError> {
                 let mut unbatched_type = input.unbatched_type();
                 if let (Some(sharding), ShardingDimension::Sharded(axis_names)) =
                     (unbatched_type.sharding.as_mut(), &axis_sharding)
@@ -1674,11 +1674,16 @@ impl<
                         .filter(|name| sharding.mesh().axis_type(name.as_str()) == Some(MeshAxisType::Manual))
                         .cloned()
                         .collect::<Vec<_>>();
-                    sharding.varying_manual_axes.extend(varying_manual_axes);
+                    let mut combined_varying_manual_axes = sharding.varying_manual_axes().clone();
+                    combined_varying_manual_axes.extend(varying_manual_axes);
+                    *sharding = sharding
+                        .clone()
+                        .with_varying_manual_axes(combined_varying_manual_axes)
+                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
                 }
-                unbatched_type
+                Ok(unbatched_type)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let inputs = inputs.iter().map(|input| input.move_axis(batch_axis)).collect::<Result<Vec<_>, _>>()?;
 
         // Broadcast every operand to the common unbatched per-item shape when one exists. Otherwise, retain
