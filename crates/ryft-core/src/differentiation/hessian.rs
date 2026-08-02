@@ -470,35 +470,36 @@ macro_rules! define_hessian_function {
     ) => {
         $(#[doc = $documentation])*
         #[inline]
-        pub fn $function_name<D, V, F, I, O>(
+        pub fn $function_name<C, V, F, I, O>(
             function: F,
             primals: I,
         ) -> Result<Hessian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
         where
-            D: HessianDifferentiate<Type = V::Type, Value = V>,
-            V: Value<ExecutionDomain = D>,
-            V::Type: DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<D>>>,
-            D::Operation: ResidualZeroProvider<V::Type>,
-            F: FnOnce(I::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>>)
+            C: HessianDifferentiate<Type = V::Type, Value = V, Operation: ResidualZeroProvider<V::Type>>,
+            V: Value<
+                Type: DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<C>>>,
+                ExecutionDomain = C,
+            >,
+            F: FnOnce(I::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>)
                 -> Result<O, ProgramError>,
             I: Parameterized<V, To<V> = I>,
+            I::Family: ParameterizedFamily<V::Type>
+                + ParameterizedFamily<LinearizationTracer<C>>
+                + ParameterizedFamily<
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>,
+                >,
             I::To<V::Type>: Clone,
-            I::To<LinearizationTracer<D>>: Parameterized<
-                LinearizationTracer<D>,
-                To<LinearizationTracer<D>> = I::To<LinearizationTracer<D>>,
-                To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>> = I::To<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>,
+            I::To<LinearizationTracer<C>>: Parameterized<
+                LinearizationTracer<C>,
+                To<LinearizationTracer<C>> = I::To<LinearizationTracer<C>>,
+                To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>> = I::To<
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>,
                 >,
                 To<V::Type> = I::To<V::Type>,
             >,
-            I::Family: ParameterizedFamily<V::Type>
-                + ParameterizedFamily<LinearizationTracer<D>>
-                + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>,
-                >,
-            O: Parameterized<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>>,
+            O: Parameterized<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
+            O::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<C>>,
             O::To<V::Type>: Clone,
-            O::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<D>>,
         {
             let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
                 return Err(DifferentiationError::EmptyInput);
@@ -517,38 +518,39 @@ macro_rules! define_hessian_auxiliary_function {
     ) => {
         $(#[doc = $documentation])*
         #[inline]
-        pub fn $function_name<D, V, F, I, O, A>(
+        pub fn $function_name<C, V, F, I, O, A>(
             function: F,
             primals: I,
         ) -> Result<(Hessian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, A::To<V>), DifferentiationError>
         where
-            D: HessianDifferentiate<Type = V::Type, Value = V>,
-            V: Value<ExecutionDomain = D>,
-            V::Type: DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<D>>>,
-            D::Operation: ResidualZeroProvider<V::Type>,
-            F: FnOnce(I::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>>)
+            C: HessianDifferentiate<Type = V::Type, Value = V, Operation: ResidualZeroProvider<V::Type>>,
+            V: Value<
+                Type: DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<C>>>,
+                ExecutionDomain = C,
+            >,
+            F: FnOnce(I::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>)
                 -> Result<(O, A), ProgramError>,
             I: Parameterized<V, To<V> = I>,
+            I::Family: ParameterizedFamily<V::Type>
+                + ParameterizedFamily<LinearizationTracer<C>>
+                + ParameterizedFamily<
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>,
+                >,
             I::To<V::Type>: Clone,
-            I::To<LinearizationTracer<D>>: Parameterized<
-                LinearizationTracer<D>,
-                To<LinearizationTracer<D>> = I::To<LinearizationTracer<D>>,
-                To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>> = I::To<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>,
+            I::To<LinearizationTracer<C>>: Parameterized<
+                LinearizationTracer<C>,
+                To<LinearizationTracer<C>> = I::To<LinearizationTracer<C>>,
+                To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>> = I::To<
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>,
                 >,
                 To<V::Type> = I::To<V::Type>,
             >,
-            I::Family: ParameterizedFamily<V::Type>
-                + ParameterizedFamily<LinearizationTracer<D>>
-                + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>,
-                >,
-            O: Parameterized<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>>,
+            O: Parameterized<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
+            O::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<C>>,
             O::To<V::Type>: Clone,
-            O::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<D>>,
-            A: Parameterized<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<D>>>>,
-            A::To<LinearizationTracer<D>>: Parameterized<LinearizationTracer<D>, To<V> = A::To<V>>,
-            A::Family: ParameterizedFamily<LinearizationTracer<D>> + ParameterizedFamily<V>,
+            A: Parameterized<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
+            A::Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<V>,
+            A::To<LinearizationTracer<C>>: Parameterized<LinearizationTracer<C>, To<V> = A::To<V>>,
         {
             let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
                 return Err(DifferentiationError::EmptyInput);
@@ -558,11 +560,9 @@ macro_rules! define_hessian_auxiliary_function {
     };
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 define_hessian_function!(
     /// Computes the [`Hessian`] of `function` at `primals` using forward-over-reverse differentiation.
-    /// For `y = f(x)`, each Hessian entry is `H[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. This function first uses
+    /// For `y = f(x)`, each Hessian entry is `H[k, i, j] = ∂²y[k] / (∂x[i] ∂x[j])`. This function first uses
     /// [`jacobian_reverse`](crate::jacobian_reverse) to materialize the inner output/first-input Jacobian, and then
     /// uses [`jacobian_forward`](crate::jacobian_forward) to differentiate it with respect to the second input. The
     /// resulting [`Hessian`] stores blocks in output-major/first-input-major/second-input-minor order. For arrays,
@@ -584,9 +584,8 @@ define_hessian_function!(
     /// Computes the [`Hessian`] of a complex holomorphic `function` at `primals` using forward-over-reverse
     /// differentiation. This has the algorithm and representation described by [`hessian`], but treats both derivative
     /// transforms as complex linear and requires every differentiated input and output parameter to be complex. Passing
-    /// `function` is a promise of holomorphy; this function validates the parameter types but cannot prove that the
-    /// function satisfies the
-    /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
+    /// `function` is a promise of holomorphy. It validates the parameter types but cannot prove that the function
+    /// satisfies the [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
     ///
     /// # Parameters
     ///
