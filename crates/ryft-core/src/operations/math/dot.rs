@@ -760,7 +760,7 @@ where
 /// `f8 × f8 → f32` dot) so the produced cotangent matches the operand's cotangent representation exactly.
 impl<
     V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<crate::operations::manipulation::ConvertElementTypeOperation> + From<DotOperation>,
+    O: Operation<ArrayType> + From<ConvertElementTypeOperation<ArrayType>> + From<DotOperation>,
 > TransposableOperation<V, O> for DotOperation
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -1246,7 +1246,7 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ScaledDotOpe
 where
     O: Operation<ArrayType>
         + From<LegacyBroadcastOperation>
-        + From<ConvertElementTypeOperation>
+        + From<ConvertElementTypeOperation<ArrayType>>
         + From<DotOperation>
         + From<MulOperation>
         + From<LegacyReshapeOperation>,

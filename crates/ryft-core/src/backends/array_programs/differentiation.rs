@@ -1674,7 +1674,7 @@ where
                 };
                 let tangent = context
                     .bind(
-                        ArrayProgramOperation::<A>::Array(ArrayOperation::ZeroLike(ZeroLikeOperation)),
+                        ArrayProgramOperation::<A>::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new())),
                         Vec::new(),
                         &[exemplar],
                     )?

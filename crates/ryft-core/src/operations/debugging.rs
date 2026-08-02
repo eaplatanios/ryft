@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -11,7 +12,6 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this module.
 
@@ -35,16 +35,19 @@ pub const PRINT_OPERATION_NAME: &str = "print";
 /// including through `while`/`if` regions; refer to `ryft-xla`'s `experimental::debugging` module for the calling
 /// convention and the capturable output sink.
 #[derive(Clone, Debug)]
-pub struct PrintOperation {
+pub struct PrintOperation<T: Type> {
     /// Label printed before the value.
     label: String,
+
+    /// Type universe in which this operation is valid.
+    marker: PhantomData<fn() -> T>,
 }
 
-impl PrintOperation {
+impl<T: Type> PrintOperation<T> {
     /// Creates a new [`PrintOperation`] with the provided label.
     #[inline]
     pub fn new<L: Into<String>>(label: L) -> Self {
-        Self { label: label.into() }
+        Self { label: label.into(), marker: PhantomData }
     }
 
     /// Returns the label carried by this [`PrintOperation`].
@@ -54,13 +57,13 @@ impl PrintOperation {
     }
 }
 
-impl Display for PrintOperation {
+impl<T: Type> Display for PrintOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, 0)
+        Operation::<T>::render(self, formatter, 0)
     }
 }
 
-impl<T: Type> Operation<T> for PrintOperation {
+impl<T: Type> Operation<T> for PrintOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         PRINT_OPERATION_NAME
@@ -87,14 +90,14 @@ impl<T: Type> Operation<T> for PrintOperation {
     }
 }
 
-impl ElementwiseOperation for PrintOperation {
+impl ElementwiseOperation for PrintOperation<crate::types::ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         1
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for PrintOperation {
+impl<C: Domain> InterpretableOperation<C> for PrintOperation<C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -111,7 +114,10 @@ impl<C: Domain> InterpretableOperation<C> for PrintOperation {
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate): the print folds into the known side when its
 /// input is known and residualizes otherwise, with dead-code elimination keeping residual prints alive because
 /// [`Operation::effects`] is not [`Effects::PURE`].
-impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation where C::Operation: From<PrintOperation> {}
+impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation<C::Type> where
+    C::Operation: From<PrintOperation<C::Type>>
+{
+}
 
 /// Represents the ability to print values in programs with labels. [`Print`] stages a [`PrintOperation`], which is
 /// effectively an identity function that prints its input to standard error when executed. Because the staged
@@ -128,7 +134,7 @@ pub trait Print: Sized {
 /// without conflicting with concrete implementations.
 impl<V: Value> Print for V
 where
-    V::DispatchDomain: Context<Operation: From<PrintOperation>>,
+    V::DispatchDomain: Context<Operation: From<PrintOperation<V::Type>>>,
 {
     #[inline]
     fn print(self, label: &str) -> Self {
@@ -140,8 +146,8 @@ where
 }
 
 impl_differentiable_elementwise_operation! {
-    @linear
-    PrintOperation,
+    @linear<T>
+    PrintOperation<T>,
     rule = [@positive]
 }
 

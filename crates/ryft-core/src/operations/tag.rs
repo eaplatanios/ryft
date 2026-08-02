@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -23,16 +24,19 @@ pub const TAG_OPERATION_NAME: &str = "tag";
 /// that define linearization residuals, which is exactly what consumers such as key-based rematerialization strategies
 /// need.
 #[derive(Clone, Debug)]
-pub struct TagOperation {
+pub struct TagOperation<T: Type> {
     /// Key tagging the operation's output [`Value`].
     key: String,
+
+    /// Type universe in which this operation is valid.
+    marker: PhantomData<fn() -> T>,
 }
 
-impl TagOperation {
+impl<T: Type> TagOperation<T> {
     /// Creates a new [`TagOperation`] with the provided key.
     #[inline]
     pub fn new<K: Into<String>>(key: K) -> Self {
-        Self { key: key.into() }
+        Self { key: key.into(), marker: PhantomData }
     }
 
     /// Returns the key carried by this [`TagOperation`].
@@ -42,13 +46,13 @@ impl TagOperation {
     }
 }
 
-impl Display for TagOperation {
+impl<T: Type> Display for TagOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{TAG_OPERATION_NAME}[{}]", self.key)
     }
 }
 
-impl<T: Type> Operation<T> for TagOperation {
+impl<T: Type> Operation<T> for TagOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         TAG_OPERATION_NAME
@@ -65,14 +69,14 @@ impl<T: Type> Operation<T> for TagOperation {
     }
 }
 
-impl ElementwiseOperation for TagOperation {
+impl ElementwiseOperation for TagOperation<crate::types::ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         1
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for TagOperation {
+impl<C: Domain> InterpretableOperation<C> for TagOperation<C::Type> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -85,7 +89,7 @@ impl<C: Domain> InterpretableOperation<C> for TagOperation {
     }
 }
 
-impl<C: Context<Operation: From<TagOperation>>> PartiallyEvaluatableOperation<C> for TagOperation {}
+impl<C: Context<Operation: From<TagOperation<C::Type>>>> PartiallyEvaluatableOperation<C> for TagOperation<C::Type> {}
 
 /// Represents the ability to tag values in programs with keys. [`Tag`] stages a [`TagOperation`], which is effectively
 /// an identity function carrying a string-valued key. The tag gets attached to traced values and survives forward-mode
@@ -97,7 +101,7 @@ pub trait Tag: Sized {
     fn tag(self, key: &str) -> Self;
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V {
+impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation<V::Type>>>>> Tag for V {
     #[inline]
     fn tag(self, key: &str) -> Self {
         self.dispatch_domain()
@@ -108,8 +112,8 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V
 }
 
 impl_differentiable_elementwise_operation! {
-    @linear
-    TagOperation,
+    @linear<T>
+    TagOperation<T>,
     rule = [@positive]
 }
 
