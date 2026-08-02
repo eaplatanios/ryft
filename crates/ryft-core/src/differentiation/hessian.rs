@@ -8,7 +8,7 @@ use crate::differentiation::forward::{DifferentiableOperation, DifferentiationCo
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DenseDifferentiableType;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::ZeroOperationProvider;
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
@@ -411,7 +411,7 @@ pub trait HessianDifferentiate:
         > + DifferentiableOperation<
             PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<Self>>>,
         > + TransposableOperation<Self::Constant, Self::Operation>
-                       + From<ZeroOperation<Self::Type>>
+                       + ZeroOperationProvider<Self::Type>
                        + From<AddOperation>,
     >
 {
@@ -456,7 +456,7 @@ where
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
         + DifferentiableOperation<PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<C>>>>
         + TransposableOperation<C::Constant, C::Operation>
-        + From<ZeroOperation<C::Type>>
+        + ZeroOperationProvider<C::Type>
         + From<AddOperation>,
 {
 }
@@ -509,7 +509,7 @@ macro_rules! define_hessian_function {
                                        + TransposableOperation<
                             <V::ExecutionDomain as Domain>::Constant,
                             <V::ExecutionDomain as Domain>::Operation,
-                        > + From<ZeroOperation<V::Type>>
+                        > + ZeroOperationProvider<V::Type>
                                        + From<AddOperation>,
                     >,
                 >,
@@ -603,7 +603,7 @@ macro_rules! define_hessian_auxiliary_function {
                                        + TransposableOperation<
                             <V::ExecutionDomain as Domain>::Constant,
                             <V::ExecutionDomain as Domain>::Operation,
-                        > + From<ZeroOperation<V::Type>>
+                        > + ZeroOperationProvider<V::Type>
                                        + From<AddOperation>,
                     >,
                 >,

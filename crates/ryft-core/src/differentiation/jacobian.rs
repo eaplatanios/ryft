@@ -8,7 +8,7 @@ use crate::differentiation::reverse::{ReverseModeDifferentiate, TransposableOper
 use crate::differentiation::types::{DenseDifferentiableType, DifferentiableType};
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::ZeroOperationProvider;
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
@@ -308,7 +308,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
                 + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + From<ZeroOperation<Self::Type>>
+                + ZeroOperationProvider<Self::Type>
         ],
     );
 
@@ -320,7 +320,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
                 + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + From<ZeroOperation<Self::Type>>
+                + ZeroOperationProvider<Self::Type>
         ],
     );
 
@@ -333,7 +333,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
                 + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + From<ZeroOperation<Self::Type>>
+                + ZeroOperationProvider<Self::Type>
         ],
     );
 
@@ -346,7 +346,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
                 + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + From<ZeroOperation<Self::Type>>
+                + ZeroOperationProvider<Self::Type>
         ],
     );
 
@@ -360,7 +360,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
                 + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
                 + DifferentiableOperation<PartialEvaluationContext<Self>>
                 + TransposableOperation<Self::Constant, Self::Operation>
-                + From<ZeroOperation<Self::Type>>
+                + ZeroOperationProvider<Self::Type>
                 + From<AddOperation>
         ],
     );
@@ -375,7 +375,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
                 + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
                 + DifferentiableOperation<PartialEvaluationContext<Self>>
                 + TransposableOperation<Self::Constant, Self::Operation>
-                + From<ZeroOperation<Self::Type>>
+                + ZeroOperationProvider<Self::Type>
                 + From<AddOperation>
         ],
     );
@@ -391,7 +391,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
                 + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
                 + DifferentiableOperation<PartialEvaluationContext<Self>>
                 + TransposableOperation<Self::Constant, Self::Operation>
-                + From<ZeroOperation<Self::Type>>
+                + ZeroOperationProvider<Self::Type>
                 + From<AddOperation>
         ],
     );
@@ -407,7 +407,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
                 + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
                 + DifferentiableOperation<PartialEvaluationContext<Self>>
                 + TransposableOperation<Self::Constant, Self::Operation>
-                + From<ZeroOperation<Self::Type>>
+                + ZeroOperationProvider<Self::Type>
                 + From<AddOperation>
         ],
     );
@@ -516,7 +516,7 @@ define_jacobian_function!(
                     <V::ExecutionDomain as Domain>::Operation,
                 >,
             >
-            + From<ZeroOperation<V::Type>>
+            + ZeroOperationProvider<V::Type>
     ],
 );
 
@@ -540,7 +540,7 @@ define_jacobian_function!(
                     <V::ExecutionDomain as Domain>::Operation,
                 >,
             >
-            + From<ZeroOperation<V::Type>>
+            + ZeroOperationProvider<V::Type>
     ],
 );
 
@@ -563,7 +563,7 @@ define_jacobian_auxiliary_function!(
                     <V::ExecutionDomain as Domain>::Operation,
                 >,
             >
-            + From<ZeroOperation<V::Type>>
+            + ZeroOperationProvider<V::Type>
     ],
 );
 
@@ -585,7 +585,7 @@ define_jacobian_auxiliary_function!(
                     <V::ExecutionDomain as Domain>::Operation,
                 >,
             >
-            + From<ZeroOperation<V::Type>>
+            + ZeroOperationProvider<V::Type>
     ],
 );
 
@@ -619,7 +619,7 @@ define_jacobian_function!(
                 <V::ExecutionDomain as Domain>::Constant,
                 <V::ExecutionDomain as Domain>::Operation,
             >
-            + From<ZeroOperation<V::Type>>
+            + ZeroOperationProvider<V::Type>
             + From<AddOperation>
     ],
 );
@@ -649,7 +649,7 @@ define_jacobian_function!(
                 <V::ExecutionDomain as Domain>::Constant,
                 <V::ExecutionDomain as Domain>::Operation,
             >
-            + From<ZeroOperation<V::Type>>
+            + ZeroOperationProvider<V::Type>
             + From<AddOperation>
     ],
 );
@@ -678,7 +678,7 @@ define_jacobian_auxiliary_function!(
                 <V::ExecutionDomain as Domain>::Constant,
                 <V::ExecutionDomain as Domain>::Operation,
             >
-            + From<ZeroOperation<V::Type>>
+            + ZeroOperationProvider<V::Type>
             + From<AddOperation>
     ],
 );
@@ -706,7 +706,7 @@ define_jacobian_auxiliary_function!(
                 <V::ExecutionDomain as Domain>::Constant,
                 <V::ExecutionDomain as Domain>::Operation,
             >
-            + From<ZeroOperation<V::Type>>
+            + ZeroOperationProvider<V::Type>
             + From<AddOperation>
     ],
 );
@@ -727,7 +727,7 @@ pub(crate) fn jacobian_forward_in_context<
             Type: DenseDifferentiableType<C>,
             Operation: PartiallyEvaluatableOperation<C>
                            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                           + From<ZeroOperation<C::Type>>,
+                           + ZeroOperationProvider<C::Type>,
         >,
     I: Parameterized<
             C::Value,
@@ -915,7 +915,7 @@ pub(crate) fn jacobian_reverse_in_context<
                            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
                            + DifferentiableOperation<PartialEvaluationContext<C>>
                            + TransposableOperation<C::Constant, C::Operation>
-                           + From<ZeroOperation<C::Type>>
+                           + ZeroOperationProvider<C::Type>
                            + From<AddOperation>,
         >,
     I: Parameterized<

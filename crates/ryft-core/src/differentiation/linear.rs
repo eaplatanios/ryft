@@ -12,7 +12,7 @@ use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::constants::{Zero, ZeroOperationProvider};
 use crate::operations::math::{Reduce, ReduceOperation, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
@@ -368,7 +368,7 @@ impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
         if self.is_transpose_only() {
             const { &[RegionSlot::rule("transpose")] }
         } else {
-            const { &[RegionSlot::rule("forward"), RegionSlot::rule("transpose")] }
+            const { &[RegionSlot::computation("forward"), RegionSlot::rule("transpose")] }
         }
     }
 
@@ -610,9 +610,10 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
     }
 }
 
-impl<V: Value<Type: DifferentiableType>, O> TransposableOperation<V, O> for LinearCallOperation<V::Type>
-where
-    O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<LinearCallOperation<V::Type>>,
+impl<
+    V: Value<Type: DifferentiableType>,
+    O: Operation<V::Type> + ZeroOperationProvider<V::Type> + From<LinearCallOperation<V::Type>>,
+> TransposableOperation<V, O> for LinearCallOperation<V::Type>
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -726,7 +727,7 @@ mod tests {
     use crate::programs::atoms::MaybeZero;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::programs::Program;
-    use crate::programs::regions::{RegionDriver, RegionRef};
+    use crate::programs::regions::{RegionDriver, RegionRef, RegionSlot};
     use crate::sharding::ShardingDimension;
     use crate::tracing::TracingContext;
     use crate::types::{ArrayType, DataType};
@@ -754,6 +755,7 @@ mod tests {
         assert_eq!(operation.residual_count(), 1);
         assert!(!operation.is_transpose_only());
         assert_eq!(operation.to_string(), "linear_call [residual_count=1]");
+        assert_eq!(operation.region_slots(), &[RegionSlot::computation("forward"), RegionSlot::rule("transpose")]);
         assert_eq!(
             format!("{operation:?}"),
             "LinearCallOperation { residual_count: 1, interface: ForwardAndTranspose }",
@@ -764,6 +766,7 @@ mod tests {
         assert_eq!(operation.residual_count(), 1);
         assert!(operation.is_transpose_only());
         assert_eq!(operation.to_string(), "transpose_only_linear_call [residual_count=1]");
+        assert_eq!(operation.region_slots(), &[RegionSlot::rule("transpose")]);
     }
 
     #[test]
