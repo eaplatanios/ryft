@@ -190,45 +190,42 @@ pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: Re
     Ok(residuals)
 }
 
-// TODO(eaplatanios): Review this.
 /// Runtime-geometry residuals used to reconstruct the zero-space leaves omitted from one compact derivative boundary.
 ///
 /// Let a flattened primal boundary have leaf types `T₁, …, Tₙ`, and let `D(Tᵢ)` denote the corresponding tangent or
 /// cotangent type. When `D(Tᵢ)` is a _zero space_, it contains exactly one value, `0ᵢ`, so the executable derivative
-/// [`Program`](crate::Program) omits that leaf entirely: carrying an SSA input or output for a value that cannot vary
-/// would add IR and ABI overhead without conveying information. A public [`Pushforward`](crate::Pushforward) or
-/// [`Pullback`](crate::Pullback) must still reconstruct `0ᵢ` when it rebuilds the complete user-facing boundary.
+/// [`Program`](crate::Program) omits that leaf entirely. That is because carrying a Single Static Assignment (SSA)
+/// input or output for a value that cannot vary would add IR and ABI overhead without conveying information. A public
+/// [`Pushforward`](crate::Pushforward) or [`Pullback`](crate::Pullback) must still reconstruct `0ᵢ` when it rebuilds
+/// the complete user-facing boundary.
 ///
-/// Static zeros can be constructed from their types alone. Dynamic zeros cannot. For example, the cotangent of a
-/// primal `u64[n]` array has type `zero[n]`; the type records the identity and bounds of `n`, but not its runtime
-/// extent. While the primal value is available, linearization therefore captures the minimal runtime geometry declared
-/// by [`ResidualZeroProvider::zero_residual_types`] (e.g., the concrete value of `n`). This type stores the flattened
+/// Static zeros can be constructed from their types alone. Dynamic zeros cannot. For example, the cotangent of a primal
+/// `u64[n]` array has type `zero[n]` which records the identity and bounds of `n`, but not its runtime extent. While
+/// the primal value is available, linearization therefore captures the minimal runtime geometry declared by
+/// [`ResidualZeroProvider::zero_residual_types`] (e.g., the concrete value of `n`). This type stores the flattened
 /// concatenation of those captured values in primal-leaf order. [`Self::rebuild`] later partitions that sequence by
 /// leaf, materializes each omitted `0ᵢ`, and interleaves it with the live derivative values produced by the compact
 /// program.
 ///
 /// These are **boundary reconstruction residuals**, not ordinary executable-program residuals. They are retained beside
-/// the reusable derivative callable and are consumed only while restoring its public boundary; they never become
-/// otherwise-unused inputs of the derivative program. The wrapper keeps their ordering, counts, and types validated so
-/// a raw `Vec<V>` cannot be accidentally confused with the program's own residual suffix.
+/// the reusable derivative callable and are consumed only while restoring its public boundary. They never become
+/// otherwise-unused inputs of the derivative program. The wrapper keeps their ordering, counts, and types validated and
+/// so a raw `Vec<V>` cannot be accidentally confused with the program's own residual suffix.
 pub(crate) struct ZeroSpaceBoundaryResiduals<V: Value>(Vec<V>);
 
+// TODO(eaplatanios): Review this.
 impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
-    /// Consumes these boundary residuals and returns their flattened values.
-    pub(crate) fn into_values(self) -> Vec<V> {
-        self.0
-    }
-
-    /// Validates and wraps residual values in boundary-leaf and provider-declaration order.
-    pub(crate) fn new<O: ResidualZeroProvider<V::Type>, DifferentialType: Fn(&V::Type) -> V::Type>(
+    /// Creates a new [`ZeroSpaceBoundaryResiduals`] instance by validating and wrapping the provided residual values
+    /// in boundary-leaf and provider-declaration order.
+    pub(crate) fn new<O: ResidualZeroProvider<V::Type>, DifferentialTypeFn: Fn(&V::Type) -> V::Type>(
         label: &str,
         primal_types: &[V::Type],
         residuals: Vec<V>,
-        differential_type: DifferentialType,
+        differential_type_fn: DifferentialTypeFn,
     ) -> Result<Self, ProgramError> {
         let expected_types = primal_types
             .iter()
-            .map(differential_type)
+            .map(differential_type_fn)
             .filter(DifferentiableType::is_zero_space)
             .flat_map(|r#type| O::zero_residual_types(&r#type))
             .collect::<Vec<_>>();
@@ -251,6 +248,11 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
             }
         }
         Ok(Self(residuals))
+    }
+
+    /// Returns the underlying flattened values of these [`ZeroSpaceBoundaryResiduals`].
+    pub(crate) fn into_values(self) -> Vec<V> {
+        self.0
     }
 
     /// Captures the runtime geometry needed to rebuild every zero-space leaf of a primal boundary.
