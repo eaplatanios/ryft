@@ -242,7 +242,7 @@ impl_differentiable_operation! {
         V: Value<Type = ArrayType>,
         O: Operation<ArrayType>
             + From<LegacyBroadcastOperation>
-            + From<ConvertElementTypeOperation>
+            + From<ConvertElementTypeOperation<ArrayType>>
             + From<ReduceOperation>
             + From<TransposeOperation>
             + From<LegacyReshapeOperation>

@@ -857,11 +857,11 @@ where
 /// Returns the [`tag`](crate::operations::tag::Tag::tag) key when `operation` is a
 /// [`TagOperation`](crate::operations::tag::TagOperation), and [`None`] otherwise.
 #[inline]
-fn tag_key<'a, O>(operation: &'a O) -> Option<&'a str>
+fn tag_key<'a, T: Type + 'a, O>(operation: &'a O) -> Option<&'a str>
 where
-    &'a O: TryInto<&'a TagOperation>,
+    &'a O: TryInto<&'a TagOperation<T>>,
 {
-    project::<O, TagOperation>(operation).map(TagOperation::key)
+    project::<O, TagOperation<T>>(operation).map(TagOperation::key)
 }
 
 /// Returns whether `operation` is a dot contraction without batch dimensions.
@@ -981,7 +981,7 @@ impl SaveOnlyTheseNames {
 impl<T: Type, O> RematerializationPolicy<T, O> for SaveOnlyTheseNames
 where
     O: Operation<T>,
-    for<'a> &'a O: TryInto<&'a TagOperation>,
+    for<'a> &'a O: TryInto<&'a TagOperation<T>>,
 {
     type Storage = NoStorage;
 
@@ -991,7 +991,7 @@ where
     ) -> Result<RematerializationDecision<NoStorage>, RematerializationRejection> {
         Ok(
             match candidate.producers().iter().any(|producer| {
-                tag_key(producer.operation())
+                tag_key::<T, O>(producer.operation())
                     .is_some_and(|name| self.names.iter().any(|configured_name| configured_name == name))
             }) {
                 true => RematerializationDecision::Save,
@@ -1020,7 +1020,7 @@ impl SaveAnyNamesButThese {
 impl<T: Type, O> RematerializationPolicy<T, O> for SaveAnyNamesButThese
 where
     O: Operation<T>,
-    for<'a> &'a O: TryInto<&'a TagOperation>,
+    for<'a> &'a O: TryInto<&'a TagOperation<T>>,
 {
     type Storage = NoStorage;
 
@@ -1030,7 +1030,7 @@ where
     ) -> Result<RematerializationDecision<NoStorage>, RematerializationRejection> {
         Ok(
             match candidate.producers().iter().any(|producer| {
-                tag_key(producer.operation())
+                tag_key::<T, O>(producer.operation())
                     .is_some_and(|name| !self.names.iter().any(|configured_name| configured_name == name))
             }) {
                 true => RematerializationDecision::Save,
@@ -1059,7 +1059,7 @@ impl SaveAnythingExceptTheseNames {
 impl<T: Type, O> RematerializationPolicy<T, O> for SaveAnythingExceptTheseNames
 where
     O: Operation<T>,
-    for<'a> &'a O: TryInto<&'a TagOperation>,
+    for<'a> &'a O: TryInto<&'a TagOperation<T>>,
 {
     type Storage = NoStorage;
 
@@ -1069,7 +1069,7 @@ where
     ) -> Result<RematerializationDecision<NoStorage>, RematerializationRejection> {
         Ok(
             match candidate.producers().iter().any(|producer| {
-                !tag_key(producer.operation())
+                !tag_key::<T, O>(producer.operation())
                     .is_some_and(|name| self.names.iter().any(|configured_name| configured_name == name))
             }) {
                 true => RematerializationDecision::Save,
@@ -1170,7 +1170,7 @@ impl SaveAndOffloadOnlyTheseNames {
 impl<O> RematerializationPolicy<ArrayType, O> for SaveAndOffloadOnlyTheseNames
 where
     O: Operation<ArrayType> + From<TransferToMemoryOperation>,
-    for<'a> &'a O: TryInto<&'a TagOperation>,
+    for<'a> &'a O: TryInto<&'a TagOperation<ArrayType>>,
 {
     type Storage = MemoryTransferStorage;
 
@@ -1179,12 +1179,12 @@ where
         candidate: &RematerializationCandidate<'_, ArrayType, O>,
     ) -> Result<RematerializationDecision<MemoryTransferStorage>, RematerializationRejection> {
         if candidate.producers().iter().any(|producer| {
-            tag_key(producer.operation())
+            tag_key::<ArrayType, O>(producer.operation())
                 .is_some_and(|name| self.saveable.iter().any(|configured_name| configured_name == name))
         }) {
             Ok(RematerializationDecision::Save)
         } else if candidate.producers().iter().any(|producer| {
-            tag_key(producer.operation())
+            tag_key::<ArrayType, O>(producer.operation())
                 .is_some_and(|name| self.offloadable.iter().any(|configured_name| configured_name == name))
         }) {
             Ok(RematerializationDecision::SaveWith(MemoryTransferStorage::new(self.destination)))
