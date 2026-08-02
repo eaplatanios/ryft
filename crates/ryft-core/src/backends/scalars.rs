@@ -97,14 +97,14 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Imaginary(ImaginaryOperation),
     Compare(CompareOperation),
     Select(SelectOperation<DataType>),
-    While(WhileOperation),
+    While(WhileOperation<DataType>),
     ConvertElementType(ConvertElementTypeOperation<DataType>),
     StopGradient(StopGradientOperation<DataType>),
     Tag(TagOperation<DataType>),
-    Rematerialize(RematerializeOperation),
+    Rematerialize(RematerializeOperation<DataType>),
     Print(PrintOperation<DataType>),
-    CustomJvp(CustomJvpOperation),
-    CustomVjp(CustomVjpOperation),
+    CustomJvp(CustomJvpOperation<DataType>),
+    CustomVjp(CustomVjpOperation<DataType>),
     LinearCall(LinearCallOperation<DataType>),
 }
 

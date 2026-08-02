@@ -86,13 +86,22 @@ use crate::types::{ArrayType, Memory};
 /// The `prevent_cse` flag is likewise rematerialization-specific. Backends may lower it as an optimization barrier
 /// around rematerialized tangent/pullback outputs so compiler common-subexpression elimination does not undo the
 /// requested memory/computation tradeoff.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct RematerializeOperation {
+///
+/// The `T` parameter fixes the type universe of every attached region and the call boundary. Each concrete payload
+/// therefore has exactly one [`Operation<T>`](Operation) contract, while the rematerialization algorithm remains one
+/// shared implementation for all type universes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RematerializeOperation<T: Type> {
     /// Backend lowering hint requesting an optimization barrier around rematerialized backward/tangent outputs.
     prevent_cse: bool,
+
+    /// Type universe in which the attached rematerialization regions operate.
+    marker: PhantomData<fn() -> T>,
 }
 
-impl RematerializeOperation {
+impl<T: Type> Copy for RematerializeOperation<T> {}
+
+impl<T: Type> RematerializeOperation<T> {
     /// Creates a rematerialization operation. The primal, forward, backward, and tangent [`Program`]s are supplied
     /// separately as the operation's attached regions (via the region driver passed to
     /// [`Context::bind`]) in the region order `["primal", "forward", "backward", "tangent"]`;
@@ -100,7 +109,7 @@ impl RematerializeOperation {
     /// primal interface.
     #[inline]
     pub fn new() -> Self {
-        Self { prevent_cse: false }
+        Self { prevent_cse: false, marker: PhantomData }
     }
 
     /// Sets whether backends should wrap the lowered backward/tangent program outputs in an optimization barrier
@@ -119,14 +128,14 @@ impl RematerializeOperation {
     }
 }
 
-impl Default for RematerializeOperation {
+impl<T: Type> Default for RematerializeOperation<T> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Display for RematerializeOperation {
+impl<T: Type> Display for RematerializeOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("rematerialize")
     }
@@ -179,7 +188,7 @@ fn validated_rematerialize_interfaces<'i, T: Type>(
     Ok(primal_interface)
 }
 
-impl<T: Type> Operation<T> for RematerializeOperation {
+impl<T: Type> Operation<T> for RematerializeOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         "rematerialize"
@@ -251,7 +260,7 @@ impl<T: Type> Operation<T> for RematerializeOperation {
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for RematerializeOperation {
+impl<C: Domain> InterpretableOperation<C> for RematerializeOperation<C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -265,8 +274,8 @@ impl<C: Domain> InterpretableOperation<C> for RematerializeOperation {
 /// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
 /// [`RematerializeOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
 /// residualizes unchanged.
-impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation where
-    C::Operation: From<RematerializeOperation>
+impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::Type> where
+    C::Operation: From<RematerializeOperation<C::Type>>
 {
 }
 
@@ -292,7 +301,9 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation whe
 /// replayed recompute-and-pushforward operations like any other straight-line
 /// tangent program. The [`prevent_cse`](RematerializeOperation::prevent_cse) optimization-barrier hint is
 /// dropped in the forward (it is a backend lowering hint with no value-level semantics).
-impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C> for RematerializeOperation {
+impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
+    for RematerializeOperation<C::Type>
+{
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
@@ -340,16 +351,19 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
     }
 }
 
-crate::impl_non_transposable_operation!(RematerializeOperation);
+crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: Type);
 
 /// Batching rule for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
 /// programs so the rematerialization boundary survives `batch` under eager and staging parents alike; see
 /// `stage_rewrapped_custom_call`.
-impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for RematerializeOperation
+impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for RematerializeOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
-    O: Operation<ArrayType> + From<TransposeOperation> + From<LegacyBroadcastOperation> + From<RematerializeOperation>,
+    O: Operation<ArrayType>
+        + From<TransposeOperation>
+        + From<LegacyBroadcastOperation>
+        + From<RematerializeOperation<ArrayType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -1691,7 +1705,7 @@ where
 /// `["primal", "forward", "backward", "tangent"]` region order), and the structure of the body's output tree.
 type CachedDerivation<D, OT> = (
     Vec<<D as Domain>::Type>,
-    RematerializeOperation,
+    RematerializeOperation<<D as Domain>::Type>,
     Vec<
         Program<
             <D as Domain>::Constant,
@@ -1788,7 +1802,7 @@ where
             To<DomainTracer<D>> = OT,
             To<<D as Domain>::Constant> = OT::To<<D as Domain>::Constant>,
         >,
-    <D as Domain>::Operation: From<RematerializeOperation>
+    <D as Domain>::Operation: From<RematerializeOperation<<D as Domain>::Type>>
         + ResidualZeroProvider<D::Type>
         + From<AddOperation>
         + TransposableOperation<<D as Domain>::Constant, <D as Domain>::Operation>

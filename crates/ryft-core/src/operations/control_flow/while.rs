@@ -10,6 +10,7 @@
 //! masked tangent scan.
 
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -92,21 +93,30 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 ///   - **Unbounded staged (recompute loop, forward-only).** Without a bound, no statically shaped residual
 ///     stack exists, so the rule stages a doubled-state linear loop that recomputes its residuals forward; that loop
 ///     rejects transposition, exactly like JAX's `while_loop`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct WhileOperation {
+///
+/// The `T` parameter fixes the loop's type universe in the payload itself. Consequently, one concrete
+/// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<T>`](Operation) contract even though the shared
+/// implementation supports scalar, array, and composite array-program loops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WhileOperation<T: Type> {
     /// Optional semantic iteration bound: when present, the loop runs at most this many iterations by definition,
     /// truncating even while the condition still produces true.
     pub(crate) iteration_bound: Option<usize>,
+
+    /// Type universe of the loop-carried state and attached regions.
+    marker: PhantomData<fn() -> T>,
 }
 
-impl WhileOperation {
+impl<T: Type> Copy for WhileOperation<T> {}
+
+impl<T: Type> WhileOperation<T> {
     /// Creates a new [`WhileOperation`] with no semantic iteration bound. The condition and body [`Program`]s are
     /// supplied separately as the operation's attached regions (via the region driver passed to
     /// [`Context::bind`]); [`Operation::infer_output_types`] validates the loop contract over
     /// their interfaces.
     #[inline]
     pub fn new() -> Self {
-        Self { iteration_bound: None }
+        Self { iteration_bound: None, marker: PhantomData }
     }
 
     /// Returns the semantic iteration bound of this [`WhileOperation`], if any. Refer to the documentation of
@@ -136,16 +146,16 @@ impl WhileOperation {
     }
 }
 
-impl Default for WhileOperation {
+impl<T: Type> Default for WhileOperation<T> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Display for WhileOperation {
+impl<T: WhileTypeSemantics> Display for WhileOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, 0)
+        Operation::<T>::render(self, formatter, 0)
     }
 }
 
@@ -307,7 +317,7 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
     Ok((condition_interface, body_interface))
 }
 
-impl<T: WhileTypeSemantics> Operation<T> for WhileOperation {
+impl<T: WhileTypeSemantics> Operation<T> for WhileOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         WHILE_OPERATION_NAME
@@ -358,7 +368,7 @@ impl<T: WhileTypeSemantics> Operation<T> for WhileOperation {
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for WhileOperation
+impl<C: Domain> InterpretableOperation<C> for WhileOperation<C::Type>
 where
     C::Value: WhilePredicate,
     C::Type: WhileTypeSemantics,
@@ -402,10 +412,10 @@ where
 /// Partial-evaluation override for [`WhileOperation`], dispatching to the loop's type family through
 /// `WhilePartialEvaluation` type family: array loops fold loop-invariant-known state, and scalar loops defer to the default
 /// fold-or-residualize behavior.
-impl<C: Context> PartiallyEvaluatableOperation<C> for WhileOperation
+impl<C: Context> PartiallyEvaluatableOperation<C> for WhileOperation<C::Type>
 where
     C::Type: WhilePartialEvaluation<C>,
-    C::Operation: From<WhileOperation>,
+    C::Operation: From<WhileOperation<C::Type>>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -419,14 +429,13 @@ where
 
 /// Type-family partial-evaluation semantics for [`WhileOperation`]s. The known-side context parameter rides as a
 /// trait input (with the type family as the implementing type, mirroring [`ScanPayload`](super::scan::ScanPayload))
-/// so that the [`ArrayType`] and [`DataType`] implementations stay coherent now that [`WhileOperation`] does not
-/// name its type family as a struct parameter, and so that each family implementation can carry exactly the
-/// capability bounds its rule needs.
-pub(crate) trait WhilePartialEvaluation<C: Context>: Type {
+/// so that the [`ArrayType`] and [`DataType`] implementations stay coherent and each family implementation can carry
+/// exactly the capability bounds its rule needs.
+pub(crate) trait WhilePartialEvaluation<C: Context>: WhileTypeSemantics {
     /// Partially evaluates the provided [`WhileOperation`]; refer to the documentation of
     /// [`PartiallyEvaluatableOperation::partially_evaluate`] for the contract.
     fn partially_evaluate_while<D: PartialEvaluationDriver<C>>(
-        operation: &WhileOperation,
+        operation: &WhileOperation<Self>,
         context: &PartialEvaluationContext<C>,
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
@@ -470,10 +479,10 @@ where
     V: Value<Type = ArrayType>,
     C: Context<Type = ArrayType, Constant = V, Operation = O>,
     C::Value: PartialEq,
-    O: Operation<ArrayType> + From<WhileOperation>,
+    O: Operation<ArrayType> + From<WhileOperation<ArrayType>>,
 {
     fn partially_evaluate_while<D: PartialEvaluationDriver<C>>(
-        operation: &WhileOperation,
+        operation: &WhileOperation<ArrayType>,
         context: &PartialEvaluationContext<C>,
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
@@ -647,10 +656,10 @@ where
 /// doubled-state loops the scalar forward-mode rule stages — before residualizing unchanged.
 impl<C: Context<Type = DataType>> WhilePartialEvaluation<C> for DataType
 where
-    C::Operation: From<WhileOperation>,
+    C::Operation: From<WhileOperation<DataType>>,
 {
     fn partially_evaluate_while<D: PartialEvaluationDriver<C>>(
-        operation: &WhileOperation,
+        operation: &WhileOperation<DataType>,
         context: &PartialEvaluationContext<C>,
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
@@ -661,10 +670,10 @@ where
 
 impl<C: Context<Type = ArrayProgramType>> WhilePartialEvaluation<C> for ArrayProgramType
 where
-    C::Operation: From<WhileOperation>,
+    C::Operation: From<WhileOperation<ArrayProgramType>>,
 {
     fn partially_evaluate_while<D: PartialEvaluationDriver<C>>(
-        operation: &WhileOperation,
+        operation: &WhileOperation<ArrayProgramType>,
         context: &PartialEvaluationContext<C>,
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
@@ -675,13 +684,14 @@ where
 
 /// Partially evaluates a loop type family that supports the closed-knownness split but no invariant-state rewrite.
 fn partially_evaluate_while_by_closed_knownness<C: Context, D: PartialEvaluationDriver<C>>(
-    operation: &WhileOperation,
+    operation: &WhileOperation<C::Type>,
     context: &PartialEvaluationContext<C>,
     driver: &D,
     inputs: &[PartialEvaluationValue<C::Value>],
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
-    C::Operation: From<WhileOperation>,
+    C::Type: WhileTypeSemantics,
+    C::Operation: From<WhileOperation<C::Type>>,
 {
     let condition = driver.region(0)?;
     let body = driver.region(1)?;
@@ -774,7 +784,7 @@ fn rebuild_while_program<C: Context<Type = ArrayType>>(
 /// residual loop runs all of it again, so an effectful loop would observe its effects twice.
 fn split_while_by_closed_knownness<V, O, C, D>(
     context: &PartialEvaluationContext<C>,
-    operation: &WhileOperation,
+    operation: &WhileOperation<V::Type>,
     condition: RegionRef<'_, V, O>,
     body: RegionRef<'_, V, O>,
     inputs: &[PartialEvaluationValue<C::Value>],
@@ -782,8 +792,9 @@ fn split_while_by_closed_knownness<V, O, C, D>(
 ) -> Result<Option<Vec<PartialEvaluationValue<C::Value>>>, ProgramError>
 where
     V: Value,
+    V::Type: WhileTypeSemantics,
     C: Context<Constant = V, Operation = O>,
-    O: Operation<V::Type> + From<WhileOperation>,
+    O: Operation<V::Type> + From<WhileOperation<V::Type>>,
     D: PartialEvaluationDriver<C>,
 {
     let state_types = body.input_types();
@@ -939,7 +950,7 @@ where
 ///      lowering reduces the predicate with `or` and masks carry updates with a broadcast select. The iteration
 ///      bound is preserved (batch items share masked iterations, so capping the loop matches per-item truncation
 ///      exactly).
-impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for WhileOperation
+impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for WhileOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
@@ -949,7 +960,7 @@ where
         + From<ReduceOperation>
         + From<SelectOperation<ArrayType>>
         + From<AndOperation>
-        + From<WhileOperation>,
+        + From<WhileOperation<ArrayType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -1099,13 +1110,13 @@ where
 /// `WhileJvp` trait: bounded array loops stage the reverse-capable hybrid rule documented on that trait's
 /// [`ArrayType`] implementation, while unbounded array loops and scalar loops stage the forward-only fused
 /// doubled-state loop (see the crate-private `jvp_while_fused`).
-impl<C> DifferentiableOperation<C> for WhileOperation
+impl<C> DifferentiableOperation<C> for WhileOperation<C::Type>
 where
     C: Context + Zero<C::Value>,
     C::Type: WhileJvp<C>,
     C::Value: Concretizable<bool>,
     C::Operation: ZeroOperationProvider<C::Type>,
-    for<'operation> &'operation WhileOperation: TryFrom<&'operation C::Operation>,
+    for<'operation> &'operation WhileOperation<C::Type>: TryFrom<&'operation C::Operation>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -1128,9 +1139,7 @@ where
 
 /// Type-family forward-mode (JVP) semantics for [`WhileOperation`], with the differentiation context riding as a
 /// trait input and the type family as the implementing type (mirroring the partial-evaluation dispatch in the
-/// `while` module) so that the [`ArrayType`] and [`DataType`] rules stay coherent without the operation struct
-/// naming its type family as a parameter, and so that each family implementation carries exactly the capability
-/// bounds its rule needs.
+/// `while` module), so that each family implementation carries exactly the capability bounds its rule needs.
 pub(crate) trait WhileJvp<C>: DifferentiableType + WhileTypeSemantics
 where
     C: Context<Type = Self>,
@@ -1140,7 +1149,7 @@ where
     /// `driver` serves the rule's nested forward-mode and linearization requests over rebuilt body forms,
     /// keeping the rule free of operation-family semantic bounds.
     fn jvp_while<D: DifferentiationDriver<C>>(
-        operation: &WhileOperation,
+        operation: &WhileOperation<Self>,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         context: &C,
@@ -1323,7 +1332,7 @@ where
 /// side receives a zero cotangent on inactive batch items while the carried side receives the full cotangent, so
 /// cotangents pass through inactive batch items unchanged.
 fn jvp_array_backed_while<C, D: DifferentiationDriver<C>, A>(
-    operation: &WhileOperation,
+    operation: &WhileOperation<C::Type>,
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
     body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
     context: &C,
@@ -1335,7 +1344,7 @@ where
     C::Value: Concretizable<bool>,
     C::Operation: ZeroOperationProvider<C::Type>
         + From<ConditionOperation<C::Constant>>
-        + From<WhileOperation>
+        + From<WhileOperation<C::Type>>
         + From<ScanOperation<C::Constant>>
         + WhileResidualStackOperation<C::Type, A>,
 {
@@ -1385,12 +1394,12 @@ where
     C::Value: Concretizable<bool>,
     C::Operation: ZeroOperationProvider<ArrayType>
         + From<ConditionOperation<C::Constant>>
-        + From<WhileOperation>
+        + From<WhileOperation<ArrayType>>
         + From<ScanOperation<C::Constant>>
         + WhileResidualStackOperation<ArrayType, C::Constant>,
 {
     fn jvp_while<D: DifferentiationDriver<C>>(
-        operation: &WhileOperation,
+        operation: &WhileOperation<ArrayType>,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         context: &C,
@@ -1413,7 +1422,7 @@ where
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
     C::Operation: WhileResidualStackOperation<C::Type, A>
         + From<ConditionOperation<C::Constant>>
-        + From<WhileOperation>
+        + From<WhileOperation<C::Type>>
         + From<ScanOperation<C::Constant>>,
 {
     let state_types = driver.region(1)?.input_types();
@@ -1684,10 +1693,10 @@ where
 /// doubled-state loop (see [`jvp_while_fused`]), which is forward-total but not transposable.
 impl<C: Context<Type = DataType> + Zero<C::Value>> WhileJvp<C> for DataType
 where
-    C::Operation: ZeroOperationProvider<DataType> + From<WhileOperation>,
+    C::Operation: ZeroOperationProvider<DataType> + From<WhileOperation<DataType>>,
 {
     fn jvp_while<D: DifferentiationDriver<C>>(
-        operation: &WhileOperation,
+        operation: &WhileOperation<DataType>,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         _body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         context: &C,
@@ -1704,12 +1713,12 @@ where
     C::Value: Concretizable<bool>,
     C::Operation: ZeroOperationProvider<ArrayProgramType>
         + From<ConditionOperation<C::Constant>>
-        + From<WhileOperation>
+        + From<WhileOperation<ArrayProgramType>>
         + From<ScanOperation<C::Constant>>
         + WhileResidualStackOperation<ArrayProgramType, <C::Constant as ValueProjection<ArrayType>>::Projected>,
 {
     fn jvp_while<D: DifferentiationDriver<C>>(
-        operation: &WhileOperation,
+        operation: &WhileOperation<ArrayProgramType>,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         context: &C,
@@ -1726,7 +1735,7 @@ where
 /// a borrowed `WhileOperation` projection. Composite dispatch already owns the concrete operation payload, so the
 /// recursive projection used by the generic eager shortcut would be redundant.
 pub(crate) fn jvp_array_program_while<C, D: DifferentiationDriver<C>>(
-    operation: &WhileOperation,
+    operation: &WhileOperation<ArrayProgramType>,
     context: &C,
     driver: &D,
     inputs: &[DifferentiationDual<C::Value>],
@@ -1737,7 +1746,7 @@ where
     C::Value: Concretizable<bool>,
     C::Operation: ZeroOperationProvider<ArrayProgramType>
         + From<ConditionOperation<C::Constant>>
-        + From<WhileOperation>
+        + From<WhileOperation<ArrayProgramType>>
         + From<ScanOperation<C::Constant>>
         + WhileResidualStackOperation<ArrayProgramType, <C::Constant as ValueProjection<ArrayType>>::Projected>,
 {
@@ -1766,7 +1775,7 @@ where
 /// per-iteration residuals, its linearized form is **not transposable**: reverse mode through a staged unbounded
 /// loop still reports the `while` transposition error, exactly like JAX's `lax.while_loop`.
 fn jvp_while_fused<C, D: DifferentiationDriver<C>>(
-    operation: &WhileOperation,
+    operation: &WhileOperation<C::Type>,
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
     context: &C,
     driver: &D,
@@ -1774,8 +1783,8 @@ fn jvp_while_fused<C, D: DifferentiationDriver<C>>(
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
     C: Context + Zero<C::Value>,
-    C::Type: DifferentiableType,
-    C::Operation: ZeroOperationProvider<C::Type> + From<WhileOperation>,
+    C::Type: DifferentiableType + WhileTypeSemantics,
+    C::Operation: ZeroOperationProvider<C::Type> + From<WhileOperation<C::Type>>,
 {
     let state_count = inputs.len();
 
@@ -1852,7 +1861,7 @@ where
 /// semantic [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the loop once it is reached, matching
 /// the bounded-`while` truncation semantics. Each body effect executes exactly once per loop iteration.
 fn jvp_while_eagerly<C, D: DifferentiationDriver<C>>(
-    operation: &WhileOperation,
+    operation: &WhileOperation<C::Type>,
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
     body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
     context: &C,
@@ -1861,10 +1870,10 @@ fn jvp_while_eagerly<C, D: DifferentiationDriver<C>>(
 ) -> Result<Option<Vec<DifferentiationDual<C::Value>>>, ProgramError>
 where
     C: Context + Zero<C::Value>,
-    C::Type: DifferentiableType,
+    C::Type: DifferentiableType + WhileTypeSemantics,
     C::Value: Concretizable<bool>,
     C::Operation: ZeroOperationProvider<C::Type>,
-    for<'operation> &'operation WhileOperation: TryFrom<&'operation C::Operation>,
+    for<'operation> &'operation WhileOperation<C::Type>: TryFrom<&'operation C::Operation>,
 {
     let state_count = inputs.len();
     let mut primal_carries = Vec::with_capacity(state_count);
@@ -2205,7 +2214,7 @@ where
     Ok((masked_condition, masked_body))
 }
 
-impl<V: Value, O> TransposableOperation<V, O> for WhileOperation
+impl<V: Value, O> TransposableOperation<V, O> for WhileOperation<V::Type>
 where
     V::Type: WhileTypeSemantics,
     O: Operation<V::Type>,
@@ -2465,7 +2474,7 @@ mod tests {
         assert_eq!(bounded.iteration_bound(), Some(2));
         assert_eq!(bounded.with_iteration_bound(None).unwrap().iteration_bound(), None);
         assert_eq!(
-            WhileOperation::new().with_iteration_bound(0).map(|_| ()),
+            WhileOperation::<ArrayType>::new().with_iteration_bound(0).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid("while iteration bound must be at least 1".to_string()))),
         );
 
@@ -3082,7 +3091,7 @@ mod tests {
     enum TestOperation {
         Sub,
         IsPositive,
-        While(WhileOperation),
+        While(WhileOperation<ArrayType>),
     }
 
     impl Display for TestOperation {
@@ -3407,7 +3416,7 @@ mod tests {
     fn bounded_doubling_while_operation(
         threshold: f64,
         bound: usize,
-    ) -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
+    ) -> (WhileOperation<ArrayType>, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(scalar_f64);
@@ -3422,7 +3431,7 @@ mod tests {
 
     /// Builds `while (x < 8) { print(x); x = 2 * x }`, whose input `1` executes exactly three body iterations.
     fn effectful_doubling_while_operation()
-    -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
+    -> (WhileOperation<ArrayType>, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let condition = scalar_threshold_condition(8.0);
         let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let input = body_builder.add_input(ArrayType::scalar(DataType::F64));
@@ -3439,7 +3448,7 @@ mod tests {
     fn bounded_squaring_while_operation(
         threshold: f64,
         bound: usize,
-    ) -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
+    ) -> (WhileOperation<ArrayType>, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(scalar_f64);
@@ -3457,7 +3466,7 @@ mod tests {
     /// recomputation inside the residual loop.
     fn unbounded_squaring_while_operation(
         threshold: f64,
-    ) -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
+    ) -> (WhileOperation<ArrayType>, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let squared = builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
@@ -3718,8 +3727,8 @@ mod tests {
     }
 
     /// Builds the per-item countdown loop `while (x > 0) { x = x - 1 }` over one scalar state element.
-    fn countdown_while_operation() -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>)
-    {
+    fn countdown_while_operation()
+    -> (WhileOperation<ArrayType>, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
@@ -3749,7 +3758,7 @@ mod tests {
     /// Stages `while_operation` over one batched item (mapped at axis 0 with `batch_size` batch items) under tracing
     /// and returns the staged batched program for structural and numeric assertions.
     fn batch_while_under_tracing(
-        while_operation: WhileOperation,
+        while_operation: WhileOperation<ArrayType>,
         while_regions: Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>,
         batch_size: usize,
     ) -> Program<Array, TestDomainOperation, Array, Array> {
@@ -3811,7 +3820,7 @@ mod tests {
     /// Builds the `while (counter > 0) { (counter, value) = (counter - 1, value + value) }` loop whose predicate
     /// depends only on the counter state element.
     fn counter_doubling_while_operation()
-    -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
+    -> (WhileOperation<ArrayType>, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let condition_counter = condition_builder.add_input(scalar_f64.clone());

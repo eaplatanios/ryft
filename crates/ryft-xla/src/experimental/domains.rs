@@ -455,7 +455,7 @@ impl<'c> Constant<ArrayProgramValue<Array<'c>>, XlaConstant> for XlaDomain<'c> {
 /// executable. This rule covers the remaining path — a `jit_call` nested inside another region being interpreted —
 /// by re-entering the active interpreter on the callee region, which dispatches the callee's operations one by one
 /// through this same domain.
-impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation {
+impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation<ArrayProgramType> {
     fn interpret<D: InterpretationDriver<XlaDomain<'c>>>(
         &self,
         context: &XlaDomain<'c>,

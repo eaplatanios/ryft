@@ -178,7 +178,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Compare(CompareOperation),
     Select(SelectOperation<ArrayType>),
     Condition(ConditionOperation<V>),
-    While(WhileOperation),
+    While(WhileOperation<ArrayType>),
     Scan(ScanOperation<V>),
     ConvertElementType(ConvertElementTypeOperation<ArrayType>),
     TransferToMemory(TransferToMemoryOperation),
@@ -186,11 +186,11 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     ShardingConstraint(ShardingConstraintOperation),
     StopGradient(StopGradientOperation<ArrayType>),
     Tag(TagOperation<ArrayType>),
-    Rematerialize(RematerializeOperation),
+    Rematerialize(RematerializeOperation<ArrayType>),
     Print(PrintOperation<ArrayType>),
     CustomCall(CustomCallOperation),
-    CustomJvp(CustomJvpOperation),
-    CustomVjp(CustomVjpOperation),
+    CustomJvp(CustomJvpOperation<ArrayType>),
+    CustomVjp(CustomVjpOperation<ArrayType>),
     LinearCall(LinearCallOperation<ArrayType>),
 }
 

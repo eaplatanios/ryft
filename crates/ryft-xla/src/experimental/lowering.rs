@@ -4391,7 +4391,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested while operation inside this lowering context.
     pub(crate) fn lower_while(
         &mut self,
-        while_op: &WhileOperation,
+        while_op: &WhileOperation<ArrayProgramType>,
         loop_regions: &[FlatXlaProgram],
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
@@ -5377,7 +5377,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
 }
 
 fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
-    while_op: &WhileOperation,
+    while_op: &WhileOperation<ArrayProgramType>,
     loop_regions: &[FlatXlaProgram],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -9715,7 +9715,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let operation = CustomJvpOperation;
+        let operation = CustomJvpOperation::new();
         let mut builder = CompositeXlaProgramBuilder::new();
         let primal_region = builder.import_region(primal.entry_region_ref());
         let jvp_region = builder.import_region(jvp.entry_region_ref());

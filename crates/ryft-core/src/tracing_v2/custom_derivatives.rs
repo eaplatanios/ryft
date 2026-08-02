@@ -48,10 +48,34 @@ pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 /// itself is gone from the tangent program long before transposition runs (which is also why the JVP program must be
 /// linear in its tangent arguments). Transposition can therefore only reach the operation when transposing a raw,
 /// un-linearized program directly, which JAX rejects for its `custom_jvp_call` primitive in exactly the same way.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct CustomJvpOperation;
+///
+/// The `T` parameter fixes the type universe of both attached regions and the call boundary, so each concrete payload
+/// has exactly one [`Operation<T>`](Operation) contract while the semantic and transform implementations remain
+/// shared across differentiable type universes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomJvpOperation<T: DifferentiableType> {
+    /// Type universe in which this custom-JVP call is valid.
+    marker: PhantomData<fn() -> T>,
+}
 
-impl Display for CustomJvpOperation {
+impl<T: DifferentiableType> Copy for CustomJvpOperation<T> {}
+
+impl<T: DifferentiableType> Default for CustomJvpOperation<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: DifferentiableType> CustomJvpOperation<T> {
+    /// Creates a custom-JVP call operation whose attached regions operate on `T` values.
+    #[inline]
+    pub const fn new() -> Self {
+        Self { marker: PhantomData }
+    }
+}
+
+impl<T: DifferentiableType> Display for CustomJvpOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(CUSTOM_JVP_OPERATION_NAME)
@@ -84,7 +108,7 @@ fn validated_custom_jvp_interfaces<T: DifferentiableType>(
     Ok(primal_interface)
 }
 
-impl<T: DifferentiableType> Operation<T> for CustomJvpOperation {
+impl<T: DifferentiableType> Operation<T> for CustomJvpOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         CUSTOM_JVP_OPERATION_NAME
@@ -122,7 +146,7 @@ impl<T: DifferentiableType> Operation<T> for CustomJvpOperation {
     }
 }
 
-impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomJvpOperation {
+impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomJvpOperation<C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -136,8 +160,8 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomJv
 /// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
 /// [`CustomJvpOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
 /// residualizes unchanged.
-impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomJvpOperation where
-    C::Operation: From<CustomJvpOperation>
+impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomJvpOperation<C::Type> where
+    C::Operation: From<CustomJvpOperation<C::Type>>
 {
 }
 
@@ -222,11 +246,14 @@ pub(crate) fn batch_rewrapped_program<
 
 /// Batching rule for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
 /// derivative survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>> for CustomJvpOperation
+impl<C, O, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>> for CustomJvpOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
-    O: Operation<ArrayType> + From<TransposeOperation> + From<LegacyBroadcastOperation> + From<CustomJvpOperation>,
+    O: Operation<ArrayType>
+        + From<TransposeOperation>
+        + From<LegacyBroadcastOperation>
+        + From<CustomJvpOperation<ArrayType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
         &self,
@@ -237,7 +264,7 @@ where
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
             None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
             Some(_) => Ok((
-                O::from(CustomJvpOperation),
+                O::from(CustomJvpOperation::new()),
                 vec![batch_rewrapped_program(context, driver, 0)?, batch_rewrapped_program(context, driver, 1)?],
             )),
         })
@@ -255,7 +282,7 @@ where
 /// partial-evaluation split discovers the residual operand edges structurally — so the rule is a leaf needing no
 /// nested differentiation or linearization request, and reverse mode transposes the replayed bilinear operations
 /// exactly as it does for any other straight-line tangent program.
-impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation {
+impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation<C::Type> {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
@@ -288,7 +315,7 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
 // Rejecting transposition is correct: the `jvp` rule above replays the user JVP program as plain primitive operations,
 // so a linearized tangent program never contains this operation and its transpose entry point is unreachable through
 // reverse mode. Only a direct transpose of a raw, un-linearized program can reach it.
-impl_non_transposable_operation!(CustomJvpOperation);
+impl_non_transposable_operation!(<T> CustomJvpOperation<T> where T: DifferentiableType);
 
 /// Canonical operation name for [`CustomVjpOperation`].
 pub const CUSTOM_VJP_OPERATION_NAME: &str = "custom_vjp";
@@ -318,10 +345,34 @@ pub const CUSTOM_VJP_OPERATION_NAME: &str = "custom_vjp";
 /// analogue of JAX's `custom_lin` primitive — so the operation itself is gone from the tangent program long before
 /// transposition runs. Transposition can therefore only reach the operation when transposing a raw, un-linearized
 /// program directly, which JAX rejects for its `custom_vjp_call` primitive in exactly the same way.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct CustomVjpOperation;
+///
+/// The `T` parameter fixes the type universe of all attached regions and the call boundary, so each concrete payload
+/// has exactly one [`Operation<T>`](Operation) contract while the semantic and transform implementations remain
+/// shared across differentiable type universes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomVjpOperation<T: DifferentiableType> {
+    /// Type universe in which this custom-VJP call is valid.
+    marker: PhantomData<fn() -> T>,
+}
 
-impl Display for CustomVjpOperation {
+impl<T: DifferentiableType> Copy for CustomVjpOperation<T> {}
+
+impl<T: DifferentiableType> Default for CustomVjpOperation<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: DifferentiableType> CustomVjpOperation<T> {
+    /// Creates a custom-VJP call operation whose attached regions operate on `T` values.
+    #[inline]
+    pub const fn new() -> Self {
+        Self { marker: PhantomData }
+    }
+}
+
+impl<T: DifferentiableType> Display for CustomVjpOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(CUSTOM_VJP_OPERATION_NAME)
@@ -373,7 +424,7 @@ fn validated_custom_vjp_interfaces<T: DifferentiableType>(
     Ok(primal_interface)
 }
 
-impl<T: DifferentiableType> Operation<T> for CustomVjpOperation {
+impl<T: DifferentiableType> Operation<T> for CustomVjpOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         CUSTOM_VJP_OPERATION_NAME
@@ -436,7 +487,7 @@ impl<T: DifferentiableType> Operation<T> for CustomVjpOperation {
     }
 }
 
-impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomVjpOperation {
+impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomVjpOperation<C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -450,18 +501,21 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomVj
 /// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
 /// [`CustomVjpOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
 /// residualizes unchanged.
-impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomVjpOperation where
-    C::Operation: From<CustomVjpOperation>
+impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomVjpOperation<C::Type> where
+    C::Operation: From<CustomVjpOperation<C::Type>>
 {
 }
 
 /// Batching rule for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward programs so
 /// the custom derivative survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>> for CustomVjpOperation
+impl<C, O, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>> for CustomVjpOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
-    O: Operation<ArrayType> + From<TransposeOperation> + From<LegacyBroadcastOperation> + From<CustomVjpOperation>,
+    O: Operation<ArrayType>
+        + From<TransposeOperation>
+        + From<LegacyBroadcastOperation>
+        + From<CustomVjpOperation<ArrayType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
         &self,
@@ -472,7 +526,7 @@ where
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
             None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
             Some(_) => Ok((
-                O::from(CustomVjpOperation),
+                O::from(CustomVjpOperation::new()),
                 vec![
                     batch_rewrapped_program(context, driver, 0)?,
                     batch_rewrapped_program(context, driver, 1)?,
@@ -497,7 +551,7 @@ where
 /// program to produce the input cotangents. Because the residuals flow as operand edges and the carrier is a leaf
 /// primal-enum operation, the rule introduces no symbolic capture and needs no nested differentiation or linearization
 /// request.
-impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation
+impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation<C::Type>
 where
     C::Type: DifferentiableType,
     C::Operation: From<LinearCallOperation<C::Type>>,
@@ -559,7 +613,7 @@ where
 // Rejecting transposition is correct: the `jvp` rule above replaces this operation with a transpose-only
 // `LinearCallOperation` carrier, so a linearized tangent program never contains this operation and its transpose entry
 // point is unreachable through reverse mode. Only a direct transpose of a raw, un-linearized program can reach it.
-impl_non_transposable_operation!(CustomVjpOperation);
+impl_non_transposable_operation!(<T> CustomVjpOperation<T> where T: DifferentiableType);
 
 /// Function with a user-supplied JVP rule, built by [`custom_jvp`]. It stores the primal and JVP closures together
 /// with a phantom marker pinning the [`Domain`] and the tracer-tree types named by those closure signatures; refer to
@@ -625,7 +679,7 @@ where
     D: Domain<Type: DifferentiableType>,
     P: Fn(IT) -> Result<OT, ProgramError>,
     J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
-    D::Operation: From<CustomJvpOperation>,
+    D::Operation: From<CustomJvpOperation<D::Type>>,
     IT: Parameterized<DomainTracer<D>>,
     IT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
     OT: Parameterized<DomainTracer<D>>,
@@ -666,7 +720,7 @@ where
         let input_tangent_types =
             input_types.clone().map_parameters(|r#type| r#type.tangent()).map_err(ProgramError::from)?;
         let (output_types, jvp) = D::trace(|(x, t)| (self.jvp)(x, t), (input_types, input_tangent_types))?;
-        let operation = D::Operation::from(CustomJvpOperation);
+        let operation = D::Operation::from(CustomJvpOperation::new());
         // The call binds through whatever context the input values flow (a staged trace, a batching context, or a
         // JVP context), so `custom_jvp` composes under `vmap`/`jvp` — the batch/JVP rule of the bound operation fires.
         let context = first.dispatch_domain();
@@ -756,7 +810,7 @@ where
     P: Fn(IT) -> Result<OT, ProgramError>,
     F: Fn(IT) -> Result<(OT, RT), ProgramError>,
     B: Fn(RT, OT) -> Result<IT, ProgramError>,
-    D::Operation: From<CustomVjpOperation>,
+    D::Operation: From<CustomVjpOperation<D::Type>>,
     IT: Parameterized<DomainTracer<D>>,
     IT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
     OT: Parameterized<DomainTracer<D>>,
@@ -806,7 +860,7 @@ where
             |(residuals, cotangents)| (self.backward)(residuals, cotangents),
             (residual_types, output_cotangent_types),
         )?;
-        let operation = D::Operation::from(CustomVjpOperation);
+        let operation = D::Operation::from(CustomVjpOperation::new());
         // Bind through whatever context the inputs flow, so `custom_vjp` composes under `vmap`/`jvp`.
         let context = first.dispatch_domain();
         let outputs = context.bind(
@@ -897,14 +951,17 @@ mod tests {
     fn custom_jvp_sin(
         r#type: &ArrayType,
     ) -> (ArrayOperation<Array>, Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>) {
-        (ArrayOperation::CustomJvp(CustomJvpOperation), vec![sin_program(r#type), doubled_sin_jvp_program(r#type)])
+        (
+            ArrayOperation::CustomJvp(CustomJvpOperation::new()),
+            vec![sin_program(r#type), doubled_sin_jvp_program(r#type)],
+        )
     }
 
     fn custom_vjp_sin(
         r#type: &ArrayType,
     ) -> (ArrayOperation<Array>, Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>) {
         (
-            ArrayOperation::CustomVjp(CustomVjpOperation),
+            ArrayOperation::CustomVjp(CustomVjpOperation::new()),
             vec![sin_program(r#type), sin_forward_program(r#type), tripled_sin_backward_program(r#type)],
         )
     }
@@ -919,11 +976,12 @@ mod tests {
     #[test]
     fn test_custom_jvp_inference_validates_the_rule_signature() {
         let scalar = test_type(&[]);
-        assert_eq!(Operation::<ArrayType>::region_role(&CustomJvpOperation, 0), Some(RegionRole::Computation),);
-        assert_eq!(Operation::<ArrayType>::region_role(&CustomJvpOperation, 1), Some(RegionRole::Rule));
+        let operation = CustomJvpOperation::<ArrayType>::new();
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 0), Some(RegionRole::Computation),);
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 1), Some(RegionRole::Rule));
         // The JVP interface must take `(inputs..., tangents...)`; a primal-only signature is rejected.
         assert!(
-            CustomJvpOperation
+            operation
                 .infer_output_types(
                     std::slice::from_ref(&scalar),
                     &[custom_region_interface(&sin_program(&scalar)), custom_region_interface(&sin_program(&scalar))],
@@ -935,13 +993,14 @@ mod tests {
     #[test]
     fn test_custom_vjp_inference_validates_the_rule_signatures() {
         let scalar = test_type(&[]);
-        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation, 0), Some(RegionRole::Computation));
-        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation, 1), Some(RegionRole::Rule));
-        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation, 2), Some(RegionRole::Rule));
+        let operation = CustomVjpOperation::<ArrayType>::new();
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 0), Some(RegionRole::Computation));
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 1), Some(RegionRole::Rule));
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 2), Some(RegionRole::Rule));
         // The backward interface must consume `(residuals..., output cotangents...)`; a single-input program whose
         // signature cannot line up with the forward residuals is rejected.
         assert!(
-            CustomVjpOperation
+            operation
                 .infer_output_types(
                     std::slice::from_ref(&scalar),
                     &[
@@ -967,7 +1026,7 @@ mod tests {
             Effects::PURE,
         );
         assert_eq!(
-            CustomJvpOperation
+            CustomJvpOperation::<ArrayType>::new()
                 .infer_output_types(std::slice::from_ref(&primal_type), &[primal_interface.clone(), jvp_interface],),
             Ok(vec![primal_type.clone()]),
         );
@@ -983,7 +1042,7 @@ mod tests {
             Effects::PURE,
         );
         assert_eq!(
-            CustomVjpOperation.infer_output_types(
+            CustomVjpOperation::<ArrayType>::new().infer_output_types(
                 std::slice::from_ref(&primal_type),
                 &[primal_interface, forward_interface, backward_interface.clone()],
             ),
@@ -1161,7 +1220,7 @@ mod tests {
         let (primal, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .jvp(
                 |x| {
-                    let operation = ScalarOperation::CustomJvp(CustomJvpOperation);
+                    let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
                     let operation_regions = vec![scalar_sin_program(), scalar_doubled_sin_jvp_program()];
                     Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
                 },
@@ -1176,7 +1235,7 @@ mod tests {
 
     #[test]
     fn test_linearization_rejects_known_custom_jvp_tangents() {
-        let operation = ScalarOperation::CustomJvp(CustomJvpOperation);
+        let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
         let operation_regions = || vec![scalar_sin_program(), scalar_known_tangent_jvp_program()];
         let expected = "linearization produced a known tangent output; differentiation rules must represent \
                         input-independent zero tangents structurally";
@@ -1217,7 +1276,7 @@ mod tests {
         let (value, gradient) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .value_and_gradient(
                 |x| {
-                    let operation = ScalarOperation::CustomVjp(CustomVjpOperation);
+                    let operation = ScalarOperation::CustomVjp(CustomVjpOperation::new());
                     let operation_regions =
                         vec![scalar_sin_program(), scalar_sin_forward_program(), scalar_tripled_sin_backward_program()];
                     x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()

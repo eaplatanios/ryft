@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 use ryft_core::batching::{
@@ -151,16 +152,16 @@ where
     Condition(ConditionOperation<C>),
 
     /// Backend-owned loop whose attached condition and body regions can contain XLA operations.
-    While(WhileOperation),
+    While(WhileOperation<ArrayProgramType>),
 
     /// Backend-owned scan whose attached body region can contain XLA operations.
     Scan(ScanOperation<C>),
 
     /// Backend-owned custom JVP call whose attached regions can contain XLA operations.
-    CustomJvp(CustomJvpOperation),
+    CustomJvp(CustomJvpOperation<ArrayProgramType>),
 
     /// Backend-owned custom VJP call whose attached regions can contain XLA operations.
-    CustomVjp(CustomVjpOperation),
+    CustomVjp(CustomVjpOperation<ArrayProgramType>),
 
     /// Differentiation-owned call to an explicitly transposable linear map with ordinary trailing residual
     /// operands. This variant carries both carrier forms: the forward-and-transpose form lowers by inlining its
@@ -169,10 +170,10 @@ where
     LinearCall(LinearCallOperation<ArrayProgramType>),
 
     /// Backend-owned rematerialized call whose attached regions can contain XLA operations.
-    Rematerialize(RematerializeOperation),
+    Rematerialize(RematerializeOperation<ArrayProgramType>),
 
     /// Call to a flat jitted XLA sub-program.
-    JitCall(JitCallOperation),
+    JitCall(JitCallOperation<ArrayProgramType>),
 
     /// XLA-specific `shard_map`.
     ShardMap(Box<ShardMapOperation<C>>),
@@ -275,12 +276,12 @@ where
     }
 }
 
-impl<C> From<JitCallOperation> for XlaOperation<C>
+impl<C> From<JitCallOperation<ArrayProgramType>> for XlaOperation<C>
 where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
-    fn from(operation: JitCallOperation) -> Self {
+    fn from(operation: JitCallOperation<ArrayProgramType>) -> Self {
         Self::JitCall(operation)
     }
 }
@@ -295,12 +296,12 @@ where
     }
 }
 
-impl<C> From<WhileOperation> for XlaOperation<C>
+impl<C> From<WhileOperation<ArrayProgramType>> for XlaOperation<C>
 where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
-    fn from(operation: WhileOperation) -> Self {
+    fn from(operation: WhileOperation<ArrayProgramType>) -> Self {
         Self::While(operation)
     }
 }
@@ -315,32 +316,32 @@ where
     }
 }
 
-impl<C> From<CustomJvpOperation> for XlaOperation<C>
+impl<C> From<CustomJvpOperation<ArrayProgramType>> for XlaOperation<C>
 where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
-    fn from(operation: CustomJvpOperation) -> Self {
+    fn from(operation: CustomJvpOperation<ArrayProgramType>) -> Self {
         Self::CustomJvp(operation)
     }
 }
 
-impl<C> From<CustomVjpOperation> for XlaOperation<C>
+impl<C> From<CustomVjpOperation<ArrayProgramType>> for XlaOperation<C>
 where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
-    fn from(operation: CustomVjpOperation) -> Self {
+    fn from(operation: CustomVjpOperation<ArrayProgramType>) -> Self {
         Self::CustomVjp(operation)
     }
 }
 
-impl<C> From<RematerializeOperation> for XlaOperation<C>
+impl<C> From<RematerializeOperation<ArrayProgramType>> for XlaOperation<C>
 where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
-    fn from(operation: RematerializeOperation) -> Self {
+    fn from(operation: RematerializeOperation<ArrayProgramType>) -> Self {
         Self::Rematerialize(operation)
     }
 }
@@ -576,7 +577,7 @@ where
     }
 }
 
-impl<'operation, C> TryFrom<&'operation XlaOperation<C>> for &'operation WhileOperation
+impl<'operation, C> TryFrom<&'operation XlaOperation<C>> for &'operation WhileOperation<ArrayProgramType>
 where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
@@ -898,15 +899,23 @@ pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 /// operation (the single `["callee"]` slot), interned by [`Rc`] identity when the call is staged through the
 /// [`BindingRegionDriver`](ryft_core::BindingRegionDriver) passed to [`Context::bind`], so repeated calls staged from
 /// one function handle share one callee root and remain identity-comparable for call-site deduplication at lowering.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct JitCallOperation;
+/// The `T` parameter fixes the callee boundary's type universe, allowing the reusable homogeneous-array batching form
+/// and the executable composite array-program form to remain distinct payload types with one [`Operation`] contract
+/// each.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JitCallOperation<T: Type> {
+    /// Type universe of the callee boundary.
+    marker: PhantomData<fn() -> T>,
+}
 
-impl JitCallOperation {
+impl<T: Type> Copy for JitCallOperation<T> {}
+
+impl<T: Type> JitCallOperation<T> {
     /// Creates a staged jitted-call operation. The flat callee program is supplied as a shared region attachment to
     /// [`Context::bind`].
     #[inline]
     pub(crate) fn new() -> Self {
-        Self
+        Self { marker: PhantomData }
     }
 }
 
@@ -950,7 +959,7 @@ fn ensure_call_input_types<T: Type>(
     Ok(())
 }
 
-impl<T: Type> Operation<T> for JitCallOperation {
+impl<T: Type> Operation<T> for JitCallOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         "jit_call"
@@ -992,7 +1001,7 @@ impl<T: Type> Operation<T> for JitCallOperation {
 /// enclosing known-side context
 /// wrapped in a fresh `jit_call` over the original known call inputs, and the residual side is emitted as the
 /// residual `jit_call` over the surviving unknown call inputs plus the known-side call's residual-edge outputs.
-impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation
+impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation<ArrayProgramType>
 where
     V: PartialEq
         + Value<Type = ArrayProgramType>
@@ -1043,10 +1052,10 @@ where
 /// client-backed parent (e.g., [`XlaDomain`](crate::XlaDomain)) compiles and executes the batched call immediately, a
 /// staging parent stages it into the enclosing trace, and a differentiation parent dispatches it through its own
 /// `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
-impl<C> BatchableOperation<C, ArrayBatching> for JitCallOperation
+impl<C> BatchableOperation<C, ArrayBatching> for JitCallOperation<ArrayType>
 where
     C: Context<Type = ArrayType>,
-    C::Operation: From<JitCallOperation>,
+    C::Operation: From<JitCallOperation<ArrayType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching>>(
         &self,
@@ -1126,7 +1135,7 @@ where
 ///   - `context`: Active evaluation or staging context used to bind the differentiated calls.
 ///   - `driver`: Call-scoped access to the attached callee region.
 ///   - `inputs`: Primal and tangent values for the call operands.
-impl<C, V> DifferentiableOperation<C> for JitCallOperation
+impl<C, V> DifferentiableOperation<C> for JitCallOperation<ArrayProgramType>
 where
     C: Context<Type = ArrayProgramType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
     V: PartialEq
@@ -1295,7 +1304,7 @@ pub fn transpose_primal_jit_call<
     V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     D: TranspositionDriver<V, XlaOperation<V>>,
 >(
-    _operation: &JitCallOperation,
+    _operation: &JitCallOperation<ArrayProgramType>,
     context: &mut TracingContext<V, XlaOperation<V>>,
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
@@ -1358,7 +1367,7 @@ pub fn transpose_primal_jit_call<
 /// transposition happens on the concretely [`XlaConstant`]-keyed [`FlatXlaProgram`], so the recursion is resolved once
 /// at definition time and instantiating this implementation introduces no recursive [`TransposableOperation`]
 /// obligation on [`XlaOperation`].
-impl<V> TransposableOperation<V, XlaOperation<V>> for JitCallOperation
+impl<V> TransposableOperation<V, XlaOperation<V>> for JitCallOperation<ArrayProgramType>
 where
     V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {

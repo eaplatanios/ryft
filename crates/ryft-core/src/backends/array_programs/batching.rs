@@ -1163,7 +1163,7 @@ fn without_threaded_extent_output<C: Context<Type = ArrayProgramType>>(
 
 /// Batches a composite while loop while keeping first-class dimensions replicated loop state.
 fn batch_while<C, D>(
-    operation: &WhileOperation,
+    operation: &WhileOperation<ArrayProgramType>,
     context: &BatchingContext<C, ArrayProgramBatching>,
     driver: &D,
     inputs: &[ArrayProgramBatch<C::Value>],
@@ -1174,7 +1174,7 @@ where
             Operation: From<BroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + From<WhileOperation>
+                           + From<WhileOperation<ArrayProgramType>>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -2159,7 +2159,7 @@ where
         + From<RngBitGeneratorOperation>
         + From<ReshapeOperation>
         + From<ScanOperation<ArrayProgramValue<A>>>
-        + From<WhileOperation>
+        + From<WhileOperation<ArrayProgramType>>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     ArrayOperation<A>: BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,

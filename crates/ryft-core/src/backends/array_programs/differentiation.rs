@@ -131,7 +131,7 @@ where
         + From<DimensionToScalarOperation>
         + From<LinearCallOperation<ArrayProgramType>>
         + From<ScanOperation<C::Constant>>
-        + From<WhileOperation>
+        + From<WhileOperation<ArrayProgramType>>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + ZeroOperationProvider<ArrayProgramType>,
     ArrayOperation<A>: DifferentiableOperation<ProjectedContext<C, ArrayType>>,

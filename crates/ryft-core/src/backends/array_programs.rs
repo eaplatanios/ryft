@@ -343,7 +343,7 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     Condition(ConditionOperation<ArrayProgramValue<A>>),
 
     /// Composite while loop whose condition and body may carry arrays and first-class dimensions.
-    While(WhileOperation),
+    While(WhileOperation<ArrayProgramType>),
 
     /// Composite scan whose body may carry arrays and first-class dimensions.
     Scan(ScanOperation<ArrayProgramValue<A>>),
@@ -365,7 +365,9 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayProgramOperati
         match operation {
             ArrayOperation::Zero(operation) => Self::from(operation),
             ArrayOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
-            ArrayOperation::While(operation) => Self::While(operation),
+            ArrayOperation::While(operation) => {
+                Self::While(WhileOperation::new().with_iteration_bound(operation.iteration_bound()).unwrap())
+            }
             ArrayOperation::Scan(operation) => {
                 let captures = operation.captures().iter().cloned().map(ArrayProgramValue::Array).collect();
                 Self::Scan(operation.with_captures(captures))
@@ -389,9 +391,9 @@ impl<A: Value<Type = ArrayType>> From<ConditionOperation<ArrayProgramValue<A>>> 
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<WhileOperation> for ArrayProgramOperation<A> {
+impl<A: Value<Type = ArrayType>> From<WhileOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
     #[inline]
-    fn from(operation: WhileOperation) -> Self {
+    fn from(operation: WhileOperation<ArrayProgramType>) -> Self {
         Self::While(operation)
     }
 }
@@ -1660,7 +1662,7 @@ impl<
                            + From<DimensionFromScalarOperation>
                            + From<DimensionToScalarOperation>
                            + From<ScanOperation<C::Constant>>
-                           + From<WhileOperation>
+                           + From<WhileOperation<ArrayProgramType>>
                            + ZeroOperationProvider<ArrayProgramType>,
         >,
 > PartiallyEvaluatableOperation<C> for ArrayProgramOperation<A>
@@ -2805,7 +2807,11 @@ mod tests {
         ));
         let while_operation = WhileOperation::new().with_iteration_bound(7).unwrap();
         let promoted_while = ArrayProgramOperation::<Array>::from(ArrayOperation::While(while_operation.clone()));
-        assert!(matches!(promoted_while, ArrayProgramOperation::While(operation) if operation == while_operation));
+        assert!(matches!(
+            promoted_while,
+            ArrayProgramOperation::While(operation)
+                if operation.iteration_bound() == while_operation.iteration_bound()
+        ));
         let capture = Array::vector(vec![3.0_f32, 4.0, 5.0, 6.0]);
         let scan_operation = ScanOperation::<Array>::new(1, 4)
             .with_reverse(true)
