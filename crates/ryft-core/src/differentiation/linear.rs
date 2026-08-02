@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::ops::Range;
 
 use crate::axes::Axis;
 use crate::batching::{
@@ -190,6 +191,19 @@ pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: Re
     Ok(residuals)
 }
 
+/// Reconstruction metadata for one zero-space leaf omitted from a compact derivative boundary.
+/// This is only used as part of [`ZeroSpaceBoundaryResiduals`].
+pub(crate) struct ZeroSpaceBoundaryLeaf<T: Type> {
+    /// Position of the omitted zero in the complete public differential boundary.
+    index: usize,
+
+    /// Tangent or cotangent type of the omitted zero.
+    r#type: T,
+
+    /// Range of captured residuals consumed to materialize the omitted zero.
+    residual_range: Range<usize>,
+}
+
 /// Runtime-geometry residuals used to reconstruct the zero-space leaves omitted from one compact derivative boundary.
 ///
 /// Let a flattened primal boundary have leaf types `T₁, …, Tₙ`, and let `D(Tᵢ)` denote the corresponding tangent or
@@ -203,82 +217,49 @@ pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: Re
 /// `u64[n]` array has type `zero[n]` which records the identity and bounds of `n`, but not its runtime extent. While
 /// the primal value is available, linearization therefore captures the minimal runtime geometry declared by
 /// [`ResidualZeroProvider::zero_residual_types`] (e.g., the concrete value of `n`). This type stores the flattened
-/// concatenation of those captured values in primal-leaf order. [`Self::rebuild`] later partitions that sequence by
-/// leaf, materializes each omitted `0ᵢ`, and interleaves it with the live derivative values produced by the compact
-/// program.
+/// concatenation of those captured values in primal-leaf order together with a sparse reconstruction plan for the
+/// zero-space leaves. [`Self::rebuild`] replays that plan to materialize each omitted `0ᵢ` and interleave it with the
+/// live derivative values produced by the compact program.
 ///
 /// These are **boundary reconstruction residuals**, not ordinary executable-program residuals. They are retained beside
 /// the reusable derivative callable and are consumed only while restoring its public boundary. They never become
-/// otherwise-unused inputs of the derivative program. The wrapper keeps their ordering, counts, and types validated and
-/// so a raw `Vec<V>` cannot be accidentally confused with the program's own residual suffix.
-pub(crate) struct ZeroSpaceBoundaryResiduals<V: Value>(Vec<V>);
+/// otherwise-unused inputs of the derivative program. The wrapper retains the boundary size, the position and type of
+/// every omitted zero, and the range of residuals that reconstructs it. The tangent/cotangent mapping and primal
+/// boundary are therefore consumed exactly once during capture and cannot be changed later during reconstruction.
+pub(crate) struct ZeroSpaceBoundaryResiduals<V: Value> {
+    /// Flattened runtime-geometry residuals captured in zero-leaf and provider-declaration order.
+    residuals: Vec<V>,
+
+    /// Number of leaves in the complete public differential boundary.
+    boundary_size: usize,
+
+    /// Sparse reconstruction plan containing one entry for every zero-space boundary leaf, in boundary order.
+    zero_leaves: Vec<ZeroSpaceBoundaryLeaf<V::Type>>,
+}
 
 impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
-    /// Validates and wraps the runtime-geometry residuals for one complete differential boundary.
+    /// Captures the runtime geometry and reconstruction plan for every zero-space leaf of one differential boundary.
     ///
-    /// For each primal leaf type `Tᵢ`, `differential_type_fn` derives the boundary type `D(Tᵢ)`. Leaves whose derived
-    /// type is not a zero space need no reconstruction residuals because their live differential values remain in the
-    /// compact derivative program. For each zero-space leaf, this function asks `O` for the residual signature declared
-    /// by [`ResidualZeroProvider::zero_residual_types`]. Concatenating those signatures in primal-leaf order produces
-    /// the exact count, types, and ordering that `residuals` must have.
-    ///
-    /// This function validates residuals that have already been captured. It does not read them from primal values.
-    /// [`Self::capture`] performs capture and returns an instance satisfying the same contract. The selected
-    /// `differential_type_fn` must describe the boundary that will eventually consume these residuals and must match
-    /// the mapping supplied to [`Self::rebuild`]: use [`DifferentiableType::tangent`] for omitted tangent values such
-    /// as pushforward outputs, and [`DifferentiableType::cotangent`] for omitted cotangent values such as pullback
-    /// inputs or pushforward inputs retained for later pullback construction.
+    /// For each primal leaf type `Tᵢ`, `differential_type_fn` derives the boundary type `D(Tᵢ)`. A nonzero-space
+    /// `D(Tᵢ)` remains a live input or output of the compact derivative program and needs no entry in the stored plan.
+    /// For a zero-space `D(Tᵢ)`, this function captures and validates the runtime values declared by
+    /// [`ResidualZeroProvider::zero_residual_types`] from the corresponding primal value, then records the leaf index,
+    /// differential type, and captured residual range. Reconstruction therefore never needs the primal boundary or
+    /// differential mapping again.
     ///
     /// # Parameters
     ///
-    ///   - `label`: Human-readable name of the derivative boundary, to be included in validation diagnostics.
-    ///   - `primal_types`: Complete flattened primal boundary in leaf order, including leaves whose derived
-    ///     differential values are absent from the compact derivative program.
-    ///   - `residuals`: Captured runtime-geometry values, flattened first by primal-leaf order and then by each leaf's
-    ///     [`ResidualZeroProvider::zero_residual_types`] declaration order.
+    ///   - `context`: Context in which the operation family reads runtime geometry from the primal values.
+    ///   - `primal_values`: Complete flattened primal boundary values in leaf order.
+    ///   - `primal_types`: Complete flattened primal boundary types in the same order as `primal_values`.
     ///   - `differential_type_fn`: Type mapping that defines this boundary. Pass [`DifferentiableType::tangent`] for a
     ///     tangent boundary and [`DifferentiableType::cotangent`] for a cotangent boundary.
+    ///   - `label`: Human-readable name of the derivative boundary, included in capture diagnostics.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] if `residuals` does not have exactly the count and types declared by
-    /// `O` for the selected differential boundary.
-    pub(crate) fn new<O: ResidualZeroProvider<V::Type>, DifferentialTypeFn: Fn(&V::Type) -> V::Type>(
-        label: &str,
-        primal_types: &[V::Type],
-        residuals: Vec<V>,
-        differential_type_fn: DifferentialTypeFn,
-    ) -> Result<Self, ProgramError> {
-        let expected_types = primal_types
-            .iter()
-            .map(differential_type_fn)
-            .filter(DifferentiableType::is_zero_space)
-            .flat_map(|r#type| O::zero_residual_types(&r#type))
-            .collect::<Vec<_>>();
-        if residuals.len() != expected_types.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "{} has {} zero residuals but its boundary requires {}",
-                label,
-                residuals.len(),
-                expected_types.len(),
-            )));
-        }
-        for (index, (residual, expected_type)) in residuals.iter().zip(expected_types).enumerate() {
-            if residual.r#type().as_ref() != &expected_type {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "{} zero residual {} has type {} but expected {}",
-                    label,
-                    index,
-                    residual.r#type(),
-                    expected_type,
-                )));
-            }
-        }
-        Ok(Self(residuals))
-    }
-
-    // TODO(eaplatanios): Review this.
-    /// Captures the runtime geometry needed to rebuild every zero-space leaf of a primal boundary.
+    /// Returns [`ProgramError::MalformedProgram`] if the primal value/type counts differ or if an operation family
+    /// captures residual values whose count or types disagree with its declaration.
     pub(crate) fn capture<
         C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>,
         DifferentialTypeFn: Fn(&C::Type) -> C::Type,
@@ -298,45 +279,55 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
             )));
         }
         let mut residuals = Vec::new();
-        for (value, primal_type) in primal_values.iter().zip(primal_types) {
-            let r#type = differential_type_fn(primal_type);
-            if r#type.is_zero_space() {
-                residuals.extend(capture_and_validate_zero_residual_values(context, value, &r#type, label)?);
+        let mut zero_leaves = Vec::new();
+        for (index, (value, primal_type)) in primal_values.iter().zip(primal_types).enumerate() {
+            let differential_type = differential_type_fn(primal_type);
+            if differential_type.is_zero_space() {
+                let residual_start = residuals.len();
+                residuals.extend(capture_and_validate_zero_residual_values(context, value, &differential_type, label)?);
+                zero_leaves.push(ZeroSpaceBoundaryLeaf {
+                    index,
+                    r#type: differential_type,
+                    residual_range: residual_start..residuals.len(),
+                });
             }
         }
-        Ok(Self(residuals))
+        Ok(Self { residuals, boundary_size: primal_types.len(), zero_leaves })
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Rebuilds a complete differential boundary by interleaving materialized zero-space leaves with `live_values`.
+    /// Rebuilds the complete differential boundary described by this instance, interleaving materialized zero-space
+    /// leaves with the compact derivative program's `live_values`. The boundary size, zero-leaf positions, differential
+    /// types, and residual partitions were fixed and validated by [`Self::capture`]. Reconstruction consequently needs
+    /// only the context in which to bind each zero and the live values produced by the compact derivative program.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Context in which residual-backed zero operations are bound.
+    ///   - `live_values`: Differential values for every nonzero-space boundary leaf, in boundary order.
+    ///   - `label`: Human-readable name of the derivative boundary, included in compact-program count diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if a zero cannot be materialized or if `live_values` does not contain exactly one
+    /// value for every nonzero-space boundary leaf.
     pub(crate) fn rebuild<
         C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>,
         I: IntoIterator<Item = C::Value>,
-        DifferentialTypeFn: Fn(&C::Type) -> C::Type,
     >(
         &self,
         context: &C,
-        primal_types: &[C::Type],
-        differential_type_fn: DifferentialTypeFn,
         live_values: I,
         label: &str,
     ) -> Result<Vec<C::Value>, ProgramError> {
         let mut live_values = live_values.into_iter();
-        let mut next_zero_residual = 0_usize;
-        let mut values = Vec::with_capacity(primal_types.len());
-        for primal_type in primal_types {
-            let r#type = differential_type_fn(primal_type);
-            if r#type.is_zero_space() {
-                let residual_count = C::Operation::zero_residual_types(&r#type).len();
-                let residual_end = next_zero_residual.checked_add(residual_count).ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!("{label} zero residual count overflows usize"))
-                })?;
-                let residuals = self
-                    .0
-                    .get(next_zero_residual..residual_end)
-                    .ok_or_else(|| ProgramError::MalformedProgram(format!("{label} has too few zero residuals")))?;
-                next_zero_residual = residual_end;
-                let (operation, operands) = C::Operation::zero_operation_with_residuals(r#type, residuals)?;
+        let mut zero_leaves = self.zero_leaves.iter().peekable();
+        let mut values = Vec::with_capacity(self.boundary_size);
+        for index in 0..self.boundary_size {
+            if zero_leaves.peek().is_some_and(|leaf| leaf.index == index) {
+                let zero_leaf = zero_leaves.next().unwrap();
+                let residuals = self.residuals.get(zero_leaf.residual_range.clone()).unwrap();
+                let (operation, operands) =
+                    C::Operation::zero_operation_with_residuals(zero_leaf.r#type.clone(), residuals)?;
                 let mut outputs = context.bind(operation, Vec::new(), operands.as_slice())?;
                 check_count!("output", outputs, 1, ProgramError);
                 values.push(outputs.remove(0));
@@ -346,20 +337,12 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
                 })?);
             }
         }
-        if next_zero_residual != self.0.len() {
-            return Err(ProgramError::MalformedProgram(format!("{label} has unused zero residuals")));
-        }
         if live_values.next().is_some() {
             return Err(ProgramError::MalformedProgram(format!(
                 "{label} produced too many nonzero differential values",
             )));
         }
         Ok(values)
-    }
-
-    /// Returns the underlying flattened values of these [`ZeroSpaceBoundaryResiduals`].
-    pub(crate) fn into_values(self) -> Vec<V> {
-        self.0
     }
 }
 
