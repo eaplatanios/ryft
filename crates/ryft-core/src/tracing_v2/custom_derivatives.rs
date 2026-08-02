@@ -13,24 +13,16 @@ use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     LinearCallOperation,
 };
-#[cfg(test)]
-use crate::differentiation::{TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::Zero;
-#[cfg(test)]
-use crate::operations::constants::ZeroOperation;
 use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
-#[cfg(test)]
-use crate::programs::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::regions::{RegionInterface, RegionSlot};
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::{Program, ProgramError, Value};
-#[cfg(test)]
-use crate::tracing::TracingContext;
 use crate::tracing::{DomainTracer, Trace};
 use crate::types::ArrayType;
 
@@ -841,17 +833,15 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{Batch, BatchAxis};
-    use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-    use crate::operations::constants::ZeroLikeOperation;
     use crate::operations::math::{Cos, CosOperation, MulOperation, Sin, SinOperation};
     use crate::operations::math::{Dot, DotDimensionNumbers};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::ProgramBuilder;
     use crate::programs::effects::Effects;
-    use crate::programs::regions::{RegionDriver, RegionRef, RegionRole};
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+    use crate::programs::regions::RegionRole;
     use crate::types::{DataType, Dimension, Shape};
 
     use super::*;
@@ -936,35 +926,6 @@ mod tests {
         program.interface()
     }
 
-    /// Test-only transposition driver exposing one backward region to direct custom-VJP transpose-rule tests.
-    struct TestTranspositionDriver<'r> {
-        /// Backward region exposed by this driver.
-        region: RegionRef<'r, Array, ArrayOperation<Array>>,
-    }
-
-    impl RegionDriver<Array, ArrayOperation<Array>> for TestTranspositionDriver<'_> {
-        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Array, ArrayOperation<Array>>>
-        where
-            Array: 'r,
-            ArrayOperation<Array>: 'r,
-        {
-            std::iter::once(self.region)
-        }
-    }
-
-    impl TranspositionDriver<Array, ArrayOperation<Array>> for TestTranspositionDriver<'_> {
-        fn transpose_program(
-            &self,
-            _region: RegionRef<'_, Array, ArrayOperation<Array>>,
-            _input_linearity: &[bool],
-        ) -> Result<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>, DifferentiationError> {
-            Err(ProgramError::UnsupportedOperation {
-                message: "test driver does not transpose nested regions".to_string(),
-            }
-            .into())
-        }
-    }
-
     #[test]
     fn test_custom_jvp_inference_validates_the_rule_signature() {
         let scalar = test_type(&[]);
@@ -1038,15 +999,6 @@ mod tests {
             ),
             Ok(vec![primal_type]),
         );
-        assert_eq!(
-            LinearCallOperation::transpose_only(1, vec![tangent_type.clone()], vec![tangent_type.clone()])
-                .infer_output_types(&[residual_type, tangent_type.clone()], std::slice::from_ref(&backward_interface),),
-            Ok(vec![tangent_type]),
-        );
-        assert_eq!(
-            LinearCallOperation::transpose_only(1, Vec::<ArrayType>::new(), Vec::new()).region_role(0),
-            Some(RegionRole::Rule),
-        );
     }
 
     #[test]
@@ -1072,165 +1024,6 @@ mod tests {
                 ArrayOperation::CustomJvp(_) | ArrayOperation::CustomVjp(_),
             ));
         }
-    }
-
-    #[test]
-    fn test_custom_vjp_transpose_only_carrier_remains_opaque_to_partial_evaluation() {
-        let scalar = test_type(&[]);
-        let operation = ArrayOperation::LinearCall(LinearCallOperation::transpose_only(
-            1,
-            vec![scalar.clone()],
-            vec![scalar.clone()],
-        ));
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let backward_region = builder.import_region(tripled_sin_backward_program(&scalar).entry_region_ref());
-        let tangent = builder.add_input(scalar.clone());
-        let residual = builder.add_input(scalar.clone());
-        let output = builder.add_instruction(operation, vec![backward_region], vec![tangent, residual]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        let evaluation = program
-            .partially_evaluate(&[PartialValue::Unknown(scalar.clone()), PartialValue::Unknown(scalar)])
-            .unwrap();
-
-        assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::LinearCall(_)));
-    }
-
-    #[test]
-    fn test_custom_vjp_transpose_only_carrier_validates_residual_count() {
-        let scalar = test_type(&[]);
-        let backward_interface = RegionInterface::new(vec![scalar.clone()], vec![scalar.clone()], Effects::PURE);
-        assert!(matches!(
-            LinearCallOperation::transpose_only(2, Vec::new(), Vec::new())
-                .infer_output_types(&[], std::slice::from_ref(&backward_interface)),
-            Err(TypeError::Invalid { message }) if message == "linear call residual count 2 exceeds input count 0",
-        ));
-
-        let backward = tripled_sin_backward_program(&scalar);
-        let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        assert!(matches!(
-            LinearCallOperation::transpose_only(3, vec![scalar.clone()], vec![scalar]).transpose(
-                &mut context,
-                &driver,
-                &[],
-                &[],
-            ),
-            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
-                if message == "linear call residual count 3 exceeds input count 0",
-        ));
-
-        let scalar = test_type(&[]);
-        let output_cotangent = context.input(scalar.clone());
-        assert!(matches!(
-            LinearCallOperation::transpose_only(1, vec![scalar.clone()], vec![scalar.clone()]).transpose(
-                &mut context,
-                &driver,
-                &[PartialValue::Unknown(scalar.clone()), PartialValue::Unknown(scalar)],
-                &[MaybeZero::Value(output_cotangent)],
-            ),
-            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
-                if message == "linear call residual operand 0 is not known during transposition",
-        ));
-    }
-
-    #[test]
-    fn test_custom_vjp_transpose_preserves_known_tangent_operands_before_residuals() {
-        let scalar = test_type(&[]);
-        let mut backward_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let residual = backward_builder.add_input(scalar.clone());
-        let output_cotangent = backward_builder.add_input(scalar.clone());
-        let first_input_cotangent = backward_builder
-            .add_instruction(MulOperation, Vec::new(), vec![residual, output_cotangent])
-            .unwrap()[0];
-        let backward = backward_builder
-            .build::<Vec<Array>, Vec<Array>>(
-                vec![first_input_cotangent, output_cotangent],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let known_tangent = context.input(scalar.clone());
-        let residual = context.input(scalar.clone());
-        let output_cotangent = context.input(scalar.clone());
-
-        let contributions =
-            LinearCallOperation::transpose_only(1, vec![scalar.clone(), scalar.clone()], vec![scalar.clone()])
-                .transpose(
-                    &mut context,
-                    &driver,
-                    &[PartialValue::Known(residual), PartialValue::Unknown(scalar), PartialValue::Known(known_tangent)],
-                    &[MaybeZero::Value(output_cotangent)],
-                )
-                .unwrap();
-
-        assert_eq!(contributions.len(), 3);
-        assert!(contributions[0].is_zero());
-        assert!(matches!(contributions[1], MaybeZero::Value(_)));
-        assert!(contributions[2].is_zero());
-    }
-
-    #[test]
-    fn test_custom_vjp_transpose_preserves_structural_zero_outputs() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let primal_type = ArrayType::scalar(DataType::F64)
-            .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
-            .unwrap();
-        let tangent_type = primal_type.tangent();
-        let cotangent_type = primal_type.cotangent();
-        assert_ne!(tangent_type, cotangent_type);
-
-        // A canonical `zero` backward output is already typed in the primal input's cotangent space. Recovering its
-        // structural zero must retain that type instead of dualizing its sharding a second time.
-        let mut backward_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        backward_builder.add_input(cotangent_type.clone());
-        let zero = backward_builder
-            .add_instruction(ZeroOperation::new(cotangent_type.clone()), Vec::new(), Vec::new())
-            .unwrap()[0];
-        let backward = backward_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let output_cotangent = context.input(cotangent_type.clone());
-        let contributions =
-            LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type.clone()])
-                .transpose(
-                    &mut context,
-                    &driver,
-                    &[PartialValue::Unknown(tangent_type.clone())],
-                    &[MaybeZero::Value(output_cotangent)],
-                )
-                .unwrap();
-        assert!(matches!(&contributions[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
-
-        // `zero_like` is equally structural even though it consumes an exemplar input. Opaque backward replay must
-        // recognize it instead of turning the result into a live zero-valued tracer.
-        let mut backward_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let output_cotangent = backward_builder.add_input(cotangent_type.clone());
-        let zero_like =
-            backward_builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![output_cotangent]).unwrap()[0];
-        let backward = backward_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![zero_like], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let output_cotangent = context.input(cotangent_type.clone());
-        let contributions = LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type])
-            .transpose(
-                &mut context,
-                &driver,
-                &[PartialValue::Unknown(primal_type.tangent())],
-                &[MaybeZero::Value(output_cotangent)],
-            )
-            .unwrap();
-        assert!(matches!(&contributions[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
     }
 
     #[test]
@@ -1292,24 +1085,6 @@ mod tests {
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         // The custom backward rule triples the true gradient, proving it is in control.
         assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_custom_vjp_rejects_forward_mode() {
-        // The staged tangent carrier refuses interpretation in its un-transposed (pushforward) form, which is
-        // exactly the operation `jvp` would need to execute; reverse mode transposes it first and replays
-        // `backward`.
-        let scalar = test_type(&[]);
-        let carrier = LinearCallOperation::transpose_only(1, vec![scalar.clone()], vec![scalar]);
-        assert!(matches!(
-        InterpretableOperation::<_>::interpret(
-                        &carrier,
-                        &crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver,
-                                        &[Array::scalar(1.0)],
-                    ),
-                    Err(ProgramError::UnsupportedOperation { message })
-                        if message.starts_with("a transpose-only linear call has no forward program to execute"),
-                ));
     }
 
     #[test]

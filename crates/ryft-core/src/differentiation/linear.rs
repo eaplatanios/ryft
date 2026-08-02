@@ -1082,15 +1082,17 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::DifferentiationError;
     use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
+    use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::math::{AddOperation, MulOperation};
     use crate::parameters::Placeholder;
-    use crate::partial::PartialValue;
+    use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::ProgramError;
     use crate::programs::atoms::MaybeZero;
     use crate::programs::builders::ProgramBuilder;
+    use crate::programs::effects::Effects;
     use crate::programs::programs::Program;
     use crate::programs::regions::{RegionDriver, RegionRef, RegionSlot};
-    use crate::sharding::ShardingDimension;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::TracingContext;
     use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
@@ -1106,6 +1108,36 @@ mod tests {
         builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()
+    }
+
+    /// Test-only transposition driver exposing one attached region, used to invoke the _transpose-only_ form's
+    /// transposition rule directly on the transpose region it replays.
+    struct TestTranspositionDriver<'r> {
+        /// Transpose region exposed by this driver.
+        region: RegionRef<'r, Array, ArrayOperation<Array>>,
+    }
+
+    impl RegionDriver<Array, ArrayOperation<Array>> for TestTranspositionDriver<'_> {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Array, ArrayOperation<Array>>>
+        where
+            Array: 'r,
+            ArrayOperation<Array>: 'r,
+        {
+            std::iter::once(self.region)
+        }
+    }
+
+    impl TranspositionDriver<Array, ArrayOperation<Array>> for TestTranspositionDriver<'_> {
+        fn transpose_program(
+            &self,
+            _region: RegionRef<'_, Array, ArrayOperation<Array>>,
+            _input_linearity: &[bool],
+        ) -> Result<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation {
+                message: "test driver does not transpose nested regions".to_string(),
+            }
+            .into())
+        }
     }
 
     #[test]
@@ -1241,6 +1273,22 @@ mod tests {
         assert!(operation.is_transpose_only());
         assert_eq!(operation.to_string(), "transpose_only_linear_call [residual_count=1]");
         assert_eq!(operation.region_slots(), &[RegionSlot::rule("transpose")]);
+
+        // The transpose-only form derives its transpose region's expected interface from the stored forward interface
+        // through the cotangent type mapping, so it infers the stored output types whenever the attached region agrees.
+        // The linear types are differential types rather than primal storage types, which the mapping must respect.
+        let residual_type = ArrayType::scalar(DataType::F64);
+        let tangent_type = ArrayType::scalar(DataType::F32);
+        let transpose_interface = RegionInterface::new(
+            vec![residual_type.clone(), tangent_type.clone()],
+            vec![tangent_type.clone()],
+            Effects::PURE,
+        );
+        assert_eq!(
+            LinearCallOperation::transpose_only(1, vec![tangent_type.clone()], vec![tangent_type.clone()])
+                .infer_output_types(&[residual_type, tangent_type.clone()], std::slice::from_ref(&transpose_interface)),
+            Ok(vec![tangent_type]),
+        );
     }
 
     #[test]
@@ -1296,6 +1344,50 @@ mod tests {
     }
 
     #[test]
+    fn test_linear_call_operation_transpose_only_validates_residual_count() {
+        let r#type = ArrayType::scalar(DataType::F64);
+
+        // A residual count larger than the operand count is a malformed call rather than a silently truncated split,
+        // and inference rejects it before any region interface is consulted.
+        let transpose_interface = RegionInterface::new(vec![r#type.clone()], vec![r#type.clone()], Effects::PURE);
+        assert!(matches!(
+            LinearCallOperation::transpose_only(2, Vec::new(), Vec::new())
+                .infer_output_types(&[], std::slice::from_ref(&transpose_interface)),
+            Err(TypeError::Invalid { message }) if message == "linear call residual count 2 exceeds input count 0",
+        ));
+
+        // Transposition enforces the same split independently, because a pullback may be built from an imported call
+        // whose operands were pruned after inference ran.
+        let transpose = scalar_multiply_program();
+        let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            LinearCallOperation::transpose_only(3, vec![r#type.clone()], vec![r#type.clone()]).transpose(
+                &mut context,
+                &driver,
+                &[],
+                &[],
+            ),
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
+                if message == "linear call residual count 3 exceeds input count 0",
+        ));
+
+        // Every residual must be known during transposition, because the replayed transpose region consumes the
+        // residual values themselves rather than cotangents for them.
+        let output_cotangent = context.input(r#type.clone());
+        assert!(matches!(
+            LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type.clone()]).transpose(
+                &mut context,
+                &driver,
+                &[PartialValue::Unknown(r#type.clone()), PartialValue::Unknown(r#type)],
+                &[MaybeZero::Value(output_cotangent)],
+            ),
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
+                if message == "linear call residual operand 0 is not known during transposition",
+        ));
+    }
+
+    #[test]
     fn test_linear_call_operation_transpose_only_form_rejects_forward_execution() {
         let r#type = ArrayType::scalar(DataType::F64);
         let transpose = scalar_multiply_program();
@@ -1332,6 +1424,41 @@ mod tests {
                 if message == "a transpose-only linear call cannot be batched with mapped inputs because its \
                                unavailable forward program does not determine output batch axes",
         ));
+    }
+
+    #[test]
+    fn test_linear_call_operation_transpose_only_remains_opaque_to_partial_evaluation() {
+        // A transpose-only carrier (the form `custom_vjp` stages into its tangent program) must survive partial
+        // evaluation as one unknown-producing instruction. Splitting or folding it would separate the backward region
+        // from the residuals that parameterize it, so the default opaque rule is the correct behavior here.
+        let r#type = ArrayType::scalar(DataType::F64);
+        let transpose = scalar_multiply_program();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(r#type.clone());
+        let linear = builder.add_input(r#type.clone());
+        let output = builder
+            .add_instruction(
+                ArrayOperation::LinearCall(LinearCallOperation::transpose_only(
+                    1,
+                    vec![r#type.clone()],
+                    vec![r#type.clone()],
+                )),
+                vec![transpose],
+                vec![residual, linear],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Unknown(r#type.clone()), PartialValue::Unknown(r#type)])
+            .unwrap();
+
+        assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::LinearCall(_)));
     }
 
     #[test]
@@ -1590,5 +1717,104 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_linear_call_operation_transposition_zeros_known_operand_cotangents() {
+        // The transpose region of a transpose-only call returns one cotangent per linear operand, in operand order
+        // after the leading residuals. Residual operands are fixed primal parameters rather than linear inputs, and
+        // a *known* linear operand is not being differentiated, so both receive structural zeros while the replayed
+        // region's cotangents are assigned only to the unknown linear operands.
+        let r#type = ArrayType::scalar(DataType::F64);
+        let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let residual = transpose_builder.add_input(r#type.clone());
+        let output_cotangent = transpose_builder.add_input(r#type.clone());
+        let first_input_cotangent = transpose_builder
+            .add_instruction(MulOperation, Vec::new(), vec![residual, output_cotangent])
+            .unwrap()[0];
+        let transpose = transpose_builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![first_input_cotangent, output_cotangent],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let residual = context.input(r#type.clone());
+        let known_linear = context.input(r#type.clone());
+        let output_cotangent = context.input(r#type.clone());
+
+        let linear_types = vec![r#type.clone(), r#type.clone()];
+        let cotangents = LinearCallOperation::transpose_only(1, linear_types, vec![r#type.clone()])
+            .transpose(
+                &mut context,
+                &driver,
+                &[PartialValue::Known(residual), PartialValue::Unknown(r#type), PartialValue::Known(known_linear)],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+
+        assert_eq!(cotangents.len(), 3);
+        assert!(cotangents[0].is_zero());
+        assert!(matches!(cotangents[1], MaybeZero::Value(_)));
+        assert!(cotangents[2].is_zero());
+    }
+
+    #[test]
+    fn test_linear_call_operation_transposition_preserves_structural_zero_outputs() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let primal_type = ArrayType::scalar(DataType::F64)
+            .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let tangent_type = primal_type.tangent();
+        let cotangent_type = primal_type.cotangent();
+        assert_ne!(tangent_type, cotangent_type);
+
+        // A canonical `zero` transpose-region output is already typed in the linear input's cotangent space.
+        // Recovering its structural zero must retain that type instead of dualizing its sharding a second time.
+        let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        transpose_builder.add_input(cotangent_type.clone());
+        let zero = transpose_builder
+            .add_instruction(ZeroOperation::new(cotangent_type.clone()), Vec::new(), Vec::new())
+            .unwrap()[0];
+        let transpose = transpose_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(cotangent_type.clone());
+        let cotangents = LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type.clone()])
+            .transpose(
+                &mut context,
+                &driver,
+                &[PartialValue::Unknown(tangent_type.clone())],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+        assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
+
+        // `zero_like` is equally structural even though it consumes an exemplar input. Opaque region replay must
+        // recognize it instead of turning the result into a live zero-valued tracer.
+        let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = transpose_builder.add_input(cotangent_type.clone());
+        let zero_like = transpose_builder
+            .add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![output_cotangent])
+            .unwrap()[0];
+        let transpose = transpose_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![zero_like], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(cotangent_type.clone());
+        let cotangents = LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type])
+            .transpose(
+                &mut context,
+                &driver,
+                &[PartialValue::Unknown(primal_type.tangent())],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+        assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
     }
 }
