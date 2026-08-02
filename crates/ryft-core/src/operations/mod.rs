@@ -93,19 +93,13 @@ pub trait ElementwiseOperation: Operation<ArrayType> {
                     .collect::<BTreeSet<_>>();
                 let mut input_types = input_types.to_vec();
                 for sharding in input_types.iter_mut().filter_map(|input_type| input_type.sharding.as_mut()) {
-                    *sharding = sharding
-                        .clone()
-                        .with_varying_manual_axes(std::iter::empty::<String>())
-                        .map_err(TypeError::custom)?;
+                    sharding.clear_varying_manual_axes();
                 }
                 let mut output = ArrayType::broadcasted(input_types.as_slice()).map_err(|_| {
                     TypeError::invalid(format!("'{}' input types are not broadcast-compatible", self.name()))
                 })?;
                 if let Some(sharding) = &mut output.sharding {
-                    *sharding = sharding
-                        .clone()
-                        .with_varying_manual_axes(original_varying_manual_axes)
-                        .map_err(TypeError::custom)?;
+                    sharding.set_varying_manual_axes(original_varying_manual_axes).map_err(TypeError::custom)?;
                 }
                 Ok(output)
             }

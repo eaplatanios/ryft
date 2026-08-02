@@ -296,11 +296,17 @@ impl Sharding {
     /// Returns this [`Sharding`] with its per-array dimension assignments replaced by `dimensions`, while preserving
     /// its mesh and auxiliary axis state. The resulting sharding is revalidated against all preserved axis sets.
     #[inline]
-    pub fn with_dimensions(self, dimensions: Vec<ShardingDimension>) -> Result<Self, ShardingError> {
-        Self::new(self.mesh, dimensions)?
-            .with_unreduced_axes(self.unreduced_axes)?
-            .with_reduced_axes(self.reduced_axes)?
-            .with_varying_manual_axes(self.varying_manual_axes)
+    pub fn with_dimensions(&self, dimensions: Vec<ShardingDimension>) -> Result<Self, ShardingError> {
+        let mut sharding = Self::new(self.mesh.clone(), dimensions)?;
+        for axis_name in self.unreduced_axes.iter().chain(&self.reduced_axes) {
+            if sharding.dimensions_use_axis(axis_name) {
+                return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
+            }
+        }
+        sharding.unreduced_axes = self.unreduced_axes.clone();
+        sharding.reduced_axes = self.reduced_axes.clone();
+        sharding.varying_manual_axes = self.varying_manual_axes.clone();
+        Ok(sharding)
     }
 
     /// Returns this [`Sharding`] with its unreduced mesh axes replaced by `unreduced_axes`. Use this when the
@@ -314,11 +320,7 @@ impl Sharding {
             if self.mesh.axis_index(axis_name).is_none() {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
             }
-            if self.dimensions.iter().any(|dimension| match dimension {
-                ShardingDimension::Sharded(axis_names) => axis_names.contains(axis_name),
-                ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-            }) || self.reduced_axes.contains(axis_name)
-            {
+            if self.dimensions_use_axis(axis_name) || self.reduced_axes.contains(axis_name) {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
             }
             if self.varying_manual_axes.contains(axis_name) {
@@ -339,11 +341,7 @@ impl Sharding {
             if self.mesh.axis_index(axis_name).is_none() {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
             }
-            if self.dimensions.iter().any(|dimension| match dimension {
-                ShardingDimension::Sharded(axis_names) => axis_names.contains(axis_name),
-                ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-            }) || self.unreduced_axes.contains(axis_name)
-            {
+            if self.dimensions_use_axis(axis_name) || self.unreduced_axes.contains(axis_name) {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
             }
             if self.varying_manual_axes.contains(axis_name) {
@@ -359,23 +357,44 @@ impl Sharding {
         mut self,
         varying_manual_axes: I,
     ) -> Result<Self, ShardingError> {
+        self.set_varying_manual_axes(varying_manual_axes)?;
+        Ok(self)
+    }
+
+    /// Replaces this [`Sharding`]'s varying manual mesh axes with `varying_manual_axes` after validating the
+    /// replacement. If validation fails, this sharding remains unchanged.
+    pub fn set_varying_manual_axes<A: Into<String>, I: IntoIterator<Item = A>>(
+        &mut self,
+        varying_manual_axes: I,
+    ) -> Result<(), ShardingError> {
         let varying_manual_axes = varying_manual_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
         for axis_name in &varying_manual_axes {
-            if self.mesh.axis_index(axis_name).is_none() {
-                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
-            }
-            if self.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
-                return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
-            }
-            if self.unreduced_axes.contains(axis_name) {
-                return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.clone() });
-            }
-            if self.reduced_axes.contains(axis_name) {
-                return Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name: axis_name.clone() });
-            }
+            self.validate_varying_manual_axis(axis_name)?;
         }
         self.varying_manual_axes = varying_manual_axes;
-        Ok(self)
+        Ok(())
+    }
+
+    /// Adds `varying_manual_axes` to this [`Sharding`]'s varying manual mesh axes after validating every addition.
+    /// If validation fails, this sharding remains unchanged.
+    pub fn extend_varying_manual_axes<A: Into<String>, I: IntoIterator<Item = A>>(
+        &mut self,
+        varying_manual_axes: I,
+    ) -> Result<(), ShardingError> {
+        let varying_manual_axes = varying_manual_axes.into_iter().map(Into::into).collect::<Vec<_>>();
+        for axis_name in &varying_manual_axes {
+            if !self.varying_manual_axes.contains(axis_name) {
+                self.validate_varying_manual_axis(axis_name)?;
+            }
+        }
+        self.varying_manual_axes.extend(varying_manual_axes);
+        Ok(())
+    }
+
+    /// Clears this [`Sharding`]'s varying manual mesh axes.
+    #[inline]
+    pub fn clear_varying_manual_axes(&mut self) {
+        self.varying_manual_axes.clear();
     }
 
     /// Returns the [`Sharding`] that reverse-mode cotangents of values sharded like this one carry. It swaps
@@ -542,6 +561,31 @@ impl Sharding {
         };
         symmetric_difference_contains_explicit(&self.unreduced_axes, &other.unreduced_axes)
             || symmetric_difference_contains_explicit(&self.reduced_axes, &other.reduced_axes)
+    }
+
+    /// Returns `true` if any ranked dimension of this [`Sharding`] uses `axis_name` for sharding.
+    fn dimensions_use_axis(&self, axis_name: &str) -> bool {
+        self.dimensions.iter().any(|dimension| match dimension {
+            ShardingDimension::Sharded(axis_names) => axis_names.iter().any(|name| name == axis_name),
+            ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+        })
+    }
+
+    /// Validates that `axis_name` can be used as a varying manual mesh axis in this [`Sharding`].
+    fn validate_varying_manual_axis(&self, axis_name: &str) -> Result<(), ShardingError> {
+        if self.mesh.axis_index(axis_name).is_none() {
+            return Err(ShardingError::UnknownMeshAxisName { name: axis_name.to_string() });
+        }
+        if self.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
+            return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.to_string() });
+        }
+        if self.unreduced_axes.contains(axis_name) {
+            return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.to_string() });
+        }
+        if self.reduced_axes.contains(axis_name) {
+            return Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name: axis_name.to_string() });
+        }
+        Ok(())
     }
 }
 

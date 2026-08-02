@@ -93,7 +93,7 @@ use crate::programs::regions::{
 };
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
-use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
+use crate::sharding::{MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Dimension, DimensionType, Shape};
 
@@ -1412,23 +1412,23 @@ impl ArrayType {
         dimensions.remove(axis);
         let sharding = self
             .sharding()
-            .map(|sharding| {
+            .map(|sharding| -> Result<Sharding, ShardingError> {
                 let mut sharding_dimensions = sharding.dimensions().to_vec();
                 let removed_dimension = sharding_dimensions.remove(axis);
-                let mut varying_manual_axes = sharding.varying_manual_axes().clone();
+                let mut projected_sharding = sharding.with_dimensions(sharding_dimensions)?;
 
                 // Manual axes remain semantically visible after their ranked dimension is removed because values may
                 // still vary across those axes. All other mesh axes are intentionally omitted (they placed the batch
                 // dimension itself, which is outside the unbatched per-item type).
                 if let ShardingDimension::Sharded(axis_names) = removed_dimension {
-                    varying_manual_axes.extend(
+                    projected_sharding.extend_varying_manual_axes(
                         axis_names
                             .into_iter()
                             .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual)),
-                    );
+                    )?;
                 }
 
-                sharding.clone().with_dimensions(sharding_dimensions)?.with_varying_manual_axes(varying_manual_axes)
+                Ok(projected_sharding)
             })
             .transpose()
             .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
@@ -1674,11 +1674,8 @@ impl<
                         .filter(|name| sharding.mesh().axis_type(name.as_str()) == Some(MeshAxisType::Manual))
                         .cloned()
                         .collect::<Vec<_>>();
-                    let mut combined_varying_manual_axes = sharding.varying_manual_axes().clone();
-                    combined_varying_manual_axes.extend(varying_manual_axes);
-                    *sharding = sharding
-                        .clone()
-                        .with_varying_manual_axes(combined_varying_manual_axes)
+                    sharding
+                        .extend_varying_manual_axes(varying_manual_axes)
                         .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
                 }
                 Ok(unbatched_type)
