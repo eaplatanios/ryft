@@ -1,5 +1,3 @@
-//! Contains higher-order custom-derivative operations and their transformation rules.
-
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
@@ -14,7 +12,7 @@ use crate::differentiation::{
     LinearCallOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types};
+use crate::macros::{check_count, check_types, impl_non_transposable_operation};
 use crate::operations::constants::Zero;
 use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -26,45 +24,37 @@ use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Trace};
 use crate::types::ArrayType;
 
-/// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
+/// Canonical operation name for [`CustomJvpOperation`].
+pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
+
+/// Higher-order [`Operation`] pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
 /// [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
 ///
-/// The JVP program follows JAX's calling convention: it receives the primal inputs followed by one tangent per
-/// primal input, and returns the primal outputs followed by one tangent per primal output. The primal program is
-/// kept separate from the JVP program so that un-differentiated calls do not pay for tangent computation:
-/// interpretation and backend lowering replay the lean primal program; linearization replays the JVP
-/// program instead of differentiating the primal body, so the user-supplied derivative governs both forward and
-/// reverse mode (reverse mode transposes the linearization of the JVP program, which therefore must be linear in
-/// its tangent arguments).
+/// The two [`Program`]s are supplied as the operation's attached regions (via the region driver passed to
+/// [`Context::bind`]) in the region order `["primal", "jvp"]`, and [`Operation::infer_output_types`] validates the
+/// interface contract between them: the JVP region's inputs are the primal inputs followed by one tangent per primal
+/// input, and its outputs are the primal outputs followed by one tangent per primal output. Keeping the primal program
+/// separate from the JVP program means un-differentiated calls never pay for tangent computation.
 ///
-/// Batching (`batch`) re-wraps the call around batched primal/JVP programs — mirroring JAX's
-/// `custom_jvp_call_jaxpr` batching rule — so the custom derivative survives a `batch` applied *before*
-/// differentiation, under eager and staging parents alike.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// The transforms treat a staged call as follows: interpretation replays the primal region; partial evaluation folds a
+/// call whose operands are all known and otherwise residualizes it unchanged; batching re-wraps the call around
+/// batched copies of both regions so the custom derivative survives a `batch` applied *before* differentiation; and
+/// differentiation replays the user JVP region instead of differentiating the primal body, so the user-supplied
+/// derivative governs both forward and reverse mode. Refer to the documentation of [`custom_jvp`] for the full
+/// semantics and for when to reach for a custom JVP.
+///
+/// This operation is deliberately non-transposable, which does not restrict reverse-mode differentiation. Reverse mode
+/// linearizes first, and the `jvp` rule replays the user JVP program as plain primitive operations, so the operation
+/// itself is gone from the tangent program long before transposition runs (which is also why the JVP program must be
+/// linear in its tangent arguments). Transposition can therefore only reach the operation when transposing a raw,
+/// un-linearized program directly, which JAX rejects for its `custom_jvp_call` primitive in exactly the same way.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CustomJvpOperation;
 
-impl CustomJvpOperation {
-    /// Creates a custom-JVP operation. The primal and JVP [`Program`]s are supplied separately as the operation's
-    /// attached regions (via the region driver passed to [`Context::bind`]) in the region order
-    /// `["primal", "jvp"]`; [`Operation::infer_output_types`] validates that the JVP interface matches the primal
-    /// interface (its inputs are the primal inputs followed by their tangents, and its outputs the primal outputs
-    /// followed by their tangents).
-    #[inline]
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for CustomJvpOperation {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Display for CustomJvpOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("custom_jvp")
+        formatter.write_str(CUSTOM_JVP_OPERATION_NAME)
     }
 }
 
@@ -97,7 +87,7 @@ fn validated_custom_jvp_interfaces<T: DifferentiableType>(
 impl<T: DifferentiableType> Operation<T> for CustomJvpOperation {
     #[inline]
     fn name(&self) -> &'static str {
-        "custom_jvp"
+        CUSTOM_JVP_OPERATION_NAME
     }
 
     #[inline]
@@ -151,52 +141,6 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 {
 }
 
-/// Capture-free forward-mode (JVP) rule for [`CustomJvpOperation`]: replays the user-supplied JVP program through the
-/// active context, staging its operations in the shared builder.
-///
-/// The JVP program is already JVP-shaped over the primal operation family — it maps
-/// `(inputs..., input_tangents...)` to `(outputs..., output_tangents...)` — so the rule simply replays it
-/// through [`Program::interpret_in_context`](crate::Program::interpret_in_context) over the dual inputs: the primal tracers followed by the
-/// tangent tracers feed the JVP
-/// program, and its outputs split into the primal outputs and the staged output tangents. Because the replayed program
-/// is straight-line primal-enum operations referencing those tracers directly, it introduces no symbolic capture and
-/// the enclosing partial-evaluation split discovers the residual operand edges structurally — so
-/// the rule is a leaf needing no nested differentiation or linearization request, and reverse mode transposes the
-/// replayed bilinear operations exactly as it does for any other straight-line
-/// tangent program.
-impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation {
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The user's JVP computation is region 1 (region 0 is the primal), mapping
-        // `(inputs..., input_tangents...)` to `(outputs..., output_tangents...)`.
-        let jvp_region = driver.region(1)?;
-        let output_count = jvp_region.output_types().len() / 2;
-        check_count!("input", inputs, jvp_region.input_types().len() / 2, ProgramError);
-        // The JVP region consumes `(primals..., input_tangents...)`, so feed the dual primals followed by the dual
-        // tangents.
-        let mut jvp_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        // The user's JVP region takes every input tangent as a real region input, so materialize structural
-        // zeros.
-        for input in inputs {
-            jvp_inputs.push(input.tangent().clone().materialize(context)?);
-        }
-        let mut outputs = jvp_region.interpret_in_context(context, jvp_inputs)?;
-        check_count!("output", outputs, 2 * output_count, ProgramError);
-        let tangents = outputs.split_off(output_count);
-        Ok(outputs
-            .into_iter()
-            .zip(tangents)
-            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-}
-
-crate::impl_non_transposable_operation!(CustomJvpOperation);
-
 /// Binds a re-wrapped custom-derivative call into the batching context's parent.
 ///
 /// This is the shared body of the `batch` rules for [`CustomJvpOperation`] and [`CustomVjpOperation`],
@@ -246,7 +190,7 @@ where
         .into_iter()
         .map(|tracer| {
             let packed_type = tracer.r#type().into_owned();
-            ArrayBatch::new(packed_type, tracer, Some(0))
+            ArrayBatch::new(packed_type, tracer, BatchAxis::new(0))
         })
         .collect()
 }
@@ -293,60 +237,101 @@ where
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
             None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
             Some(_) => Ok((
-                O::from(CustomJvpOperation::new()),
+                O::from(CustomJvpOperation),
                 vec![batch_rewrapped_program(context, driver, 0)?, batch_rewrapped_program(context, driver, 1)?],
             )),
         })
     }
 }
 
-/// Higher-order operation pairing a primal program with user-supplied forward/backward (VJP) programs — the direct
+/// Capture-free forward-mode (JVP) rule for [`CustomJvpOperation`]: replays the user-supplied JVP program through the
+/// active context, staging its operations in the shared builder.
+///
+/// The JVP program is already JVP-shaped over the primal operation family — it maps `(inputs..., input_tangents...)`
+/// to `(outputs..., output_tangents...)` — so the rule simply replays it through [`Program::interpret_in_context`]
+/// over the dual inputs: the primal tracers followed by the tangent tracers feed the JVP program, and its outputs
+/// split into the primal outputs and the staged output tangents. Because the replayed program is straight-line
+/// primal-enum operations referencing those tracers directly, it introduces no symbolic capture and the enclosing
+/// partial-evaluation split discovers the residual operand edges structurally — so the rule is a leaf needing no
+/// nested differentiation or linearization request, and reverse mode transposes the replayed bilinear operations
+/// exactly as it does for any other straight-line tangent program.
+impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation {
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // The user's JVP computation is region 1 (region 0 is the primal), mapping
+        // `(inputs..., input_tangents...)` to `(outputs..., output_tangents...)`.
+        let jvp_region = driver.region(1)?;
+        let output_count = jvp_region.output_types().len() / 2;
+        check_count!("input", inputs, jvp_region.input_types().len() / 2, ProgramError);
+        // The JVP region consumes `(primals..., input_tangents...)`, so feed the dual primals followed by the dual
+        // tangents.
+        let mut jvp_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        // The user's JVP region takes every input tangent as a real region input, so materialize structural
+        // zeros.
+        for input in inputs {
+            jvp_inputs.push(input.tangent().clone().materialize(context)?);
+        }
+        let mut outputs = jvp_region.interpret_in_context(context, jvp_inputs)?;
+        check_count!("output", outputs, 2 * output_count, ProgramError);
+        let tangents = outputs.split_off(output_count);
+        Ok(outputs
+            .into_iter()
+            .zip(tangents)
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+// Rejecting transposition is correct: the `jvp` rule above replays the user JVP program as plain primitive operations,
+// so a linearized tangent program never contains this operation and its transpose entry point is unreachable through
+// reverse mode. Only a direct transpose of a raw, un-linearized program can reach it.
+impl_non_transposable_operation!(CustomJvpOperation);
+
+/// Canonical operation name for [`CustomVjpOperation`].
+pub const CUSTOM_VJP_OPERATION_NAME: &str = "custom_vjp";
+
+/// Higher-order [`Operation`] pairing a primal program with user-supplied forward/backward (VJP) programs — the direct
 /// analogue of JAX's [`custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html).
 ///
-/// The forward program maps the primal inputs to the primal outputs followed by arbitrarily many residual values;
-/// the backward program maps those residuals followed by one cotangent per primal output to one cotangent per primal
-/// input. The primal program is kept separate from the forward program so that un-differentiated calls do not pay
-/// for residual computation: interpretation and backend lowering replay the lean primal program, and the
-/// forward program runs only under reverse-mode differentiation. Linearization evaluates the
-/// forward program, captures its residuals as factors, and stages one opaque linear call whose transpose replays the
-/// backward program — so reverse mode uses exactly the user-supplied gradient. Forward-mode differentiation
-/// (interpreting the staged linear call) is rejected, matching JAX's `custom_vjp` semantics.
+/// The three [`Program`]s are supplied as the operation's attached regions (via the region driver passed to
+/// [`Context::bind`]) in the region order `["primal", "forward", "backward"]`, and
+/// [`Operation::infer_output_types`] validates the interface contract between them: the forward region consumes the
+/// primal inputs and produces the primal outputs followed by arbitrarily many residual values, and the backward region
+/// consumes those residuals followed by one cotangent per primal output and produces one cotangent per primal input.
+/// Keeping the primal program separate from the forward program means un-differentiated calls never pay for residual
+/// computation.
 ///
-/// Batching (`batch`) re-wraps the call around batched primal/forward/backward programs — mirroring JAX's
-/// `custom_vjp_call_jaxpr` batching rule — so the custom derivative survives a `batch` applied *before*
-/// differentiation, under eager and staging parents alike.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// The transforms treat a staged call as follows: interpretation replays the primal region; partial evaluation folds a
+/// call whose operands are all known and otherwise residualizes it unchanged; batching re-wraps the call around
+/// batched copies of all three regions so the custom derivative survives a `batch` applied *before* differentiation;
+/// and differentiation replays the forward region for the primal outputs and residuals and stages one transpose-only
+/// [`LinearCallOperation`] carrier for the output tangents, whose transpose replays the user backward program — so
+/// reverse mode uses exactly the user-supplied gradient. Because that carrier rejects interpretation, forward-mode
+/// differentiation of a staged call is rejected, matching JAX's reverse-mode-only `custom_vjp` semantics. Refer to the
+/// documentation of [`custom_vjp`] for the full semantics and for when to reach for a custom VJP.
+///
+/// This operation is deliberately non-transposable, which does not restrict reverse-mode differentiation. Reverse mode
+/// linearizes first, and the `jvp` rule replaces the operation with the transpose-only carrier described above — the
+/// analogue of JAX's `custom_lin` primitive — so the operation itself is gone from the tangent program long before
+/// transposition runs. Transposition can therefore only reach the operation when transposing a raw, un-linearized
+/// program directly, which JAX rejects for its `custom_vjp_call` primitive in exactly the same way.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CustomVjpOperation;
 
-impl CustomVjpOperation {
-    /// Creates a custom-VJP operation. The primal, forward, and backward [`Program`]s are supplied separately as
-    /// the operation's attached regions (via the region driver passed to [`Context::bind`]) in
-    /// the region order `["primal", "forward", "backward"]`; [`Operation::infer_output_types`] validates that the
-    /// forward interface consumes the primal inputs and produces the primal outputs followed by the residuals, and
-    /// that the backward interface consumes those residuals followed by one cotangent per primal output and
-    /// produces one cotangent per primal input.
-    #[inline]
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for CustomVjpOperation {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Display for CustomVjpOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("custom_vjp")
+        formatter.write_str(CUSTOM_VJP_OPERATION_NAME)
     }
 }
 
 /// Validates the custom-VJP contract over the three attached region interfaces
 /// (`["primal", "forward", "backward"]` region order) and returns the primal interface; refer to the documentation of
-/// [`CustomVjpOperation::new`] for the contract.
+/// [`CustomVjpOperation`] for the contract.
 fn validated_custom_vjp_interfaces<T: DifferentiableType>(
     region_interfaces: &[RegionInterface<T>],
 ) -> Result<&RegionInterface<T>, TypeError> {
@@ -392,7 +377,7 @@ fn validated_custom_vjp_interfaces<T: DifferentiableType>(
 impl<T: DifferentiableType> Operation<T> for CustomVjpOperation {
     #[inline]
     fn name(&self) -> &'static str {
-        "custom_vjp"
+        CUSTOM_VJP_OPERATION_NAME
     }
 
     #[inline]
@@ -488,7 +473,7 @@ where
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
             None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
             Some(_) => Ok((
-                O::from(CustomVjpOperation::new()),
+                O::from(CustomVjpOperation),
                 vec![
                     batch_rewrapped_program(context, driver, 0)?,
                     batch_rewrapped_program(context, driver, 1)?,
@@ -505,15 +490,14 @@ where
 /// Unlike [`CustomJvpOperation`], a `custom_vjp` function has no forward tangent program, so the forward cannot
 /// compute the output tangents straight-line. Instead it reproduces — under the capture-free direct-transpose path —
 /// the same structure the capture-based reverse rule builds: the forward program (already an ordinary primal-enum
-/// program mapping `inputs -> (outputs..., residuals...)`) is replayed through
-/// [`Program::interpret_in_context`](crate::Program::interpret_in_context) over the dual
-/// primals, recovering the primal outputs and the residuals; then one [`LinearCallOperation`] is staged over
-/// `[input_tangents..., residuals...]` with the residuals as ordinary *operands* (not capture factors). That carrier
-/// is opaque: it stands for the unknown tangent map and rejects interpretation, so a forward-mode use through it
-/// fails with the canonical reverse-only error, while [`LinearCallOperation`]'s transpose rule replays the user's `backward`
+/// program mapping `inputs -> (outputs..., residuals...)`) is replayed through [`Program::interpret_in_context`] over
+/// the dual primals, recovering the primal outputs and the residuals; then one [`LinearCallOperation`] is staged over
+/// `[residuals..., input_tangents...]` with the residuals as ordinary *operands* (not capture factors). That carrier
+/// is opaque: it stands for the unknown tangent map and rejects interpretation, so a forward-mode use through it fails
+/// with the canonical reverse-only error, while [`LinearCallOperation`]'s transpose rule replays the user's `backward`
 /// program to produce the input cotangents. Because the residuals flow as operand edges and the carrier is a leaf
-/// primal-enum operation, the rule introduces no symbolic capture and needs no
-/// nested differentiation or linearization request.
+/// primal-enum operation, the rule introduces no symbolic capture and needs no nested differentiation or linearization
+/// request.
 impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation
 where
     C::Type: DifferentiableType,
@@ -550,7 +534,7 @@ where
         let input_tangent_types = inputs.iter().map(|input| input.primal().r#type().tangent()).collect::<Vec<_>>();
         let output_tangent_types = primal_outputs.iter().map(|output| output.r#type().tangent()).collect::<Vec<_>>();
 
-        // Stage one opaque carrier over `[input_tangents..., residuals...]`, producing the output tangents. The
+        // Stage one opaque carrier over `[residuals..., input_tangents...]`, producing the output tangents. The
         // carrier rejects forward interpretation and transposes by replaying the user's backward region.
         // The transpose-only carrier takes its residuals first, followed by every input tangent as a real operand,
         // so materialize structural zeros.
@@ -573,40 +557,15 @@ where
     }
 }
 
-crate::impl_non_transposable_operation!(CustomVjpOperation);
+// Rejecting transposition is correct: the `jvp` rule above replaces this operation with a transpose-only
+// `LinearCallOperation` carrier, so a linearized tangent program never contains this operation and its transpose entry
+// point is unreachable through reverse mode. Only a direct transpose of a raw, un-linearized program can reach it.
+impl_non_transposable_operation!(CustomVjpOperation);
 
-/// Function with a user-supplied JVP rule — the ergonomic analogue of JAX's
-/// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
-/// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair, built by
-/// [`custom_jvp`].
-///
-/// # When to use
-///
-/// Reach for a custom JVP when the function *is* forward-differentiable but its automatically derived tangent is
-/// numerically unstable or wasteful and you want to supply a stable, efficient one by hand — classic cases are a
-/// `log`-`sum`-`exp`, a softmax, or a normalization, where a hand-written tangent avoids the cancellation or
-/// redundant work the generic rule incurs. A single custom JVP serves **both** differentiation modes: reverse mode
-/// obtains its gradient by transposing the supplied tangent map, so the one rule composes with forward mode, reverse
-/// mode, and their higher-order combinations. Prefer it over [`CustomVjp`] whenever the function is naturally
-/// forward-differentiable, and reach for [`CustomVjp`] only when just the reverse rule is natural (for example
-/// implicit differentiation or adjoint solvers).
-///
-/// The primal function and its JVP rule are stored as plain closures over [`Parameterized`] trees of
-/// [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so inputs and outputs can be single tracers, tuples, or
-/// any other parameterized structure. Nothing is traced at construction time: each [`call`](Self::call) reads the
-/// input types off its tracer arguments, traces both closures into programs specialized to those types, validates
-/// the rule signature, and stages one [`CustomJvpOperation`] into the caller's staging context — mirroring how JAX
-/// traces rule functions into jaxprs lazily at transform time. `primal` maps the input tree to the output tree, and
-/// `jvp` maps `(inputs, input_tangents)` to `(outputs, output_tangents)`, exactly like a JAX `defjvp` rule.
-///
-/// The primal closure is kept separate from the JVP closure for efficiency rather than necessity: the JVP rule
-/// computes both the outputs and their tangents, so deriving the primal from it would make every un-differentiated
-/// call pay for tangent computation. Interpretation, batching, and backend lowering replay the lean primal program;
-/// the JVP program runs only under differentiation.
-///
-/// There is no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static, non-differentiated
-/// configuration is simply captured by the closures (all of them can see it), exactly like JAX threads
-/// non-differentiated arguments through to the rule functions.
+/// Function with a user-supplied JVP rule, built by [`custom_jvp`]. It stores the primal and JVP closures together
+/// with a phantom marker pinning the [`Domain`] and the tracer-tree types named by those closure signatures; refer to
+/// the documentation of [`custom_jvp`] for the calling convention, the tracing semantics, and when to reach for a
+/// custom JVP.
 pub struct CustomJvp<D: Domain, P, J, IT, OT> {
     /// Closure computing the primal output tree from the primal input tree.
     primal: P,
@@ -620,7 +579,39 @@ pub struct CustomJvp<D: Domain, P, J, IT, OT> {
 }
 
 /// Creates a [`CustomJvp`] function from a primal closure and a JVP-rule closure over trees of the [`Domain`] `D`'s
-/// tracers. Refer to the documentation of [`CustomJvp`] for the calling convention and tracing semantics.
+/// tracers — the ergonomic analogue of JAX's
+/// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
+/// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
+///
+/// # When to use
+///
+/// Reach for a custom JVP when the function *is* forward-differentiable but its automatically derived tangent is
+/// numerically unstable or wasteful and you want to supply a stable, efficient one by hand — classic cases are a
+/// `log`-`sum`-`exp`, a softmax, or a normalization, where a hand-written tangent avoids the cancellation or redundant
+/// work the generic rule incurs. A single custom JVP serves **both** differentiation modes: reverse mode obtains its
+/// gradient by transposing the supplied tangent map, so the one rule composes with forward mode, reverse mode, and
+/// their higher-order combinations. Prefer it over [`custom_vjp`] whenever the function is naturally
+/// forward-differentiable, and reach for [`custom_vjp`] only when just the reverse rule is natural (for example
+/// implicit differentiation or adjoint solvers).
+///
+/// # Calling convention
+///
+/// Both closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
+/// inputs and outputs can be single tracers, tuples, or any other parameterized structure. `primal` maps the input
+/// tree to the output tree, and `jvp` maps `(inputs, input_tangents)` to `(outputs, output_tangents)`, exactly like a
+/// JAX `defjvp` rule. There is no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static,
+/// non-differentiated configuration is simply captured by the closures (all of them can see it), exactly like JAX
+/// threads non-differentiated arguments through to the rule functions.
+///
+/// # Tracing semantics
+///
+/// Nothing is traced at construction time: each [`CustomJvp::call`] reads the input types off its tracer arguments,
+/// traces both closures into programs specialized to those types, validates the rule signature, and stages one
+/// [`CustomJvpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
+/// lazily at transform time. The primal closure is kept separate from the JVP closure for efficiency rather than
+/// necessity: the JVP rule computes both the outputs and their tangents, so deriving the primal from it would make
+/// every un-differentiated call pay for tangent computation. Interpretation, batching, and backend lowering replay the
+/// lean primal program, and the JVP program runs only under differentiation.
 pub fn custom_jvp<D, P, J, IT, OT>(primal: P, jvp: J) -> CustomJvp<D, P, J, IT, OT>
 where
     D: Domain<Type: DifferentiableType>,
@@ -676,7 +667,7 @@ where
         let input_tangent_types =
             input_types.clone().map_parameters(|r#type| r#type.tangent()).map_err(ProgramError::from)?;
         let (output_types, jvp) = D::trace(|(x, t)| (self.jvp)(x, t), (input_types, input_tangent_types))?;
-        let operation = D::Operation::from(CustomJvpOperation::new());
+        let operation = D::Operation::from(CustomJvpOperation);
         // The call binds through whatever context the input values flow (a staged trace, a batching context, or a
         // JVP context), so `custom_jvp` composes under `vmap`/`jvp` — the batch/JVP rule of the bound operation fires.
         let context = first.dispatch_domain();
@@ -686,10 +677,29 @@ where
     }
 }
 
-/// Function with user-supplied forward/backward (VJP) rules — the ergonomic analogue of JAX's
+/// Function with user-supplied forward/backward (VJP) rules, built by [`custom_vjp`]. It stores the primal, forward,
+/// and backward closures together with a phantom marker pinning the [`Domain`] and the tracer-tree types named by those
+/// closure signatures; refer to the documentation of [`custom_vjp`] for the calling convention, the tracing semantics,
+/// and when to reach for a custom VJP.
+pub struct CustomVjp<D: Domain, P, F, B, IT, OT, RT> {
+    /// Closure computing the primal output tree from the primal input tree.
+    primal: P,
+
+    /// Closure computing `(outputs, residuals)` from the primal input tree.
+    forward: F,
+
+    /// Closure computing the input cotangent tree from `(residuals, output_cotangents)`.
+    backward: B,
+
+    /// Phantom marker pinning the [`Domain`] and the input, output, and residual tracer-tree types named by the
+    /// closure signatures. The domain is a pure type witness, so no domain value is stored.
+    marker: PhantomData<fn() -> (D, IT, OT, RT)>,
+}
+
+/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over trees of the [`Domain`] `D`'s
+/// tracers — the ergonomic analogue of JAX's
 /// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
-/// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair, built by
-/// [`custom_vjp`].
+/// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair.
 ///
 /// # When to use
 ///
@@ -708,45 +718,29 @@ where
 /// A custom VJP is reverse-mode only: forward-mode differentiation of a staged call is rejected, and the current
 /// transpose implementation also rejects transposing its generated pullback, so higher-order derivatives through a
 /// custom VJP are not yet supported. When the function is forward-differentiable or must participate in higher-order
-/// differentiation, use [`CustomJvp`] instead.
+/// differentiation, use [`custom_jvp`] instead.
 ///
-/// The primal function and its forward/backward rules are stored as plain closures over [`Parameterized`] trees of
-/// [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so inputs, outputs, and residuals can be single tracers,
-/// tuples, or any other parameterized structure. Nothing is traced at construction time: each [`call`](Self::call)
-/// reads the input types off its tracer arguments, traces the closures into programs specialized to those types,
-/// validates the rule signatures, and stages one [`CustomVjpOperation`] into the caller's staging context —
-/// mirroring how JAX traces rule functions into jaxprs lazily at transform time. `primal` maps the input tree to
-/// the output tree, `forward` maps the input tree to `(outputs, residuals)` (the same structural split as a JAX
-/// `f_fwd`), and `backward` maps `(residuals, output_cotangents)` to the input cotangent tree. As in JAX, the
-/// resulting function supports reverse mode only; forward-mode differentiation of a staged call is rejected.
+/// # Calling convention
 ///
-/// The primal closure is kept separate from the forward closure for efficiency rather than necessity: an
-/// un-differentiated call should not pay for residual computation. Interpretation, batching, and backend lowering
-/// replay the lean primal program; the residual-producing forward program runs only under reverse-mode
-/// differentiation. Callers that do not care about the distinction can pass the same body for both — accepting that
-/// the residual outputs are dead code outside of differentiation — which mirrors the common JAX idiom of writing
-/// `f_fwd` as `return f(x), residuals`.
-///
-/// There is no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static, non-differentiated
+/// All three closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
+/// inputs, outputs, and residuals can be single tracers, tuples, or any other parameterized structure. `primal` maps
+/// the input tree to the output tree, `forward` maps the input tree to `(outputs, residuals)` (the same structural
+/// split as a JAX `f_fwd`), and `backward` maps `(residuals, output_cotangents)` to the input cotangent tree. There is
+/// no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static, non-differentiated
 /// configuration is simply captured by the closures (all of them can see it), exactly like JAX threads
 /// non-differentiated arguments through to the rule functions.
-pub struct CustomVjp<D: Domain, P, F, B, IT, OT, RT> {
-    /// Closure computing the primal output tree from the primal input tree.
-    primal: P,
-
-    /// Closure computing `(outputs, residuals)` from the primal input tree.
-    forward: F,
-
-    /// Closure computing the input cotangent tree from `(residuals, output_cotangents)`.
-    backward: B,
-
-    /// Phantom marker pinning the [`Domain`] and the input, output, and residual tracer-tree types named by the
-    /// closure signatures. The domain is a pure type witness, so no domain value is stored.
-    marker: PhantomData<fn() -> (D, IT, OT, RT)>,
-}
-
-/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over trees of the [`Domain`] `D`'s
-/// tracers. Refer to the documentation of [`CustomVjp`] for the calling convention and tracing semantics.
+///
+/// # Tracing semantics
+///
+/// Nothing is traced at construction time: each [`CustomVjp::call`] reads the input types off its tracer arguments,
+/// traces the closures into programs specialized to those types, validates the rule signatures, and stages one
+/// [`CustomVjpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
+/// lazily at transform time. The primal closure is kept separate from the forward closure for efficiency rather than
+/// necessity: an un-differentiated call should not pay for residual computation. Interpretation, batching, and backend
+/// lowering replay the lean primal program, and the residual-producing forward program runs only under reverse-mode
+/// differentiation. Callers that do not care about the distinction can pass the same body for both — accepting that the
+/// residual outputs are dead code outside of differentiation — which mirrors the common JAX idiom of writing `f_fwd` as
+/// `return f(x), residuals`.
 pub fn custom_vjp<D, P, F, B, IT, OT, RT>(primal: P, forward: F, backward: B) -> CustomVjp<D, P, F, B, IT, OT, RT>
 where
     D: Domain<Type: DifferentiableType>,
@@ -813,7 +807,7 @@ where
             |(residuals, cotangents)| (self.backward)(residuals, cotangents),
             (residual_types, output_cotangent_types),
         )?;
-        let operation = D::Operation::from(CustomVjpOperation::new());
+        let operation = D::Operation::from(CustomVjpOperation);
         // Bind through whatever context the inputs flow, so `custom_vjp` composes under `vmap`/`jvp`.
         let context = first.dispatch_domain();
         let outputs = context.bind(
@@ -904,17 +898,14 @@ mod tests {
     fn custom_jvp_sin(
         r#type: &ArrayType,
     ) -> (ArrayOperation<Array>, Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>) {
-        (
-            ArrayOperation::CustomJvp(CustomJvpOperation::new()),
-            vec![sin_program(r#type), doubled_sin_jvp_program(r#type)],
-        )
+        (ArrayOperation::CustomJvp(CustomJvpOperation), vec![sin_program(r#type), doubled_sin_jvp_program(r#type)])
     }
 
     fn custom_vjp_sin(
         r#type: &ArrayType,
     ) -> (ArrayOperation<Array>, Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>) {
         (
-            ArrayOperation::CustomVjp(CustomVjpOperation::new()),
+            ArrayOperation::CustomVjp(CustomVjpOperation),
             vec![sin_program(r#type), sin_forward_program(r#type), tripled_sin_backward_program(r#type)],
         )
     }
@@ -929,11 +920,11 @@ mod tests {
     #[test]
     fn test_custom_jvp_inference_validates_the_rule_signature() {
         let scalar = test_type(&[]);
-        assert_eq!(Operation::<ArrayType>::region_role(&CustomJvpOperation::new(), 0), Some(RegionRole::Computation),);
-        assert_eq!(Operation::<ArrayType>::region_role(&CustomJvpOperation::new(), 1), Some(RegionRole::Rule));
+        assert_eq!(Operation::<ArrayType>::region_role(&CustomJvpOperation, 0), Some(RegionRole::Computation),);
+        assert_eq!(Operation::<ArrayType>::region_role(&CustomJvpOperation, 1), Some(RegionRole::Rule));
         // The JVP interface must take `(inputs..., tangents...)`; a primal-only signature is rejected.
         assert!(
-            CustomJvpOperation::new()
+            CustomJvpOperation
                 .infer_output_types(
                     std::slice::from_ref(&scalar),
                     &[custom_region_interface(&sin_program(&scalar)), custom_region_interface(&sin_program(&scalar))],
@@ -945,13 +936,13 @@ mod tests {
     #[test]
     fn test_custom_vjp_inference_validates_the_rule_signatures() {
         let scalar = test_type(&[]);
-        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation::new(), 0), Some(RegionRole::Computation));
-        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation::new(), 1), Some(RegionRole::Rule));
-        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation::new(), 2), Some(RegionRole::Rule));
+        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation, 0), Some(RegionRole::Computation));
+        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation, 1), Some(RegionRole::Rule));
+        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation, 2), Some(RegionRole::Rule));
         // The backward interface must consume `(residuals..., output cotangents...)`; a single-input program whose
         // signature cannot line up with the forward residuals is rejected.
         assert!(
-            CustomVjpOperation::new()
+            CustomVjpOperation
                 .infer_output_types(
                     std::slice::from_ref(&scalar),
                     &[
@@ -977,7 +968,7 @@ mod tests {
             Effects::PURE,
         );
         assert_eq!(
-            CustomJvpOperation::new()
+            CustomJvpOperation
                 .infer_output_types(std::slice::from_ref(&primal_type), &[primal_interface.clone(), jvp_interface],),
             Ok(vec![primal_type.clone()]),
         );
@@ -993,7 +984,7 @@ mod tests {
             Effects::PURE,
         );
         assert_eq!(
-            CustomVjpOperation::new().infer_output_types(
+            CustomVjpOperation.infer_output_types(
                 std::slice::from_ref(&primal_type),
                 &[primal_interface, forward_interface, backward_interface.clone()],
             ),
@@ -1171,7 +1162,7 @@ mod tests {
         let (primal, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .jvp(
                 |x| {
-                    let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
+                    let operation = ScalarOperation::CustomJvp(CustomJvpOperation);
                     let operation_regions = vec![scalar_sin_program(), scalar_doubled_sin_jvp_program()];
                     Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
                 },
@@ -1186,7 +1177,7 @@ mod tests {
 
     #[test]
     fn test_linearization_rejects_known_custom_jvp_tangents() {
-        let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
+        let operation = ScalarOperation::CustomJvp(CustomJvpOperation);
         let operation_regions = || vec![scalar_sin_program(), scalar_known_tangent_jvp_program()];
         let expected = "linearization produced a known tangent output; differentiation rules must represent \
                         input-independent zero tangents structurally";
@@ -1227,7 +1218,7 @@ mod tests {
         let (value, gradient) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .value_and_gradient(
                 |x| {
-                    let operation = ScalarOperation::CustomVjp(CustomVjpOperation::new());
+                    let operation = ScalarOperation::CustomVjp(CustomVjpOperation);
                     let operation_regions =
                         vec![scalar_sin_program(), scalar_sin_forward_program(), scalar_tripled_sin_backward_program()];
                     x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
@@ -1362,7 +1353,7 @@ mod tests {
     fn test_custom_jvp_wrapper_surfaces_rule_signature_mismatches() {
         // Arity mismatches are compile-time errors under the structured signatures, but shape mismatches remain
         // runtime concerns: this rule produces a scalar tangent for a vector-valued function, so the traced JVP
-        // program fails the signature validation that `CustomJvpOperation::new` performs at the call site.
+        // program fails the signature validation that `CustomJvpOperation` performs at the call site.
         let function = custom_jvp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, dx| {

@@ -1924,8 +1924,19 @@ The first P8a prerequisite slice is complete. `SelectOperation<T>`, `StopGradien
 arguments, and only their intended scalar/array instantiations implement `Operation`. Select's mathematical transform
 rules remain one shared declaration, stop-gradient uses the generic transform generators, and all core, composite, and
 XLA callers select the concrete contract through inference or an explicit family field type. Verification passed the
-complete `ryft-core` library suite (1,108 tests) plus `ryft-core` and `ryft-xla` test-target checks. The remaining
-type-polymorphic payload migration and compile-fail gate stay pending as separate review units.
+complete `ryft-core` library suite (1,108 tests) plus `ryft-core` and `ryft-xla` test-target checks. Later prerequisite
+slices and the compile-fail gate stay pending as separate review units.
+
+The second P8a prerequisite slice is complete. `OneLikeOperation<T>`, `ZeroLikeOperation<T>`, `PrintOperation<T>`,
+`TagOperation<T>`, and `ConvertElementTypeOperation<T>` now make their type universe nominal, retain inferred
+constructors, and implement only the matching `Operation<T>` contract. One-like, zero-like, print, and tag continue to
+share one declarative differentiation/transposition rule through the extended generic elementwise forms; conversion
+retains its specialized derivative behavior under explicit type-equality bounds. Scalar and array conversion inference
+remain covered by separate explicitly typed payloads. The region/call payloads, genuinely mixed dual-contract payloads,
+and compile-fail gate remain separate review units. Verification passed all 1,107 `ryft-core` library tests and the
+`ryft-core` and `ryft-xla` test-target checks before the subsequent region/call edits began in the shared checkout. A
+clean isolated snapshot against the advanced HEAD then revalidated all 1,107 core tests plus both macro integration and
+trybuild suites for the exact leaf diff.
 
 ### Phase 8: enforce contracts and consolidate operation declarations
 
@@ -1936,8 +1947,10 @@ type-polymorphic payload migration and compile-fail gate stay pending as separat
 - [x] Parameterize `SelectOperation`, `StopGradientOperation`, and `TestNullaryOperation` by their operation type as
       the first isolated prerequisite. Each concrete payload instantiation now has exactly one contract, without a
       compatibility alias or default type argument.
-- [ ] Apply the proven pattern to the inventory's remaining type-polymorphic payloads before adding `Operation::Type`.
-      Each concrete payload instantiation must have exactly one contract.
+- [x] Apply the proven pattern to the type-polymorphic leaf payloads (`OneLike`, `ZeroLike`, `Print`, `Tag`, and
+      conversion), retaining constructor inference and one shared transform rule per semantic operation.
+- [ ] Apply the proven pattern to the remaining region/call and genuinely mixed dual-contract payloads before adding
+      `Operation::Type`. Each concrete payload instantiation must have exactly one contract.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
       `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
       `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and
