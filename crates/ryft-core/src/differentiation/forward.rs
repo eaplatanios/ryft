@@ -2248,7 +2248,7 @@ mod tests {
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::F64(2.0));
         let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![input, constant]).unwrap()[0];
-        let severed = builder.add_instruction(StopGradientOperation, Vec::new(), vec![scaled]).unwrap()[0];
+        let severed = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![scaled]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![scaled, constant, severed], vec![Placeholder], vec![Placeholder; 3])
             .unwrap();

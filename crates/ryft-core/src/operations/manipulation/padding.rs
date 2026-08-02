@@ -400,7 +400,7 @@ where
     O: Operation<ArrayType>
         + From<OneOperation<ArrayType>>
         + From<PadOperation>
-        + From<SelectOperation>
+        + From<SelectOperation<ArrayType>>
         + From<SliceOperation>
         + From<ReduceOperation>
         + From<ZeroOperation<ArrayType>>,
@@ -506,7 +506,7 @@ where
                     check_count!("output", mask, 1, ProgramError);
                     let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
                     let mut selected = context.stage_operation(
-                        SelectOperation,
+                        SelectOperation::<ArrayType>::new(),
                         Vec::new(),
                         &[mask.remove(0), cotangent.clone(), zero],
                     )?;

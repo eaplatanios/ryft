@@ -8617,7 +8617,8 @@ mod tests {
         let compare = builder
             .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![left, right])
             .unwrap()[0];
-        let select = builder.add_instruction(SelectOperation, Vec::new(), vec![condition, scalar, right]).unwrap()[0];
+        let select =
+            builder.add_instruction(SelectOperation::new(), Vec::new(), vec![condition, scalar, right]).unwrap()[0];
         let and = builder.add_instruction(AndOperation, Vec::new(), vec![condition, boolean_vector]).unwrap()[0];
         let or = builder.add_instruction(OrOperation, Vec::new(), vec![boolean_vector, condition]).unwrap()[0];
         let xor = builder.add_instruction(XorOperation, Vec::new(), vec![condition, boolean_vector]).unwrap()[0];

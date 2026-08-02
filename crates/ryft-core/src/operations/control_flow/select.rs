@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, StagingContext};
@@ -19,22 +20,37 @@ use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
 
+// TODO(eaplatanios): Review this.
+
 /// Canonical operation name for [`SelectOperation`].
 pub const SELECT_OPERATION_NAME: &str = "select";
 
 /// [`Operation`] that performs an elementwise selection between two values driven by a Boolean condition.
-/// Refer to the documentation of [`Select`] for more information.
-#[derive(Copy, Clone, Debug)]
-pub struct SelectOperation;
+///
+/// The `T` parameter fixes the operation's type universe at construction time. Consequently,
+/// `SelectOperation<DataType>` and `SelectOperation<ArrayType>` are distinct zero-sized payload types, and each payload
+/// implements exactly one [`Operation`] contract. Refer to the documentation of [`Select`] for more information.
+#[derive(Clone, Debug)]
+pub struct SelectOperation<T: Type>(PhantomData<fn() -> T>);
 
-impl Display for SelectOperation {
+impl<T: Type> Copy for SelectOperation<T> {}
+
+impl<T: Type> SelectOperation<T> {
+    /// Constructs a select operation for the `T` type universe.
+    #[inline]
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Type> Display for SelectOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(SELECT_OPERATION_NAME)
     }
 }
 
-impl Operation<DataType> for SelectOperation {
+impl Operation<DataType> for SelectOperation<DataType> {
     #[inline]
     fn name(&self) -> &'static str {
         SELECT_OPERATION_NAME
@@ -67,7 +83,7 @@ impl Operation<DataType> for SelectOperation {
     }
 }
 
-impl Operation<ArrayType> for SelectOperation {
+impl Operation<ArrayType> for SelectOperation<ArrayType> {
     #[inline]
     fn name(&self) -> &'static str {
         SELECT_OPERATION_NAME
@@ -97,7 +113,7 @@ impl Operation<ArrayType> for SelectOperation {
 // broadcast of all three operand shapes and the output `DataType` is the promotion of the two branch data types.
 // Implementing `ElementwiseOperation` also gives `select` the standard elementwise batching rule through its blanket
 // `BatchableOperation` implementation.
-impl ElementwiseOperation for SelectOperation {
+impl ElementwiseOperation for SelectOperation<ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         3
@@ -124,7 +140,7 @@ impl ElementwiseOperation for SelectOperation {
     }
 }
 
-impl<C: Domain<Value: Select>> InterpretableOperation<C> for SelectOperation
+impl<T: Type, C: Domain<Type = T, Value: Select>> InterpretableOperation<C> for SelectOperation<T>
 where
     Self: Operation<C::Type>,
 {
@@ -144,16 +160,34 @@ where
     }
 }
 
-impl<C: Context<Operation: From<SelectOperation>>> PartiallyEvaluatableOperation<C> for SelectOperation {}
+impl<T: Type, C: Context<Type = T, Operation: From<SelectOperation<T>>>> PartiallyEvaluatableOperation<C>
+    for SelectOperation<T>
+where
+    Self: Operation<T>,
+{
+}
 
-impl_differentiable_operation! {
-    SelectOperation,
+macro_rules! impl_select_differentiation {
+    // This branch attaches one shared rule declaration to both concrete select operation contracts.
+    ($($rules:tt)*) => {
+        impl_differentiable_operation! {
+            SelectOperation<DataType>,
+            $($rules)*
+        }
+        impl_differentiable_operation! {
+            SelectOperation<ArrayType>,
+            $($rules)*
+        }
+    };
+}
+
+impl_select_differentiation! {
     jvp<C>
     where
         C: Zero<C::Value>,
         C::Type: DifferentiableType,
         C::Value: ElementwiseDerivativeAlignment<C::Type>,
-        C::Operation: From<SelectOperation>,
+        C::Operation: From<SelectOperation<C::Type>>,
     {
         |_operation, context, _driver, inputs| {
             // Forward-mode differentiation rule for `SelectOperation`. The primal output is `select(condition, on_true,
@@ -166,7 +200,7 @@ impl_differentiable_operation! {
             let on_true = &inputs[1];
             let on_false = &inputs[2];
             let mut primal = context.bind(
-                SelectOperation,
+                SelectOperation::new(),
                 Vec::new(),
                 &[condition.primal().clone(), on_true.primal().clone(), on_false.primal().clone()],
             )?;
@@ -179,7 +213,7 @@ impl_differentiable_operation! {
                 let on_true_tangent = on_true.tangent().clone().materialize(context)?;
                 let on_false_tangent = on_false.tangent().clone().materialize(context)?;
                 let mut tangents = context.bind(
-                    SelectOperation,
+                    SelectOperation::new(),
                     Vec::new(),
                     &[condition.primal().clone(), on_true_tangent, on_false_tangent],
                 )?;
@@ -193,7 +227,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V::Type: DifferentiableType,
-        O: From<ZeroLikeOperation> + ZeroOperationProvider<V::Type> + From<SelectOperation>,
+        O: From<ZeroLikeOperation> + ZeroOperationProvider<V::Type> + From<SelectOperation<V::Type>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, context, _driver, inputs, outputs| {
@@ -238,13 +272,13 @@ impl_differentiable_operation! {
                         MaybeZero::Zero(cotangent_type).materialize(context)?
                     };
                     let on_true = context.stage_operation(
-                        SelectOperation,
+                        SelectOperation::new(),
                         Vec::new(),
                         &[condition.clone(), cotangent.clone(), zero.clone()],
                     )?;
                     check_count!("output", on_true, 1, ProgramError);
                     let on_false = context.stage_operation(
-                        SelectOperation,
+                        SelectOperation::new(),
                         Vec::new(),
                         &[condition, zero, cotangent.clone()],
                     )?;
@@ -307,15 +341,18 @@ pub trait Select: Sized {
 
 // Any context-carrying value selects by binding a [`SelectOperation`] through its own context. A staged tracer records
 // the operation, a batching tracer selects the packed values under the common batch axis, and a differentiation dual
-// selects the primals and (linearly) the tangents by the same condition. The `From<SelectOperation>` bound makes this
-// blanket disjoint from the concrete eager value types (whose context operation is `ConstantOperation`), which
-// implement `Select` directly.
-impl<V: Value<DispatchDomain: Context<Operation: From<SelectOperation>>>> Select for V {
+// selects the primals and (linearly) the tangents by the same condition. The `From<SelectOperation<V::Type>>` bound
+// makes this blanket disjoint from the concrete eager value types (whose context operation is `ConstantOperation`),
+// which implement `Select` directly.
+impl<V: Value> Select for V
+where
+    V::DispatchDomain: Context<Operation: From<SelectOperation<V::Type>>>,
+{
     #[inline]
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         Ok(condition
             .dispatch_domain()
-            .bind(SelectOperation, Vec::new(), &[condition.clone(), on_true.clone(), on_false.clone()])?
+            .bind(SelectOperation::new(), Vec::new(), &[condition.clone(), on_true.clone(), on_false.clone()])?
             .remove(0))
     }
 }
@@ -342,16 +379,18 @@ mod tests {
 
     #[test]
     fn test_select() {
-        let operation = SelectOperation;
+        let scalar_operation = SelectOperation::<DataType>::new();
+        let array_operation = SelectOperation::<ArrayType>::new();
 
         // Check operation identity in both supported type universes.
-        assert_eq!(Operation::<ArrayType>::name(&operation), SELECT_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::name(&operation), SELECT_OPERATION_NAME);
-        assert_eq!(format!("{operation}"), SELECT_OPERATION_NAME);
+        assert_eq!(Operation::<DataType>::name(&scalar_operation), SELECT_OPERATION_NAME);
+        assert_eq!(Operation::<ArrayType>::name(&array_operation), SELECT_OPERATION_NAME);
+        assert_eq!(format!("{scalar_operation}"), SELECT_OPERATION_NAME);
+        assert_eq!(format!("{array_operation}"), SELECT_OPERATION_NAME);
 
         // Check Boolean-condition validation and branch promotion in the scalar type universe.
         check_operation_type_inference!(
-            operation = operation,
+            operation = scalar_operation,
             cases = [
                 {
                     input_types = [DataType::Boolean, DataType::F64, DataType::F64],
@@ -378,7 +417,7 @@ mod tests {
         let scalar_branch = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
         let scalar_condition = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(1)]));
         check_operation_type_inference!(
-            operation = operation,
+            operation = array_operation,
             cases = [
                 {
                     input_types = [condition_type.clone(), branch_type.clone(), branch_type.clone()],
@@ -442,7 +481,7 @@ mod tests {
 
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
-            operation = operation,
+            operation = scalar_operation,
             inputs = [Scalar::from(true), Scalar::from(2.0_f32), Scalar::from(3.0_f64)],
             expected = Scalar::from(2.0_f64),
         );
@@ -450,7 +489,7 @@ mod tests {
         // Check elementwise batching with mapped conditions and a replicated branch.
         check_operation_batching!(
             @exact,
-            operation = operation,
+            operation = array_operation,
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -507,7 +546,7 @@ mod tests {
         let branch_type = on_true.r#type().into_owned();
         check_operation_transposition!(
             @exact,
-            operation = SelectOperation,
+            operation = SelectOperation::<ArrayType>::new(),
             cases = [{
                 inputs = [
                     (@known, condition),

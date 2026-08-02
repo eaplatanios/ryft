@@ -1,17 +1,18 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_elementwise_operation};
+use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::types::{ArrayType, DataType};
 
@@ -20,23 +21,39 @@ use crate::types::{ArrayType, DataType};
 /// Canonical operation name for [`StopGradientOperation`].
 pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
 
-/// [`Operation`] that returns its input unchanged while severing gradient flow/propagation. Interpretation and backend
-/// lowering treat this operation as the identity function. Batching preserves its mapped axis and rebinds the barrier
-/// through the parent transform. The Jacobian-Vector Product (JVP) rule passes the primal through unchanged and
-/// replaces the tangent with a structural zero, so that no derivative flows through the marked value in either forward
-/// or reverse automatic differentiation. Because the rule stages only that zero tangent, `stop_gradient` can never
-/// appear on a linear operand in a valid tangent program, and its
+/// [`Operation`] that returns its input unchanged while severing gradient flow/propagation. The `T` parameter fixes
+/// the operation's type universe at construction time, so each zero-sized payload implements exactly one [`Operation`]
+/// contract. Interpretation and backend lowering treat this operation as the identity function. Batching preserves
+/// its mapped axis and rebinds the barrier through the parent transform. The Jacobian-Vector Product (JVP) rule passes
+/// the primal through unchanged and replaces the tangent with a structural zero, so that no derivative flows through
+/// the marked value in either forward or reverse automatic differentiation. Because the rule stages only that zero
+/// tangent, `stop_gradient` can never appear on a linear operand in a valid tangent program, and its
 /// [`TransposableOperation`](crate::TransposableOperation) implementation reports an error.
-#[derive(Clone, Debug, Default)]
-pub struct StopGradientOperation;
+#[derive(Clone, Debug)]
+pub struct StopGradientOperation<T: Type>(PhantomData<fn() -> T>);
 
-impl Display for StopGradientOperation {
+impl<T: Type> StopGradientOperation<T> {
+    /// Constructs a stop-gradient operation for the `T` type universe.
+    #[inline]
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Type> Default for StopGradientOperation<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Type> Display for StopGradientOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(STOP_GRADIENT_OPERATION_NAME)
     }
 }
 
-impl Operation<DataType> for StopGradientOperation {
+impl Operation<DataType> for StopGradientOperation<DataType> {
     #[inline]
     fn name(&self) -> &'static str {
         STOP_GRADIENT_OPERATION_NAME
@@ -53,7 +70,7 @@ impl Operation<DataType> for StopGradientOperation {
     }
 }
 
-impl Operation<ArrayType> for StopGradientOperation {
+impl Operation<ArrayType> for StopGradientOperation<ArrayType> {
     #[inline]
     fn name(&self) -> &'static str {
         STOP_GRADIENT_OPERATION_NAME
@@ -70,7 +87,7 @@ impl Operation<ArrayType> for StopGradientOperation {
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for StopGradientOperation
+impl<T: Type, C: Domain<Type = T>> InterpretableOperation<C> for StopGradientOperation<T>
 where
     Self: Operation<C::Type>,
 {
@@ -88,8 +105,10 @@ where
 
 /// Partial evaluation defers to the default fold-or-residualize behavior of
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context> PartiallyEvaluatableOperation<C> for StopGradientOperation where
-    C::Operation: From<StopGradientOperation>
+impl<T: Type, C: Context<Type = T>> PartiallyEvaluatableOperation<C> for StopGradientOperation<T>
+where
+    C::Operation: From<StopGradientOperation<T>>,
+    Self: Operation<T>,
 {
 }
 
@@ -98,9 +117,9 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for StopGradientOperation wher
 /// the packed value as an ordinary interpreted identity would clone that tracer and silently expose its tangent to an
 /// enclosing transform.
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for StopGradientOperation
+    for StopGradientOperation<ArrayType>
 where
-    C::Operation: From<StopGradientOperation>,
+    C::Operation: From<StopGradientOperation<ArrayType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -117,7 +136,8 @@ where
     }
 }
 
-impl_differentiable_elementwise_operation!(@non_differentiable StopGradientOperation);
+impl_non_differentiable_operation!(<T> StopGradientOperation<T> where T: Type);
+impl_non_transposable_operation!(<T> StopGradientOperation<T> where T: Type);
 
 /// Value-level gradient stopping capability. [`StopGradient`] fills the same role for [`StopGradientOperation`]
 /// that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
@@ -139,18 +159,18 @@ pub fn stop_gradient<V: Parameter + StopGradient, Values: Parameterized<V>>(mut 
 
 /// Any context-carrying value stops gradients by binding a [`StopGradientOperation`] through its own context: a
 /// staged tracer records the operation, while batching / JVP tracers apply their transform rules. The
-/// `From<StopGradientOperation>` bound makes this blanket disjoint from the concrete eager value types (whose context
-/// operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), which implement
+/// `From<StopGradientOperation<V::Type>>` bound makes this blanket disjoint from the concrete eager value types (whose
+/// context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), which implement
 /// [`StopGradient`] directly.
 impl<V: Value> StopGradient for V
 where
     V::DispatchDomain: Context,
-    <V::DispatchDomain as Domain>::Operation: From<StopGradientOperation>,
+    <V::DispatchDomain as Domain>::Operation: From<StopGradientOperation<V::Type>>,
 {
     #[inline]
     fn stop_gradient(&self) -> Self {
         self.dispatch_domain()
-            .bind(StopGradientOperation, Vec::new(), &[self.clone()])
+            .bind(StopGradientOperation::new(), Vec::new(), &[self.clone()])
             .expect("`stop_gradient` operation failed")
             .remove(0)
     }
@@ -182,11 +202,12 @@ mod tests {
 
     #[test]
     fn test_stop_gradient() {
-        let operation = StopGradientOperation;
+        let scalar_operation = StopGradientOperation::<DataType>::new();
+        let array_operation = StopGradientOperation::<ArrayType>::new();
 
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
+                &scalar_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Scalar::from(2.0)],
@@ -195,7 +216,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
+                &scalar_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Scalar::from(Complex::new(1.0f64, -2.0))],
@@ -204,7 +225,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
+                &array_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::scalar(2.0)],
@@ -258,11 +279,18 @@ mod tests {
         // Gradient stopping is the identity on every data type, including types the numeric operations reject.
         for input_type in [DataType::Token, DataType::Boolean, DataType::I32, DataType::C64] {
             check_operation_type_inference!(
-                @elementwise @unary,
-                operation = StopGradientOperation,
+                operation = StopGradientOperation::<DataType>::new(),
                 cases = [{
-                    input_data_types = [input_type],
-                    output_data_types = [input_type],
+                    input_types = [input_type],
+                    output_types = [input_type],
+                }],
+            );
+            let input_type = ArrayType::new(input_type, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+            check_operation_type_inference!(
+                operation = StopGradientOperation::<ArrayType>::new(),
+                cases = [{
+                    input_types = [input_type.clone()],
+                    output_types = [input_type],
                 }],
             );
         }
@@ -278,7 +306,7 @@ mod tests {
             )
             .unwrap();
         check_operation_type_inference!(
-            operation = StopGradientOperation,
+            operation = StopGradientOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [unreduced.clone()],
                 output_types = [unreduced],
@@ -293,7 +321,7 @@ mod tests {
             )
             .unwrap();
         check_operation_type_inference!(
-            operation = StopGradientOperation,
+            operation = StopGradientOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [reduced.clone()],
                 output_types = [reduced],
@@ -305,7 +333,7 @@ mod tests {
     fn test_stop_gradient_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = StopGradientOperation,
+            operation = StopGradientOperation::<ArrayType>::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
@@ -317,7 +345,7 @@ mod tests {
         // sees it. The blanket elementwise batching rule would interpret the operation as an identity and erase it.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(StopGradientOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let (batched, output_axes) = program
@@ -405,7 +433,7 @@ mod tests {
         // tangent output materializes as a canonical zero.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(StopGradientOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
@@ -425,14 +453,18 @@ mod tests {
 
     #[test]
     fn test_stop_gradient_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = StopGradientOperation, inputs = [2.0], expected = 2.0,);
+        check_operation_partial_evaluation!(
+            operation = StopGradientOperation::<DataType>::new(),
+            inputs = [2.0],
+            expected = 2.0,
+        );
     }
 
     #[test]
     fn test_stop_gradient_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = StopGradientOperation,
+            operation = StopGradientOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

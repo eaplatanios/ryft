@@ -521,9 +521,9 @@ mod tests {
         );
 
         // Check that program fields are rendered over multiple lines.
-        let mut builder = ProgramBuilder::<Scalar, StopGradientOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, StopGradientOperation<DataType>>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(StopGradientOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             std::fmt::from_fn(|formatter| {
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_operation() {
-        let operation = StopGradientOperation;
+        let operation = StopGradientOperation::<DataType>::new();
 
         // Check required inference and the default operation contract.
         assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
@@ -570,10 +570,7 @@ mod tests {
         assert_eq!(Operation::<DataType>::output_region_provenance(&operation, 0), Vec::new());
         assert!(!Operation::<DataType>::is_zero(&operation, 0));
         assert_eq!(Operation::<DataType>::effects(&operation), Effects::PURE);
-        assert!(matches!(
-            Operation::<DataType>::rename_type_identities(&operation, &TypeIdentityRenaming::new()),
-            Ok(StopGradientOperation),
-        ));
+        assert!(Operation::<DataType>::rename_type_identities(&operation, &TypeIdentityRenaming::new()).is_ok());
         assert_eq!(
             std::fmt::from_fn(|formatter| Operation::<DataType>::render(&operation, formatter, 0)).to_string(),
             "stop_gradient",

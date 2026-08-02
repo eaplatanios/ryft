@@ -5462,7 +5462,7 @@ in (%4)
         let input = builder.add_input(input_type.into());
         let output = builder
             .add_instruction(
-                ArrayProgramOperation::Array(ArrayOperation::StopGradient(StopGradientOperation)),
+                ArrayProgramOperation::Array(ArrayOperation::StopGradient(StopGradientOperation::new())),
                 Vec::new(),
                 vec![input],
             )

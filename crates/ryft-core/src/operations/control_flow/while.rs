@@ -947,7 +947,7 @@ where
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
         + From<ReduceOperation>
-        + From<SelectOperation>
+        + From<SelectOperation<ArrayType>>
         + From<AndOperation>
         + From<WhileOperation>,
 {
@@ -1237,7 +1237,7 @@ where
         + From<AddOperation>
         + From<LegacyBroadcastOperation>
         + From<DynamicUpdateSliceOperation>
-        + From<SelectOperation>
+        + From<SelectOperation<ArrayType>>
         + From<ReduceOperation>
         + From<AndOperation>,
 {
@@ -1268,7 +1268,7 @@ where
 
     #[inline]
     fn residual_stack_select() -> Self {
-        Self::from(SelectOperation)
+        Self::from(SelectOperation::<ArrayType>::new())
     }
 
     #[inline]

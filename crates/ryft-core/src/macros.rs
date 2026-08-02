@@ -2359,19 +2359,48 @@ macro_rules! impl_non_differentiable_operation {
 /// still implement [`TransposableOperation`](crate::TransposableOperation) at all is that transposition is driven
 /// through whole operation families. Ryft used to have a separate linear operation family type, but that resulted
 /// in overly complicated backend and operation implementations for very little benefit in practice, and so the two
-/// families were unified.
+/// families were unified. The optional leading generic list declares operation-specific type parameters, and an
+/// optional `where` clause can provide bounds needed to make the operation type well-formed.
 ///
 /// # Parameters
 ///
+///   - `$generic`: Optional operation-specific type parameters used by `$operation`.
 ///   - `$operation`: The operation type for which the implementation is generated.
+///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
 #[macro_export]
 macro_rules! impl_non_transposable_operation {
-    // This branch generates the standard unsupported-transposition diagnostic for the selected operation.
+    // This branch accepts a generic operation with additional well-formedness bounds.
+    (<$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
+        $crate::impl_non_transposable_operation!(@impl [$($generic),+] ($operation) { $($bounds)+ });
+    };
+
+    // This branch accepts a generic operation whose `Operation` implementation supplies all required bounds.
+    (<$($generic:ident),+> $operation:ty $(,)?) => {
+        $crate::impl_non_transposable_operation!(@impl [$($generic),+] ($operation) {});
+    };
+
+    // This branch accepts a non-generic operation with additional well-formedness bounds.
+    ($operation:ty where $($bounds:tt)+) => {
+        $crate::impl_non_transposable_operation!(@impl [] ($operation) { $($bounds)+ });
+    };
+
+    // This branch accepts the common non-generic operation form.
     ($operation:ty $(,)?) => {
-        impl<__T: $crate::Type, __V: $crate::Value<Type = __T>, __O: $crate::Operation<__T>>
+        $crate::impl_non_transposable_operation!(@impl [] ($operation) {});
+    };
+
+    // This internal helper generates the standard unsupported-transposition diagnostic.
+    (@impl [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
+        impl<
+            __T: $crate::Type,
+            __V: $crate::Value<Type = __T>,
+            __O: $crate::Operation<__T>
+            $(, $generic)*
+        >
             $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<__T>,
+            $($bounds)*
         {
             #[inline]
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
@@ -4554,17 +4583,24 @@ mod tests {
         method = apply_provided_binary_fallible,
     );
 
-    /// Nullary operation used to execute generated transposition and batching rules.
-    #[derive(Clone, Debug, Default)]
-    struct TestNullaryOperation;
+    /// Type-directed nullary operation used to execute generated transposition and batching rules.
+    #[derive(Clone, Debug)]
+    struct TestNullaryOperation<T: Type>(PhantomData<fn() -> T>);
 
-    impl Display for TestNullaryOperation {
+    impl<T: Type> TestNullaryOperation<T> {
+        /// Constructs a fixture operation for the `T` type universe.
+        fn new() -> Self {
+            Self(PhantomData)
+        }
+    }
+
+    impl<T: Type> Display for TestNullaryOperation<T> {
         fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("test_nullary")
         }
     }
 
-    impl Operation<DataType> for TestNullaryOperation {
+    impl Operation<DataType> for TestNullaryOperation<DataType> {
         fn name(&self) -> &'static str {
             "test_nullary"
         }
@@ -4579,7 +4615,7 @@ mod tests {
         }
     }
 
-    impl Operation<ArrayType> for TestNullaryOperation {
+    impl Operation<ArrayType> for TestNullaryOperation<ArrayType> {
         fn name(&self) -> &'static str {
             "test_nullary"
         }
@@ -4594,10 +4630,10 @@ mod tests {
         }
     }
 
-    impl InterpretableOperation<EagerContext<Array, TestNullaryOperation>> for TestNullaryOperation {
-        fn interpret<D: crate::InterpretationDriver<EagerContext<Array, TestNullaryOperation>>>(
+    impl InterpretableOperation<EagerContext<Array, TestNullaryOperation<ArrayType>>> for TestNullaryOperation<ArrayType> {
+        fn interpret<D: crate::InterpretationDriver<EagerContext<Array, TestNullaryOperation<ArrayType>>>>(
             &self,
-            _context: &EagerContext<Array, TestNullaryOperation>,
+            _context: &EagerContext<Array, TestNullaryOperation<ArrayType>>,
             _driver: &D,
             inputs: &[Array],
         ) -> Result<Vec<Array>, ProgramError> {
@@ -4606,8 +4642,8 @@ mod tests {
         }
     }
 
-    impl_nullary_transposable_operation!(TestNullaryOperation);
-    impl_nullary_batchable_operation!(@replicated TestNullaryOperation);
+    impl_nullary_transposable_operation!(<T> TestNullaryOperation<T> where T: Type);
+    impl_nullary_batchable_operation!(@replicated <T> TestNullaryOperation<T> where T: Type);
 
     /// Nullary operation used to instantiate the non-generic `where` macro forms.
     #[derive(Clone, Debug, Default)]
@@ -5985,22 +6021,20 @@ mod tests {
 
     #[test]
     fn test_impl_nullary_transposable_operation() {
-        let mut context = TracingContext::<Scalar, TestNullaryOperation>::new();
-        let inputs: [PartialValue<Tracer<TracingContext<Scalar, TestNullaryOperation>>>; 0] = [];
+        let operation = TestNullaryOperation::<DataType>::new();
+        let mut context = TracingContext::<Scalar, TestNullaryOperation<DataType>>::new();
+        let inputs: [PartialValue<Tracer<TracingContext<Scalar, TestNullaryOperation<DataType>>>>; 0] = [];
         let outputs = [MaybeZero::Zero(DataType::F64), MaybeZero::Zero(DataType::F64)];
-        let result = <TestNullaryOperation as TransposableOperation<Scalar, TestNullaryOperation>>::transpose(
-            &TestNullaryOperation,
-            &mut context,
-            &EmptyRegionDriver,
-            &inputs,
-            &outputs,
-        )
+        let result = <TestNullaryOperation<DataType> as TransposableOperation<
+            Scalar,
+            TestNullaryOperation<DataType>,
+        >>::transpose(&operation, &mut context, &EmptyRegionDriver, &inputs, &outputs)
         .unwrap();
         assert!(result.is_empty());
         let input = context.input(DataType::F64);
         assert!(matches!(
-            <TestNullaryOperation as TransposableOperation<Scalar, TestNullaryOperation>>::transpose(
-                &TestNullaryOperation,
+            <TestNullaryOperation<DataType> as TransposableOperation<Scalar, TestNullaryOperation<DataType>>>::transpose(
+                &operation,
                 &mut context,
                 &EmptyRegionDriver,
                 &[PartialValue::Known(input)],
@@ -6009,8 +6043,8 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
         ));
         assert!(matches!(
-            <TestNullaryOperation as TransposableOperation<Scalar, TestNullaryOperation>>::transpose(
-                &TestNullaryOperation,
+            <TestNullaryOperation<DataType> as TransposableOperation<Scalar, TestNullaryOperation<DataType>>>::transpose(
+                &operation,
                 &mut context,
                 &EmptyRegionDriver,
                 &inputs,
@@ -6028,11 +6062,12 @@ mod tests {
 
     #[test]
     fn test_impl_nullary_batchable_operation() {
-        let context = BatchingContext::new(EagerContext::<Array, TestNullaryOperation>::new(), 2);
-        let outputs = <TestNullaryOperation as BatchableOperation<
-            EagerContext<Array, TestNullaryOperation>,
+        let operation = TestNullaryOperation::<ArrayType>::new();
+        let context = BatchingContext::new(EagerContext::<Array, TestNullaryOperation<ArrayType>>::new(), 2);
+        let outputs = <TestNullaryOperation<ArrayType> as BatchableOperation<
+            EagerContext<Array, TestNullaryOperation<ArrayType>>,
             ArrayBatching,
-        >>::batch(&TestNullaryOperation, &context, &EmptyRegionDriver, &[])
+        >>::batch(&operation, &context, &EmptyRegionDriver, &[])
         .unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].value(), &Array::scalar(3.0));
@@ -6040,14 +6075,11 @@ mod tests {
         assert!(outputs[0].batch_axis().is_replicated());
         assert!(outputs[1].batch_axis().is_replicated());
         assert!(matches!(
-            <TestNullaryOperation as BatchableOperation<
-                EagerContext<Array, TestNullaryOperation>,
+            <TestNullaryOperation<ArrayType> as BatchableOperation<
+                EagerContext<Array, TestNullaryOperation<ArrayType>>,
                 ArrayBatching,
             >>::batch(
-                &TestNullaryOperation,
-                &context,
-                &EmptyRegionDriver,
-                &[ArrayBatch::replicated(Array::scalar(1.0))],
+                &operation, &context, &EmptyRegionDriver, &[ArrayBatch::replicated(Array::scalar(1.0))],
             ),
             Err(crate::BatchingError::Program(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
         ));

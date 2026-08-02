@@ -5427,7 +5427,7 @@ mod tests {
         assert_eq!(read_booleans(&client, &compare[0]), vec![false, false, true, true]);
 
         let select = domain
-            .bind(SelectOperation, Vec::new(), &[boolean_scalar(&client, &mesh, true), scalar, vector])
+            .bind(SelectOperation::new(), Vec::new(), &[boolean_scalar(&client, &mesh, true), scalar, vector])
             .unwrap();
         assert_eq!(read_f64s(&client, &select[0]), vec![2.0, 2.0, 2.0, 2.0]);
 

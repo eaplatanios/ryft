@@ -1040,7 +1040,7 @@ where
     C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Select + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
-        From<LegacyBroadcastOperation> + From<SelectOperation> + From<TransposeOperation>,
+        From<LegacyBroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
     <C::Operation as OperationProjection<DimensionType>>::Projected: From<DimensionRequirementOperation>,
     D: BatchingDriver<C, ArrayProgramBatching>,
 {
@@ -1125,7 +1125,7 @@ where
                 let mut selected =
                     batch_projected_operation::<ArrayType, _, _, ArrayBatching<DynamicArrayBatchingPolicy>, _>(
                         context,
-                        &SelectOperation,
+                        &SelectOperation::<ArrayType>::new(),
                         &[predicate.clone(), true_output, false_output],
                     )?;
                 check_count!("output", selected, 1, ProgramError);
@@ -1880,7 +1880,7 @@ where
         + From<DimensionSizeOperation>
         + From<OneOperation<ArrayType>>
         + From<PadOperation>
-        + OperationProjection<ArrayType, Projected: From<SelectOperation> + From<ZeroOperation<ArrayType>>>,
+        + OperationProjection<ArrayType, Projected: From<SelectOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>,
 {
     fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
         &self,
@@ -2026,7 +2026,8 @@ where
         let mask = <C::Value as ValueProjection<ArrayType>>::into_projected(mask)?;
         let padded = <C::Value as ValueProjection<ArrayType>>::into_projected(padded)?;
         let broadcasted_padding = <C::Value as ValueProjection<ArrayType>>::into_projected(broadcasted_padding)?;
-        let mut output = array_context.bind(SelectOperation, Vec::new(), &[mask, padded, broadcasted_padding])?;
+        let mut output =
+            array_context.bind(SelectOperation::new(), Vec::new(), &[mask, padded, broadcasted_padding])?;
         check_count!("output", output, 1, ProgramError);
         Ok(vec![ArrayProgramBatch::new(
             <C::Value as ValueProjection<ArrayType>>::from_projected(output.remove(0)),
@@ -3016,7 +3017,7 @@ mod tests {
         let true_value = BatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(replicated));
         let [selected] = context
             .bind(
-                ArrayProgramOperation::Array(ArrayOperation::Select(SelectOperation)),
+                ArrayProgramOperation::Array(ArrayOperation::Select(SelectOperation::new())),
                 Vec::new(),
                 &[predicate, true_value, false_value],
             )?

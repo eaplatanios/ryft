@@ -1919,15 +1919,25 @@ in `.tasks/plan_p8a_operation_contract_inventory.md`. The next isolated code rev
 `SelectOperation`, `StopGradientOperation`, and the macro's `TestNullaryOperation` fixture before any associated-type
 trait change.
 
+The first P8a prerequisite slice is complete. `SelectOperation<T>`, `StopGradientOperation<T>`, and the test-only
+`TestNullaryOperation<T>` now encode their type universe in each zero-sized payload, without aliases or default type
+arguments, and only their intended scalar/array instantiations implement `Operation`. Select's mathematical transform
+rules remain one shared declaration, stop-gradient uses the generic transform generators, and all core, composite, and
+XLA callers select the concrete contract through inference or an explicit family field type. Verification passed the
+complete `ryft-core` library suite (1,108 tests) plus `ryft-core` and `ryft-xla` test-target checks. The remaining
+type-polymorphic payload migration and compile-fail gate stay pending as separate review units.
+
 ### Phase 8: enforce contracts and consolidate operation declarations
 
 - [x] Begin only after Phases 1 through 7 have removed implicit replay and overlapping mixed constructors. Capture the
       remaining dual/type-polymorphic payloads plus the implementor and bound inventory before changing the trait. The
       exact ledger, baseline, migration order, and abort criteria are recorded in
       `.tasks/plan_p8a_operation_contract_inventory.md` against `7da7d7f25`.
-- [ ] Parameterize `SelectOperation`, `StopGradientOperation`, and `TestNullaryOperation` by their operation type as
-      the first isolated prerequisite, then apply the proven pattern to the inventory's remaining type-polymorphic
-      payloads before adding `Operation::Type`. Each concrete payload instantiation must have exactly one contract.
+- [x] Parameterize `SelectOperation`, `StopGradientOperation`, and `TestNullaryOperation` by their operation type as
+      the first isolated prerequisite. Each concrete payload instantiation now has exactly one contract, without a
+      compatibility alias or default type argument.
+- [ ] Apply the proven pattern to the inventory's remaining type-polymorphic payloads before adding `Operation::Type`.
+      Each concrete payload instantiation must have exactly one contract.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
       `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
       `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and

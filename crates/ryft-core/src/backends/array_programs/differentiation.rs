@@ -102,7 +102,7 @@ where
 
     #[inline]
     fn residual_stack_select() -> Self {
-        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::Select(SelectOperation)))
+        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::Select(SelectOperation::new())))
     }
 
     #[inline]
@@ -403,7 +403,7 @@ where
                                 .remove(0);
                             let selected = transpose_context
                                 .bind(
-                                    ArrayProgramOperation::<A>::Array(ArrayOperation::from(SelectOperation)),
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::from(SelectOperation::new())),
                                     Vec::new(),
                                     &[mask, output_cotangent, output_zero],
                                 )?

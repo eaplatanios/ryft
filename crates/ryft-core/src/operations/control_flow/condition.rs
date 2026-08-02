@@ -852,7 +852,7 @@ where
     O: Operation<ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
-        + From<SelectOperation>
+        + From<SelectOperation<ArrayType>>
         + From<ConditionOperation<C::Constant>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
@@ -960,7 +960,7 @@ pub(crate) fn batch_condition_with_interpreter<C, P: ArrayBatchingPolicy<C>, F>(
 where
     C: Context<Type = ArrayType>,
     C::Value: LegacyBroadcast + Transpose + Select,
-    C::Operation: From<LegacyBroadcastOperation> + From<SelectOperation> + From<TransposeOperation>,
+    C::Operation: From<LegacyBroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
     F: FnMut(usize, Vec<ArrayBatch<C::Value>>) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>,
 {
     let true_outputs = batch_branch(0, operand_inputs.to_vec())?;
@@ -970,7 +970,7 @@ where
         .into_iter()
         .zip(false_outputs)
         .map(|(true_output, false_output)| -> Result<ArrayBatch<C::Value>, BatchingError> {
-            let mut selected = SelectOperation.batch(
+            let mut selected = SelectOperation::<ArrayType>::new().batch(
                 context,
                 &crate::EmptyRegionDriver,
                 &[predicate_batch.clone(), true_output, false_output],
