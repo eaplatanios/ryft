@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -16,17 +17,27 @@ pub const ZERO_LIKE_OPERATION_NAME: &str = "zero_like";
 
 /// [`Operation`] that has one exemplar input and that produces a single output that corresponds to the _zero_ value
 /// with the same [`Type`] as that input.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct ZeroLikeOperation;
+#[derive(Clone, Debug, Default)]
+pub struct ZeroLikeOperation<T: Type>(PhantomData<fn() -> T>);
 
-impl Display for ZeroLikeOperation {
+impl<T: Type> Copy for ZeroLikeOperation<T> {}
+
+impl<T: Type> ZeroLikeOperation<T> {
+    /// Constructs a zero-like operation for the `T` type universe.
+    #[inline]
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Type> Display for ZeroLikeOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(ZERO_LIKE_OPERATION_NAME)
     }
 }
 
-impl<T: Type> Operation<T> for ZeroLikeOperation {
+impl<T: Type> Operation<T> for ZeroLikeOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         ZERO_LIKE_OPERATION_NAME
@@ -48,14 +59,14 @@ impl<T: Type> Operation<T> for ZeroLikeOperation {
     }
 }
 
-impl ElementwiseOperation for ZeroLikeOperation {
+impl ElementwiseOperation for ZeroLikeOperation<crate::types::ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         1
     }
 }
 
-impl<C: Domain<Value: ZeroLike>> InterpretableOperation<C> for ZeroLikeOperation {
+impl<C: Domain<Value: ZeroLike>> InterpretableOperation<C> for ZeroLikeOperation<C::Type> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -68,9 +79,12 @@ impl<C: Domain<Value: ZeroLike>> InterpretableOperation<C> for ZeroLikeOperation
     }
 }
 
-impl<C: Context<Operation: From<ZeroLikeOperation>>> PartiallyEvaluatableOperation<C> for ZeroLikeOperation {}
+impl<C: Context<Operation: From<ZeroLikeOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
+    for ZeroLikeOperation<C::Type>
+{
+}
 
-impl_differentiable_elementwise_operation!(@constant ZeroLikeOperation);
+impl_differentiable_elementwise_operation!(@constant<T> ZeroLikeOperation<T>);
 
 /// Synthesizes a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart to [`Zero`](super::Zero).
 /// It is what [`ZeroLikeOperation`] needs for its [`InterpretableOperation`] implementation.
@@ -79,11 +93,11 @@ pub trait ZeroLike {
     fn zero_like(&self) -> Self;
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<ZeroLikeOperation>>>> ZeroLike for V {
+impl<V: Value<DispatchDomain: Context<Operation: From<ZeroLikeOperation<V::Type>>>>> ZeroLike for V {
     #[inline]
     fn zero_like(&self) -> Self {
         self.dispatch_domain()
-            .bind(ZeroLikeOperation, Vec::new(), &[self.clone()])
+            .bind(ZeroLikeOperation::new(), Vec::new(), &[self.clone()])
             .expect("`zero_like` operation failed")
             .remove(0)
     }
@@ -124,7 +138,7 @@ mod tests {
         }
 
         // Verify the operation's identity, zero metadata, rendering, and eager interpretation.
-        let operation = ZeroLikeOperation;
+        let operation = ZeroLikeOperation::<DataType>::new();
         assert!(Operation::<DataType>::is_zero(&operation, 0));
         assert!(!Operation::<DataType>::is_zero(&operation, 1));
         assert_eq!(format!("{operation}"), ZERO_LIKE_OPERATION_NAME);
@@ -139,7 +153,7 @@ mod tests {
         );
 
         // Verify the operation's textual form when it appears in a program.
-        let mut builder = ProgramBuilder::<Scalar, ZeroLikeOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, ZeroLikeOperation<DataType>>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();

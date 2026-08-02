@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -16,17 +17,27 @@ pub const ONE_LIKE_OPERATION_NAME: &str = "one_like";
 
 /// [`Operation`] that has one exemplar input and that produces a single output that corresponds to the _one_ value
 /// with the same [`Type`] as that input.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct OneLikeOperation;
+#[derive(Clone, Debug, Default)]
+pub struct OneLikeOperation<T: Type>(PhantomData<fn() -> T>);
 
-impl Display for OneLikeOperation {
+impl<T: Type> Copy for OneLikeOperation<T> {}
+
+impl<T: Type> OneLikeOperation<T> {
+    /// Constructs a one-like operation for the `T` type universe.
+    #[inline]
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Type> Display for OneLikeOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(ONE_LIKE_OPERATION_NAME)
     }
 }
 
-impl<T: Type> Operation<T> for OneLikeOperation {
+impl<T: Type> Operation<T> for OneLikeOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         ONE_LIKE_OPERATION_NAME
@@ -43,14 +54,14 @@ impl<T: Type> Operation<T> for OneLikeOperation {
     }
 }
 
-impl ElementwiseOperation for OneLikeOperation {
+impl ElementwiseOperation for OneLikeOperation<crate::types::ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         1
     }
 }
 
-impl<C: Domain<Value: OneLike>> InterpretableOperation<C> for OneLikeOperation {
+impl<C: Domain<Value: OneLike>> InterpretableOperation<C> for OneLikeOperation<C::Type> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -63,9 +74,12 @@ impl<C: Domain<Value: OneLike>> InterpretableOperation<C> for OneLikeOperation {
     }
 }
 
-impl<C: Context<Operation: From<OneLikeOperation>>> PartiallyEvaluatableOperation<C> for OneLikeOperation {}
+impl<C: Context<Operation: From<OneLikeOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
+    for OneLikeOperation<C::Type>
+{
+}
 
-impl_differentiable_elementwise_operation!(@constant OneLikeOperation);
+impl_differentiable_elementwise_operation!(@constant<T> OneLikeOperation<T>);
 
 /// Synthesizes a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart to [`One`](super::One).
 /// It is what [`OneLikeOperation`] needs for its [`InterpretableOperation`] implementation.
@@ -74,11 +88,11 @@ pub trait OneLike {
     fn one_like(&self) -> Self;
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<OneLikeOperation>>>> OneLike for V {
+impl<V: Value<DispatchDomain: Context<Operation: From<OneLikeOperation<V::Type>>>>> OneLike for V {
     #[inline]
     fn one_like(&self) -> Self {
         self.dispatch_domain()
-            .bind(OneLikeOperation, Vec::new(), &[self.clone()])
+            .bind(OneLikeOperation::new(), Vec::new(), &[self.clone()])
             .expect("`one_like` operation failed")
             .remove(0)
     }
@@ -118,7 +132,7 @@ mod tests {
         }
 
         // Verify the operation's identity, rendering, and eager interpretation.
-        let operation = OneLikeOperation;
+        let operation = OneLikeOperation::<DataType>::new();
         assert_eq!(format!("{operation}"), ONE_LIKE_OPERATION_NAME);
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
@@ -131,7 +145,7 @@ mod tests {
         );
 
         // Verify the operation's textual form when it appears in a program.
-        let mut builder = ProgramBuilder::<Scalar, OneLikeOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, OneLikeOperation<DataType>>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();

@@ -2974,7 +2974,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let mismatched_carry = builder.add_input(scalar_f64.clone());
         let mismatched_output =
-            builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![mismatched_carry]).unwrap()[0];
+            builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![mismatched_carry]).unwrap()[0];
         let mismatched_output = builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::Equal),

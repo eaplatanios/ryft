@@ -251,7 +251,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V::Type: DifferentiableType,
-        O: From<ComplexOperation> + From<ZeroLikeOperation>,
+        O: From<ComplexOperation> + From<ZeroLikeOperation<V::Type>>,
     {
         |_operation, _context, _driver, inputs, outputs| {
             // Transpose rule for the ℝ-linear [`RealOperation`]. Under the bilinear (i.e., conjugation-free) pairing
@@ -262,7 +262,7 @@ impl_differentiable_operation! {
             Ok(match &outputs[0] {
                 MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
                 MaybeZero::Value(output_cotangent) => {
-                    let zero = output_cotangent.unary(ZeroLikeOperation);
+                    let zero = output_cotangent.unary(ZeroLikeOperation::new());
                     vec![MaybeZero::Value(output_cotangent.binary(&zero, ComplexOperation))]
                 }
             })
@@ -319,7 +319,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V::Type: DifferentiableType,
-        O: From<NegOperation> + From<ComplexOperation> + From<ZeroLikeOperation>,
+        O: From<NegOperation> + From<ComplexOperation> + From<ZeroLikeOperation<V::Type>>,
     {
         |_operation, _context, _driver, inputs, outputs| {
             // Transpose rule for the ℝ-linear [`ImaginaryOperation`]. Under the bilinear (i.e., conjugation-free)
@@ -331,7 +331,7 @@ impl_differentiable_operation! {
             Ok(match &outputs[0] {
                 MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
                 MaybeZero::Value(output_cotangent) => {
-                    let zero = output_cotangent.unary(ZeroLikeOperation);
+                    let zero = output_cotangent.unary(ZeroLikeOperation::new());
                     let negated = output_cotangent.unary(NegOperation);
                     vec![MaybeZero::Value(zero.binary(&negated, ComplexOperation))]
                 }

@@ -1373,7 +1373,7 @@ mod tests {
         let operand_type = ArrayType::scalar(DataType::F64);
         let operation = ConditionOperation::<Array>::new();
         let true_branch = scalar_branch(ArrayOperation::Add(AddOperation));
-        let false_branch = scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation));
+        let false_branch = scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation::new()));
         let interfaces = vec![branch_interface(&true_branch), branch_interface(&false_branch)];
 
         // Operation identity, declared region slots, output provenance, and payload-free rendering.
@@ -1426,7 +1426,7 @@ mod tests {
         // Inference rejects branch interfaces with mismatched output signatures.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![input]).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let boolean_output = builder
             .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![input, zero])
             .unwrap()[0];

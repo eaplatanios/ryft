@@ -227,7 +227,7 @@ impl_select_differentiation! {
     transpose<V, O>
     where
         V::Type: DifferentiableType,
-        O: From<ZeroLikeOperation> + ZeroOperationProvider<V::Type> + From<SelectOperation<V::Type>>,
+        O: From<ZeroLikeOperation<V::Type>> + ZeroOperationProvider<V::Type> + From<SelectOperation<V::Type>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, context, _driver, inputs, outputs| {
@@ -262,7 +262,7 @@ impl_select_differentiation! {
                         // cotangent as the shape exemplar. Identity-free types retain the canonical nullary zero,
                         // whose zero-producing marker keeps higher-order partial evaluation structural.
                         let mut zero = context.stage_operation(
-                            ZeroLikeOperation,
+                            ZeroLikeOperation::new(),
                             Vec::new(),
                             std::slice::from_ref(cotangent),
                         )?;
