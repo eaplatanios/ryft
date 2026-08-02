@@ -270,8 +270,7 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
         // The JVP region consumes `(primals..., input_tangents...)`, so feed the dual primals followed by the dual
         // tangents.
         let mut jvp_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        // The user's JVP region takes every input tangent as a real region input, so materialize structural
-        // zeros.
+        // The user's JVP region takes every input tangent as a real region input, so materialize structural zeros.
         for input in inputs {
             jvp_inputs.push(input.tangent().clone().materialize(context)?);
         }
