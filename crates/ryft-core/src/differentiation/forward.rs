@@ -7,7 +7,7 @@ use ryft_macros::Parameter;
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::constants::{Zero, ZeroOperationProvider};
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
@@ -16,6 +16,7 @@ use crate::partial::{
 };
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, MaybeZero};
+use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::TypeIdentityPosition;
 use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::programs::Program;
@@ -302,15 +303,13 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
     pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     where
         V::Type: DifferentiableType,
-        O: TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
+        O: TransposableOperation<V, O> + ZeroOperationProvider<V::Type> + From<AddOperation>,
     {
         // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
         // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are
         // not folded into captured factors here. The subtraction cannot underflow because `Self::new` validated that
         // the tangent program consumes at least `residual_count` inputs.
-        let tangent_input_count = self.tangent.input_ids().len() - self.residual_count;
-        let with_respect_to = (0..tangent_input_count).collect::<Vec<_>>();
-        self.tangent.transpose_with_respect_to(with_respect_to.as_slice())
+        self.tangent.transpose_with_trailing_residuals(self.residual_count)
     }
 }
 
@@ -712,7 +711,7 @@ where
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + From<ZeroOperation<C::Type>>,
+        + ZeroOperationProvider<C::Type>,
 {
     fn jvp_program(
         &self,
@@ -767,7 +766,7 @@ where
 ///     transports each rule's own capability requirements (e.g., `C::Value: Sin` for the sine rule) to the use site,
 ///     so that the enum does not spell them, plus a `Self: From<Payload>` conversion for every concrete payload (the
 ///     rules stage ordinary primal-enum operations for both the primal and the tangent side) and the direct
-///     `Self: From<ZeroOperation<T>>` bound that the nested-region differentiation drivers require. Higher-order
+///     `Self: ZeroOperationProvider<T>` bound that the nested-region differentiation drivers require. Higher-order
 ///     payload rules request nested forward-mode and linearization work through their instruction-scoped
 ///     [`DifferentiationDriver`], whose concrete implementation establishes the finite program-level bounds at its
 ///     construction site. Output-level semantic queries such as [`Operation::is_zero`] are forwarded by the base
@@ -989,7 +988,7 @@ where
         + DifferentiableOperation<C>
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + From<ZeroOperation<C::Type>>,
+        + ZeroOperationProvider<C::Type>,
 {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
@@ -1087,7 +1086,7 @@ where
     O: PartiallyEvaluatableOperation<TracingContext<V, O>>
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
-        + From<ZeroOperation<V::Type>>,
+        + ZeroOperationProvider<V::Type>,
 {
     /// Builds the *fused* Jacobian-Vector Product (JVP) [`Program`] of this borrowed [`Region`](crate::Region).
     /// Refer to the documentation of [`Program::jvp`] for more information.
@@ -1291,6 +1290,7 @@ where
         // Seed the direct walk's boundary. Unknown tangent ordinals are already the canonical tangent input positions,
         // unlike the former fused program where they were offset by the primal-input count.
         let mut tangent_index = 0usize;
+        let mut primal_input_atoms = Vec::with_capacity(primal_input_count);
         let input_duals = self
             .input_ids()
             .iter()
@@ -1299,6 +1299,7 @@ where
                 let primal_type = self.atoms()[input_atom.index()].r#type().into_owned();
                 let tangent_type = primal_type.tangent();
                 let primal = primal_context.input(primal_type);
+                primal_input_atoms.push(primal.atom_id()?);
                 let tangent = if !tangent_type.is_zero_space() {
                     let tangent = evaluation_context.unknown_input(tangent_type.clone(), tangent_index);
                     tangent_index += 1;
@@ -1331,9 +1332,12 @@ where
         // Split the direct output duals. Primal halves must be known tracers in the primal builder. Structural-zero
         // tangent halves become residualized typed zeros so the tangent program preserves the source output arity. A
         // value tangent that folded to known is malformed: rules must preserve input-independent zeros structurally,
-        // and accepting any other known value would turn the tangent program into an affine map.
+        // and accepting any other known value would turn the tangent program into an affine map. Do not bind through
+        // `Zero` here as partial evaluation could classify that value as known and remove it from the tangent boundary.
+        // Forced residualization keeps a structural zero as an unknown Single Static Assignment (SSA) output,
+        // preserving the linear program's output arity without admitting an affine constant.
         let staged_zero = |r#type: V::Type| {
-            let mut outputs = evaluation_context.residualize(ZeroOperation::new(r#type), Vec::new(), &[])?;
+            let mut outputs = evaluation_context.residualize(O::zero_operation(r#type)?, Vec::new(), &[])?;
             check_count!("output", outputs, 1, ProgramError);
             Ok::<_, ProgramError>(outputs.remove(0))
         };
@@ -1399,7 +1403,7 @@ where
             )
             .into());
         }
-        let tangent_program = evaluation.program;
+        let mut tangent_program = evaluation.program;
 
         // Inputs are created as all tangent unknowns first, followed by lazily materialized residual feeders. The
         // residual program simplifier preserves public inputs, so this metadata must align one-for-one with its input
@@ -1433,6 +1437,76 @@ where
                 }
             }
         }
+
+        // Retain the explicit shape residuals needed to materialize a disconnected input cotangent. These residuals
+        // are captured while the corresponding primal input is available and become ordinary trailing inputs of the
+        // tangent program. Homogeneous operation families request no residuals. A live tangent input receives an
+        // accumulated cotangent during transposition. Only a dead tangent input can require a newly constructed
+        // disconnected zero, so only those inputs need their runtime geometry retained.
+        let tangent_live_sets = tangent_program.live_sets();
+        let differentiable_primal_inputs = self
+            .input_ids()
+            .iter()
+            .map(|input| &self.atoms()[input.index()])
+            .zip(primal_input_atoms)
+            .filter(|(input, _)| !input.r#type().tangent().is_zero_space());
+        let mut zero_residual_types = Vec::new();
+        for (((input, primal_input), tangent_input), tangent_input_atom) in differentiable_primal_inputs
+            .zip(tangent_program.inputs().take(tangent_input_count))
+            .zip(tangent_program.input_ids().iter().copied().take(tangent_input_count))
+        {
+            if tangent_live_sets.atoms()[tangent_input_atom.index()] {
+                continue;
+            }
+            let tangent_type = tangent_input.r#type().into_owned();
+            let expected_types = O::transposition_zero_residual_types(&tangent_type);
+            let residuals =
+                O::capture_transposition_zero_residuals(&mut primal_builder.borrow_mut(), primal_input, &tangent_type)?;
+            if residuals.len() != expected_types.len() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "transposition zero for input type {} captured {} residuals but declared {}",
+                    input.r#type(),
+                    residuals.len(),
+                    expected_types.len(),
+                ))
+                .into());
+            }
+            for (residual, expected_type) in residuals.iter().copied().zip(&expected_types) {
+                let builder = primal_builder.borrow();
+                let actual_type =
+                    builder.atoms().get(residual.index()).ok_or(ProgramError::UnboundAtomId { id: residual })?.r#type();
+                if actual_type.as_ref() != expected_type {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "transposition zero residual for input type {} has type {} but expected {}",
+                        input.r#type(),
+                        actual_type,
+                        expected_type,
+                    ))
+                    .into());
+                }
+            }
+            residual_output_atoms.extend(residuals);
+            zero_residual_types.extend(expected_types);
+        }
+
+        if !zero_residual_types.is_empty() {
+            // Program boundaries are immutable. Rebuild the tangent program with the old inputs as an unchanged prefix
+            // and the zero-geometry residuals as a trailing suffix; the primal program emits residual values in this
+            // same order below.
+            let mut builder = ProgramBuilder::<V, O>::new();
+            let old_input_count = tangent_program.input_ids().len();
+            let inputs = tangent_program
+                .input_types()
+                .into_iter()
+                .chain(zero_residual_types)
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
+            let outputs = builder.splice_program(&tangent_program, &inputs[..old_input_count])?;
+            let output_count = outputs.len();
+            tangent_program =
+                builder.build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])?;
+        }
+
         let residual_count = residual_output_atoms.len();
         primal_output_atoms.extend(residual_output_atoms);
 
@@ -1462,7 +1536,7 @@ where
     O: PartiallyEvaluatableOperation<TracingContext<V, O>>
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
-        + From<ZeroOperation<V::Type>>,
+        + ZeroOperationProvider<V::Type>,
 {
     /// Builds the *fused* Jacobian-Vector Product (JVP) [`Program`] of this [`Program`]. Assume the input program
     /// represents a function `f` from its inputs to its outputs, `x ↦ y = f(x)`. This function returns the program that
@@ -1632,7 +1706,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     where
         Self::Operation: PartiallyEvaluatableOperation<Self>
             + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-            + From<ZeroOperation<Self::Type>>,
+            + ZeroOperationProvider<Self::Type>,
     {
         if primals.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
@@ -1641,6 +1715,10 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         let input_structure = primals.parameter_structure();
         let input_values = primals.into_parameters().collect::<Vec<_>>();
         let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+
+        // The dual-seeding pass consumes `input_values` so we retain the primals separately because dead tangent inputs
+        // may later need their concrete runtime shapes captured for disconnected pullback zeros.
+        let primal_input_values = input_values.clone();
         let tangent_input_count = input_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
 
         // Wrap each primal as a dual over a partial-evaluation context wrapping this context. The primal half is a
@@ -1678,11 +1756,17 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         // an arbitrary known value would silently turn the pushforward into an affine map.
         let output_structure = output.parameter_structure();
         let output_duals = output.into_parameters().collect::<Vec<_>>();
+
+        // Force structural zeros into the residual program. Calling `Zero` normally would allow partial evaluation to
+        // keep the result known, but a reusable pushforward must expose every non-zero-space tangent output as a
+        // Single Static Assignment (SSA) value.
         let staged_zero = |r#type: Self::Type| {
-            let mut outputs = evaluation_context.residualize(ZeroOperation::new(r#type), Vec::new(), &[])?;
+            let mut outputs =
+                evaluation_context.residualize(Self::Operation::zero_operation(r#type)?, Vec::new(), &[])?;
             check_count!("output", outputs, 1, ProgramError);
             Ok::<_, ProgramError>(outputs.remove(0))
         };
+
         let mut primal_outputs = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
         let mut output_types = Vec::with_capacity(output_duals.len());
@@ -1748,9 +1832,66 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             }
         }
 
+        // A dead tangent input is the only one that can become a disconnected cotangent after transposition. Capture
+        // the exact runtime geometry for those inputs now, while their concrete primal values remain available.
+        let mut program = evaluation.program;
+        let live_sets = program.live_sets();
+        let differentiable_primal_inputs =
+            primal_input_values.iter().filter(|value| !value.r#type().tangent().is_zero_space());
+        let mut zero_residuals = Vec::new();
+        for ((primal, tangent_input), tangent_input_atom) in differentiable_primal_inputs
+            .zip(program.inputs().take(tangent_input_count))
+            .zip(program.input_ids().iter().copied().take(tangent_input_count))
+        {
+            if live_sets.atoms()[tangent_input_atom.index()] {
+                continue;
+            }
+            let tangent_type = tangent_input.r#type().into_owned();
+            let expected_types = Self::Operation::transposition_zero_residual_types(&tangent_type);
+            let values = Self::Operation::capture_transposition_zero_values(self, primal, &tangent_type)?;
+            if values.len() != expected_types.len() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "transposition zero for input type {} captured {} residual values but declared {}",
+                    primal.r#type(),
+                    values.len(),
+                    expected_types.len(),
+                ))
+                .into());
+            }
+            for (value, expected_type) in values.iter().zip(&expected_types) {
+                if value.r#type().as_ref() != expected_type {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "transposition zero residual for input type {} has type {} but expected {}",
+                        primal.r#type(),
+                        value.r#type(),
+                        expected_type,
+                    ))
+                    .into());
+                }
+            }
+            zero_residuals.extend(values);
+        }
+
+        if !zero_residuals.is_empty() {
+            // Append the geometry values and their types in one shared order. The rebuilt pushforward consumes them
+            // as trailing inputs, while `residuals` closes those inputs when the reusable callable is constructed.
+            let mut builder = ProgramBuilder::<Self::Constant, Self::Operation>::new();
+            let old_input_count = program.input_ids().len();
+            let inputs = program
+                .input_types()
+                .into_iter()
+                .chain(zero_residuals.iter().map(|value| value.r#type().into_owned()))
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
+            let outputs = builder.splice_program(&program, &inputs[..old_input_count])?;
+            let output_count = outputs.len();
+            program = builder.build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])?;
+            residuals.extend(zero_residuals);
+        }
+
         // Close the pushforward program over the linearization-point residuals behind the reusable callable.
         let pushforward =
-            Pushforward::new(self.clone(), evaluation.program, residuals, input_types, output_types, output_structure)?;
+            Pushforward::new(self.clone(), program, residuals, input_types, output_types, output_structure)?;
         Ok((output, pushforward))
     }
 }
@@ -1848,7 +1989,7 @@ pub fn linearize<
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
                                + PartiallyEvaluatableOperation<
                     TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-                > + From<ZeroOperation<V::Type>>,
+                > + ZeroOperationProvider<V::Type>,
             > + Zero<V>,
         >,
     F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
