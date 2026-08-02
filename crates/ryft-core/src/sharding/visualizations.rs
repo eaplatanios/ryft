@@ -111,10 +111,10 @@ impl Sharding {
         for device_index in 0..self.mesh.device_count() {
             // Decompose the linear device index into row-major mesh coordinates.
             let mut remaining = device_index;
-            let mut mesh_coordinates = vec![0usize; self.mesh.axes.len()];
-            for (axis_index, axis) in self.mesh.axes.iter().enumerate().rev() {
-                mesh_coordinates[axis_index] = remaining % axis.size;
-                remaining /= axis.size;
+            let mut mesh_coordinates = vec![0usize; self.mesh.axes().len()];
+            for (axis_index, axis) in self.mesh.axes().iter().enumerate().rev() {
+                mesh_coordinates[axis_index] = remaining % axis.size();
+                remaining /= axis.size();
             }
 
             // Map the mesh coordinates to a `(row, column)` grid cell. For rank-1 shardings the row is always `0`

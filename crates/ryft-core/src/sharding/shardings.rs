@@ -137,7 +137,7 @@ impl Sharding {
 
                 let mut seen_axis_names = HashSet::new();
                 for axis_name in axis_names {
-                    if !sharding.mesh.axis_indices.contains_key(axis_name) {
+                    if sharding.mesh.axis_index(axis_name).is_none() {
                         return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
                     }
 
@@ -159,7 +159,7 @@ impl Sharding {
     ) -> Result<Self, ShardingError> {
         let unreduced_axes = unreduced_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
         for axis_name in &unreduced_axes {
-            if !self.mesh.axis_indices.contains_key(axis_name) {
+            if self.mesh.axis_index(axis_name).is_none() {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
             }
             if self.dimensions.iter().any(|dimension| match dimension {
@@ -184,7 +184,7 @@ impl Sharding {
     ) -> Result<Self, ShardingError> {
         let reduced_axes = reduced_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
         for axis_name in &reduced_axes {
-            if !self.mesh.axis_indices.contains_key(axis_name) {
+            if self.mesh.axis_index(axis_name).is_none() {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
             }
             if self.dimensions.iter().any(|dimension| match dimension {
@@ -209,7 +209,7 @@ impl Sharding {
     ) -> Result<Self, ShardingError> {
         let varying_manual_axes = varying_manual_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
         for axis_name in &varying_manual_axes {
-            if !self.mesh.axis_indices.contains_key(axis_name) {
+            if self.mesh.axis_index(axis_name).is_none() {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
             }
             if self.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
@@ -327,10 +327,10 @@ impl Sharding {
         used_axes.extend(self.unreduced_axes.iter().map(String::as_str));
         used_axes.extend(self.reduced_axes.iter().map(String::as_str));
         self.mesh
-            .axes
+            .axes()
             .iter()
             .filter_map(|axis| {
-                let axis_name = axis.name.as_str();
+                let axis_name = axis.name();
                 (matches!(self.mesh.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
                     && !used_axes.contains(axis_name))
                 .then_some(axis_name)
@@ -361,11 +361,9 @@ impl Sharding {
             ShardingDimension::Sharded(axis_names) => axis_names.iter().try_fold(0usize, |index, axis_name| {
                 let axis_index = self
                     .mesh
-                    .axis_indices
-                    .get(axis_name.as_str())
-                    .copied()
+                    .axis_index(axis_name)
                     .ok_or_else(|| ShardingError::UnknownMeshAxisName { name: axis_name.clone() })?;
-                Ok(index * self.mesh.axes[axis_index].size + device_mesh_coordinates[axis_index])
+                Ok(index * self.mesh.axes()[axis_index].size() + device_mesh_coordinates[axis_index])
             }),
         }
     }
@@ -551,9 +549,9 @@ impl Display for Sharding {
             formatter,
             "{}",
             self.mesh
-                .axes
+                .axes()
                 .iter()
-                .map(|axis| format!("'{}'={}:{}", axis.name.replace('\'', "\\'"), axis.size, axis.r#type))
+                .map(|axis| format!("'{}'={}:{}", axis.name().replace('\'', "\\'"), axis.size(), axis.r#type()))
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;

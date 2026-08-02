@@ -1,10 +1,8 @@
-pub mod devices;
 pub mod meshes;
 pub mod shardings;
 pub mod visualizations;
 
-pub use devices::{Device, DeviceId, DeviceMesh, ProcessIndex};
-pub use meshes::{LogicalMesh, MeshAxis, MeshAxisType};
+pub use meshes::{Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex};
 pub use shardings::{Sharding, ShardingDimension};
 pub use visualizations::ShardingVisualization;
 
