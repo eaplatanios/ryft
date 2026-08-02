@@ -737,6 +737,60 @@ mod tests {
     }
 
     #[test]
+    fn test_sharding_with_dimensions() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap()
+                .with_unreduced_axes(["y"])
+                .unwrap()
+                .with_reduced_axes(["z"])
+                .unwrap()
+                .with_varying_manual_axes(["m"])
+                .unwrap();
+        assert_eq!(
+            sharding.with_dimensions(vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"]),]),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                .unwrap()
+                .with_unreduced_axes(["y"])
+                .unwrap()
+                .with_reduced_axes(["z"])
+                .unwrap()
+                .with_varying_manual_axes(["m"]),
+        );
+        assert_eq!(sharding.dimensions(), &[ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]);
+        assert!(matches!(
+            sharding.with_dimensions(vec![ShardingDimension::sharded(["unknown"])]),
+            Err(ShardingError::UnknownMeshAxisName { name }) if name == "unknown",
+        ));
+        assert!(matches!(
+            sharding.with_dimensions(vec![
+                ShardingDimension::sharded(["x"]),
+                ShardingDimension::sharded(["x"]),
+            ]),
+            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
+        ));
+        assert!(matches!(
+            sharding.with_dimensions(vec![ShardingDimension::sharded(["y"])]),
+            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "y",
+        ));
+        assert!(matches!(
+            sharding.with_dimensions(vec![ShardingDimension::sharded(["z"])]),
+            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "z",
+        ));
+        assert_eq!(sharding.mesh(), &mesh);
+        assert_eq!(sharding.unreduced_axes(), &BTreeSet::from(["y".to_string()]));
+        assert_eq!(sharding.reduced_axes(), &BTreeSet::from(["z".to_string()]));
+        assert_eq!(sharding.varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
+    }
+
+    #[test]
     fn test_sharding_axis_setters() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -763,6 +817,14 @@ mod tests {
         assert!(varying.unreduced_axes().is_empty());
         assert!(varying.reduced_axes().is_empty());
 
+        let mut varying_in_place = sharding.clone();
+        assert_eq!(varying_in_place.set_varying_manual_axes(["m"]), Ok(()));
+        assert_eq!(varying_in_place.varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
+        assert_eq!(varying_in_place.extend_varying_manual_axes(["n", "m"]), Ok(()));
+        assert_eq!(varying_in_place.varying_manual_axes(), &BTreeSet::from(["m".to_string(), "n".to_string()]));
+        varying_in_place.clear_varying_manual_axes();
+        assert!(varying_in_place.varying_manual_axes().is_empty());
+
         assert!(sharding.unreduced_axes().is_empty());
         assert!(sharding.reduced_axes().is_empty());
         assert!(sharding.varying_manual_axes().is_empty());
@@ -774,6 +836,7 @@ mod tests {
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("n", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -825,9 +888,28 @@ mod tests {
             Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name }) if name == "m",
         ));
         assert!(matches!(
-            sharding.with_reduced_axes(["m"]).unwrap().with_varying_manual_axes(["m"]),
+            sharding.clone().with_reduced_axes(["m"]).unwrap().with_varying_manual_axes(["m"]),
             Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name }) if name == "m",
         ));
+
+        let mut varying = sharding.with_varying_manual_axes(["m"]).unwrap();
+        assert!(matches!(
+            varying.set_varying_manual_axes(["n", "unknown"]),
+            Err(ShardingError::UnknownMeshAxisName { name }) if name == "unknown",
+        ));
+        assert_eq!(varying.varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
+        assert!(matches!(
+            varying.extend_varying_manual_axes(["n", "unknown"]),
+            Err(ShardingError::UnknownMeshAxisName { name }) if name == "unknown",
+        ));
+        assert_eq!(varying.varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
+        assert_eq!(varying.extend_varying_manual_axes(["m", "n"]), Ok(()));
+        assert_eq!(varying.varying_manual_axes(), &BTreeSet::from(["m".to_string(), "n".to_string()]),);
+        assert!(matches!(
+            varying.set_varying_manual_axes(["y"]),
+            Err(ShardingError::ExpectedManualMeshAxis { name }) if name == "y",
+        ));
+        assert_eq!(varying.varying_manual_axes(), &BTreeSet::from(["m".to_string(), "n".to_string()]),);
     }
 
     #[test]
