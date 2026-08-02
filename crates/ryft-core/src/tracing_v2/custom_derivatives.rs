@@ -599,7 +599,20 @@ where
                 .collect::<Result<Vec<_>, _>>()?,
         );
         let carrier = LinearCallOperation::transpose_only(residual_count, input_tangent_types, output_tangent_types);
-        let output_tangents = context.bind(carrier, vec![backward_region.to_program()], &carrier_operands)?;
+        // Any context that must *execute* the carrier (an eager forward-mode pass, or a forward-mode pass over an
+        // already staged carrier) rejects it as unsupported. Restate that rejection in `custom_vjp` vocabulary instead
+        // of leaking the carrier's internals, matching the clear error JAX raises when forward-mode autodiff is
+        // applied to a `custom_vjp` function.
+        let output_tangents = context
+            .bind(carrier, vec![backward_region.to_program()], &carrier_operands)
+            .map_err(|error| match error {
+                ProgramError::UnsupportedOperation { .. } => ProgramError::UnsupportedOperation {
+                    message: "cannot apply forward-mode differentiation to a custom_vjp call; it supports only \
+                              reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or 'jacobian_reverse')"
+                        .to_string(),
+                },
+                error => error,
+            })?;
         check_count!("output", output_tangents, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -876,14 +889,17 @@ where
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
+    use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-    use crate::operations::math::{Cos, CosOperation, MulOperation, Sin, SinOperation};
-    use crate::operations::math::{Dot, DotDimensionNumbers};
+    use crate::differentiation::jacobian::jacobian_reverse;
+    use crate::differentiation::{ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate};
+    use crate::operations::math::{
+        Cos, CosOperation, Dot, DotDimensionNumbers, MulOperation, Reduce, ReductionKind, Sin, SinOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::ProgramBuilder;
@@ -948,6 +964,8 @@ mod tests {
         builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
+    /// Returns a custom-JVP call over `f(x) = sin(x)` together with its `["primal", "jvp"]` regions, whose JVP rule
+    /// deliberately doubles the true derivative.
     fn custom_jvp_sin(
         r#type: &ArrayType,
     ) -> (ArrayOperation<Array>, Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>) {
@@ -957,6 +975,8 @@ mod tests {
         )
     }
 
+    /// Returns a custom-VJP call over `f(x) = sin(x)` together with its `["primal", "forward", "backward"]` regions,
+    /// whose backward rule deliberately triples the true gradient.
     fn custom_vjp_sin(
         r#type: &ArrayType,
     ) -> (ArrayOperation<Array>, Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>) {
@@ -964,199 +984,6 @@ mod tests {
             ArrayOperation::CustomVjp(CustomVjpOperation::new()),
             vec![sin_program(r#type), sin_forward_program(r#type), tripled_sin_backward_program(r#type)],
         )
-    }
-
-    /// Returns the [`RegionInterface`] of the provided flat region program.
-    fn custom_region_interface(
-        program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
-    ) -> RegionInterface<ArrayType> {
-        program.interface()
-    }
-
-    #[test]
-    fn test_custom_jvp_inference_validates_the_rule_signature() {
-        let scalar = test_type(&[]);
-        let operation = CustomJvpOperation::<ArrayType>::new();
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 0), Some(RegionRole::Computation),);
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 1), Some(RegionRole::Rule));
-        // The JVP interface must take `(inputs..., tangents...)`; a primal-only signature is rejected.
-        assert!(
-            operation
-                .infer_output_types(
-                    std::slice::from_ref(&scalar),
-                    &[custom_region_interface(&sin_program(&scalar)), custom_region_interface(&sin_program(&scalar))],
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn test_custom_vjp_inference_validates_the_rule_signatures() {
-        let scalar = test_type(&[]);
-        let operation = CustomVjpOperation::<ArrayType>::new();
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 0), Some(RegionRole::Computation));
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 1), Some(RegionRole::Rule));
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 2), Some(RegionRole::Rule));
-        // The backward interface must consume `(residuals..., output cotangents...)`; a single-input program whose
-        // signature cannot line up with the forward residuals is rejected.
-        assert!(
-            operation
-                .infer_output_types(
-                    std::slice::from_ref(&scalar),
-                    &[
-                        custom_region_interface(&sin_program(&scalar)),
-                        custom_region_interface(&sin_forward_program(&scalar)),
-                        custom_region_interface(&sin_program(&scalar)),
-                    ],
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn test_custom_derivative_inference_uses_differential_types() {
-        let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(Vec::new()));
-        let tangent_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()));
-        let residual_type = test_type(&[]);
-        let primal_interface =
-            RegionInterface::new(vec![primal_type.clone()], vec![primal_type.clone()], Effects::PURE);
-        let jvp_interface = RegionInterface::new(
-            vec![primal_type.clone(), tangent_type.clone()],
-            vec![primal_type.clone(), tangent_type.clone()],
-            Effects::PURE,
-        );
-        assert_eq!(
-            CustomJvpOperation::<ArrayType>::new()
-                .infer_output_types(std::slice::from_ref(&primal_type), &[primal_interface.clone(), jvp_interface],),
-            Ok(vec![primal_type.clone()]),
-        );
-
-        let forward_interface = RegionInterface::new(
-            vec![primal_type.clone()],
-            vec![primal_type.clone(), residual_type.clone()],
-            Effects::PURE,
-        );
-        let backward_interface = RegionInterface::new(
-            vec![residual_type.clone(), tangent_type.clone()],
-            vec![tangent_type.clone()],
-            Effects::PURE,
-        );
-        assert_eq!(
-            CustomVjpOperation::<ArrayType>::new().infer_output_types(
-                std::slice::from_ref(&primal_type),
-                &[primal_interface, forward_interface, backward_interface.clone()],
-            ),
-            Ok(vec![primal_type]),
-        );
-    }
-
-    #[test]
-    fn test_custom_derivative_calls_remain_opaque_to_partial_evaluation() {
-        let scalar = test_type(&[]);
-        for (operation, operation_regions) in [custom_jvp_sin(&scalar), custom_vjp_sin(&scalar)] {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let region_ids = operation_regions
-                .iter()
-                .map(|region| builder.import_region(region.entry_region_ref()))
-                .collect::<Vec<_>>();
-            let input = builder.add_input(scalar.clone());
-            let output = builder.add_instruction(operation, region_ids, vec![input]).unwrap()[0];
-            let program =
-                builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-
-            let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar.clone())]).unwrap();
-
-            assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-            assert_eq!(evaluation.program.instructions().len(), 1);
-            assert!(matches!(
-                evaluation.program.instructions()[0].operation(),
-                ArrayOperation::CustomJvp(_) | ArrayOperation::CustomVjp(_),
-            ));
-        }
-    }
-
-    #[test]
-    fn test_custom_jvp_interprets_the_primal_program() {
-        let scalar = test_type(&[]);
-        let (operation, operation_regions) = custom_jvp_sin(&scalar);
-        let outputs = crate::EagerContext::<Array, ArrayOperation<Array>>::new()
-            .bind(operation, operation_regions, &[Array::scalar(2.0)])
-            .unwrap();
-        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_custom_jvp_governs_forward_mode() {
-        let scalar = test_type(&[]);
-        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jvp(
-                |x| {
-                    let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
-                    Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
-                },
-                Array::scalar(2.0),
-                Array::scalar(1.0),
-            )
-            .unwrap();
-        let _ = scalar;
-        assert_abs_diff_eq!(primal.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-        // The custom rule doubles the true derivative, proving it is in control.
-        assert_abs_diff_eq!(tangent.to_f64s()[0], 2.0 * 2.0f64.cos(), epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_custom_jvp_governs_reverse_mode() {
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| {
-                    let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
-                    x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
-                },
-                Array::scalar(3.0),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 3.0f64.sin(), epsilon = 1e-9);
-        // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
-        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 3.0f64.cos(), epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_custom_vjp_governs_reverse_mode() {
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| {
-                    let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
-                    x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
-                },
-                Array::scalar(2.0),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-        // The custom backward rule triples the true gradient, proving it is in control.
-        assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_jacobian_reverse_through_custom_vjp_uses_the_custom_backward_rule() {
-        use crate::differentiation::jacobian::jacobian_reverse;
-
-        // jacobian_reverse interprets the pullback with batch-stacked cotangent bases, exercising the batched replay
-        // of the custom backward program. The Jacobian of elementwise `sin` with the tripled rule is the diagonal
-        // matrix `diag(3 * cos(x))`.
-        let vector = test_type(&[2]);
-        let jacobian = jacobian_reverse(
-            |x| {
-                let (operation, operation_regions) = custom_vjp_sin(&test_type(&[2]));
-                Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
-            },
-            Array::from_f64s(vector, vec![0.5, 1.0]),
-        )
-        .unwrap();
-        let block = jacobian.iter_blocks().next().unwrap();
-        assert_abs_diff_eq!(block.value().values()[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[3], 3.0 * 1.0f64.cos(), epsilon = 1e-9);
     }
 
     /// Builds the scalar `f(x) = sin(x)` program.
@@ -1216,25 +1043,230 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_custom_jvp_governs_forward_mode() {
-        let (primal, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .jvp(
-                |x| {
-                    let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
-                    let operation_regions = vec![scalar_sin_program(), scalar_doubled_sin_jvp_program()];
-                    Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
-                },
-                Scalar::from(2.0),
-                Scalar::from(1.0),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(primal, 2.0f64.sin(), epsilon = 1e-9);
-        // The custom rule doubles the true derivative, proving it is in control.
-        assert_abs_diff_eq!(tangent, 2.0 * 2.0f64.cos(), epsilon = 1e-9);
+    fn test_custom_jvp() {
+        let scalar = test_type(&[]);
+        let operation = CustomJvpOperation::<ArrayType>::new();
+
+        // Verify the operation's identity, rendering, and region contract: the primal program is a computation region
+        // and the user JVP program is a rule region, in that order.
+        assert_eq!(Operation::<ArrayType>::name(&operation), CUSTOM_JVP_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "custom_jvp");
+        assert_eq!(
+            Operation::<ArrayType>::region_slots(&operation),
+            &[RegionSlot::computation("primal"), RegionSlot::rule("jvp")],
+        );
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 0), Some(RegionRole::Computation));
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 1), Some(RegionRole::Rule));
+
+        // The primal region receives the call inputs and the JVP region receives `(inputs..., input tangents...)`.
+        let primal_interface = sin_program(&scalar).interface();
+        let jvp_interface = doubled_sin_jvp_program(&scalar).interface();
+        assert_eq!(
+            operation.infer_region_input_types(
+                std::slice::from_ref(&scalar),
+                &[primal_interface.clone(), jvp_interface.clone()],
+            ),
+            Ok(vec![Some(vec![scalar.clone()]), Some(vec![scalar.clone(), scalar.clone()])]),
+        );
+
+        // A rule that satisfies the interface contract makes the call produce the primal outputs.
+        assert_eq!(
+            operation
+                .infer_output_types(std::slice::from_ref(&scalar), &[primal_interface, jvp_interface]),
+            Ok(vec![scalar.clone()]),
+        );
+
+        // Inference maps the primal boundary through *differential* types rather than requiring the tangents to reuse
+        // the primal storage type, so an `f8e8m0fnu` primal pairs with an `f32` tangent.
+        let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(Vec::new()));
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()));
+        let differential_primal_interface =
+            RegionInterface::new(vec![primal_type.clone()], vec![primal_type.clone()], Effects::PURE);
+        let differential_jvp_interface = RegionInterface::new(
+            vec![primal_type.clone(), tangent_type.clone()],
+            vec![primal_type.clone(), tangent_type],
+            Effects::PURE,
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&primal_type),
+                &[differential_primal_interface, differential_jvp_interface],
+            ),
+            Ok(vec![primal_type]),
+        );
+
+        // The JVP interface must be `(inputs..., input tangents...) -> (outputs..., output tangents...)`; a
+        // primal-shaped rule signature is rejected.
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&scalar),
+                &[sin_program(&scalar).interface(), sin_program(&scalar).interface()],
+            ),
+            Err(TypeError::invalid(
+                "custom_jvp rule input type signature mismatch: expected [f64[], f64[]] but got [f64[]]".to_string(),
+            )),
+        );
     }
 
     #[test]
-    fn test_linearization_rejects_known_custom_jvp_tangents() {
+    fn test_custom_jvp_interprets_the_primal_program() {
+        let scalar = test_type(&[]);
+        let (operation, operation_regions) = custom_jvp_sin(&scalar);
+
+        // Interpretation replays the lean primal region only, so an un-differentiated call never pays for the JVP
+        // program's tangent computation.
+        let outputs = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .bind(operation, operation_regions, &[Array::scalar(2.0)])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_jvp_remains_opaque_to_partial_evaluation() {
+        // A call with an unknown operand residualizes unchanged instead of inlining its primal region, which is what
+        // keeps the custom rule attached to the residual program.
+        let scalar = test_type(&[]);
+        let (operation, operation_regions) = custom_jvp_sin(&scalar);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let region_ids = operation_regions
+            .iter()
+            .map(|region| builder.import_region(region.entry_region_ref()))
+            .collect::<Vec<_>>();
+        let input = builder.add_input(scalar.clone());
+        let output = builder.add_instruction(operation, region_ids, vec![input]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar)]).unwrap();
+
+        assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::CustomJvp(_)));
+    }
+
+    #[test]
+    fn test_custom_jvp_batches_by_rewrapping_the_call() {
+        let scalar = test_type(&[]);
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(
+                |x| {
+                    let (operation, operation_regions) = custom_jvp_sin(&scalar);
+                    Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
+                },
+                Array::vector(vec![0.5, 1.0, 1.5]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+        for (actual, input) in output.to_f64s().iter().zip([0.5f64, 1.0, 1.5]) {
+            assert_abs_diff_eq!(*actual, input.sin(), epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_custom_jvp_survives_batching_and_governs_the_batched_gradient() {
+        // Differentiating *through* a batch of the custom call must still use the (deliberately doubled) custom
+        // rule: batching re-wraps the call around batched programs instead of inlining the primal, so the
+        // custom derivative survives `batch` — mirroring JAX's `vmap`-of-`custom_jvp` semantics.
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
+                        &context,
+                        |item| {
+                            let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
+                            Ok(item
+                                .context()
+                                .bind(operation, operation_regions, &[item.clone()])?
+                                .into_iter()
+                                .next()
+                                .unwrap())
+                        },
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    mapped.reduce(&[0], ReductionKind::Sum)
+                },
+                Array::vector(vec![0.5, 1.0]),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 0.5f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[1], 2.0 * 1.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_jvp_governs_forward_mode() {
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(
+                |x| {
+                    let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
+                    Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
+                },
+                Array::scalar(2.0),
+                Array::scalar(1.0),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(primal.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        // The custom rule doubles the true derivative, proving it is in control.
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 2.0 * 2.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_jvp_governs_reverse_mode() {
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(
+                |x| {
+                    let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
+                    x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
+                },
+                Array::scalar(3.0),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 3.0f64.sin(), epsilon = 1e-9);
+        // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 3.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_jvp_supports_second_order_differentiation() {
+        // The JVP rule replays the user program as plain primitive operations, so the gradient program it produces is
+        // itself differentiable and arbitrary-order differentiation composes (as it does through JAX's `custom_jvp`).
+        // The doubled rule makes the first derivative `2 cos(x)`, so the second derivative is `-2 sin(x)`.
+        let (gradient, second_derivative) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    context
+                        .gradient(
+                            |y| {
+                                let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
+                                y.context()
+                                    .bind(operation, operation_regions, &[y.clone()])
+                                    .unwrap()
+                                    .into_iter()
+                                    .next()
+                                    .unwrap()
+                            },
+                            x,
+                        )
+                        .unwrap()
+                },
+                Array::scalar(0.7),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 0.7f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(second_derivative.to_f64s()[0], -2.0 * 0.7f64.sin(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_jvp_rejects_known_tangent_outputs() {
         let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
         let operation_regions = || vec![scalar_sin_program(), scalar_known_tangent_jvp_program()];
         let expected = "linearization produced a known tangent output; differentiation rules must represent \
@@ -1269,6 +1301,297 @@ mod tests {
             result,
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message))) if message == expected,
         ));
+    }
+
+    #[test]
+    fn test_scalar_custom_jvp_governs_forward_mode() {
+        let (primal, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
+            .jvp(
+                |x| {
+                    let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
+                    let operation_regions = vec![scalar_sin_program(), scalar_doubled_sin_jvp_program()];
+                    Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
+                },
+                Scalar::from(2.0),
+                Scalar::from(1.0),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(primal, 2.0f64.sin(), epsilon = 1e-9);
+        // The custom rule doubles the true derivative, proving it is in control.
+        assert_abs_diff_eq!(tangent, 2.0 * 2.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_vjp() {
+        let scalar = test_type(&[]);
+        let operation = CustomVjpOperation::<ArrayType>::new();
+
+        // Verify the operation's identity, rendering, and region contract: the primal program is a computation region
+        // followed by the user forward and backward rule regions.
+        assert_eq!(Operation::<ArrayType>::name(&operation), CUSTOM_VJP_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "custom_vjp");
+        assert_eq!(
+            Operation::<ArrayType>::region_slots(&operation),
+            &[RegionSlot::computation("primal"), RegionSlot::rule("forward"), RegionSlot::rule("backward")],
+        );
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 0), Some(RegionRole::Computation));
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 1), Some(RegionRole::Rule));
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 2), Some(RegionRole::Rule));
+
+        // The primal and forward regions receive the call inputs, and the backward region receives the forward
+        // region's trailing residuals followed by one cotangent per primal output.
+        let primal_interface = sin_program(&scalar).interface();
+        let forward_interface = sin_forward_program(&scalar).interface();
+        let backward_interface = tripled_sin_backward_program(&scalar).interface();
+        assert_eq!(
+            operation.infer_region_input_types(
+                std::slice::from_ref(&scalar),
+                &[primal_interface.clone(), forward_interface.clone(), backward_interface.clone()],
+            ),
+            Ok(vec![
+                Some(vec![scalar.clone()]),
+                Some(vec![scalar.clone()]),
+                Some(vec![scalar.clone(), scalar.clone()]),
+            ]),
+        );
+
+        // Rules that satisfy the interface contract make the call produce the primal outputs.
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&scalar),
+                &[primal_interface, forward_interface, backward_interface],
+            ),
+            Ok(vec![scalar.clone()]),
+        );
+
+        // Inference maps the primal boundary through *differential* types, so the cotangent boundary of an
+        // `f8e8m0fnu` primal is `f32` while the residual keeps its own storage type.
+        let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(Vec::new()));
+        let cotangent_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()));
+        let differential_primal_interface =
+            RegionInterface::new(vec![primal_type.clone()], vec![primal_type.clone()], Effects::PURE);
+        let differential_forward_interface = RegionInterface::new(
+            vec![primal_type.clone()],
+            vec![primal_type.clone(), scalar.clone()],
+            Effects::PURE,
+        );
+        let differential_backward_interface = RegionInterface::new(
+            vec![scalar.clone(), cotangent_type.clone()],
+            vec![cotangent_type],
+            Effects::PURE,
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&primal_type),
+                &[differential_primal_interface, differential_forward_interface, differential_backward_interface],
+            ),
+            Ok(vec![primal_type]),
+        );
+
+        // The backward interface must consume `(residuals..., output cotangents...)`; a single-input rule whose
+        // signature cannot line up with the forward residuals is rejected.
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&scalar),
+                &[
+                    sin_program(&scalar).interface(),
+                    sin_forward_program(&scalar).interface(),
+                    sin_program(&scalar).interface(),
+                ],
+            ),
+            Err(TypeError::invalid(
+                "custom_vjp backward input type signature mismatch: expected [f64[], f64[]] but got [f64[]]"
+                    .to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_custom_vjp_interprets_the_primal_program() {
+        let scalar = test_type(&[]);
+        let (operation, operation_regions) = custom_vjp_sin(&scalar);
+
+        // Interpretation replays the lean primal region only, so an un-differentiated call produces just the primal
+        // output and never pays for the forward region's residual computation.
+        let outputs = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .bind(operation, operation_regions, &[Array::scalar(2.0)])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_vjp_remains_opaque_to_partial_evaluation() {
+        // A call with an unknown operand residualizes unchanged instead of inlining its primal region, which is what
+        // keeps the custom rule attached to the residual program.
+        let scalar = test_type(&[]);
+        let (operation, operation_regions) = custom_vjp_sin(&scalar);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let region_ids = operation_regions
+            .iter()
+            .map(|region| builder.import_region(region.entry_region_ref()))
+            .collect::<Vec<_>>();
+        let input = builder.add_input(scalar.clone());
+        let output = builder.add_instruction(operation, region_ids, vec![input]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar)]).unwrap();
+
+        assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::CustomVjp(_)));
+    }
+
+    #[test]
+    fn test_custom_vjp_survives_batching_and_governs_the_batched_gradient() {
+        // The reverse-mode analogue of the custom-JVP batching test: the (deliberately tripled) custom backward rule
+        // governs the gradient through the batched call — mirroring JAX's `vmap`-of-`custom_vjp` semantics.
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
+                        &context,
+                        |item| {
+                            let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
+                            Ok(item
+                                .context()
+                                .bind(operation, operation_regions, &[item.clone()])?
+                                .into_iter()
+                                .next()
+                                .unwrap())
+                        },
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    mapped.reduce(&[0], ReductionKind::Sum)
+                },
+                Array::vector(vec![0.5, 1.0]),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[1], 3.0 * 1.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_vjp_governs_reverse_mode() {
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(
+                |x| {
+                    let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
+                    x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
+                },
+                Array::scalar(2.0),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        // The custom backward rule triples the true gradient, proving it is in control.
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_vjp_rejects_forward_mode() {
+        // A `custom_vjp` supplies no forward tangent program, so the tangent carrier its `jvp` rule stages cannot be
+        // executed. Forward mode must therefore fail with a user-facing custom-VJP error rather than leaking the
+        // carrier's internal vocabulary, matching JAX's "can't apply forward-mode autodiff to a custom_vjp function".
+        let result = EagerContext::<Array, ArrayOperation<Array>>::new().jvp(
+            |x| {
+                let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
+                Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
+            },
+            Array::scalar(2.0),
+            Array::scalar(1.0),
+        );
+        assert!(matches!(
+            result,
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "cannot apply forward-mode differentiation to a custom_vjp call; it supports only \
+                               reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or \
+                               'jacobian_reverse')",
+        ));
+    }
+
+    #[test]
+    fn test_custom_vjp_supports_multiple_outputs() {
+        // A two-output custom VJP exercises the forward region's output/residual split: its leading values are the
+        // primal outputs and the rest are residuals, and the backward region consumes one cotangent per output. The
+        // deliberately wrong rule scales the first output's contribution by 2 and the second's by 3, so seeding one
+        // output cotangent at a time isolates each term of the custom backward.
+        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                Ok(((x.sin()?, x.cos()?), (x.cos()?, x.sin()?)))
+            },
+            |(cosine, sine): (
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            ),
+             (first, second)| {
+                let from_first = cosine * first;
+                let from_second = sine * second;
+                Ok(from_first.clone()
+                    + from_first
+                    + from_second.clone()
+                    + from_second.clone()
+                    + from_second)
+            },
+        );
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let ((sine, cosine), pullback) = domain.vjp(|x| function.call(x), Array::scalar(0.5)).unwrap();
+        assert_abs_diff_eq!(sine.to_f64s()[0], 0.5f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(cosine.to_f64s()[0], 0.5f64.cos(), epsilon = 1e-9);
+
+        let first_cotangent = pullback.apply((Array::scalar(1.0), Array::scalar(0.0))).unwrap();
+        assert_abs_diff_eq!(first_cotangent.to_f64s()[0], 2.0 * 0.5f64.cos(), epsilon = 1e-9);
+        let second_cotangent = pullback.apply((Array::scalar(0.0), Array::scalar(1.0))).unwrap();
+        assert_abs_diff_eq!(second_cotangent.to_f64s()[0], 3.0 * 0.5f64.sin(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_vjp_pullback_applies_the_backward_program() {
+        // First-order reverse mode through a user custom VJP applies the user-supplied backward program. The
+        // reverse entry stages an opaque tangent carrier and the direct transpose replays the backward program forward
+        // into the pullback, so seeding the pullback at `[cotangent ++ residuals]` recovers `residual * cotangent`. The
+        // user backward defines the residual as `cos(x)`, so at `x = 0.7` and a unit cotangent the input cotangent is
+        // `cos(0.7)`.
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
+            |residual, cotangent| Ok(residual * cotangent),
+        );
+        let (_, pullback) = domain.vjp(|x| function.call(x), Array::scalar(0.7)).unwrap();
+        let (pullback, residuals) = pullback.into_parts();
+        let mut pullback_inputs = vec![Array::scalar(1.0)];
+        pullback_inputs.extend(residuals);
+        let input_cotangents = pullback.interpret(pullback_inputs).unwrap();
+        assert_abs_diff_eq!(input_cotangents[0].to_f64s()[0], 0.7f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_vjp_governs_the_reverse_jacobian() {
+        // `jacobian_reverse` interprets the pullback with batch-stacked cotangent bases, exercising the batched replay
+        // of the custom backward program. The Jacobian of elementwise `sin` with the tripled rule is the diagonal
+        // matrix `diag(3 * cos(x))`.
+        let vector = test_type(&[2]);
+        let jacobian = jacobian_reverse(
+            |x| {
+                let (operation, operation_regions) = custom_vjp_sin(&test_type(&[2]));
+                Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
+            },
+            Array::from_f64s(vector, vec![0.5, 1.0]),
+        )
+        .unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_abs_diff_eq!(block.value().values()[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[3], 3.0 * 1.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1315,26 +1638,25 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_derivative_wrappers_use_zero_space_boundaries() {
-        type ScalarContext = EagerContext<Scalar, ScalarOperation<Scalar>>;
-
-        let function = custom_jvp::<ScalarContext, _, _, _, _>(
-            |token: DomainTracer<ScalarContext>| Ok(token),
-            |token: DomainTracer<ScalarContext>, tangent| Ok((token, tangent)),
+    fn test_custom_jvp_wrapper_surfaces_rule_signature_mismatches() {
+        // Arity mismatches are compile-time errors under the structured signatures, but shape mismatches remain
+        // runtime concerns: this rule produces a scalar tangent for a vector-valued function, so the traced JVP
+        // program fails the signature validation that `CustomJvpOperation` performs at the call site.
+        let function = custom_jvp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, dx| {
+                Ok((x.sin()?, dx.dot(&dx, &DotDimensionNumbers::inner_product())))
+            },
         );
+        let error =
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), test_type(&[2])).unwrap_err();
         assert_eq!(
-            ScalarContext::new().jvp(|token| function.call(token), Scalar::Token, Scalar::Zero),
-            Ok((Scalar::Token, Scalar::Zero)),
+            error,
+            ProgramError::Type(TypeError::invalid(
+                "custom_jvp rule output type signature mismatch: expected [f64[2], f64[2]] but got [f64[2], f64[]]"
+                    .to_string(),
+            )),
         );
-
-        let function = custom_vjp::<ScalarContext, _, _, _, _, _, _>(
-            |token: DomainTracer<ScalarContext>| Ok(token),
-            |token: DomainTracer<ScalarContext>| Ok((token.clone(), token)),
-            |_residual: DomainTracer<ScalarContext>, cotangent| Ok(cotangent),
-        );
-        let (value, pullback) = ScalarContext::new().vjp(|token| function.call(token), Scalar::Token).unwrap();
-        assert_eq!(value, Scalar::Token);
-        assert_eq!(pullback.apply(Scalar::Zero), Ok(Scalar::Zero));
     }
 
     #[test]
@@ -1392,159 +1714,26 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_custom_vjp_wrapper_governs_reverse_mode() {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let function = custom_vjp::<EagerContext<Scalar, ScalarOperation<Scalar>>, _, _, _, _, _, _>(
-            |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.sin()?),
-            |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok((x.sin()?, x.cos()?)),
-            |residual, cotangent| {
-                let product = residual * cotangent;
-                Ok(product.clone() + product.clone() + product)
-            },
-        );
-        let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
-        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_custom_jvp_wrapper_surfaces_rule_signature_mismatches() {
-        // Arity mismatches are compile-time errors under the structured signatures, but shape mismatches remain
-        // runtime concerns: this rule produces a scalar tangent for a vector-valued function, so the traced JVP
-        // program fails the signature validation that `CustomJvpOperation` performs at the call site.
-        let function = custom_jvp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _>(
-            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
-            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, dx| {
-                Ok((x.sin()?, dx.dot(&dx, &DotDimensionNumbers::inner_product())))
-            },
-        );
-        let error =
-            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), test_type(&[2])).unwrap_err();
-        assert!(error.to_string().contains("custom_jvp rule output"));
-    }
-
-    #[test]
-    fn test_custom_jvp_batches_by_rewrapping_the_call() {
-        let scalar = test_type(&[]);
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |x| {
-                    let (operation, operation_regions) = custom_jvp_sin(&scalar);
-                    Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
-                },
-                Array::vector(vec![0.5, 1.0, 1.5]),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                None,
-            )
-            .unwrap();
-        for (actual, input) in output.to_f64s().iter().zip([0.5f64, 1.0, 1.5]) {
-            assert_abs_diff_eq!(*actual, input.sin(), epsilon = 1e-9);
-        }
-    }
-
-    #[test]
-    fn test_custom_jvp_survives_batching_and_governs_the_batched_gradient() {
-        use crate::batching::Batch;
-        use crate::differentiation::LinearizationTracer;
-        use crate::operations::math::{Reduce, ReductionKind};
-
-        // Differentiating *through* a batch of the custom call must still use the (deliberately doubled) custom
-        // rule: batching re-wraps the call around batched programs instead of inlining the primal, so the
-        // custom derivative survives `batch` — mirroring JAX's `vmap`-of-`custom_jvp` semantics.
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| {
-                    let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |item| {
-                            let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
-                            Ok(item
-                                .context()
-                                .bind(operation, operation_regions, &[item.clone()])?
-                                .into_iter()
-                                .next()
-                                .unwrap())
-                        },
-                        x,
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        None,
-                    )
-                    .unwrap();
-                    mapped.reduce(&[0], ReductionKind::Sum)
-                },
-                Array::vector(vec![0.5, 1.0]),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 0.5f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.to_f64s()[1], 2.0 * 1.0f64.cos(), epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_custom_vjp_survives_batching_and_governs_the_batched_gradient() {
-        use crate::batching::Batch;
-        use crate::differentiation::LinearizationTracer;
-        use crate::operations::math::{Reduce, ReductionKind};
-
-        // The reverse-mode analogue of the test above: the (deliberately tripled) custom backward rule governs the
-        // gradient through the batched call — mirroring JAX's `vmap`-of-`custom_vjp` semantics.
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| {
-                    let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |item| {
-                            let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
-                            Ok(item
-                                .context()
-                                .bind(operation, operation_regions, &[item.clone()])?
-                                .into_iter()
-                                .next()
-                                .unwrap())
-                        },
-                        x,
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        None,
-                    )
-                    .unwrap();
-                    mapped.reduce(&[0], ReductionKind::Sum)
-                },
-                Array::vector(vec![0.5, 1.0]),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.to_f64s()[1], 3.0 * 1.0f64.cos(), epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_user_custom_vjp_pullback_applies_the_user_backward_program() {
-        // First-order reverse mode through a user custom VJP applies the user-supplied backward program. The
-        // reverse entry stages an opaque tangent carrier and the direct transpose replays the backward program forward
-        // into the pullback, so seeding the pullback at `[cotangent ++ residuals]` recovers `residual * cotangent`. The
-        // user backward defines the residual as `cos(x)`, so at `x = 0.7` and a unit cotangent the input cotangent is
-        // `cos(0.7)`.
-        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+    fn test_custom_vjp_wrapper_supports_empty_residuals() {
+        // A forward rule that saves nothing (`RT = ()`) exercises the zero-residual carrier path: the backward rule
+        // depends only on the output cotangent, so the deliberately wrong `backward(cotangent) = 2 * cotangent` makes
+        // the gradient the constant `2` instead of `cos(x)`.
         let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
-            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
-            |residual, cotangent| Ok(residual * cotangent),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, ())),
+            |(), cotangent: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                Ok(cotangent.clone() + cotangent)
+            },
         );
-        let (_, pullback) = domain.vjp(|x| function.call(x), Array::scalar(0.7)).unwrap();
-        let (pullback, residuals) = pullback.into_parts();
-        let mut pullback_inputs = vec![Array::scalar(1.0)];
-        pullback_inputs.extend(residuals);
-        let input_cotangents = pullback.interpret(pullback_inputs).unwrap();
-        assert_abs_diff_eq!(input_cotangents[0].to_f64s()[0], 0.7f64.cos(), epsilon = 1e-9);
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(|x| function.call(x).unwrap(), Array::scalar(2.0))
+            .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0, epsilon = 1e-9);
     }
 
     #[test]
-    fn test_custom_vjp_batching_broadcasts_replicated_inputs() {
+    fn test_custom_vjp_wrapper_batching_broadcasts_replicated_inputs() {
         // Mapping only the first input exercises the replicated broadcast in the re-wrapping batch rule: the
         // unmapped operand is broadcast into the batch (the all-inputs-mapped-at-0 convention) and the batched call
         // still computes per-item products.
@@ -1569,5 +1758,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.to_f64s(), vec![10.0, 15.0, 20.0]);
+    }
+
+    #[test]
+    fn test_scalar_custom_vjp_wrapper_governs_reverse_mode() {
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let function = custom_vjp::<EagerContext<Scalar, ScalarOperation<Scalar>>, _, _, _, _, _, _>(
+            |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.sin()?),
+            |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok((x.sin()?, x.cos()?)),
+            |residual, cotangent| {
+                let product = residual * cotangent;
+                Ok(product.clone() + product.clone() + product)
+            },
+        );
+        let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
+        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_derivative_wrappers_use_zero_space_boundaries() {
+        type ScalarContext = EagerContext<Scalar, ScalarOperation<Scalar>>;
+
+        let function = custom_jvp::<ScalarContext, _, _, _, _>(
+            |token: DomainTracer<ScalarContext>| Ok(token),
+            |token: DomainTracer<ScalarContext>, tangent| Ok((token, tangent)),
+        );
+        assert_eq!(
+            ScalarContext::new().jvp(|token| function.call(token), Scalar::Token, Scalar::Zero),
+            Ok((Scalar::Token, Scalar::Zero)),
+        );
+
+        let function = custom_vjp::<ScalarContext, _, _, _, _, _, _>(
+            |token: DomainTracer<ScalarContext>| Ok(token),
+            |token: DomainTracer<ScalarContext>| Ok((token.clone(), token)),
+            |_residual: DomainTracer<ScalarContext>, cotangent| Ok(cotangent),
+        );
+        let (value, pullback) = ScalarContext::new().vjp(|token| function.call(token), Scalar::Token).unwrap();
+        assert_eq!(value, Scalar::Token);
+        assert_eq!(pullback.apply(Scalar::Zero), Ok(Scalar::Zero));
     }
 }

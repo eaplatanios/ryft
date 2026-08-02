@@ -1938,6 +1938,20 @@ and compile-fail gate remain separate review units. Verification passed all 1,10
 clean isolated snapshot against the advanced HEAD then revalidated all 1,107 core tests plus both macro integration and
 trybuild suites for the exact leaf diff.
 
+The third P8a prerequisite slice is complete. `WhileOperation<T>`, `RematerializeOperation<T>`,
+`CustomJvpOperation<T>`, `CustomVjpOperation<T>`, and the XLA-owned `JitCallOperation<T>` now carry their type universe
+nominally. Each concrete payload instantiation implements exactly one `Operation<T>` contract, while the existing
+generic inference, interpretation, PE, batching, JVP, transposition, region, and lowering implementations remain
+single shared rules. The array-to-composite while lift reconstructs only the payload's validated iteration-bound
+metadata; attached regions continue to live on the instruction. JIT calls retain two intentional instantiations:
+`JitCallOperation<ArrayType>` owns the reusable homogeneous batching contract, and
+`JitCallOperation<ArrayProgramType>` owns the executable composite call contract. No aliases, default type arguments,
+compatibility implementations, duplicated semantic rules, or new projection layers were introduced. The genuinely
+mixed/homogeneous dual payloads and compile-fail gate remain separate review units. Verification passed the complete
+`ryft-core` suite (1,107 tests), the complete `ryft-xla` library suite (433 passed, 1 intentional benchmark ignore),
+strict core doctests (52 passed, 16 intentionally ignored), both test-target checks, and both macro unit/integration
+and trybuild suites.
+
 ### Phase 8: enforce contracts and consolidate operation declarations
 
 - [x] Begin only after Phases 1 through 7 have removed implicit replay and overlapping mixed constructors. Capture the
@@ -1949,8 +1963,10 @@ trybuild suites for the exact leaf diff.
       compatibility alias or default type argument.
 - [x] Apply the proven pattern to the type-polymorphic leaf payloads (`OneLike`, `ZeroLike`, `Print`, `Tag`, and
       conversion), retaining constructor inference and one shared transform rule per semantic operation.
-- [ ] Apply the proven pattern to the remaining region/call and genuinely mixed dual-contract payloads before adding
-      `Operation::Type`. Each concrete payload instantiation must have exactly one contract.
+- [x] Apply the proven pattern to the remaining region/call payloads (`While`, rematerialization, custom JVP/VJP, and
+      XLA JIT call). Each concrete payload instantiation now has exactly one contract.
+- [ ] Resolve the genuinely mixed/homogeneous dual-contract payloads before adding `Operation::Type`. Each concrete
+      payload instantiation must have exactly one contract without duplicating semantics.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
       `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
       `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and
