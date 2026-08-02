@@ -11,7 +11,7 @@ pub use fill::Fill;
 pub use iota::{IOTA_OPERATION_NAME, Iota, IotaOperation};
 pub use one::{ONE_OPERATION_NAME, One, OneOperation};
 pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation};
-pub use zero::{ZERO_OPERATION_NAME, Zero, ZeroOperation};
+pub use zero::{ZERO_OPERATION_NAME, Zero, ZeroOperation, ZeroOperationProvider};
 pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 
 use crate::programs::identities::TypeIdentityPosition;

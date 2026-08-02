@@ -109,6 +109,23 @@ impl_non_differentiable_operation!(<T> ZeroOperation<T> where T: Type);
 impl_nullary_transposable_operation!(<T> ZeroOperation<T> where T: Type);
 impl_nullary_batchable_operation!(@replicated ZeroOperation<ArrayType>);
 
+/// Supplies the canonical zero [`Operation`] of a program type's operation family. [`Self::zero_operation`] covers
+/// zeros that can be constructed from a type without operands, which is all that staging and eager materialization
+/// need. Differentiation additionally must materialize zeros whose runtime geometry is unavailable from the type alone
+/// (e.g., disconnected cotangents with dynamic axes). That residual protocol is transform-owned and lives on
+/// [`ResidualZeroProvider`](crate::ResidualZeroProvider).
+pub trait ZeroOperationProvider<T: Type>: Operation<T> {
+    /// Constructs an [`Operation`] that materializes a zero of `r#type` without operands.
+    fn zero_operation(r#type: T) -> Result<Self, ProgramError>;
+}
+
+impl<T: Type, O: Operation<T> + From<ZeroOperation<T>>> ZeroOperationProvider<T> for O {
+    #[inline]
+    fn zero_operation(r#type: T) -> Result<Self, ProgramError> {
+        Ok(Self::from(ZeroOperation::new(r#type)))
+    }
+}
+
 /// Represents the ability to synthesize a _zero_ value for a given [`Type`] in an interpretation context. [`Zero`]
 /// is the [`Type`]-driven counterpart to [`ZeroLike`](super::ZeroLike). It is what [`ZeroOperation`] needs for its
 /// [`InterpretableOperation`] implementation, and it lives on the context because producing an eager value can be
@@ -130,10 +147,10 @@ where
     }
 }
 
-impl<C: StagingContext<Operation: From<ZeroOperation<C::Type>>>> Zero<Tracer<C>> for C {
+impl<C: StagingContext<Operation: ZeroOperationProvider<C::Type>>> Zero<Tracer<C>> for C {
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<Tracer<C>, ProgramError> {
-        let mut outputs = self.stage_nullary_operation(ZeroOperation::new(r#type.clone()))?;
+        let mut outputs = self.stage_nullary_operation(C::Operation::zero_operation(r#type.clone())?)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -143,11 +160,11 @@ impl<C: Context> Zero<PartialTracer<C>> for PartialEvaluationContext<C>
 where
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<ZeroOperation<C::Type>>,
+        + ZeroOperationProvider<C::Type>,
 {
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<PartialTracer<C>, ProgramError> {
-        let mut outputs = self.bind(ZeroOperation::new(r#type.clone()), Vec::new(), &[])?;
+        let mut outputs = self.bind(C::Operation::zero_operation(r#type.clone())?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
