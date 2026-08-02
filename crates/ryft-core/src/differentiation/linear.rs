@@ -138,11 +138,8 @@ pub trait ResidualZeroProvider<T: Type>: ZeroOperationProvider<T> {
 // residual protocol applies verbatim. Composite families without that conversion implement the protocol directly.
 impl<T: Type, O: Operation<T> + From<ZeroOperation<T>>> ResidualZeroProvider<T> for O {}
 
-// TODO(eaplatanios): Review this.
 /// Captures the runtime values needed to materialize a zero of `r#type` and validates the operation family's residual
-/// protocol.
-///
-/// [`ResidualZeroProvider::zero_residual_types`] declares the residual signature, while
+/// protocol. [`ResidualZeroProvider::zero_residual_types`] declares the residual signature, while
 /// [`ResidualZeroProvider::capture_zero_residual_values`] performs the operation-family-specific reads from `source`.
 /// This helper calls both and verifies that capture returns exactly the declared number and types of values, in the
 /// declared order. A disagreement is a malformed provider implementation and is reported as a
@@ -164,15 +161,12 @@ impl<T: Type, O: Operation<T> + From<ZeroOperation<T>>> ResidualZeroProvider<T> 
 ///   - `source`: Primal value whose runtime geometry determines the zero.
 ///   - `r#type`: Type of the zero that will eventually consume the captured residuals.
 ///   - `label`: Description of the capture site included in malformed-provider diagnostics.
-pub(crate) fn capture_and_validate_zero_residual_values<C: Context>(
+pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: ResidualZeroProvider<C::Type>>>(
     context: &C,
     source: &C::Value,
     r#type: &C::Type,
     label: &str,
-) -> Result<Vec<C::Value>, ProgramError>
-where
-    C::Operation: ResidualZeroProvider<C::Type>,
-{
+) -> Result<Vec<C::Value>, ProgramError> {
     let expected_types = C::Operation::zero_residual_types(r#type);
     let residuals = C::Operation::capture_zero_residual_values(context, source, r#type)?;
     if residuals.len() != expected_types.len() {
@@ -185,8 +179,11 @@ where
     for (index, (residual, expected_type)) in residuals.iter().zip(expected_types).enumerate() {
         if residual.r#type().as_ref() != &expected_type {
             return Err(ProgramError::MalformedProgram(format!(
-                "{label} zero residual {index} has type {} but expected {expected_type}",
+                "{} zero residual {} has type {} but expected {}",
+                label,
+                index,
                 residual.r#type(),
+                expected_type,
             )));
         }
     }
@@ -245,8 +242,11 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
         for (index, (residual, expected_type)) in residuals.iter().zip(expected_types).enumerate() {
             if residual.r#type().as_ref() != &expected_type {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "{label} zero residual {index} has type {} but expected {expected_type}",
+                    "{} zero residual {} has type {} but expected {}",
+                    label,
+                    index,
                     residual.r#type(),
+                    expected_type,
                 )));
             }
         }
