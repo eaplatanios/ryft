@@ -55,10 +55,12 @@ use crate::types::ArrayType;
 ///   2. **Capture:** While the primal value is still in scope, linearization records those residuals from it.
 ///      [`Self::capture_zero_residuals`] stages the reads into the program being built (i.e., the program-level
 ///      [`Program::linearize`](crate::Program::linearize) path), and [`Self::capture_zero_residual_values`] is its
-///      value-level counterpart for reusable pullback callables that close over concrete or tracer values. The captured
-///      residuals ride the tangent program's ordinary trailing residual suffix.
-///   3. **Spend:** During transposition, [`Self::add_zero_from_residuals`] stages the zero inside the pullback
-///      program, consuming exactly the residuals captured in step 2 as its explicit operands.
+///      value-level counterpart for reusable derivative callables that close over concrete or tracer values. Program
+///      transposition appends captured residuals to its ordinary trailing residual suffix. Reusable callables retain
+///      boundary-reconstruction residuals beside that executable program.
+///   3. **Spend:** [`Self::zero_operation_with_residuals`] assembles the zero operation and its operands from the
+///      captured residuals. Callers then stage that operation inside a pullback program or bind it in the originating
+///      [`Context`] of a reusable value-level derivative callable.
 ///
 /// The three steps must agree on residual count and order. Every mismatch is a loud typed error (the capture sites
 /// validate against the declared types, and the spend site validates the residual count), never a silently wrong-shaped
@@ -67,11 +69,12 @@ use crate::types::ArrayType;
 /// # Who Implements It
 ///
 /// Almost nobody needs to implement this trait, by design. Every operation family with an input-free zero (i.e., every
-/// family with a `From<ZeroOperation<T>>` conversion) receives the whole protocol through a blanket implementation that
-/// declares nothing, captures nothing, and spends by constructing the type-only zero (i.e., the fail-loud default
+/// family with a `From<ZeroOperation<T>>` conversion) receives the whole protocol through a blanket implementation
+/// that declares nothing, captures nothing, and spends by constructing the type-only zero (i.e., the fail-loud default
 /// rejects unexpected residuals rather than ignoring them, so a mismatched linearize/transpose pairing cannot be
 /// silently accepted). Only families whose zero genuinely consumes runtime-geometry operands (e.g., the composite
-/// program family and its XLA counterpart) override all four methods coherently.
+/// program family and its XLA counterpart) override the declaration, capture, and operation-assembly functions. Every
+/// spending path reuses that shared assembly.
 ///
 /// [`LinearCallOperation`] below is this protocol's sibling. It retains residual geometry for the transpose of a
 /// *non-trivial* residual-parameterized linear map by attaching explicit forward/transpose regions to an instruction,
@@ -81,9 +84,10 @@ use crate::types::ArrayType;
 /// into primal operation payloads.
 pub trait ResidualZeroProvider<T: Type>: ZeroOperationProvider<T> {
     /// Returns the types of the residual values that a zero of `r#type` needs, in the exact order in which
-    /// [`Self::capture_zero_residuals`] captures them and [`Self::add_zero_from_residuals`] consumes them. Input-free
-    /// [`Operation`] families use the empty default. The array-dimension composite family returns one dimension type
-    /// per _distinct_ dynamic identity of `r#type`, in first-occurrence order, so repeated axes share one residual.
+    /// [`Self::capture_zero_residuals`] captures them and [`Self::zero_operation_with_residuals`] consumes them.
+    /// Input-free [`Operation`] families use the empty default. The array-dimension composite family returns one
+    /// dimension type per _distinct_ dynamic identity of `r#type`, in first-occurrence order, so repeated axes share
+    /// one residual.
     #[inline]
     fn zero_residual_types(_type: &T) -> Vec<T> {
         Vec::new()
@@ -116,28 +120,219 @@ pub trait ResidualZeroProvider<T: Type>: ZeroOperationProvider<T> {
         Ok(Vec::new())
     }
 
-    /// Stages a zero of `r#type` into `builder`, consuming the `residuals` captured by [`Self::capture_zero_residuals`]
-    /// as its explicit operands, in declaration order. Transposition calls this inside the pullback program, where the
-    /// primal that supplied the residuals is no longer an input.
-    fn add_zero_from_residuals<V: Value<Type = T>>(
-        builder: &mut ProgramBuilder<V, Self>,
-        r#type: T,
-        residuals: &[AtomId],
-    ) -> Result<AtomId, ProgramError> {
-        // The default represents genuinely input-free zero families. Rejecting residuals rather than ignoring them
-        // keeps a mismatched linearization/transposition boundary from being silently accepted.
+    /// Returns the canonical zero operation for `r#type` and expands `residuals` into its operand order. The default
+    /// represents an input-free zero operation. Families whose zero consumes runtime geometry override this function
+    /// so that value-level binding, residualization, and builder-level staging share one operation assembly.
+    #[inline]
+    fn zero_operation_with_residuals<R: Clone>(r#type: T, residuals: &[R]) -> Result<(Self, Vec<R>), ProgramError> {
         if !residuals.is_empty() {
             return Err(ProgramError::InvalidArgument {
                 message: format!("input-free zero expected 0 residuals but got {}", residuals.len()),
             });
         }
-        Ok(builder.add_instruction(Self::zero_operation(r#type)?, Vec::new(), Vec::new())?[0])
+        Ok((Self::zero_operation(r#type)?, Vec::new()))
     }
 }
 
 // Every operation family that absorbs a type-only `ZeroOperation` has an input-free zero, and so the defaulted
 // residual protocol applies verbatim. Composite families without that conversion implement the protocol directly.
 impl<T: Type, O: Operation<T> + From<ZeroOperation<T>>> ResidualZeroProvider<T> for O {}
+
+// TODO(eaplatanios): Review this.
+/// Captures the runtime values needed to materialize a zero of `r#type` and validates the operation family's residual
+/// protocol.
+///
+/// [`ResidualZeroProvider::zero_residual_types`] declares the residual signature, while
+/// [`ResidualZeroProvider::capture_zero_residual_values`] performs the operation-family-specific reads from `source`.
+/// This helper calls both and verifies that capture returns exactly the declared number and types of values, in the
+/// declared order. A disagreement is a malformed provider implementation and is reported as a
+/// [`ProgramError::MalformedProgram`] before the residuals can construct a zero with incorrect runtime geometry.
+///
+/// For example, suppose `r#type` is `zero[n, n, m]` and `source` is the corresponding primal array. A composite array
+/// provider declares one dimension residual per distinct dynamic identity, `[dimension(n), dimension(m)]`, and captures
+/// the runtime extents `[n, m]` from the first source axis carrying each identity. This helper validates those two
+/// captured values. Later, [`ResidualZeroProvider::zero_operation_with_residuals`] expands them into the per-axis
+/// operand order `[n, n, m]`. A static zero declares and captures no residuals.
+///
+/// This function neither chooses which geometry to retain nor constructs the zero; those responsibilities belong to
+/// the operation family. It only enforces the declaration/capture contract for concrete or tracer [`Value`]s. The
+/// program-level [`AtomId`] capture path performs the corresponding validation where its atoms are staged.
+///
+/// # Parameters
+///
+///   - `context`: Context in which the provider reads residual values from `source`.
+///   - `source`: Primal value whose runtime geometry determines the zero.
+///   - `r#type`: Type of the zero that will eventually consume the captured residuals.
+///   - `label`: Description of the capture site included in malformed-provider diagnostics.
+pub(crate) fn capture_and_validate_zero_residual_values<C: Context>(
+    context: &C,
+    source: &C::Value,
+    r#type: &C::Type,
+    label: &str,
+) -> Result<Vec<C::Value>, ProgramError>
+where
+    C::Operation: ResidualZeroProvider<C::Type>,
+{
+    let expected_types = C::Operation::zero_residual_types(r#type);
+    let residuals = C::Operation::capture_zero_residual_values(context, source, r#type)?;
+    if residuals.len() != expected_types.len() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "{label} captured {} zero residuals but declared {}",
+            residuals.len(),
+            expected_types.len(),
+        )));
+    }
+    for (index, (residual, expected_type)) in residuals.iter().zip(expected_types).enumerate() {
+        if residual.r#type().as_ref() != &expected_type {
+            return Err(ProgramError::MalformedProgram(format!(
+                "{label} zero residual {index} has type {} but expected {expected_type}",
+                residual.r#type(),
+            )));
+        }
+    }
+    Ok(residuals)
+}
+
+// TODO(eaplatanios): Review this.
+/// Runtime-geometry residuals used to reconstruct the zero-space leaves omitted from one compact derivative boundary.
+///
+/// Let a flattened primal boundary have leaf types `T₁, …, Tₙ`, and let `D(Tᵢ)` denote the corresponding tangent or
+/// cotangent type. When `D(Tᵢ)` is a _zero space_, it contains exactly one value, `0ᵢ`, so the executable derivative
+/// [`Program`](crate::Program) omits that leaf entirely: carrying an SSA input or output for a value that cannot vary
+/// would add IR and ABI overhead without conveying information. A public [`Pushforward`](crate::Pushforward) or
+/// [`Pullback`](crate::Pullback) must still reconstruct `0ᵢ` when it rebuilds the complete user-facing boundary.
+///
+/// Static zeros can be constructed from their types alone. Dynamic zeros cannot. For example, the cotangent of a
+/// primal `u64[n]` array has type `zero[n]`; the type records the identity and bounds of `n`, but not its runtime
+/// extent. While the primal value is available, linearization therefore captures the minimal runtime geometry declared
+/// by [`ResidualZeroProvider::zero_residual_types`] (e.g., the concrete value of `n`). This type stores the flattened
+/// concatenation of those captured values in primal-leaf order. [`Self::rebuild`] later partitions that sequence by
+/// leaf, materializes each omitted `0ᵢ`, and interleaves it with the live derivative values produced by the compact
+/// program.
+///
+/// These are **boundary reconstruction residuals**, not ordinary executable-program residuals. They are retained beside
+/// the reusable derivative callable and are consumed only while restoring its public boundary; they never become
+/// otherwise-unused inputs of the derivative program. The wrapper keeps their ordering, counts, and types validated so
+/// a raw `Vec<V>` cannot be accidentally confused with the program's own residual suffix.
+pub(crate) struct ZeroSpaceBoundaryResiduals<V: Value>(Vec<V>);
+
+impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryResiduals<V> {
+    /// Consumes these boundary residuals and returns their flattened values.
+    pub(crate) fn into_values(self) -> Vec<V> {
+        self.0
+    }
+
+    /// Validates and wraps residual values in boundary-leaf and provider-declaration order.
+    pub(crate) fn new<O: ResidualZeroProvider<V::Type>, DifferentialType: Fn(&V::Type) -> V::Type>(
+        label: &str,
+        primal_types: &[V::Type],
+        residuals: Vec<V>,
+        differential_type: DifferentialType,
+    ) -> Result<Self, ProgramError> {
+        let expected_types = primal_types
+            .iter()
+            .map(differential_type)
+            .filter(DifferentiableType::is_zero_space)
+            .flat_map(|r#type| O::zero_residual_types(&r#type))
+            .collect::<Vec<_>>();
+        if residuals.len() != expected_types.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "{label} has {} zero residuals but its boundary requires {}",
+                residuals.len(),
+                expected_types.len(),
+            )));
+        }
+        for (index, (residual, expected_type)) in residuals.iter().zip(expected_types).enumerate() {
+            if residual.r#type().as_ref() != &expected_type {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "{label} zero residual {index} has type {} but expected {expected_type}",
+                    residual.r#type(),
+                )));
+            }
+        }
+        Ok(Self(residuals))
+    }
+
+    /// Captures the runtime geometry needed to rebuild every zero-space leaf of a primal boundary.
+    pub(crate) fn capture<C, DifferentialType>(
+        context: &C,
+        primal_values: &[C::Value],
+        primal_types: &[C::Type],
+        differential_type: DifferentialType,
+        label: &str,
+    ) -> Result<Self, ProgramError>
+    where
+        C: Context<Value = V, Type = V::Type>,
+        C::Operation: ResidualZeroProvider<C::Type>,
+        DifferentialType: Fn(&C::Type) -> C::Type,
+    {
+        if primal_values.len() != primal_types.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "{label} has {} primal values but {} primal types",
+                primal_values.len(),
+                primal_types.len(),
+            )));
+        }
+        let mut residuals = Vec::new();
+        for (value, primal_type) in primal_values.iter().zip(primal_types) {
+            let r#type = differential_type(primal_type);
+            if r#type.is_zero_space() {
+                residuals.extend(capture_and_validate_zero_residual_values(context, value, &r#type, label)?);
+            }
+        }
+        Ok(Self(residuals))
+    }
+
+    /// Rebuilds a complete differential boundary by interleaving materialized zero-space leaves with `live_values`.
+    pub(crate) fn rebuild<C, DifferentialType>(
+        &self,
+        context: &C,
+        primal_types: &[C::Type],
+        differential_type: DifferentialType,
+        live_values: impl IntoIterator<Item = C::Value>,
+        label: &str,
+    ) -> Result<Vec<C::Value>, ProgramError>
+    where
+        C: Context<Value = V, Type = V::Type>,
+        C::Operation: ResidualZeroProvider<C::Type>,
+        DifferentialType: Fn(&C::Type) -> C::Type,
+    {
+        let mut live_values = live_values.into_iter();
+        let mut next_zero_residual = 0_usize;
+        let mut values = Vec::with_capacity(primal_types.len());
+        for primal_type in primal_types {
+            let r#type = differential_type(primal_type);
+            if r#type.is_zero_space() {
+                let residual_count = C::Operation::zero_residual_types(&r#type).len();
+                let residual_end = next_zero_residual.checked_add(residual_count).ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!("{label} zero residual count overflows usize"))
+                })?;
+                let residuals = self
+                    .0
+                    .get(next_zero_residual..residual_end)
+                    .ok_or_else(|| ProgramError::MalformedProgram(format!("{label} has too few zero residuals")))?;
+                next_zero_residual = residual_end;
+                let (operation, operands) = C::Operation::zero_operation_with_residuals(r#type, residuals)?;
+                let mut outputs = context.bind(operation, Vec::new(), operands.as_slice())?;
+                check_count!("output", outputs, 1, ProgramError);
+                values.push(outputs.remove(0));
+            } else {
+                values.push(live_values.next().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!("{label} omitted a nonzero differential value"))
+                })?);
+            }
+        }
+        if next_zero_residual != self.0.len() {
+            return Err(ProgramError::MalformedProgram(format!("{label} has unused zero residuals")));
+        }
+        if live_values.next().is_some() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "{label} produced too many nonzero differential values",
+            )));
+        }
+        Ok(values)
+    }
+}
 
 /// Interface form implemented by a [`LinearCallOperation`].
 #[derive(Clone, Debug, PartialEq)]
@@ -878,8 +1073,10 @@ mod tests {
             Ok(Vec::new()),
         );
 
-        // Spending no residuals stages the type-only zero.
-        let zero = ArrayOperation::<Array>::add_zero_from_residuals(&mut builder, r#type.clone(), &[]).unwrap();
+        // Spending no residuals assembles the type-only zero, which the transposition path stages normally.
+        let (operation, operands) =
+            ArrayOperation::<Array>::zero_operation_with_residuals(r#type.clone(), &[] as &[AtomId]).unwrap();
+        let zero = builder.add_instruction(operation, Vec::new(), operands).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(program.interpret(vec![Array::scalar(3.0)]), Ok(vec![Array::scalar(0.0)]));
@@ -889,7 +1086,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let residual = builder.add_input(r#type.clone());
         assert_eq!(
-            ArrayOperation::<Array>::add_zero_from_residuals(&mut builder, r#type, &[residual]).map(|_| ()),
+            ArrayOperation::<Array>::zero_operation_with_residuals(r#type, &[residual]).map(|_| ()),
             Err(ProgramError::InvalidArgument {
                 message: "input-free zero expected 0 residuals but got 1".to_string(),
             }),
