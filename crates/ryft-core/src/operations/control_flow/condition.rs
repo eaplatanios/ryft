@@ -18,7 +18,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::constants::{Zero, ZeroOperationProvider};
 use crate::operations::control_flow::{Select, SelectOperation};
 use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
@@ -261,7 +261,7 @@ impl<V, O, C> PartiallyEvaluatableOperation<C> for ConditionOperation<V>
 where
     V: Value + Concretizable<bool>,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
-    O: Operation<V::Type> + From<ConditionOperation<V>> + From<ZeroOperation<V::Type>>,
+    O: Operation<V::Type> + From<ConditionOperation<V>> + ZeroOperationProvider<V::Type>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -415,7 +415,7 @@ fn split_condition_by_knownness<V, O, C, D: PartialEvaluationDriver<C>>(
 where
     V: Value,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
-    O: Operation<V::Type> + From<ConditionOperation<V>> + From<ZeroOperation<V::Type>>,
+    O: Operation<V::Type> + From<ConditionOperation<V>> + ZeroOperationProvider<V::Type>,
 {
     let true_branch = driver.region(0)?;
     let false_branch = driver.region(1)?;
@@ -576,7 +576,7 @@ where
         }
         let mut zero_atoms = Vec::with_capacity(other.edge_types.len());
         for edge_type in other.edge_types.iter() {
-            let zeros = builder.add_instruction(ZeroOperation::new(edge_type.clone()), Vec::new(), Vec::new())?;
+            let zeros = builder.add_instruction(O::zero_operation(edge_type.clone())?, Vec::new(), Vec::new())?;
             check_count!("output", zeros, 1, ProgramError);
             zero_atoms.push(zeros[0]);
         }
@@ -1001,7 +1001,7 @@ where
 impl<C: Context<Type: ConditionTypeSemantics + DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
     for ConditionOperation<C::Constant>
 where
-    C::Operation: From<ZeroOperation<C::Type>> + From<ConditionOperation<C::Constant>>,
+    C::Operation: ZeroOperationProvider<C::Type> + From<ConditionOperation<C::Constant>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -1061,7 +1061,7 @@ where
 impl<V, O> TransposableOperation<V, O> for ConditionOperation<V>
 where
     V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
-    O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<ConditionOperation<V>>,
+    O: Operation<V::Type> + ZeroOperationProvider<V::Type> + From<ConditionOperation<V>>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1114,7 +1114,7 @@ pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
     V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
-    O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<ConditionOperation<V>>,
+    O: Operation<V::Type> + ZeroOperationProvider<V::Type> + From<ConditionOperation<V>>,
 {
     // A condition with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {

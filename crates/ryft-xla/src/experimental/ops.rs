@@ -17,13 +17,13 @@ use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, Dot
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{ConstantOperation, OneLikeOperation, ZeroLikeOperation};
-use ryft_core::operations::constants::{IotaOperation, OneOperation, Zero, ZeroOperation};
+use ryft_core::operations::constants::{IotaOperation, OneOperation, Zero, ZeroOperation, ZeroOperationProvider};
 use ryft_core::operations::control_flow::SelectOperation;
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use ryft_core::operations::dimensions::{
-    DimensionFromScalarOperation, DimensionSizeOperation, DimensionToScalarOperation,
+    DimensionFromScalarOperation, DimensionRequirementOperation, DimensionSizeOperation, DimensionToScalarOperation,
 };
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
@@ -67,7 +67,7 @@ use ryft_core::operations::tag::TagOperation;
 use ryft_core::programs::types::{Type, TypeError, Typed};
 use ryft_core::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
-use ryft_core::types::{ArrayProgramType, ArrayType, DimensionType, DimensionVariable};
+use ryft_core::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, DimensionVariable};
 
 use crate::experimental::operations::ShardMapOperation;
 
@@ -88,11 +88,10 @@ pub enum XlaOperation<C = XlaConstant>
 where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    /// Generic composite zero used by transform machinery.
-    Zero(ZeroOperation<ArrayProgramType>),
-
-    /// Mixed zero constructor with explicit dynamic-extent operands.
-    DynamicZero(ZeroOperation<ArrayType>),
+    /// Mixed zero constructor whose explicit first-class dimension operands provide its dynamic result extents.
+    /// This variant cannot be represented by the homogeneous array member because its signature consumes both
+    /// dimension members and produces an array member.
+    Zero(ZeroOperation<ArrayType>),
 
     /// Mixed one constructor with explicit dynamic-extent operands.
     DynamicOne(OneOperation<ArrayType>),
@@ -185,7 +184,10 @@ where
 {
     #[inline]
     fn from(operation: ArrayOperation<C::Projected>) -> Self {
-        Self::Array(operation)
+        match operation {
+            ArrayOperation::Zero(operation) => ArrayProgramOperation::<C::Projected>::from(operation).into(),
+            operation => Self::Array(operation),
+        }
     }
 }
 
@@ -196,7 +198,6 @@ where
     fn from(operation: ArrayProgramOperation<C::Projected>) -> Self {
         match operation {
             ArrayProgramOperation::Zero(operation) => Self::Zero(operation),
-            ArrayProgramOperation::DynamicZero(operation) => Self::DynamicZero(operation),
             ArrayProgramOperation::DynamicOne(operation) => Self::DynamicOne(operation),
             ArrayProgramOperation::DynamicIota(operation) => Self::DynamicIota(operation),
             ArrayProgramOperation::Array(operation) => Self::Array(operation),
@@ -241,6 +242,16 @@ where
             }
             ArrayProgramOperation::LinearCall(operation) => Self::LinearCall(operation),
         }
+    }
+}
+
+impl<C> From<DimensionRequirementOperation> for XlaOperation<C>
+where
+    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: DimensionRequirementOperation) -> Self {
+        Self::Dimension(DimensionOperation::Requirement(operation))
     }
 }
 
@@ -362,7 +373,6 @@ macro_rules! impl_composite_operation_conversion {
 }
 
 impl_composite_operation_conversion!(
-    ZeroOperation<ArrayProgramType>,
     ZeroOperation<ArrayType>,
     OneOperation<ArrayType>,
     IotaOperation<ArrayType>,
@@ -477,6 +487,43 @@ where
     type Projected = DimensionOperation<DimensionValue>;
 }
 
+impl<Capture> ZeroOperationProvider<ArrayProgramType> for XlaOperation<Capture>
+where
+    Capture: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    fn zero_operation(r#type: ArrayProgramType) -> Result<Self, ProgramError> {
+        Ok(ArrayProgramOperation::<Capture::Projected>::zero_operation(r#type)?.into())
+    }
+
+    fn transposition_zero_residual_types(r#type: &ArrayProgramType) -> Vec<ArrayProgramType> {
+        ArrayProgramOperation::<Capture::Projected>::transposition_zero_residual_types(r#type)
+    }
+
+    fn capture_transposition_zero_residuals<V: Value<Type = ArrayProgramType>>(
+        builder: &mut ProgramBuilder<V, Self>,
+        source: ryft_core::AtomId,
+        r#type: &ArrayProgramType,
+    ) -> Result<Vec<ryft_core::AtomId>, ProgramError> {
+        ArrayProgramOperation::<Capture::Projected>::capture_transposition_zero_residuals(builder, source, r#type)
+    }
+
+    fn capture_transposition_zero_values<C: Context<Type = ArrayProgramType, Operation = Self>>(
+        context: &C,
+        source: &C::Value,
+        r#type: &ArrayProgramType,
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        ArrayProgramOperation::<Capture::Projected>::capture_transposition_zero_values(context, source, r#type)
+    }
+
+    fn add_transposition_zero<V: Value<Type = ArrayProgramType>>(
+        builder: &mut ProgramBuilder<V, Self>,
+        r#type: ArrayProgramType,
+        residuals: &[ryft_core::AtomId],
+    ) -> Result<ryft_core::AtomId, ProgramError> {
+        ArrayProgramOperation::<Capture::Projected>::add_transposition_zero(builder, r#type, residuals)
+    }
+}
+
 impl<C> XlaOperation<C>
 where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -490,7 +537,6 @@ where
     pub(crate) fn to_core_operation(&self) -> Option<ArrayProgramOperation<C::Projected>> {
         Some(match self {
             Self::Zero(operation) => ArrayProgramOperation::Zero(operation.clone()),
-            Self::DynamicZero(operation) => ArrayProgramOperation::DynamicZero(operation.clone()),
             Self::DynamicOne(operation) => ArrayProgramOperation::DynamicOne(operation.clone()),
             Self::DynamicIota(operation) => ArrayProgramOperation::DynamicIota(operation.clone()),
             Self::Array(operation) => ArrayProgramOperation::Array(operation.clone()),
@@ -547,7 +593,6 @@ macro_rules! dispatch_operation {
     ($operation:expr, $method:ident $(, $argument:expr)* $(,)?) => {
         match $operation {
             XlaOperation::Zero(operation) => operation.$method($($argument),*),
-            XlaOperation::DynamicZero(operation) => operation.$method($($argument),*),
             XlaOperation::DynamicOne(operation) => operation.$method($($argument),*),
             XlaOperation::DynamicIota(operation) => operation.$method($($argument),*),
             XlaOperation::Array(operation) => operation.$method($($argument),*),
@@ -1145,6 +1190,60 @@ where
     }
 }
 
+/// Returns a tracer for `cotangent`, materializing a structural zero through the canonical XLA representation when a
+/// higher-order transpose call requires an ordinary SSA operand. Dynamic array zeros read their extent operands from
+/// the known dimension inputs of the differentiated call; they are never reconstructed from type metadata.
+pub(crate) fn materialize_transpose_cotangent<
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+>(
+    context: &TracingContext<V, XlaOperation<V>>,
+    cotangent: &MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>,
+    output_type: &ArrayProgramType,
+    inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
+) -> Result<Tracer<TracingContext<V, XlaOperation<V>>>, ProgramError> {
+    if let MaybeZero::Value(cotangent) = cotangent {
+        return Ok(cotangent.clone());
+    }
+
+    let (operation, operands) = match output_type {
+        ArrayProgramType::Array(array_type)
+            if array_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) =>
+        {
+            // The generic input-free provider cannot construct a reference-bearing array zero. Resolve each dynamic
+            // axis from the known dimension inputs and pass those extents through the mixed zero operation instead.
+            let operands = array_type
+                .shape()
+                .dimensions()
+                .iter()
+                .filter_map(Dimension::variable)
+                .map(|variable| {
+                    inputs
+                        .iter()
+                        .filter_map(PartialValue::as_known)
+                        .find(|input| {
+                            matches!(
+                                input.r#type().as_ref(),
+                                ArrayProgramType::Dimension(r#type) if r#type.variable() == variable
+                            )
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "cannot materialize dynamic transpose cotangent of type {output_type} because no known \
+                                 dimension input defines '{variable}'",
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (XlaOperation::from(ZeroOperation::new(array_type.clone())), operands)
+        }
+        _ => (XlaOperation::zero_operation(output_type.clone())?, Vec::new()),
+    };
+    let mut outputs = context.stage_operation(operation, Vec::new(), operands.as_slice())?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
+}
+
 /// Partition-aware transpose rule for a *primal* tangent [`JitCallOperation`], the jitted-call counterpart of
 /// [`transpose_primal_condition`](ryft_core::operations::control_flow::transpose_primal_condition),
 /// [`transpose_primal_scan`](ryft_core::operations::control_flow::transpose_primal_scan), and
@@ -1223,14 +1322,7 @@ pub fn transpose_primal_jit_call<
     check_count!("output", outputs, output_types.len(), ProgramError);
     let mut operands = Vec::with_capacity(output_types.len() + known_values.len());
     for (cotangent, output_type) in outputs.iter().zip(output_types.iter()) {
-        match cotangent {
-            MaybeZero::Value(cotangent) => operands.push(cotangent.clone()),
-            MaybeZero::Zero(_) => {
-                let mut zeros = context.stage_nullary_operation(ZeroOperation::new(output_type.cotangent()))?;
-                check_count!("output", zeros, 1, ProgramError);
-                operands.push(zeros.remove(0));
-            }
-        }
+        operands.push(materialize_transpose_cotangent(context, cotangent, &output_type.cotangent(), inputs)?);
     }
     operands.extend(known_values);
     let transposed_call = XlaOperation::JitCall(JitCallOperation::new());
@@ -1281,6 +1373,7 @@ mod tests {
     use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};
+    use ryft_core::operations::constants::ZeroOperation;
     use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
     use ryft_core::operations::dimensions::DimensionFromScalarOperation;
     use ryft_core::operations::manipulation::BroadcastOperation;
@@ -1301,7 +1394,7 @@ mod tests {
 
     use super::{
         JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder,
-        transpose_primal_jit_call,
+        materialize_transpose_cotangent, transpose_primal_jit_call,
     };
 
     /// Test-only driver that exposes one source callee and returns a predetermined transpose for it.
@@ -1358,6 +1451,44 @@ mod tests {
                     && operation.length() == &Dimension::Static(5)
                     && operation.reverse()
         ));
+
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let zero: XlaOperation<XlaConstant> = ArrayOperation::Zero(ZeroOperation::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent)]),
+        )))
+        .into();
+        assert!(matches!(zero, XlaOperation::Zero(_)));
+    }
+
+    #[test]
+    fn test_xla_dynamic_disconnected_pullback_uses_explicit_extent_residual() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut builder = XlaProgramBuilder::new();
+        builder.add_input(dynamic_type.into());
+        let scalar = builder.add_input(scalar_type.into());
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![scalar],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The XLA operation family preserves the core transform contract: only the runtime extent crosses the
+        // residual boundary, and the mixed zero consumes it when the disconnected cotangent is materialized.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert!(matches!(
+            linearization.primal().instructions().last().unwrap().operation(),
+            XlaOperation::DimensionSize(_)
+        ));
+        let pullback = linearization.pullback().unwrap();
+        let zero = pullback.instructions().last().unwrap();
+        assert!(matches!(zero.operation(), XlaOperation::Zero(_)));
+        assert_eq!(zero.inputs(), &[ryft_core::AtomId::new(1)]);
     }
 
     #[test]
@@ -1546,6 +1677,34 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
+    }
+
+    #[test]
+    fn test_jit_call_dynamic_zero_transpose_uses_known_extent_operand() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let output_type = ArrayProgramType::Array(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+        ));
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let extent = context.input(extent_type.into());
+
+        let zero = materialize_transpose_cotangent(
+            &context,
+            &MaybeZero::Zero(output_type.clone()),
+            &output_type,
+            &[PartialValue::Known(extent)],
+        )
+        .unwrap();
+
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected one dynamic zero instruction");
+        };
+        assert!(matches!(instruction.operation(), XlaOperation::Zero(_)));
+        assert_eq!(instruction.inputs(), &[ryft_core::AtomId::new(0)]);
+        assert_eq!(zero.atom_id().unwrap(), instruction.outputs()[0]);
     }
 
     #[test]

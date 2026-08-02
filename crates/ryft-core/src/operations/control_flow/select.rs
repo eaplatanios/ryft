@@ -8,7 +8,7 @@ use crate::differentiation::forward::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::ElementwiseOperation;
-use crate::operations::constants::{Zero, ZeroLikeOperation, ZeroOperation};
+use crate::operations::constants::{Zero, ZeroLikeOperation, ZeroOperationProvider};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
@@ -193,7 +193,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V::Type: DifferentiableType,
-        O: From<ZeroLikeOperation> + From<ZeroOperation<V::Type>> + From<SelectOperation>,
+        O: From<ZeroLikeOperation> + ZeroOperationProvider<V::Type> + From<SelectOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, context, _driver, inputs, outputs| {

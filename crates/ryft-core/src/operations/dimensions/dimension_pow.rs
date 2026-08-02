@@ -2,7 +2,7 @@ use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_di
 use crate::parameters::Parameter;
 use crate::types::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
 
-use super::{bounds_overflow, checked_power, representable_extent_range};
+use super::{bounds_overflow, checked_power, maximum_extent, representable_extent_range};
 
 /// Canonical operation name for [`DimensionPowOperation`].
 pub const DIMENSION_POW_OPERATION_NAME: &str = "dimension_pow";
@@ -17,6 +17,12 @@ define_arithmetic_dimension_operation!(
         format!("{} ^ {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
+    requires_runtime_assertion = |left: &DimensionType, right: &DimensionType| {
+        maximum_extent(left)
+            .zip(maximum_extent(right))
+            .and_then(|(left, right)| checked_power(left, right))
+            .is_none_or(|result| result > MAX_DIMENSION_EXTENT)
+    },
 );
 
 define_arithmetic_dimension_capability!(

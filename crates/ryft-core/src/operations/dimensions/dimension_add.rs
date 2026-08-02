@@ -5,7 +5,7 @@ use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError};
 use crate::types::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
 
-use super::{bounds_overflow, representable_extent_range};
+use super::{bounds_overflow, maximum_extent, representable_extent_range};
 
 /// Canonical operation name for [`DimensionAddOperation`].
 pub const DIMENSION_ADD_OPERATION_NAME: &str = "dimension_add";
@@ -20,6 +20,12 @@ define_arithmetic_dimension_operation!(
         format!("{} + {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
+    requires_runtime_assertion = |left: &DimensionType, right: &DimensionType| {
+        maximum_extent(left)
+            .zip(maximum_extent(right))
+            .and_then(|(left, right)| left.checked_add(right))
+            .is_none_or(|result| result > MAX_DIMENSION_EXTENT)
+    },
 );
 
 impl OperationProvider<DimensionType> for AddOperation {

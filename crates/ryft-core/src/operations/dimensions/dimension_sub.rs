@@ -5,7 +5,7 @@ use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError};
 use crate::types::{DimensionBounds, DimensionError, DimensionType};
 
-use super::representable_extent_range;
+use super::{maximum_extent, representable_extent_range};
 
 /// Canonical operation name for [`DimensionSubOperation`].
 pub const DIMENSION_SUB_OPERATION_NAME: &str = "dimension_sub";
@@ -18,6 +18,9 @@ define_arithmetic_dimension_operation!(
         format!("{} - {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
+    requires_runtime_assertion = |left: &DimensionType, right: &DimensionType| {
+        maximum_extent(right).is_none_or(|right| left.bounds().lower() < right)
+    },
 );
 
 impl OperationProvider<DimensionType> for SubOperation {

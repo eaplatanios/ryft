@@ -19,7 +19,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::constants::{Zero, ZeroOperationProvider};
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
 use crate::operations::manipulation::{
     LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Reshape, Slice, SliceOperation, Transpose,
@@ -1705,7 +1705,7 @@ impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for S
 where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
     <C as Domain>::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape,
-    C::Operation: From<ZeroOperation<ArrayType>>
+    C::Operation: ZeroOperationProvider<ArrayType>
         + From<LegacyBroadcastOperation>
         + From<TransposeOperation>
         + From<SliceOperation>
@@ -2066,7 +2066,7 @@ pub(crate) fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
 impl<C: Context<Type: DifferentiableType + ScanTypeSemantics> + Zero<C::Value>> DifferentiableOperation<C>
     for ScanOperation<C::Constant>
 where
-    C::Operation: From<ZeroOperation<C::Type>> + From<ScanOperation<C::Constant>>,
+    C::Operation: ZeroOperationProvider<C::Type> + From<ScanOperation<C::Constant>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -2332,7 +2332,7 @@ impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayType
 where
     V: Value<Type = ArrayType>,
     F: Value<Type = ArrayType>,
-    Target: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScanOperation<F>>,
+    Target: Operation<ArrayType> + ZeroOperationProvider<ArrayType> + From<ScanOperation<F>>,
 {
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
@@ -2349,7 +2349,7 @@ impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayProgramType
 where
     V: Value<Type = ArrayProgramType>,
     F: Value<Type = ArrayProgramType>,
-    Target: Operation<ArrayProgramType> + From<ZeroOperation<ArrayProgramType>> + From<ScanOperation<F>>,
+    Target: Operation<ArrayProgramType> + ZeroOperationProvider<ArrayProgramType> + From<ScanOperation<F>>,
 {
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
@@ -2373,7 +2373,7 @@ fn transpose_array_scan<V, F, Target, D>(
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
     F: Value<Type = V::Type>,
-    Target: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<ScanOperation<F>>,
+    Target: Operation<V::Type> + ZeroOperationProvider<V::Type> + From<ScanOperation<F>>,
     D: TranspositionDriver<V, Target>,
 {
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -2413,7 +2413,7 @@ impl<V, F, Target> ScanTransposition<V, F, Target> for DataType
 where
     V: Value<Type = DataType>,
     F: Value<Type = DataType>,
-    Target: Operation<DataType> + From<ZeroOperation<DataType>> + From<ScanOperation<F>>,
+    Target: Operation<DataType> + ZeroOperationProvider<DataType> + From<ScanOperation<F>>,
 {
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
@@ -2509,7 +2509,7 @@ pub fn transpose_primal_scan<V, O, F, D: TranspositionDriver<V, O>>(
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
     F: Value<Type = V::Type>,
-    O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<ScanOperation<F>>,
+    O: Operation<V::Type> + ZeroOperationProvider<V::Type> + From<ScanOperation<F>>,
 {
     // A scan with only zero output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -2658,7 +2658,7 @@ fn thread_known_carries<V, O>(
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value<Type: DifferentiableType>,
-    O: Operation<V::Type> + From<ZeroOperation<V::Type>>,
+    O: Operation<V::Type> + ZeroOperationProvider<V::Type>,
 {
     let linear_carry_count = operand_linear[..carry_count].iter().filter(|&&linear| linear).count();
     let body_output_count = body_output_types.len();
@@ -2710,7 +2710,7 @@ where
                     "scan transpose boundary reconstruction omitted non-zero-space input {index}",
                 )));
             }
-            let outputs = builder.add_instruction(O::from(ZeroOperation::new(r#type)), Vec::new(), Vec::new())?;
+            let outputs = builder.add_instruction(O::zero_operation(r#type)?, Vec::new(), Vec::new())?;
             check_count!("output", outputs, 1, ProgramError);
             Ok(outputs[0])
         })

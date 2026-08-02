@@ -13,6 +13,7 @@ use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_tra
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
+use crate::programs::effects::{Effect, Effects};
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
@@ -165,6 +166,11 @@ impl Operation<ArrayProgramType> for DimensionFromScalarOperation {
         Ok(vec![self.result_type.clone().into()])
     }
 
+    #[inline]
+    fn effects(&self) -> Effects {
+        Effects::single(Effect::OrderedAssertion)
+    }
+
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         Ok(Self { result_type: self.result_type.rename_identities(renaming)? })
     }
@@ -233,6 +239,7 @@ mod tests {
         assert_eq!(operation.name(), DIMENSION_FROM_SCALAR_OPERATION_NAME);
         assert_eq!(operation.result_type(), &DimensionType::new(variable.clone()));
         assert_eq!(operation.to_string(), "dimension_from_scalar [bounds=[0, 9)]");
+        assert_eq!(operation.effects(), Effects::single(Effect::OrderedAssertion));
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&scalar_type), &[]),
             Ok(vec![operation.result_type().clone().into()]),

@@ -25,7 +25,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 #[cfg(test)]
 use crate::operations::constants::One;
-use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
+use crate::operations::constants::{OneOperation, Zero, ZeroOperation, ZeroOperationProvider};
 use crate::operations::control_flow::scan::stacked_scan_type;
 use crate::operations::control_flow::{
     ConditionOperation, ScanOperation, SelectOperation, TemporalResidualOperation, TemporalResidualType,
@@ -1104,7 +1104,7 @@ where
     C: Context + Zero<C::Value>,
     C::Type: WhileJvp<C>,
     C::Value: Concretizable<bool>,
-    C::Operation: From<ZeroOperation<C::Type>>,
+    C::Operation: ZeroOperationProvider<C::Type>,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation C::Operation>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -1333,7 +1333,7 @@ fn jvp_array_backed_while<C, D: DifferentiationDriver<C>, A>(
 where
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
     C::Value: Concretizable<bool>,
-    C::Operation: From<ZeroOperation<C::Type>>
+    C::Operation: ZeroOperationProvider<C::Type>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation>
         + From<ScanOperation<C::Constant>>
@@ -1383,7 +1383,7 @@ where
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> WhileJvp<C> for ArrayType
 where
     C::Value: Concretizable<bool>,
-    C::Operation: From<ZeroOperation<ArrayType>>
+    C::Operation: ZeroOperationProvider<ArrayType>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation>
         + From<ScanOperation<C::Constant>>
@@ -1684,7 +1684,7 @@ where
 /// doubled-state loop (see [`jvp_while_fused`]), which is forward-total but not transposable.
 impl<C: Context<Type = DataType> + Zero<C::Value>> WhileJvp<C> for DataType
 where
-    C::Operation: From<ZeroOperation<DataType>> + From<WhileOperation>,
+    C::Operation: ZeroOperationProvider<DataType> + From<WhileOperation>,
 {
     fn jvp_while<D: DifferentiationDriver<C>>(
         operation: &WhileOperation,
@@ -1702,7 +1702,7 @@ impl<C: Context<Type = ArrayProgramType> + Zero<C::Value>> WhileJvp<C> for Array
 where
     C::Constant: ValueProjection<ArrayType>,
     C::Value: Concretizable<bool>,
-    C::Operation: From<ZeroOperation<ArrayProgramType>>
+    C::Operation: ZeroOperationProvider<ArrayProgramType>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation>
         + From<ScanOperation<C::Constant>>
@@ -1735,7 +1735,7 @@ where
     C: Context<Type = ArrayProgramType> + Zero<C::Value>,
     C::Constant: ValueProjection<ArrayType>,
     C::Value: Concretizable<bool>,
-    C::Operation: From<ZeroOperation<ArrayProgramType>>
+    C::Operation: ZeroOperationProvider<ArrayProgramType>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation>
         + From<ScanOperation<C::Constant>>
@@ -1775,7 +1775,7 @@ fn jvp_while_fused<C, D: DifferentiationDriver<C>>(
 where
     C: Context + Zero<C::Value>,
     C::Type: DifferentiableType,
-    C::Operation: From<ZeroOperation<C::Type>> + From<WhileOperation>,
+    C::Operation: ZeroOperationProvider<C::Type> + From<WhileOperation>,
 {
     let state_count = inputs.len();
 
@@ -1863,7 +1863,7 @@ where
     C: Context + Zero<C::Value>,
     C::Type: DifferentiableType,
     C::Value: Concretizable<bool>,
-    C::Operation: From<ZeroOperation<C::Type>>,
+    C::Operation: ZeroOperationProvider<C::Type>,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation C::Operation>,
 {
     let state_count = inputs.len();

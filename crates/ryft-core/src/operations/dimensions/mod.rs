@@ -11,6 +11,8 @@ use crate::programs::operations::Operation;
 use crate::programs::types::{Type, TypeError};
 use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
 
+// TODO(eaplatanios): Review this module.
+
 pub mod dimension_add;
 pub mod dimension_div_floor;
 pub mod dimension_from_scalar;
@@ -160,6 +162,12 @@ pub(crate) fn representable_extent_range(bounds: DimensionBounds) -> Result<(usi
     Ok((bounds.lower(), maximum))
 }
 
+/// Returns the largest portable extent admitted by `r#type` when its upper bound is finite.
+#[inline]
+pub(crate) fn maximum_extent(r#type: &DimensionType) -> Option<usize> {
+    r#type.bounds().upper()?.checked_sub(1).map(|maximum| maximum.min(MAX_DIMENSION_EXTENT))
+}
+
 /// Computes `base.pow(exponent)` without narrowing `exponent`.
 pub(crate) fn checked_power(mut base: usize, mut exponent: usize) -> Option<usize> {
     let mut result = 1usize;
@@ -205,6 +213,7 @@ fn test_dimension_type(name: &'static str, lower: usize, upper: usize) -> Dimens
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::programs::effects::{Effect, Effects};
     use crate::programs::identities::TypeIdentityRenaming;
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
@@ -237,5 +246,36 @@ mod tests {
         let renamed = operation.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed.left_type(), &renamed_left);
         assert_eq!(renamed.right_type(), &renamed_right);
+    }
+
+    #[test]
+    fn test_arithmetic_dimension_operation_effects() {
+        let bounded_left = test_dimension_type("bounded_left", 2, 9);
+        let bounded_right = test_dimension_type("bounded_right", 1, 5);
+        let safe_subtrahend = test_dimension_type("safe_subtrahend", 1, 4);
+        let safe_minuend = test_dimension_type("safe_minuend", 5, 9);
+        let maybe_zero = test_dimension_type("maybe_zero", 0, 5);
+        let unbounded = DimensionType::new(DimensionVariable::new("unbounded", DimensionBounds::unbounded()));
+        let assertion = Effects::single(Effect::OrderedAssertion);
+
+        // Arithmetic is pure exactly when operand bounds prove that its checked eager operation is total.
+        assert_eq!(DimensionAddOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
+        assert_eq!(DimensionAddOperation::new(&unbounded, &bounded_right).unwrap().effects(), assertion);
+        assert_eq!(DimensionSubOperation::new(&safe_minuend, &safe_subtrahend).unwrap().effects(), Effects::PURE);
+        assert_eq!(DimensionSubOperation::new(&bounded_left, &bounded_right).unwrap().effects(), assertion);
+        assert_eq!(
+            DimensionSaturatingSubOperation::new(&bounded_left, &bounded_right).unwrap().effects(),
+            Effects::PURE,
+        );
+        assert_eq!(DimensionMulOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
+        assert_eq!(DimensionMulOperation::new(&unbounded, &bounded_right).unwrap().effects(), assertion);
+        assert_eq!(DimensionPowOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
+        assert_eq!(DimensionPowOperation::new(&unbounded, &bounded_right).unwrap().effects(), assertion);
+        assert_eq!(DimensionDivFloorOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
+        assert_eq!(DimensionDivFloorOperation::new(&bounded_left, &maybe_zero).unwrap().effects(), assertion);
+        assert_eq!(DimensionRemOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
+        assert_eq!(DimensionRemOperation::new(&bounded_left, &maybe_zero).unwrap().effects(), assertion);
+        assert_eq!(DimensionMinOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
+        assert_eq!(DimensionMaxOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
     }
 }

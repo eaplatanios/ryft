@@ -10,7 +10,7 @@ use ryft_core::differentiation::{
     TranspositionDriver,
 };
 use ryft_core::macros::check_count;
-use ryft_core::operations::constants::{Zero, ZeroOperation};
+use ryft_core::operations::constants::Zero;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
@@ -26,7 +26,7 @@ use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::programs::types::{Type, TypeError, Typed};
 use ryft_core::types::{ArrayProgramType, ArrayType};
 
-use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram};
+use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, materialize_transpose_cotangent};
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
     ShardMapTraceError, ShardMapTracer, TracedShardMap,
@@ -452,34 +452,6 @@ where
     }
 }
 
-/// Returns a concrete atom for `cotangent`, staging a typed `Zero` op when the cotangent is
-/// structurally zero. Higher-order linear rules use this when they must consume all output
-/// cotangents jointly.
-fn materialize_cotangent<T: Type, V: Value<Type = T>, O>(
-    context: &TracingContext<V, O>,
-    cotangent: &MaybeZero<Tracer<TracingContext<V, O>>>,
-    output_type: &T,
-) -> Tracer<TracingContext<V, O>>
-where
-    O: Operation<T> + From<ZeroOperation<T>>,
-{
-    match cotangent {
-        MaybeZero::Value(cotangent) => return cotangent.clone(),
-        MaybeZero::Zero(_) => {}
-    }
-    let builder = &context.builder();
-    let mut builder_borrow = builder.borrow_mut();
-    let output = builder_borrow.add_variable(output_type.clone());
-    builder_borrow.add_instruction_unchecked(ryft_core::programs::Instruction::new(
-        O::from(ZeroOperation::new(output_type.clone())),
-        vec![],
-        vec![output],
-        Vec::new(),
-    ));
-    drop(builder_borrow);
-    context.tracer(output, None)
-}
-
 /// Builds the residual boundary sharding and matching global type for one residual edge.
 ///
 /// Residuals are arbitrary shard-local body intermediates threaded across the shard-map boundary as plain operand
@@ -779,7 +751,7 @@ pub fn transpose_primal_shard_map<
     let mut operands = Vec::with_capacity(output_types.len() + known_values.len());
     for (cotangent, output_type) in outputs.iter().zip(output_types.iter()) {
         let output_type = ArrayProgramType::Array(output_type.cotangent());
-        operands.push(materialize_cotangent(context, cotangent, &output_type));
+        operands.push(materialize_transpose_cotangent(context, cotangent, &output_type, inputs)?);
     }
     operands.extend(known_values);
     let transposed_operation = XlaOperation::ShardMap(Box::new(transposed_operation));

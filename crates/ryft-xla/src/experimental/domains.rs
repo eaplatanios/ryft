@@ -33,7 +33,7 @@ use ryft_core::differentiation::DifferentiationError;
 use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::{
-    Constant, ConstantOperation, ONE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroOperation,
+    Constant, ConstantOperation, ONE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
 };
 use ryft_core::operations::dimensions::{DimensionFromScalar, DimensionSize};
 use ryft_core::parameters::{Parameterized, Placeholder};
@@ -109,6 +109,10 @@ pub enum XlaDomainError {
     /// Error surfaced while normalizing backend analysis data.
     #[error("invalid XLA compilation analysis: {reason}")]
     InvalidCompilationAnalysis { reason: String },
+
+    /// Runtime assertion host callbacks currently require host-accessible scalar buffers.
+    #[error("compiled runtime assertions are not supported on XLA platform '{platform}'")]
+    UnsupportedRuntimeAssertionPlatform { platform: String },
 }
 
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs
@@ -416,10 +420,11 @@ impl<'c> Context for XlaDomain<'c> {
 /// the batching rules of nullary constant operations and the accumulator seeding of recursive higher-order rules)
 /// synthesizes constants through the active context's type-driven [`Zero`] / [`One`] / [`Fill`] / [`Iota`] leaves.
 /// The binds below take the constant-materialization fast path on domains constructed with a concrete mesh and the
-/// compiled eager dispatch path (over a derived default mesh) otherwise.
+/// compiled eager dispatch path (over a derived default mesh) otherwise. Dynamic array zeros are intentionally not
+/// available through this type-only capability because they require explicit first-class extent operands.
 impl<'c> Zero<ArrayProgramValue<Array<'c>>> for XlaDomain<'c> {
     fn zero(&self, r#type: &ArrayProgramType) -> Result<ArrayProgramValue<Array<'c>>, ProgramError> {
-        let mut outputs = self.bind(ZeroOperation::new(r#type.clone()), Vec::new(), &[])?;
+        let mut outputs = self.bind(XlaOperation::zero_operation(r#type.clone())?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1114,6 +1119,9 @@ pub struct XlaLoweredProgram {
     /// Logical-to-physical StableHLO/PJRT boundary mapping.
     signature: XlaExecutableSignature,
 
+    /// Whether execution requires Ryft's host runtime assertion handler.
+    requires_assertion_handler: bool,
+
     /// Donation declarations for public inputs. Captures are always non-donatable.
     donation_flags: Arc<[bool]>,
 
@@ -1180,9 +1188,9 @@ impl XlaLoweredProgram {
 }
 
 const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA2";
-const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 3;
+const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 4;
 const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 1;
-const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 3;
+const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 4;
 static XLA_COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "ryft-xla/{}/openxla/{}/jax/{}",
@@ -1282,13 +1290,14 @@ pub struct XlaOptimizedProgram {
 }
 
 #[derive(Serialize)]
-struct XlaPersistentKeyV3<'a> {
+struct XlaPersistentKeyV4<'a> {
     schema_version: u32,
     stable_hlo: &'a str,
     compilation_options: &'a [u8],
     signature: PersistentCanonicalArraySignatureV3,
     input_mapping: Vec<Option<u64>>,
     output_mapping: Vec<Option<u64>>,
+    requires_assertion_handler: bool,
     donation_flags: &'a [bool],
     capture_count: u64,
     expected_argument_shardings: Vec<PersistentShardingV1>,
@@ -1301,13 +1310,14 @@ struct XlaPersistentKeyV3<'a> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct XlaPersistentExecutableMetadataV3 {
+struct XlaPersistentExecutableMetadataV4 {
     schema_version: u32,
     feature_flags: u64,
     compilation_options: Vec<u8>,
     signature: PersistentArraySignatureV3,
     input_mapping: Vec<Option<u64>>,
     output_mapping: Vec<Option<u64>>,
+    requires_assertion_handler: bool,
     donation_flags: Vec<bool>,
     capture_count: u64,
     expected_argument_shardings: Vec<PersistentShardingV1>,
@@ -1831,6 +1841,7 @@ pub struct XlaCompiledProgram<'c> {
     input_types: Arc<[ArrayType]>,
     output_types: Arc<[ArrayType]>,
     signature: XlaExecutableSignature,
+    requires_assertion_handler: bool,
     donation_flags: Arc<[bool]>,
     capture_count: usize,
     expected_argument_shardings: Arc<[Sharding]>,
@@ -1929,6 +1940,24 @@ impl<'c> XlaCompiledProgram<'c> {
 }
 
 impl<'c> XlaDomain<'c> {
+    /// Ensures that process-local runtime support required by one compiled program is available.
+    fn ensure_runtime_requirements(
+        &self,
+        requires_assertion_handler: bool,
+        platform_name: &str,
+    ) -> Result<(), XlaDomainError> {
+        if !requires_assertion_handler {
+            return Ok(());
+        }
+        // The callback reads scalar buffers directly from host memory. Until a device callback implementation exists,
+        // rejecting non-CPU programs here is required for correctness rather than merely a registration limitation.
+        if !platform_name.eq_ignore_ascii_case("cpu") {
+            return Err(XlaDomainError::UnsupportedRuntimeAssertionPlatform { platform: platform_name.to_string() });
+        }
+        super::assertions::ensure_assertion_handler_registered(self.client()?)?;
+        Ok(())
+    }
+
     /// Validates that this domain's PJRT client owns `program`.
     fn validate_xla_program_owner(&self, program: &XlaCompiledProgram<'c>) -> Result<(), XlaDomainError> {
         if program.executable.is_owned_by(self.client()?) {
@@ -1945,6 +1974,7 @@ impl<'c> XlaDomain<'c> {
         inputs: Vec<Array<'c>>,
     ) -> Result<Execution<Vec<Array<'c>>>, XlaDomainError> {
         self.validate_xla_program_owner(program)?;
+        self.ensure_runtime_requirements(program.requires_assertion_handler, &program.platform_name)?;
         if inputs.len() != program.input_types.len() {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: format!(
@@ -2158,7 +2188,7 @@ impl<'c> XlaDomain<'c> {
             target_platform.as_deref(),
         )
         .map_err(|error| XlaDomainError::Lowering(error.into()))?;
-        let (stable_hlo, signature) = lowered_module.into_parts();
+        let (stable_hlo, signature, requires_assertion_handler) = lowered_module.into_parts();
         for (mapping, donation) in signature.input_mapping()[capture_count..].iter().zip(donation_flags.iter_mut()) {
             if mapping.is_none() {
                 *donation = false;
@@ -2173,6 +2203,7 @@ impl<'c> XlaDomain<'c> {
             input_types: effective_input_types.into(),
             output_types: output_types.into(),
             signature,
+            requires_assertion_handler,
             donation_flags: donation_flags.into(),
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
@@ -2187,13 +2218,14 @@ impl<'c> XlaDomain<'c> {
 
     fn xla_compilation_key(program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
         let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
-        let key = XlaPersistentKeyV3 {
+        let key = XlaPersistentKeyV4 {
             schema_version: XLA_PERSISTENT_KEY_SCHEMA_VERSION,
             stable_hlo: &program.stable_hlo,
             compilation_options: compilation_options.as_slice(),
             signature: PersistentArraySignatureV3::encode(&program.input_types, &program.output_types).into_canonical(),
             input_mapping: persistent_mapping(program.signature.input_mapping())?,
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
+            requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count as u64,
             expected_argument_shardings: program
@@ -2217,6 +2249,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         program: &XlaLoweredProgram,
     ) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
+        self.ensure_runtime_requirements(program.requires_assertion_handler, &program.platform_name)?;
         let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
         let compilation_start = Instant::now();
         let executable = self.client()?.compile(&pjrt_program, &program.compilation_options)?;
@@ -2226,6 +2259,7 @@ impl<'c> XlaDomain<'c> {
             input_types: Arc::clone(&program.input_types),
             output_types: Arc::clone(&program.output_types),
             signature: program.signature.clone(),
+            requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: Arc::clone(&program.donation_flags),
             capture_count: program.capture_count,
             expected_argument_shardings: Arc::clone(&program.expected_argument_shardings),
@@ -2278,13 +2312,14 @@ impl<'c> XlaDomain<'c> {
             Err(error) => return Err(error.into()),
         };
         let device_assignment = program.executable.device_assignment()?;
-        let metadata = XlaPersistentExecutableMetadataV3 {
+        let metadata = XlaPersistentExecutableMetadataV4 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
             feature_flags: XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: program.compilation_options.encode_to_vec(),
             signature: PersistentArraySignatureV3::encode(&program.input_types, &program.output_types),
             input_mapping: persistent_mapping(program.signature.input_mapping())?,
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
+            requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: program.donation_flags.to_vec(),
             capture_count: program.capture_count as u64,
             expected_argument_shardings: program
@@ -2336,7 +2371,7 @@ impl<'c> XlaDomain<'c> {
             .checked_add(metadata_size)
             .filter(|metadata_end| *metadata_end <= bytes.len())
             .ok_or_else(|| persistent_error("persistent executable metadata is truncated"))?;
-        let metadata: XlaPersistentExecutableMetadataV3 = serde_json::from_slice(&bytes[header_size..metadata_end])
+        let metadata: XlaPersistentExecutableMetadataV4 = serde_json::from_slice(&bytes[header_size..metadata_end])
             .map_err(|error| persistent_error(format!("failed to decode metadata: {error}")))?;
         if metadata.schema_version != XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION
             || metadata.feature_flags != XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS
@@ -2401,6 +2436,9 @@ impl<'c> XlaDomain<'c> {
         let donation_flags = metadata.donation_flags;
         let compilation_options = CompilationOptions::decode(metadata.compilation_options.as_slice())
             .map_err(|error| persistent_error(format!("failed to decode compilation options: {error}")))?;
+        // Register before deserialization because loading an executable may resolve its custom-call target. The
+        // persisted flag is authoritative on cache hits, where the source program is no longer available to inspect.
+        self.ensure_runtime_requirements(metadata.requires_assertion_handler, metadata.platform_name.as_str())?;
         let executable = self.client()?.deserialize_and_load_executable(
             &bytes[metadata_end..],
             Some(&compilation_options),
@@ -2419,6 +2457,7 @@ impl<'c> XlaDomain<'c> {
             input_types: input_types.into(),
             output_types: output_types.into(),
             signature,
+            requires_assertion_handler: metadata.requires_assertion_handler,
             donation_flags: donation_flags.into(),
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
@@ -2912,8 +2951,10 @@ mod tests {
     use ryft_core::operations::compare::{CompareOperation, ComparisonDirection};
     use ryft_core::operations::constants::{ConstantOperation, Fill, OneOperation};
     use ryft_core::operations::control_flow::{ConditionOperation, SelectOperation, WhileOperation};
+    use ryft_core::operations::debugging::PrintOperation;
     use ryft_core::operations::dimensions::{
-        DimensionAddOperation, DimensionDivFloorOperation, DimensionSizeOperation, DimensionToScalarOperation,
+        DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation,
+        DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
     };
     use ryft_core::operations::logical::AndOperation;
     use ryft_core::operations::manipulation::{BroadcastOperation, DynamicShapeSliceOperation, ReshapeOperation};
@@ -3265,6 +3306,341 @@ mod tests {
         };
         assert_eq!(from_scalar.extent(), 5);
         assert_eq!(domain.cache_size(), 0);
+    }
+
+    #[test]
+    fn test_compiled_dimension_from_scalar_reports_observed_bounds_failure_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::I64);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let dimension =
+            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 1, "{}", lowered.stable_hlo());
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        assert!(compiled.requires_assertion_handler);
+        // Some PJRT plugins do not serialize executables containing host callbacks. When serialization is available,
+        // exercise the cache-hit path and prove its runtime-feature metadata survives restoration.
+        let compiled = match domain.serialize_program(&compiled).unwrap() {
+            Some(bytes) => domain.deserialize_program(bytes.as_slice()).unwrap().unwrap(),
+            None => compiled,
+        };
+        assert!(compiled.requires_assertion_handler);
+
+        let valid =
+            Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), 4_i64.to_ne_bytes().as_slice()).unwrap();
+        let valid = domain.execute_xla_program(&compiled, vec![valid]).unwrap();
+        assert_eq!(read_i64s(&client, &valid[0]), vec![4]);
+
+        let invalid = Array::from_host_buffer(&client, input_type, mesh, 9_i64.to_ne_bytes().as_slice()).unwrap();
+        let error = domain.execute_xla_program(&compiled, vec![invalid]).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "'dimension_from_scalar' failed: input dimension `extent` = 9 is outside its declared bounds [1, 9)"
+            ),
+            "{error}",
+        );
+    }
+
+    #[test]
+    fn test_compiled_dimension_requirements_report_the_first_same_class_failure_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::I64);
+        let bounds = DimensionBounds::new(0, Some(10)).unwrap();
+        let first_type = DimensionType::new(DimensionVariable::new("first", bounds));
+        let second_type = DimensionType::new(DimensionVariable::new("second", bounds));
+        let third_type = DimensionType::new(DimensionVariable::new("third", bounds));
+
+        let mut builder = XlaProgramBuilder::new();
+        let first_input = builder.add_input(input_type.clone().into());
+        let second_input = builder.add_input(input_type.clone().into());
+        let third_input = builder.add_input(input_type.clone().into());
+        let first = builder
+            .add_instruction(
+                DimensionFromScalarOperation::new(first_type.variable().clone()),
+                Vec::new(),
+                vec![first_input],
+            )
+            .unwrap()[0];
+        let second = builder
+            .add_instruction(
+                DimensionFromScalarOperation::new(second_type.variable().clone()),
+                Vec::new(),
+                vec![second_input],
+            )
+            .unwrap()[0];
+        let third = builder
+            .add_instruction(
+                DimensionFromScalarOperation::new(third_type.variable().clone()),
+                Vec::new(),
+                vec![third_input],
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                DimensionRequirementOperation::less_than_or_equal(&first_type, &second_type),
+                Vec::new(),
+                vec![first, second],
+            )
+            .unwrap();
+        builder
+            .add_instruction(
+                DimensionRequirementOperation::less_than_or_equal(&second_type, &third_type),
+                Vec::new(),
+                vec![second, third],
+            )
+            .unwrap();
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![third]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 5, "{}", lowered.stable_hlo());
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let input = |value: i64| {
+            Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+        };
+
+        let error = domain.execute_xla_program(&compiled, vec![input(4), input(3), input(2)]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("'dimension_require_less_than_or_equal' failed: first <= second; observed first=4, second=3"),
+            "{error}",
+        );
+        assert!(!error.to_string().contains("second <= third"), "{error}");
+    }
+
+    #[test]
+    fn test_compiled_dimension_requirement_predicates_preserve_diagnostics_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::I64);
+        let bounds = DimensionBounds::new(0, Some(20)).unwrap();
+        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
+        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let check = |operation: DimensionRequirementOperation, left_value: i64, right_value: i64, expected: &str| {
+            let mut builder = XlaProgramBuilder::new();
+            let left_input = builder.add_input(input_type.clone().into());
+            let right_input = builder.add_input(input_type.clone().into());
+            let left = builder
+                .add_instruction(
+                    DimensionFromScalarOperation::new(left_type.variable().clone()),
+                    Vec::new(),
+                    vec![left_input],
+                )
+                .unwrap()[0];
+            let right = builder
+                .add_instruction(
+                    DimensionFromScalarOperation::new(right_type.variable().clone()),
+                    Vec::new(),
+                    vec![right_input],
+                )
+                .unwrap()[0];
+            builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap();
+            let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![right]).unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+            let compiled = domain.compile_xla_program(&lowered).unwrap();
+            let input = |value: i64| {
+                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                    .unwrap()
+            };
+
+            let error = domain.execute_xla_program(&compiled, vec![input(left_value), input(right_value)]).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        };
+
+        check(
+            DimensionRequirementOperation::equal(&left_type, &right_type),
+            3,
+            4,
+            "'dimension_require_equal' failed: left == right; observed left=3, right=4",
+        );
+        check(
+            DimensionRequirementOperation::divisible_by(&left_type, &right_type),
+            7,
+            3,
+            "'dimension_require_divisible_by' failed: left % right == 0; observed left=7, right=3",
+        );
+        check(
+            DimensionRequirementOperation::divisible_by(&left_type, &right_type),
+            7,
+            0,
+            "'dimension_require_divisible_by' failed: right > 0 for divisibility; observed left=7, right=0",
+        );
+    }
+
+    #[test]
+    fn test_compiled_dimension_arithmetic_preserves_checked_host_diagnostics_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::I64);
+        let bounds = DimensionBounds::new(0, Some(10)).unwrap();
+        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
+        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let check = |operation: DimensionOperation<DimensionValue>,
+                     valid_operands: (i64, i64),
+                     expected_output: i64,
+                     invalid_operands: (i64, i64),
+                     expected_error: &str| {
+            let mut builder = XlaProgramBuilder::new();
+            let left_input = builder.add_input(input_type.clone().into());
+            let right_input = builder.add_input(input_type.clone().into());
+            let left = builder
+                .add_instruction(
+                    DimensionFromScalarOperation::new(left_type.variable().clone()),
+                    Vec::new(),
+                    vec![left_input],
+                )
+                .unwrap()[0];
+            let right = builder
+                .add_instruction(
+                    DimensionFromScalarOperation::new(right_type.variable().clone()),
+                    Vec::new(),
+                    vec![right_input],
+                )
+                .unwrap()[0];
+            let result = builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap()[0];
+            let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![result]).unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+            assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 3, "{}", lowered.stable_hlo());
+            let compiled = domain.compile_xla_program(&lowered).unwrap();
+            let input = |value: i64| {
+                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                    .unwrap()
+            };
+
+            let output = domain
+                .execute_xla_program(&compiled, vec![input(valid_operands.0), input(valid_operands.1)])
+                .unwrap();
+            assert_eq!(read_i64s(&client, &output[0]), vec![expected_output]);
+            let error = domain
+                .execute_xla_program(&compiled, vec![input(invalid_operands.0), input(invalid_operands.1)])
+                .unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error}");
+        };
+
+        check(
+            DimensionOperation::Sub(DimensionSubOperation::new(&left_type, &right_type).unwrap()),
+            (5, 2),
+            3,
+            (2, 5),
+            "left >= right; observed left=2, right=5",
+        );
+        check(
+            DimensionOperation::DivFloor(DimensionDivFloorOperation::new(&left_type, &right_type).unwrap()),
+            (7, 3),
+            2,
+            (7, 0),
+            "right > 0; observed left=7, right=0",
+        );
+        check(
+            DimensionOperation::Rem(DimensionRemOperation::new(&left_type, &right_type).unwrap()),
+            (7, 3),
+            1,
+            (7, 0),
+            "right > 0; observed left=7, right=0",
+        );
+    }
+
+    #[test]
+    fn test_compiled_dimension_assertion_does_not_merge_ordered_io_chains_on_cpu() {
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        ensure_print_handler_registered(&client).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::I64);
+        let bounds = DimensionBounds::new(0, Some(10)).unwrap();
+        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
+        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+
+        let mut builder = XlaProgramBuilder::new();
+        let left_input = builder.add_input(input_type.clone().into());
+        let right_input = builder.add_input(input_type.clone().into());
+        builder.add_instruction(PrintOperation::new("left"), Vec::new(), vec![left_input]).unwrap();
+        let left = builder
+            .add_instruction(
+                DimensionFromScalarOperation::new(left_type.variable().clone()),
+                Vec::new(),
+                vec![left_input],
+            )
+            .unwrap()[0];
+        let right = builder
+            .add_instruction(
+                DimensionFromScalarOperation::new(right_type.variable().clone()),
+                Vec::new(),
+                vec![right_input],
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                DimensionRequirementOperation::less_than_or_equal(&left_type, &right_type),
+                Vec::new(),
+                vec![left, right],
+            )
+            .unwrap();
+        let output = builder.add_instruction(PrintOperation::new("right"), Vec::new(), vec![right_input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.after_all").count(), 2, "{}", lowered.stable_hlo());
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let input = |value: i64| {
+            Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+        };
+
+        let (output, lines) = with_captured_prints(|| {
+            let output = domain.execute_xla_program(&compiled, vec![input(3), input(4)]).unwrap();
+            assert_eq!(read_i64s(&client, &output[0]), vec![4]);
+            output
+        });
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("left: "), "{:?}", lines);
+        assert!(lines[1].starts_with("right: "), "{:?}", lines);
+        assert_eq!(read_i64s(&client, &output[0]), vec![4]);
     }
 
     #[test]
@@ -3804,7 +4180,7 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV3 =
+        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV4 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_signature_metadata.input_mapping[0] = None;
         let invalid_signature_metadata = serde_json::to_vec(&invalid_signature_metadata).unwrap();
@@ -3817,7 +4193,7 @@ mod tests {
             Err(XlaDomainError::InvalidPersistentExecutable { .. }),
         ));
 
-        let mut incompatible_metadata: XlaPersistentExecutableMetadataV3 =
+        let mut incompatible_metadata: XlaPersistentExecutableMetadataV4 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         incompatible_metadata.platform_version.push_str("-incompatible");
         let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
@@ -3908,13 +4284,14 @@ mod tests {
         legacy.extend_from_slice(&0u64.to_le_bytes());
         assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
-        let metadata = XlaPersistentExecutableMetadataV3 {
+        let metadata = XlaPersistentExecutableMetadataV4 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
             feature_flags: 0,
             compilation_options: CompilationOptions::default().encode_to_vec(),
             signature: PersistentArraySignatureV3::encode(&[], &[]),
             input_mapping: Vec::new(),
             output_mapping: Vec::new(),
+            requires_assertion_handler: false,
             donation_flags: Vec::new(),
             capture_count: 0,
             expected_argument_shardings: Vec::new(),

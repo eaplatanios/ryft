@@ -2,9 +2,11 @@
 
 use ryft_core::backends::array_programs::ArrayProgramOperation;
 use ryft_core::backends::dimensions::DimensionOperation;
-use ryft_core::operations::manipulation::CONCATENATE_OPERATION_NAME;
+use ryft_core::operations::compare::ComparisonDirection;
+use ryft_core::operations::dimensions::DimensionRequirementOperation;
+use ryft_core::programs::effects::Effect;
 use ryft_core::programs::{Operation as CoreOperation, ProgramError};
-use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, MAX_DIMENSION_EXTENT, Shape};
+use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
     Block, Context as MlirContext, Location, Operation as MlirOperation, Size as MlirSize, Type as MlirType,
@@ -12,12 +14,13 @@ use ryft_mlir::{
 };
 
 use super::{
-    CollectiveLoweringState, LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer,
+    CollectiveLoweringState, EffectTokens, LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer,
     PlainMlirLoweringMode, broadcast_changes_explicit_sharding, lower_all_gather_to_mlir, lower_all_to_all_to_mlir,
-    lower_compare_to_mlir, lower_constant_elements_attribute, lower_constant_output, lower_custom_call_to_mlir,
-    lower_pad_to_mlir, lower_psum_scatter_to_mlir, lower_rng_bit_generator_to_mlir, lower_sharding_constraint,
-    lower_tensor_type, reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound,
-    static_dimensions,
+    lower_compare_to_mlir, lower_concatenate_extent_assertion, lower_constant_elements_attribute,
+    lower_constant_output, lower_custom_call_to_mlir, lower_dimension_arithmetic_assertion,
+    lower_dimension_requirement_to_assertion, lower_pad_to_mlir, lower_psum_scatter_to_mlir,
+    lower_rng_bit_generator_to_mlir, lower_sharding_constraint, lower_static_index_constants, lower_tensor_type,
+    reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 
 /// Lowers a composite array-program type to its physical StableHLO tensor type.
@@ -243,7 +246,7 @@ pub(super) fn lower_array_program_operation<'b, 'c: 'b, 't: 'c, A>(
     input_types: &[ArrayProgramType],
     output_types: &[ArrayProgramType],
     collective_state: &CollectiveLoweringState,
-    token: &mut Option<ValueRef<'b, 'c, 't>>,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
@@ -252,16 +255,7 @@ where
     A: MlirLowerableValue,
 {
     match operation {
-        ArrayProgramOperation::Zero(_) => {
-            let output_types = output_types
-                .iter()
-                .map(|r#type| {
-                    <&ArrayType>::try_from(r#type).cloned().map_err(|error| LoweringError::Tracing(error.into()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            lower_constant_output(output_types.as_slice(), 0, block, context, location)
-        }
-        ArrayProgramOperation::DynamicZero(operation) => {
+        ArrayProgramOperation::Zero(operation) => {
             lower_dynamic_constructor(operation.name(), 0, input_values, output_types, block, context, location)
         }
         ArrayProgramOperation::DynamicOne(operation) => {
@@ -298,7 +292,7 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
             let mut lowerer = PlainMlirLowerer::new(*block, context, location)
                 .with_input_types(input_types)
-                .with_token(*token)
+                .with_effect_tokens(*effect_tokens)
                 .with_collective_state(collective_state.clone());
             let outputs = operation.lower_to_mlir(
                 input_values,
@@ -306,7 +300,7 @@ where
                 PlainMlirLoweringMode::Unpacked,
                 &mut lowerer,
             )?;
-            *token = lowerer.token;
+            *effect_tokens = lowerer.effect_tokens;
             Ok(outputs)
         }
         ArrayProgramOperation::Dimension(operation) => {
@@ -340,53 +334,43 @@ where
                         <&DimensionType>::try_from(left_type).map_err(|error| LoweringError::Tracing(error.into()))?;
                     let right_type =
                         <&DimensionType>::try_from(right_type).map_err(|error| LoweringError::Tracing(error.into()))?;
-                    let maximum = |r#type: &DimensionType| r#type.bounds().upper()?.checked_sub(1);
-                    let checked_power = |mut base: usize, mut exponent: usize| {
-                        let mut result = 1usize;
-                        while exponent > 0 {
-                            if exponent & 1 == 1 {
-                                result = result.checked_mul(base)?;
-                            }
-                            exponent >>= 1;
-                            if exponent > 0 {
-                                base = base.checked_mul(base)?;
-                            }
-                        }
-                        Some(result)
-                    };
-                    let arithmetic_is_proven = match operation {
-                        DimensionOperation::Add(_) => maximum(left_type)
-                            .zip(maximum(right_type))
-                            .and_then(|(left, right)| left.checked_add(right))
-                            .is_some_and(|result| result <= MAX_DIMENSION_EXTENT),
-                        DimensionOperation::Sub(_) => {
-                            maximum(right_type).is_some_and(|right| left_type.bounds().lower() >= right)
-                        }
-                        DimensionOperation::SaturatingSub(_)
-                        | DimensionOperation::Min(_)
-                        | DimensionOperation::Max(_) => true,
-                        DimensionOperation::Mul(_) => maximum(left_type)
-                            .zip(maximum(right_type))
-                            .and_then(|(left, right)| left.checked_mul(right))
-                            .is_some_and(|result| result <= MAX_DIMENSION_EXTENT),
-                        DimensionOperation::Pow(_) => maximum(left_type)
-                            .zip(maximum(right_type))
-                            .and_then(|(left, right)| checked_power(left, right))
-                            .is_some_and(|result| result <= MAX_DIMENSION_EXTENT),
-                        DimensionOperation::DivFloor(_) | DimensionOperation::Rem(_) => right_type.bounds().lower() > 0,
-                        _ => unreachable!(),
-                    };
-                    // A bounds proof makes these physical scalar `i64` operations equivalent to checked dimension
-                    // arithmetic. P7 owns runtime assertion lowering for the remaining overflow, underflow, and
-                    // zero-divisor cases.
-                    if !arithmetic_is_proven {
-                        return Err(LoweringError::UnsupportedOp {
-                            op: format!(
-                                "first-class dimension operation `{}` requires checked runtime assertion lowering",
-                                operation.name(),
-                            ),
-                        });
+                    // Bounds-proven arithmetic lowers without assertion overhead. Otherwise, preserve eager checked
+                    // semantics with one diagnostic runtime check on the ordered-assertion chain.
+                    let requires_runtime_assertion =
+                        CoreOperation::<DimensionType>::effects(operation).contains(Effect::OrderedAssertion);
+                    if requires_runtime_assertion {
+                        lower_dimension_arithmetic_assertion(
+                            operation,
+                            left_type,
+                            right_type,
+                            *left,
+                            *right,
+                            effect_tokens,
+                            block,
+                            context,
+                            location,
+                        )?;
                     }
+                    // A runtime assertion and the arithmetic operation do not have a StableHLO data dependency.
+                    // Select a valid divisor for the data operation so speculative or reordered execution cannot
+                    // evaluate division by zero before the host callback reports the original operands.
+                    let safe_right = if requires_runtime_assertion
+                        && matches!(operation, DimensionOperation::DivFloor(_) | DimensionOperation::Rem(_))
+                    {
+                        let constants = lower_static_index_constants(&[0, 1], block, context, location)?;
+                        let positive = lower_compare_to_mlir(
+                            ComparisonDirection::GreaterThan,
+                            *right,
+                            constants[0],
+                            block,
+                            location,
+                        )?;
+                        let selected =
+                            block.append_operation(stable_hlo::select(positive, *right, constants[1], location)?)?;
+                        selected.result(0).expect("stablehlo.select should return one result").as_ref()
+                    } else {
+                        *right
+                    };
                     let result = match operation {
                         DimensionOperation::Add(_) => {
                             block.append_operation(stable_hlo::add(*left, *right, location)?)?
@@ -411,10 +395,10 @@ where
                             block.append_operation(stable_hlo::power(*left, *right, location)?)?
                         }
                         DimensionOperation::DivFloor(_) => {
-                            block.append_operation(stable_hlo::divide(*left, *right, location)?)?
+                            block.append_operation(stable_hlo::divide(*left, safe_right, location)?)?
                         }
                         DimensionOperation::Rem(_) => {
-                            block.append_operation(stable_hlo::remainder(*left, *right, location)?)?
+                            block.append_operation(stable_hlo::remainder(*left, safe_right, location)?)?
                         }
                         DimensionOperation::Min(_) => {
                             block.append_operation(stable_hlo::minimum(*left, *right, location)?)?
@@ -426,10 +410,20 @@ where
                     };
                     Ok(vec![result.result(0).unwrap().as_ref()])
                 }
-                _ => Err(LoweringError::UnsupportedOp {
-                    op: format!("first-class dimension operation `{}` has not been lowered yet", operation.name()),
+                DimensionOperation::Requirement(operation) => {
+                    if operation.effects().contains(ryft_core::Effect::OrderedAssertion) {
+                        lower_dimension_requirement_to_assertion(
+                            operation,
+                            operation.name(),
+                            input_values,
+                            effect_tokens,
+                            block,
+                            context,
+                            location,
+                        )?;
+                    }
+                    Ok(Vec::new())
                 }
-                .into()),
             }
         }
         ArrayProgramOperation::Compare(operation) => {
@@ -469,9 +463,26 @@ where
                 }
             }
         }
-        ArrayProgramOperation::DimensionFromScalar(_) => Err(LoweringError::UnsupportedOp {
-            op: "dimension_from_scalar requires checked runtime assertion lowering".to_string(),
-        }),
+        ArrayProgramOperation::DimensionFromScalar(operation) => {
+            let [input] = input_values else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
+            };
+            let i64_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
+            let converted = block.append_operation(stable_hlo::convert(*input, i64_type, location)?)?;
+            let converted = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
+            let requirement =
+                DimensionRequirementOperation::bounds(operation.result_type(), operation.result_type().bounds());
+            lower_dimension_requirement_to_assertion(
+                &requirement,
+                operation.name(),
+                &[converted],
+                effect_tokens,
+                block,
+                context,
+                location,
+            )?;
+            Ok(vec![converted])
+        }
         ArrayProgramOperation::DimensionToScalar(_) => {
             let [input] = input_values else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
@@ -615,7 +626,7 @@ where
             }
         }
         ArrayProgramOperation::Concatenate(operation) => {
-            let Some((_result_extent, array_inputs)) = input_values.split_last() else {
+            let Some((result_extent, array_inputs)) = input_values.split_last() else {
                 return Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }.into());
             };
             let Some((result_extent_type, array_input_types)) = input_types.split_last() else {
@@ -624,27 +635,42 @@ where
             if array_inputs.is_empty() {
                 return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() }.into());
             }
-            let result_extent_type =
-                <&DimensionType>::try_from(result_extent_type).map_err(|error| LoweringError::Tracing(error.into()))?;
-            let input_extents_are_static = array_input_types.iter().try_fold(true, |all_static, r#type| {
-                let r#type = <&ArrayType>::try_from(r#type).map_err(|error| LoweringError::Tracing(error.into()))?;
-                Ok::<_, LoweringError>(
-                    all_static && matches!(r#type.shape().dimensions()[operation.axis()], Dimension::Static(_)),
-                )
-            })?;
-            if !input_extents_are_static || matches!(result_extent_type.to_dimension(), Dimension::Dynamic(_)) {
-                return Err(LoweringError::UnsupportedOp {
-                    op: format!(
-                        "{} with first-class dimensions requires runtime equality assertion lowering when its \
-                         explicit result extent is not statically proven equal to the input extent sum",
-                        CONCATENATE_OPERATION_NAME,
-                    ),
-                });
-            }
+            <&DimensionType>::try_from(result_extent_type).map_err(|error| LoweringError::Tracing(error.into()))?;
 
-            // The mixed type-inference contract has already proven that the exact trailing extent equals the sum of
-            // the exact concatenated input axes. The scalar extent is therefore consumed as compile-time shape
-            // authority, while StableHLO receives only the physical array operands.
+            // The callback receives every concrete logical input extent and computes their checked sum on the host.
+            // This avoids both overflow in a speculative StableHLO sum and false rejection from conservative declared
+            // maxima while preserving the explicit result-extent contract as an ordered assertion.
+            let i64_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
+            let mut input_extents = Vec::with_capacity(array_inputs.len());
+            for (input, r#type) in array_inputs.iter().zip(array_input_types) {
+                let r#type = <&ArrayType>::try_from(r#type).map_err(|error| LoweringError::Tracing(error.into()))?;
+                let extent = match r#type.shape().dimensions()[operation.axis()] {
+                    Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
+                    Dimension::Dynamic(_) => {
+                        let extent = block.append_operation(stable_hlo::get_dimension_size(
+                            *input,
+                            operation.axis(),
+                            location,
+                        )?)?;
+                        let extent =
+                            extent.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
+                        let extent = block.append_operation(stable_hlo::convert(extent, i64_type, location)?)?;
+                        extent.result(0).expect("stablehlo.convert should return one result").as_ref()
+                    }
+                };
+                input_extents.push(extent);
+            }
+            lower_concatenate_extent_assertion(
+                operation.axis(),
+                *result_extent,
+                input_extents.as_slice(),
+                effect_tokens,
+                block,
+                context,
+                location,
+            )?;
+
+            // StableHLO receives only the physical arrays; the trailing scalar is consumed by the ordered assertion.
             let result = block.append_operation(stable_hlo::concatenate(array_inputs, operation.axis(), location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
         }

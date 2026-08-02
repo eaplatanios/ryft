@@ -1,3 +1,5 @@
+/// Runtime assertion support for compiled first-class-dimension programs.
+pub(crate) mod assertions;
 #[cfg(all(feature = "benchmarking"))]
 /// XLA-specific IR benchmark cases layered on top of `ryft_core::tracing_v2::benchmarking`.
 pub mod benchmark_support;

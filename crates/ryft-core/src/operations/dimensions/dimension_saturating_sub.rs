@@ -17,6 +17,7 @@ define_arithmetic_dimension_operation!(
         format!("max(0, {} - {})", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
+    requires_runtime_assertion = |_, _| false,
 );
 
 define_arithmetic_dimension_capability!(

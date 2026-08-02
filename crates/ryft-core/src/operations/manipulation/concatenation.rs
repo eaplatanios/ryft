@@ -17,6 +17,7 @@ use crate::operations::manipulation::{LegacyBroadcast, SliceOperation, Transpose
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
+use crate::programs::effects::{Effect, Effects};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
@@ -118,6 +119,11 @@ impl Operation<ArrayProgramType> for ConcatenateOperation {
             .with_sharding(infer_concatenation_sharding(&inputs)?)
             .map_err(|error| TypeError::invalid(error.to_string()))?;
         Ok(vec![output_type.into()])
+    }
+
+    #[inline]
+    fn effects(&self) -> Effects {
+        Effects::single(Effect::OrderedAssertion)
     }
 
     #[inline]
@@ -584,6 +590,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
+    use crate::programs::effects::{Effect, Effects};
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -597,6 +604,8 @@ mod tests {
         assert_eq!(operation.axis(), 0);
         assert_eq!(Operation::<ArrayProgramType>::name(&operation), CONCATENATE_OPERATION_NAME);
         assert_eq!(operation.to_string(), "concatenate [axis=0]");
+        assert_eq!(Operation::<ArrayProgramType>::effects(&operation), Effects::single(Effect::OrderedAssertion),);
+        assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::PURE);
         let infer = |input_types: &[ArrayProgramType]| {
             Operation::<ArrayProgramType>::infer_output_types(&operation, input_types, &[])
         };

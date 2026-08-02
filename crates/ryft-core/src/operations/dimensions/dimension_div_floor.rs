@@ -18,6 +18,7 @@ define_arithmetic_dimension_operation!(
         format!("{} // {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
+    requires_runtime_assertion = |_: &DimensionType, right: &DimensionType| right.bounds().lower() == 0,
 );
 
 impl OperationProvider<DimensionType> for DivOperation {
