@@ -103,21 +103,25 @@ variables, searching ambient dimension values, or synthesizing `dimension_size` 
 hidden dependency environment. It is smaller than the deleted expression/witness machinery, but it violates the same
 architectural invariant: the graph temporarily stops being the complete source of data dependencies.
 
-The current operation trait still permits the same payload to implement multiple type-family contracts, but the
-original inventory is no longer current. As of the 2026-07-28 audit:
+The current operation trait still permits the same payload to implement multiple type-family contracts. The
+post-Phase-7 inventory at `7da7d7f25`, recorded in `.tasks/plan_p8a_operation_contract_inventory.md`, supersedes the
+2026-07-28 count:
 
 - `ConcatenateOperation`, `CustomCallOperation`, `PadOperation`, and `RngBitGeneratorOperation` directly implement
   both `Operation<ArrayType>` and `Operation<ArrayProgramType>`;
 - `CompareOperation` has a generic homogeneous `Operation<T>` implementation plus its distinct composite dimension
   comparison contract;
-- `BroadcastOperation`, `ReshapeOperation`, and `DimensionSizeOperation` now have one canonical composite contract,
-  while their remaining homogeneous behavior lives under explicit legacy payloads where still needed; and
-- dynamic slice, gather, reduce, and ordinary slice are intentionally array-only. The archived slice-scatter proposal
-  was never introduced.
+- `ShardMapOperation<V>` implements both array and composite contracts;
+- `SelectOperation` and `StopGradientOperation` each implement scalar and array contracts; and
+- ten more payloads use a type-independent generic `impl<T> Operation<T>` and must become nominally typed before an
+  associated operation type is representable: `PrintOperation`, `WhileOperation`, `RematerializeOperation`,
+  `CustomJvpOperation`, `CustomVjpOperation`, `OneLikeOperation`, `ZeroLikeOperation`, `TagOperation`,
+  `ConvertElementTypeOperation`, and `JitCallOperation` (`CompareOperation` belongs to both categories).
 
-The remaining five dual-contract payloads are transitional and still block Phase 8's associated-type operation
-contract. Constructor mixed semantics must continue to live in the composite variant arm rather than adding a sixth
-dual-contract payload.
+`BroadcastOperation`, `ReshapeOperation`, and `DimensionSizeOperation` have one canonical composite contract, while
+remaining homogeneous behavior lives under explicit legacy payloads where still needed. Dynamic slice, gather,
+reduce, and ordinary slice are intentionally array-only. Constructor mixed semantics must continue to live in the
+composite variant arm rather than adding another dual-contract payload.
 
 The archived inventory also included overlapping generic constructor contracts, which are a distinct and harder
 case:
@@ -1902,23 +1906,32 @@ suite passed 433 tests with 1 intentional ignore; the serialized local suite pas
 ignore. Dynamic RNG retains its exact semantic rejection because upper-bound generation would advance its functional
 state by the physical rather than logical element count; Phase 13 owns that padding-sensitive design. Effectful
 shard-map bodies also reject exactly because `sdy.manual_computation` cannot thread StableHLO effect tokens across its
-boundary; pure shard-map bodies are unchanged. The next isolated review unit is Phase 8. The post-review correction
-pass moved every checked failure into the core effect model, deleted the backend
-effect overlay, made division/remainder and concatenate checks scheduling-safe, and carried assertion-runtime
-requirements through persistent cache restoration. Local verification passed 1,100 `ryft-core` unit tests plus its
-integration/compile-fail/doctest suites, 432 `ryft-xla` tests (1 ignored benchmark), both macro integration/trybuild
-suites, formatting, diff hygiene, and residual searches; the exact ledger is in the P7 plan.
+boundary; pure shard-map bodies are unchanged. The post-review correction pass moved every checked failure into the
+core effect model, deleted the backend effect overlay, made division/remainder and concatenate checks scheduling-safe,
+and carried assertion-runtime requirements through persistent cache restoration. Local verification passed 1,100
+`ryft-core` unit tests plus its integration/compile-fail/doctest suites, 432 `ryft-xla` tests (1 ignored benchmark),
+both macro integration/trybuild suites, formatting, diff hygiene, and residual searches; the exact ledger is in the
+P7 plan.
+
+P8a's post-Phase-7 operation-contract inventory is complete against `7da7d7f25`. It corrects the stale dual-contract
+count, records the 65 explicit production impl heads and compilation baselines, and establishes the dependency order
+in `.tasks/plan_p8a_operation_contract_inventory.md`. The next isolated code review parameterizes
+`SelectOperation`, `StopGradientOperation`, and the macro's `TestNullaryOperation` fixture before any associated-type
+trait change.
 
 ### Phase 8: enforce contracts and consolidate operation declarations
 
-- [ ] Begin only after Phases 1 through 7 have removed dual semantic contracts, implicit replay, and overlapping mixed
-      constructors. Capture the resulting implementor and bound inventory before changing the trait.
+- [x] Begin only after Phases 1 through 7 have removed implicit replay and overlapping mixed constructors. Capture the
+      remaining dual/type-polymorphic payloads plus the implementor and bound inventory before changing the trait. The
+      exact ledger, baseline, migration order, and abort criteria are recorded in
+      `.tasks/plan_p8a_operation_contract_inventory.md` against `7da7d7f25`.
+- [ ] Parameterize `SelectOperation`, `StopGradientOperation`, and `TestNullaryOperation` by their operation type as
+      the first isolated prerequisite, then apply the proven pattern to the inventory's remaining type-polymorphic
+      payloads before adding `Operation::Type`. Each concrete payload instantiation must have exactly one contract.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
       `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
       `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and
       `ArrayProgramOperation`.
-- [ ] Parameterize `SelectOperation`, `StopGradientOperation`, and `TestNullaryOperation` by their operation type so
-      each concrete payload instantiation has exactly one associated contract.
 - [ ] Update the derive macro in the prototype so homogeneous enums prove that every payload has the same operation
       type.
 - [ ] Exercise the prototype through inference, eager interpretation, tracing, PE, batching, JVP, VJP, transposition,
