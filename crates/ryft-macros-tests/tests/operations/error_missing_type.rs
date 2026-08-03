@@ -1,4 +1,6 @@
-trait Operation<T> {}
+trait Operation {
+    type Type;
+}
 
 #[derive(ryft::Operation)]
 enum BadOperation {

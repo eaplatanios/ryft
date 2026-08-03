@@ -1,0 +1,8 @@
+error[E0119]: conflicting implementations of trait `ryft::Operation` for type `BadOperation`
+  --> tests/operations/error_multiple_operation_types.rs:22:1
+   |
+ 6 | impl Operation for BadOperation {
+   | ------------------------------- first implementation here
+...
+22 | impl Operation for BadOperation {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `BadOperation`

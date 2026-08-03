@@ -62,7 +62,7 @@ struct OutputRegionProvenance {
 }
 
 /// Stand-in for `ryft_core::RegionDriver`.
-trait RegionDriver<V: Value, O: Operation<V::Type>> {}
+trait RegionDriver<V: Value, O: Operation<Type = V::Type>> {}
 
 /// Stand-in for `ryft_core::InterpretationDriver`.
 trait InterpretationDriver<C: Domain>: RegionDriver<C::Value, C::Operation> {}
@@ -71,18 +71,18 @@ trait InterpretationDriver<C: Domain>: RegionDriver<C::Value, C::Operation> {}
 trait DifferentiationDriver<C: Context> {}
 
 /// Stand-in for `ryft_core::TranspositionDriver`.
-trait TranspositionDriver<V: Value, O: Operation<V::Type>> {}
+trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>> {}
 
 /// Empty region transform driver used when testing operation rules that do not access nested regions.
 struct EmptyRegionDriver;
 
-impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EmptyRegionDriver {}
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for EmptyRegionDriver {}
 
 impl<C: Domain> InterpretationDriver<C> for EmptyRegionDriver {}
 
 impl<C: Context> DifferentiationDriver<C> for EmptyRegionDriver {}
 
-impl<V: Value, O: Operation<V::Type>> TranspositionDriver<V, O> for EmptyRegionDriver {}
+impl<V: Value, O: Operation<Type = V::Type>> TranspositionDriver<V, O> for EmptyRegionDriver {}
 
 /// Stand-in for `ryft_core::DifferentiationError`, the error type the differentiation dispatchers return.
 #[derive(Debug, PartialEq, Eq)]
@@ -103,7 +103,7 @@ trait Domain {
     type Type: Type;
     type Value: Value<Type = Self::Type>;
     type Constant: Value<Type = Self::Type>;
-    type Operation: Operation<Self::Type>;
+    type Operation: Operation<Type = Self::Type>;
 }
 
 /// Stand-in for `ryft_core::Context`.
@@ -113,9 +113,11 @@ trait Context: Domain {
 
 /// Stand-in minimal operation family for value-only contexts.
 #[derive(Clone, Debug)]
-struct NoOperation;
+struct NoOperation<T: Type>(PhantomData<fn() -> T>);
 
-impl<T: Type> Operation<T> for NoOperation {
+impl<T: Type> Operation for NoOperation<T> {
+    type Type = T;
+
     fn name(&self) -> &'static str {
         "no_operation"
     }
@@ -130,18 +132,18 @@ impl<T: Type> Operation<T> for NoOperation {
 }
 
 /// Stand-in interpretation context that lifts constants by cloning them.
-struct TestContext<V: Value, O: Operation<V::Type> = NoOperation> {
+struct TestContext<V: Value, O: Operation<Type = V::Type> = NoOperation<<V as Value>::Type>> {
     marker: PhantomData<(V, O)>,
 }
 
-impl<V: Value, O: Operation<V::Type>> Domain for TestContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Domain for TestContext<V, O> {
     type Type = V::Type;
     type Value = V;
     type Constant = V;
     type Operation = O;
 }
 
-impl<V: Value, O: Operation<V::Type>> Context for TestContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Context for TestContext<V, O> {
     fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
         Ok(constant)
     }
@@ -170,14 +172,14 @@ impl<V> Parameterized<V> for Vec<V> {
 /// Stand-in for `ryft_core::Zero`.
 trait Zero<V: Value> {}
 
-impl<V: Value, O: Operation<V::Type>> Zero<V> for TestContext<V, O> {}
+impl<V: Value, O: Operation<Type = V::Type>> Zero<V> for TestContext<V, O> {}
 
 /// Stand-in for `ryft_core::Constant`.
 trait Constant<V: Value, Stored> {
     fn constant(&self, value: Stored) -> Result<V, ProgramError>;
 }
 
-impl<V: Value, O: Operation<V::Type>, Stored: Clone> Constant<V, Stored> for TestContext<V, O>
+impl<V: Value, O: Operation<Type = V::Type>, Stored: Clone> Constant<V, Stored> for TestContext<V, O>
 where
     V: From<Stored>,
 {
@@ -208,7 +210,9 @@ struct RegionSlot {
 }
 
 /// Stand-in for `ryft_core::Operation`.
-trait Operation<T: Type>: Clone {
+trait Operation: Clone {
+    type Type: Type;
+
     fn name(&self) -> &'static str;
 
     fn region_slots(&self) -> &'static [RegionSlot] {
@@ -221,17 +225,17 @@ trait Operation<T: Type>: Clone {
 
     fn infer_region_input_types(
         &self,
-        _input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        _input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Option<Vec<Self::Type>>>, TypeError> {
         Ok(vec![None; region_interfaces.len()])
     }
 
     fn infer_output_types(
         &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError>;
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Self::Type>, TypeError>;
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         let _ = output_index;
@@ -247,7 +251,10 @@ trait Operation<T: Type>: Clone {
         Effects::Pure
     }
 
-    fn rename_type_identities(&self, _renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+    fn rename_type_identities(
+        &self,
+        _renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
         Ok(self.clone())
     }
 
@@ -258,7 +265,7 @@ trait Operation<T: Type>: Clone {
 }
 
 /// Stand-in for `ryft_core::InterpretableOperation`.
-trait InterpretableOperation<C: Domain>: Operation<C::Type> {
+trait InterpretableOperation<C: Domain>: Operation<Type = C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -269,24 +276,24 @@ trait InterpretableOperation<C: Domain>: Operation<C::Type> {
 
 /// Stand-in for `ryft_core::TracingContext`. Mirrors the real context's defaulted capture parameter and its
 /// `StagingContext` membership at the capture-pinned form used by generated transform dispatch.
-struct TracingContext<V: Value, O: Operation<V::Type>, Capture = V> {
+struct TracingContext<V: Value, O: Operation<Type = V::Type>, Capture = V> {
     marker: PhantomData<(V, O, Capture)>,
 }
 
-impl<V: Value, O: Operation<V::Type>> Domain for TracingContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Domain for TracingContext<V, O> {
     type Type = V::Type;
     type Value = Tracer<TracingContext<V, O>>;
     type Constant = V;
     type Operation = O;
 }
 
-impl<V: Value, O: Operation<V::Type>> Context for TracingContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Context for TracingContext<V, O> {
     fn lift(&self, _constant: Self::Constant) -> Result<Self::Value, ProgramError> {
         Err(ProgramError)
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> StagingContext for TracingContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> StagingContext for TracingContext<V, O> {
     type Meta = ();
 }
 
@@ -303,7 +310,7 @@ impl<C, Meta> Clone for Tracer<C, Meta> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Value for Tracer<TracingContext<V, O>> {
+impl<V: Value, O: Operation<Type = V::Type>> Value for Tracer<TracingContext<V, O>> {
     type Type = V::Type;
 }
 
@@ -335,7 +342,7 @@ impl<V> PartialEq for MaybeZero<V> {
 impl<V> Eq for MaybeZero<V> {}
 
 /// Stand-in for `ryft_core::TransposableOperation`.
-trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::Type> {
+trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation<Type = V::Type> {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
@@ -347,7 +354,7 @@ trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::Type>
 
 /// Stand-in for `ryft_core::Program`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Program<V: Value, O: Operation<V::Type>, Input, Output> {
+struct Program<V: Value, O: Operation<Type = V::Type>, Input, Output> {
     label: &'static str,
     constant: Option<V>,
     operation: Option<O>,
@@ -378,7 +385,7 @@ impl<O> Instruction<'_, O> {
 impl<Constant, O, Input, Output> Program<Constant, O, Input, Output>
 where
     Constant: Value,
-    O: Operation<Constant::Type>,
+    O: Operation<Type = Constant::Type>,
 {
     fn interpret_with<V, LiftConstantFn, InterpretInstructionFn>(
         &self,
@@ -423,7 +430,7 @@ trait StagingContext: Context {
     type Meta;
 }
 
-impl<V: Value, O: Operation<V::Type>> StagingContext for TestContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> StagingContext for TestContext<V, O> {
     type Meta = ();
 }
 
@@ -442,7 +449,7 @@ impl<V> std::fmt::Debug for DifferentiationDual<V> {
 }
 
 /// Stand-in for `ryft_core::DifferentiableOperation`.
-trait DifferentiableOperation<C: Context>: Operation<C::Type> {
+trait DifferentiableOperation<C: Context>: Operation<Type = C::Type> {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
@@ -461,7 +468,7 @@ impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where
     T: Type,
     V: Value<Type = T> + SpecialDifferentiableValue,
-    O: Operation<T> + From<ZeroOperation<T>>,
+    O: Operation<Type = T> + From<ZeroOperation<T>>,
 {
     /// Stand-in for `ryft_core::Program::linearize`. The `SpecialDifferentiableValue` bound on the value type stands
     /// in for the extra value capabilities a concrete differentiation implementation can require.
@@ -503,11 +510,11 @@ mod partial {
     }
 
     /// Stand-in for `ryft_core::RegionRef`.
-    pub(crate) struct RegionRef<V: Value, O: Operation<V::Type>> {
+    pub(crate) struct RegionRef<V: Value, O: Operation<Type = V::Type>> {
         marker: PhantomData<(V, O)>,
     }
 
-    impl<V: Value, O: Operation<V::Type>> RegionRef<V, O> {
+    impl<V: Value, O: Operation<Type = V::Type>> RegionRef<V, O> {
         pub(crate) fn to_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
             Program { label: "region", constant: None, operation: None, marker: PhantomData }
         }
@@ -550,7 +557,7 @@ impl<C: Context> partial::PartialEvaluationDriver<C> for EmptyRegionDriver {
     }
 }
 
-fn transposed<T: Type, V: Value<Type = T>, O: Operation<T>>(
+fn transposed<T: Type, V: Value<Type = T>, O: Operation<Type = T>>(
     label: &'static str,
 ) -> MaybeZero<Tracer<TracingContext<V, O>>> {
     MaybeZero { label, marker: PhantomData }
@@ -639,7 +646,9 @@ struct ZeroOperation<T: Type> {
     r#type: T,
 }
 
-impl<T: Type> Operation<T> for ZeroOperation<T> {
+impl<T: Type> Operation for ZeroOperation<T> {
+    type Type = T;
+
     fn name(&self) -> &'static str {
         "zero"
     }
@@ -680,7 +689,7 @@ impl<T: Type, C: Context<Type = T>> DifferentiableOperation<C> for ZeroOperation
     }
 }
 
-impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for ZeroOperation<T> {
+impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>> TransposableOperation<V, O> for ZeroOperation<T> {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
@@ -695,7 +704,9 @@ impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> f
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AddOperation;
 
-impl Operation<DataType> for AddOperation {
+impl Operation for AddOperation {
+    type Type = DataType;
+
     fn name(&self) -> &'static str {
         "add"
     }
@@ -725,7 +736,7 @@ impl<C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C> for 
 {
 }
 
-impl<V: Value<Type = DataType>, O: Operation<DataType>> TransposableOperation<V, O> for AddOperation {
+impl<V: Value<Type = DataType>, O: Operation<Type = DataType>> TransposableOperation<V, O> for AddOperation {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
@@ -742,7 +753,9 @@ impl<V: Value<Type = DataType>, O: Operation<DataType>> TransposableOperation<V,
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PrintOperation;
 
-impl Operation<DataType> for PrintOperation {
+impl Operation for PrintOperation {
+    type Type = DataType;
+
     fn name(&self) -> &'static str {
         "print"
     }
@@ -813,7 +826,9 @@ struct FactorOperation<T: Type, V> {
     marker: PhantomData<T>,
 }
 
-impl<T: Type, V: Clone> Operation<T> for FactorOperation<T, V> {
+impl<T: Type, V: Clone> Operation for FactorOperation<T, V> {
+    type Type = T;
+
     fn name(&self) -> &'static str {
         "factor"
     }
@@ -843,7 +858,9 @@ impl<T: Type, F: Clone, C: Context<Type = T>> partial::PartiallyEvaluatableOpera
 {
 }
 
-impl<T: Type, V: Value<Type = T>, O: Operation<T>, F: Clone> TransposableOperation<V, O> for FactorOperation<T, F> {
+impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, F: Clone> TransposableOperation<V, O>
+    for FactorOperation<T, F>
+{
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
@@ -861,7 +878,9 @@ struct ConstantOperation<T: Type, V> {
     marker: PhantomData<T>,
 }
 
-impl<T: Type, V: Clone> Operation<T> for ConstantOperation<T, V> {
+impl<T: Type, V: Clone> Operation for ConstantOperation<T, V> {
+    type Type = T;
+
     fn name(&self) -> &'static str {
         "constant"
     }
@@ -904,7 +923,9 @@ impl<T: Type, Constant: Clone, C: Context<Type = T>> DifferentiableOperation<C> 
     }
 }
 
-impl<T: Type, V: Value<Type = T>, O: Operation<T>, F: Clone> TransposableOperation<V, O> for ConstantOperation<T, F> {
+impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, F: Clone> TransposableOperation<V, O>
+    for ConstantOperation<T, F>
+{
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
@@ -922,7 +943,9 @@ struct CustomJvpOperation<T: Type, V> {
     marker: PhantomData<(T, V)>,
 }
 
-impl<T: Type, V: Clone> Operation<T> for CustomJvpOperation<T, V> {
+impl<T: Type, V: Clone> Operation for CustomJvpOperation<T, V> {
+    type Type = T;
+
     fn name(&self) -> &'static str {
         "custom_jvp"
     }
@@ -1065,7 +1088,9 @@ fn test_operation_default_crate_path_is_ryft() {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DotOperation;
 
-impl Operation<ArrayType> for DotOperation {
+impl Operation for DotOperation {
+    type Type = ArrayType;
+
     fn name(&self) -> &'static str {
         "dot"
     }
@@ -1098,7 +1123,9 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BackendPayload {}
 
-impl Operation<ArrayType> for BackendPayload {
+impl Operation for BackendPayload {
+    type Type = ArrayType;
+
     fn name(&self) -> &'static str {
         match *self {}
     }
@@ -1128,7 +1155,7 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 {
 }
 
-impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<V, O> for BackendPayload {
+impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O> for BackendPayload {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
@@ -1143,7 +1170,9 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SpecialOperation;
 
-impl Operation<ArrayType> for SpecialOperation {
+impl Operation for SpecialOperation {
+    type Type = ArrayType;
+
     fn name(&self) -> &'static str {
         "special"
     }
@@ -1191,7 +1220,7 @@ where
 impl<V, O> TransposableOperation<V, O> for SpecialOperation
 where
     V: Value<Type = ArrayType> + SpecialTransposableValue,
-    O: Operation<ArrayType>,
+    O: Operation<Type = ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1273,7 +1302,9 @@ struct WhileOperation<T: Type, V, O> {
     marker: PhantomData<(T, V, O)>,
 }
 
-impl<T: Type, V: Clone, O: Clone> Operation<T> for WhileOperation<T, V, O> {
+impl<T: Type, V: Clone, O: Clone> Operation for WhileOperation<T, V, O> {
+    type Type = T;
+
     fn name(&self) -> &'static str {
         "while"
     }
@@ -1298,14 +1329,14 @@ impl<T: Type, W: Clone, O: Clone, C: Domain<Type = T>> InterpretableOperation<C>
     }
 }
 
-impl<T: Type, W: Clone, O: Operation<T>, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C>
+impl<T: Type, W: Clone, O: Operation<Type = T>, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C>
     for WhileOperation<T, W, O>
 where
     C::Operation: From<WhileOperation<T, W, O>>,
 {
 }
 
-impl<T: Type, V: Value<Type = T>, O: Operation<T>, W: Clone, P: Clone> TransposableOperation<V, O>
+impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, W: Clone, P: Clone> TransposableOperation<V, O>
     for WhileOperation<T, W, P>
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -1324,7 +1355,9 @@ struct RecomputeOperation<O> {
     operation: O,
 }
 
-impl<O: Operation<ArrayType>> Operation<ArrayType> for RecomputeOperation<O> {
+impl<O: Operation<Type = ArrayType>> Operation for RecomputeOperation<O> {
+    type Type = ArrayType;
+
     fn name(&self) -> &'static str {
         self.operation.name()
     }
@@ -1338,7 +1371,7 @@ impl<O: Operation<ArrayType>> Operation<ArrayType> for RecomputeOperation<O> {
     }
 }
 
-impl<O: Operation<ArrayType>, C: Domain<Type = ArrayType>> InterpretableOperation<C> for RecomputeOperation<O> {
+impl<O: Operation<Type = ArrayType>, C: Domain<Type = ArrayType>> InterpretableOperation<C> for RecomputeOperation<O> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -1349,15 +1382,15 @@ impl<O: Operation<ArrayType>, C: Domain<Type = ArrayType>> InterpretableOperatio
     }
 }
 
-impl<RecomputedOperation: Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
-    for RecomputeOperation<RecomputedOperation>
+impl<RecomputedOperation: Operation<Type = ArrayType>, C: Context<Type = ArrayType>>
+    partial::PartiallyEvaluatableOperation<C> for RecomputeOperation<RecomputedOperation>
 where
     C::Operation: From<RecomputeOperation<RecomputedOperation>>,
 {
 }
 
-impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>, P: Operation<ArrayType>> TransposableOperation<V, O>
-    for RecomputeOperation<P>
+impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>, P: Operation<Type = ArrayType>>
+    TransposableOperation<V, O> for RecomputeOperation<P>
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1375,7 +1408,9 @@ struct CustomVjpCallOperation<T: Type, C, O, F> {
     marker: PhantomData<(T, C, O, F)>,
 }
 
-impl<T: Type, C: Clone, O: Clone, F: Clone> Operation<T> for CustomVjpCallOperation<T, C, O, F> {
+impl<T: Type, C: Clone, O: Clone, F: Clone> Operation for CustomVjpCallOperation<T, C, O, F> {
+    type Type = T;
+
     fn name(&self) -> &'static str {
         "custom_vjp_call"
     }
@@ -1409,7 +1444,7 @@ where
 {
 }
 
-impl<T: Type, V: Value<Type = T>, O: Operation<T>, C: Clone, P: Clone, F: Clone> TransposableOperation<V, O>
+impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, C: Clone, P: Clone, F: Clone> TransposableOperation<V, O>
     for CustomVjpCallOperation<T, C, P, F>
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -1431,7 +1466,7 @@ enum LinearArrayOperation<
     C: Value<Type = ArrayType>,
     Backend = BackendPayload,
     F: Value<Type = ArrayType> = V,
-    P: Operation<ArrayType> = ArrayOperation<C, Backend>,
+    P: Operation<Type = ArrayType> = ArrayOperation<C, Backend>,
 > {
     Zero(ZeroOperation<ArrayType>),
     Factor(FactorOperation<ArrayType, F>),
@@ -1544,7 +1579,9 @@ struct PartialEvaluationRecursiveOperation<V, O> {
     marker: PhantomData<(V, O)>,
 }
 
-impl<V: Clone, O: Clone> Operation<ArrayType> for PartialEvaluationRecursiveOperation<V, O> {
+impl<V: Clone, O: Clone> Operation for PartialEvaluationRecursiveOperation<V, O> {
+    type Type = ArrayType;
+
     fn name(&self) -> &'static str {
         "partial_evaluation_recursive"
     }
@@ -1571,7 +1608,7 @@ impl<W: Clone, O: Clone, C: Domain<Type = ArrayType>> InterpretableOperation<C>
     }
 }
 
-impl<W: Clone, O: Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
+impl<W: Clone, O: Operation<Type = ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
     for PartialEvaluationRecursiveOperation<W, O>
 where
     C::Value: SpecialPartiallyEvaluatableValue,
@@ -1643,7 +1680,7 @@ impl<V> ArrayBatch<V> {
 
 /// Stand-in for `ryft_core::BatchableOperation`. Every rule receives the active [`BatchingContext`] and its optional
 /// instruction-scoped [`BatchingDriver`] while physical values remain owned by the parent context `C`.
-trait BatchableOperation<C: Context<Type = ArrayType>, P>: Operation<ArrayType> {
+trait BatchableOperation<C: Context<Type = ArrayType>, P>: Operation<Type = ArrayType> {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
@@ -1654,24 +1691,24 @@ trait BatchableOperation<C: Context<Type = ArrayType>, P>: Operation<ArrayType> 
 
 /// Stand-in for `ryft_core::EagerContext`. Mirrors the real context's `Context` membership so that a top-level
 /// eager batch can be represented as `BatchingContext<EagerContext<...>, ArrayBatching>`.
-struct EagerContext<V: Value, O: Operation<V::Type>> {
+struct EagerContext<V: Value, O: Operation<Type = V::Type>> {
     marker: PhantomData<(V, O)>,
 }
 
-impl<V: Value, O: Operation<V::Type>> Domain for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Domain for EagerContext<V, O> {
     type Type = V::Type;
     type Value = V;
     type Constant = V;
     type Operation = O;
 }
 
-impl<V: Value, O: Operation<V::Type>> Context for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Context for EagerContext<V, O> {
     fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
         Ok(constant)
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Zero<V> for EagerContext<V, O> {}
+impl<V: Value, O: Operation<Type = V::Type>> Zero<V> for EagerContext<V, O> {}
 
 /// Stand-in for `ryft_core::BatchingContext`. Mirrors the real context's parent accessor and observable axis
 /// metadata, which active rules (e.g., named-axis collectives) inspect.
@@ -1722,7 +1759,7 @@ enum ProgramBatchingOutputAxesPolicy {
 impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
     V: Value<Type = ArrayType>,
-    O: Operation<ArrayType>,
+    O: Operation<Type = ArrayType>,
 {
     /// Stand-in for `ryft_core::Program::batched`.
     fn batched(
@@ -1793,7 +1830,9 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CollectiveLikeOperation;
 
-impl Operation<ArrayType> for CollectiveLikeOperation {
+impl Operation for CollectiveLikeOperation {
+    type Type = ArrayType;
+
     fn name(&self) -> &'static str {
         "collective_like"
     }
@@ -1849,7 +1888,9 @@ struct BatchRecursiveOperation<V, O> {
     marker: PhantomData<(V, O)>,
 }
 
-impl<V: Clone, O: Clone> Operation<ArrayType> for BatchRecursiveOperation<V, O> {
+impl<V: Clone, O: Clone> Operation for BatchRecursiveOperation<V, O> {
+    type Type = ArrayType;
+
     fn name(&self) -> &'static str {
         "batch_recursive"
     }
@@ -1874,7 +1915,7 @@ impl<W: Clone, O: Clone, C: Domain<Type = ArrayType>> InterpretableOperation<C> 
     }
 }
 
-impl<W: Clone, O: Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
+impl<W: Clone, O: Operation<Type = ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
     for BatchRecursiveOperation<W, O>
 where
     C::Operation: From<BatchRecursiveOperation<W, O>>,
@@ -2013,6 +2054,8 @@ fn test_errors() {
     test_cases.compile_fail("tests/operations/error_duplicate_dispatcher.rs");
     test_cases.compile_fail("tests/operations/error_empty_dispatch.rs");
     test_cases.compile_fail("tests/operations/error_missing_type.rs");
+    test_cases.compile_fail("tests/operations/error_mismatched_payload_type.rs");
+    test_cases.compile_fail("tests/operations/error_multiple_operation_types.rs");
     test_cases.compile_fail("tests/operations/error_type_attribute.rs");
     test_cases.compile_fail("tests/operations/error_unknown_dispatcher.rs");
 }

@@ -1,0 +1,83 @@
+error[E0308]: arguments to this function are incorrect
+ --> tests/operations/error_mismatched_payload_type.rs:3:17
+  |
+3 | #[derive(Clone, ryft::Operation)]
+  |                 ^^^^^^^^^^^^^^^
+  |                 |
+  |                 expected `&[ArrayType]`, found `&[DataType]`
+  |                 expected `&[RegionInterface<ArrayType>]`, found `&[RegionInterface<DataType>]`
+  |
+  = note: expected reference `&[ArrayType]`
+             found reference `&[ryft::DataType]`
+  = note: expected reference `&[RegionInterface<ArrayType>]`
+             found reference `&[RegionInterface<ryft::DataType>]`
+note: method defined here
+ --> $WORKSPACE/crates/ryft-core/src/programs/operations.rs
+  |
+  |     fn infer_region_input_types(
+  |        ^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: this error originates in the derive macro `ryft::Operation` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+ --> tests/operations/error_mismatched_payload_type.rs:3:17
+  |
+3 | #[derive(Clone, ryft::Operation)]
+  |                 ^^^^^^^^^^^^^^^
+  |                 |
+  |                 expected `Result<Vec<Option<Vec<DataType>>>, ...>`, found `Result<Vec<Option<Vec<ArrayType>>>, ...>`
+  |                 expected `Result<Vec<Option<Vec<ryft::DataType>>>, TypeError>` because of return type
+  |
+  = note: expected enum `Result<Vec<Option<Vec<ryft::DataType>>>, TypeError>`
+             found enum `Result<Vec<Option<Vec<ArrayType>>>, TypeError>`
+  = note: this error originates in the derive macro `ryft::Operation` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: arguments to this function are incorrect
+ --> tests/operations/error_mismatched_payload_type.rs:3:17
+  |
+3 | #[derive(Clone, ryft::Operation)]
+  |                 ^^^^^^^^^^^^^^^
+  |                 |
+  |                 expected `&[ArrayType]`, found `&[DataType]`
+  |                 expected `&[RegionInterface<ArrayType>]`, found `&[RegionInterface<DataType>]`
+  |
+  = note: expected reference `&[ArrayType]`
+             found reference `&[ryft::DataType]`
+  = note: expected reference `&[RegionInterface<ArrayType>]`
+             found reference `&[RegionInterface<ryft::DataType>]`
+note: method defined here
+ --> $WORKSPACE/crates/ryft-core/src/programs/operations.rs
+  |
+  |     fn infer_output_types(
+  |        ^^^^^^^^^^^^^^^^^^
+  = note: this error originates in the derive macro `ryft::Operation` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+ --> tests/operations/error_mismatched_payload_type.rs:3:17
+  |
+3 | #[derive(Clone, ryft::Operation)]
+  |                 ^^^^^^^^^^^^^^^
+  |                 |
+  |                 expected `Result<Vec<DataType>, TypeError>`, found `Result<Vec<ArrayType>, TypeError>`
+  |                 expected `Result<Vec<ryft::DataType>, TypeError>` because of return type
+  |
+  = note: expected enum `Result<Vec<ryft::DataType>, TypeError>`
+             found enum `Result<Vec<ArrayType>, TypeError>`
+  = note: this error originates in the derive macro `ryft::Operation` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+ --> tests/operations/error_mismatched_payload_type.rs:3:17
+  |
+3 | #[derive(Clone, ryft::Operation)]
+  |                 ^^^^^^^^^^^^^^^
+  |                 |
+  |                 expected `&TypeIdentityRenaming<DimensionVariable>`, found `&TypeIdentityRenaming<NoIdentity>`
+  |                 arguments to this function are incorrect
+  |
+  = note: expected reference `&TypeIdentityRenaming<DimensionVariable>`
+             found reference `&TypeIdentityRenaming<NoIdentity>`
+note: method defined here
+ --> $WORKSPACE/crates/ryft-core/src/programs/operations.rs
+  |
+  |     fn rename_type_identities(
+  |        ^^^^^^^^^^^^^^^^^^^^^^
+  = note: this error originates in the derive macro `ryft::Operation` (in Nightly builds, run with -Z macro-backtrace for more info)

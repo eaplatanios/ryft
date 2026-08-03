@@ -18,7 +18,9 @@ struct OutputRegionProvenance {
 
 struct RegionSlot;
 
-trait Operation<T> {
+trait Operation {
+    type Type;
+
     fn name(&self) -> &'static str;
 
     fn region_slots(&self) -> &'static [RegionSlot] {
@@ -27,9 +29,9 @@ trait Operation<T> {
 
     fn infer_output_types(
         &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError>;
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Self::Type>, TypeError>;
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         let _ = output_index;

@@ -58,7 +58,7 @@ pub use tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 /// Implementations declare their fixed input count, while the default type inference implementation checks
 /// the input count, broadcasts all input [`ArrayType`]s while tolerating [`Sharding`](crate::Sharding)s that
 /// differ only by [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes).
-pub trait ElementwiseOperation: Operation<ArrayType> {
+pub trait ElementwiseOperation: Operation<Type = ArrayType> {
     /// Returns the number of input arrays consumed by this elementwise [`Operation`].
     fn input_count(&self) -> usize;
 
@@ -128,7 +128,9 @@ mod tests {
             input_count: usize,
         }
 
-        impl Operation<ArrayType> for TestElementwiseArrayOperation {
+        impl Operation for TestElementwiseArrayOperation {
+            type Type = ArrayType;
+
             #[inline]
             fn name(&self) -> &'static str {
                 "elementwise_test"
@@ -153,18 +155,15 @@ mod tests {
 
         let operation = TestElementwiseArrayOperation { input_count: 1 };
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        assert_eq!(Operation::infer_output_types(&operation, &[input_type.clone()], &[]), Ok(vec![input_type]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[input_type.clone()], &[]),
-            Ok(vec![input_type])
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
+            Operation::infer_output_types(&operation, &[], &[]),
             Err(TypeError::invalid("expected 1 input but got 0".to_string())),
         );
 
         let operation = TestElementwiseArrayOperation { input_count: 2 };
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
+            Operation::infer_output_types(
                 &operation,
                 &[
                     ArrayType::scalar(DataType::F32).with_layout(Layout::Strided(StridedLayout::new(Vec::new()))),
@@ -175,7 +174,7 @@ mod tests {
             Ok(vec![ArrayType::scalar(DataType::F32)]),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
+            Operation::infer_output_types(
                 &operation,
                 &[
                     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])),
@@ -187,7 +186,7 @@ mod tests {
         );
 
         let operation = TestElementwiseArrayOperation { input_count: 3 };
-        let output = Operation::<ArrayType>::infer_output_types(
+        let output = Operation::infer_output_types(
             &operation,
             &[
                 ArrayType::scalar(DataType::F32),
@@ -232,7 +231,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let output = Operation::<ArrayType>::infer_output_types(&operation, &[first, second, third], &[]).unwrap();
+        let output = Operation::infer_output_types(&operation, &[first, second, third], &[]).unwrap();
         assert_eq!(
             output[0].sharding().unwrap().varying_manual_axes(),
             &BTreeSet::from(["x".to_string(), "y".to_string(), "z".to_string()]),
@@ -249,11 +248,11 @@ mod tests {
             ]),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[dynamic_type.clone(), dynamic_type.clone()], &[]),
+            Operation::infer_output_types(&operation, &[dynamic_type.clone(), dynamic_type.clone()], &[]),
             Ok(vec![dynamic_type.clone()]),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
+            Operation::infer_output_types(
                 &operation,
                 &[
                     dynamic_type,

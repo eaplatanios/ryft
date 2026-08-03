@@ -361,8 +361,6 @@ impl OperationEnum {
     fn generate_operation(&self) -> TokenStream {
         let variants = &self.variants;
         let ryft = &self.ryft_crate;
-        let primary_type = &self.operation_type;
-
         let operation_self_type = &self.self_type;
         let operation_generics = &self.operation_generics;
         let (operation_impl_generics, _, operation_where_clause) = operation_generics.split_for_impl();
@@ -386,7 +384,7 @@ impl OperationEnum {
             #operation_where_clause
             {
                 fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                    <Self as #ryft::Operation<#primary_type>>::render(self, formatter, 0)
+                    <Self as #ryft::Operation>::render(self, formatter, 0)
                 }
             }
 
@@ -406,7 +404,7 @@ impl OperationEnum {
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation<#primary_type>>::name(#receiver)
+                    <#payload_type as #ryft::Operation>::name(#receiver)
                 },
             }
         });
@@ -416,7 +414,7 @@ impl OperationEnum {
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation<#primary_type>>::infer_output_types(
+                    <#payload_type as #ryft::Operation>::infer_output_types(
                         #receiver,
                         input_types,
                         region_interfaces,
@@ -431,7 +429,7 @@ impl OperationEnum {
             let renamed = if variant.is_boxed {
                 quote! {
                     ::std::boxed::Box::new(
-                        <#payload_type as #ryft::Operation<#primary_type>>::rename_type_identities(
+                        <#payload_type as #ryft::Operation>::rename_type_identities(
                             #receiver,
                             renaming,
                         )?
@@ -439,7 +437,7 @@ impl OperationEnum {
                 }
             } else {
                 quote! {
-                    <#payload_type as #ryft::Operation<#primary_type>>::rename_type_identities(
+                    <#payload_type as #ryft::Operation>::rename_type_identities(
                         #receiver,
                         renaming,
                     )?
@@ -457,7 +455,7 @@ impl OperationEnum {
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation<#primary_type>>::infer_region_input_types(
+                    <#payload_type as #ryft::Operation>::infer_region_input_types(
                         #receiver,
                         input_types,
                         region_interfaces,
@@ -471,7 +469,7 @@ impl OperationEnum {
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation<#primary_type>>::region_slots(#receiver)
+                    <#payload_type as #ryft::Operation>::region_slots(#receiver)
                 },
             }
         });
@@ -481,7 +479,7 @@ impl OperationEnum {
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation<#primary_type>>::output_region_provenance(
+                    <#payload_type as #ryft::Operation>::output_region_provenance(
                         #receiver,
                         output_index,
                     )
@@ -494,7 +492,7 @@ impl OperationEnum {
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation<#primary_type>>::is_zero(#receiver, output_index)
+                    <#payload_type as #ryft::Operation>::is_zero(#receiver, output_index)
                 },
             }
         });
@@ -504,7 +502,7 @@ impl OperationEnum {
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation<#primary_type>>::effects(#receiver)
+                    <#payload_type as #ryft::Operation>::effects(#receiver)
                 },
             }
         });
@@ -514,16 +512,18 @@ impl OperationEnum {
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation<#primary_type>>::render(#receiver, formatter, indentation)
+                    <#payload_type as #ryft::Operation>::render(#receiver, formatter, indentation)
                 },
             }
         });
 
         quote! {
             #[automatically_derived]
-            impl #impl_generics #ryft::Operation<#primary_type> for #operation_self_type
+            impl #impl_generics #ryft::Operation for #operation_self_type
             #where_clause
             {
+                type Type = #primary_type;
+
                 fn name(&self) -> &'static str {
                     match self { #(#name_arms)* }
                 }
@@ -751,13 +751,18 @@ impl OperationEnum {
         batching_where_clause
             .predicates
             .push(syn::parse_quote!(__P: #ryft::ArrayBatchingPolicy<__ParentContext>));
+        // Each payload predicate also restates the payload's operation-type agreement, which
+        // `BatchableOperation::batch` requires per method because its own super-trait cannot carry that projection
+        // equality. Concrete payloads discharge it immediately; type-parameterized payloads transport it to the
+        // use site alongside their rule's other requirements.
         batching_where_clause.predicates.extend(variants.iter().map(|variant| {
             let operation_type = &variant.program_payload_type;
             let predicate: syn::WherePredicate = syn::parse_quote!(
-                #operation_type: #ryft::BatchableOperation<
-                    __ParentContext,
-                    #ryft::ArrayBatching<__P>,
-                >
+                #operation_type: #ryft::Operation<Type = #primary_type>
+                    + #ryft::BatchableOperation<
+                        __ParentContext,
+                        #ryft::ArrayBatching<__P>,
+                    >
             );
             predicate
         }));
@@ -868,10 +873,14 @@ impl OperationEnum {
         // Every payload carries its forward-mode obligation as a per-variant predicate, exactly like the
         // interpretation and partial-evaluation impls. The predicate transports each rule's own capability
         // requirements (e.g., `C::Value: Sin` for the sine rule) to the use site without the enum spelling them.
+        // The predicate also restates the payload's operation-type agreement, which `DifferentiableOperation::jvp`
+        // requires per method because its own super-trait cannot carry that projection equality.
         where_clause.predicates.extend(variants.iter().map(|variant| {
             let operation_type = &variant.program_payload_type;
-            let predicate: syn::WherePredicate =
-                syn::parse_quote!(#operation_type: #ryft::DifferentiableOperation<__DifferentiationContext>);
+            let predicate: syn::WherePredicate = syn::parse_quote!(
+                #operation_type: #ryft::Operation<Type = #primary_type>
+                    + #ryft::DifferentiableOperation<__DifferentiationContext>
+            );
             predicate
         }));
         // Higher-order payload rules (condition/while/scan) forward-differentiate and linearize their nested
@@ -964,7 +973,7 @@ impl OperationEnum {
         }
         where_clause
             .predicates
-            .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
+            .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<Type = #primary_type>));
         where_clause.predicates.extend(variants.iter().map(|variant| {
             let operation_type = &variant.payload_type;
             let predicate: syn::WherePredicate = syn::parse_quote! {
@@ -1160,8 +1169,8 @@ impl OperationVariant {
 }
 
 /// Builds the generics used by the generated [`Operation`] and [`Display`] implementations: the enum generics
-/// without defaults, plus one `Payload: Operation<T>` predicate per bare generic payload (concrete payloads already
-/// implement [`Operation`] on their own).
+/// without defaults, plus one `Payload: Operation<Type = T>` predicate per bare generic payload (concrete payloads
+/// already implement [`Operation`] on their own).
 fn operation_generics(
     generics: &syn::Generics,
     variants: &[OperationVariant],
@@ -1171,7 +1180,7 @@ fn operation_generics(
     let mut generics = generics.without_defaults();
     let generic_operation_bounds = variants.iter().filter(|variant| variant.is_generic_extension).map(|variant| {
         let payload_type = &variant.payload_type;
-        let predicate: syn::WherePredicate = syn::parse_quote!(#payload_type: #ryft::Operation<#operation_type>);
+        let predicate: syn::WherePredicate = syn::parse_quote!(#payload_type: #ryft::Operation<Type = #operation_type>);
         predicate
     });
     generics.make_where_clause().predicates.extend(generic_operation_bounds);
