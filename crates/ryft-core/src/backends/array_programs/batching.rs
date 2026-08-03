@@ -243,7 +243,7 @@ impl<C: Context<Type = ArrayProgramType>> BatchingPolicy<C> for ArrayProgramBatc
     }
 }
 
-impl<V: Value<Type = ArrayProgramType>, O: Operation<ArrayProgramType>> ThreadedExtentBatchedProgram<V, O> {
+impl<V: Value<Type = ArrayProgramType>, O: Operation<Type = ArrayProgramType>> ThreadedExtentBatchedProgram<V, O> {
     /// Creates a structurally batched array program with one leading mapped-extent input and forwarded output.
     pub(crate) fn new(
         program: Program<V, O, Vec<V>, Vec<V>>,
@@ -2171,7 +2171,8 @@ where
         + From<WhileOperation<ArrayProgramType>>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    ArrayOperation<A>: BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+    ArrayOperation<A>: Operation<Type = ArrayType>
+        + BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
 {
     fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
         &self,
@@ -2287,9 +2288,9 @@ where
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
-            Self::Concatenate(operation) => BatchableOperation::batch(operation, context, driver, inputs),
-            Self::CustomCall(operation) => BatchableOperation::batch(operation, context, driver, inputs),
-            Self::Pad(operation) => BatchableOperation::batch(operation, context, driver, inputs),
+            Self::Concatenate(operation) => operation.batch(context, driver, inputs),
+            Self::CustomCall(operation) => operation.batch(context, driver, inputs),
+            Self::Pad(operation) => operation.batch(context, driver, inputs),
             Self::DynamicShapeSlice(operation) => {
                 let Some((input, bounds)) = inputs.split_first() else {
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -2447,7 +2448,7 @@ where
                     .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(0)))
                     .collect()
             }
-            Self::LinearCall(operation) => BatchableOperation::batch(operation, context, driver, inputs),
+            Self::LinearCall(operation) => operation.batch(context, driver, inputs),
         }
     }
 }

@@ -487,7 +487,7 @@ impl AbsDiffEq for Array {
     }
 }
 
-impl<O: Operation<ArrayType>> Zero<Array> for EagerContext<Array, O> {
+impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
     fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
         let element = Array::zero_element(r#type.data_type())?;
         Ok(Array { r#type: r#type.clone(), values: vec![element; Array::materialized_element_count(r#type)?] })
@@ -500,7 +500,7 @@ impl ZeroLike for Array {
     }
 }
 
-impl<O: Operation<ArrayType>> One<Array> for EagerContext<Array, O> {
+impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
     fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
         let element = EagerContext::<Scalar>::new().one(&r#type.data_type())?;
         Ok(Array { r#type: r#type.clone(), values: vec![element; Array::materialized_element_count(r#type)?] })
@@ -520,14 +520,14 @@ impl StopGradient for Array {
     }
 }
 
-impl<O: Operation<ArrayType>> Fill<Scalar, Array> for EagerContext<Array, O> {
+impl<O: Operation<Type = ArrayType>> Fill<Scalar, Array> for EagerContext<Array, O> {
     fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array, ProgramError> {
         let element = value.convert_element_type(r#type.data_type())?;
         Ok(Array { r#type: r#type.clone(), values: vec![element; Array::materialized_element_count(r#type)?] })
     }
 }
 
-impl<O: Operation<ArrayType>> crate::operations::constants::Iota<Array> for EagerContext<Array, O> {
+impl<O: Operation<Type = ArrayType>> crate::operations::constants::Iota<Array> for EagerContext<Array, O> {
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
         if !r#type.data_type().is_numeric() {
             return Err(TypeError::invalid(format!(

@@ -677,7 +677,7 @@ impl AbsDiffEq for Scalar {
     }
 }
 
-impl<O: Operation<DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
+impl<O: Operation<Type = DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
     #[inline]
     fn zero(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
         Ok(match r#type {
@@ -750,7 +750,7 @@ impl ZeroLike for Scalar {
     }
 }
 
-impl<O: Operation<DataType>> One<Scalar> for EagerContext<Scalar, O> {
+impl<O: Operation<Type = DataType>> One<Scalar> for EagerContext<Scalar, O> {
     #[inline]
     fn one(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
         Ok(match r#type {
@@ -787,7 +787,7 @@ impl<O: Operation<DataType>> One<Scalar> for EagerContext<Scalar, O> {
     }
 }
 
-impl<O: Operation<DataType>> Fill<Scalar, Scalar> for EagerContext<Scalar, O> {
+impl<O: Operation<Type = DataType>> Fill<Scalar, Scalar> for EagerContext<Scalar, O> {
     #[inline]
     fn fill(&self, r#type: &DataType, value: Scalar) -> Result<Scalar, ProgramError> {
         value.convert_element_type(*r#type)
@@ -2395,7 +2395,7 @@ mod tests {
         let interfaces = [condition.interface(), body.interface()];
 
         // Operation identity, type inference, and eager binding through detached region access.
-        assert_eq!(Operation::<DataType>::name(&operation), crate::operations::control_flow::WHILE_OPERATION_NAME);
+        assert_eq!(operation.name(), crate::operations::control_flow::WHILE_OPERATION_NAME);
         assert_eq!(operation.iteration_bound(), None);
         assert_eq!(operation.infer_output_types(&[DataType::F64], &interfaces), Ok(vec![DataType::F64]));
         assert_eq!(

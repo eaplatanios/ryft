@@ -314,6 +314,28 @@ If the associated-type prototype fails those gates, retain `Operation<T>` and in
 `OperationContract` trait implemented once per payload to record its canonical type. Do not continue allowing dual
 semantic implementations merely to avoid the trait migration.
 
+**ADOPTED (2026-08-02).** The full-scale worktree experiment (`experiment/p8-assoc-type` @ `50e86f964`; evidence in
+its `EXPERIMENT_NOTES.md` and `EXPERIMENT_E0284_PROBE.rs`) passed all five gates: trait solving stable, derive output
+slightly smaller with the homogeneous-family invariant compiler-enforced, bound spellings 623 → 295 with all 199
+disambiguation turbofishes deleted, no inference-only wrapper (3 universe-dispatch traits carry real per-universe
+algorithm bodies), and ~2,100-line ~92%-mechanical churn splittable along review seams. An earlier prototype's two
+failure classes were diagnosed as (1) E0283 from per-instantiation `Operation` impls — eliminated by the blanket-impl
+discipline (one `impl<T: Universe> Operation for FooOperation<T>` per payload family) — and (2) E0284 from
+supertraits projecting `Self`'s operation type through a context built from `Self` — an independent current-solver
+limitation handled by relaxing 4 projecting supertraits, with per-method `where Self: Operation<Type = C::Type>`
+clauses restoring the enforcement and `TODO(eaplatanios)` markers to restore the strict supertraits once the
+next-generation trait solver stabilizes. The fallback paragraph above is retained for history only. Execution
+checklist: `.tasks/plan_p8a_operation_contract_inventory.md` Phase 4.
+
+Adoption landed on the live tree (2026-08-02, Phase 4 review in the P8a plan): 84 files, +1,553/−1,063, all suites
+green (1,112 core / 434 XLA / macros incl. new trybuild mismatch coverage), zero new annotations, turbofishes
+242 → 0, `ryft-xla` (including the `XlaOperation` dispatcher) migrated with **no** solver errors at all. One
+enforcement nuance: the method-level equality clause works on `BatchableOperation::batch`,
+`DifferentiableOperation::jvp`, and `ZeroOperationProvider` (on `zero_operation_with_residuals`; placing it on the
+`ResidualZeroProvider` supertrait chain instead exploded into E0284), but `InterpretableOperation::interpret` fell
+back to plain relaxation — the composite eager dispatcher cannot discharge the clause under the current solver
+(E0275/E0284 in every spelling), so its `TODO(eaplatanios)` covers both the supertrait and the method clause.
+
 ### Generic typed projection
 
 Use standard `From` and borrowed `TryFrom` implementations for type lifting and projection. Retain one reusable value
@@ -2064,31 +2086,42 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
 - [x] Verify every migrated production payload's former alternate contract with transient pre-prototype compile-fail
       coverage, then remove those enumerated snapshots before the associated-type migration. Keep only the durable
       universal and homogeneous-enum failures in the prototype gate below.
-- [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
-      `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
-      `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and
-      `ArrayProgramOperation`.
-- [ ] Update the derive macro in the prototype so homogeneous enums prove that every payload has the same operation
-      type.
-- [ ] Exercise the prototype through inference, eager interpretation, tracing, PE, batching, JVP, VJP, transposition,
-      rendering, region import, and XLA lowering.
+- [x] Prototype `Operation` with an associated `Type` — executed as a full-scale worktree experiment rather than a
+      bounded slice, since the trait change is compile-atomic (branch `experiment/p8-assoc-type` @ `50e86f964`;
+      evidence in its `EXPERIMENT_NOTES.md` and `EXPERIMENT_E0284_PROBE.rs`), then adopted on the live tree
+      (2026-08-02, 84 files, +1,553/−1,063 across `ryft-core`/`ryft-xla`/`ryft-macros`/`ryft-macros-tests`).
+- [x] Update the derive macro so homogeneous enums prove that every payload has the same operation type
+      (`#[derive(Operation)]` emits `type Type = <family type>` plus one `Payload: Operation<Type = <family type>>`
+      predicate per member).
+- [x] Exercise the design through inference, eager interpretation, tracing, PE, batching, JVP, VJP, transposition,
+      rendering, region import (experiment), and XLA lowering (adoption; 434 XLA library tests).
 - [ ] Simplify the three projected-operation helper signatures and every call site after `Operation::Type` makes the
       member type recoverable from the projected operation: `jvp_projected_operation` and
       `transpose_projected_operation` must require no turbofish, while `batch_projected_operation` must drop its
       explicit member-type argument and either infer its projected batching policy from the final policy contracts or
       keep that one irreducible policy selection explicit. Do not retain inferred generic placeholders or introduce a
       marker/wrapper solely to relocate the same type annotation. Add compile-checked direct-call fixtures pinning the
-      final syntax.
-- [ ] Add compile-fail tests proving one payload cannot acquire two semantic type contracts and a homogeneous enum
-      cannot combine mismatched payload types.
-- [ ] Measure clean/incremental compile time, peak memory, macro output size, and trait-solver stability against
-      Phase 0.
-- [ ] Produce a mechanical migration count for all crates, not only `ryft-core`.
-- [ ] Gate: adopt the associated-type trait only if it enforces the already-established canonical signatures with no
+      final syntax. (Still open; the related 34 pre-existing `AddOperation::<X>::new()` turbofishes in `ryft-xla`
+      stem from `XlaOperation`'s two `From<AddOperation<_>>` impls and belong to this item's scope.)
+- [x] Add compile-fail tests proving one payload cannot acquire two semantic type contracts and a homogeneous enum
+      cannot combine mismatched payload types (`error_multiple_operation_types` pins E0119;
+      `error_mismatched_payload_type` pins the derive-boundary rejection).
+- [x] Measure clean/incremental compile time, peak memory, macro output size, and trait-solver stability against
+      Phase 0 (clean +3.1% time / RSS flat; no-change flat; incremental after touching `programs/operations.rs`
+      +36%; derive output slightly smaller; zero residual solver ambiguity).
+- [x] Produce a mechanical migration count for all crates, not only `ryft-core` (84 files: core 70, XLA 7,
+      macros-tests 5, macros 2).
+- [x] Gate: adopt the associated-type trait only if it enforces the already-established canonical signatures with no
       trait-solver regression, no wrapper layer beyond the approved localized type-indexed payloads, and a neutral or
-      smaller final generic surface.
-- [ ] Fallback gate: if rejected, implement the smallest sealed one-contract marker that prohibits dual semantics and
-      document why the associated type failed. Do not leave the invariant conventional.
+      smaller final generic surface. **Passed and adopted** (bound spellings 623 → 295; turbofishes 242 → 0; the
+      accepted trade is the 4 relaxed projecting supertraits recorded in the ADOPTED note above). Post-adoption
+      simplification (2026-08-03): all three universe-dispatch traits were subsequently removed in favor of
+      per-instantiation / generic-plus-composite `Operation` impls (`ElementwiseUniverse` via the owner's macro
+      restructuring; `CompareUniverse` and `RngBitGeneratorUniverse` by owner decision after establishing they bought
+      only direct-call inference ergonomics), at the cost of four explicit universe spellings in tests.
+- [x] ~~Fallback gate: if rejected, implement the smallest sealed one-contract marker that prohibits dual semantics
+      and document why the associated type failed.~~ Not triggered; the interim `OperationType` marker that had been
+      staged in this direction was subsumed into the associated type during adoption.
 
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
 - [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.

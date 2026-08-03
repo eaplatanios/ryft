@@ -29,7 +29,7 @@ impl TemporalResidualType for ArrayProgramType {
 
 impl<O> TemporalResidualOperation<ArrayProgramType> for O
 where
-    O: Operation<ArrayProgramType> + From<DimensionFromScalarOperation> + From<DimensionToScalarOperation>,
+    O: Operation<Type = ArrayProgramType> + From<DimensionFromScalarOperation> + From<DimensionToScalarOperation>,
 {
     fn residual_to_storage(residual_type: &ArrayProgramType) -> Result<Option<Self>, TypeError> {
         Ok(match residual_type {
@@ -66,7 +66,9 @@ impl WhileResidualStackType for ArrayProgramType {
 
 impl<A: Value<Type = ArrayType>, O> WhileResidualStackOperation<ArrayProgramType, A> for O
 where
-    O: Operation<ArrayProgramType> + From<ArrayProgramOperation<A>> + TemporalResidualOperation<ArrayProgramType>,
+    O: Operation<Type = ArrayProgramType>
+        + From<ArrayProgramOperation<A>>
+        + TemporalResidualOperation<ArrayProgramType>,
 {
     fn residual_stack_zero(r#type: ArrayProgramType) -> Self {
         let ArrayProgramType::Array(r#type) = r#type else {
@@ -1688,7 +1690,7 @@ where
 impl<
     A: Value<Type = ArrayType>,
     V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected = A>,
-    O: Operation<ArrayProgramType>
+    O: Operation<Type = ArrayProgramType>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + From<ArrayProgramOperation<A>>
         + From<ConditionOperation<V>>

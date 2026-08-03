@@ -550,7 +550,7 @@ impl<A: Value<Type = ArrayType>> ArrayProgramOperation<A> {
     /// Captures the runtime extents needed to materialize a disconnected cotangent zero from the primal `source`.
     pub fn capture_zero_residuals<
         V: Value<Type = ArrayProgramType>,
-        O: Operation<ArrayProgramType> + From<DimensionSizeOperation>,
+        O: Operation<Type = ArrayProgramType> + From<DimensionSizeOperation>,
     >(
         builder: &mut ProgramBuilder<V, O>,
         source: AtomId,
@@ -785,7 +785,9 @@ where
     ))
 }
 
-impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOperation<A> {
+impl<A: Value<Type = ArrayType>> Operation for ArrayProgramOperation<A> {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         match self {
@@ -794,22 +796,22 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DynamicIota(operation) => operation.name(),
             Self::Array(operation) => operation.name(),
             Self::Dimension(operation) => operation.name(),
-            Self::Compare(operation) => Operation::<ArrayProgramType>::name(operation),
+            Self::Compare(operation) => operation.name(),
             Self::DimensionSize(operation) => operation.name(),
             Self::DimensionFromScalar(operation) => operation.name(),
             Self::DimensionToScalar(operation) => operation.name(),
             Self::Reshape(operation) => operation.name(),
             Self::Broadcast(operation) => operation.name(),
-            Self::Concatenate(operation) => Operation::<ArrayProgramType>::name(operation),
-            Self::CustomCall(operation) => Operation::<ArrayProgramType>::name(operation),
-            Self::Pad(operation) => Operation::<ArrayProgramType>::name(operation),
+            Self::Concatenate(operation) => operation.name(),
+            Self::CustomCall(operation) => operation.name(),
+            Self::Pad(operation) => operation.name(),
             Self::DynamicShapeSlice(operation) => operation.name(),
-            Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::name(operation),
-            Self::AllGather(operation) => Operation::<ArrayType>::name(operation),
-            Self::PSumScatter(operation) => Operation::<ArrayType>::name(operation),
-            Self::AllToAll(operation) => Operation::<ArrayType>::name(operation),
+            Self::RngBitGenerator(operation) => operation.name(),
+            Self::AllGather(operation) => operation.name(),
+            Self::PSumScatter(operation) => operation.name(),
+            Self::AllToAll(operation) => operation.name(),
             Self::Condition(operation) => operation.name(),
-            Self::While(operation) => Operation::<ArrayProgramType>::name(operation),
+            Self::While(operation) => operation.name(),
             Self::Scan(operation) => operation.name(),
             Self::LinearCall(operation) => operation.name(),
         }
@@ -823,22 +825,22 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DynamicIota(operation) => operation.region_slots(),
             Self::Array(operation) => operation.region_slots(),
             Self::Dimension(operation) => operation.region_slots(),
-            Self::Compare(operation) => Operation::<ArrayProgramType>::region_slots(operation),
+            Self::Compare(operation) => operation.region_slots(),
             Self::DimensionSize(operation) => operation.region_slots(),
             Self::DimensionFromScalar(operation) => operation.region_slots(),
             Self::DimensionToScalar(operation) => operation.region_slots(),
             Self::Reshape(operation) => operation.region_slots(),
             Self::Broadcast(operation) => operation.region_slots(),
-            Self::Concatenate(operation) => Operation::<ArrayProgramType>::region_slots(operation),
-            Self::CustomCall(operation) => Operation::<ArrayProgramType>::region_slots(operation),
-            Self::Pad(operation) => Operation::<ArrayProgramType>::region_slots(operation),
+            Self::Concatenate(operation) => operation.region_slots(),
+            Self::CustomCall(operation) => operation.region_slots(),
+            Self::Pad(operation) => operation.region_slots(),
             Self::DynamicShapeSlice(operation) => operation.region_slots(),
-            Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::region_slots(operation),
-            Self::AllGather(operation) => Operation::<ArrayType>::region_slots(operation),
-            Self::PSumScatter(operation) => Operation::<ArrayType>::region_slots(operation),
-            Self::AllToAll(operation) => Operation::<ArrayType>::region_slots(operation),
+            Self::RngBitGenerator(operation) => operation.region_slots(),
+            Self::AllGather(operation) => operation.region_slots(),
+            Self::PSumScatter(operation) => operation.region_slots(),
+            Self::AllToAll(operation) => operation.region_slots(),
             Self::Condition(operation) => operation.region_slots(),
-            Self::While(operation) => Operation::<ArrayProgramType>::region_slots(operation),
+            Self::While(operation) => operation.region_slots(),
             Self::Scan(operation) => operation.region_slots(),
             Self::LinearCall(operation) => operation.region_slots(),
         }
@@ -964,30 +966,22 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DynamicIota(operation) => operation.output_region_provenance(output_index),
             Self::Array(operation) => operation.output_region_provenance(output_index),
             Self::Dimension(operation) => operation.output_region_provenance(output_index),
-            Self::Compare(operation) => {
-                Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
-            }
+            Self::Compare(operation) => operation.output_region_provenance(output_index),
             Self::DimensionSize(operation) => operation.output_region_provenance(output_index),
             Self::DimensionFromScalar(operation) => operation.output_region_provenance(output_index),
             Self::DimensionToScalar(operation) => operation.output_region_provenance(output_index),
             Self::Reshape(operation) => operation.output_region_provenance(output_index),
             Self::Broadcast(operation) => operation.output_region_provenance(output_index),
-            Self::Concatenate(operation) => {
-                Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
-            }
-            Self::CustomCall(operation) => {
-                Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
-            }
-            Self::Pad(operation) => Operation::<ArrayProgramType>::output_region_provenance(operation, output_index),
+            Self::Concatenate(operation) => operation.output_region_provenance(output_index),
+            Self::CustomCall(operation) => operation.output_region_provenance(output_index),
+            Self::Pad(operation) => operation.output_region_provenance(output_index),
             Self::DynamicShapeSlice(operation) => operation.output_region_provenance(output_index),
-            Self::RngBitGenerator(operation) => {
-                Operation::<ArrayProgramType>::output_region_provenance(operation, output_index)
-            }
-            Self::AllGather(operation) => Operation::<ArrayType>::output_region_provenance(operation, output_index),
-            Self::PSumScatter(operation) => Operation::<ArrayType>::output_region_provenance(operation, output_index),
-            Self::AllToAll(operation) => Operation::<ArrayType>::output_region_provenance(operation, output_index),
+            Self::RngBitGenerator(operation) => operation.output_region_provenance(output_index),
+            Self::AllGather(operation) => operation.output_region_provenance(output_index),
+            Self::PSumScatter(operation) => operation.output_region_provenance(output_index),
+            Self::AllToAll(operation) => operation.output_region_provenance(output_index),
             Self::Condition(operation) => operation.output_region_provenance(output_index),
-            Self::While(operation) => Operation::<ArrayProgramType>::output_region_provenance(operation, output_index),
+            Self::While(operation) => operation.output_region_provenance(output_index),
             Self::Scan(operation) => operation.output_region_provenance(output_index),
             Self::LinearCall(operation) => operation.output_region_provenance(output_index),
         }
@@ -1001,22 +995,22 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DynamicIota(operation) => operation.is_zero(output_index),
             Self::Array(operation) => operation.is_zero(output_index),
             Self::Dimension(operation) => operation.is_zero(output_index),
-            Self::Compare(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
+            Self::Compare(operation) => operation.is_zero(output_index),
             Self::DimensionSize(operation) => operation.is_zero(output_index),
             Self::DimensionFromScalar(operation) => operation.is_zero(output_index),
             Self::DimensionToScalar(operation) => operation.is_zero(output_index),
             Self::Reshape(operation) => operation.is_zero(output_index),
             Self::Broadcast(operation) => operation.is_zero(output_index),
-            Self::Concatenate(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
-            Self::CustomCall(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
-            Self::Pad(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
+            Self::Concatenate(operation) => operation.is_zero(output_index),
+            Self::CustomCall(operation) => operation.is_zero(output_index),
+            Self::Pad(operation) => operation.is_zero(output_index),
             Self::DynamicShapeSlice(operation) => operation.is_zero(output_index),
-            Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
-            Self::AllGather(operation) => Operation::<ArrayType>::is_zero(operation, output_index),
-            Self::PSumScatter(operation) => Operation::<ArrayType>::is_zero(operation, output_index),
-            Self::AllToAll(operation) => Operation::<ArrayType>::is_zero(operation, output_index),
+            Self::RngBitGenerator(operation) => operation.is_zero(output_index),
+            Self::AllGather(operation) => operation.is_zero(output_index),
+            Self::PSumScatter(operation) => operation.is_zero(output_index),
+            Self::AllToAll(operation) => operation.is_zero(output_index),
             Self::Condition(operation) => operation.is_zero(output_index),
-            Self::While(operation) => Operation::<ArrayProgramType>::is_zero(operation, output_index),
+            Self::While(operation) => operation.is_zero(output_index),
             Self::Scan(operation) => operation.is_zero(output_index),
             Self::LinearCall(operation) => operation.is_zero(output_index),
         }
@@ -1030,22 +1024,22 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DynamicIota(operation) => operation.effects(),
             Self::Array(operation) => operation.effects(),
             Self::Dimension(operation) => operation.effects(),
-            Self::Compare(operation) => Operation::<ArrayProgramType>::effects(operation),
+            Self::Compare(operation) => operation.effects(),
             Self::DimensionSize(operation) => operation.effects(),
             Self::DimensionFromScalar(operation) => operation.effects(),
             Self::DimensionToScalar(operation) => operation.effects(),
             Self::Reshape(operation) => operation.effects(),
             Self::Broadcast(operation) => operation.effects(),
-            Self::Concatenate(operation) => Operation::<ArrayProgramType>::effects(operation),
-            Self::CustomCall(operation) => Operation::<ArrayProgramType>::effects(operation),
-            Self::Pad(operation) => Operation::<ArrayProgramType>::effects(operation),
+            Self::Concatenate(operation) => operation.effects(),
+            Self::CustomCall(operation) => operation.effects(),
+            Self::Pad(operation) => operation.effects(),
             Self::DynamicShapeSlice(operation) => operation.effects(),
-            Self::RngBitGenerator(operation) => Operation::<ArrayProgramType>::effects(operation),
-            Self::AllGather(operation) => Operation::<ArrayType>::effects(operation),
-            Self::PSumScatter(operation) => Operation::<ArrayType>::effects(operation),
-            Self::AllToAll(operation) => Operation::<ArrayType>::effects(operation),
+            Self::RngBitGenerator(operation) => operation.effects(),
+            Self::AllGather(operation) => operation.effects(),
+            Self::PSumScatter(operation) => operation.effects(),
+            Self::AllToAll(operation) => operation.effects(),
             Self::Condition(operation) => operation.effects(),
-            Self::While(operation) => Operation::<ArrayProgramType>::effects(operation),
+            Self::While(operation) => operation.effects(),
             Self::Scan(operation) => operation.effects(),
             Self::LinearCall(operation) => operation.effects(),
         }
@@ -1058,9 +1052,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DynamicIota(operation) => Ok(Self::DynamicIota(operation.rename_type_identities(renaming)?)),
             Self::Array(operation) => Ok(Self::Array(operation.rename_type_identities(renaming)?)),
             Self::Dimension(operation) => Ok(Self::Dimension(operation.rename_type_identities(renaming)?)),
-            Self::Compare(operation) => {
-                Ok(Self::Compare(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
+            Self::Compare(operation) => Ok(Self::Compare(operation.rename_type_identities(renaming)?)),
             Self::DimensionSize(operation) => Ok(Self::DimensionSize(operation.rename_type_identities(renaming)?)),
             Self::DimensionFromScalar(operation) => {
                 Ok(Self::DimensionFromScalar(operation.rename_type_identities(renaming)?))
@@ -1070,34 +1062,18 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             }
             Self::Reshape(operation) => Ok(Self::Reshape(operation.rename_type_identities(renaming)?)),
             Self::Broadcast(operation) => Ok(Self::Broadcast(operation.rename_type_identities(renaming)?)),
-            Self::Concatenate(operation) => {
-                Ok(Self::Concatenate(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::CustomCall(operation) => {
-                Ok(Self::CustomCall(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::Pad(operation) => {
-                Ok(Self::Pad(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
+            Self::Concatenate(operation) => Ok(Self::Concatenate(operation.rename_type_identities(renaming)?)),
+            Self::CustomCall(operation) => Ok(Self::CustomCall(operation.rename_type_identities(renaming)?)),
+            Self::Pad(operation) => Ok(Self::Pad(operation.rename_type_identities(renaming)?)),
             Self::DynamicShapeSlice(operation) => {
                 Ok(Self::DynamicShapeSlice(operation.rename_type_identities(renaming)?))
             }
-            Self::RngBitGenerator(operation) => {
-                Ok(Self::RngBitGenerator(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::AllGather(operation) => {
-                Ok(Self::AllGather(Operation::<ArrayType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::PSumScatter(operation) => {
-                Ok(Self::PSumScatter(Operation::<ArrayType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::AllToAll(operation) => {
-                Ok(Self::AllToAll(Operation::<ArrayType>::rename_type_identities(operation, renaming)?))
-            }
+            Self::RngBitGenerator(operation) => Ok(Self::RngBitGenerator(operation.rename_type_identities(renaming)?)),
+            Self::AllGather(operation) => Ok(Self::AllGather(operation.rename_type_identities(renaming)?)),
+            Self::PSumScatter(operation) => Ok(Self::PSumScatter(operation.rename_type_identities(renaming)?)),
+            Self::AllToAll(operation) => Ok(Self::AllToAll(operation.rename_type_identities(renaming)?)),
             Self::Condition(operation) => Ok(Self::Condition(operation.rename_type_identities(renaming)?)),
-            Self::While(operation) => {
-                Ok(Self::While(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
+            Self::While(operation) => Ok(Self::While(operation.rename_type_identities(renaming)?)),
             Self::Scan(operation) => Ok(Self::Scan(operation.rename_type_identities(renaming)?)),
             Self::LinearCall(operation) => Ok(Self::LinearCall(operation.rename_type_identities(renaming)?)),
         }
@@ -1111,24 +1087,22 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
             Self::DynamicIota(operation) => operation.render(formatter, indentation),
             Self::Array(operation) => operation.render(formatter, indentation),
             Self::Dimension(operation) => operation.render(formatter, indentation),
-            Self::Compare(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
+            Self::Compare(operation) => operation.render(formatter, indentation),
             Self::DimensionSize(operation) => operation.render(formatter, indentation),
             Self::DimensionFromScalar(operation) => operation.render(formatter, indentation),
             Self::DimensionToScalar(operation) => operation.render(formatter, indentation),
             Self::Reshape(operation) => operation.render(formatter, indentation),
             Self::Broadcast(operation) => operation.render(formatter, indentation),
-            Self::Concatenate(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
-            Self::CustomCall(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
-            Self::Pad(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
+            Self::Concatenate(operation) => operation.render(formatter, indentation),
+            Self::CustomCall(operation) => operation.render(formatter, indentation),
+            Self::Pad(operation) => operation.render(formatter, indentation),
             Self::DynamicShapeSlice(operation) => operation.render(formatter, indentation),
-            Self::RngBitGenerator(operation) => {
-                Operation::<ArrayProgramType>::render(operation, formatter, indentation)
-            }
-            Self::AllGather(operation) => Operation::<ArrayType>::render(operation, formatter, indentation),
-            Self::PSumScatter(operation) => Operation::<ArrayType>::render(operation, formatter, indentation),
-            Self::AllToAll(operation) => Operation::<ArrayType>::render(operation, formatter, indentation),
+            Self::RngBitGenerator(operation) => operation.render(formatter, indentation),
+            Self::AllGather(operation) => operation.render(formatter, indentation),
+            Self::PSumScatter(operation) => operation.render(formatter, indentation),
+            Self::AllToAll(operation) => operation.render(formatter, indentation),
             Self::Condition(operation) => operation.render(formatter, indentation),
-            Self::While(operation) => Operation::<ArrayProgramType>::render(operation, formatter, indentation),
+            Self::While(operation) => operation.render(formatter, indentation),
             Self::Scan(operation) => operation.render(formatter, indentation),
             Self::LinearCall(operation) => operation.render(formatter, indentation),
         }
@@ -1140,7 +1114,7 @@ impl<A: Value<Type = ArrayType>> Operation<ArrayProgramType> for ArrayProgramOpe
 fn interpret_homogeneous_operation<
     T: Type,
     V: Value<Type = T>,
-    O: Operation<T> + InterpretableOperation<EagerContext<V, O>>,
+    O: Operation<Type = T> + InterpretableOperation<EagerContext<V, O>>,
     A: Value<Type = ArrayType>,
 >(
     operation: &O,
@@ -1276,7 +1250,7 @@ impl<
 where
     DimensionValue: Compare<A> + DimensionToScalar<A>,
     EagerContext<A, ArrayOperation<A>>: Iota<A> + One<A> + Zero<A>,
-    ArrayOperation<A>: InterpretableOperation<EagerContext<A, ArrayOperation<A>>>,
+    ArrayOperation<A>: Operation<Type = ArrayType> + InterpretableOperation<EagerContext<A, ArrayOperation<A>>>,
     DimensionOperation<DimensionValue>:
         InterpretableOperation<EagerContext<DimensionValue, DimensionOperation<DimensionValue>>>,
 {
@@ -2057,7 +2031,7 @@ where
     }
 }
 
-impl<A: Value<Type = ArrayType>, O: Operation<ArrayProgramType>> Zero<ArrayProgramValue<A>>
+impl<A: Value<Type = ArrayType>, O: Operation<Type = ArrayProgramType>> Zero<ArrayProgramValue<A>>
     for EagerContext<ArrayProgramValue<A>, O>
 where
     EagerContext<A, ArrayOperation<A>>: Zero<A>,
@@ -2812,7 +2786,7 @@ mod tests {
 
     #[test]
     fn test_array_program_operation() {
-        fn assert_projection<T: Type, O: Operation<T>, C: OperationProjection<T, Projected = O>>() {}
+        fn assert_projection<T: Type, O: Operation<Type = T>, C: OperationProjection<T, Projected = O>>() {}
 
         assert_projection::<ArrayType, ArrayOperation<Array>, ArrayProgramOperation<Array>>();
         assert_projection::<DimensionType, DimensionOperation<DimensionValue>, ArrayProgramOperation<Array>>();
