@@ -1763,8 +1763,8 @@ mod tests {
         let x = builder.add_input(DataType::F64);
         let r = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(3.0));
-        let product = builder.add_instruction(MulOperation, Vec::new(), vec![x, r]).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation, Vec::new(), vec![product, c]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, r]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, c]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -1846,7 +1846,7 @@ mod tests {
     fn test_partial_evaluation_context() {
         let context = PartialEvaluationContext::new(EagerContext::<Scalar, ScalarOperation<Scalar>>::new());
         assert_eq!(
-            context.parent().bind(AddOperation, Vec::new(), &[Scalar::from(1.0), Scalar::from(2.0)]),
+            context.parent().bind(AddOperation::new(), Vec::new(), &[Scalar::from(1.0), Scalar::from(2.0)]),
             Ok(vec![Scalar::from(3.0)]),
         );
 
@@ -1854,7 +1854,7 @@ mod tests {
         // are known values with no residual materialization decision yet.
         let inputs =
             [PartialEvaluationValue::known(Scalar::from(2.0)), PartialEvaluationValue::known(Scalar::from(3.0))];
-        let folded = context.fold_or_residualize(MulOperation, Vec::new(), &inputs).unwrap();
+        let folded = context.fold_or_residualize(MulOperation::new(), Vec::new(), &inputs).unwrap();
         assert_eq!(folded.len(), 1);
         assert!(folded[0].is_known());
         assert!(!folded[0].is_unknown());
@@ -1866,7 +1866,7 @@ mod tests {
         // `residualize` emits the operation into the residual program, materializing each known input as a fresh
         // residual input (i.e., atoms 0 and 1) and returning the instruction output as a residual variable
         // (i.e., atom 2).
-        let residual = context.residualize(AddOperation, Vec::new(), &inputs).unwrap();
+        let residual = context.residualize(AddOperation::new(), Vec::new(), &inputs).unwrap();
         assert_eq!(residual.len(), 1);
         assert!(residual[0].is_unknown());
         assert_eq!(residual[0].as_known(), None);
@@ -1878,15 +1878,15 @@ mod tests {
 
         // `fold_or_residualize` residualizes as soon as any input is unknown. `neg` lands in the residual program
         // over the residual variable, producing the next residual atom.
-        let mixed = context.fold_or_residualize(NegOperation, Vec::new(), &[residual[0].clone()]).unwrap();
+        let mixed = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[residual[0].clone()]).unwrap();
         assert_eq!(mixed[0].materialization(), PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) });
 
         // Materializing the same known value twice reuses the residual atom assigned on first materialization through
         // the value's shared materialization slot, so a value consumed by several residualized instructions yields a
         // single residual input.
         let shared = PartialEvaluationValue::known_input(Scalar::from(4.0));
-        let first = context.residualize(NegOperation, Vec::new(), &[shared.clone()]).unwrap();
-        let second = context.residualize(SinOperation, Vec::new(), &[shared.clone()]).unwrap();
+        let first = context.residualize(NegOperation::new(), Vec::new(), &[shared.clone()]).unwrap();
+        let second = context.residualize(SinOperation::new(), Vec::new(), &[shared.clone()]).unwrap();
         assert_eq!(
             shared.materialization(),
             PartialValueMaterialization::Input { residual_atom: Some(AtomId::new(4)) }
@@ -1900,8 +1900,8 @@ mod tests {
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(1.0));
-        let product = builder.add_instruction(MulOperation, Vec::new(), vec![a, x]).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation, Vec::new(), vec![product, c]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, x]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, c]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -1933,8 +1933,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
-        let sine = builder.add_instruction(SinOperation, Vec::new(), vec![a]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, Vec::new(), vec![sine, x]).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -1943,8 +1943,8 @@ mod tests {
             .inline_partitioned_program(
                 partition,
                 &[PartialEvaluationValue::known(Scalar::from(2.0)), residual[0].clone()],
-                |_| (ScalarOperation::Sin(SinOperation), Vec::new()),
-                |_| (ScalarOperation::Mul(MulOperation), Vec::new()),
+                |_| (ScalarOperation::Sin(SinOperation::new()), Vec::new()),
+                |_| (ScalarOperation::Mul(MulOperation::new()), Vec::new()),
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -1955,7 +1955,7 @@ mod tests {
         // reassembled outputs are known values even though the (empty) residual operation is still emitted.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
-        let sine = builder.add_instruction(SinOperation, Vec::new(), vec![a]).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a]).unwrap()[0];
         let program =
             builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![sine], vec![Placeholder], vec![Placeholder]).unwrap();
         let partition = program.partition(&[true]).unwrap();
@@ -1963,7 +1963,7 @@ mod tests {
             .inline_partitioned_program(
                 partition,
                 &[PartialEvaluationValue::known(Scalar::from(2.0))],
-                |_| (ScalarOperation::Sin(SinOperation), Vec::new()),
+                |_| (ScalarOperation::Sin(SinOperation::new()), Vec::new()),
                 |_| (ScalarOperation::Constant(ConstantOperation::new(Scalar::from(0.0))), Vec::new()),
             )
             .unwrap();
@@ -2031,7 +2031,7 @@ mod tests {
             PartialValueMaterialization::Constant { residual_atom: None },
         ));
         assert!(matches!(context.resolve(&lifted), ValueResolution::Constant(value) if value == Scalar::from(2.0)));
-        let folded = context.bind(AddOperation, Vec::new(), &[lifted.clone(), lifted.clone()]).unwrap();
+        let folded = context.bind(AddOperation::new(), Vec::new(), &[lifted.clone(), lifted.clone()]).unwrap();
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].value().unwrap().as_known(), Some(&Scalar::from(4.0)));
         assert_eq!(folded[0].concretize(), Ok(true));
@@ -2050,7 +2050,7 @@ mod tests {
         context.inputs.borrow_mut().push(PartialEvaluationInput::Unknown(0));
         let unknown =
             PartialTracer::new(context.clone(), PartialEvaluationValue::variable(DataType::F64, unknown_atom));
-        let mixed = context.bind(MulOperation, Vec::new(), &[folded[0].clone(), unknown.clone()]).unwrap();
+        let mixed = context.bind(MulOperation::new(), Vec::new(), &[folded[0].clone(), unknown.clone()]).unwrap();
         assert!(mixed[0].value().unwrap().is_unknown());
         assert!(matches!(context.resolve(&mixed[0]), ValueResolution::Opaque));
         assert!(matches!(mixed[0].concretize(), Err(ProgramError::Concretization { .. })));
@@ -2087,7 +2087,7 @@ mod tests {
         let context = PartialEvaluationContext::new(outer_a.clone());
         let known_a = PartialTracer::new(context.clone(), PartialEvaluationValue::known(outer_a.input(DataType::F64)));
         let known_b = PartialTracer::new(context.clone(), PartialEvaluationValue::known(outer_b.input(DataType::F64)));
-        let poisoned = context.bind(AddOperation, Vec::new(), &[known_a.clone(), known_b]).unwrap();
+        let poisoned = context.bind(AddOperation::new(), Vec::new(), &[known_a.clone(), known_b]).unwrap();
         assert_eq!(poisoned.len(), 1);
         assert_eq!(format!("{}", poisoned[0]), "<poison:f64>");
         assert_eq!(poisoned[0].r#type().into_owned(), DataType::F64);
@@ -2096,7 +2096,7 @@ mod tests {
 
         // Poison propagates from inputs to outputs of later binds, and unwrapping at a boundary reports the original
         // deferred error rather than a generic poison error.
-        let propagated = context.bind(MulOperation, Vec::new(), &[known_a, poisoned[0].clone()]).unwrap();
+        let propagated = context.bind(MulOperation::new(), Vec::new(), &[known_a, poisoned[0].clone()]).unwrap();
         assert!(matches!(propagated[0].value(), Err(ProgramError::MismatchedProgramBuilders)));
         assert!(matches!(propagated[0].clone().into_value(), Err(ProgramError::MismatchedProgramBuilders)));
     }
@@ -2110,10 +2110,10 @@ mod tests {
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(1.0));
-        let squared = builder.add_instruction(MulOperation, Vec::new(), vec![a, a]).unwrap()[0];
-        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![squared, x]).unwrap()[0];
-        let shifted = builder.add_instruction(AddOperation, Vec::new(), vec![scaled, c]).unwrap()[0];
-        let offset = builder.add_instruction(AddOperation, Vec::new(), vec![squared, x]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![squared, x]).unwrap()[0];
+        let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, c]).unwrap()[0];
+        let offset = builder.add_instruction(AddOperation::new(), Vec::new(), vec![squared, x]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(
                 vec![squared, shifted, offset],
@@ -2210,7 +2210,7 @@ mod tests {
         let x = builder.add_input(DataType::F64);
         let printed = builder.add_instruction(PrintOperation::new("known"), Vec::new(), vec![a]).unwrap()[0];
         builder.add_instruction(PrintOperation::new("dead"), Vec::new(), vec![x]).unwrap();
-        let product = builder.add_instruction(MulOperation, Vec::new(), vec![printed, x]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![printed, x]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2248,9 +2248,9 @@ mod tests {
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(1.0));
-        let squared = builder.add_instruction(MulOperation, Vec::new(), vec![a, a]).unwrap()[0];
-        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![squared, x]).unwrap()[0];
-        let shifted = builder.add_instruction(AddOperation, Vec::new(), vec![scaled, c]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![squared, x]).unwrap()[0];
+        let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, c]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![shifted], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2311,9 +2311,9 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
-        let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![a, a]).unwrap()[0];
-        let sine = builder.add_instruction(SinOperation, Vec::new(), vec![a]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, Vec::new(), vec![sine, x]).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, a]).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled, product], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();

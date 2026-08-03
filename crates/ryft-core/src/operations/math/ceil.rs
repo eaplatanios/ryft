@@ -98,7 +98,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = CeilOperation,
+            operation = CeilOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -107,7 +107,7 @@ mod tests {
     fn test_ceil_batching() {
         check_operation_batching!(
             @exact,
-            operation = CeilOperation,
+            operation = CeilOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.5]))],
@@ -120,7 +120,7 @@ mod tests {
     fn test_ceil_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = CeilOperation,
+            operation = CeilOperation::new(),
             cases = [{
                 primals = [Array::scalar(2.5)],
                 tangents = [Array::scalar(1.0)],
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_ceil_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = CeilOperation, inputs = [2.3], expected = 3.0,);
+        check_operation_partial_evaluation!(operation = CeilOperation::new(), inputs = [2.3], expected = 3.0,);
     }
 
     #[test]

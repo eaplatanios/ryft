@@ -1248,7 +1248,7 @@ where
         + From<LegacyBroadcastOperation>
         + From<ConvertElementTypeOperation<ArrayType>>
         + From<DotOperation>
-        + From<MulOperation>
+        + From<MulOperation<ArrayType>>
         + From<LegacyReshapeOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(

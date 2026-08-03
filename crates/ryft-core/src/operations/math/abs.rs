@@ -52,6 +52,7 @@ impl_differentiable_operation! {
     <T> AbsOperation<T>,
     jvp<C>
     where
+        T: Type,
         C::Type: DifferentiableType,
         C::Value: Abs
             + Compare<C::Value>

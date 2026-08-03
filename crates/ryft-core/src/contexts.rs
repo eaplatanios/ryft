@@ -1164,7 +1164,7 @@ pub(crate) mod tests {
         assert_eq!(context.bind(ZeroOperation::new(DataType::F64), [], &[]), Ok(vec![Scalar::from(0.0)]));
         assert_eq!(context.bind(OneOperation::new(DataType::F64), Vec::new(), &[]), Ok(vec![Scalar::from(1.0)]));
         assert_eq!(
-            context.bind(AddOperation, Vec::new(), &[Scalar::from(2.0), Scalar::from(3.5)]),
+            context.bind(AddOperation::new(), Vec::new(), &[Scalar::from(2.0), Scalar::from(3.5)]),
             Ok(vec![Scalar::from(5.5)]),
         );
     }
@@ -1187,7 +1187,7 @@ pub(crate) mod tests {
         let body = {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
-            let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
+            let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry]).unwrap()[0];
             builder
                 .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -1331,7 +1331,7 @@ pub(crate) mod tests {
 
         let lhs = context.input(DataType::F64);
         let rhs = context.input(DataType::F64);
-        let mut add_outputs = context.stage_operation(AddOperation, [], &[&lhs, &rhs]).unwrap();
+        let mut add_outputs = context.stage_operation(AddOperation::new(), [], &[&lhs, &rhs]).unwrap();
         assert_eq!(add_outputs.len(), 1);
         let sum = add_outputs.remove(0);
         assert_eq!(sum.atom_id(), Ok(AtomId::new(3)));
@@ -1367,7 +1367,7 @@ pub(crate) mod tests {
         assert_eq!(context.error(second_error.clone()), second_error);
         assert_eq!(builder.borrow().error().cloned(), Some(first_error.clone()));
 
-        let mut outputs = context.stage_operation(NegOperation, Vec::new(), &[&input]).unwrap();
+        let mut outputs = context.stage_operation(NegOperation::new(), Vec::new(), &[&input]).unwrap();
         assert_eq!(outputs.len(), 1);
         let output = outputs.remove(0);
         assert_eq!(output.state(), &TracerState::Poison);
@@ -1381,7 +1381,7 @@ pub(crate) mod tests {
         let foreign_input = foreign_context.input(DataType::F64);
 
         assert!(matches!(
-            context.stage_operation(AddOperation, Vec::new(), &[&input, &foreign_input]),
+            context.stage_operation(AddOperation::new(), Vec::new(), &[&input, &foreign_input]),
             Err(ProgramError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
@@ -1585,7 +1585,7 @@ pub(crate) mod tests {
         let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let input = context.input(DataType::F64);
         let constant = context.constant(Scalar::from(2.5));
-        let mut add_outputs = context.stage_operation(AddOperation, Vec::new(), &[&input, &constant]).unwrap();
+        let mut add_outputs = context.stage_operation(AddOperation::new(), Vec::new(), &[&input, &constant]).unwrap();
         let sum = add_outputs.remove(0);
 
         // Literal-backed tracers resolve to their program-constant payload, while inputs and operation outputs
@@ -1604,7 +1604,7 @@ pub(crate) mod tests {
         let poisoning_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         assert_eq!(foreign_context.error(poisoning_error.clone()), poisoning_error);
         let mut poisoned_outputs =
-            foreign_context.stage_operation(NegOperation, Vec::new(), &[&foreign_input]).unwrap();
+            foreign_context.stage_operation(NegOperation::new(), Vec::new(), &[&foreign_input]).unwrap();
         let poisoned = poisoned_outputs.remove(0);
         assert_eq!(poisoned.state(), &TracerState::Poison);
         assert_eq!(foreign_context.resolve(&poisoned), ValueResolution::Opaque);

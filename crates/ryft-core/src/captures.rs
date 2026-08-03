@@ -633,7 +633,7 @@ mod tests {
         let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let capture = builder.add_constant(CaptureReference::new(1, DataType::F64));
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![input, capture]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
                 vec![output],
@@ -742,8 +742,8 @@ mod tests {
         let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let capture = builder.add_constant(CaptureReference::new(0, DataType::F64));
-        let sum = builder.add_instruction(AddOperation, Vec::new(), vec![input, capture]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![sum, capture]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, capture]).unwrap()[0];
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
                 vec![output],
@@ -892,7 +892,7 @@ mod tests {
                 let context = inputs[0].context().clone();
                 let reference = context.capture(Scalar::from(3.0))?;
                 let captured = StagingContext::constant(&context, reference);
-                context.bind(AddOperation, Vec::new(), &[inputs[0].clone(), captured])
+                context.bind(AddOperation::new(), Vec::new(), &[inputs[0].clone(), captured])
             },
             vec![DataType::F64],
         )

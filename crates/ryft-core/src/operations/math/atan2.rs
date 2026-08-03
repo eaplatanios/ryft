@@ -7,7 +7,7 @@ use crate::macros::{
 };
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
-use crate::programs::types::Typed;
+use crate::programs::types::{Type, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -31,6 +31,7 @@ impl_differentiable_operation! {
     <T> Atan2Operation<T>,
     jvp<C>
     where
+        T: Type,
         C::Type: DifferentiableType,
         C::Value: Atan2
             + StandardNeg<Output = C::Value>

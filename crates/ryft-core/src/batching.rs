@@ -3217,7 +3217,7 @@ mod tests {
                     .with_sharding(Sharding::replicated(mesh.clone(), 2))
                     .unwrap(),
             );
-            let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[batch.clone(), batch]).unwrap();
+            let outputs = AddOperation::new().batch(&context, &EmptyRegionDriver, &[batch.clone(), batch]).unwrap();
             assert_eq!(outputs[0].r#type(), Cow::Borrowed(&batched_type));
             assert_eq!(outputs[0].batch_axis(), BatchAxis::from_position(batch_axis));
         }
@@ -3298,14 +3298,14 @@ mod tests {
         // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
         let left = make_batch(&matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Some(0));
         let right = make_batch(&matrix_type, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], Some(0));
-        let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left.clone(), right]).unwrap();
+        let outputs = AddOperation::new().batch(&context, &EmptyRegionDriver, &[left.clone(), right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
         // A replicated operand is broadcast across the mapped operand's batch before adding.
         let replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left.clone(), replicated]).unwrap();
+        let outputs = AddOperation::new().batch(&context, &EmptyRegionDriver, &[left.clone(), replicated]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::matrix(2, 3, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]));
 
@@ -3313,7 +3313,7 @@ mod tests {
         let transposed_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let right_axis_one = make_batch(&transposed_type, vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0], Some(1));
-        let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left, right_axis_one]).unwrap();
+        let outputs = AddOperation::new().batch(&context, &EmptyRegionDriver, &[left, right_axis_one]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
@@ -3327,7 +3327,7 @@ mod tests {
         let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let left = make_batch(&left_type, (1..=24).map(f64::from).collect(), Some(2));
         let right = make_batch(&right_type, vec![10.0, 20.0], Some(0));
-        let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left, right]).unwrap();
+        let outputs = AddOperation::new().batch(&context, &EmptyRegionDriver, &[left, right]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(2));
         assert_eq!(
             outputs[0].value(),
@@ -3343,14 +3343,16 @@ mod tests {
         // With no operand mapped, the operands are interpreted as given and the output is replicated.
         let left_replicated = make_batch(&vector_type, vec![1.0, 2.0, 3.0], None);
         let right_replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left_replicated, right_replicated]).unwrap();
+        let outputs = AddOperation::new()
+            .batch(&context, &EmptyRegionDriver, &[left_replicated, right_replicated])
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &Array::vector(vec![11.0, 22.0, 33.0]));
 
         // Unary elementwise operations use the same blanket rule and preserve the mapped input axis.
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
         let input = make_batch(&vector_type, vec![1.0, 2.0, 3.0], Some(0));
-        let outputs = NegOperation.batch(&context, &EmptyRegionDriver, &[input]).unwrap();
+        let outputs = NegOperation::new().batch(&context, &EmptyRegionDriver, &[input]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::vector(vec![-1.0, -2.0, -3.0]));
     }
@@ -3387,7 +3389,7 @@ mod tests {
             .unwrap();
             let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
-            let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[sharded, replicated]).unwrap();
+            let outputs = AddOperation::new().batch(&context, &EmptyRegionDriver, &[sharded, replicated]).unwrap();
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
             assert_eq!(outputs[0].r#type(), Cow::Borrowed(&sharded_type));
@@ -3404,7 +3406,9 @@ mod tests {
         let left = ArrayBatch::new(vector_type.clone(), Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(vector_type.clone(), Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
         let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
-        let outputs = AddOperation.interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)]).unwrap();
+        let outputs = AddOperation::new()
+            .interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(*outputs[0].r#type(), vector_type);
@@ -3414,7 +3418,7 @@ mod tests {
         let left = ArrayBatch::new(vector_type.clone(), Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(vector_type, Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
         assert!(matches!(
-            AddOperation.interpret_with_batch_axes(&context, &[left, right], &[]),
+            AddOperation::new().interpret_with_batch_axes(&context, &[left, right], &[]),
             Err(BatchingError::Program(_)),
         ));
     }
