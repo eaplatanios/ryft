@@ -248,7 +248,9 @@ pub trait NamedAxes: Context {
     fn named_axis(&self, name: &str) -> Option<NamedAxis>;
 }
 
-impl<V: Value, O: Operation<V::Type> + InterpretableOperation<EagerContext<V, O>>> NamedAxes for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContext<V, O>>> NamedAxes
+    for EagerContext<V, O>
+{
     #[inline]
     fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
         // An eager context binds no named axes as it is a leaf of the resolution stack. So every lookup returns `None`.
@@ -270,7 +272,7 @@ where
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> NamedAxes for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> NamedAxes for TracingContext<V, O, C> {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // A `TracingContext` is a leaf of the resolution stack and it resolves only the named axes it was seeded with
@@ -442,7 +444,9 @@ impl Display for AxisIndexOperation {
     }
 }
 
-impl Operation<ArrayType> for AxisIndexOperation {
+impl Operation for AxisIndexOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         AXIS_INDEX_OPERATION_NAME

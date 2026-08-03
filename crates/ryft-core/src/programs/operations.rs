@@ -58,7 +58,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
     /// Renders the provided nested field name-[`Program`] pair. This must be used for [`Program`]-valued metadata
     /// fields; attached [`Region`](crate::Region)s render through the contextual program renderer instead.
     #[inline]
-    pub fn program<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>(
+    pub fn program<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         name: &str,
         program: &Program<V, O, Input, Output>,
@@ -119,7 +119,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// operation payload and the enum should behave exactly like whichever payload it contains. The derived implementation
 /// generates:
 ///
-///   - An [`Operation<T>`](Operation) implementation whose semantic and rendering methods forward to the active
+///   - An [`Operation<Type = T>`](Operation) implementation whose semantic and rendering methods forward to the active
 ///     variant payload.
 ///   - An [`InterpretableOperation<C>`](crate::InterpretableOperation) implementation that forwards
 ///     [`interpret`](crate::InterpretableOperation::interpret) to the active variant payload. Operation-specific eager
@@ -141,12 +141,12 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - Every variant must be a tuple variant with exactly one payload field.
 ///   - A payload may be stored directly as `Payload` or indirectly as `Box<Payload>`. Boxed variants still delegate to
 ///     `Payload`, and their generated `From<Payload>` implementation boxes the payload for the caller.
-///   - Every payload must implement [`Operation<T>`](Operation), either because it is a concrete operation type whose
-///     implementation already exists or because the derivation macro adds a bound for a bare generic payload.
+///   - Every payload must implement [`Operation<Type = T>`](Operation), either because it is a concrete operation type
+///     whose implementation already exists or because the derivation macro adds a bound for a bare generic payload.
 ///   - Bare generic payload variants such as `Extension(Extension)` do not receive `From` or `TryFrom` conversions.
 ///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
 ///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
-///     generic payload by adding an `Extension: Operation<T>` bound.
+///     generic payload by adding an `Extension: Operation<Type = T>` bound.
 ///   - Each generated semantic dispatcher receives a corresponding bound on every payload, such as
 ///     `Payload: InterpretableOperation<C>` or `Payload: BatchableOperation<C, ArrayBatching>`.
 ///     Payload-specific value and context requirements belong on the payload's own semantic-trait implementation.
@@ -156,9 +156,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// The operation type `T` is selected as follows:
 ///
-///   - If the enum has exactly one distinct generic bound of the form `Value<Type = T>`, the derivation infers `T` from
-///     that bound. For example, `enum BackendOperation<V: Value<Type = ArrayType>>` derives `Operation<ArrayType>`.
-///     Multiple generic parameters may use the same `T`. For example,
+///   - If the enum has exactly one distinct generic bound of the form `Value<Type = T>`, the derivation infers `T`
+///     from that bound. For example, `enum BackendOperation<V: Value<Type = ArrayType>>` derives `Operation<Type =
+///     ArrayType>`. Multiple generic parameters may use the same `T`. For example,
 ///     `V: Value<Type = ArrayType>, C: Value<Type = ArrayType>` still infers `ArrayType`.
 ///   - If no `Value<Type = T>` bound is present, or if multiple distinct operation types are present (e.g.,
 ///     `Value<Type = DataType>` and `Value<Type = ArrayType>`), the derivation macro cannot choose an operation type
@@ -203,7 +203,13 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// let operation = BackendOperation::<Scalar>::from(ZeroOperation::new(DataType::F32));
 /// assert_eq!(operation.name(), "zero");
 /// ```
-pub trait Operation<T: Type>: Clone {
+pub trait Operation: Clone {
+    /// Canonical [`Type`] universe of this [`Operation`]. Every payload has exactly one operation contract, so
+    /// this associated type is the single source of truth for the operation's type universe. [`Program`]s require
+    /// `O: Operation<Type = V::Type>`, which makes the value/operation type agreement compiler-enforced instead of
+    /// depending on a separately supplied type argument.
+    type Type: Type;
+
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 
@@ -239,9 +245,9 @@ pub trait Operation<T: Type>: Clone {
     #[inline]
     fn infer_region_input_types(
         &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Option<Vec<Self::Type>>>, TypeError> {
         let _ = input_types;
         Ok(vec![None; region_interfaces.len()])
     }
@@ -264,9 +270,9 @@ pub trait Operation<T: Type>: Clone {
     ///     empty slice and ignore it.
     fn infer_output_types(
         &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError>;
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Self::Type>, TypeError>;
 
     /// Returns information about which attached-[`Region`](crate::Region) `output_index`-th output can come from.
     /// An empty vector means that the [`Instruction`](crate::Instruction) result is produced by the [`Operation`]
@@ -304,7 +310,10 @@ pub trait Operation<T: Type>: Clone {
     /// signature metadata must apply the same renaming as its surrounding program so the payload and atom types remain
     /// consistent.
     #[inline]
-    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
         let _ = renaming;
         Ok(self.clone())
     }
@@ -333,7 +342,9 @@ pub trait Operation<T: Type>: Clone {
     }
 }
 
-impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
+impl<O: Operation> Operation for Box<O> {
+    type Type = O::Type;
+
     #[inline]
     fn name(&self) -> &'static str {
         self.as_ref().name()
@@ -347,18 +358,18 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
     #[inline]
     fn infer_region_input_types(
         &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Option<Vec<Self::Type>>>, TypeError> {
         self.as_ref().infer_region_input_types(input_types, region_interfaces)
     }
 
     #[inline]
     fn infer_output_types(
         &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError> {
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Vec<Self::Type>, TypeError> {
         self.as_ref().infer_output_types(input_types, region_interfaces)
     }
 
@@ -378,7 +389,10 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
     }
 
     #[inline]
-    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
         Ok(Box::new(self.as_ref().rename_type_identities(renaming)?))
     }
 
@@ -390,11 +404,11 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
 
 /// Names the `T`-typed member [`Operation`] family embedded in a composite [`Operation`] family. [`Program`]s that
 /// store several kinds of values in one composite [`Type`] still keep most of their operations narrow. For example,
-/// in a program mixing arrays with first-class runtime dimensions, array-only operations implement
-/// `Operation<ArrayType>` and dimension-only operations implement `Operation<DimensionType>`, while the composite
-/// operation family merely stores and dispatches them, providing one [`From`] implementation per member family to lift
-/// member operations into it. Those [`From`] implementations cannot, however, answer the reverse question that generic
-/// code needs: *given* the composite family and a member type `T`, which family is *the* `T`-typed member? [`From`] is
+/// in a program mixing arrays with first-class runtime dimensions, array-only operations implement `Operation<Type =
+/// ArrayType>` and dimension-only operations implement `Operation<Type = DimensionType>`, while the composite operation
+/// family merely stores and dispatches them, providing one [`From`] implementation per member family to lift member
+/// operations into it. Those [`From`] implementations cannot, however, answer the reverse question that generic code
+/// needs: *given* the composite family and a member type `T`, which family is *the* `T`-typed member? [`From`] is
 /// many-to-one (a composite family is [`From`] many payload types), so the answer must be a type-level function from
 /// `(composite family, T)` to the member family. The [`Projected`](Self::Projected) associated type is that function.
 /// This trait adds no methods as lifting a member operation into the composite family remains the [`From`] trait's job.
@@ -426,7 +440,7 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
     /// counterpart of [`ValueProjection::Projected`](crate::ValueProjection::Projected). Lifting a member operation
     /// into the composite family goes through the [`From`] super-trait, and trait coherence guarantees that each
     /// composite family names at most one member family per member type `T`.
-    type Projected: Operation<T>;
+    type Projected: Operation<Type = T>;
 }
 
 /// Selects and constructs the concrete [`Operation`] staged by one value-level capability for program type `T`.
@@ -442,13 +456,13 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 ///
 /// Two implementation levels cover every case:
 ///
-///   - **Self-Provision (Blanket):** A stateless operation that implements [`Operation<T>`](Operation) and [`Default`]
-///     provides itself for `T`, so ordinary homogeneous operation families need no code at all.
+///   - **Self-Provision (Blanket):** A stateless operation that implements [`Operation<Type = T>`](Operation) and
+///     [`Default`] provides itself for `T`, so ordinary homogeneous operation families need no code at all.
 ///   - **Per-Type-Family Override:** A type family whose concrete operation carries type-derived metadata implements
 ///     this trait for the marker directly (e.g., `impl OperationProvider<DimensionType> for MulOperation`),
 ///     constructing the family-specific operation from the input types. Such an override is coherent with the blanket
-///     implementation exactly because the marker does not implement `Operation<T>` for that type family, which is also
-///     precisely the situation that requires providing a different concrete operation.
+///     implementation exactly because the marker does not implement `Operation<Type = T>` for that type family, which
+///     is also precisely the situation that requires providing a different concrete operation.
 ///
 /// The contract is deliberately narrow. `input_types` contains exactly the operation's input type descriptors in
 /// operand order, callers (i.e., the generated capability implementations) always pass borrowed stack arrays, and
@@ -457,17 +471,17 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 /// region-carrying operations, and operations requiring explicit user parameters keep their ordinary constructors.
 pub trait OperationProvider<T: Type> {
     /// Concrete [`Operation`] type provided for program [`Type`] `T`.
-    type Operation: Operation<T>;
+    type Operation: Operation<Type = T>;
 
     /// Selects and constructs the [`Operation`] from its ordered input [`Type`]s.
     fn provide(input_types: &[&T]) -> Result<Self::Operation, ProgramError>;
 }
 
-impl<T: Type, O: Default + Operation<T>> OperationProvider<T> for O {
+impl<O: Default + Operation> OperationProvider<O::Type> for O {
     type Operation = O;
 
     #[inline]
-    fn provide(_input_types: &[&T]) -> Result<Self::Operation, ProgramError> {
+    fn provide(_input_types: &[&O::Type]) -> Result<Self::Operation, ProgramError> {
         Ok(Self::default())
     }
 }
@@ -556,7 +570,7 @@ mod tests {
         // Check required inference and the default operation contract.
         assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
+            Operation::infer_output_types(&operation, &[], &[]),
             Err(TypeError::invalid("expected 1 input but got 0".to_string())),
         );
         let region_interfaces = [
@@ -564,15 +578,15 @@ mod tests {
             RegionInterface::new(vec![DataType::I32], vec![DataType::I64], Effects::PURE),
         ];
 
-        assert_eq!(Operation::<DataType>::region_slots(&operation), &[]);
-        assert_eq!(Operation::<DataType>::region_role(&operation, 0), None);
+        assert_eq!(Operation::region_slots(&operation), &[]);
+        assert_eq!(Operation::region_role(&operation, 0), None);
         assert_eq!(operation.infer_region_input_types(&[DataType::F64], &region_interfaces), Ok(vec![None, None]),);
-        assert_eq!(Operation::<DataType>::output_region_provenance(&operation, 0), Vec::new());
-        assert!(!Operation::<DataType>::is_zero(&operation, 0));
-        assert_eq!(Operation::<DataType>::effects(&operation), Effects::PURE);
-        assert!(Operation::<DataType>::rename_type_identities(&operation, &TypeIdentityRenaming::new()).is_ok());
+        assert_eq!(Operation::output_region_provenance(&operation, 0), Vec::new());
+        assert!(!Operation::is_zero(&operation, 0));
+        assert_eq!(Operation::effects(&operation), Effects::PURE);
+        assert!(Operation::rename_type_identities(&operation, &TypeIdentityRenaming::new()).is_ok());
         assert_eq!(
-            std::fmt::from_fn(|formatter| Operation::<DataType>::render(&operation, formatter, 0)).to_string(),
+            std::fmt::from_fn(|formatter| Operation::render(&operation, formatter, 0)).to_string(),
             "stop_gradient",
         );
 
@@ -582,7 +596,9 @@ mod tests {
             renamed: bool,
         }
 
-        impl Operation<DataType> for ForwardingOperation {
+        impl Operation for ForwardingOperation {
+            type Type = DataType;
+
             fn name(&self) -> &'static str {
                 "forwarding"
             }
@@ -635,29 +651,26 @@ mod tests {
         let operation = Box::new(ForwardingOperation { renamed: false });
         let region_interfaces = [RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE)];
 
-        assert_eq!(Operation::<DataType>::name(&operation), "forwarding");
-        assert_eq!(Operation::<DataType>::region_slots(&operation), &[RegionSlot::computation("body")]);
-        assert_eq!(Operation::<DataType>::region_role(&operation, 0), Some(RegionRole::Computation));
-        assert_eq!(Operation::<DataType>::region_role(&operation, 1), None);
+        assert_eq!(Operation::name(&operation), "forwarding");
+        assert_eq!(Operation::region_slots(&operation), &[RegionSlot::computation("body")]);
+        assert_eq!(Operation::region_role(&operation, 0), Some(RegionRole::Computation));
+        assert_eq!(Operation::region_role(&operation, 1), None);
         assert_eq!(
             operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
             Ok(vec![Some(vec![DataType::F32])]),
         );
         assert_eq!(operation.infer_output_types(&[DataType::F32], &region_interfaces), Ok(vec![DataType::F64]),);
         assert_eq!(
-            Operation::<DataType>::output_region_provenance(&operation, 3),
+            Operation::output_region_provenance(&operation, 3),
             vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],
         );
-        assert!(!Operation::<DataType>::is_zero(&operation, 1));
-        assert!(Operation::<DataType>::is_zero(&operation, 2));
-        assert_eq!(Operation::<DataType>::effects(&operation), Effects::single(Effect::OrderedIo));
+        assert!(!Operation::is_zero(&operation, 1));
+        assert!(Operation::is_zero(&operation, 2));
+        assert_eq!(Operation::effects(&operation), Effects::single(Effect::OrderedIo));
         assert_eq!(
-            Operation::<DataType>::rename_type_identities(&operation, &TypeIdentityRenaming::new()),
+            Operation::rename_type_identities(&operation, &TypeIdentityRenaming::new()),
             Ok(Box::new(ForwardingOperation { renamed: true })),
         );
-        assert_eq!(
-            std::fmt::from_fn(|formatter| Operation::<DataType>::render(&operation, formatter, 0)).to_string(),
-            "forwarded",
-        );
+        assert_eq!(std::fmt::from_fn(|formatter| Operation::render(&operation, formatter, 0)).to_string(), "forwarded",);
     }
 }

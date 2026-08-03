@@ -52,7 +52,7 @@ pub struct ProgramBuilder<V: Typed + Parameter, O> {
     pub(crate) error: Option<ProgramError>,
 }
 
-impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// Creates a new [`ProgramBuilder`].
     #[inline]
     pub fn new() -> Self {
@@ -761,7 +761,9 @@ mod tests {
         #[derive(Clone)]
         struct ArrayIdentityOperation;
 
-        impl Operation<ArrayType> for ArrayIdentityOperation {
+        impl Operation for ArrayIdentityOperation {
+            type Type = ArrayType;
+
             fn name(&self) -> &'static str {
                 "array_identity"
             }

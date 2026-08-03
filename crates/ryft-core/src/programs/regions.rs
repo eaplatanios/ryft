@@ -145,7 +145,7 @@ impl<V: Typed, O> Region<V, O> {
     ) -> Result<Self, ProgramError>
     where
         V: Value,
-        O: Operation<V::Type>,
+        O: Operation<Type = V::Type>,
     {
         let atoms = self
             .atoms
@@ -179,7 +179,7 @@ impl<V: Typed, O> Region<V, O> {
         &self,
     ) -> Result<TypeIdentitySignature<<V::Type as Type>::Identity>, TypeError>
     where
-        O: Operation<V::Type>,
+        O: Operation<Type = V::Type>,
     {
         // Region inputs establish the identities that are available at entry. Preserve first-occurrence order and
         // record each identity once even when several input types refer to the same dynamic quantity. Note that the
@@ -320,7 +320,7 @@ pub struct RegionWithMetadata<V: Typed, O> {
     type_identity_signature: TypeIdentitySignature<<V::Type as Type>::Identity>,
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionWithMetadata<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
     /// Creates a new [`RegionWithMetadata`] by _sealing_ the provided `region` after deriving its metadata against
     /// `sealed_regions`, which must contain every region it references.
     pub fn new(region: Region<V, O>, sealed_regions: &[Self]) -> Result<Self, ProgramError> {
@@ -385,7 +385,7 @@ pub struct RegionArena<V: Typed, O> {
     regions: Vec<RegionWithMetadata<V, O>>,
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionArena<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
     /// Creates an empty [`RegionArena`].
     #[inline]
     pub fn new() -> Self {
@@ -481,7 +481,7 @@ impl<V: Typed, O> Default for RegionArena<V, O> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Index<usize> for RegionArena<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Index<usize> for RegionArena<V, O> {
     type Output = Region<V, O>;
 
     #[inline]
@@ -528,7 +528,7 @@ impl<V: Typed, O> ExactSizeIterator for RegionArenaIterator<'_, V, O> {
 /// or lowering a source arena. Calling [`RegionRef::to_program`] crosses the explicit ownership boundary as it clones
 /// the selected region's complete reachable region closure into a detached [`Program`].
 #[derive(Debug)]
-pub struct RegionRef<'r, V: Value, O: Operation<V::Type>> {
+pub struct RegionRef<'r, V: Value, O: Operation<Type = V::Type>> {
     /// [`RegionArena`] containing the referenced [`Region`] and its reachable descendants.
     arena: &'r RegionArena<V, O>,
 
@@ -536,7 +536,7 @@ pub struct RegionRef<'r, V: Value, O: Operation<V::Type>> {
     id: RegionId,
 }
 
-impl<'r, V: Value, O: Operation<V::Type>> RegionRef<'r, V, O> {
+impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Creates a new [`RegionRef`] for the [`Region`] with the provided [`RegionId`] in the provided [`RegionArena`].
     #[inline]
     pub fn new(arena: &'r RegionArena<V, O>, id: RegionId) -> Result<Self, ProgramError> {
@@ -644,7 +644,7 @@ impl<'r, V: Value, O: Operation<V::Type>> RegionRef<'r, V, O> {
     #[inline]
     pub fn interface(self) -> RegionInterface<V::Type>
     where
-        O: Operation<V::Type>,
+        O: Operation<Type = V::Type>,
     {
         RegionInterface::new(self.input_types(), self.output_types(), self.effects())
     }
@@ -683,9 +683,9 @@ impl<'r, V: Value, O: Operation<V::Type>> RegionRef<'r, V, O> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Copy for RegionRef<'_, V, O> {}
+impl<V: Value, O: Operation<Type = V::Type>> Copy for RegionRef<'_, V, O> {}
 
-impl<V: Value, O: Operation<V::Type>> Clone for RegionRef<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Clone for RegionRef<'_, V, O> {
     #[inline]
     fn clone(&self) -> Self {
         *self
@@ -784,7 +784,7 @@ impl<T: Type> RegionInterface<T> {
 /// instruction. Transform-specific drivers extend this trait with the recursive work they can perform on those regions,
 /// while this shared capability keeps region lookup independent of batching, differentiation, partial evaluation, or
 /// transposition. Drivers **must not** combine regions from multiple operation applications.
-pub trait RegionDriver<V: Value, O: Operation<V::Type>> {
+pub trait RegionDriver<V: Value, O: Operation<Type = V::Type>> {
     /// Returns an [`Iterator`] over borrowed views of every [`Region`] attached to the current operation application,
     /// in operation-defined order. Constructing and advancing this iterator cannot fail because the [`RegionDriver`]
     /// represents an already-validated application scope.
@@ -811,7 +811,7 @@ pub trait RegionDriver<V: Value, O: Operation<V::Type>> {
 
 impl<
     V: Value,
-    O: Operation<V::Type>,
+    O: Operation<Type = V::Type>,
     R: AsRef<[Program<V, O, Vec<V>, Vec<V>>]> + IntoIterator<Item = Program<V, O, Vec<V>, Vec<V>>>,
 > RegionDriver<V, O> for R
 {
@@ -832,7 +832,7 @@ impl<
 #[derive(Copy, Clone, Debug, Default)]
 pub struct EmptyRegionDriver;
 
-impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EmptyRegionDriver {
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for EmptyRegionDriver {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
@@ -851,7 +851,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EmptyRegionDriver {
 ///
 /// Ordinary owned collections implement this trait when they support both slice-like borrowing and owned iteration.
 /// Consequently, fixed-size arrays and [`Vec`]s remain valid direct binding arguments.
-pub trait BindingRegionDriver<V: Value, O: Operation<V::Type>>: RegionDriver<V, O> + Sized {
+pub trait BindingRegionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDriver<V, O> + Sized {
     /// Imports these attached [`Region`]s into the provided [`ProgramBuilder`] in application order and returns their
     /// [`RegionId`]s in the same order. Each type in `input_types` corresponds to the corresponding attached [`Region`]
     /// at that same index and [`None`] preserves its declared input [`TypeIdentity`](crate::TypeIdentity)s, while
@@ -865,7 +865,7 @@ pub trait BindingRegionDriver<V: Value, O: Operation<V::Type>>: RegionDriver<V, 
 
 impl<
     V: Value,
-    O: Operation<V::Type>,
+    O: Operation<Type = V::Type>,
     R: AsRef<[Program<V, O, Vec<V>, Vec<V>>]> + IntoIterator<Item = Program<V, O, Vec<V>, Vec<V>>>,
 > BindingRegionDriver<V, O> for R
 {
@@ -899,12 +899,12 @@ impl<
 /// [`Operation`] application. Callees are exposed in the order provided at construction and are interned by [`Rc`]
 /// identity when imported into a [`StagingContext`](crate::StagingContext), preserving sharing between repeated
 /// references to the same program.
-pub struct CalleeRegionDriver<'r, V: Value, O: Operation<V::Type>> {
+pub struct CalleeRegionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// Shared callee [`Program`]s in [`Operation`]-defined region order.
     callees: &'r [Rc<Program<V, O, Vec<V>, Vec<V>>>],
 }
 
-impl<'r, V: Value, O: Operation<V::Type>> CalleeRegionDriver<'r, V, O> {
+impl<'r, V: Value, O: Operation<Type = V::Type>> CalleeRegionDriver<'r, V, O> {
     /// Creates a new [`CalleeRegionDriver`].
     #[inline]
     pub fn new(callees: &'r [Rc<Program<V, O, Vec<V>, Vec<V>>>]) -> Self {
@@ -912,7 +912,7 @@ impl<'r, V: Value, O: Operation<V::Type>> CalleeRegionDriver<'r, V, O> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for CalleeRegionDriver<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for CalleeRegionDriver<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
@@ -923,7 +923,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for CalleeRegionDriver<
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for CalleeRegionDriver<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for CalleeRegionDriver<'_, V, O> {
     fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
@@ -950,7 +950,7 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for CalleeRegion
 /// imports them, `mappings` preserves their source identities across every instruction in the surrounding replay.
 /// Construction validates that every root belongs to `source`'s arena, which lets [`RegionDriver::regions`] remain
 /// non-fallible without trusting callers to preserve that relationship.
-pub struct ReplayRegionDriver<'r, V: Value, O: Operation<V::Type>> {
+pub struct ReplayRegionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// Borrowed [`Region`] view used to access every root's shared source arena.
     source: RegionRef<'r, V, O>,
 
@@ -989,7 +989,7 @@ pub struct ReplayRegionDriver<'r, V: Value, O: Operation<V::Type>> {
     mappings: &'r RegionReplayMappings<V, O>,
 }
 
-impl<'r, V: Value, O: Operation<V::Type>> ReplayRegionDriver<'r, V, O> {
+impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
     /// Creates a new [`ReplayRegionDriver`].
     #[inline]
     pub fn new(
@@ -1004,7 +1004,7 @@ impl<'r, V: Value, O: Operation<V::Type>> ReplayRegionDriver<'r, V, O> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
@@ -1015,7 +1015,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for ReplayRegionDriver<
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
     fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
@@ -1082,12 +1082,12 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
 /// descendants retain their identity across [`Instruction`] applications without mixing the unrelated identifier
 /// spaces of different builders. Refer to [`ReplayRegionDriver::mappings`] for more information on how this is
 /// used and why it is necessary.
-pub struct RegionReplayMappings<V: Value, O: Operation<V::Type>> {
+pub struct RegionReplayMappings<V: Value, O: Operation<Type = V::Type>> {
     /// Per-destination [`DestinationRegionMapping`]s accumulated during a replay.
     destinations: RefCell<Vec<DestinationRegionMapping<V, O>>>,
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionReplayMappings<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> RegionReplayMappings<V, O> {
     /// Creates a new [`RegionReplayMappings`].
     #[inline]
     pub fn new() -> Self {
@@ -1095,7 +1095,7 @@ impl<V: Value, O: Operation<V::Type>> RegionReplayMappings<V, O> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Default for RegionReplayMappings<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Default for RegionReplayMappings<V, O> {
     #[inline]
     fn default() -> Self {
         Self { destinations: RefCell::new(Vec::new()) }
@@ -1106,7 +1106,7 @@ impl<V: Value, O: Operation<V::Type>> Default for RegionReplayMappings<V, O> {
 /// [`Region`] replay. [`RegionReplayMappings`] owns one of these values per destination because [`RegionId`]s are local
 /// to their owning arenas. Refer to [`ReplayRegionDriver::mappings`] for more information on how this is used and why
 /// it is necessary.
-pub struct DestinationRegionMapping<V: Value, O: Operation<V::Type>> {
+pub struct DestinationRegionMapping<V: Value, O: Operation<Type = V::Type>> {
     /// Weak identity of the destination [`ProgramBuilder`]. Weak ownership prevents replay bookkeeping from keeping
     /// a completed builder alive or interfering with trace finalization through `Rc::try_unwrap`.
     pub builder: Weak<RefCell<ProgramBuilder<V, O>>>,
@@ -1317,7 +1317,9 @@ mod tests {
     #[derive(Clone)]
     struct StructuralOperation;
 
-    impl Operation<StructuralType> for StructuralOperation {
+    impl Operation for StructuralOperation {
+        type Type = StructuralType;
+
         fn name(&self) -> &'static str {
             "structural"
         }
@@ -1783,7 +1785,9 @@ mod tests {
         #[derive(Clone)]
         struct ArrayIdentityOperation;
 
-        impl Operation<ArrayType> for ArrayIdentityOperation {
+        impl Operation for ArrayIdentityOperation {
+            type Type = ArrayType;
+
             fn name(&self) -> &'static str {
                 "array_identity"
             }

@@ -109,7 +109,9 @@ impl Display for ReshardOperation {
     }
 }
 
-impl Operation<ArrayType> for ReshardOperation {
+impl Operation for ReshardOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         RESHARD_OPERATION_NAME
@@ -231,7 +233,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: Operation<ArrayType> + From<LegacyBroadcastOperation> + From<ReshardOperation>,
+        O: Operation<Type = ArrayType> + From<LegacyBroadcastOperation> + From<ReshardOperation>,
     {
         |_operation, _context, _driver, inputs, outputs| {
             // Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output
@@ -327,7 +329,9 @@ impl Display for ShardingConstraintOperation {
     }
 }
 
-impl Operation<ArrayType> for ShardingConstraintOperation {
+impl Operation for ShardingConstraintOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         SHARDING_CONSTRAINT_OPERATION_NAME
@@ -444,7 +448,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: Operation<ArrayType> + From<ShardingConstraintOperation>,
+        O: Operation<Type = ArrayType> + From<ShardingConstraintOperation>,
     {
         |operation, _context, _driver, inputs, outputs| {
             // Transpose rule for [`ShardingConstraintOperation`]: the operation is self-adjoint, so the cotangent of

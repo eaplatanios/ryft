@@ -110,11 +110,13 @@ impl SortOperation {
 
 impl Display for SortOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, 0)
+        Operation::render(self, formatter, 0)
     }
 }
 
-impl Operation<ArrayType> for SortOperation {
+impl Operation for SortOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         SORT_OPERATION_NAME

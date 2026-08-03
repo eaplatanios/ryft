@@ -52,7 +52,9 @@ impl<T: Type> Display for TagOperation<T> {
     }
 }
 
-impl<T: Type> Operation<T> for TagOperation<T> {
+impl<T: Type> Operation for TagOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         TAG_OPERATION_NAME

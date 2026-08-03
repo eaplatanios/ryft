@@ -42,7 +42,9 @@ pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Par
     pub(crate) marker: PhantomData<(Input, Output)>,
 }
 
-impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, O, Input, Output> {
+impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<V, O, Input, Output>
+{
     /// Creates a new [`Program`] containing the provided [`Region`]s after validating them
     /// and their structural ordering.
     pub fn new(
@@ -449,7 +451,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// values. Before interpreting that program, the mapping closure can receive each linear operation, call the
     /// operation's factor-mapping hook, and replace each residual reference with the concrete residual value captured
     /// by the corresponding linearization run.
-    pub fn map_operations<P: Operation<V::Type>, F: FnMut(&O) -> Result<P, ProgramError>>(
+    pub fn map_operations<P: Operation<Type = V::Type>, F: FnMut(&O) -> Result<P, ProgramError>>(
         &self,
         mut map_fn: F,
     ) -> Result<Program<V, P, Input, Output>, ProgramError> {
@@ -544,7 +546,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     where
         UnprojectedValue: Value + ValueProjection<V::Type, Projected = V>,
         UnprojectedValue::Type: From<V::Type>,
-        UnprojectedOperation: Operation<UnprojectedValue::Type> + From<O>,
+        UnprojectedOperation: Operation<Type = UnprojectedValue::Type> + From<O>,
         Input::Family: ParameterizedFamily<UnprojectedValue>,
         Output::Family: ParameterizedFamily<UnprojectedValue>,
     {
@@ -1171,7 +1173,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, O, Input, Output> {
+impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<V, O, Input, Output>
+{
     /// Renders this [`Program`] with the provided indentation level that is useful for situations where [`Program`]s
     /// are nested within other programs like with control flow [`Operation`]s. [`Instruction`]s with attached
     /// [`Region`]s render a bracketed region section after their inputs, pairing each region with its declared
@@ -1183,7 +1187,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     pub fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         /// Renders one [`Region`] as a `lambda ... in (...)` block, recursively rendering the regions attached to its
         /// instructions according to `reference_counts` and `rendered`.
-        fn render_region<V: Value, O: Operation<V::Type>>(
+        fn render_region<V: Value, O: Operation<Type = V::Type>>(
             regions: &RegionArena<V, O>,
             id: RegionId,
             formatter: &mut std::fmt::Formatter<'_>,
@@ -1327,7 +1331,7 @@ impl<V: Value, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clon
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Display
+impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Display
     for Program<V, O, Input, Output>
 {
     #[inline]
@@ -1403,7 +1407,7 @@ struct ProgramLivenessAnalysis {
 /// are reconstructed from their producing [`Instruction`], whose attached-region references are preserved verbatim
 /// (unreferenced regions are dropped and identifiers rewritten by [`compact_regions`] afterward). A reachable variable
 /// that is neither mapped nor produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
-fn clone_atom_subgraph_into_region<V: Value, O: Operation<V::Type>>(
+fn clone_atom_subgraph_into_region<V: Value, O: Operation<Type = V::Type>>(
     atom_id_mapping: &mut HashMap<AtomId, AtomId>,
     atom_id: AtomId,
     region: &Region<V, O>,
@@ -1517,7 +1521,7 @@ fn compact_regions<V: Typed, O>(regions: Vec<Region<V, O>>, entry: RegionId) -> 
 /// (including their attached-region references, verbatim) instead of cloning them, so each is taken from its slot at
 /// most once. Atoms already present in the mapping are reused, and a reachable variable that is neither mapped nor
 /// produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
-fn move_atom_to_program<V: Value, O: Operation<V::Type>>(
+fn move_atom_to_program<V: Value, O: Operation<Type = V::Type>>(
     atom_id_mapping: &mut HashMap<AtomId, AtomId>,
     atom_id: AtomId,
     atoms: &mut [Option<Atom<V>>],
@@ -1634,7 +1638,9 @@ mod tests {
         );
     }
 
-    impl Operation<DataType> for LongMetadataOperation {
+    impl Operation for LongMetadataOperation {
+        type Type = DataType;
+
         #[inline]
         fn name(&self) -> &'static str {
             "long_metadata"
@@ -1659,7 +1665,9 @@ mod tests {
     #[derive(Clone, Debug)]
     struct ZeroOutputEffectOperation;
 
-    impl Operation<DataType> for ZeroOutputEffectOperation {
+    impl Operation for ZeroOutputEffectOperation {
+        type Type = DataType;
+
         fn name(&self) -> &'static str {
             "zero_output_effect"
         }
@@ -1685,7 +1693,9 @@ mod tests {
         Effectful,
     }
 
-    impl Operation<DataType> for DormantRegionOperation {
+    impl Operation for DormantRegionOperation {
+        type Type = DataType;
+
         fn name(&self) -> &'static str {
             match self {
                 Self::Dormant => "dormant_region",

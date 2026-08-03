@@ -339,7 +339,7 @@ pub struct BatchedProgram<V: Typed + Parameter, O> {
     output_axes: Vec<BatchAxis>,
 }
 
-impl<V: Value, O: Operation<V::Type>> BatchedProgram<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> BatchedProgram<V, O> {
     /// Creates a new [`BatchedProgram`] that carries exactly the source [`Region`](crate::Region)'s inputs and outputs.
     #[inline]
     pub fn new(program: Program<V, O, Vec<V>, Vec<V>>, output_axes: Vec<BatchAxis>) -> Result<Self, ProgramError> {
@@ -1517,7 +1517,7 @@ impl<'r, D> RecursiveBatchingDriver<'r, D> {
     }
 }
 
-impl<T: Type, V: Value<Type = T>, O: Operation<T>, D: RegionDriver<V, O>> RegionDriver<V, O>
+impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, D: RegionDriver<V, O>> RegionDriver<V, O>
     for RecursiveBatchingDriver<'_, D>
 {
     #[inline]
@@ -1555,6 +1555,9 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
     }
 }
 
+// TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
+//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
+//  context type is built from `Self` (E0284); the equality is enforced per method through `where` clauses instead.
 /// Represents [`Operation`]s that can be batched (i.e., vectorized). The trait is parameterized by the parent
 /// [`Context`] `C` that owns the packed values flowing through the batching transform, and every rule receives
 /// the active durable [`BatchingContext`] plus a [`BatchingDriver`]. Ordinary rules lift their operation to its
@@ -1578,7 +1581,14 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
 ///     capability requirements to the use site. Nested programs batch structurally through [`Program::batched`],
 ///     requested by higher-order rules through their active [`BatchingDriver`], whose concrete implementation
 ///     establishes the finite program-level bounds at its construction site.
-pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<C::Type> {
+///
+/// The super-trait is a plain [`Operation`] rather than `Operation<Type = C::Type>` because the current trait solver
+/// cannot discharge that projection equality at implementation heads whose batching context is itself built from
+/// `Self`. The equality is instead required per method through `where Self: Operation<Type = C::Type>`, so a payload
+/// whose [`Operation::Type`] disagrees with `C::Type` cannot be batched in `C`: the requirement is restated by the
+/// derived dispatcher's per-payload predicates and by the generic projected-batching helpers, and any mismatched
+/// payload is rejected with a type-mismatch error at its use site.
+pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation {
     /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes.
     /// `context` borrows the durable [`BatchingContext`] for the transform level being applied. `driver` exposes the
     /// current operation application's regions and has a region count of zero for region-free applications. Packed
@@ -1610,7 +1620,9 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<C::Typ
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError>;
+    ) -> Result<Vec<P::Batch>, BatchingError>
+    where
+        Self: Operation<Type = C::Type>;
 }
 
 // Blanket `BatchableOperation` implementation for any `ElementwiseOperation`, so per-operation `BatchableOperation`
@@ -2081,7 +2093,7 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
 
 impl<
     V: Value<Type = ArrayType>,
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + BatchableOperation<TracingContext<V, O>, ArrayBatching>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>,
@@ -2236,7 +2248,7 @@ impl<
 
 impl<
     V: Value<Type = ArrayType>,
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + BatchableOperation<TracingContext<V, O>, ArrayBatching>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>,
@@ -2540,7 +2552,7 @@ pub(crate) fn normalized_batch_axis_type(
 ///   - `inputs`: Packed composite batches corresponding to the operation's operands.
 pub fn batch_projected_operation<
     T: Type,
-    O: BatchableOperation<ProjectedContext<C, T>, Q>,
+    O: Operation<Type = T> + BatchableOperation<ProjectedContext<C, T>, Q>,
     P: BatchingPolicy<C>,
     Q: BatchingPolicy<ProjectedContext<C, T>, Extent = P::Extent>,
     C: Context<
@@ -2636,12 +2648,20 @@ mod tests {
 
     type ProjectedProgramContext = EagerContext<ProjectedProgramValue, ProjectedProgramOperation>;
 
-    impl BatchingPolicy<ProjectedProgramContext> for ProjectedProgramBatching {
-        type Batch = ProjectedBatch<ProjectedProgramValue>;
+    impl<C> BatchingPolicy<C> for ProjectedProgramBatching
+    where
+        C: Context<
+                Type = ProjectedProgramType,
+                Value = ProjectedProgramValue,
+                Constant = ProjectedProgramValue,
+                Operation = ProjectedProgramOperation,
+            >,
+    {
+        type Batch = ProjectedBatch<C::Value>;
         type Extent = usize;
-        type BatchedProgram = BatchedProgram<ProjectedProgramValue, ProjectedProgramOperation>;
+        type BatchedProgram = BatchedProgram<C::Constant, C::Operation>;
 
-        fn batch(value: ProjectedProgramValue, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
+        fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
             if !batch_axis.is_replicated() && !matches!(value, ProjectedProgramValue::First(_)) {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!("{} values must remain replicated under batching", value.r#type()),
@@ -2650,11 +2670,11 @@ mod tests {
             Ok(ProjectedBatch { value, batch_axis })
         }
 
-        fn replicated(value: ProjectedProgramValue) -> Self::Batch {
+        fn replicated(value: C::Value) -> Self::Batch {
             ProjectedBatch { value, batch_axis: BatchAxis::replicated() }
         }
 
-        fn value(batch: &Self::Batch) -> &ProjectedProgramValue {
+        fn value(batch: &Self::Batch) -> &C::Value {
             &batch.value
         }
 
@@ -2662,34 +2682,47 @@ mod tests {
             batch.batch_axis
         }
 
-        fn unbatched_type(batch: &Self::Batch) -> Cow<'_, ProjectedProgramType> {
+        fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
             batch.r#type()
         }
 
         fn adapt_batched_program<
             CollapseFn: Fn(
-                &TracingContext<ProjectedProgramValue, ProjectedProgramOperation>,
-                Tracer<TracingContext<ProjectedProgramValue, ProjectedProgramOperation>>,
+                &TracingContext<C::Constant, C::Operation>,
+                Tracer<TracingContext<C::Constant, C::Operation>>,
                 Axis,
-            )
-                -> Result<Tracer<TracingContext<ProjectedProgramValue, ProjectedProgramOperation>>, BatchingError>,
+            ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
         >(
             program: Self::BatchedProgram,
             required_output_axes: Option<&[BatchAxis]>,
             collapse_fn: CollapseFn,
-        ) -> Result<BatchedProgram<ProjectedProgramValue, ProjectedProgramOperation>, BatchingError> {
+        ) -> Result<BatchedProgram<C::Constant, C::Operation>, BatchingError> {
             let (program, output_axes) = program.into_parts();
             BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, collapse_fn)
         }
     }
 
-    impl BatchableOperation<ProjectedProgramContext, ProjectedProgramBatching> for ProjectedProgramOperation {
-        fn batch<D: BatchingDriver<ProjectedProgramContext, ProjectedProgramBatching>>(
+    // The rule is context-generic so that the per-method `Self: Operation<Type = C::Type>` requirement of
+    // `BatchableOperation::batch` is discharged from the context bound instead of by normalizing an eager
+    // context that is itself built from this operation family.
+    impl<C> BatchableOperation<C, ProjectedProgramBatching> for ProjectedProgramOperation
+    where
+        C: Context<
+                Type = ProjectedProgramType,
+                Value = ProjectedProgramValue,
+                Constant = ProjectedProgramValue,
+                Operation = ProjectedProgramOperation,
+            >,
+    {
+        fn batch<D: BatchingDriver<C, ProjectedProgramBatching>>(
             &self,
-            _context: &BatchingContext<ProjectedProgramContext, ProjectedProgramBatching>,
+            _context: &BatchingContext<C, ProjectedProgramBatching>,
             _driver: &D,
-            inputs: &[ProjectedBatch<ProjectedProgramValue>],
-        ) -> Result<Vec<ProjectedBatch<ProjectedProgramValue>>, BatchingError> {
+            inputs: &[ProjectedBatch<C::Value>],
+        ) -> Result<Vec<ProjectedBatch<C::Value>>, BatchingError>
+        where
+            Self: Operation<Type = C::Type>,
+        {
             if inputs.len() != 1 {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             }
@@ -3228,7 +3261,9 @@ mod tests {
         let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
         let tracer = BatchingTracer::new(
             context.clone(),
-            ProjectedProgramBatching::replicated(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7))),
+            <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
+                ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+            ),
         );
         assert_eq!(tracer.r#type(), Cow::Owned(ProjectedProgramType::Third(ProjectedMemberType::<2>)));
         assert_eq!(tracer.batch_extent(), &5);
@@ -3244,7 +3279,7 @@ mod tests {
         );
 
         assert!(matches!(
-            ProjectedProgramBatching::batch(
+            <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::batch(
                 ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
                 BatchAxis::new(0),
             ),
@@ -4017,7 +4052,9 @@ mod tests {
         // rule proves that the adapter depends only on the projection and policy contracts, while preserving the
         // composite policy's packed value and replicated-axis representation.
         let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
-        let input = ProjectedProgramBatching::replicated(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)));
+        let input = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
+            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+        );
         let outputs = batch_projected_operation::<ProjectedMemberType<2>, _, _, ProjectedMemberBatching<2>, _>(
             &context,
             &ProjectedMemberOperation,

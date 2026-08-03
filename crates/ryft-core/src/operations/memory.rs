@@ -67,7 +67,9 @@ impl Display for TransferToMemoryOperation {
     }
 }
 
-impl Operation<ArrayType> for TransferToMemoryOperation {
+impl Operation for TransferToMemoryOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         TRANSFER_TO_MEMORY_OPERATION_NAME
@@ -157,7 +159,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: Operation<ArrayType> + From<TransferToMemoryOperation>,
+        O: Operation<Type = ArrayType> + From<TransferToMemoryOperation>,
     {
         |_operation, context, _driver, inputs, outputs| {
             // Transpose rule for [`TransferToMemoryOperation`]. A memory transfer is the identity linear map between two
