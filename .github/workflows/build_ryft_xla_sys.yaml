@@ -96,6 +96,10 @@ jobs:
         run: |
           sudo apt purge llvm* clang* lld* -y
           sudo apt autoremove -y
+          # The LLVM apt script requires these tools, which the runner image no longer ships (and the purge above can
+          # remove as orphaned dependencies).
+          sudo apt-get update -qq
+          sudo apt-get install -y lsb-release wget software-properties-common gnupg
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
           sudo apt-get install libnuma-dev -y
       - name: Install CUDA 12
