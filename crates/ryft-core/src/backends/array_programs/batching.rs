@@ -17,8 +17,9 @@ use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchAxisSpecification, BatchableOperation,
     BatchableType, BatchedProgram, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
-    BatchingPolicy, BatchingTracer, DimensionSource, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver,
-    RecursiveBatchingPolicy, batch_axis_sharding, batch_projected_operation, normalized_batch_axis_type,
+    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, DimensionSource, ProgramBatchingOutputAxesPolicy,
+    RecursiveBatchingDriver, RecursiveBatchingPolicy, batch_axis_sharding, batch_projected_operation,
+    normalized_batch_axis_type,
 };
 use crate::contexts::{Context, ProjectedContext, StagingContext, ValueResolution};
 use crate::differentiation::LinearCallOperation;
@@ -190,7 +191,6 @@ impl<C: Context<Type = ArrayProgramType>> BatchingPolicy<C> for ArrayProgramBatc
     type Batch = ArrayProgramBatch<C::Value>;
     type Extent = C::Value;
     type BatchedProgram = ThreadedExtentBatchedProgram<C::Constant, C::Operation>;
-    type Projected = ArrayBatching<DynamicArrayBatchingPolicy>;
 
     #[inline]
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
@@ -323,7 +323,6 @@ where
         <C::Constant as ValueProjection<ArrayType>>::Projected,
         <C::Operation as OperationProjection<ArrayType>>::Projected,
     >;
-    type Projected = Self;
 
     #[inline]
     fn batch(
@@ -390,6 +389,138 @@ where
     {
         let (program, output_axes) = program.into_parts();
         BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, collapse_fn)
+    }
+}
+
+/// Batching policy used while a homogeneous first-class-dimension operation runs inside an array-program batching
+/// transform. A dimension is shared shape metadata, so its projected value is itself the complete batch carrier:
+/// replicated inputs pass through unchanged, while any mapped input is rejected because a different extent per batch
+/// item would require a ragged array representation. The policy still carries the outer transform's first-class
+/// mapped extent so [`batch_projected_operation`] can construct one uniform projected batching context for every
+/// member kind without specializing that extent.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ReplicatedDimensionBatchingPolicy;
+
+impl<C: Context<Type = ArrayProgramType>> BatchingPolicy<ProjectedContext<C, DimensionType>>
+    for ReplicatedDimensionBatchingPolicy
+where
+    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Operation: OperationProjection<DimensionType>,
+{
+    type Batch = <C::Value as ValueProjection<DimensionType>>::Projected;
+    type Extent = C::Value;
+    type BatchedProgram = BatchedProgram<
+        <C::Constant as ValueProjection<DimensionType>>::Projected,
+        <C::Operation as OperationProjection<DimensionType>>::Projected,
+    >;
+
+    fn batch(
+        value: <C::Value as ValueProjection<DimensionType>>::Projected,
+        batch_axis: BatchAxis,
+    ) -> Result<Self::Batch, BatchingError> {
+        if !batch_axis.is_replicated() {
+            return Err(BatchingError::MappedDimension {
+                r#type: Box::new(value.r#type().into_owned()),
+                axis: batch_axis,
+            });
+        }
+        Ok(value)
+    }
+
+    #[inline]
+    fn replicated(value: <C::Value as ValueProjection<DimensionType>>::Projected) -> Self::Batch {
+        value
+    }
+
+    #[inline]
+    fn value(batch: &Self::Batch) -> &<C::Value as ValueProjection<DimensionType>>::Projected {
+        batch
+    }
+
+    #[inline]
+    fn batch_axis(_batch: &Self::Batch) -> BatchAxis {
+        BatchAxis::replicated()
+    }
+
+    #[inline]
+    fn unbatched_type(batch: &Self::Batch) -> Cow<'_, DimensionType> {
+        batch.r#type()
+    }
+
+    #[inline]
+    fn adapt_batched_program<CollapseFn>(
+        program: Self::BatchedProgram,
+        required_output_axes: Option<&[BatchAxis]>,
+        collapse_fn: CollapseFn,
+    ) -> Result<
+        BatchedProgram<
+            <C::Constant as ValueProjection<DimensionType>>::Projected,
+            <C::Operation as OperationProjection<DimensionType>>::Projected,
+        >,
+        BatchingError,
+    >
+    where
+        CollapseFn: Fn(
+            &TracingContext<
+                <C::Constant as ValueProjection<DimensionType>>::Projected,
+                <C::Operation as OperationProjection<DimensionType>>::Projected,
+            >,
+            Tracer<
+                TracingContext<
+                    <C::Constant as ValueProjection<DimensionType>>::Projected,
+                    <C::Operation as OperationProjection<DimensionType>>::Projected,
+                >,
+            >,
+            Axis,
+        ) -> Result<
+            Tracer<
+                TracingContext<
+                    <C::Constant as ValueProjection<DimensionType>>::Projected,
+                    <C::Operation as OperationProjection<DimensionType>>::Projected,
+                >,
+            >,
+            BatchingError,
+        >,
+    {
+        let (program, output_axes) = program.into_parts();
+        BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, collapse_fn)
+    }
+}
+
+impl<C: Context<Type = ArrayProgramType>> BatchingPolicyProjection<C, ArrayType> for ArrayProgramBatching
+where
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: OperationProjection<ArrayType>,
+{
+    type Projected = ArrayBatching<DynamicArrayBatchingPolicy>;
+}
+
+impl<C: Context<Type = ArrayProgramType>> BatchingPolicyProjection<C, DimensionType> for ArrayProgramBatching
+where
+    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Operation: OperationProjection<DimensionType>,
+{
+    type Projected = ReplicatedDimensionBatchingPolicy;
+}
+
+impl<C: Context<Type = ArrayProgramType>>
+    BatchableOperation<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>
+    for DimensionOperation<DimensionValue>
+where
+    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Operation: OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+{
+    fn batch<D: BatchingDriver<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>,
+        _driver: &D,
+        inputs: &[<C::Value as ValueProjection<DimensionType>>::Projected],
+    ) -> Result<Vec<<C::Value as ValueProjection<DimensionType>>::Projected>, BatchingError> {
+        context.parent().bind(self.clone(), Vec::new(), inputs).map_err(Into::into)
     }
 }
 
@@ -2203,21 +2334,7 @@ where
             Self::While(operation) => batch_while(operation, context, driver, inputs),
             Self::Scan(operation) => batch_scan(operation, context, driver, inputs),
             Self::Array(operation) => batch_projected_operation(context, operation, inputs),
-            Self::Dimension(operation) => {
-                for input in inputs {
-                    input.validate_replicated_dimension()?;
-                }
-                let inputs = inputs
-                    .iter()
-                    .map(|input| <C::Value as ValueProjection<DimensionType>>::into_projected(input.value.clone()))
-                    .collect::<Result<Vec<_>, TypeError>>()?;
-                Ok(ProjectedContext::<C, DimensionType>::new(context.parent().clone())
-                    .bind(operation.clone(), Vec::new(), inputs.as_slice())?
-                    .into_iter()
-                    .map(<C::Value as ValueProjection<DimensionType>>::from_projected)
-                    .map(ArrayProgramBatch::replicated)
-                    .collect())
-            }
+            Self::Dimension(operation) => batch_projected_operation(context, operation, inputs),
             Self::Compare(_) => {
                 let [left, right] = inputs else {
                     return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());

@@ -2109,9 +2109,10 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       keep that one irreducible policy selection explicit. Do not retain inferred generic placeholders or introduce a
       marker/wrapper solely to relocate the same type annotation. Add compile-checked direct-call fixtures pinning the
       final syntax. Completed 2026-08-03: all three helpers now infer the projected member type from the operation
-      argument and are called without helper turbofishes; batching selects its member policy through
-      `BatchingPolicy::Projected`; the duplicate direct homogeneous-array `AddOperation` conversions were
-      deleted; and all 34 `ryft-xla` `AddOperation::<X>::new()` annotations were removed.
+      argument and are called without helper turbofishes; batching initially selected its sole member policy through
+      `BatchingPolicy::Projected` (subsequently generalized to the type-indexed `BatchingPolicyProjection<C, T>` in
+      P8b); the duplicate direct homogeneous-array `AddOperation` conversions were deleted; and all 34 `ryft-xla`
+      `AddOperation::<X>::new()` annotations were removed.
 - [x] Add compile-fail tests proving one payload cannot acquire two semantic type contracts and a homogeneous enum
       cannot combine mismatched payload types (`error_multiple_operation_types` pins E0119;
       `error_mismatched_payload_type` pins the derive-boundary rejection).
@@ -2132,28 +2133,35 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       and document why the associated type failed.~~ Not triggered; the interim `OperationType` marker that had been
       staged in this direction was subsumed into the associated type during adoption.
 
+- [x] Re-audit the Phase 8 declaration prerequisites after adopting associated-type `Operation`. The audit found that
+      the previous single `member(T)` model conflated rule-bearing projected array operations with replicated,
+      zero-differential dimension operations, and that `BatchingPolicy::Projected` cannot select by projected member
+      type. The corrected migration and review-unit ledger lives in
+      `.tasks/plan_p8b_array_program_operation_declaration.md`.
+- [x] Replace `BatchingPolicy::Projected` with `BatchingPolicyProjection<C, T>`, add the replicated dimension-member
+      policy, and route both homogeneous array and replicated dimension member operations through the common projected
+      batching helper without changing their distinct mapped-axis semantics.
+- [ ] Execute `.tasks/plan_p8b_array_program_operation_declaration.md` as the next bounded Phase 8 sequence: first
+      restore type-indexed batching-policy projection and move semantic rules to their payload owners, then extend the
+      existing derive vertically, and only then migrate the production enum.
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
 - [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.
 - [ ] Make `#[derive(Operation)]` with `#[ryft(dispatch(batching, differentiation, transposition))]` the mechanical
       dispatch surface for `ArrayProgramOperation`, matching the homogeneous families instead of introducing a second
-      generator syntax. Prerequisites, both scheduled elsewhere: every semantic rule has moved off the enum match onto
-      a colocated payload implementation (the P6 differentiation relocation plus the existing composite-`jvp` TODO),
-      and each dual-contract variant carries a dedicated typed payload instantiation (or a semantic mixed payload when
-      its stored metadata differs) so one concrete payload never carries two semantic contracts. The mixed
-      concatenate representation additionally owns its extent signature the way the dimension arithmetic payloads do,
-      making its
-      `OrderedAssertion` effect conditional on the same bounds-proof predicate so bounds-proven concatenates stop
-      being permanently effectful (today's shared `{ axis }` payload cannot express that without duplicating
-      operand-derived shape metadata; the over-approximation is documented at the payload's `effects`). Extend the
-      derive itself in
-      exactly two ways: a variant-level member marker (e.g. `#[ryft(member(ArrayType))]`) that emits the
-      project-delegate-lift arm by calling the existing projection helpers rather than inlining boundary logic, and
-      batching-policy selection through `<PrimaryType as BatchableType>::Policy` instead of the hard-coded homogeneous
-      `ArrayBatching<P>` family, so the same attribute serves both universes with no new syntax. The variant member
-      markers and typed mixed payloads are irreducible declaration content, not ceremony: which universe a
-      variant's payload speaks must be declared exactly once, on the declaration. Sequence this after P5d and P6 so
-      the transform rules the derive delegates to have stopped moving, and land it with the associated-type
-      `Operation` prototype so the one-contract compile-fail gates and the dispatch generation are one review unit.
+      generator syntax. Before migration, move every semantic rule off the enum match and into its colocated payload
+      implementation, and ensure each dual-contract variant carries a dedicated typed payload instantiation (or a
+      semantic mixed payload when its stored metadata differs) so one concrete payload never carries two semantic
+      contracts. The mixed concatenate representation additionally owns its extent signature the way dimension
+      arithmetic payloads do, making its `OrderedAssertion` effect conditional on the same bounds-proof predicate so
+      bounds-proven concatenates stop being permanently effectful (today's shared `{ axis }` payload cannot express
+      that without duplicating operand-derived shape metadata; the over-approximation is documented at the payload's
+      `effects`). Extend the derive with variant-level class markers that distinguish rule-bearing projected members
+      from replicated structural members and emit the corresponding project-delegate-lift or structural arm by calling
+      shared helpers rather than inlining boundary logic. Select a projected batching policy through the type-indexed
+      `BatchingPolicyProjection<C, T>` relation instead of assuming one projected policy per outer policy, and select each
+      top-level universe's entrypoint policy through `<PrimaryType as BatchableType>::Policy` instead of hard-coding
+      `ArrayBatching<P>`. The class markers and typed mixed payloads are irreducible declaration content, not ceremony:
+      which universe and transform contract a variant's payload speaks must be declared exactly once on the enum.
 - [ ] Make each mixed operation's inference contract the authoritative source for dimension operand positions,
       member kinds, ordering, and result metadata.
 - [ ] Extend the typed mixed projection vocabulary only for repeated fixed/optional/segmented patterns found in the
