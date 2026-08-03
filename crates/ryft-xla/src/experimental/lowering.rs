@@ -47,7 +47,7 @@ use ryft_core::programs::types::{Type as RyftType, Typed};
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::types::{
-    ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, MAX_DIMENSION_EXTENT, Memory, Shape,
+    ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Layout, MAX_DIMENSION_EXTENT, Memory, Shape,
 };
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
@@ -2342,6 +2342,7 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -2359,10 +2360,15 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
         let custom_call = CustomCallOperation::new("__op$block_scaled_dot", vec![output_types[0].clone()]);
         let mut reordered_inputs = vec![input_values[0], input_values[2], input_values[1], input_values[3]];
         reordered_inputs.extend(input_values.get(4).copied());
+        let mut reordered_input_types =
+            vec![input_types[0].clone(), input_types[2].clone(), input_types[1].clone(), input_types[3].clone()];
+        reordered_input_types.extend(input_types.get(4).cloned());
         return lower_custom_call_to_mlir(
             &custom_call,
             reordered_inputs.as_slice(),
+            reordered_input_types.as_slice(),
             output_types,
+            effect_tokens,
             block,
             context,
             location,
@@ -3489,21 +3495,74 @@ fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(results)
 }
 
+/// Returns the minor-to-major layout required by one custom-call array type.
+fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Option<Vec<usize>>, LoweringError> {
+    let Some(layout) = r#type.layout() else {
+        return Ok(None);
+    };
+    let Layout::Tiled(layout) = layout else {
+        return Err(LoweringError::UnsupportedOp { op: format!("custom_call with strided array layout '{layout}'") });
+    };
+    if !layout.tiles().is_empty() {
+        return Err(LoweringError::UnsupportedOp { op: format!("custom_call with tiled array layout '{layout}'") });
+    }
+    if layout.rank() != r#type.rank()
+        || layout.minor_to_major().iter().any(|axis| *axis >= r#type.rank())
+        || layout.minor_to_major().iter().collect::<HashSet<_>>().len() != r#type.rank()
+    {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("custom_call with invalid array layout '{layout}' for rank-{} type '{type}'", r#type.rank(), type = r#type),
+        });
+    }
+    Ok(Some(layout.minor_to_major().to_vec()))
+}
+
+/// Returns the complete StableHLO custom-call layout lists when at least one array type requests an explicit layout.
+fn lower_custom_call_memory_layouts(
+    input_types: &[ArrayType],
+    output_types: &[ArrayType],
+    has_effect_token: bool,
+) -> Result<Option<CustomCallMemoryLayouts>, LoweringError> {
+    let input_layouts = input_types.iter().map(lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
+    let output_layouts = output_types.iter().map(lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
+    if input_layouts.iter().chain(&output_layouts).all(Option::is_none) {
+        return Ok(None);
+    }
+    let mut operands = input_types
+        .iter()
+        .zip(input_layouts)
+        .map(|(r#type, layout)| layout.unwrap_or_else(|| (0..r#type.rank()).rev().collect()))
+        .collect::<Vec<_>>();
+    let mut results = output_types
+        .iter()
+        .zip(output_layouts)
+        .map(|(r#type, layout)| layout.unwrap_or_else(|| (0..r#type.rank()).rev().collect()))
+        .collect::<Vec<_>>();
+    if has_effect_token {
+        operands.push(Vec::new());
+        results.push(Vec::new());
+    }
+    Ok(Some(CustomCallMemoryLayouts { operands, results }))
+}
+
 /// Lowers one traced custom call to a `stablehlo.custom_call` using the typed FFI calling convention
-/// (`api_version = 4`): the operation's typed attributes become the `backend_config` dictionary entries (strings as
-/// string attributes, Booleans as `i1` Boolean attributes, integers as signless `i64` attributes, and floats as
-/// `f64` attributes — the encodings the XLA FFI decodes into typed call-frame attributes), its side-effect flag
-/// becomes `has_side_effect`, and its declared output types are lowered verbatim. Handlers are resolved by the XLA
+/// (`api_version = 4`). Typed attributes become the `backend_config` dictionary, array layouts become complete
+/// StableHLO operand/result layout lists, and flat input/output aliases become StableHLO output-operand aliases.
+/// A side-effecting call additionally consumes and produces the current ordered-I/O token so multiple such calls
+/// remain ordered even when their array results do not carry a data dependency. Handlers are resolved by the XLA
 /// runtime through the target name at execution time (e.g., registered via `ryft-pjrt`'s
 /// `Client::register_ffi_handler`).
 fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType>(
     operation: &CustomCallOperation<T>,
     input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
     output_types: &[ArrayType],
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    check_count!("input", input_types, input_values.len(), ProgramError);
     let attributes = operation
         .attributes()
         .iter()
@@ -3520,23 +3579,49 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType>(
         })
         .collect::<Vec<_>>();
     let backend_config = context.dictionary_attribute(&attributes);
-    let lowered_output_types = output_types
+    let memory_layouts = lower_custom_call_memory_layouts(input_types, output_types, operation.has_side_effect())?;
+    let mut lowered_inputs = input_values.to_vec();
+    if operation.has_side_effect() {
+        lowered_inputs.push(current_or_new_token(Effect::OrderedIo, effect_tokens, block, location)?);
+    }
+    let mut lowered_output_types = output_types
         .iter()
-        .map(|output_type| lower_tensor_type(output_type, context, location))
+        .map(|output_type| lower_tensor_type(output_type, context, location).map(|r#type| r#type.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if operation.has_side_effect() {
+        lowered_output_types.push(context.stable_hlo_token_type()?.as_ref());
+    }
+    let output_operand_aliases = operation
+        .input_output_aliases()
+        .iter()
+        .map(|alias| {
+            let output_tuple_indices =
+                if lowered_output_types.len() == 1 { Vec::new() } else { vec![alias.output_index()] };
+            context.stable_hlo_output_operand_alias(output_tuple_indices.as_slice(), alias.input_index(), &[])
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let lowered = block.append_operation(stable_hlo::custom_call(
-        input_values,
+        lowered_inputs.as_slice(),
         operation.target_name(),
         operation.has_side_effect(),
         Some(backend_config.as_ref()),
         CustomCallApiVersion::TypedFfi,
         &[],
-        None,
-        &[],
+        memory_layouts,
+        output_operand_aliases.as_slice(),
         None,
         &lowered_output_types,
         location,
     )?)?;
+    if operation.has_side_effect() {
+        effect_tokens.set(
+            Effect::OrderedIo,
+            lowered
+                .result(output_types.len())
+                .expect("a side-effecting custom call should return one trailing token result")
+                .as_ref(),
+        );
+    }
     Ok((0..output_types.len())
         .map(|index| {
             lowered
@@ -3832,7 +3917,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::CustomCall(operation) => lower_custom_call_to_mlir(
                 operation,
                 input_values,
+                &lowerer.input_types,
                 output_types,
+                &mut lowerer.effect_tokens,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
@@ -3946,6 +4033,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     input_values,
                     &lowerer.input_types,
                     output_types,
+                    &mut lowerer.effect_tokens,
                     &mut lowerer.block,
                     lowerer.context,
                     lowerer.location,
@@ -11434,24 +11522,37 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_lowers_custom_call() {
         use ryft_core::operations::custom_call::CustomCallOperation;
+        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::types::{StridedLayout, TiledLayout};
 
-        // A side-effecting custom call with one attribute of each supported type lowers to a typed-FFI
-        // `stablehlo.custom_call` whose `backend_config` dictionary carries the typed encodings (string, `i1`
-        // Boolean, signless `i64`, and `f64`); a pure attribute-free call lowers with an empty dictionary and
-        // no `has_side_effect` marker.
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        // A side-effecting custom call lowers its typed attributes, complete memory-layout lists, buffer alias,
+        // and one hidden ordered-I/O token. A second side-effecting call consumes that token even though the first
+        // call's array result is unused, while the final pure call remains token-free.
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let column_major_type = array_type.clone().with_layout(Some(TiledLayout::new(vec![0, 1], Vec::new()).into()));
         let mut builder = XlaProgramBuilder::new();
-        let left = builder.add_input(array_type.clone());
+        let left = builder.add_input(column_major_type.clone());
         let right = builder.add_input(array_type.clone());
-        let effectful = CustomCallOperation::new("ryft.test.scaled_add", vec![array_type.clone()])
-            .with_attribute("scale", 2.0)
-            .with_attribute("count", 4i64)
-            .with_attribute("flag", true)
-            .with_attribute("label", "x")
-            .with_side_effect();
-        let scaled = builder.add_instruction(effectful, Vec::new(), vec![left, right]).unwrap()[0];
+        let effectful =
+            CustomCallOperation::new("ryft.test.scaled_add", vec![array_type.clone(), column_major_type.clone()])
+                .with_attribute("scale", 2.0)
+                .with_attribute("count", 4i64)
+                .with_attribute("flag", true)
+                .with_attribute("label", "x")
+                .with_input_output_alias(0, 1)
+                .unwrap()
+                .with_side_effect();
+        builder.add_instruction(effectful, Vec::new(), vec![left, right]).unwrap();
+        let printed = builder.add_instruction(PrintOperation::new("between"), Vec::new(), vec![right]).unwrap()[0];
+        let chained = builder
+            .add_instruction(
+                CustomCallOperation::new("ryft.test.record", vec![array_type.clone()]).with_side_effect(),
+                Vec::new(),
+                vec![printed],
+            )
+            .unwrap()[0];
         let pure = CustomCallOperation::new("ryft.test.add_one", vec![array_type.clone()]);
-        let output = builder.add_instruction(pure, Vec::new(), vec![scaled]).unwrap()[0];
+        let output = builder.add_instruction(pure, Vec::new(), vec![chained]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![output],
@@ -11460,7 +11561,7 @@ mod tests {
             )
             .unwrap();
         let program = unproject_plain_program(program);
-        let input_types = vec![array_type.clone(), array_type.clone()];
+        let input_types = vec![column_major_type, array_type.clone()];
         let output_types = vec![array_type];
         let module =
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
@@ -11469,10 +11570,96 @@ mod tests {
             module,
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<2xf32>, %arg1: tensor<2xf32>) -> tensor<2xf32> {
-                    %0 = stablehlo.custom_call @ryft.test.scaled_add(%arg0, %arg1) {api_version = 4 : i32, backend_config = {count = 4 : i64, flag = true, label = "x", scale = 2.000000e+00 : f64}, has_side_effect = true} : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
-                    %1 = stablehlo.custom_call @ryft.test.add_one(%0) {api_version = 4 : i32, backend_config = {}} : (tensor<2xf32>) -> tensor<2xf32>
-                    return %1 : tensor<2xf32>
+                  func.func @main(%arg0: tensor<2x3xf32>, %arg1: tensor<2x3xf32>) -> tensor<2x3xf32> {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1:3 = stablehlo.custom_call @ryft.test.scaled_add(%arg0, %arg1, %0) {api_version = 4 : i32, backend_config = {count = 4 : i64, flag = true, label = "x", scale = 2.000000e+00 : f64}, has_side_effect = true, operand_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<> : tensor<0xindex>], output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [1], operand_index = 0, operand_tuple_indices = []>], result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0, 1]> : tensor<2xindex>, dense<> : tensor<0xindex>]} : (tensor<2x3xf32>, tensor<2x3xf32>, !stablehlo.token) -> (tensor<2x3xf32>, tensor<2x3xf32>, !stablehlo.token)
+                    %2 = stablehlo.custom_call @ryft.print(%arg1, %1#2) {api_version = 4 : i32, backend_config = {label = "between"}, has_side_effect = true} : (tensor<2x3xf32>, !stablehlo.token) -> !stablehlo.token
+                    %3:2 = stablehlo.custom_call @ryft.test.record(%arg1, %2) {api_version = 4 : i32, backend_config = {}, has_side_effect = true} : (tensor<2x3xf32>, !stablehlo.token) -> (tensor<2x3xf32>, !stablehlo.token)
+                    %4 = stablehlo.custom_call @ryft.test.add_one(%3#0) {api_version = 4 : i32, backend_config = {}} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                    return %4 : tensor<2x3xf32>
+                  }
+                }
+            "#},
+        );
+
+        // Byte-strided descriptors cannot be represented by StableHLO's permutation-only custom-call layouts.
+        let strided_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+            .with_layout(Some(StridedLayout::new(vec![12, 4]).into()));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(strided_type.clone());
+        let output = builder
+            .add_instruction(
+                CustomCallOperation::new("ryft.test.strided", vec![strided_type.clone()]),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        assert_eq!(
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![strided_type.clone()],
+                &vec![strided_type],
+                "main",
+                None,
+                None,
+            ),
+            Err(LoweringError::UnsupportedOp {
+                op: "custom_call with strided array layout 'strided{12,4}'".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_dynamic_custom_call_alias() {
+        use ryft_core::operations::custom_call::CustomCallOperation;
+
+        // A composite custom call receives its declared extent as trailing scalar SSA metadata, but only the array
+        // operand enters the FFI call. An alias continues to refer to that leading array operand and the result is
+        // refined with the trailing logical extent after the call.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(dynamic_type.clone());
+        let extent = builder
+            .add_instruction(DimensionSizeOperation::new(&dynamic_type, 0).unwrap(), Vec::new(), vec![input])
+            .unwrap()[0];
+        let operation = CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_type.clone()])
+            .with_input_output_alias(0, 0)
+            .unwrap();
+        let output = builder.add_instruction(operation, Vec::new(), vec![input, extent]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![dynamic_type.clone()],
+            &vec![dynamic_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<8xf32>, %arg1: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<8>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<8xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %3 = stablehlo.custom_call @ryft.test.dynamic(%0) {api_version = 4 : i32, backend_config = {}, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>]} : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                    %4 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
+                    %5 = stablehlo.set_dimension_size %3, %4, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                    %6 = stablehlo.get_dimension_size %5, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
+                    %7 = stablehlo.convert %6 : (tensor<i32>) -> tensor<i64>
+                    return %5, %7 : tensor<?xf32, #stablehlo.bounds<8>>, tensor<i64>
                   }
                 }
             "#},

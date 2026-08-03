@@ -187,7 +187,8 @@ pub(crate) mod tests {
         let count = input.dimensions().iter().map(|&dimension| dimension.max(0) as usize).product::<usize>();
         // SAFETY: Both data pointers are provided by the XLA runtime, are valid for the duration of the handler
         // invocation, and (per the element type and shape equality checks above) are backed by allocations of at
-        // least `count` `f32` elements. The runtime allocates inputs and outputs separately so they do not overlap.
+        // least `count` `f32` elements. The elementwise loop is also valid when the output aliases the input because
+        // it reads each element before overwriting that same element.
         unsafe {
             let source = input.data() as *const f32;
             let destination = output.data() as *mut f32;

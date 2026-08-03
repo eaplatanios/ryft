@@ -658,23 +658,43 @@ mod tests {
     #[test]
     fn test_eager_custom_call_executes_registered_ffi_handler() {
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
+        use ryft_core::types::TiledLayout;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         ensure_add_one_handler_registered(&client).unwrap();
         let mesh = cpu_mesh(&client);
-        let input = f32_vector(&client, &mesh, &[1.5, 2.5]);
 
-        let operation =
-            CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_type(&mesh, DataType::F32, &[2])]);
-        let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&input)).unwrap();
+        // The handler receives both matrix buffers in non-default column-major order. Its elementwise computation is
+        // layout-independent because the input and output use the same physical ordering.
+        let matrix_type = replicated_type(&mesh, DataType::F32, &[2, 2])
+            .with_layout(Some(TiledLayout::new(vec![0, 1], Vec::new()).into()));
+        let matrix_input = Array::from_host_buffer(
+            &client,
+            matrix_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.5, 2.5, 3.5, 4.5]),
+        )
+        .unwrap();
+        let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![matrix_type]);
+        let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&matrix_input)).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(read_f32s(&outputs[0]), vec![2.5, 3.5]);
+        assert_eq!(read_f32s(&outputs[0]), vec![2.5, 3.5, 4.5, 5.5]);
 
         // A typed `f64` attribute reaches the handler through the `backend_config` dictionary.
         let operation = operation.with_attribute("increment", 2.5);
-        let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&input)).unwrap();
-        assert_eq!(read_f32s(&outputs[0]), vec![4.0, 5.0]);
+        let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&matrix_input)).unwrap();
+        assert_eq!(read_f32s(&outputs[0]), vec![4.0, 5.0, 6.0, 7.0]);
+
+        // An aliased side-effecting call executes with the same public array-only FFI contract while its lowering
+        // uses the alias metadata and a hidden ordered-I/O token.
+        let vector_input = f32_vector(&client, &mesh, &[1.5, 2.5]);
+        let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![vector_input.r#type().into_owned()])
+            .with_input_output_alias(0, 0)
+            .unwrap()
+            .with_side_effect();
+        let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&vector_input)).unwrap();
+        assert_eq!(read_f32s(&outputs[0]), vec![2.5, 3.5]);
     }
 
     /// A custom call wrapped with `custom_vjp` differentiates through the user-provided rule while the primal

@@ -86,6 +86,46 @@ impl From<f64> for CustomCallAttribute {
     }
 }
 
+/// Declares that one flat array output of a [`CustomCallOperation`] aliases one flat array input.
+///
+/// Aliasing requires the input and output to describe the same logical array. It allows a backend to reuse the input
+/// buffer for the output without changing Ryft's functional SSA semantics. The indices never include mixed trailing
+/// dimension operands or backend-internal effect tokens.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CustomCallInputOutputAlias {
+    /// Index of the aliased array input.
+    input_index: usize,
+
+    /// Index of the array output that aliases the input.
+    output_index: usize,
+}
+
+impl CustomCallInputOutputAlias {
+    /// Creates an alias from the array input at `input_index` to the array output at `output_index`.
+    #[inline]
+    pub fn new(input_index: usize, output_index: usize) -> Self {
+        Self { input_index, output_index }
+    }
+
+    /// Returns the index of the aliased array input.
+    #[inline]
+    pub fn input_index(&self) -> usize {
+        self.input_index
+    }
+
+    /// Returns the index of the array output that aliases the input.
+    #[inline]
+    pub fn output_index(&self) -> usize {
+        self.output_index
+    }
+}
+
+impl Display for CustomCallInputOutputAlias {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}->{}", self.input_index, self.output_index)
+    }
+}
+
 /// [`Operation`] that calls a foreign kernel registered with the executing backend under a target name — the
 /// analogue of [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/ffi.html). The operation is opaque to Ryft:
 /// its output types are declared up front instead of inferred, and typed [`CustomCallAttribute`]s are forwarded
@@ -133,10 +173,11 @@ impl From<f64> for CustomCallAttribute {
 /// that cannot execute foreign kernels (like the reference array backend) reject interpretation with a clear
 /// error instead of guessing.
 ///
-/// Backend-specific vocabulary must never grow on this payload: encodings such as XLA's FFI API version or
-/// `backend_config` layout, operand memory layouts, output-operand aliasing, or called-computation references
-/// belong in the owning backend's lowering (or in a backend-owned wrapper operation), not here. If a
-/// configuration knob only makes sense for one backend, it does not belong on this operation.
+/// Array layouts come from the canonical [`ArrayType`] descriptors of the operands and results. Portable flat-array
+/// buffer aliases are declared with [`CustomCallInputOutputAlias`]. Backend-specific vocabulary must never grow on
+/// this payload: encodings such as XLA's FFI API version, `backend_config` representation, tuple alias paths, result
+/// tiling attributes, or called-computation references belong in the owning backend's lowering (or in a backend-owned
+/// operation). If a configuration knob only makes sense for one backend, it does not belong on this operation.
 #[derive(Clone, Debug)]
 pub struct CustomCallOperation<T: Type> {
     /// Name under which the foreign kernel is registered with the executing backend.
@@ -147,6 +188,9 @@ pub struct CustomCallOperation<T: Type> {
 
     /// Typed configuration attributes forwarded to the kernel, in insertion order.
     attributes: Vec<(String, CustomCallAttribute)>,
+
+    /// Flat array input/output buffer aliases, in declaration order.
+    input_output_aliases: Vec<CustomCallInputOutputAlias>,
 
     /// Whether the call has observable side effects beyond its returned outputs.
     has_side_effect: bool,
@@ -168,6 +212,7 @@ impl CustomCallOperation<ArrayType> {
             target_name: target_name.into(),
             output_types,
             attributes: Vec::new(),
+            input_output_aliases: Vec::new(),
             has_side_effect: false,
             marker: PhantomData,
         }
@@ -180,6 +225,25 @@ impl<T: Type> CustomCallOperation<T> {
     pub fn with_attribute<N: Into<String>, V: Into<CustomCallAttribute>>(mut self, name: N, value: V) -> Self {
         self.attributes.push((name.into(), value.into()));
         self
+    }
+
+    /// Returns this operation with an alias from array input `input_index` to array output `output_index`.
+    ///
+    /// Index bounds and type compatibility are validated during type inference, when the input types are available.
+    /// Each input and output can participate in at most one alias.
+    pub fn with_input_output_alias(mut self, input_index: usize, output_index: usize) -> Result<Self, TypeError> {
+        if let Some(alias) = self
+            .input_output_aliases
+            .iter()
+            .find(|alias| alias.input_index == input_index || alias.output_index == output_index)
+        {
+            return Err(TypeError::invalid(format!(
+                "'{CUSTOM_CALL_OPERATION_NAME}' cannot add alias {input_index}->{output_index} because alias \
+                 '{alias}' already uses the same input or output",
+            )));
+        }
+        self.input_output_aliases.push(CustomCallInputOutputAlias::new(input_index, output_index));
+        Ok(self)
     }
 
     /// Returns a copy of this [`CustomCallOperation`] marked as having observable side effects.
@@ -207,6 +271,12 @@ impl<T: Type> CustomCallOperation<T> {
         self.attributes.as_slice()
     }
 
+    /// Returns the flat array input/output buffer aliases in declaration order.
+    #[inline]
+    pub fn input_output_aliases(&self) -> &[CustomCallInputOutputAlias] {
+        self.input_output_aliases.as_slice()
+    }
+
     /// Returns whether the call has observable side effects beyond its returned outputs.
     #[inline]
     pub fn has_side_effect(&self) -> bool {
@@ -223,6 +293,7 @@ impl<T: Type> CustomCallOperation<T> {
                 .map(|r#type| r#type.rename_identities(renaming))
                 .collect::<Result<Vec<_>, _>>()?,
             attributes: self.attributes.clone(),
+            input_output_aliases: self.input_output_aliases.clone(),
             has_side_effect: self.has_side_effect,
             marker: PhantomData,
         })
@@ -234,6 +305,9 @@ impl<T: Type> CustomCallOperation<T> {
             operation.field("target", &self.target_name)?;
             for (name, value) in &self.attributes {
                 operation.field(name, value)?;
+            }
+            for alias in &self.input_output_aliases {
+                operation.field("input_output_alias", alias)?;
             }
             if self.has_side_effect {
                 operation.field("has_side_effect", true)?;
@@ -249,6 +323,7 @@ impl From<CustomCallOperation<ArrayType>> for CustomCallOperation<ArrayProgramTy
             target_name: operation.target_name,
             output_types: operation.output_types,
             attributes: operation.attributes,
+            input_output_aliases: operation.input_output_aliases,
             has_side_effect: operation.has_side_effect,
             marker: PhantomData,
         }
@@ -261,6 +336,7 @@ impl From<CustomCallOperation<ArrayProgramType>> for CustomCallOperation<ArrayTy
             target_name: operation.target_name,
             output_types: operation.output_types,
             attributes: operation.attributes,
+            input_output_aliases: operation.input_output_aliases,
             has_side_effect: operation.has_side_effect,
             marker: PhantomData,
         }
@@ -273,6 +349,37 @@ impl<T: Type> Display for CustomCallOperation<T> {
     }
 }
 
+impl<T: Type> CustomCallOperation<T> {
+    /// Validates flat input/output aliases against the array operands of this operation.
+    fn validate_input_output_aliases(&self, input_types: &[&ArrayType]) -> Result<(), TypeError> {
+        for alias in &self.input_output_aliases {
+            let Some(input_type) = input_types.get(alias.input_index) else {
+                return Err(TypeError::invalid(format!(
+                    "'{CUSTOM_CALL_OPERATION_NAME}' alias '{alias}' refers to input {} but the call has {} array \
+                     inputs",
+                    alias.input_index,
+                    input_types.len(),
+                )));
+            };
+            let Some(output_type) = self.output_types.get(alias.output_index) else {
+                return Err(TypeError::invalid(format!(
+                    "'{CUSTOM_CALL_OPERATION_NAME}' alias '{alias}' refers to output {} but the call has {} outputs",
+                    alias.output_index,
+                    self.output_types.len(),
+                )));
+            };
+            if *input_type != output_type {
+                return Err(TypeError::invalid(format!(
+                    "'{CUSTOM_CALL_OPERATION_NAME}' alias '{alias}' requires matching input and output types but \
+                     input {} has type '{}' and output {} has type '{}'",
+                    alias.input_index, input_type, alias.output_index, output_type,
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Operation<ArrayType> for CustomCallOperation<ArrayType> {
     #[inline]
     fn name(&self) -> &'static str {
@@ -282,9 +389,11 @@ impl Operation<ArrayType> for CustomCallOperation<ArrayType> {
     #[inline]
     fn infer_output_types(
         &self,
-        _input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        self.validate_input_output_aliases(&input_types.iter().collect::<Vec<_>>())?;
         Ok(self.output_types.clone())
     }
 
@@ -331,9 +440,9 @@ impl Operation<ArrayProgramType> for CustomCallOperation<ArrayProgramType> {
                 input_types.len(),
             )));
         };
-        for input_type in &input_types[..array_input_count] {
-            <&ArrayType>::try_from(input_type)?;
-        }
+        let array_input_types =
+            input_types[..array_input_count].iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
+        self.validate_input_output_aliases(array_input_types.as_slice())?;
         for (input_type, expected_variable) in input_types[array_input_count..].iter().zip(dynamic_output_dimensions) {
             let actual_variable = <&crate::DimensionType>::try_from(input_type)?.variable();
             if actual_variable != expected_variable {
@@ -554,6 +663,8 @@ mod tests {
             .with_attribute("count", 4i64)
             .with_attribute("verbose", true)
             .with_attribute("label", "x")
+            .with_input_output_alias(0, 0)
+            .unwrap()
             .with_side_effect();
 
         assert_eq!(operation.target_name(), "ryft.test.add_one");
@@ -567,6 +678,7 @@ mod tests {
                 ("label".to_string(), CustomCallAttribute::String("x".to_string())),
             ],
         );
+        assert_eq!(operation.input_output_aliases(), &[CustomCallInputOutputAlias::new(0, 0)]);
         assert!(operation.has_side_effect());
         assert_eq!(Operation::<ArrayType>::name(&operation), CUSTOM_CALL_OPERATION_NAME);
         assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::single(Effect::OrderedIo));
@@ -581,6 +693,7 @@ mod tests {
                     count=4,
                     verbose=true,
                     label=x,
+                    input_output_alias=0->0,
                     has_side_effect=true,
                 ]
             "}
@@ -590,6 +703,45 @@ mod tests {
         let pure = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
         assert_eq!(Operation::<ArrayType>::effects(&pure), Effects::PURE);
         assert_eq!(pure.to_string(), "custom_call [target=ryft.test.add_one]");
+        let roundtrip =
+            CustomCallOperation::<ArrayType>::from(CustomCallOperation::<ArrayProgramType>::from(operation.clone()));
+        assert_eq!(roundtrip.input_output_aliases(), operation.input_output_aliases());
+        assert!(matches!(
+            operation.clone().with_input_output_alias(0, 1),
+            Err(TypeError::Invalid { message })
+                if message == "'custom_call' cannot add alias 0->1 because alias '0->0' already uses the same input \
+                               or output",
+        ));
+        assert!(matches!(
+            operation.clone().with_input_output_alias(1, 0),
+            Err(TypeError::Invalid { message })
+                if message == "'custom_call' cannot add alias 1->0 because alias '0->0' already uses the same input \
+                               or output",
+        ));
+        assert_eq!(
+            CustomCallOperation::new("ryft.test.add_one", vec![vector_type()])
+                .with_input_output_alias(1, 0)
+                .unwrap()
+                .infer_output_types(&[vector_type()], &[]),
+            Err(TypeError::invalid("'custom_call' alias '1->0' refers to input 1 but the call has 1 array inputs",)),
+        );
+        assert_eq!(
+            CustomCallOperation::new("ryft.test.add_one", vec![vector_type()])
+                .with_input_output_alias(0, 1)
+                .unwrap()
+                .infer_output_types(&[vector_type()], &[]),
+            Err(TypeError::invalid("'custom_call' alias '0->1' refers to output 1 but the call has 1 outputs",)),
+        );
+        assert_eq!(
+            CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::scalar(DataType::F32)])
+                .with_input_output_alias(0, 0)
+                .unwrap()
+                .infer_output_types(&[vector_type()], &[]),
+            Err(TypeError::invalid(
+                "'custom_call' alias '0->0' requires matching input and output types but input 0 has type 'f32[2]' \
+                 and output 0 has type 'f32[]'",
+            )),
+        );
 
         // Composite output extents are positional SSA operands: output-major and then axis-major.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
@@ -611,6 +763,23 @@ mod tests {
             DimensionType::new(rows.clone()).into(),
             DimensionType::new(columns.clone()).into(),
         ];
+        let aliased_dynamic_operation = CustomCallOperation::<ArrayProgramType>::from(
+            CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_output_type.clone()])
+                .with_input_output_alias(0, 0)
+                .unwrap(),
+        );
+        assert_eq!(
+            Operation::<ArrayProgramType>::infer_output_types(
+                &aliased_dynamic_operation,
+                &[
+                    dynamic_output_type.clone().into(),
+                    DimensionType::new(rows.clone()).into(),
+                    DimensionType::new(columns.clone()).into(),
+                ],
+                &[],
+            ),
+            Ok(vec![dynamic_output_type.clone().into()]),
+        );
         assert_eq!(
             Operation::<ArrayProgramType>::infer_output_types(&dynamic_operation, &input_types, &[]),
             Ok(vec![dynamic_output_type.into()]),

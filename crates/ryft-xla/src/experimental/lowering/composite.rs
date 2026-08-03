@@ -708,7 +708,12 @@ where
                 .into());
             };
             let (array_inputs, output_extents) = input_values.split_at(array_input_count);
-            let physical_output_types = operation
+            let array_input_types = input_types[..array_input_count]
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| LoweringError::Tracing(error.into()))?;
+            let mut physical_output_types = operation
                 .output_types()
                 .iter()
                 .map(|output_type| {
@@ -735,10 +740,15 @@ where
                     Ok(output_type.clone().with_shape(Shape::new(dimensions)))
                 })
                 .collect::<Result<Vec<_>, LoweringError>>()?;
+            for alias in operation.input_output_aliases() {
+                physical_output_types[alias.output_index()] = array_input_types[alias.input_index()].clone();
+            }
             let mut results = lower_custom_call_to_mlir(
                 operation,
                 array_inputs,
+                array_input_types.as_slice(),
                 physical_output_types.as_slice(),
+                effect_tokens,
                 block,
                 context,
                 location,
