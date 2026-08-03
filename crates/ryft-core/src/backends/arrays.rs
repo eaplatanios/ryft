@@ -157,7 +157,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     DotProductAttentionBackward(DotProductAttentionBackwardOperation),
     Reduce(ReduceOperation),
     Sort(SortOperation),
-    RngBitGenerator(RngBitGeneratorOperation),
+    RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
     Collective(CollectiveOperation),
     AllGather(AllGatherOperation),
     PSumScatter(PSumScatterOperation),

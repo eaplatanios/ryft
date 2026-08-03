@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
 use crate::backends::scalars::Scalar;
@@ -24,7 +25,7 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::ShardingDimension;
-use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
+use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -66,7 +67,7 @@ impl Display for RandomAlgorithm {
 }
 
 /// [`Operation`] that deterministically generates uniformly distributed random bits from a counter-based generator
-/// state — the analogue of
+/// state in the `T` type universe — the analogue of
 /// [StableHLO's `rng_bit_generator`](https://openxla.org/stablehlo/spec#rng_bit_generator) and the primitive
 /// underneath [JAX's `jax.random.bits`](https://docs.jax.dev/en/latest/_autosummary/jax.random.bits.html). The
 /// single input is the generator state (see [`RandomAlgorithm::state_type`]), and the two outputs are the advanced
@@ -92,19 +93,22 @@ impl Display for RandomAlgorithm {
 /// [`ThreeFry`](RandomAlgorithm::ThreeFry) and [`Philox`](RandomAlgorithm::Philox)
 /// bit-exactly with XLA's implementation.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RngBitGeneratorOperation {
+pub struct RngBitGeneratorOperation<T: Type> {
     /// Algorithm generating the bits.
     algorithm: RandomAlgorithm,
 
     /// Declared type of the generated-bits output.
     output_type: ArrayType,
+
+    /// Type universe whose bit-generator contract this payload represents.
+    marker: PhantomData<fn() -> T>,
 }
 
-impl RngBitGeneratorOperation {
+impl<T: Type> RngBitGeneratorOperation<T> {
     /// Creates a new [`RngBitGeneratorOperation`] with the provided algorithm and declared bits output type.
     #[inline]
     pub fn new(algorithm: RandomAlgorithm, output_type: ArrayType) -> Self {
-        Self { algorithm, output_type }
+        Self { algorithm, output_type, marker: PhantomData }
     }
 
     /// Returns the algorithm generating the bits.
@@ -118,11 +122,24 @@ impl RngBitGeneratorOperation {
     pub fn output_type(&self) -> &ArrayType {
         &self.output_type
     }
+
+    /// Returns this payload with every declared output identity renamed according to `renaming`.
+    fn renamed(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
+        Ok(Self::new(self.algorithm, self.output_type.rename_identities(renaming)?))
+    }
+
+    /// Renders this payload independently of its homogeneous or composite operation contract.
+    fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, RNG_BIT_GENERATOR_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("algorithm", self.algorithm)?;
+            operation.field("output_type", &self.output_type)
+        })
+    }
 }
 
-impl Display for RngBitGeneratorOperation {
+impl<T: Type> Display for RngBitGeneratorOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayProgramType>::render(self, formatter, 0)
+        self.render_operation(formatter, 0)
     }
 }
 
@@ -160,7 +177,7 @@ fn validate_rng_bit_generator_types(
     Ok(())
 }
 
-impl Operation<ArrayType> for RngBitGeneratorOperation {
+impl Operation<ArrayType> for RngBitGeneratorOperation<ArrayType> {
     #[inline]
     fn name(&self) -> &'static str {
         RNG_BIT_GENERATOR_OPERATION_NAME
@@ -185,18 +202,15 @@ impl Operation<ArrayType> for RngBitGeneratorOperation {
         &self,
         renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
-        Ok(Self { algorithm: self.algorithm, output_type: self.output_type.rename_identities(renaming)? })
+        self.renamed(renaming)
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, RNG_BIT_GENERATOR_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("algorithm", self.algorithm)?;
-            operation.field("output_type", &self.output_type)
-        })
+        self.render_operation(formatter, indentation)
     }
 }
 
-impl Operation<ArrayProgramType> for RngBitGeneratorOperation {
+impl Operation<ArrayProgramType> for RngBitGeneratorOperation<ArrayProgramType> {
     #[inline]
     fn name(&self) -> &'static str {
         RNG_BIT_GENERATOR_OPERATION_NAME
@@ -230,16 +244,18 @@ impl Operation<ArrayProgramType> for RngBitGeneratorOperation {
         &self,
         renaming: &TypeIdentityRenaming<<ArrayProgramType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
-        Operation::<ArrayType>::rename_type_identities(self, renaming)
+        self.renamed(renaming)
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, indentation)
+        self.render_operation(formatter, indentation)
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: RngBitGenerator>> InterpretableOperation<C> for RngBitGeneratorOperation {
+impl<C: Domain<Type = ArrayType, Value: RngBitGenerator>> InterpretableOperation<C>
+    for RngBitGeneratorOperation<ArrayType>
+{
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -253,7 +269,8 @@ impl<C: Domain<Type = ArrayType, Value: RngBitGenerator>> InterpretableOperation
 }
 
 impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for RngBitGeneratorOperation
+    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>
+    for RngBitGeneratorOperation<ArrayProgramType>
 {
     fn interpret<D: InterpretationDriver<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>>(
         &self,
@@ -305,13 +322,13 @@ impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
 
 /// Partial evaluation defers to the default fold-or-residualize behavior of
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RngBitGeneratorOperation where
-    C::Operation: From<RngBitGeneratorOperation>
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RngBitGeneratorOperation<ArrayType> where
+    C::Operation: From<RngBitGeneratorOperation<ArrayType>>
 {
 }
 
-impl_non_differentiable_operation!(RngBitGeneratorOperation);
-impl_non_transposable_operation!(RngBitGeneratorOperation);
+impl_non_differentiable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
+impl_non_transposable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 
 /// Batching rule for [`RngBitGeneratorOperation`]. A state mapped at some batch axis is realigned to batch axis 0
 /// (a `[b, state_width]` stack of per-item states for both [`ThreeFry`](RandomAlgorithm::ThreeFry) and
@@ -325,10 +342,10 @@ impl_non_transposable_operation!(RngBitGeneratorOperation);
 /// A *replicated* state is rejected: every batch item would see the same state and silently draw identical,
 /// correlated bits, so callers derive one state per batch item with [`split_key`] and map over the states instead.
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for RngBitGeneratorOperation
+    for RngBitGeneratorOperation<ArrayType>
 where
     C::Value: Transpose,
-    C::Operation: From<RngBitGeneratorOperation> + From<ScanOperation<C::Constant>>,
+    C::Operation: From<RngBitGeneratorOperation<ArrayType>> + From<ScanOperation<C::Constant>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -388,12 +405,12 @@ pub trait RngBitGenerator: Sized {
 }
 
 /// Any context-carrying value generates bits by binding an [`RngBitGeneratorOperation`] through its own context.
-/// The `From<RngBitGeneratorOperation>` bound makes this disjoint from the eager reference value types (whose
+/// The `From<RngBitGeneratorOperation<ArrayType>>` bound makes this disjoint from the eager reference value types (whose
 /// context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
 /// transform tracers and backend-owned values without conflicting with concrete implementations.
 impl<V: Value<Type = ArrayType>> RngBitGenerator for V
 where
-    V::DispatchDomain: Context<Operation: From<RngBitGeneratorOperation>>,
+    V::DispatchDomain: Context<Operation: From<RngBitGeneratorOperation<ArrayType>>>,
 {
     fn rng_bit_generator(
         &self,

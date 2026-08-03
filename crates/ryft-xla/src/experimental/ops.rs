@@ -137,7 +137,7 @@ where
     DynamicShapeSlice(DynamicShapeSliceOperation),
 
     /// Generates random bits with explicit dynamic result extents.
-    RngBitGenerator(RngBitGeneratorOperation),
+    RngBitGenerator(RngBitGeneratorOperation<ArrayProgramType>),
 
     /// Gathers values with one explicit extent per result axis.
     AllGather(AllGatherOperation),
@@ -386,7 +386,7 @@ impl_composite_operation_conversion!(
     ConcatenateOperation,
     CustomCallOperation,
     PadOperation,
-    RngBitGeneratorOperation,
+    RngBitGeneratorOperation<ArrayProgramType>,
     AllGatherOperation,
     PSumScatterOperation,
     AllToAllOperation,

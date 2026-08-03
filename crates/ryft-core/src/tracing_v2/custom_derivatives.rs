@@ -317,6 +317,121 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
 // reverse mode. Only a direct transpose of a raw, un-linearized program can reach it.
 impl_non_transposable_operation!(<T> CustomJvpOperation<T> where T: DifferentiableType);
 
+/// Function with a user-supplied JVP rule, built by [`custom_jvp`]. It stores the primal and JVP closures together
+/// with a phantom marker pinning the [`Domain`] and the tracer-tree types named by those closure signatures; refer to
+/// the documentation of [`custom_jvp`] for the calling convention, the tracing semantics, and when to reach for a
+/// custom JVP.
+pub struct CustomJvp<D: Domain, P, J, IT, OT> {
+    /// Closure computing the primal output tree from the primal input tree.
+    primal: P,
+
+    /// Closure computing `(outputs, output_tangents)` from `(inputs, input_tangents)`.
+    jvp: J,
+
+    /// Phantom marker pinning the [`Domain`] and the input and output tracer-tree types named by the closure
+    /// signatures. The domain is a pure type witness, so no domain value is stored.
+    marker: PhantomData<fn() -> (D, IT, OT)>,
+}
+
+impl<D, P, J, IT, OT> CustomJvp<D, P, J, IT, OT>
+where
+    D: Domain<Type: DifferentiableType>,
+    P: Fn(IT) -> Result<OT, ProgramError>,
+    J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
+    D::Operation: From<CustomJvpOperation<D::Type>>,
+    IT: Parameterized<DomainTracer<D>>,
+    IT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
+    OT: Parameterized<DomainTracer<D>>,
+    OT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
+    IT::To<D::Type>: Clone
+        + Parameterized<D::Type, Family = IT::Family, To<DomainTracer<D>> = IT, To<D::Constant> = IT::To<D::Constant>>,
+    OT::To<D::Type>:
+        Parameterized<D::Type, Family = OT::Family, To<DomainTracer<D>> = OT, To<D::Constant> = OT::To<D::Constant>>,
+{
+    /// Stages this custom-JVP function on the provided tracer input tree and returns its output tree, tracing the
+    /// stored closures into programs specialized to the input types. Differentiation of the staged call replays the
+    /// JVP rule instead of differentiating the primal body, in both forward and reverse mode.
+    pub fn call<V, ICT>(&self, input: ICT) -> Result<<OT::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
+    where
+        V: Value<Type = D::Type>,
+        V::DispatchDomain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
+        IT::Family: ParameterizedFamily<V>,
+        OT::Family: ParameterizedFamily<V>,
+        ICT: Parameterized<V, Family = IT::Family, To<D::Type> = IT::To<D::Type>>,
+        <OT::To<D::Type> as Parameterized<D::Type>>::To<V>: Parameterized<
+                V,
+                Family = OT::Family,
+                ParameterStructure = <OT::To<D::Type> as Parameterized<D::Type>>::ParameterStructure,
+            >,
+    {
+        let mut input_values = Vec::new();
+        let input_types = input
+            .map_parameters(|value| {
+                let r#type = value.r#type().into_owned();
+                input_values.push(value);
+                r#type
+            })
+            .map_err(ProgramError::from)?;
+        let Some(first) = input_values.first() else {
+            return Err(TypeError::invalid("custom_jvp requires at least one input".to_string()).into());
+        };
+        let (_, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
+        let input_tangent_types =
+            input_types.clone().map_parameters(|r#type| r#type.tangent()).map_err(ProgramError::from)?;
+        let (output_types, jvp) = D::trace(|(x, t)| (self.jvp)(x, t), (input_types, input_tangent_types))?;
+        let operation = D::Operation::from(CustomJvpOperation::new());
+        // The call binds through whatever context the input values flow (a staged trace, a batching context, or a
+        // JVP context), so `custom_jvp` composes under `vmap`/`jvp` — the batch/JVP rule of the bound operation fires.
+        let context = first.dispatch_domain();
+        let outputs = context.bind(operation, vec![primal.to_flat_program(), jvp.to_flat_program()], &input_values)?;
+        let output_structure = output_types.0.parameter_structure();
+        Ok(Parameterized::from_parameters(output_structure, outputs)?)
+    }
+}
+
+/// Creates a [`CustomJvp`] function from a primal closure and a JVP-rule closure over trees of the [`Domain`] `D`'s
+/// tracers — the ergonomic analogue of JAX's
+/// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
+/// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
+///
+/// # When to use
+///
+/// Reach for a custom JVP when the function *is* forward-differentiable but its automatically derived tangent is
+/// numerically unstable or wasteful and you want to supply a stable, efficient one by hand — classic cases are a
+/// `log`-`sum`-`exp`, a softmax, or a normalization, where a hand-written tangent avoids the cancellation or redundant
+/// work the generic rule incurs. A single custom JVP serves **both** differentiation modes: reverse mode obtains its
+/// gradient by transposing the supplied tangent map, so the one rule composes with forward mode, reverse mode, and
+/// their higher-order combinations. Prefer it over [`custom_vjp`] whenever the function is naturally
+/// forward-differentiable, and reach for [`custom_vjp`] only when just the reverse rule is natural (for example
+/// implicit differentiation or adjoint solvers).
+///
+/// # Calling convention
+///
+/// Both closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
+/// inputs and outputs can be single tracers, tuples, or any other parameterized structure. `primal` maps the input
+/// tree to the output tree, and `jvp` maps `(inputs, input_tangents)` to `(outputs, output_tangents)`, exactly like a
+/// JAX `defjvp` rule. There is no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static,
+/// non-differentiated configuration is simply captured by the closures (all of them can see it), exactly like JAX
+/// threads non-differentiated arguments through to the rule functions.
+///
+/// # Tracing semantics
+///
+/// Nothing is traced at construction time: each [`CustomJvp::call`] reads the input types off its tracer arguments,
+/// traces both closures into programs specialized to those types, validates the rule signature, and stages one
+/// [`CustomJvpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
+/// lazily at transform time. The primal closure is kept separate from the JVP closure for efficiency rather than
+/// necessity: the JVP rule computes both the outputs and their tangents, so deriving the primal from it would make
+/// every un-differentiated call pay for tangent computation. Interpretation, batching, and backend lowering replay the
+/// lean primal program, and the JVP program runs only under differentiation.
+pub fn custom_jvp<D, P, J, IT, OT>(primal: P, jvp: J) -> CustomJvp<D, P, J, IT, OT>
+where
+    D: Domain<Type: DifferentiableType>,
+    P: Fn(IT) -> Result<OT, ProgramError>,
+    J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
+{
+    CustomJvp { primal, jvp, marker: PhantomData }
+}
+
 /// Canonical operation name for [`CustomVjpOperation`].
 pub const CUSTOM_VJP_OPERATION_NAME: &str = "custom_vjp";
 
@@ -628,121 +743,6 @@ where
 // point is unreachable through reverse mode. Only a direct transpose of a raw, un-linearized program can reach it.
 impl_non_transposable_operation!(<T> CustomVjpOperation<T> where T: DifferentiableType);
 
-/// Function with a user-supplied JVP rule, built by [`custom_jvp`]. It stores the primal and JVP closures together
-/// with a phantom marker pinning the [`Domain`] and the tracer-tree types named by those closure signatures; refer to
-/// the documentation of [`custom_jvp`] for the calling convention, the tracing semantics, and when to reach for a
-/// custom JVP.
-pub struct CustomJvp<D: Domain, P, J, IT, OT> {
-    /// Closure computing the primal output tree from the primal input tree.
-    primal: P,
-
-    /// Closure computing `(outputs, output_tangents)` from `(inputs, input_tangents)`.
-    jvp: J,
-
-    /// Phantom marker pinning the [`Domain`] and the input and output tracer-tree types named by the closure
-    /// signatures. The domain is a pure type witness, so no domain value is stored.
-    marker: PhantomData<fn() -> (D, IT, OT)>,
-}
-
-/// Creates a [`CustomJvp`] function from a primal closure and a JVP-rule closure over trees of the [`Domain`] `D`'s
-/// tracers — the ergonomic analogue of JAX's
-/// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
-/// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
-///
-/// # When to use
-///
-/// Reach for a custom JVP when the function *is* forward-differentiable but its automatically derived tangent is
-/// numerically unstable or wasteful and you want to supply a stable, efficient one by hand — classic cases are a
-/// `log`-`sum`-`exp`, a softmax, or a normalization, where a hand-written tangent avoids the cancellation or redundant
-/// work the generic rule incurs. A single custom JVP serves **both** differentiation modes: reverse mode obtains its
-/// gradient by transposing the supplied tangent map, so the one rule composes with forward mode, reverse mode, and
-/// their higher-order combinations. Prefer it over [`custom_vjp`] whenever the function is naturally
-/// forward-differentiable, and reach for [`custom_vjp`] only when just the reverse rule is natural (for example
-/// implicit differentiation or adjoint solvers).
-///
-/// # Calling convention
-///
-/// Both closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
-/// inputs and outputs can be single tracers, tuples, or any other parameterized structure. `primal` maps the input
-/// tree to the output tree, and `jvp` maps `(inputs, input_tangents)` to `(outputs, output_tangents)`, exactly like a
-/// JAX `defjvp` rule. There is no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static,
-/// non-differentiated configuration is simply captured by the closures (all of them can see it), exactly like JAX
-/// threads non-differentiated arguments through to the rule functions.
-///
-/// # Tracing semantics
-///
-/// Nothing is traced at construction time: each [`CustomJvp::call`] reads the input types off its tracer arguments,
-/// traces both closures into programs specialized to those types, validates the rule signature, and stages one
-/// [`CustomJvpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
-/// lazily at transform time. The primal closure is kept separate from the JVP closure for efficiency rather than
-/// necessity: the JVP rule computes both the outputs and their tangents, so deriving the primal from it would make
-/// every un-differentiated call pay for tangent computation. Interpretation, batching, and backend lowering replay the
-/// lean primal program, and the JVP program runs only under differentiation.
-pub fn custom_jvp<D, P, J, IT, OT>(primal: P, jvp: J) -> CustomJvp<D, P, J, IT, OT>
-where
-    D: Domain<Type: DifferentiableType>,
-    P: Fn(IT) -> Result<OT, ProgramError>,
-    J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
-{
-    CustomJvp { primal, jvp, marker: PhantomData }
-}
-
-impl<D, P, J, IT, OT> CustomJvp<D, P, J, IT, OT>
-where
-    D: Domain<Type: DifferentiableType>,
-    P: Fn(IT) -> Result<OT, ProgramError>,
-    J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
-    D::Operation: From<CustomJvpOperation<D::Type>>,
-    IT: Parameterized<DomainTracer<D>>,
-    IT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-    OT: Parameterized<DomainTracer<D>>,
-    OT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-    IT::To<D::Type>: Clone
-        + Parameterized<D::Type, Family = IT::Family, To<DomainTracer<D>> = IT, To<D::Constant> = IT::To<D::Constant>>,
-    OT::To<D::Type>:
-        Parameterized<D::Type, Family = OT::Family, To<DomainTracer<D>> = OT, To<D::Constant> = OT::To<D::Constant>>,
-{
-    /// Stages this custom-JVP function on the provided tracer input tree and returns its output tree, tracing the
-    /// stored closures into programs specialized to the input types. Differentiation of the staged call replays the
-    /// JVP rule instead of differentiating the primal body, in both forward and reverse mode.
-    pub fn call<V, ICT>(&self, input: ICT) -> Result<<OT::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
-    where
-        V: Value<Type = D::Type>,
-        V::DispatchDomain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
-        IT::Family: ParameterizedFamily<V>,
-        OT::Family: ParameterizedFamily<V>,
-        ICT: Parameterized<V, Family = IT::Family, To<D::Type> = IT::To<D::Type>>,
-        <OT::To<D::Type> as Parameterized<D::Type>>::To<V>: Parameterized<
-                V,
-                Family = OT::Family,
-                ParameterStructure = <OT::To<D::Type> as Parameterized<D::Type>>::ParameterStructure,
-            >,
-    {
-        let mut input_values = Vec::new();
-        let input_types = input
-            .map_parameters(|value| {
-                let r#type = value.r#type().into_owned();
-                input_values.push(value);
-                r#type
-            })
-            .map_err(ProgramError::from)?;
-        let Some(first) = input_values.first() else {
-            return Err(TypeError::invalid("custom_jvp requires at least one input".to_string()).into());
-        };
-        let (_, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
-        let input_tangent_types =
-            input_types.clone().map_parameters(|r#type| r#type.tangent()).map_err(ProgramError::from)?;
-        let (output_types, jvp) = D::trace(|(x, t)| (self.jvp)(x, t), (input_types, input_tangent_types))?;
-        let operation = D::Operation::from(CustomJvpOperation::new());
-        // The call binds through whatever context the input values flow (a staged trace, a batching context, or a
-        // JVP context), so `custom_jvp` composes under `vmap`/`jvp` — the batch/JVP rule of the bound operation fires.
-        let context = first.dispatch_domain();
-        let outputs = context.bind(operation, vec![primal.to_flat_program(), jvp.to_flat_program()], &input_values)?;
-        let output_structure = output_types.0.parameter_structure();
-        Ok(Parameterized::from_parameters(output_structure, outputs)?)
-    }
-}
-
 /// Function with user-supplied forward/backward (VJP) rules, built by [`custom_vjp`]. It stores the primal, forward,
 /// and backward closures together with a phantom marker pinning the [`Domain`] and the tracer-tree types named by those
 /// closure signatures; refer to the documentation of [`custom_vjp`] for the calling convention, the tracing semantics,
@@ -760,61 +760,6 @@ pub struct CustomVjp<D: Domain, P, F, B, IT, OT, RT> {
     /// Phantom marker pinning the [`Domain`] and the input, output, and residual tracer-tree types named by the
     /// closure signatures. The domain is a pure type witness, so no domain value is stored.
     marker: PhantomData<fn() -> (D, IT, OT, RT)>,
-}
-
-/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over trees of the [`Domain`] `D`'s
-/// tracers — the ergonomic analogue of JAX's
-/// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
-/// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair.
-///
-/// # When to use
-///
-/// Reach for a custom VJP when only the *reverse* rule is natural, or when the function is not (efficiently)
-/// forward-differentiable. Common cases:
-///
-///   - **Implicit differentiation** — differentiate through a solver, optimizer, or fixed point via the implicit
-///     function theorem rather than unrolling its iterations.
-///   - **Adjoint methods** — backpropagate through an ODE or PDE solve via the adjoint system instead of
-///     differentiating the integrator's individual steps.
-///   - **External or black-box calls** — supply the reverse rule for a custom kernel or a computation that does not
-///     itself trace into `ryft` programs.
-///   - **Numerical stability** — replace an unstable or wasteful automatically derived gradient with a hand-written
-///     one.
-///
-/// A custom VJP is reverse-mode only: forward-mode differentiation of a staged call is rejected, and the current
-/// transpose implementation also rejects transposing its generated pullback, so higher-order derivatives through a
-/// custom VJP are not yet supported. When the function is forward-differentiable or must participate in higher-order
-/// differentiation, use [`custom_jvp`] instead.
-///
-/// # Calling convention
-///
-/// All three closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
-/// inputs, outputs, and residuals can be single tracers, tuples, or any other parameterized structure. `primal` maps
-/// the input tree to the output tree, `forward` maps the input tree to `(outputs, residuals)` (the same structural
-/// split as a JAX `f_fwd`), and `backward` maps `(residuals, output_cotangents)` to the input cotangent tree. There is
-/// no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static, non-differentiated
-/// configuration is simply captured by the closures (all of them can see it), exactly like JAX threads
-/// non-differentiated arguments through to the rule functions.
-///
-/// # Tracing semantics
-///
-/// Nothing is traced at construction time: each [`CustomVjp::call`] reads the input types off its tracer arguments,
-/// traces the closures into programs specialized to those types, validates the rule signatures, and stages one
-/// [`CustomVjpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
-/// lazily at transform time. The primal closure is kept separate from the forward closure for efficiency rather than
-/// necessity: an un-differentiated call should not pay for residual computation. Interpretation, batching, and backend
-/// lowering replay the lean primal program, and the residual-producing forward program runs only under reverse-mode
-/// differentiation. Callers that do not care about the distinction can pass the same body for both — accepting that the
-/// residual outputs are dead code outside of differentiation — which mirrors the common JAX idiom of writing `f_fwd` as
-/// `return f(x), residuals`.
-pub fn custom_vjp<D, P, F, B, IT, OT, RT>(primal: P, forward: F, backward: B) -> CustomVjp<D, P, F, B, IT, OT, RT>
-where
-    D: Domain<Type: DifferentiableType>,
-    P: Fn(IT) -> Result<OT, ProgramError>,
-    F: Fn(IT) -> Result<(OT, RT), ProgramError>,
-    B: Fn(RT, OT) -> Result<IT, ProgramError>,
-{
-    CustomVjp { primal, forward, backward, marker: PhantomData }
 }
 
 impl<D, P, F, B, IT, OT, RT> CustomVjp<D, P, F, B, IT, OT, RT>
@@ -884,6 +829,61 @@ where
         let output_structure = output_types.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
+}
+
+/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over trees of the [`Domain`] `D`'s
+/// tracers — the ergonomic analogue of JAX's
+/// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
+/// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair.
+///
+/// # When to use
+///
+/// Reach for a custom VJP when only the *reverse* rule is natural, or when the function is not (efficiently)
+/// forward-differentiable. Common cases:
+///
+///   - **Implicit differentiation** — differentiate through a solver, optimizer, or fixed point via the implicit
+///     function theorem rather than unrolling its iterations.
+///   - **Adjoint methods** — backpropagate through an ODE or PDE solve via the adjoint system instead of
+///     differentiating the integrator's individual steps.
+///   - **External or black-box calls** — supply the reverse rule for a custom kernel or a computation that does not
+///     itself trace into `ryft` programs.
+///   - **Numerical stability** — replace an unstable or wasteful automatically derived gradient with a hand-written
+///     one.
+///
+/// A custom VJP is reverse-mode only: forward-mode differentiation of a staged call is rejected, and the current
+/// transpose implementation also rejects transposing its generated pullback, so higher-order derivatives through a
+/// custom VJP are not yet supported. When the function is forward-differentiable or must participate in higher-order
+/// differentiation, use [`custom_jvp`] instead.
+///
+/// # Calling convention
+///
+/// All three closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
+/// inputs, outputs, and residuals can be single tracers, tuples, or any other parameterized structure. `primal` maps
+/// the input tree to the output tree, `forward` maps the input tree to `(outputs, residuals)` (the same structural
+/// split as a JAX `f_fwd`), and `backward` maps `(residuals, output_cotangents)` to the input cotangent tree. There is
+/// no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static, non-differentiated
+/// configuration is simply captured by the closures (all of them can see it), exactly like JAX threads
+/// non-differentiated arguments through to the rule functions.
+///
+/// # Tracing semantics
+///
+/// Nothing is traced at construction time: each [`CustomVjp::call`] reads the input types off its tracer arguments,
+/// traces the closures into programs specialized to those types, validates the rule signatures, and stages one
+/// [`CustomVjpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
+/// lazily at transform time. The primal closure is kept separate from the forward closure for efficiency rather than
+/// necessity: an un-differentiated call should not pay for residual computation. Interpretation, batching, and backend
+/// lowering replay the lean primal program, and the residual-producing forward program runs only under reverse-mode
+/// differentiation. Callers that do not care about the distinction can pass the same body for both — accepting that the
+/// residual outputs are dead code outside of differentiation — which mirrors the common JAX idiom of writing `f_fwd` as
+/// `return f(x), residuals`.
+pub fn custom_vjp<D, P, F, B, IT, OT, RT>(primal: P, forward: F, backward: B) -> CustomVjp<D, P, F, B, IT, OT, RT>
+where
+    D: Domain<Type: DifferentiableType>,
+    P: Fn(IT) -> Result<OT, ProgramError>,
+    F: Fn(IT) -> Result<(OT, RT), ProgramError>,
+    B: Fn(RT, OT) -> Result<IT, ProgramError>,
+{
+    CustomVjp { primal, forward, backward, marker: PhantomData }
 }
 
 #[cfg(test)]

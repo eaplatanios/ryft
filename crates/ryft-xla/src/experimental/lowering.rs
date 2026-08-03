@@ -2201,8 +2201,8 @@ fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
 
 /// Lowers one traced random bit generation to a `stablehlo.rng_bit_generator`, mapping the algorithm to the
 /// corresponding StableHLO algorithm attribute. The two results are the advanced generator state and the bits.
-fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &RngBitGeneratorOperation,
+fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType>(
+    operation: &RngBitGeneratorOperation<T>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,

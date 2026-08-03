@@ -2038,7 +2038,7 @@ where
 
 /// Batches mapped RNG states through one composite scan whose replicated dimension carries define dynamic outputs.
 fn batch_rng_bit_generator<A, C>(
-    operation: &RngBitGeneratorOperation,
+    operation: &RngBitGeneratorOperation<ArrayProgramType>,
     context: &BatchingContext<C, ArrayProgramBatching>,
     inputs: &[ArrayProgramBatch<C::Value>],
 ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError>
@@ -2049,7 +2049,7 @@ where
             Operation: From<BroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + From<RngBitGeneratorOperation>
+                           + From<RngBitGeneratorOperation<ArrayProgramType>>
                            + From<ScanOperation<ArrayProgramValue<A>>>
                            + OperationProjection<ArrayType>,
         >,
@@ -2156,7 +2156,7 @@ where
         + From<DimensionSizeOperation>
         + From<OneOperation<ArrayType>>
         + From<PadOperation>
-        + From<RngBitGeneratorOperation>
+        + From<RngBitGeneratorOperation<ArrayProgramType>>
         + From<ReshapeOperation>
         + From<ScanOperation<ArrayProgramValue<A>>>
         + From<WhileOperation<ArrayProgramType>>

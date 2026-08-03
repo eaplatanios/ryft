@@ -1960,6 +1960,14 @@ argument, projection adapter, or duplicated inference algorithm. Focused core an
 test-target checks pass. The remaining random-bit-generator, custom-call, concatenate, pad, and shard-map payloads are
 still pending as separate review units.
 
+The fifth P8a prerequisite slice parameterizes `RngBitGeneratorOperation<T>`. Its homogeneous `ArrayType` instance
+owns the static-shape kernel contract and scan-based array batching, while its `ArrayProgramType` instance owns the
+mixed explicit-output-extent contract and composite batching rule. Shared payload validation, identity renaming,
+rendering, reference execution, and XLA lowering remain single implementations, and ordinary constructors infer the
+type universe from the receiving context. Focused random, composite batching, and XLA eager/lowering tests pass, as do
+all 1,112 core tests and all 433 passing XLA tests (with one intentional benchmark ignore); the custom-call,
+concatenate, pad, and shard-map payloads remain pending.
+
 ### Phase 8: enforce contracts and consolidate operation declarations
 
 - [x] Begin only after Phases 1 through 7 have removed implicit replay and overlapping mixed constructors. Capture the
@@ -1977,8 +1985,9 @@ still pending as separate review units.
       payload instantiation must have exactly one contract without duplicating semantics.
   - [x] Parameterize `CompareOperation<T>` so its homogeneous and mixed contracts belong to distinct concrete payload
         instantiations while retaining shared semantics.
-  - [ ] Resolve `RngBitGeneratorOperation`, `CustomCallOperation`, `ConcatenateOperation`, `PadOperation`, and
-        `ShardMapOperation<V>`.
+  - [x] Parameterize `RngBitGeneratorOperation<T>` so its homogeneous static-shape and mixed explicit-extent contracts
+        belong to distinct concrete payload instantiations while retaining shared semantics.
+  - [ ] Resolve `CustomCallOperation`, `ConcatenateOperation`, `PadOperation`, and `ShardMapOperation<V>`.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
       `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
       `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and

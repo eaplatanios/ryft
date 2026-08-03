@@ -328,7 +328,7 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     DynamicShapeSlice(DynamicShapeSliceOperation),
 
     /// Mixed bit generator whose trailing dimension operands define its dynamic bits-output axes.
-    RngBitGenerator(RngBitGeneratorOperation),
+    RngBitGenerator(RngBitGeneratorOperation<ArrayProgramType>),
 
     /// Mixed all-gather whose trailing dimension operands define every result axis in axis order.
     AllGather(AllGatherOperation),
@@ -475,9 +475,9 @@ impl<A: Value<Type = ArrayType>> From<DynamicShapeSliceOperation> for ArrayProgr
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<RngBitGeneratorOperation> for ArrayProgramOperation<A> {
+impl<A: Value<Type = ArrayType>> From<RngBitGeneratorOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
     #[inline]
-    fn from(operation: RngBitGeneratorOperation) -> Self {
+    fn from(operation: RngBitGeneratorOperation<ArrayProgramType>) -> Self {
         Self::RngBitGenerator(operation)
     }
 }
