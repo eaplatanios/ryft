@@ -43,7 +43,7 @@ use crate::operations::manipulation::{
     BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, DynamicShapeSliceOperation, LegacyBroadcast,
     LegacyBroadcastOperation, PadOperation, Reshape, ReshapeOperation, Transpose, TransposeOperation,
 };
-use crate::operations::math::{Div, Mul, Reduce, ReduceOperation, ReductionKind};
+use crate::operations::math::{Div, Mul, Reduce};
 use crate::operations::random::RngBitGeneratorOperation;
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::operations::{Operation, OperationProjection};
@@ -2244,35 +2244,6 @@ where
         ArrayProgramBatch::new(advanced_states, BatchAxis::new(0))?,
         ArrayProgramBatch::new(bits, BatchAxis::new(0))?,
     ])
-}
-
-impl<C> BatchableOperation<C, ArrayProgramBatching> for LinearCallOperation<ArrayProgramType>
-where
-    C: Context<
-            Type = ArrayProgramType,
-            Operation: From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<ReduceOperation>,
-{
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
-        &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
-        driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
-        let input_axes = inputs.iter().map(ArrayProgramBatch::batch_axis).collect::<Vec<_>>();
-        self.batch_regions(context, driver, inputs, input_axes, |_, output, axis| {
-            // Projecting the replayed array output gives it the ordinary `Reduce` capability, whose staged operation
-            // lifts back through the composite operation family.
-            let output = ValueProjection::<ArrayType>::into_projected(output)?;
-            let axis = axis.normalize(output.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
-                r#type: Box::new(output.r#type().into_owned()),
-                axis,
-            })?;
-            Ok(ValueProjection::from_projected(output.reduce(&[axis], ReductionKind::Sum)))
-        })
-    }
 }
 
 impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ArrayProgramOperation<A>

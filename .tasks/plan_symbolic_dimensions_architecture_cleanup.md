@@ -2144,6 +2144,12 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
 - [ ] Execute `.tasks/plan_p8b_array_program_operation_declaration.md` as the next bounded Phase 8 sequence: first
       restore type-indexed batching-policy projection and move semantic rules to their payload owners, then extend the
       existing derive vertically, and only then migrate the production enum.
+  - [x] Freeze the variant/conversion migration ledger and pre-migration source, expansion-size, and macro-test build
+        baselines at `ef1cb48823436a298f625daa975155a819ad0000`.
+  - [x] P8b1a: move linear-call batching beside its payload, introduce the narrow `LinearCallBatchingPolicy` extension
+        point for universe-specific cotangent collapse, and replace the homogeneous/composite operation adapters with
+        one generic `BatchableOperation` implementation while leaving direct delegation in the outer dispatcher.
+  - [ ] Continue P8b1 with the condition/while/scan and trivial structural rules.
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
 - [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.
 - [ ] Make `#[derive(Operation)]` with `#[ryft(dispatch(batching, differentiation, transposition))]` the mechanical
@@ -2162,6 +2168,29 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       top-level universe's entrypoint policy through `<PrimaryType as BatchableType>::Policy` instead of hard-coding
       `ArrayBatching<P>`. The class markers and typed mixed payloads are irreducible declaration content, not ceremony:
       which universe and transform contract a variant's payload speaks must be declared exactly once on the enum.
+      Design decisions settled in review (2026-08-03):
+      - The projected-member arm is **family-level**, not per-primitive: because `ArrayProgramOperation` embeds the
+        entire `ArrayOperation` family as one member variant, the derive generates one project-delegate-lift adapter
+        at the family boundary and every current and future `ArrayOperation` batching rule flows through it. A new
+        composite universe provides its projection vocabulary once (`ValueProjection`, `OperationProjection<ArrayType>`
+        plus operation lifts, `BatchingPolicyProjection<C, ArrayType>` with a projected policy compatible with the
+        outer extent representation, and its `BatchableType` entrypoint policy) and inherits the adapters.
+      - `LinearCallOperation<ArrayProgramType>` is classified **composite-native**, not a projected member: its
+        regions carry composite boundaries with dimension residuals and batching threads the first-class mapped
+        extent through them, so no member marker can generate its semantics. The shared semantic algorithm stays in
+        `LinearCallOperation::batch_regions`, and one generic `BatchableOperation` implementation uses the narrow
+        `LinearCallBatchingPolicy` extension point to collapse mapped cotangents. Ordinary arrays reduce directly;
+        array programs project/reduce/lift. A downstream composite universe implements that policy capability once,
+        without reimplementing the Ryft-owned operation or its region algorithm. This is an exceptional extension
+        seam, not a template: if another operation needs the same hook, generalize the shared semantic capability;
+        do not introduce one operation-specific policy trait per primitive.
+      - Prototype sequencing: prove the generated member adapter on the macro third-member fixture and then the
+        production `Array` variant; use `Concatenate` afterwards to prove the shared-array-core-plus-explicit-mixed-
+        wrapper pattern (it is NOT a member-projection prototype — its composite contract consumes a trailing
+        result-extent operand, validates and rejects mapped extents, and lifts the concatenation axis; the 2026-07-24
+        "delegatable" audit finding predates that mixed contract). All genuinely mixed contracts (reshape, broadcast,
+        concatenate, pad, custom call, RNG, collectives, gateways, and region operations) keep explicit wrappers
+        where their signatures or region boundaries differ.
 - [ ] Make each mixed operation's inference contract the authoritative source for dimension operand positions,
       member kinds, ordering, and result metadata.
 - [ ] Extend the typed mixed projection vocabulary only for repeated fixed/optional/segmented patterns found in the

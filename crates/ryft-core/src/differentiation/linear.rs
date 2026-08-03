@@ -2,9 +2,10 @@ use std::fmt::Display;
 use std::ops::Range;
 
 use crate::axes::Axis;
+use crate::backends::array_programs::batching::ArrayProgramBatching;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
+    ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    BatchingPolicy, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationError;
@@ -20,12 +21,12 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::{AtomId, MaybeZero};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
-use crate::types::ArrayType;
+use crate::types::{ArrayProgramType, ArrayType};
 
 /// Differentiation-owned protocol through which an operation family materializes zeros whose runtime geometry must
 /// be supplied by explicitly captured _residual_ values, because it is not derivable from the zero's [`Type`] alone.
@@ -606,29 +607,16 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ///   - `driver`: [`BatchingDriver`] exposing this call's attached regions.
     ///   - `inputs`: Batched operands, ordered as `[residuals..., linear_inputs...]`.
     ///   - `input_axes`: Batch axis of each operand in `inputs`.
-    ///   - `collapse_fn`: Function that sums one mapped transpose output along the provided axis within the adapted
-    ///     program's own [`TracingContext`]. Summation is the correct collapse here because these outputs are
-    ///     cotangents (i.e., a replicated linear input `u` was broadcast across the batch, the batched transpose
-    ///     therefore produced one cotangent `ūᵢ` per batch item, and the transpose of a broadcast is a summation,
-    ///     so the one shared cotangent is `ū = Σᵢ ūᵢ`). Callers own this closure only because its mechanics are
-    ///     universe-specific (e.g., the homogeneous tracer has the direct reduction capability, while the composite
-    ///     universe reaches it through a projected value).
     pub(crate) fn batch_regions<
         C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
-        P: BatchingPolicy<C>,
+        P: LinearCallBatchingPolicy<C>,
         D: BatchingDriver<C, P>,
-        CollapseFn: Fn(
-            &TracingContext<C::Constant, C::Operation>,
-            Tracer<TracingContext<C::Constant, C::Operation>>,
-            Axis,
-        ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
     >(
         &self,
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
         input_axes: Vec<BatchAxis>,
-        collapse_fn: CollapseFn,
     ) -> Result<Vec<P::Batch>, BatchingError> {
         if self.residual_count > inputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
@@ -672,7 +660,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )?,
             None,
-            &collapse_fn,
+            P::sum_mapped_cotangents,
         )?
         .into_parts();
 
@@ -687,7 +675,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
                 ProgramBatchingOutputAxesPolicy::AlignEachTo(linear_axes.to_vec()),
             )?,
             Some(linear_axes),
-            &collapse_fn,
+            P::sum_mapped_cotangents,
         )?
         .into_parts();
         check_count!("output", transpose_output_axes, linear_axes.len(), ProgramError);
@@ -891,26 +879,19 @@ impl<C: Context<Type: DifferentiableType, Operation: From<LinearCallOperation<C:
 }
 
 impl<
-    C: Context<Type = ArrayType, Operation: From<LinearCallOperation<ArrayType>> + From<ReduceOperation>>,
-    P: ArrayBatchingPolicy<C>,
-> BatchableOperation<C, ArrayBatching<P>> for LinearCallOperation<ArrayType>
+    T: DifferentiableType,
+    C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
+    P: LinearCallBatchingPolicy<C>,
+> BatchableOperation<C, P> for LinearCallOperation<T>
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, P>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, P>,
         driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let input_axes = inputs.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
-        self.batch_regions(context, driver, inputs, input_axes, |_, output, axis| {
-            Ok(output.reduce(
-                &[axis.normalize(output.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
-                    r#type: Box::new(output.r#type().into_owned()),
-                    axis,
-                })?],
-                ReductionKind::Sum,
-            ))
-        })
+        inputs: &[P::Batch],
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
+        self.batch_regions(context, driver, inputs, input_axes)
     }
 }
 
@@ -1068,6 +1049,86 @@ impl<
             },
         ));
         Ok(cotangents)
+    }
+}
+
+/// [`BatchingPolicy`] that collapses a mapped cotangent when batching a [`LinearCallOperation`].
+///
+/// Batching a residual-parameterized linear map may replicate one of its linear inputs across the mapped axis. If the
+/// batched transpose subsequently produces one cotangent `ūᵢ` for each batch item, the transpose of that replication
+/// is summation, so the single cotangent for the original replicated input is:
+///
+/// ```text
+/// ū = Σᵢ ūᵢ.
+/// ```
+///
+/// [`LinearCallOperation::batch_regions`] owns every universe-independent part of this transformation: structurally
+/// batching the forward and transpose regions, aligning their boundaries, threading policy-owned bookkeeping values,
+/// and rebuilding the linear call. The representation of `ūᵢ` is the one step it cannot determine generically. An
+/// ordinary array policy reduces the cotangent directly along its mapped axis, while a composite policy may first need
+/// to project the cotangent to its differentiable member, perform that member's reduction, and lift the result back.
+/// This capability supplies exactly that representation-dependent step and lets one generic [`BatchableOperation`]
+/// implementation retain the complete linear-call algorithm.
+///
+/// Implement this trait for a [`BatchingPolicy`] only when its program universe supports batching executable linear
+/// calls. An implementation must return a value owned by `context`, of the same program type as `cotangent`, with
+/// `axis` removed and all batch-item cotangents combined by addition. Policies that do not support linear calls
+/// should omit the implementation. This is deliberately an operation-specific opt-in rather than a method on
+/// [`BatchingPolicy`] and ordinary batching policies need not provide differentiation semantics, and other operation
+/// families must not acquire parallel policy traits unless they expose an independently irreducible universe-specific
+/// step of their own.
+///
+/// # Parameters
+///
+///   - `context`: [`TracingContext`] that owns the structurally batched transpose program being adapted.
+///   - `cotangent`: Mapped cotangent produced by that transpose program.
+///   - `axis`: Physical axis containing the packed family of per-item cotangents.
+pub trait LinearCallBatchingPolicy<C: Context<Type: DifferentiableType>>: BatchingPolicy<C> {
+    /// Sums the per-item cotangents packed along `axis`.
+    fn sum_mapped_cotangents(
+        context: &TracingContext<C::Constant, C::Operation>,
+        cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
+        axis: Axis,
+    ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>;
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>, P: ArrayBatchingPolicy<C>>
+    LinearCallBatchingPolicy<C> for ArrayBatching<P>
+{
+    fn sum_mapped_cotangents(
+        _context: &TracingContext<C::Constant, C::Operation>,
+        cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
+        axis: Axis,
+    ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError> {
+        let axis = axis.normalize(cotangent.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
+            r#type: Box::new(cotangent.r#type().into_owned()),
+            axis,
+        })?;
+        Ok(cotangent.reduce(&[axis], ReductionKind::Sum))
+    }
+}
+
+impl<
+    C: Context<
+            Type = ArrayProgramType,
+            Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+            Operation: OperationProjection<ArrayType, Projected: From<ReduceOperation>>,
+        >,
+> LinearCallBatchingPolicy<C> for ArrayProgramBatching
+{
+    fn sum_mapped_cotangents(
+        _context: &TracingContext<C::Constant, C::Operation>,
+        cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
+        axis: Axis,
+    ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError> {
+        // Projecting the replayed array cotangent gives it the ordinary `Reduce` capability,
+        // whose staged operation lifts back through the composite operation family.
+        let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
+        let axis = axis.normalize(cotangent.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
+            r#type: Box::new(cotangent.r#type().into_owned()),
+            axis,
+        })?;
+        Ok(ValueProjection::from_projected(cotangent.reduce(&[axis], ReductionKind::Sum)))
     }
 }
 
