@@ -163,7 +163,7 @@ mod tests {
         };
 
         check_operation_type_inference!(
-            operation = AddOperation,
+            operation = AddOperation::new(),
             cases = [
                 {
                     input_types = [unreduced(), unreduced()],
@@ -182,7 +182,7 @@ mod tests {
 
         check_operation_type_inference!(
             @reject @mismatched_reduced,
-            operation = AddOperation,
+            operation = AddOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -191,7 +191,7 @@ mod tests {
     fn test_add_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = AddOperation,
+            operation = AddOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -207,7 +207,7 @@ mod tests {
     fn test_add_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = AddOperation,
+            operation = AddOperation::new(),
             cases = [{
                 primals = [Array::scalar(2.0), Array::scalar(5.0)],
                 tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_add_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = AddOperation, inputs = [2.0, 3.5], expected = 5.5,);
+        check_operation_partial_evaluation!(operation = AddOperation::new(), inputs = [2.0, 3.5], expected = 5.5,);
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         check_operation_transposition!(
             @exact,
-            operation = AddOperation,
+            operation = AddOperation::new(),
             cases = [
                 {
                     inputs = [

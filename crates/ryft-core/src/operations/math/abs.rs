@@ -49,7 +49,7 @@ define_elementwise_operation!(
 );
 
 impl_differentiable_operation! {
-    AbsOperation,
+    <T> AbsOperation<T>,
     jvp<C>
     where
         C::Type: DifferentiableType,
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_abs() {
-        let operation = AbsOperation;
+        let operation = AbsOperation::new();
 
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
@@ -268,21 +268,21 @@ mod tests {
 
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = AbsOperation,
+            operation = AbsOperation::new(),
             input_types = [ArrayType::scalar(DataType::F32)],
         );
     }
 
     #[test]
     fn test_abs_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = AbsOperation, inputs = [-2.0], expected = 2.0,);
+        check_operation_partial_evaluation!(operation = AbsOperation::new(), inputs = [-2.0], expected = 2.0,);
     }
 
     #[test]
     fn test_abs_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = AbsOperation,
+            operation = AbsOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -2.0]))],
@@ -295,7 +295,7 @@ mod tests {
     fn test_abs_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = AbsOperation,
+            operation = AbsOperation::new(),
             cases = [
                 {
                     primals = [Array::scalar(0.7)],
@@ -399,7 +399,7 @@ mod tests {
     fn test_abs_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = AbsOperation,
+            operation = AbsOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

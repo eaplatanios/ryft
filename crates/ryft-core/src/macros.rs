@@ -569,17 +569,32 @@ macro_rules! define_elementwise_operation {
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
         $(#[$documentation])*
-        #[derive(Clone, Debug, Default)]
-        pub struct $operation;
+        #[derive(Clone, Debug)]
+        pub struct $operation<__T: $crate::Type>(::std::marker::PhantomData<fn() -> __T>);
 
-        impl ::std::fmt::Display for $operation {
+        impl<__T: $crate::Type> $operation<__T> {
+            /// Creates a new operation marker for the inferred type universe.
+            #[inline]
+            pub const fn new() -> Self {
+                Self(::std::marker::PhantomData)
+            }
+        }
+
+        impl<__T: $crate::Type> ::std::default::Default for $operation<__T> {
+            #[inline]
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl<__T: $crate::Type> ::std::fmt::Display for $operation<__T> {
             #[inline]
             fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 formatter.write_str($name)
             }
         }
 
-        impl $crate::Operation<$crate::DataType> for $operation {
+        impl $crate::Operation<$crate::DataType> for $operation<$crate::DataType> {
             #[inline]
             fn name(&self) -> &'static str {
                 $name
@@ -603,7 +618,7 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl $crate::Operation<$crate::ArrayType> for $operation {
+        impl $crate::Operation<$crate::ArrayType> for $operation<$crate::ArrayType> {
             #[inline]
             fn name(&self) -> &'static str {
                 $name
@@ -619,7 +634,7 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl $crate::ElementwiseOperation for $operation {
+        impl $crate::ElementwiseOperation for $operation<$crate::ArrayType> {
             #[inline]
             fn input_count(&self) -> usize {
                 1
@@ -643,9 +658,10 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<__C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<__C> for $operation
+        impl<__C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<__C>
+            for $operation<__C::Type>
         where
-            Self: $crate::Operation<__C::Type>,
+            $operation<__C::Type>: $crate::Operation<__C::Type>,
         {
             #[inline]
             fn interpret<__D: $crate::InterpretationDriver<__C>>(
@@ -659,8 +675,10 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<__C: $crate::Context> $crate::PartiallyEvaluatableOperation<__C> for $operation where
-            __C::Operation: ::std::convert::From<$operation>
+        impl<__C: $crate::Context> $crate::PartiallyEvaluatableOperation<__C> for $operation<__C::Type>
+        where
+            $operation<__C::Type>: $crate::Operation<__C::Type>,
+            __C::Operation: ::std::convert::From<$operation<__C::Type>>,
         {
         }
     };
@@ -677,17 +695,32 @@ macro_rules! define_elementwise_operation {
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
         $(#[$documentation])*
-        #[derive(Clone, Debug, Default)]
-        pub struct $operation;
+        #[derive(Clone, Debug)]
+        pub struct $operation<__T: $crate::Type>(::std::marker::PhantomData<fn() -> __T>);
 
-        impl ::std::fmt::Display for $operation {
+        impl<__T: $crate::Type> $operation<__T> {
+            /// Creates a new operation marker for the inferred type universe.
+            #[inline]
+            pub const fn new() -> Self {
+                Self(::std::marker::PhantomData)
+            }
+        }
+
+        impl<__T: $crate::Type> ::std::default::Default for $operation<__T> {
+            #[inline]
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl<__T: $crate::Type> ::std::fmt::Display for $operation<__T> {
             #[inline]
             fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 formatter.write_str($name)
             }
         }
 
-        impl $crate::Operation<$crate::DataType> for $operation {
+        impl $crate::Operation<$crate::DataType> for $operation<$crate::DataType> {
             #[inline]
             fn name(&self) -> &'static str {
                 $name
@@ -711,7 +744,7 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl $crate::Operation<$crate::ArrayType> for $operation {
+        impl $crate::Operation<$crate::ArrayType> for $operation<$crate::ArrayType> {
             #[inline]
             fn name(&self) -> &'static str {
                 $name
@@ -727,7 +760,7 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl $crate::ElementwiseOperation for $operation {
+        impl $crate::ElementwiseOperation for $operation<$crate::ArrayType> {
             #[inline]
             fn input_count(&self) -> usize {
                 2
@@ -755,9 +788,10 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<__C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<__C> for $operation
+        impl<__C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<__C>
+            for $operation<__C::Type>
         where
-            Self: $crate::Operation<__C::Type>,
+            $operation<__C::Type>: $crate::Operation<__C::Type>,
         {
             #[inline]
             fn interpret<__D: $crate::InterpretationDriver<__C>>(
@@ -771,8 +805,10 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<__C: $crate::Context> $crate::PartiallyEvaluatableOperation<__C> for $operation where
-            __C::Operation: ::std::convert::From<$operation>
+        impl<__C: $crate::Context> $crate::PartiallyEvaluatableOperation<__C> for $operation<__C::Type>
+        where
+            $operation<__C::Type>: $crate::Operation<__C::Type>,
+            __C::Operation: ::std::convert::From<$operation<__C::Type>>,
         {
         }
     };
@@ -906,12 +942,12 @@ macro_rules! define_elementwise_capability {
 
         impl<__V: $crate::Value> $capability for __V
         where
-            $operation: $crate::OperationProvider<__V::Type>,
+            $operation<__V::Type>: $crate::OperationProvider<__V::Type>,
             __V::DispatchDomain: $crate::Context<
                     Type = __V::Type,
                     Value = __V,
                     Operation: ::std::convert::From<
-                        <$operation as $crate::OperationProvider<__V::Type>>::Operation,
+                        <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::Operation,
                     >,
                 >,
         {
@@ -919,7 +955,7 @@ macro_rules! define_elementwise_capability {
             fn $method(&self) -> Result<Self, $crate::ProgramError> {
                 let input_type = $crate::Typed::r#type(self);
                 let operation =
-                    <$operation as $crate::OperationProvider<__V::Type>>::provide(&[input_type.as_ref()])?;
+                    <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::provide(&[input_type.as_ref()])?;
                 Ok($crate::Context::bind(
                     &$crate::Value::dispatch_domain(self),
                     operation,
@@ -949,12 +985,12 @@ macro_rules! define_elementwise_capability {
 
         impl<__V: $crate::Value> $capability for __V
         where
-            $operation: $crate::OperationProvider<__V::Type>,
+            $operation<__V::Type>: $crate::OperationProvider<__V::Type>,
             __V::DispatchDomain: $crate::Context<
                     Type = __V::Type,
                     Value = __V,
                     Operation: ::std::convert::From<
-                        <$operation as $crate::OperationProvider<__V::Type>>::Operation,
+                        <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::Operation,
                     >,
                 >,
         {
@@ -962,7 +998,7 @@ macro_rules! define_elementwise_capability {
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError> {
                 let left_type = $crate::Typed::r#type(self);
                 let right_type = $crate::Typed::r#type($argument);
-                let operation = <$operation as $crate::OperationProvider<__V::Type>>::provide(&[
+                let operation = <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::provide(&[
                     left_type.as_ref(),
                     right_type.as_ref(),
                 ])?;
@@ -1136,7 +1172,10 @@ macro_rules! impl_differentiable_operation {
             |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
         }
 
-        $crate::impl_non_transposable_operation!(<$generic $(, $remaining_generic)*> $operation);
+        $crate::impl_non_transposable_operation!(
+            <$generic $(, $remaining_generic)*> $operation
+            where $generic: $crate::Type $(, $remaining_generic: $crate::Type)*
+        );
     };
 
     // This internal helper emits a non-generic operation's complete JVP followed by the standard rejecting
@@ -1380,9 +1419,9 @@ macro_rules! impl_differentiable_operation {
 ///         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
 ///     {
 ///         [left = @linear, right = @known] =>
-///             |output_cotangent| right.binary(output_cotangent, MulOperation);
+///             |output_cotangent| right.binary(output_cotangent, MulOperation::new());
 ///         [left = @known, right = @linear] =>
-///             |output_cotangent| left.binary(output_cotangent, MulOperation);
+///             |output_cotangent| left.binary(output_cotangent, MulOperation::new());
 ///     },
 /// }
 /// ```
@@ -1518,20 +1557,29 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     // This branch implements an operation with no differential dependence by replaying its primal outputs with
     // structural-zero tangents and generating the standard rejecting primitive-transposition rule.
-    (@non_differentiable $operation:ty $(,)?) => {
-        $crate::impl_non_differentiable_operation!($operation);
-        $crate::impl_non_transposable_operation!($operation);
+    (@non_differentiable $operation:ident $(,)?) => {
+        $crate::impl_non_differentiable_operation!(
+            <__P> $operation<__P> where __P: $crate::Type
+        );
+        $crate::impl_non_transposable_operation!(
+            <__P> $operation<__P> where __P: $crate::Type
+        );
     };
 
     // This branch implements a unary result that is constant with respect to its exemplar input. Its JVP has a
     // structural-zero tangent, while transposition returns a structural-zero cotangent shaped by that input.
-    (@constant $operation:ty $(,)?) => {
-        $crate::impl_non_differentiable_operation!($operation);
+    (@constant $operation:ident $(,)?) => {
+        $crate::impl_non_differentiable_operation!(<__P> $operation<__P>
+            where __P: $crate::Type);
 
-        impl<__T: $crate::DifferentiableType, __V: $crate::Value<Type = __T>, __O: $crate::Operation<__T>>
-            $crate::TransposableOperation<__V, __O> for $operation
+        impl<
+            __T: $crate::DifferentiableType,
+            __P: $crate::Type,
+            __V: $crate::Value<Type = __T>,
+            __O: $crate::Operation<__T>,
+        > $crate::TransposableOperation<__V, __O> for $operation<__P>
         where
-            $operation: $crate::Operation<__T>,
+            $operation<__P>: $crate::Operation<__T>,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -1554,26 +1602,30 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     // This branch starts parsing a unary rule, whose single independently lazy tangent contribution may bind
     // its input primal and output primal. The shared parser handles its optional unbraced JVP bounds.
-    (@unary $($tail:tt)*) => {
-        $crate::impl_differentiable_elementwise_operation!(@public_jvp [unary] $($tail)*);
+    (@unary $operation:ident, $($tail:tt)*) => {
+        $crate::impl_differentiable_elementwise_operation!(
+            @public_jvp [unary] [__P] $operation<__P>, $($tail)*
+        );
     };
 
     // This branch starts parsing a binary rule with one independently lazy contribution per input tangent
     // and either a structured or custom primitive-transposition rule.
-    (@binary $($tail:tt)*) => {
-        $crate::impl_differentiable_elementwise_operation!(@public_jvp [binary] $($tail)*);
+    (@binary $operation:ident, $($tail:tt)*) => {
+        $crate::impl_differentiable_elementwise_operation!(
+            @public_jvp [binary] [__P] $operation<__P>, $($tail)*
+        );
     };
 
     // This branch implements a positive unary linear rule. Both its tangent and cotangent pass through unchanged,
     // so the generated implementations need no arithmetic capabilities beyond the operation itself.
     (
         @linear
-        $operation:ty,
+        $operation:ident,
         rule = [@positive $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_unary [positive]
-            impl<__C> $operation
+            impl<__C, __P> $operation<__P>
             where {}
             transpose_type_bound { $crate::Type }
             transpose_operation_bounds {}
@@ -1584,17 +1636,17 @@ macro_rules! impl_differentiable_elementwise_operation {
     // the shared generator with the `Neg` value capability and `NegOperation` operation-family conversion.
     (
         @linear
-        $operation:ty,
+        $operation:ident,
         rule = [@negative $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_unary [negative]
-            impl<__C> $operation
+            impl<__C, __P> $operation<__P>
             where {
                 <__C as $crate::Domain>::Value: ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>,
             }
             transpose_type_bound { $crate::DifferentiableType }
-            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation<__T>> }
         }
     };
 
@@ -1602,12 +1654,12 @@ macro_rules! impl_differentiable_elementwise_operation {
     // with addition and forwards the output cotangent positively to each linear input.
     (
         @linear
-        $operation:ty,
+        $operation:ident,
         rule = [@positive, @positive $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_binary [positive, positive]
-            impl<__C> $operation
+            impl<__C, __P> $operation<__P>
             where { ::std::ops::Add<Output = <__C as $crate::Domain>::Value> }
             transpose_operation_bounds {}
         }
@@ -1617,17 +1669,17 @@ macro_rules! impl_differentiable_elementwise_operation {
     // It stages subtraction for the tangent and negates only the right cotangent contribution.
     (
         @linear
-        $operation:ty,
+        $operation:ident,
         rule = [@positive, @negative $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_binary [positive, negative]
-            impl<__C> $operation
+            impl<__C, __P> $operation<__P>
             where {
                 ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
                     + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
             }
-            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation<__T>> }
         }
     };
 
@@ -1635,17 +1687,17 @@ macro_rules! impl_differentiable_elementwise_operation {
     // It stages the reversed subtraction needed for the tangent and negates only the left cotangent.
     (
         @linear
-        $operation:ty,
+        $operation:ident,
         rule = [@negative, @positive $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_binary [negative, positive]
-            impl<__C> $operation
+            impl<__C, __P> $operation<__P>
             where {
                 ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
                     + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
             }
-            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation<__T>> }
         }
     };
 
@@ -1653,17 +1705,17 @@ macro_rules! impl_differentiable_elementwise_operation {
     // tangents and negates both input cotangent contributions.
     (
         @linear
-        $operation:ty,
+        $operation:ident,
         rule = [@negative, @negative $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_binary [negative, negative]
-            impl<__C> $operation
+            impl<__C, __P> $operation<__P>
             where {
                 ::std::ops::Add<Output = <__C as $crate::Domain>::Value>
                     + ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
             }
-            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation<__T>> }
         }
     };
 
@@ -1671,14 +1723,14 @@ macro_rules! impl_differentiable_elementwise_operation {
     // token-by-token bound collection. Collection is necessary because `macro_rules!` has no fragment that
     // matches a complete Rust `where` clause while also identifying where the following JVP body begins.
     (
-        @public_jvp [$kind:ident]
+        @public_jvp [$kind:ident] [$($generic:ident),*]
         $operation:ty,
         jvp<$context:ident>
         where
         $($tail:tt)*
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @collect_jvp_where [$kind] [$context] [$operation] [] $($tail)*
+            @collect_jvp_where [$kind] [$($generic),*] [$context] [$operation] [] $($tail)*
         }
     };
 
@@ -1686,13 +1738,13 @@ macro_rules! impl_differentiable_elementwise_operation {
     // normalized rule dispatch. It bypasses the collector so the common boundless form does not take an unnecessary
     // recursive parsing path.
     (
-        @public_jvp [$kind:ident]
+        @public_jvp [$kind:ident] [$($generic:ident),*]
         $operation:ty,
         jvp<$context:ident> { $($jvp:tt)* },
         $($tail:tt)*
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @jvp_ready [$kind] [$context] [$operation] []
+            @jvp_ready [$kind] [$($generic),*] [$context] [$operation] []
             { $($jvp)* }
             $($tail)*
         }
@@ -1703,12 +1755,12 @@ macro_rules! impl_differentiable_elementwise_operation {
     // the body delimiter from ordinary token trees inside the preceding `where` clause.
     (
         @collect_jvp_where
-        [$kind:ident] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        [$kind:ident] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
         { $($jvp:tt)* },
         $($tail:tt)*
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @jvp_ready [$kind] [$context] [$operation] [$($bounds)*]
+            @jvp_ready [$kind] [$($generic),*] [$context] [$operation] [$($bounds)*]
             { $($jvp)* }
             $($tail)*
         }
@@ -1719,12 +1771,12 @@ macro_rules! impl_differentiable_elementwise_operation {
     // macro fragment without also consuming the JVP body that follows them.
     (
         @collect_jvp_where
-        [$kind:ident] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        [$kind:ident] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
         $next:tt $($rest:tt)+
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @collect_jvp_where
-            [$kind] [$context] [$operation] [$($bounds)* $next] $($rest)*
+            [$kind] [$($generic),*] [$context] [$operation] [$($bounds)* $next] $($rest)*
         }
     };
 
@@ -1732,14 +1784,15 @@ macro_rules! impl_differentiable_elementwise_operation {
     // bounds. It remains a dedicated branch because unary rules have one tangent contribution and always reject
     // transposition, unlike binary rules with structured knownness cases.
     (
-        @jvp_ready [unary] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        @jvp_ready [unary] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
         { |($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?| $term:expr }
         transpose = @nonlinear $(,)?
     ) => {
         $crate::impl_differentiable_operation! {
             @impl_jvp
-            impl<$context> $operation
+            impl<$context $(, $generic)*> $operation
             where {
+                $($generic: $crate::Type,)*
                 <$context as $crate::Domain>::Type: $crate::DifferentiableType,
                 <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
                 <$context as $crate::Domain>::Value:
@@ -1774,32 +1827,32 @@ macro_rules! impl_differentiable_elementwise_operation {
             }
         }
 
-        $crate::impl_non_transposable_operation!($operation);
+        $crate::impl_non_transposable_operation!(<$($generic),*> $operation where $($generic: $crate::Type),*);
     };
 
     // This internal helper branch emits a binary JVP whose operation is explicitly nonlinear under transposition, then
     // adds the standard rejecting transposition implementation. Separating this terminal form avoids forcing nonlinear
     // operations through the transposition-bound parser.
     (
-        @jvp_ready [binary] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        @jvp_ready [binary] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
         { $($jvp:tt)* }
         transpose = @nonlinear $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @binary_jvp
-            impl<$context> $operation
+            impl<$context $(, $generic)*> $operation
             where { $($bounds)* }
             jvp { $($jvp)* }
         }
 
-        $crate::impl_non_transposable_operation!($operation);
+        $crate::impl_non_transposable_operation!(<$($generic),*> $operation where $($generic: $crate::Type),*);
     };
 
     // This internal helper branch recognizes a binary rule with a transposition implementation and starts collecting
     // its unbraced transposition bounds. The JVP is carried along unchanged so both implementations can be emitted
     // once the transposition body supplies an unambiguous end marker.
     (
-        @jvp_ready [binary] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
+        @jvp_ready [binary] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
         { $($jvp:tt)* }
         transpose<$value:ident, $operations:ident>
         where
@@ -1807,7 +1860,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @collect_public_transpose_where
-            [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
+            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
             [$value] [$operations] [] $($tail)*
         }
     };
@@ -1818,13 +1871,13 @@ macro_rules! impl_differentiable_elementwise_operation {
     // `where`.
     (
         @collect_public_transpose_where
-        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
         [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
         { $($transpose_body:tt)* } $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @binary_ready
-            impl<$context> $operation
+            impl<$context $(, $generic)*> $operation
             where { $($jvp_bounds)* }
             {
                 jvp { $($jvp)* }
@@ -1840,13 +1893,13 @@ macro_rules! impl_differentiable_elementwise_operation {
     // needed solely because `macro_rules!` cannot parse a complete unbraced `where` clause.
     (
         @collect_public_transpose_where
-        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
         [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
         $next:tt $($rest:tt)+
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @collect_public_transpose_where
-            [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
+            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
             [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
         }
     };
@@ -1856,15 +1909,16 @@ macro_rules! impl_differentiable_elementwise_operation {
     // positive tangents and cotangents or negate negative ones without duplicating both trait implementations.
     (
         @linear_unary [$sign:ident]
-        impl<$context:ident> $operation:ty
+        impl<$context:ident $(, $generic:ident)*> $operation:ty
         where { $($jvp_bounds:tt)* }
         transpose_type_bound { $($transpose_type_bound:tt)+ }
         transpose_operation_bounds { $($transpose_operation_bounds:tt)* }
     ) => {
         $crate::impl_differentiable_operation! {
             @impl_jvp
-            impl<$context> $operation
+            impl<$context $(, $generic)*> $operation
             where {
+                $($generic: $crate::Type,)*
                 <$context as $crate::Domain>::Type: $crate::DifferentiableType,
                 <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
                 $($jvp_bounds)*
@@ -1887,6 +1941,7 @@ macro_rules! impl_differentiable_elementwise_operation {
 
         impl<
             __T: $($transpose_type_bound)+,
+            $($generic: $crate::Type,)*
             __V: $crate::Value<Type = __T>,
             __O: $crate::Operation<__T> $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
@@ -1919,14 +1974,15 @@ macro_rules! impl_differentiable_elementwise_operation {
     // natural staged tangent expression and each operand's cotangent contribution.
     (
         @linear_binary [$left_sign:ident, $right_sign:ident]
-        impl<$context:ident> $operation:ty
+        impl<$context:ident $(, $generic:ident)*> $operation:ty
         where { $($value_bounds:tt)* }
         transpose_operation_bounds { $($transpose_operation_bounds:tt)* }
     ) => {
         $crate::impl_differentiable_operation! {
             @impl_jvp
-            impl<$context> $operation
+            impl<$context $(, $generic)*> $operation
             where {
+                $($generic: $crate::Type,)*
                 <$context as $crate::Domain>::Type: $crate::DifferentiableType,
                 <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
                 <$context as $crate::Domain>::Value: $($value_bounds)*
@@ -1989,6 +2045,7 @@ macro_rules! impl_differentiable_elementwise_operation {
 
         impl<
             __T: $crate::DifferentiableType,
+            $($generic: $crate::Type,)*
             __V: $crate::Value<Type = __T>,
             __O: $crate::Operation<__T> $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
@@ -2080,7 +2137,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     // user-provided cotangent formulas at runtime and reports the actual unsupported knownness pattern.
     (
         @binary_ready
-        impl<$context:ident> $operation:ty
+        impl<$context:ident $(, $generic:ident)*> $operation:ty
         where { $($jvp_bounds:tt)* }
         {
             jvp { $($jvp:tt)* }
@@ -2097,15 +2154,18 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @binary_jvp
-            impl<$context> $operation
+            impl<$context $(, $generic)*> $operation
             where { $($jvp_bounds)* }
             jvp { $($jvp)* }
         }
 
         $crate::impl_differentiable_operation! {
             @impl_transpose
-            impl<$value, $operations> $operation
-            where { $($transpose_bounds)* }
+            impl<$value, $operations $(, $generic)*> $operation
+            where {
+                $($generic: $crate::Type,)*
+                $($transpose_bounds)*
+            }
             |operation, _context, _driver, inputs, outputs| {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
@@ -2209,7 +2269,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     // avoids requiring a second formula that is mathematically invalid or unavailable.
     (
         @binary_ready
-        impl<$context:ident> $operation:ty
+        impl<$context:ident $(, $generic:ident)*> $operation:ty
         where { $($jvp_bounds:tt)* }
         {
             jvp { $($jvp:tt)* }
@@ -2224,15 +2284,18 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @binary_jvp
-            impl<$context> $operation
+            impl<$context $(, $generic)*> $operation
             where { $($jvp_bounds)* }
             jvp { $($jvp)* }
         }
 
         $crate::impl_differentiable_operation! {
             @impl_transpose
-            impl<$value, $operations> $operation
-            where { $($transpose_bounds)* }
+            impl<$value, $operations $(, $generic)*> $operation
+            where {
+                $($generic: $crate::Type,)*
+                $($transpose_bounds)*
+            }
             |operation, _context, _driver, inputs, outputs| {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
@@ -2293,7 +2356,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     // symmetric or one-sided forms above.
     (
         @binary_ready
-        impl<$context:ident> $operation:ty
+        impl<$context:ident $(, $generic:ident)*> $operation:ty
         where { $($jvp_bounds:tt)* }
         {
             jvp { $($jvp:tt)* }
@@ -2308,15 +2371,18 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @binary_jvp
-            impl<$context> $operation
+            impl<$context $(, $generic)*> $operation
             where { $($jvp_bounds)* }
             jvp { $($jvp)* }
         }
 
         $crate::impl_differentiable_operation! {
             @impl_transpose
-            impl<$value, $operations> $operation
-            where { $($transpose_bounds)* }
+            impl<$value, $operations $(, $generic)*> $operation
+            where {
+                $($generic: $crate::Type,)*
+                $($transpose_bounds)*
+            }
             |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
         }
     };
@@ -2326,7 +2392,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     // only state the mathematics unique to each operand.
     (
         @binary_jvp
-        impl<$context:ident> $operation:ty
+        impl<$context:ident $(, $generic:ident)*> $operation:ty
         where { $($bounds:tt)* }
         jvp {
             |($left_primal_for_left:tt, $left_tangent:ident), ($right_primal_for_left:tt, _)|
@@ -2337,8 +2403,9 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_operation! {
             @impl_jvp
-            impl<$context> $operation
+            impl<$context $(, $generic)*> $operation
             where {
+                $($generic: $crate::Type,)*
                 <$context as $crate::Domain>::Type: $crate::DifferentiableType,
                 <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
                 <$context as $crate::Domain>::Value: ::std::ops::Add<Output = <$context as $crate::Domain>::Value>
@@ -2732,14 +2799,14 @@ macro_rules! impl_nullary_batchable_operation {
 #[macro_export]
 macro_rules! define_tracer_operator {
     // This branch implements receiver-only operator syntax for every transform tracer family.
-    (@unary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
+    (@unary $trait:path, $method:ident, $operation:ident, $message:literal $(,)?) => {
         impl<__T: $crate::Type, __V> $trait for $crate::ProjectedValue<__T, __V>
         where
             $crate::ProjectedValue<__T, __V>: $crate::Value<Type = __T>,
             <$crate::ProjectedValue<__T, __V> as $crate::Value>::DispatchDomain: $crate::Context<
                     Type = __T,
                     Value = $crate::ProjectedValue<__T, __V>,
-                    Operation: ::std::convert::From<$operation>,
+                    Operation: ::std::convert::From<$operation<__T>>,
                 >,
         {
             type Output = Self;
@@ -2748,7 +2815,7 @@ macro_rules! define_tracer_operator {
             fn $method(self) -> Self {
                 $crate::Context::bind(
                     &$crate::Value::dispatch_domain(&self),
-                    $operation,
+                    $operation::<__T>::new(),
                     Vec::new(),
                     ::std::slice::from_ref(&self),
                 )
@@ -2757,46 +2824,47 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait
+        impl<__C: $crate::StagingContext<Operation: ::std::convert::From<$operation<__C::Type>>>> $trait
             for $crate::Tracer<__C>
         {
             type Output = Self;
 
             #[inline]
             fn $method(self) -> Self {
-                self.unary($operation)
+                self.unary($operation::new())
             }
         }
 
         impl<__C: $crate::Context> $trait for $crate::PartialTracer<__C>
         where
-            $crate::PartialEvaluationContext<__C>:
-                $crate::Context<Value = $crate::PartialTracer<__C>, Operation: ::std::convert::From<$operation>>,
-        {
-            type Output = Self;
-
-            #[inline]
-            fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), ::std::slice::from_ref(&self))
-                    .expect($message)
-                    .remove(0)
-            }
-        }
-
-        impl<__C: $crate::Context<Type = $crate::ArrayType>>
-            $trait
-            for $crate::BatchingTracer<__C, $crate::ArrayBatching>
-        where
-            $crate::BatchingContext<__C, $crate::ArrayBatching>: $crate::Context<
-                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatching>,
-                    Operation: ::std::convert::From<$operation>,
+            $crate::PartialEvaluationContext<__C>: $crate::Context<
+                    Value = $crate::PartialTracer<__C>,
+                    Operation: ::std::convert::From<$operation<__C::Type>>,
                 >,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), ::std::slice::from_ref(&self))
+                $crate::Context::bind(self.context(), $operation::new(), Vec::new(), ::std::slice::from_ref(&self))
+                    .expect($message)
+                    .remove(0)
+            }
+        }
+
+        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait
+            for $crate::BatchingTracer<__C, $crate::ArrayBatching>
+        where
+            $crate::BatchingContext<__C, $crate::ArrayBatching>: $crate::Context<
+                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatching>,
+                    Operation: ::std::convert::From<$operation<$crate::ArrayType>>,
+                >,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self) -> Self {
+                $crate::Context::bind(self.context(), $operation::new(), Vec::new(), ::std::slice::from_ref(&self))
                     .expect($message)
                     .remove(0)
             }
@@ -2806,14 +2874,14 @@ macro_rules! define_tracer_operator {
         where
             $crate::DifferentiationContext<__C>: $crate::Context<
                     Value = $crate::DifferentiationTracer<__C>,
-                    Operation: ::std::convert::From<$operation>,
+                    Operation: ::std::convert::From<$operation<__C::Type>>,
                 >,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), ::std::slice::from_ref(&self))
+                $crate::Context::bind(self.context(), $operation::new(), Vec::new(), ::std::slice::from_ref(&self))
                     .expect($message)
                     .remove(0)
             }
@@ -2870,8 +2938,7 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context<Type = $crate::ArrayType>>
-            $trait
+        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait
             for $crate::BatchingTracer<__C, $crate::ArrayBatching>
         where
             Self: $capability,
@@ -2924,7 +2991,7 @@ macro_rules! define_tracer_operator {
 /// # use ryft_core::{AddOperation, DataType, check_operation_type_inference};
 /// check_operation_type_inference!(
 ///     @elementwise @binary,
-///     operation = AddOperation,
+///     operation = AddOperation::new(),
 ///     cases = [
 ///         {
 ///             input_data_types = [DataType::F32, DataType::F64],
@@ -2945,7 +3012,7 @@ macro_rules! define_tracer_operator {
 /// # use ryft_core::{ArrayType, DataType, SinOperation, check_operation_type_inference};
 /// check_operation_type_inference!(
 ///     @reject @unreduced,
-///     operation = SinOperation,
+///     operation = SinOperation::new(),
 ///     input_types = [ArrayType::scalar(DataType::F64)],
 /// );
 /// ```
@@ -2973,11 +3040,14 @@ macro_rules! check_operation_type_inference {
     // It leaves rejected cases in the data-type universe because custom array inference may own a more specific error.
     (
         @elementwise @unary,
-        operation = $operation:expr,
+        operation = $operation:ident,
         cases = [$( { $($case:tt)* } ),+ $(,)?] $(,)?
     ) => {{
-        let operation = $operation;
-        $($crate::check_operation_type_inference!(@elementwise_unary_case operation, { $($case)* });)+
+        let data_operation = $operation::<$crate::types::DataType>::new();
+        let array_operation = $operation::<$crate::types::ArrayType>::new();
+        $($crate::check_operation_type_inference!(
+            @elementwise_unary_case data_operation, array_operation, { $($case)* }
+        );)+
     }};
 
     // This branch checks binary element-type cases and lifts every successful case through matching representative
@@ -2985,11 +3055,14 @@ macro_rules! check_operation_type_inference {
     // impose stricter array relationships than ordinary broadcasting.
     (
         @elementwise @binary,
-        operation = $operation:expr,
+        operation = $operation:ident,
         cases = [$( { $($case:tt)* } ),+ $(,)?] $(,)?
     ) => {{
-        let operation = $operation;
-        $($crate::check_operation_type_inference!(@elementwise_binary_case operation, { $($case)* });)+
+        let data_operation = $operation::<$crate::types::DataType>::new();
+        let array_operation = $operation::<$crate::types::ArrayType>::new();
+        $($crate::check_operation_type_inference!(
+            @elementwise_binary_case data_operation, array_operation, { $($case)* }
+        );)+
     }};
 
     // This branch checks one or more exact regionless type-inference cases. It evaluates the operation once and
@@ -3108,7 +3181,7 @@ macro_rules! check_operation_type_inference {
     // This internal branch checks a successful unary element-type case in both the data-type and array-type universes.
     // The array fixture carries shape, layout, and memory metadata so the assertion also verifies structural lifting.
     (
-        @elementwise_unary_case $operation:ident,
+        @elementwise_unary_case $data_operation:ident, $array_operation:ident,
         {
             input_data_types = [$input_data_type:expr $(,)?],
             output_data_types = [$($output_data_type:expr),* $(,)?] $(,)?
@@ -3118,7 +3191,7 @@ macro_rules! check_operation_type_inference {
         let output_data_types: ::std::vec::Vec<$crate::types::DataType> = ::std::vec![$($output_data_type),*];
         assert_eq!(
             $crate::programs::operations::Operation::<$crate::types::DataType>::infer_output_types(
-                &$operation,
+                &$data_operation,
                 &[input_data_type],
                 &[],
             ),
@@ -3132,7 +3205,7 @@ macro_rules! check_operation_type_inference {
         .with_memory($crate::types::Memory::Host { pinned: true });
         assert_eq!(
             $crate::programs::operations::Operation::<$crate::types::ArrayType>::infer_output_types(
-                &$operation,
+                &$array_operation,
                 ::std::slice::from_ref(&input_type),
                 &[],
             ),
@@ -3145,13 +3218,13 @@ macro_rules! check_operation_type_inference {
 
     // This internal branch checks a rejected unary element-type case and compares the exact operation-owned diagnostic.
     (
-        @elementwise_unary_case $operation:ident,
+        @elementwise_unary_case $data_operation:ident, $array_operation:ident,
         {
             input_data_types = [$input_data_type:expr $(,)?],
             error = $message:expr $(,)?
         }
     ) => {
-        $crate::check_operation_type_inference!(@case $operation, {
+        $crate::check_operation_type_inference!(@case $data_operation, {
             input_types = [$input_data_type],
             error = $message,
         });
@@ -3160,7 +3233,7 @@ macro_rules! check_operation_type_inference {
     // This internal branch checks a successful binary element-type case in both universes. Matching array structures
     // isolate element-type lifting from the separately tested shared broadcasting contract.
     (
-        @elementwise_binary_case $operation:ident,
+        @elementwise_binary_case $data_operation:ident, $array_operation:ident,
         {
             input_data_types = [$left_data_type:expr, $right_data_type:expr $(,)?],
             output_data_types = [$($output_data_type:expr),* $(,)?] $(,)?
@@ -3171,7 +3244,7 @@ macro_rules! check_operation_type_inference {
         let output_data_types: ::std::vec::Vec<$crate::types::DataType> = ::std::vec![$($output_data_type),*];
         assert_eq!(
             $crate::programs::operations::Operation::<$crate::types::DataType>::infer_output_types(
-                &$operation,
+                &$data_operation,
                 &[left_data_type, right_data_type],
                 &[],
             ),
@@ -3186,7 +3259,7 @@ macro_rules! check_operation_type_inference {
         let right_type = left_type.clone().with_data_type(right_data_type);
         assert_eq!(
             $crate::programs::operations::Operation::<$crate::types::ArrayType>::infer_output_types(
-                &$operation,
+                &$array_operation,
                 &[left_type.clone(), right_type],
                 &[],
             ),
@@ -3199,13 +3272,13 @@ macro_rules! check_operation_type_inference {
 
     // This internal branch checks a rejected binary element-type case and compares the exact operation-owned diagnostic.
     (
-        @elementwise_binary_case $operation:ident,
+        @elementwise_binary_case $data_operation:ident, $array_operation:ident,
         {
             input_data_types = [$left_data_type:expr, $right_data_type:expr $(,)?],
             error = $message:expr $(,)?
         }
     ) => {
-        $crate::check_operation_type_inference!(@case $operation, {
+        $crate::check_operation_type_inference!(@case $data_operation, {
             input_types = [$left_data_type, $right_data_type],
             error = $message,
         });
@@ -3292,7 +3365,7 @@ macro_rules! check_operation_type_inference {
 /// ```rust
 /// # use ryft_core::{NegOperation, Scalar, check_operation_partial_evaluation};
 /// check_operation_partial_evaluation!(
-///     operation = NegOperation,
+///     operation = NegOperation::new(),
 ///     inputs = [Scalar::from(2.0)],
 ///     expected = Scalar::from(-2.0),
 /// );
@@ -3306,7 +3379,7 @@ macro_rules! check_operation_type_inference {
 /// ```rust
 /// # use ryft_core::{AddOperation, DataType, Scalar, check_operation_partial_evaluation};
 /// check_operation_partial_evaluation!(
-///     operation = AddOperation,
+///     operation = AddOperation::new(),
 ///     cases = [{
 ///         inputs = [
 ///             (@known, Scalar::from(2.0)),
@@ -3529,7 +3602,7 @@ macro_rules! check_operation_partial_evaluation {
 /// # use ryft_core::{Array, AddOperation, check_operation_batching};
 /// check_operation_batching!(
 ///     @exact,
-///     operation = AddOperation,
+///     operation = AddOperation::new(),
 ///     axis_size = 2,
 ///     cases = [
 ///         {
@@ -3748,7 +3821,7 @@ macro_rules! check_operation_batching {
 /// # use ryft_core::{Array, MulOperation, check_operation_differentiation};
 /// check_operation_differentiation!(
 ///     @approx(step = 1e-6, epsilon = 1e-6),
-///     operation = MulOperation,
+///     operation = MulOperation::new(),
 ///     cases = [{
 ///         primals = [Array::scalar(2.0), Array::scalar(5.0)],
 ///         tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
@@ -3906,7 +3979,7 @@ macro_rules! check_operation_differentiation {
 /// # use ryft_core::{Array, ArrayType, DataType, MulOperation, check_operation_transposition};
 /// check_operation_transposition!(
 ///     @exact,
-///     operation = MulOperation,
+///     operation = MulOperation::new(),
 ///     cases = [{
 ///         inputs = [
 ///             (@known, Array::scalar(4.0)),
@@ -4528,7 +4601,7 @@ mod tests {
     );
 
     impl_differentiable_operation! {
-        TestDifferentiableOperation,
+        TestDifferentiableOperation<DataType>,
         jvp<C>
         where
             C::Type: crate::DifferentiableType,
@@ -4584,67 +4657,79 @@ mod tests {
         rule = [@negative, @negative]
     }
 
-    impl_non_differentiable_operation!(TestUnaryOperation);
-    impl_non_transposable_operation!(TestUnaryOperation);
-    impl_non_differentiable_operation!(TestBinaryOperation);
+    impl_non_differentiable_operation!(TestUnaryOperation<DataType>);
+    impl_non_transposable_operation!(TestUnaryOperation<DataType>);
+    impl_non_differentiable_operation!(TestBinaryOperation<DataType>);
 
-    impl From<ZeroOperation<DataType>> for TestUnaryOperation {
+    impl From<ZeroOperation<DataType>> for TestUnaryOperation<DataType> {
         fn from(_operation: ZeroOperation<DataType>) -> Self {
-            Self
+            Self::new()
         }
     }
 
-    impl From<ZeroOperation<DataType>> for TestBinaryOperation {
+    impl From<ZeroOperation<DataType>> for TestBinaryOperation<DataType> {
         fn from(_operation: ZeroOperation<DataType>) -> Self {
-            Self
+            Self::new()
         }
     }
 
-    impl From<TransposeOperation> for TestUnaryOperation {
+    impl From<TransposeOperation> for TestUnaryOperation<ArrayType> {
         fn from(_operation: TransposeOperation) -> Self {
-            Self
+            Self::new()
         }
     }
 
-    impl From<LegacyBroadcastOperation> for TestUnaryOperation {
+    impl From<LegacyBroadcastOperation> for TestUnaryOperation<ArrayType> {
         fn from(_operation: LegacyBroadcastOperation) -> Self {
-            Self
+            Self::new()
         }
     }
 
-    impl From<NegOperation> for TestUnaryOperation {
-        fn from(_operation: NegOperation) -> Self {
-            Self
+    impl From<NegOperation<DataType>> for TestUnaryOperation<DataType> {
+        fn from(_operation: NegOperation<DataType>) -> Self {
+            Self::new()
         }
     }
 
-    impl From<TransposeOperation> for TestBinaryOperation {
+    impl From<NegOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
+        fn from(_operation: NegOperation<ArrayType>) -> Self {
+            Self::new()
+        }
+    }
+
+    impl From<TransposeOperation> for TestBinaryOperation<ArrayType> {
         fn from(_operation: TransposeOperation) -> Self {
-            Self
+            Self::new()
         }
     }
 
-    impl From<LegacyBroadcastOperation> for TestBinaryOperation {
+    impl From<LegacyBroadcastOperation> for TestBinaryOperation<ArrayType> {
         fn from(_operation: LegacyBroadcastOperation) -> Self {
-            Self
+            Self::new()
         }
     }
 
-    impl From<AddOperation> for TestBinaryOperation {
-        fn from(_operation: AddOperation) -> Self {
-            Self
+    impl From<AddOperation<DataType>> for TestBinaryOperation<DataType> {
+        fn from(_operation: AddOperation<DataType>) -> Self {
+            Self::new()
         }
     }
 
-    impl From<TestUnaryOperation> for ArrayOperation<Array> {
-        fn from(_operation: TestUnaryOperation) -> Self {
-            Self::Neg(NegOperation)
+    impl From<AddOperation<ArrayType>> for TestBinaryOperation<ArrayType> {
+        fn from(_operation: AddOperation<ArrayType>) -> Self {
+            Self::new()
         }
     }
 
-    impl From<TestBinaryOperation> for ArrayOperation<Array> {
-        fn from(_operation: TestBinaryOperation) -> Self {
-            Self::Add(AddOperation)
+    impl From<TestUnaryOperation<ArrayType>> for ArrayOperation<Array> {
+        fn from(_operation: TestUnaryOperation<ArrayType>) -> Self {
+            Self::Neg(NegOperation::new())
+        }
+    }
+
+    impl From<TestBinaryOperation<ArrayType>> for ArrayOperation<Array> {
+        fn from(_operation: TestBinaryOperation<ArrayType>) -> Self {
+            Self::Add(AddOperation::new())
         }
     }
 
@@ -4675,7 +4760,7 @@ mod tests {
         fn apply_provided_binary(self, right: Self) -> Self::Output;
     }
 
-    impl OperationProvider<DimensionType> for TestBinaryOperation {
+    impl OperationProvider<DimensionType> for TestBinaryOperation<DimensionType> {
         type Operation = TestArithmeticDimensionOperation;
 
         fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
@@ -5204,15 +5289,21 @@ mod tests {
     #[test]
     fn test_check_operation_type_inference() {
         #[derive(Clone, Debug)]
-        struct TestMultiOutputOperation;
+        struct TestMultiOutputOperation<T: Type>(PhantomData<fn() -> T>);
 
-        impl Display for TestMultiOutputOperation {
+        impl<T: Type> TestMultiOutputOperation<T> {
+            const fn new() -> Self {
+                Self(PhantomData)
+            }
+        }
+
+        impl<T: Type> Display for TestMultiOutputOperation<T> {
             fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("test_multi_output")
             }
         }
 
-        impl<T: Type> Operation<T> for TestMultiOutputOperation {
+        impl<T: Type> Operation<T> for TestMultiOutputOperation<T> {
             fn name(&self) -> &'static str {
                 "test_multi_output"
             }
@@ -5227,7 +5318,7 @@ mod tests {
             }
         }
 
-        impl ElementwiseOperation for TestMultiOutputOperation {
+        impl ElementwiseOperation for TestMultiOutputOperation<ArrayType> {
             fn input_count(&self) -> usize {
                 1
             }
@@ -5277,7 +5368,7 @@ mod tests {
         );
 
         check_operation_type_inference!(
-            operation = AddOperation,
+            operation = AddOperation::new(),
             cases = [
                 {
                     input_types = [DataType::F32, DataType::F64],
@@ -5301,13 +5392,13 @@ mod tests {
 
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = SinOperation,
+            operation = SinOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
 
         check_operation_type_inference!(
             @reject @mismatched_reduced,
-            operation = AddOperation,
+            operation = AddOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -5315,12 +5406,12 @@ mod tests {
     #[test]
     fn test_check_operation_partial_evaluation() {
         check_operation_partial_evaluation!(
-            operation = NegOperation,
+            operation = NegOperation::new(),
             inputs = [Scalar::from(2.0)],
             expected = Scalar::from(-2.0),
         );
         check_operation_partial_evaluation!(
-            operation = AddOperation,
+            operation = AddOperation::new(),
             cases = [
                 {
                     inputs = [
@@ -5449,7 +5540,7 @@ mod tests {
 
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = SubOperation,
+            operation = SubOperation::new(),
             axis_size = 2,
             cases = [
                 {
@@ -5493,7 +5584,7 @@ mod tests {
 
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = SinOperation,
+            operation = SinOperation::new(),
             axis_size = 2,
             cases = [
                 {
@@ -5513,7 +5604,7 @@ mod tests {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
             backend = (Array, ArrayOperation<Array>),
-            operation = MulOperation,
+            operation = MulOperation::new(),
             cases = [
                 {
                     primals = [Array::scalar(2.0), Array::scalar(5.0)],
@@ -5544,7 +5635,7 @@ mod tests {
         check_operation_transposition!(
             @exact,
             backend = (Array, ArrayOperation<Array>),
-            operation = MulOperation,
+            operation = MulOperation::new(),
             cases = [{
                 inputs = [
                     (@known, Array::scalar(4.0)),
@@ -5561,7 +5652,7 @@ mod tests {
         );
         check_operation_transposition!(
             @approx(epsilon = 1e-9),
-            operation = AddOperation,
+            operation = AddOperation::new(),
             cases = [{
                 inputs = [
                     (@linear(type = ArrayType::scalar(DataType::F64))),
@@ -5573,49 +5664,50 @@ mod tests {
         );
         check_operation_transposition!(
             @rejected,
-            operation = SinOperation,
+            operation = SinOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
 
     #[test]
     fn test_define_elementwise_operation_unary() {
-        let operation = TestUnaryOperation;
-        assert_eq!(format!("{operation:?}"), "TestUnaryOperation");
-        assert_eq!(format!("{operation}"), TEST_UNARY_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::name(&operation), TEST_UNARY_OPERATION_NAME);
-        assert_eq!(ElementwiseOperation::input_count(&operation), 1);
+        let data_operation = TestUnaryOperation::<DataType>::new();
+        let array_operation = TestUnaryOperation::<ArrayType>::new();
+        assert_eq!(format!("{data_operation:?}"), "TestUnaryOperation");
+        assert_eq!(format!("{data_operation}"), TEST_UNARY_OPERATION_NAME);
+        assert_eq!(Operation::<DataType>::name(&data_operation), TEST_UNARY_OPERATION_NAME);
+        assert_eq!(ElementwiseOperation::input_count(&array_operation), 1);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
+            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::F32], &[]),
             Ok(vec![DataType::F32])
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
+            Operation::<DataType>::infer_output_types(&data_operation, &[], &[]),
             Err(TypeError::invalid("expected 1 input but got 0".to_string())),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean], &[]),
+            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::Boolean], &[]),
             Err(TypeError::invalid("'test_unary' does not support input data type bool".to_string())),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::I64], &[]),
+            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::I64], &[]),
             Ok(vec![DataType::I64]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
+            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::C64], &[]),
             Err(TypeError::invalid("'test_unary' does not support input data type c64".to_string())),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)], &[]),
+            Operation::<ArrayType>::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::F32)], &[]),
             Ok(vec![ArrayType::scalar(DataType::F32)]),
         );
         let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, std::slice::from_ref(&matrix_type), &[]),
+            Operation::<ArrayType>::infer_output_types(&array_operation, std::slice::from_ref(&matrix_type), &[]),
             Ok(vec![matrix_type]),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::C64)], &[]),
+            Operation::<ArrayType>::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::C64)], &[]),
             Err(TypeError::invalid("'test_unary' does not support input data type c64".to_string())),
         );
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -5623,12 +5715,12 @@ mod tests {
             .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[unreduced_type], &[]),
+            Operation::<ArrayType>::infer_output_types(&array_operation, &[unreduced_type], &[]),
             Err(TypeError::invalid("'test_unary' does not support unreduced operands".to_string())),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar, TestUnaryOperation>>::interpret(
-                &operation,
+            InterpretableOperation::<EagerContext<Scalar, TestUnaryOperation<DataType>>>::interpret(
+                &data_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Scalar::from(2.0f32)],
@@ -5636,16 +5728,16 @@ mod tests {
             Ok(vec![Scalar::from(-2.0f32)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar, TestUnaryOperation>>::interpret(
-                &operation,
+            InterpretableOperation::<EagerContext<Scalar, TestUnaryOperation<DataType>>>::interpret(
+                &data_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
-        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestUnaryOperation>::new());
-        let outputs = operation
+        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestUnaryOperation<DataType>>::new());
+        let outputs = data_operation
             .partially_evaluate(&context, &EmptyRegionDriver, &[PartialEvaluationValue::known(Scalar::from(2.0f32))])
             .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -5654,40 +5746,41 @@ mod tests {
 
     #[test]
     fn test_define_elementwise_operation_binary() {
-        let operation = TestBinaryOperation;
-        assert_eq!(format!("{operation:?}"), "TestBinaryOperation");
-        assert_eq!(format!("{operation}"), TEST_BINARY_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::name(&operation), TEST_BINARY_OPERATION_NAME);
-        assert_eq!(ElementwiseOperation::input_count(&operation), 2);
+        let data_operation = TestBinaryOperation::<DataType>::new();
+        let array_operation = TestBinaryOperation::<ArrayType>::new();
+        assert_eq!(format!("{data_operation:?}"), "TestBinaryOperation");
+        assert_eq!(format!("{data_operation}"), TEST_BINARY_OPERATION_NAME);
+        assert_eq!(Operation::<DataType>::name(&data_operation), TEST_BINARY_OPERATION_NAME);
+        assert_eq!(ElementwiseOperation::input_count(&array_operation), 2);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
+            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::F32, DataType::F64], &[]),
             Ok(vec![DataType::F64]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
+            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::F32], &[]),
             Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean, DataType::Boolean], &[]),
+            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::Boolean, DataType::Boolean], &[]),
             Err(TypeError::invalid("'test_binary' does not support input data type bool".to_string())),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::I64, DataType::I64], &[]),
+            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::I64, DataType::I64], &[]),
             Ok(vec![DataType::I64]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64, DataType::C64], &[]),
+            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::C64, DataType::C64], &[]),
             Err(TypeError::invalid("'test_binary' does not support input data type c64".to_string())),
         );
         let scalar_type = ArrayType::scalar(DataType::F32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[scalar_type, vector_type.clone()], &[]),
+            Operation::<ArrayType>::infer_output_types(&array_operation, &[scalar_type, vector_type.clone()], &[]),
             Ok(vec![vector_type]),
         );
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(
-                &operation,
+                &array_operation,
                 &[ArrayType::scalar(DataType::C64), ArrayType::scalar(DataType::C64)],
                 &[],
             ),
@@ -5705,20 +5798,20 @@ mod tests {
             .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_unreduced_axes(["y"]).unwrap())
             .unwrap();
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[unreduced_x, unreduced_y], &[]),
+            Operation::<ArrayType>::infer_output_types(&array_operation, &[unreduced_x, unreduced_y], &[]),
             Err(TypeError::invalid("'test_binary' operands must be unreduced over the same axes".to_string())),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar, TestBinaryOperation>>::interpret(
-                &operation,
+            InterpretableOperation::<EagerContext<Scalar, TestBinaryOperation<DataType>>>::interpret(
+                &data_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Scalar::from(2.0f32), Scalar::from(3.0f32)],
             ),
             Ok(vec![Scalar::from(5.0f32)]),
         );
-        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestBinaryOperation>::new());
-        let outputs = operation
+        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestBinaryOperation<DataType>>::new());
+        let outputs = data_operation
             .partially_evaluate(
                 &context,
                 &EmptyRegionDriver,
@@ -5734,44 +5827,46 @@ mod tests {
 
     #[test]
     fn test_define_elementwise_operation_custom_inference() {
-        let magnitude = TestMagnitudeOperation;
+        let data_magnitude = TestMagnitudeOperation::<DataType>::new();
+        let array_magnitude = TestMagnitudeOperation::<ArrayType>::new();
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&magnitude, &[DataType::C64], &[]),
+            Operation::<DataType>::infer_output_types(&data_magnitude, &[DataType::C64], &[]),
             Ok(vec![DataType::F32]),
         );
         let complex_vector = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(2)]));
         let real_vector = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&magnitude, std::slice::from_ref(&complex_vector), &[],),
+            Operation::<ArrayType>::infer_output_types(&array_magnitude, std::slice::from_ref(&complex_vector), &[],),
             Ok(vec![real_vector.clone()]),
         );
         assert_eq!(
-            ElementwiseOperation::infer_output_types(&magnitude, std::slice::from_ref(&complex_vector)),
+            ElementwiseOperation::infer_output_types(&array_magnitude, std::slice::from_ref(&complex_vector)),
             Ok(vec![real_vector]),
         );
 
-        let strict_add = TestStrictAddOperation;
+        let data_strict_add = TestStrictAddOperation::<DataType>::new();
+        let array_strict_add = TestStrictAddOperation::<ArrayType>::new();
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&strict_add, &[DataType::F32, DataType::F64], &[]),
+            Operation::<DataType>::infer_output_types(&data_strict_add, &[DataType::F32, DataType::F64], &[]),
             Ok(vec![DataType::F64]),
         );
         let scalar = ArrayType::scalar(DataType::F32);
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&strict_add, &[scalar.clone(), scalar.clone()], &[]),
+            Operation::<ArrayType>::infer_output_types(&array_strict_add, &[scalar.clone(), scalar.clone()], &[],),
             Ok(vec![scalar.clone()]),
         );
         let vector = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let expected = Err(TypeError::invalid("test strict-add inputs must have identical array types".to_string()));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&strict_add, &[scalar.clone(), vector.clone()], &[]),
+            Operation::<ArrayType>::infer_output_types(&array_strict_add, &[scalar.clone(), vector.clone()], &[],),
             expected.clone(),
         );
-        assert_eq!(ElementwiseOperation::infer_output_types(&strict_add, &[scalar, vector]), expected);
+        assert_eq!(ElementwiseOperation::infer_output_types(&array_strict_add, &[scalar, vector]), expected);
     }
 
     #[test]
     fn test_define_elementwise_capability_unary() {
-        let context = TracingContext::<Scalar, TestUnaryOperation>::new();
+        let context = TracingContext::<Scalar, TestUnaryOperation<DataType>>::new();
         let output = context.input(DataType::F32).test_unary().unwrap();
         let builder = output.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
@@ -5782,7 +5877,7 @@ mod tests {
 
     #[test]
     fn test_define_elementwise_capability_binary() {
-        let context = TracingContext::<Scalar, TestBinaryOperation>::new();
+        let context = TracingContext::<Scalar, TestBinaryOperation<DataType>>::new();
         let left = context.input(DataType::F32);
         let right = context.input(DataType::F32);
         let output = left.test_binary(&right).unwrap();
@@ -5801,8 +5896,8 @@ mod tests {
             DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
             DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
         ];
-        let outputs = TestDifferentiableOperation
-            .jvp(&EagerContext::<Scalar, TestDifferentiableOperation>::new(), &EmptyRegionDriver, &inputs)
+        let outputs = TestDifferentiableOperation::<DataType>::new()
+            .jvp(&EagerContext::<Scalar, TestDifferentiableOperation<DataType>>::new(), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &Scalar::from(2.0f32));
@@ -5810,10 +5905,10 @@ mod tests {
 
         // The generic transposition shell likewise forwards the complete partial-input and cotangent slices to the
         // supplied body and preserves the driver's static dispatch.
-        let mut context = TracingContext::<Scalar, TestDifferentiableOperation>::new();
+        let mut context = TracingContext::<Scalar, TestDifferentiableOperation<DataType>>::new();
         let output_cotangent = context.input(DataType::F32);
         let output_cotangent_id = output_cotangent.atom_id();
-        let input_cotangents = TestDifferentiableOperation
+        let input_cotangents = TestDifferentiableOperation::<DataType>::new()
             .transpose(
                 &mut context,
                 &EmptyRegionDriver,
@@ -5833,7 +5928,7 @@ mod tests {
             DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
             DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
         ];
-        let outputs = AddOperation
+        let outputs = AddOperation::new()
             .jvp(&EagerContext::<Scalar, ScalarOperation<Scalar>>::new(), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -5843,14 +5938,15 @@ mod tests {
         let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
         let output_cotangent = context.input(DataType::F32);
         let output_cotangent_id = output_cotangent.atom_id();
-        let input_cotangents = <AddOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
-            &AddOperation,
-            &mut context,
-            &EmptyRegionDriver,
-            &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
-            &[MaybeZero::Value(output_cotangent.clone())],
-        )
-        .unwrap();
+        let input_cotangents =
+            <AddOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &AddOperation::new(),
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &[MaybeZero::Value(output_cotangent.clone())],
+            )
+            .unwrap();
         assert_eq!(input_cotangents.len(), 2);
         assert!(matches!(
             &input_cotangents[0],
@@ -5866,41 +5962,41 @@ mod tests {
     fn test_impl_differentiable_elementwise_operation_linear_negative_signs() {
         // A `[@negative, @positive]` rule combines both live tangents as `right - left` and negates a left-only
         // tangent. The primal values come from the stand-in `Sub` interpretation and are irrelevant to the rule.
-        let context = EagerContext::<Scalar, TestReversedSubOperation>::new();
+        let context = EagerContext::<Scalar, TestReversedSubOperation<DataType>>::new();
         let inputs = [
             DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
             DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
         ];
-        let outputs = TestReversedSubOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestReversedSubOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(1.0f32)));
         let inputs = [
             DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
             DifferentiationDual::new_with_zero_tangent(Scalar::from(3.0f32)),
         ];
-        let outputs = TestReversedSubOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestReversedSubOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(-4.0f32)));
         let inputs = [
             DifferentiationDual::new_with_zero_tangent(Scalar::from(2.0f32)),
             DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
         ];
-        let outputs = TestReversedSubOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestReversedSubOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(5.0f32)));
 
         // A `[@negative, @negative]` rule combines both live tangents as `-(left + right)`.
-        let context = EagerContext::<Scalar, TestNegatedAddOperation>::new();
+        let context = EagerContext::<Scalar, TestNegatedAddOperation<DataType>>::new();
         let inputs = [
             DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
             DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
         ];
-        let outputs = TestNegatedAddOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestNegatedAddOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(-9.0f32)));
         let inputs = [
             DifferentiationDual::new_with_zero_tangent(Scalar::from(2.0f32)),
             DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
         ];
-        let outputs = TestNegatedAddOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestNegatedAddOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(-5.0f32)));
     }
 
@@ -5912,8 +6008,8 @@ mod tests {
         let output_cotangent = context.input(DataType::F32);
         let output_cotangent_id = output_cotangent.atom_id();
         let input_cotangents =
-            <TestReversedSubOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
-                &TestReversedSubOperation,
+            <TestReversedSubOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &TestReversedSubOperation::<DataType>::new(),
                 &mut context,
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
@@ -5940,8 +6036,8 @@ mod tests {
         let output_cotangent = context.input(DataType::F32);
         let output_cotangent_id = output_cotangent.atom_id();
         let input_cotangents =
-            <TestNegatedAddOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
-                &TestNegatedAddOperation,
+            <TestNegatedAddOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &TestNegatedAddOperation::<DataType>::new(),
                 &mut context,
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
@@ -5963,7 +6059,7 @@ mod tests {
 
     #[test]
     fn test_impl_differentiable_elementwise_operation_unary_jvp_contributions() {
-        let outputs = SinOperation
+        let outputs = SinOperation::new()
             .jvp(
                 &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
                 &EmptyRegionDriver,
@@ -5974,7 +6070,7 @@ mod tests {
         assert_eq!(outputs[0].primal(), &Scalar::from(0.0f32));
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(4.0f32)));
 
-        let outputs = ExpOperation
+        let outputs = ExpOperation::new()
             .jvp(
                 &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
                 &EmptyRegionDriver,
@@ -5988,7 +6084,7 @@ mod tests {
 
     #[test]
     fn test_impl_differentiable_elementwise_operation_binary_jvp_contributions() {
-        let outputs = MulOperation
+        let outputs = MulOperation::new()
             .jvp(
                 &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
                 &EmptyRegionDriver,
@@ -6009,8 +6105,8 @@ mod tests {
         let output_cotangent = context.input(DataType::F32);
         let outputs = [MaybeZero::Value(output_cotangent)];
         assert!(matches!(
-            <MulOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
-                &MulOperation,
+            <MulOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &MulOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
@@ -6025,8 +6121,8 @@ mod tests {
         let left = context.input(DataType::F32);
         let right = context.input(DataType::F32);
         assert!(matches!(
-            <MulOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
-                &MulOperation,
+            <MulOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &MulOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
                 &[PartialValue::Known(left), PartialValue::Known(right)],
@@ -6041,8 +6137,8 @@ mod tests {
         let right = context.input(DataType::I32);
         let output_cotangent = context.input(DataType::I32);
         assert!(matches!(
-            <MulOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
-                &MulOperation,
+            <MulOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &MulOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(DataType::I32), PartialValue::Known(right)],
@@ -6059,8 +6155,8 @@ mod tests {
         let output_cotangent = context.input(DataType::F32);
         let outputs = [MaybeZero::Value(output_cotangent)];
         assert!(matches!(
-            <DivOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
-                &DivOperation,
+            <DivOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &DivOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
@@ -6075,8 +6171,8 @@ mod tests {
         let numerator = context.input(DataType::F32);
         let denominator = context.input(DataType::F32);
         assert!(matches!(
-            <DivOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
-                &DivOperation,
+            <DivOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &DivOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
                 &[PartialValue::Known(numerator), PartialValue::Known(denominator)],
@@ -6093,7 +6189,7 @@ mod tests {
     fn test_impl_differentiable_elementwise_operation_skips_structural_zero_contributions() {
         let context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
         let input = context.input(DataType::F32);
-        let outputs = SinOperation
+        let outputs = SinOperation::new()
             .jvp(&context, &EmptyRegionDriver, &[DifferentiationDual::new_with_zero_tangent(input)])
             .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -6107,17 +6203,17 @@ mod tests {
     fn test_impl_non_differentiable_operation() {
         // The basic form replays the primal operation and replaces its live tangent with a structural zero.
         let inputs = [DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(1.0f32)).unwrap()];
-        let outputs = TestUnaryOperation
-            .jvp(&EagerContext::<Scalar, TestUnaryOperation>::new(), &EmptyRegionDriver, &inputs)
+        let outputs = TestUnaryOperation::<DataType>::new()
+            .jvp(&EagerContext::<Scalar, TestUnaryOperation<DataType>>::new(), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &Scalar::from(-2.0f32));
         assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
-        let context = TracingContext::<Scalar, TestUnaryOperation>::new();
+        let context = TracingContext::<Scalar, TestUnaryOperation<DataType>>::new();
         let primal = context.input(DataType::F32);
         let tangent = context.input(DataType::F32);
         let inputs = [DifferentiationDual::new(primal, tangent).unwrap()];
-        let outputs = TestUnaryOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestUnaryOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(context.builder().borrow().instructions().len(), 1);
         assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
 
@@ -6143,12 +6239,12 @@ mod tests {
 
     #[test]
     fn test_impl_non_transposable_operation() {
-        let mut context = TracingContext::<Scalar, TestUnaryOperation>::new();
-        let inputs: [PartialValue<Tracer<TracingContext<Scalar, TestUnaryOperation>>>; 0] = [];
-        let outputs: [MaybeZero<Tracer<TracingContext<Scalar, TestUnaryOperation>>>; 0] = [];
+        let mut context = TracingContext::<Scalar, TestUnaryOperation<DataType>>::new();
+        let inputs: [PartialValue<Tracer<TracingContext<Scalar, TestUnaryOperation<DataType>>>>; 0] = [];
+        let outputs: [MaybeZero<Tracer<TracingContext<Scalar, TestUnaryOperation<DataType>>>>; 0] = [];
         assert!(matches!(
-            <TestUnaryOperation as TransposableOperation<Scalar, TestUnaryOperation>>::transpose(
-                &TestUnaryOperation,
+            <TestUnaryOperation<DataType> as TransposableOperation<Scalar, TestUnaryOperation<DataType>>>::transpose(
+                &TestUnaryOperation::<DataType>::new(),
                 &mut context,
                 &EmptyRegionDriver,
                 &inputs,
@@ -6239,7 +6335,7 @@ mod tests {
 
     #[test]
     fn test_define_tracer_operator_unary() {
-        let context = TracingContext::<Scalar, TestUnaryOperation>::new();
+        let context = TracingContext::<Scalar, TestUnaryOperation<DataType>>::new();
         let input = context.input(DataType::F32);
         let input_id = input.atom_id().unwrap();
         let output = input.apply_unary();
@@ -6258,17 +6354,17 @@ mod tests {
         assert_eq!(output.value().atom_id(), Ok(builder.instructions()[0].outputs()[0]));
         drop(builder);
 
-        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestUnaryOperation>::new());
+        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestUnaryOperation<DataType>>::new());
         let input = PartialTracer::new(context, PartialEvaluationValue::known(Scalar::from(2.0f32)));
         assert_eq!(input.apply_unary().into_value().unwrap().as_known(), Some(&Scalar::from(-2.0f32)));
 
-        let context = BatchingContext::new(EagerContext::<Array, TestUnaryOperation>::new(), 2);
+        let context = BatchingContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new(), 2);
         let input = BatchingTracer::new(context, ArrayBatch::replicated(Array::scalar(2.0f32)));
         let output = input.apply_unary().into_batch();
         assert_eq!(output.value(), &Array::scalar(-2.0f32));
         assert!(output.batch_axis().is_replicated());
 
-        let context = DifferentiationContext::new(EagerContext::<Scalar, TestUnaryOperation>::new());
+        let context = DifferentiationContext::new(EagerContext::<Scalar, TestUnaryOperation<DataType>>::new());
         let input = DifferentiationTracer::new(
             DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(1.0f32)).unwrap(),
             context,
@@ -6280,7 +6376,7 @@ mod tests {
 
     #[test]
     fn test_define_tracer_operator_binary() {
-        let context = TracingContext::<Scalar, TestBinaryOperation>::new();
+        let context = TracingContext::<Scalar, TestBinaryOperation<DataType>>::new();
         let left = context.input(DataType::F32);
         let right = context.input(DataType::F32);
         let input_ids = [left.atom_id().unwrap(), right.atom_id().unwrap()];
@@ -6302,19 +6398,19 @@ mod tests {
         assert_eq!(output.value().atom_id(), Ok(builder.instructions()[0].outputs()[0]));
         drop(builder);
 
-        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestBinaryOperation>::new());
+        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestBinaryOperation<DataType>>::new());
         let left = PartialTracer::new(context.clone(), PartialEvaluationValue::known(Scalar::from(2.0f32)));
         let right = PartialTracer::new(context, PartialEvaluationValue::known(Scalar::from(3.0f32)));
         assert_eq!(left.apply_binary(right).into_value().unwrap().as_known(), Some(&Scalar::from(5.0f32)),);
 
-        let context = BatchingContext::new(EagerContext::<Array, TestBinaryOperation>::new(), 2);
+        let context = BatchingContext::new(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new(), 2);
         let left = BatchingTracer::new(context.clone(), ArrayBatch::replicated(Array::scalar(2.0f32)));
         let right = BatchingTracer::new(context, ArrayBatch::replicated(Array::scalar(3.0f32)));
         let output = left.apply_binary(right).into_batch();
         assert_eq!(output.value(), &Array::scalar(5.0f32));
         assert!(output.batch_axis().is_replicated());
 
-        let context = DifferentiationContext::new(EagerContext::<Scalar, TestBinaryOperation>::new());
+        let context = DifferentiationContext::new(EagerContext::<Scalar, TestBinaryOperation<DataType>>::new());
         let left = DifferentiationTracer::new(
             DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(1.0f32)).unwrap(),
             context.clone(),
@@ -6331,7 +6427,7 @@ mod tests {
     #[test]
     fn test_define_tracer_operator_binary_with_provider() {
         // The scalar universe selects the ordinary elementwise test operation.
-        let context = TracingContext::<Scalar, TestBinaryOperation>::new();
+        let context = TracingContext::<Scalar, TestBinaryOperation<DataType>>::new();
         let left = context.input(DataType::F32);
         let right = context.input(DataType::F32);
         let input_ids = [left.atom_id().unwrap(), right.atom_id().unwrap()];

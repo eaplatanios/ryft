@@ -28,7 +28,7 @@ define_elementwise_operation!(
 );
 
 impl_differentiable_operation! {
-    Atan2Operation,
+    <T> Atan2Operation<T>,
     jvp<C>
     where
         C::Type: DifferentiableType,
@@ -197,12 +197,12 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = Atan2Operation,
+            operation = Atan2Operation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
         check_operation_type_inference!(
             @reject @mismatched_reduced,
-            operation = Atan2Operation,
+            operation = Atan2Operation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -211,7 +211,7 @@ mod tests {
     fn test_atan2_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = Atan2Operation,
+            operation = Atan2Operation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -232,7 +232,7 @@ mod tests {
         let tangent = (x * y_tangent - y * x_tangent) / (x * x + y * y);
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = Atan2Operation,
+            operation = Atan2Operation::new(),
             cases = [{
                 primals = [Array::scalar(y), Array::scalar(x)],
                 tangents = [Array::scalar(y_tangent), Array::scalar(x_tangent)],
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn test_atan2_partial_evaluation() {
         check_operation_partial_evaluation!(
-            operation = Atan2Operation,
+            operation = Atan2Operation::new(),
             inputs = [0.5, -0.25],
             expected = 0.5f64.atan2(-0.25),
         );
@@ -308,7 +308,7 @@ mod tests {
     fn test_atan2_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = Atan2Operation,
+            operation = Atan2Operation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
