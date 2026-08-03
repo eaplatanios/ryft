@@ -461,7 +461,7 @@ impl<C: Context> PartialEvaluation<C> {
 /// which of its inputs are _known_. This is the result of calling [`Program::partition`]. This is typically passed to
 /// [`PartialEvaluationContext::inline_partitioned_program`] to inline it as part of an ongoing partial evaluation
 /// transform.
-pub struct PartitionedProgram<V: Value, O: Operation<V::Type>> {
+pub struct PartitionedProgram<V: Value, O: Operation<Type = V::Type>> {
     /// Refer to the documentation of [`known_program`](Self::known_program) for more information.
     known_program: Program<V, O, Vec<V>, Vec<V>>,
 
@@ -478,7 +478,7 @@ pub struct PartitionedProgram<V: Value, O: Operation<V::Type>> {
     outputs: Vec<PartialEvaluationOutput<usize>>,
 }
 
-impl<V: Value, O: Operation<V::Type>> PartitionedProgram<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// Returns the known-side [`Program`] of this [`PartitionedProgram`], which represents the known work reified
     /// through a fresh trace, taking the original inputs identified by
     /// [`known_input_indices`](Self::known_input_indices) and producing the fully known outputs followed by the
@@ -616,7 +616,7 @@ struct RecursivePartialEvaluationDriver<'r, D> {
     driver: &'r D,
 }
 
-impl<V: Value, O: Operation<V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
+impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
     for RecursivePartialEvaluationDriver<'_, D>
 {
     #[inline]
@@ -1076,7 +1076,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///     with the same [`Region`](crate::Region) contract as `build_known_operation`.
     pub fn inline_partitioned_program<
         V: Value<Type = C::Type>,
-        O: Operation<C::Type>,
+        O: Operation<Type = C::Type>,
         P: Into<C::Operation>,
         BuildKnownProgramOperation: FnOnce(Program<V, O, Vec<V>, Vec<V>>) -> (P, Vec<FlatProgram<C>>),
         BuildResidualProgramOperation: FnOnce(Program<V, O, Vec<V>, Vec<V>>) -> (P, Vec<FlatProgram<C>>),
@@ -1534,7 +1534,7 @@ where
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
     /// Partially evaluates this borrowed [`Region`](crate::Region) through the provided known-side context without
     /// materializing it. Refer to the documentation of [`Program::partially_evaluate_in_context`] for more information.
     pub fn partially_evaluate_in_context<C: Context<Type = V::Type, Constant = V, Operation = O>>(
@@ -1651,7 +1651,7 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Program<V, O, Vec<V>, Vec<V>> {
+impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Partially evaluates this [`Program`] against the provided [`PartialValue`] inputs, folding known work eagerly.
     /// This is the main partial evaluation entry point, instantiated at this program's own [`EagerContext`] so that
     /// known values are concrete values and folding interprets each all-known [`Instruction`](crate::Instruction)

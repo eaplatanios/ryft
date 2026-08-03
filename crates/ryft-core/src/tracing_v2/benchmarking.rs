@@ -440,7 +440,7 @@ where
     V: Value<Type = T>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-    O: Operation<T>,
+    O: Operation<Type = T>,
 {
     summarize_region(program.entry_region_ref())
 }
@@ -450,7 +450,7 @@ fn summarize_region<T, V, O>(program: RegionRef<'_, V, O>) -> Result<IrBenchmark
 where
     T: Type,
     V: Value<Type = T>,
-    O: Operation<T>,
+    O: Operation<Type = T>,
 {
     let mut op_histogram = BTreeMap::new();
     let mut nested_regions = Vec::new();

@@ -50,7 +50,7 @@ pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 /// un-linearized program directly, which JAX rejects for its `custom_jvp_call` primitive in exactly the same way.
 ///
 /// The `T` parameter fixes the type universe of both attached regions and the call boundary, so each concrete payload
-/// has exactly one [`Operation<T>`](Operation) contract while the semantic and transform implementations remain
+/// has exactly one [`Operation<Type = T>`](Operation) contract while the semantic and transform implementations remain
 /// shared across differentiable type universes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomJvpOperation<T: DifferentiableType> {
@@ -108,7 +108,9 @@ fn validated_custom_jvp_interfaces<T: DifferentiableType>(
     Ok(primal_interface)
 }
 
-impl<T: DifferentiableType> Operation<T> for CustomJvpOperation<T> {
+impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         CUSTOM_JVP_OPERATION_NAME
@@ -249,7 +251,7 @@ impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> fo
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
         + From<CustomJvpOperation<ArrayType>>,
@@ -459,7 +461,7 @@ pub const CUSTOM_VJP_OPERATION_NAME: &str = "custom_vjp";
 /// program directly, which JAX rejects for its `custom_vjp_call` primitive in exactly the same way.
 ///
 /// The `T` parameter fixes the type universe of all attached regions and the call boundary, so each concrete payload
-/// has exactly one [`Operation<T>`](Operation) contract while the semantic and transform implementations remain
+/// has exactly one [`Operation<Type = T>`](Operation) contract while the semantic and transform implementations remain
 /// shared across differentiable type universes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomVjpOperation<T: DifferentiableType> {
@@ -536,7 +538,9 @@ fn validated_custom_vjp_interfaces<T: DifferentiableType>(
     Ok(primal_interface)
 }
 
-impl<T: DifferentiableType> Operation<T> for CustomVjpOperation<T> {
+impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         CUSTOM_VJP_OPERATION_NAME
@@ -624,7 +628,7 @@ impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> fo
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
         + From<CustomVjpOperation<ArrayType>>,

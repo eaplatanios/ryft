@@ -88,7 +88,7 @@ use crate::types::{ArrayType, Memory};
 /// requested memory/computation tradeoff.
 ///
 /// The `T` parameter fixes the type universe of every attached region and the call boundary. Each concrete payload
-/// therefore has exactly one [`Operation<T>`](Operation) contract, while the rematerialization algorithm remains one
+/// therefore has exactly one [`Operation<Type = T>`](Operation) contract, while the rematerialization algorithm remains one
 /// shared implementation for all type universes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RematerializeOperation<T: Type> {
@@ -188,7 +188,9 @@ fn validated_rematerialize_interfaces<'i, T: Type>(
     Ok(primal_interface)
 }
 
-impl<T: Type> Operation<T> for RematerializeOperation<T> {
+impl<T: Type> Operation for RematerializeOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         "rematerialize"
@@ -360,7 +362,7 @@ impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> fo
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
         + From<RematerializeOperation<ArrayType>>,
@@ -462,7 +464,7 @@ impl From<RematerializationError> for ProgramError {
 /// `ryft-core`, so custom policies can inspect backend-specific variants and attributes directly. The application
 /// types belong to this nested producer and may differ from the type of the outer residual boundary.
 #[derive(Debug)]
-pub struct RematerializationProducer<'a, T: Type, O: Operation<T>> {
+pub struct RematerializationProducer<'a, T: Type, O: Operation<Type = T>> {
     /// Complete operation that may have produced the residual.
     operation: &'a O,
 
@@ -477,7 +479,7 @@ pub struct RematerializationProducer<'a, T: Type, O: Operation<T>> {
     output_types: Vec<T>,
 }
 
-impl<'a, T: Type, O: Operation<T>> RematerializationProducer<'a, T, O> {
+impl<'a, T: Type, O: Operation<Type = T>> RematerializationProducer<'a, T, O> {
     /// Returns the complete operation that may have produced the residual.
     #[inline]
     pub fn operation(&self) -> &'a O {
@@ -511,7 +513,7 @@ impl<'a, T: Type, O: Operation<T>> RematerializationProducer<'a, T, O> {
 /// branch, in semantic branch order. Policies inspect the complete producer set and return one placement decision
 /// for the boundary value; storage is never applied independently inside individual branches.
 #[derive(Debug)]
-pub struct RematerializationCandidate<'a, T: Type, O: Operation<T>> {
+pub struct RematerializationCandidate<'a, T: Type, O: Operation<Type = T>> {
     /// Operations that may have produced the residual, in stable semantic provenance order.
     producers: Vec<RematerializationProducer<'a, T, O>>,
 
@@ -519,7 +521,7 @@ pub struct RematerializationCandidate<'a, T: Type, O: Operation<T>> {
     residual_type: T,
 }
 
-impl<'a, T: Type, O: Operation<T>> RematerializationCandidate<'a, T, O> {
+impl<'a, T: Type, O: Operation<Type = T>> RematerializationCandidate<'a, T, O> {
     /// Returns the operations that may have produced this residual, in stable semantic provenance order.
     #[inline]
     pub fn producers(&self) -> &[RematerializationProducer<'a, T, O>] {
@@ -735,7 +737,7 @@ impl Display for RematerializationRejection {
 /// operations, so policies with storage capabilities bring their own operation-type bounds (e.g.,
 /// `O: From<TransferToMemoryOperation>` for [`MemoryTransferStorage`]) without imposing them on plain
 /// rematerialization.
-pub trait RematerializationPolicy<T: Type, O: Operation<T>> {
+pub trait RematerializationPolicy<T: Type, O: Operation<Type = T>> {
     /// Reversible storage transformation available to this policy through
     /// [`SaveWith`](RematerializationDecision::SaveWith).
     type Storage: ResidualStorage<T, O>;
@@ -759,7 +761,7 @@ pub trait RematerializationPolicy<T: Type, O: Operation<T>> {
 /// **Reversibility is an implementor law**: restoration must reproduce the logical residual *value* expected by the
 /// tangent and backward programs, up to physical representation (e.g., a different memory placement expressible in
 /// `T`). This cannot be validated structurally; the built-in implementations are verified numerically by tests.
-pub trait ResidualStorage<T: Type, O: Operation<T>> {
+pub trait ResidualStorage<T: Type, O: Operation<Type = T>> {
     /// Returns the operation producing the stored payload from the logical residual.
     fn store_operation(&self, logical_type: &T) -> Result<O, RematerializationError>;
 
@@ -773,7 +775,7 @@ pub trait ResidualStorage<T: Type, O: Operation<T>> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NoStorage {}
 
-impl<T: Type, O: Operation<T>> ResidualStorage<T, O> for NoStorage {
+impl<T: Type, O: Operation<Type = T>> ResidualStorage<T, O> for NoStorage {
     fn store_operation(&self, _logical_type: &T) -> Result<O, RematerializationError> {
         match *self {}
     }
@@ -811,7 +813,7 @@ impl MemoryTransferStorage {
 
 impl<O> ResidualStorage<ArrayType, O> for MemoryTransferStorage
 where
-    O: Operation<ArrayType> + From<TransferToMemoryOperation>,
+    O: Operation<Type = ArrayType> + From<TransferToMemoryOperation>,
 {
     fn store_operation(&self, _logical_type: &ArrayType) -> Result<O, RematerializationError> {
         Ok(O::from(TransferToMemoryOperation::new(self.destination)))
@@ -838,7 +840,7 @@ pub enum EitherStorage<S1, S2> {
     Right(S2),
 }
 
-impl<T: Type, O: Operation<T>, S1, S2> ResidualStorage<T, O> for EitherStorage<S1, S2>
+impl<T: Type, O: Operation<Type = T>, S1, S2> ResidualStorage<T, O> for EitherStorage<S1, S2>
 where
     S1: ResidualStorage<T, O>,
     S2: ResidualStorage<T, O>,
@@ -894,7 +896,7 @@ where
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct NothingSaveable;
 
-impl<T: Type, O: Operation<T>> RematerializationPolicy<T, O> for NothingSaveable {
+impl<T: Type, O: Operation<Type = T>> RematerializationPolicy<T, O> for NothingSaveable {
     type Storage = NoStorage;
 
     fn classify(
@@ -910,7 +912,7 @@ impl<T: Type, O: Operation<T>> RematerializationPolicy<T, O> for NothingSaveable
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EverythingSaveable;
 
-impl<T: Type, O: Operation<T>> RematerializationPolicy<T, O> for EverythingSaveable {
+impl<T: Type, O: Operation<Type = T>> RematerializationPolicy<T, O> for EverythingSaveable {
     type Storage = NoStorage;
 
     fn classify(
@@ -929,7 +931,7 @@ pub struct DotsSaveable;
 
 impl<O> RematerializationPolicy<ArrayType, O> for DotsSaveable
 where
-    O: Operation<ArrayType>,
+    O: Operation<Type = ArrayType>,
     for<'a> &'a O: TryInto<&'a DotOperation>,
 {
     type Storage = NoStorage;
@@ -960,7 +962,7 @@ pub struct DotsWithNoBatchDimsSaveable;
 
 impl<O> RematerializationPolicy<ArrayType, O> for DotsWithNoBatchDimsSaveable
 where
-    O: Operation<ArrayType>,
+    O: Operation<Type = ArrayType>,
     for<'a> &'a O: TryInto<&'a DotOperation>,
 {
     type Storage = NoStorage;
@@ -994,7 +996,7 @@ impl SaveOnlyTheseNames {
 
 impl<T: Type, O> RematerializationPolicy<T, O> for SaveOnlyTheseNames
 where
-    O: Operation<T>,
+    O: Operation<Type = T>,
     for<'a> &'a O: TryInto<&'a TagOperation<T>>,
 {
     type Storage = NoStorage;
@@ -1033,7 +1035,7 @@ impl SaveAnyNamesButThese {
 
 impl<T: Type, O> RematerializationPolicy<T, O> for SaveAnyNamesButThese
 where
-    O: Operation<T>,
+    O: Operation<Type = T>,
     for<'a> &'a O: TryInto<&'a TagOperation<T>>,
 {
     type Storage = NoStorage;
@@ -1072,7 +1074,7 @@ impl SaveAnythingExceptTheseNames {
 
 impl<T: Type, O> RematerializationPolicy<T, O> for SaveAnythingExceptTheseNames
 where
-    O: Operation<T>,
+    O: Operation<Type = T>,
     for<'a> &'a O: TryInto<&'a TagOperation<T>>,
 {
     type Storage = NoStorage;
@@ -1117,7 +1119,7 @@ impl<P1, P2> SaveFromBothPolicies<P1, P2> {
     }
 }
 
-impl<T: Type, O: Operation<T>, P1, P2> RematerializationPolicy<T, O> for SaveFromBothPolicies<P1, P2>
+impl<T: Type, O: Operation<Type = T>, P1, P2> RematerializationPolicy<T, O> for SaveFromBothPolicies<P1, P2>
 where
     P1: RematerializationPolicy<T, O>,
     P2: RematerializationPolicy<T, O>,
@@ -1183,7 +1185,7 @@ impl SaveAndOffloadOnlyTheseNames {
 
 impl<O> RematerializationPolicy<ArrayType, O> for SaveAndOffloadOnlyTheseNames
 where
-    O: Operation<ArrayType> + From<TransferToMemoryOperation>,
+    O: Operation<Type = ArrayType> + From<TransferToMemoryOperation>,
     for<'a> &'a O: TryInto<&'a TagOperation<ArrayType>>,
 {
     type Storage = MemoryTransferStorage;
@@ -1227,7 +1229,7 @@ impl OffloadDotsWithNoBatchDims {
 
 impl<O> RematerializationPolicy<ArrayType, O> for OffloadDotsWithNoBatchDims
 where
-    O: Operation<ArrayType> + From<TransferToMemoryOperation>,
+    O: Operation<Type = ArrayType> + From<TransferToMemoryOperation>,
     for<'a> &'a O: TryInto<&'a DotOperation>,
 {
     type Storage = MemoryTransferStorage;
@@ -1278,7 +1280,7 @@ impl<F, S> Debug for PolicyFn<F, S> {
     }
 }
 
-impl<T: Type, O: Operation<T>, S, F> RematerializationPolicy<T, O> for PolicyFn<F, S>
+impl<T: Type, O: Operation<Type = T>, S, F> RematerializationPolicy<T, O> for PolicyFn<F, S>
 where
     S: ResidualStorage<T, O>,
     F: Fn(&RematerializationCandidate<'_, T, O>) -> Result<RematerializationDecision<S>, RematerializationRejection>,
@@ -1294,7 +1296,7 @@ where
 }
 
 /// Validates one [`ResidualStorage`] operation against its input type and returns its single output type.
-fn validate_storage_operation<T: Type, O: Operation<T>>(
+fn validate_storage_operation<T: Type, O: Operation<Type = T>>(
     operation: &O,
     input_type: &T,
 ) -> Result<T, RematerializationError> {
@@ -1324,7 +1326,7 @@ fn validate_storage_operation<T: Type, O: Operation<T>>(
 
 /// Stages one [`ResidualStorage`] operation over one already-staged value in a program under assembly and returns its
 /// output atom after validating the storage contract.
-fn stage_storage_operation<V: Value, O: Operation<V::Type>>(
+fn stage_storage_operation<V: Value, O: Operation<Type = V::Type>>(
     builder: &mut ProgramBuilder<V, O>,
     operation: O,
     input: AtomId,
@@ -1368,7 +1370,7 @@ fn validate_restored_residual_type<T: Type>(restored_type: &T, logical_type: &T)
 /// only ever grow, and adding a cut can never make a pure slice impure. Negative answers are recomputed per root, so
 /// the producer-topological upgrade pass in [`Rematerialize::call`] is deterministic: once an earlier root upgrades
 /// to a saved cut, every later root's slice legitimately terminates there.
-fn residual_slice_is_pure<V: Value, O: Operation<V::Type>>(
+fn residual_slice_is_pure<V: Value, O: Operation<Type = V::Type>>(
     primal: &Program<V, O, Vec<V>, Vec<V>>,
     instruction_by_output: &[Option<usize>],
     cuts: &HashSet<usize>,
@@ -1430,7 +1432,7 @@ struct PrimalSliceResolver<'p, V: Value, O> {
     region_remapping: HashMap<RegionId, RegionId>,
 }
 
-impl<'p, V: Value, O: Operation<V::Type>> PrimalSliceResolver<'p, V, O> {
+impl<'p, V: Value, O: Operation<Type = V::Type>> PrimalSliceResolver<'p, V, O> {
     /// Creates a resolver over `primal` whose region inputs resolve to `region_inputs` in the destination program.
     fn new(primal: &'p Program<V, O, Vec<V>, Vec<V>>, region_inputs: &[AtomId]) -> Self {
         let mut cuts = vec![None; primal.atoms().len()];
@@ -1548,7 +1550,7 @@ fn assemble_reconstruction_program<V, O, S>(
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value,
-    O: Operation<V::Type>,
+    O: Operation<Type = V::Type>,
     S: ResidualStorage<V::Type, O>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
 {
@@ -2138,9 +2140,9 @@ mod tests {
 
     #[test]
     fn test_rematerialize_effects_only_include_the_primal_region() {
-        let operation = RematerializeOperation::new();
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 0), Some(RegionRole::Computation));
-        assert!((1..4).all(|index| Operation::<ArrayType>::region_role(&operation, index) == Some(RegionRole::Rule)));
+        let operation = RematerializeOperation::<ArrayType>::new();
+        assert_eq!(Operation::region_role(&operation, 0), Some(RegionRole::Computation));
+        assert!((1..4).all(|index| Operation::region_role(&operation, index) == Some(RegionRole::Rule)));
     }
 
     #[test]
@@ -3465,7 +3467,9 @@ mod tests {
             }
         }
 
-        impl Operation<ArrayType> for SplitOperation {
+        impl Operation for SplitOperation {
+            type Type = ArrayType;
+
             fn name(&self) -> &'static str {
                 "split"
             }
@@ -3531,7 +3535,9 @@ mod tests {
             }
         }
 
-        impl Operation<ArrayType> for InvalidOriginOperation {
+        impl Operation for InvalidOriginOperation {
+            type Type = ArrayType;
+
             fn name(&self) -> &'static str {
                 "invalid_origin"
             }
@@ -3623,7 +3629,9 @@ mod tests {
             }
         }
 
-        impl Operation<ArrayType> for PassThroughOriginOperation {
+        impl Operation for PassThroughOriginOperation {
+            type Type = ArrayType;
+
             fn name(&self) -> &'static str {
                 "pass_through_origin"
             }
@@ -3696,7 +3704,9 @@ mod tests {
             }
         }
 
-        impl Operation<ArrayType> for InvalidStorageTestOperation {
+        impl Operation for InvalidStorageTestOperation {
+            type Type = ArrayType;
+
             fn name(&self) -> &'static str {
                 match self {
                     Self::ZeroOutputs => "zero_outputs",

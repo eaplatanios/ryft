@@ -310,7 +310,7 @@ where
 /// for `V`. `C` defaults to `V` for the common non-capturing case, where no capture table exists and the distinction
 /// is moot. Refer to [`CapturingContext`](crate::CapturingContext) and [`CaptureReference`](crate::CaptureReference)
 /// for more information on what captures are and how they are used in practice.
-pub struct TracingContext<V: Value, O: Operation<V::Type>, C = V> {
+pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced. The builder is held behind
     /// an [`Rc`] rather than being outright owned because a single trace shares one builder across many contexts.
     /// A [`Tracer`] holds its [`Context`] by value, and tracing freely clones tracers (and hence their contexts) as
@@ -345,7 +345,7 @@ pub struct TracingContext<V: Value, O: Operation<V::Type>, C = V> {
     named_axes: Rc<Vec<(String, NamedAxis)>>,
 }
 
-impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     /// Creates a new [`TracingContext`] over the `(V, O)` type universe with a fresh, empty [`ProgramBuilder`] and a
     /// fresh, empty capture table. Use [`builder`](Self::builder) afterward to read or finalize the staged program, and
     /// [`captures`](Self::captures) to read values registered through [`capture`](crate::CapturingContext::capture). To
@@ -457,35 +457,35 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> Clone for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> Clone for TracingContext<V, O, C> {
     #[inline]
     fn clone(&self) -> Self {
         Self { builder: self.builder.clone(), captures: self.captures.clone(), named_axes: self.named_axes.clone() }
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> Debug for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> Debug for TracingContext<V, O, C> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("TracingContext").finish_non_exhaustive()
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> Default for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> Default for TracingContext<V, O, C> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> Domain for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> Domain for TracingContext<V, O, C> {
     type Type = V::Type;
     type Value = Tracer<Self>;
     type Constant = V;
     type Operation = O;
 }
 
-impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> Context for TracingContext<V, O, C> {
     #[inline]
     fn lift(&self, constant: V) -> Result<Tracer<Self>, ProgramError> {
         Ok(self.constant(constant))
@@ -522,7 +522,7 @@ impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> StagingContext for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, C> StagingContext for TracingContext<V, O, C> {
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
         &self.builder
@@ -1056,7 +1056,9 @@ mod tests {
         #[derive(Copy, Clone, Debug)]
         struct NoOutputOperation;
 
-        impl Operation<DataType> for NoOutputOperation {
+        impl Operation for NoOutputOperation {
+            type Type = DataType;
+
             #[inline]
             fn name(&self) -> &'static str {
                 "no_output"

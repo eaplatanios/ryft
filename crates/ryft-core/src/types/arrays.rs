@@ -511,14 +511,14 @@ impl Type for ArrayType {
 }
 
 // `ArrayType` describes itself. This fixed point (rather than a dummy unit-like type) is deliberate and load-bearing
-// for metadata-only programs. The whole value of tracing with `ArrayType` as the carrier is that it inhabits the same
-// type universe as real arrays, so every piece of machinery it reuses (e.g., `Operation<ArrayType>` type inference,
-// lowering bounds such as `MlirLowerableValue: Value<Type = ArrayType>` in `ryft-xla`, and tracing and staging code
-// pinned on `V: Value<Type = ArrayType>`) accepts it anywhere a concrete array value would slot in. A dummy `Type`
-// would place the carrier in a fresh operation universe with no operations or inference rules and an opaque unit type
-// would additionally discard the shape, element-type, and sharding payload that `r#type()` feeds to type inference
-// during a metadata trace. This is the standard abstract-interpretation move (e.g., JAX's `eval_shape` traces with
-// `ShapeDtypeStruct` standing in for arrays, and an abstract value's abstract value is itself).
+// for metadata-only programs. The whole value of tracing with `ArrayType` as the carrier is that it inhabits the
+// same type universe as real arrays, so every piece of machinery it reuses (e.g., `Operation<Type = ArrayType>` type
+// inference, lowering bounds such as `MlirLowerableValue: Value<Type = ArrayType>` in `ryft-xla`, and tracing and
+// staging code pinned on `V: Value<Type = ArrayType>`) accepts it anywhere a concrete array value would slot in.
+// A dummy `Type` would place the carrier in a fresh operation universe with no operations or inference rules and an
+// opaque unit type would additionally discard the shape, element-type, and sharding payload that `r#type()` feeds to
+// type inference during a metadata trace. This is the standard abstract-interpretation move (e.g., JAX's `eval_shape`
+// traces with `ShapeDtypeStruct` standing in for arrays, and an abstract value's abstract value is itself).
 impl Typed for ArrayType {
     type Type = ArrayType;
 
