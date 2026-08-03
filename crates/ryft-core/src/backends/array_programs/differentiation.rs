@@ -97,7 +97,7 @@ where
 
     #[inline]
     fn residual_stack_add() -> Self {
-        Self::from(ArrayProgramOperation::<A>::from(AddOperation))
+        Self::from(ArrayProgramOperation::<A>::from(AddOperation::new()))
     }
 
     #[inline]
@@ -115,7 +115,7 @@ where
 
     #[inline]
     fn mask_and() -> Self {
-        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::And(AndOperation)))
+        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::And(AndOperation::new())))
     }
 }
 
@@ -892,7 +892,7 @@ where
                             .remove(0);
                         let normalized_mask = context
                             .bind(
-                                ArrayProgramOperation::<A>::Array(ArrayOperation::Div(DivOperation)),
+                                ArrayProgramOperation::<A>::Array(ArrayOperation::Div(DivOperation::new())),
                                 Vec::new(),
                                 &[numeric_mask, broadcast_tie_count],
                             )?
@@ -910,7 +910,7 @@ where
                                 let forward_context = linear_inputs[0].dispatch_domain();
                                 let masked_tangent = forward_context
                                     .bind(
-                                        ArrayProgramOperation::<A>::Array(ArrayOperation::Mul(MulOperation)),
+                                        ArrayProgramOperation::<A>::Array(ArrayOperation::Mul(MulOperation::new())),
                                         Vec::new(),
                                         &[residuals[mask_index].clone(), linear_inputs[0].clone()],
                                     )?
@@ -942,7 +942,7 @@ where
                                     )?
                                     .remove(0);
                                 transpose_context.bind(
-                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Mul(MulOperation)),
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Mul(MulOperation::new())),
                                     Vec::new(),
                                     &[residuals[mask_index].clone(), broadcasted],
                                 )
@@ -1040,7 +1040,7 @@ where
                                     )?
                                     .remove(0);
                                 transpose_context.bind(
-                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Div(DivOperation)),
+                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Div(DivOperation::new())),
                                     Vec::new(),
                                     &[broadcasted, element_count],
                                 )
@@ -2002,7 +2002,7 @@ mod tests {
         let factor = builder.add_constant(array(Array::scalar(factor)));
         let output = builder
             .add_instruction(
-                TestOperation::Array(ArrayOperation::from(MulOperation)),
+                TestOperation::Array(ArrayOperation::from(MulOperation::new())),
                 Vec::new(),
                 vec![operand, factor],
             )
@@ -2237,7 +2237,11 @@ mod tests {
         let carry = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
         let item = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
         let product = builder
-            .add_instruction(TestOperation::Array(ArrayOperation::from(MulOperation)), Vec::new(), vec![carry, item])
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(MulOperation::new())),
+                Vec::new(),
+                vec![carry, item],
+            )
             .unwrap()[0];
         builder.build(vec![extent, product, product], vec![Placeholder; 3], vec![Placeholder; 3]).unwrap()
     }
@@ -2336,7 +2340,11 @@ mod tests {
             .unwrap()[0];
         let one = body_builder.add_constant(array(Array::scalar(1_u64)));
         let next_counter = body_builder
-            .add_instruction(TestOperation::Array(ArrayOperation::from(AddOperation)), Vec::new(), vec![counter, one])
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![counter, one],
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
@@ -2394,7 +2402,11 @@ mod tests {
         let extent = body_builder.add_input(ArrayProgramType::Dimension(extent_type));
         let state = body_builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
         let doubled = body_builder
-            .add_instruction(TestOperation::Array(ArrayOperation::from(AddOperation)), Vec::new(), vec![state, state])
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![state, state],
+            )
             .unwrap()[0];
         let body = body_builder.build(vec![extent, doubled], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
         vec![condition, body]
@@ -2461,7 +2473,11 @@ mod tests {
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let state = body_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
         let doubled = body_builder
-            .add_instruction(TestOperation::Array(ArrayOperation::from(AddOperation)), Vec::new(), vec![state, state])
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![state, state],
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![doubled], vec![Placeholder], vec![Placeholder])
@@ -2527,7 +2543,11 @@ mod tests {
             .unwrap()[0];
         let one = body_builder.add_constant(array(Array::scalar(1_i64)));
         let next_counter = body_builder
-            .add_instruction(TestOperation::Array(ArrayOperation::from(AddOperation)), Vec::new(), vec![counter, one])
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![counter, one],
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
@@ -2625,7 +2645,11 @@ mod tests {
             .unwrap()[0];
         let one = body_builder.add_constant(array(Array::scalar(1_u64)));
         let next_counter = body_builder
-            .add_instruction(TestOperation::Array(ArrayOperation::from(AddOperation)), Vec::new(), vec![counter, one])
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![counter, one],
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(

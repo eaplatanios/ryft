@@ -521,7 +521,7 @@ mod tests {
 
         let tangent_calls = Cell::new(0);
         let outputs = unary_elementwise_jvp(
-            &SinOperation,
+            &SinOperation::new(),
             &[DifferentiationDual::new_with_zero_tangent(Scalar::from(2.0f64))],
             |input| Ok(*input),
             |_| {
@@ -536,7 +536,7 @@ mod tests {
 
         let primal_evaluations = Cell::new(0);
         let outputs = unary_elementwise_jvp(
-            &SinOperation,
+            &SinOperation::new(),
             &[DifferentiationDual::new(Scalar::from(2.0f64), Scalar::from(3.0f64)).unwrap()],
             |input| {
                 primal_evaluations.set(primal_evaluations.get() + 1);
@@ -556,7 +556,7 @@ mod tests {
         let primal_evaluations = Cell::new(0);
         let input_primal = Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let outputs = unary_elementwise_jvp(
-            &SinOperation,
+            &SinOperation::new(),
             &[DifferentiationDual::new(input_primal, Scalar::from(3.0f32)).unwrap()],
             |input| {
                 primal_evaluations.set(primal_evaluations.get() + 1);
@@ -592,7 +592,7 @@ mod tests {
                 if message == "'boolean_output' output type bool has no tangent space",
         ));
         assert!(matches!(
-            unary_elementwise_jvp(&SinOperation, &[], |input: &Scalar| Ok(*input), |_| Ok(Scalar::from(1.0f64)),),
+            unary_elementwise_jvp(&SinOperation::new(), &[], |input: &Scalar| Ok(*input), |_| Ok(Scalar::from(1.0f64)),),
             Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
         ));
     }
@@ -606,7 +606,7 @@ mod tests {
         let compare = CompareOperation::new(ComparisonDirection::LessThan);
 
         let outputs = binary_elementwise_jvp(
-            &AddOperation,
+            &AddOperation::new(),
             &[
                 DifferentiationDual::new_with_zero_tangent(left_primal),
                 DifferentiationDual::new_with_zero_tangent(right_primal),
@@ -645,7 +645,7 @@ mod tests {
         assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::Zero)));
 
         let outputs = binary_elementwise_jvp(
-            &AddOperation,
+            &AddOperation::new(),
             &[
                 DifferentiationDual::new(left_primal, Scalar::from(3.0f64)).unwrap(),
                 DifferentiationDual::new_with_zero_tangent(right_primal),
@@ -665,7 +665,7 @@ mod tests {
         assert_eq!((left_calls.get(), right_calls.get()), (1, 0));
 
         let outputs = binary_elementwise_jvp(
-            &AddOperation,
+            &AddOperation::new(),
             &[
                 DifferentiationDual::new_with_zero_tangent(left_primal),
                 DifferentiationDual::new(right_primal, Scalar::from(4.0f64)).unwrap(),
@@ -685,7 +685,7 @@ mod tests {
         assert_eq!((left_calls.get(), right_calls.get()), (1, 1));
 
         let outputs = binary_elementwise_jvp(
-            &AddOperation,
+            &AddOperation::new(),
             &[
                 DifferentiationDual::new(left_primal, Scalar::from(3.0f64)).unwrap(),
                 DifferentiationDual::new(right_primal, Scalar::from(4.0f64)).unwrap(),
@@ -724,7 +724,7 @@ mod tests {
         ));
         assert!(matches!(
             binary_elementwise_jvp(
-                &AddOperation,
+                &AddOperation::new(),
                 &[DifferentiationDual::new_with_zero_tangent(left_primal)],
                 |left, right| Ok(*left + *right),
                 |_, tangent| Ok(tangent),

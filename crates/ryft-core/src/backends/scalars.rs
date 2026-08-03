@@ -63,38 +63,38 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     One(OneOperation<DataType>),
     OneLike(OneLikeOperation<DataType>),
     Constant(ConstantOperation<V>),
-    Abs(AbsOperation),
-    Neg(NegOperation),
-    Add(AddOperation),
-    Sub(SubOperation),
-    Mul(MulOperation),
-    Div(DivOperation),
-    Sin(SinOperation),
-    Cos(CosOperation),
-    Atan2(Atan2Operation),
-    Exp(ExpOperation),
-    Log(LogOperation),
-    Sqrt(SqrtOperation),
-    Rsqrt(RsqrtOperation),
-    Tanh(TanhOperation),
-    Logistic(LogisticOperation),
-    Erf(ErfOperation),
-    Pow(PowOperation),
-    Sign(SignOperation),
-    Floor(FloorOperation),
-    Ceil(CeilOperation),
-    Round(RoundOperation),
-    Max(MaxOperation),
-    Min(MinOperation),
-    Rem(RemOperation),
-    Not(NotOperation),
-    And(AndOperation),
-    Or(OrOperation),
-    Xor(XorOperation),
-    Complex(ComplexOperation),
-    Conjugate(ConjugateOperation),
-    Real(RealOperation),
-    Imaginary(ImaginaryOperation),
+    Abs(AbsOperation<DataType>),
+    Neg(NegOperation<DataType>),
+    Add(AddOperation<DataType>),
+    Sub(SubOperation<DataType>),
+    Mul(MulOperation<DataType>),
+    Div(DivOperation<DataType>),
+    Sin(SinOperation<DataType>),
+    Cos(CosOperation<DataType>),
+    Atan2(Atan2Operation<DataType>),
+    Exp(ExpOperation<DataType>),
+    Log(LogOperation<DataType>),
+    Sqrt(SqrtOperation<DataType>),
+    Rsqrt(RsqrtOperation<DataType>),
+    Tanh(TanhOperation<DataType>),
+    Logistic(LogisticOperation<DataType>),
+    Erf(ErfOperation<DataType>),
+    Pow(PowOperation<DataType>),
+    Sign(SignOperation<DataType>),
+    Floor(FloorOperation<DataType>),
+    Ceil(CeilOperation<DataType>),
+    Round(RoundOperation<DataType>),
+    Max(MaxOperation<DataType>),
+    Min(MinOperation<DataType>),
+    Rem(RemOperation<DataType>),
+    Not(NotOperation<DataType>),
+    And(AndOperation<DataType>),
+    Or(OrOperation<DataType>),
+    Xor(XorOperation<DataType>),
+    Complex(ComplexOperation<DataType>),
+    Conjugate(ConjugateOperation<DataType>),
+    Real(RealOperation<DataType>),
+    Imaginary(ImaginaryOperation<DataType>),
     Compare(CompareOperation<DataType>),
     Select(SelectOperation<DataType>),
     While(WhileOperation<DataType>),
@@ -2343,7 +2343,7 @@ mod tests {
     fn scalar_doubling_body() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let carry = builder.add_input(DataType::F64);
-        let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -2915,7 +2915,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::C64);
         let constant = builder.add_constant(Scalar::from(Complex::new(1.5f32, -2.0f32)));
-        let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, constant]).unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();

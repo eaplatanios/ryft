@@ -2741,7 +2741,7 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let [direct_output] = ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation))
+        let [direct_output] = ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation::new()))
             .interpret_with_batch_axes(&context, &[direct_input], &[BatchAxis::new(0)])?
             .try_into()
             .unwrap();
@@ -2762,7 +2762,7 @@ mod tests {
         );
         let [output] = context
             .bind(
-                ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation)),
+                ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation::new())),
                 Vec::new(),
                 std::slice::from_ref(&input),
             )?
@@ -2878,7 +2878,7 @@ mod tests {
             BatchingTracer::new(elementwise_context.clone(), ArrayProgramBatch::replicated(replicated)),
         ];
         let [output] = elementwise_context
-            .bind(ArrayProgramOperation::Array(ArrayOperation::Add(AddOperation)), Vec::new(), &inputs)?
+            .bind(ArrayProgramOperation::Array(ArrayOperation::Add(AddOperation::new())), Vec::new(), &inputs)?
             .try_into()
             .unwrap();
         let elementwise_output_id = output.batch().value().atom_id().unwrap();
@@ -2954,7 +2954,7 @@ mod tests {
         let input = BatchingTracer::new(context.clone(), ArrayProgramBatch::new(mapped, BatchAxis::new(1))?);
         let [output] = context
             .bind(
-                ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation)),
+                ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation::new())),
                 Vec::new(),
                 std::slice::from_ref(&input),
             )?
@@ -2985,7 +2985,7 @@ mod tests {
             BatchingTracer::new(context.clone(), ArrayProgramBatch::new(right, BatchAxis::new(1))?),
         ];
         let [output] = context
-            .bind(ArrayProgramOperation::Array(ArrayOperation::Add(AddOperation)), Vec::new(), &inputs)?
+            .bind(ArrayProgramOperation::Array(ArrayOperation::Add(AddOperation::new())), Vec::new(), &inputs)?
             .try_into()
             .unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
@@ -3058,7 +3058,7 @@ mod tests {
         let branch_array = branch_builder.add_input(unbatched_array_type.clone().into());
         let branch_dimension = branch_builder.add_input(shared_dimension_type.clone().into());
         let branch_array = branch_builder.add_instruction(
-            ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation)),
+            ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation::new())),
             Vec::new(),
             vec![branch_array],
         )?[0];
@@ -3299,7 +3299,7 @@ mod tests {
         let body_dimension = body_builder.add_input(dimension_type.clone().into());
         let false_value = body_builder.add_constant(ArrayProgramValue::Array(Array::scalar(false)));
         let negated = body_builder.add_instruction(
-            ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation)),
+            ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation::new())),
             Vec::new(),
             vec![body_array],
         )?[0];
@@ -3470,12 +3470,12 @@ mod tests {
         let dimension = body_builder.add_input(dimension_type.clone().into());
         let item = body_builder.add_input(ArrayType::scalar(DataType::F32).into());
         let next_carry = body_builder.add_instruction(
-            ArrayProgramOperation::Array(ArrayOperation::Add(AddOperation)),
+            ArrayProgramOperation::Array(ArrayOperation::Add(AddOperation::new())),
             Vec::new(),
             vec![carry, item],
         )?[0];
         let output = body_builder.add_instruction(
-            ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation)),
+            ArrayProgramOperation::Array(ArrayOperation::Neg(NegOperation::new())),
             Vec::new(),
             vec![item],
         )?[0];

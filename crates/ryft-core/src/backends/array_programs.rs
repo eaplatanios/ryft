@@ -48,7 +48,9 @@ use crate::operations::manipulation::{
     LegacyReshapeOperation, Pad, PadOperation, Reshape, ReshapeOperation, ReshapeParameters, ScatterDimensionNumbers,
     ScatterOperation, ScatterReductionKind, Slice, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
-use crate::operations::math::{AddOperation, DivOperation, MulOperation, Reduce, ReduceOperation, ReductionKind};
+use crate::operations::math::{
+    AddOperation, AddOperationProvider, DivOperation, MulOperation, Reduce, ReduceOperation, ReductionKind,
+};
 use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
 use crate::parameters::Parameter;
 use crate::partial::{
@@ -718,10 +720,21 @@ impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayProgram
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<AddOperation> for ArrayProgramOperation<A> {
+impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayType>> for ArrayProgramOperation<A> {
     #[inline]
-    fn from(operation: AddOperation) -> Self {
+    fn from(operation: AddOperation<ArrayType>) -> Self {
         Self::Array(ArrayOperation::Add(operation))
+    }
+}
+
+impl<A: Value<Type = ArrayType>> AddOperationProvider<ArrayProgramType> for ArrayProgramOperation<A> {
+    fn add_operation(r#type: &ArrayProgramType) -> Result<Self, ProgramError> {
+        match r#type {
+            ArrayProgramType::Array(_) => Ok(Self::Array(ArrayOperation::Add(AddOperation::new()))),
+            ArrayProgramType::Dimension(_) => {
+                Err(TypeError::invalid("cannot add first-class dimension cotangents").into())
+            }
+        }
     }
 }
 
@@ -2811,7 +2824,7 @@ mod tests {
         assert_projection::<DimensionType, DimensionOperation<DimensionValue>, ArrayProgramOperation<Array>>();
 
         let array_type = ArrayType::scalar(DataType::F32);
-        let array_operation = ArrayProgramOperation::<Array>::from(ArrayOperation::Add(AddOperation));
+        let array_operation = ArrayProgramOperation::<Array>::from(ArrayOperation::Add(AddOperation::new()));
         assert!(matches!(array_operation, ArrayProgramOperation::Array(ArrayOperation::Add(_))));
         assert_eq!(array_operation.name(), "add");
         assert_eq!(array_operation.to_string(), "add");
@@ -3070,7 +3083,7 @@ mod tests {
         let context = EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
         assert_eq!(
             context.bind(
-                ArrayOperation::Add(AddOperation),
+                ArrayOperation::Add(AddOperation::new()),
                 Vec::new(),
                 &[
                     ArrayProgramValue::Array(Array::vector(vec![1.0, 2.0])),
@@ -3294,7 +3307,7 @@ mod tests {
         let array = context.input(ArrayType::scalar(DataType::F32).into());
         let array_atom = array.atom_id().unwrap();
         let array = <Tracer<TestContext> as ValueProjection<ArrayType>>::into_projected(array).unwrap();
-        array.dispatch_domain().bind(AddOperation, Vec::new(), &[array.clone(), array]).unwrap();
+        array.dispatch_domain().bind(AddOperation::new(), Vec::new(), &[array.clone(), array]).unwrap();
 
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
@@ -3660,7 +3673,7 @@ mod tests {
                     let factor = context.lift(ArrayProgramValue::Array(Array::scalar(3.0_f64)))?;
                     Ok(context
                         .bind(
-                            ArrayProgramOperation::<Array>::Array(ArrayOperation::Mul(MulOperation)),
+                            ArrayProgramOperation::<Array>::Array(ArrayOperation::Mul(MulOperation::new())),
                             Vec::new(),
                             &[input, factor],
                         )?
@@ -3682,7 +3695,7 @@ mod tests {
                     let factor = context.lift(ArrayProgramValue::Array(Array::scalar(3.0_f64)))?;
                     Ok(context
                         .bind(
-                            ArrayProgramOperation::<Array>::Array(ArrayOperation::Mul(MulOperation)),
+                            ArrayProgramOperation::<Array>::Array(ArrayOperation::Mul(MulOperation::new())),
                             Vec::new(),
                             &[input, factor],
                         )?
@@ -3702,7 +3715,7 @@ mod tests {
         let factor = builder.add_constant(ArrayProgramValue::Array(Array::scalar(3.0_f64)));
         let output = builder
             .add_instruction(
-                ArrayProgramOperation::<Array>::Array(ArrayOperation::Mul(MulOperation)),
+                ArrayProgramOperation::<Array>::Array(ArrayOperation::Mul(MulOperation::new())),
                 Vec::new(),
                 vec![input, factor],
             )

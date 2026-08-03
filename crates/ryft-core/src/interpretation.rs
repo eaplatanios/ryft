@@ -578,7 +578,7 @@ mod tests {
         // A program whose two outputs are the same atom materializes that value into both output positions.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F32);
-        let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder
             .build::<Scalar, (Scalar, Scalar)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder))
             .unwrap();
@@ -637,7 +637,7 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(7.0f64));
         let c1 = builder.add_constant(Scalar::from(3.0f64));
-        let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, c1]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
         let mut lifted_constants = Vec::new();
         assert_eq!(
@@ -677,9 +677,9 @@ mod tests {
     #[test]
     fn test_program_interpret_input_type_checking() {
         // A statically typed program input rejects values whose concrete types do not match it exactly.
-        let mut builder = ProgramBuilder::<Array, AddOperation>::new();
+        let mut builder = ProgramBuilder::<Array, AddOperation<ArrayType>>::new();
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
-        let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
@@ -690,12 +690,12 @@ mod tests {
 
         // An unbounded dynamically sized program input accepts concrete values of any size, so one staged program
         // replays at several concrete sizes. Rank mismatches are still rejected.
-        let mut builder = ProgramBuilder::<Array, AddOperation>::new();
+        let mut builder = ProgramBuilder::<Array, AddOperation<ArrayType>>::new();
         let i0 = builder.add_input(ArrayType::new(
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
         ));
-        let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0, 3.0])).unwrap().to_f64s(), vec![2.0, 4.0, 6.0]);
@@ -706,7 +706,7 @@ mod tests {
         ));
 
         // A bounded dynamically sized program input enforces its exclusive upper bound on concrete sizes.
-        let mut builder = ProgramBuilder::<Array, AddOperation>::new();
+        let mut builder = ProgramBuilder::<Array, AddOperation<ArrayType>>::new();
         let i0 = builder.add_input(ArrayType::new(
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
@@ -714,7 +714,7 @@ mod tests {
                 DimensionBounds::non_negative(Some(3)).unwrap(),
             ))]),
         ));
-        let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
@@ -844,7 +844,7 @@ mod tests {
     fn test_program_interpret_with_wrong_number_of_operation_outputs() {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
-        let o0 = builder.add_instruction(NegOperation, Vec::new(), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.interpret_with(
