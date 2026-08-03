@@ -257,7 +257,7 @@ impl std::ops::BitAnd for Array<'_> {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self {
-        bind_single_output(AndOperation, &[self, rhs]).expect("`and` operation failed")
+        bind_single_output(AndOperation::new(), &[self, rhs]).expect("`and` operation failed")
     }
 }
 
@@ -265,7 +265,7 @@ impl std::ops::BitOr for Array<'_> {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self {
-        bind_single_output(OrOperation, &[self, rhs]).expect("`or` operation failed")
+        bind_single_output(OrOperation::new(), &[self, rhs]).expect("`or` operation failed")
     }
 }
 
@@ -273,7 +273,7 @@ impl std::ops::BitXor for Array<'_> {
     type Output = Self;
 
     fn bitxor(self, rhs: Self) -> Self {
-        bind_single_output(XorOperation, &[self, rhs]).expect("`xor` operation failed")
+        bind_single_output(XorOperation::new(), &[self, rhs]).expect("`xor` operation failed")
     }
 }
 
@@ -281,7 +281,7 @@ impl std::ops::Not for Array<'_> {
     type Output = Self;
 
     fn not(self) -> Self {
-        bind_single_output(NotOperation, &[self]).expect("`not` operation failed")
+        bind_single_output(NotOperation::new(), &[self]).expect("`not` operation failed")
     }
 }
 

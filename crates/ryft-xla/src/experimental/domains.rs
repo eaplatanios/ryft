@@ -5392,7 +5392,7 @@ mod tests {
 
         let left = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let right = f32_vector(&client, &mesh, &[10.0, 20.0, 30.0, 40.0]);
-        let outputs = domain.bind(AddOperation, Vec::new(), &[left, right]).unwrap();
+        let outputs = domain.bind(AddOperation::new(), Vec::new(), &[left, right]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![11.0, 22.0, 33.0, 44.0]);
@@ -5408,10 +5408,10 @@ mod tests {
         let scalar = f32_scalar(&client, &mesh, 2.0);
         let vector = f64_vector(&client, &mesh, &[1.0, 2.0, 4.0, 8.0]);
 
-        let divide = domain.bind(DivOperation, Vec::new(), &[scalar.clone(), vector.clone()]).unwrap();
+        let divide = domain.bind(DivOperation::new(), Vec::new(), &[scalar.clone(), vector.clone()]).unwrap();
         assert_eq!(read_f64s(&client, &divide[0]), vec![2.0, 1.0, 0.5, 0.25]);
 
-        let atan2 = domain.bind(Atan2Operation, Vec::new(), &[vector.clone(), scalar.clone()]).unwrap();
+        let atan2 = domain.bind(Atan2Operation::new(), Vec::new(), &[vector.clone(), scalar.clone()]).unwrap();
         for (actual, expected) in read_f64s(&client, &atan2[0]).into_iter().zip([
             1.0f64.atan2(2.0),
             2.0f64.atan2(2.0),
@@ -5433,7 +5433,7 @@ mod tests {
 
         let boolean_vector = boolean_vector(&client, &mesh, &[true, false, true, false]);
         let and = domain
-            .bind(AndOperation, Vec::new(), &[boolean_scalar(&client, &mesh, true), boolean_vector])
+            .bind(AndOperation::new(), Vec::new(), &[boolean_scalar(&client, &mesh, true), boolean_vector])
             .unwrap();
         assert_eq!(read_booleans(&client, &and[0]), vec![true, false, true, false]);
     }
@@ -5446,7 +5446,7 @@ mod tests {
         let domain = array_domain(&client);
 
         let input = f32_vector(&client, &mesh, &[1.0, -2.0, 3.5, 0.0]);
-        let outputs = domain.bind(NegOperation, Vec::new(), &[input]).unwrap();
+        let outputs = domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![-1.0, 2.0, -3.5, 0.0]);
@@ -5499,17 +5499,17 @@ mod tests {
 
         let left = f32_vector(&client, &mesh, &[1.0, 2.0]);
         let right = f32_vector(&client, &mesh, &[3.0, 4.0]);
-        let first = domain.bind(AddOperation, Vec::new(), &[left.clone(), right.clone()]).unwrap();
+        let first = domain.bind(AddOperation::new(), Vec::new(), &[left.clone(), right.clone()]).unwrap();
         assert_eq!(domain.parent().cache_size(), 1);
 
-        let second = domain.bind(AddOperation, Vec::new(), &[left, right]).unwrap();
+        let second = domain.bind(AddOperation::new(), Vec::new(), &[left, right]).unwrap();
         assert_eq!(domain.parent().cache_size(), 1, "a repeated eager operation must be a compile-cache hit");
         assert_eq!(read_f32s(&client, &first[0]), read_f32s(&client, &second[0]));
 
         // A different input signature compiles (and caches) a distinct executable.
         let wider_left = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let wider_right = f32_vector(&client, &mesh, &[4.0, 5.0, 6.0]);
-        domain.bind(AddOperation, Vec::new(), &[wider_left, wider_right]).unwrap();
+        domain.bind(AddOperation::new(), Vec::new(), &[wider_left, wider_right]).unwrap();
         assert_eq!(domain.parent().cache_size(), 2);
     }
 
@@ -5524,7 +5524,7 @@ mod tests {
         // An input that carries an attached client is rejected by client identity.
         let input = f32_vector(&foreign_client, &foreign_mesh, &[1.0, 2.0]);
         assert!(matches!(
-            domain.bind(NegOperation, Vec::new(), &[input.clone()]),
+            domain.bind(NegOperation::new(), Vec::new(), &[input.clone()]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "received incompatible devices for eager xla execution: input #0 is owned by a \
                     different PJRT client than this domain's client",
@@ -5534,7 +5534,7 @@ mod tests {
         let mut clientless_input = input;
         clientless_input.detach_client_for_tests();
         assert!(matches!(
-            domain.bind(NegOperation, Vec::new(), &[clientless_input]),
+            domain.bind(NegOperation::new(), Vec::new(), &[clientless_input]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "received incompatible devices for eager xla execution: input #0 is placed on device \
                     1, which does not belong to this domain's PJRT client",
@@ -5552,7 +5552,7 @@ mod tests {
         let doubled = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
-            let output = builder.add_instruction(AddOperation, Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -5560,7 +5560,7 @@ mod tests {
         let squared = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
-            let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -5605,7 +5605,7 @@ mod tests {
             let extent = builder.add_input(extent.r#type().clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let scalar = if negate {
-                builder.add_instruction(NegOperation, Vec::new(), vec![scalar]).unwrap()[0]
+                builder.add_instruction(NegOperation::new(), Vec::new(), vec![scalar]).unwrap()[0]
             } else {
                 scalar
             };
@@ -5685,7 +5685,7 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let state = builder.add_input(scalar_type.clone().into());
             let one = builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![]).unwrap()[0];
-            let next = builder.add_instruction(AddOperation, Vec::new(), vec![state, one]).unwrap()[0];
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -5719,7 +5719,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.bind(AddOperation, Vec::new(), &[input.clone(), input]).unwrap();
+        let outputs = domain.bind(AddOperation::new(), Vec::new(), &[input.clone(), input]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         let output = &outputs[0];
@@ -5753,7 +5753,7 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let one = builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![]).unwrap()[0];
-            let next = builder.add_instruction(AddOperation, Vec::new(), vec![carry, one]).unwrap()[0];
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, one]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![next, next],
@@ -5792,7 +5792,7 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let one = builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![]).unwrap()[0];
-            let next = builder.add_instruction(AddOperation, Vec::new(), vec![carry, one]).unwrap()[0];
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, one]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -5828,7 +5828,7 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let x = builder.add_input(scalar_type.clone().into());
-            let sum = builder.add_instruction(AddOperation, Vec::new(), vec![carry, x]).unwrap()[0];
+            let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -5867,7 +5867,7 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let x = builder.add_input(scalar_type.clone().into());
-            let sum = builder.add_instruction(AddOperation, Vec::new(), vec![carry, x]).unwrap()[0];
+            let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -5915,7 +5915,7 @@ mod tests {
         let callee = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
-            let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -5967,7 +5967,7 @@ mod tests {
         let body_program = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(local_type.clone().into());
-            let output = builder.add_instruction(AddOperation, Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -6086,7 +6086,7 @@ mod tests {
         let left = f32_vector(&client, &mesh, &[1.0, 2.0]);
         let right = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         assert!(matches!(
-            domain.bind(AddOperation, Vec::new(), &[left, right]),
+            domain.bind(AddOperation::new(), Vec::new(), &[left, right]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "'add' input types are not broadcast-compatible",
         ));

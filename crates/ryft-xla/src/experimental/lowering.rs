@@ -676,7 +676,7 @@ where
     ])
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AddOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AddOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -696,7 +696,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AddOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SubOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SubOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -716,7 +716,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SubOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MulOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MulOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -736,7 +736,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MulOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DivOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DivOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -756,7 +756,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DivOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for NegOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for NegOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -890,7 +890,7 @@ where
     Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SinOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SinOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -916,7 +916,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SinOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CosOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CosOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -943,7 +943,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CosOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Atan2Operation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Atan2Operation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -963,7 +963,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Atan2Operation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ExpOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ExpOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -980,7 +980,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ExpOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -996,7 +996,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SqrtOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SqrtOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1012,7 +1012,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SqrtOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RsqrtOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RsqrtOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1028,7 +1028,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RsqrtOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TanhOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TanhOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1044,7 +1044,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TanhOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogisticOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogisticOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1063,7 +1063,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogisticOperation {
 
 /// [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation
 /// over StableHLO operations during compilation.
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ErfOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ErfOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1076,7 +1076,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ErfOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for PowOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for PowOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1096,7 +1096,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for PowOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SignOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SignOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1109,7 +1109,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SignOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for FloorOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for FloorOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1122,7 +1122,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for FloorOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CeilOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CeilOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1135,7 +1135,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CeilOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RoundOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RoundOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1150,7 +1150,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RoundOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MaxOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MaxOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1170,7 +1170,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MaxOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MinOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MinOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1190,7 +1190,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MinOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RemOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RemOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1210,7 +1210,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RemOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AbsOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AbsOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1223,7 +1223,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AbsOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ComplexOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ComplexOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1241,7 +1241,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ComplexOperation {
 
 /// StableHLO has no conjugation operation, so `conjugate` lowers to the `complex(real(z), negate(imag(z)))`
 /// composition (the same decomposition JAX's `conj` lowering uses).
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConjugateOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConjugateOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1264,7 +1264,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConjugateOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RealOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RealOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1277,7 +1277,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RealOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ImaginaryOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ImaginaryOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -3687,202 +3687,210 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     lowerer,
                 )
             }
-            ArrayOperation::Add(operation) => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Add(operation) => <AddOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Sub(operation) => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Sub(operation) => <SubOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Mul(operation) => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Mul(operation) => <MulOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Div(operation) => <DivOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Div(operation) => <DivOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Neg(operation) => <NegOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Neg(operation) => <NegOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Sin(operation) => <SinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Sin(operation) => <SinOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Cos(operation) => <CosOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Cos(operation) => <CosOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Atan2(operation) => <Atan2Operation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Atan2(operation) => <Atan2Operation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Exp(operation) => <ExpOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Exp(operation) => <ExpOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Log(operation) => <LogOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Log(operation) => <LogOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Sqrt(operation) => <SqrtOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Sqrt(operation) => <SqrtOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Rsqrt(operation) => <RsqrtOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Rsqrt(operation) => <RsqrtOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Tanh(operation) => <TanhOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Tanh(operation) => <TanhOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Logistic(operation) => <LogisticOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Logistic(operation) => {
+                <LogisticOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            ArrayOperation::Erf(operation) => <ErfOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Erf(operation) => <ErfOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Pow(operation) => <PowOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Pow(operation) => <PowOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Sign(operation) => <SignOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Sign(operation) => <SignOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Floor(operation) => <FloorOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Floor(operation) => <FloorOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Ceil(operation) => <CeilOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Ceil(operation) => <CeilOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Round(operation) => <RoundOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Round(operation) => <RoundOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Max(operation) => <MaxOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Max(operation) => <MaxOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Min(operation) => <MinOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Min(operation) => <MinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Rem(operation) => <RemOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Rem(operation) => <RemOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Abs(operation) => <AbsOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Abs(operation) => <AbsOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Complex(operation) => {
+                <ComplexOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            ArrayOperation::Conjugate(operation) => {
+                <ConjugateOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            ArrayOperation::Real(operation) => <RealOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Complex(operation) => <ComplexOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            ArrayOperation::Conjugate(operation) => <ConjugateOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            ArrayOperation::Real(operation) => <RealOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            ArrayOperation::Imaginary(operation) => <ImaginaryOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
+            ArrayOperation::Imaginary(operation) => {
+                <ImaginaryOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             // `stop_gradient` only affects differentiation; by lowering time it is the identity, so
             // forward the operand without emitting any MLIR operation (matching JAX's lowering).
             ArrayOperation::StopGradient(_) => {
@@ -8678,7 +8686,7 @@ mod tests {
     fn xla_neg_branch(input_type: ArrayType) -> PlainXlaProgram {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
-        let output = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -8704,16 +8712,16 @@ mod tests {
         let condition = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let boolean_vector =
             builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])));
-        let divide = builder.add_instruction(DivOperation, Vec::new(), vec![left, right]).unwrap()[0];
-        let atan2 = builder.add_instruction(Atan2Operation, Vec::new(), vec![right, left]).unwrap()[0];
+        let divide = builder.add_instruction(DivOperation::new(), Vec::new(), vec![left, right]).unwrap()[0];
+        let atan2 = builder.add_instruction(Atan2Operation::new(), Vec::new(), vec![right, left]).unwrap()[0];
         let compare = builder
             .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![left, right])
             .unwrap()[0];
         let select =
             builder.add_instruction(SelectOperation::new(), Vec::new(), vec![condition, scalar, right]).unwrap()[0];
-        let and = builder.add_instruction(AndOperation, Vec::new(), vec![condition, boolean_vector]).unwrap()[0];
-        let or = builder.add_instruction(OrOperation, Vec::new(), vec![boolean_vector, condition]).unwrap()[0];
-        let xor = builder.add_instruction(XorOperation, Vec::new(), vec![condition, boolean_vector]).unwrap()[0];
+        let and = builder.add_instruction(AndOperation::new(), Vec::new(), vec![condition, boolean_vector]).unwrap()[0];
+        let or = builder.add_instruction(OrOperation::new(), Vec::new(), vec![boolean_vector, condition]).unwrap()[0];
+        let xor = builder.add_instruction(XorOperation::new(), Vec::new(), vec![condition, boolean_vector]).unwrap()[0];
         builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![divide, atan2, compare, select, and, or, xor],
@@ -9386,7 +9394,7 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
         let capture = builder.add_constant(XlaConstant::new(0, array_type.clone().into()));
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![input, capture]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -9504,7 +9512,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
         let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])));
-        let output = builder.add_instruction(DivOperation, Vec::new(), vec![scalar, empty]).unwrap()[0];
+        let output = builder.add_instruction(DivOperation::new(), Vec::new(), vec![scalar, empty]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![output],
@@ -9525,7 +9533,7 @@ mod tests {
     fn xla_add_self_callee(input_type: ArrayType) -> std::rc::Rc<FlatXlaProgram> {
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(input_type);
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![input, input]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
         std::rc::Rc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
 
@@ -9570,7 +9578,7 @@ mod tests {
             accumulator = Some(match accumulator {
                 None => call_output,
                 Some(previous) => {
-                    builder.add_instruction(AddOperation, Vec::new(), vec![previous, call_output]).unwrap()[0]
+                    builder.add_instruction(AddOperation::new(), Vec::new(), vec![previous, call_output]).unwrap()[0]
                 }
             });
         }
@@ -9677,7 +9685,7 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let first = add_xla_jit_call(&mut builder, &first_callee, Vec::new());
         let second = add_xla_jit_call(&mut builder, &second_callee, Vec::new());
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![first, second]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -9723,7 +9731,7 @@ mod tests {
             let input = builder.add_input(vector_type.clone());
             let first = add_xla_jit_call(&mut builder, &callee, vec![input]);
             let second = add_xla_jit_call(&mut builder, &callee, vec![input]);
-            let output = builder.add_instruction(AddOperation, Vec::new(), vec![first, second]).unwrap()[0];
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -9784,7 +9792,7 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone());
             let printed = builder.add_instruction(PrintOperation::new("primal"), Vec::new(), vec![input]).unwrap()[0];
-            let output = builder.add_instruction(AddOperation, Vec::new(), vec![printed, printed]).unwrap()[0];
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![printed, printed]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -9793,8 +9801,9 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone());
             let tangent = builder.add_input(vector_type.clone());
-            let output = builder.add_instruction(AddOperation, Vec::new(), vec![input, input]).unwrap()[0];
-            let output_tangent = builder.add_instruction(MulOperation, Vec::new(), vec![tangent, tangent]).unwrap()[0];
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
+            let output_tangent =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![tangent, tangent]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![output, output_tangent],
@@ -9892,7 +9901,7 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             let tangent = builder.add_input(vector_type.clone());
             let residual = builder.add_input(vector_type.clone());
-            let output = builder.add_instruction(MulOperation, Vec::new(), vec![tangent, residual]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![tangent, residual]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![output],
@@ -9905,7 +9914,8 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             let residual = builder.add_input(vector_type.clone());
             let cotangent = builder.add_input(vector_type.clone());
-            let output = builder.add_instruction(AddOperation, Vec::new(), vec![residual, cotangent]).unwrap()[0];
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![residual, cotangent]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![output],
@@ -9959,7 +9969,8 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             let residual = builder.add_input(vector_type.clone());
             let cotangent = builder.add_input(vector_type.clone());
-            let output = builder.add_instruction(MulOperation, Vec::new(), vec![residual, cotangent]).unwrap()[0];
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, cotangent]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![output],
@@ -10036,7 +10047,7 @@ mod tests {
             accumulator = Some(match accumulator {
                 None => call_output,
                 Some(previous) => {
-                    builder.add_instruction(AddOperation, Vec::new(), vec![previous, call_output]).unwrap()[0]
+                    builder.add_instruction(AddOperation::new(), Vec::new(), vec![previous, call_output]).unwrap()[0]
                 }
             });
         }
@@ -10183,8 +10194,10 @@ mod tests {
         let complex_type = ArrayType::scalar(DataType::C64);
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(complex_type);
-        let sine = builder.add_instruction(ArrayOperation::Sin(SinOperation), Vec::new(), vec![input]).unwrap()[0];
-        let cosine = builder.add_instruction(ArrayOperation::Cos(CosOperation), Vec::new(), vec![input]).unwrap()[0];
+        let sine =
+            builder.add_instruction(ArrayOperation::Sin(SinOperation::new()), Vec::new(), vec![input]).unwrap()[0];
+        let cosine =
+            builder.add_instruction(ArrayOperation::Cos(CosOperation::new()), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
                 vec![sine, cosine],
@@ -10583,7 +10596,7 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             let operand = builder.add_input(scalar_f32.clone());
             let output = if double {
-                builder.add_instruction(AddOperation, Vec::new(), vec![operand, operand]).unwrap()[0]
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![operand, operand]).unwrap()[0]
             } else {
                 operand
             };
@@ -10595,7 +10608,8 @@ mod tests {
         let mut scan_body_builder = CompositeXlaProgramBuilder::new();
         let carry = scan_body_builder.add_input(scalar_f32.clone());
         let item = scan_body_builder.add_input(scalar_f32.clone());
-        let next_carry = scan_body_builder.add_instruction(AddOperation, Vec::new(), vec![carry, item]).unwrap()[0];
+        let next_carry =
+            scan_body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, item]).unwrap()[0];
         let scan_body = scan_body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![next_carry, next_carry],
@@ -10618,7 +10632,8 @@ mod tests {
             .unwrap();
         let mut while_body_builder = CompositeXlaProgramBuilder::new();
         let state = while_body_builder.add_input(scalar_f32.clone());
-        let next_state = while_body_builder.add_instruction(AddOperation, Vec::new(), vec![state, state]).unwrap()[0];
+        let next_state =
+            while_body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
         let while_body = while_body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next_state], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -10880,7 +10895,7 @@ mod tests {
             let branch_extent = builder.0.add_input(extent_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone());
             let scalar = if negate {
-                builder.add_instruction(NegOperation, Vec::new(), vec![scalar]).unwrap()[0]
+                builder.add_instruction(NegOperation::new(), Vec::new(), vec![scalar]).unwrap()[0]
             } else {
                 scalar
             };
@@ -11134,7 +11149,7 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
             let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
-            let next = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
+            let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
@@ -11176,7 +11191,7 @@ mod tests {
         let mut body_builder = CompositeXlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f32.clone());
         let x = body_builder.add_input(scalar_f32.clone());
-        let product = body_builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
+        let product = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![product, product],
@@ -11389,7 +11404,7 @@ mod tests {
         let mut body_builder = CompositeXlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f32.clone());
         let x = body_builder.add_input(scalar_f32.clone());
-        let product = body_builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
+        let product = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![product, product],
@@ -11437,7 +11452,7 @@ mod tests {
         let mut body_builder = CompositeXlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f32.clone());
         let x = body_builder.add_input(scalar_f32.clone());
-        let product = body_builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
+        let product = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![product, product],
@@ -11489,10 +11504,10 @@ mod tests {
         let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
-        let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![input, input]).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
         let first = builder.add_instruction(PrintOperation::new("first"), Vec::new(), vec![input]).unwrap()[0];
         let second = builder.add_instruction(PrintOperation::new("second"), Vec::new(), vec![doubled]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![first, second]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -12027,7 +12042,7 @@ mod tests {
         ];
         let first = add_xla_jit_call(&mut builder, &callee, inputs.clone());
         let second = add_xla_jit_call(&mut builder, &callee, inputs);
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![first, second]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
@@ -12725,7 +12740,7 @@ mod tests {
         let carry = body_builder.add_input(scalar_f64.clone());
         let x = body_builder.add_input(scalar_f64.clone());
         let printed = body_builder.add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![x]).unwrap()[0];
-        let sum = body_builder.add_instruction(AddOperation, Vec::new(), vec![carry, printed]).unwrap()[0];
+        let sum = body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, printed]).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
@@ -12854,7 +12869,7 @@ mod tests {
         let true_input = true_builder.add_input(input_type.clone());
         let printed =
             true_builder.add_instruction(PrintOperation::new("taken"), Vec::new(), vec![true_input]).unwrap()[0];
-        let negated = true_builder.add_instruction(NegOperation, Vec::new(), vec![printed]).unwrap()[0];
+        let negated = true_builder.add_instruction(NegOperation::new(), Vec::new(), vec![printed]).unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![negated], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -13124,7 +13139,7 @@ mod tests {
             .add_instruction(PrintOperation::new("callee"), Vec::new(), vec![callee_input])
             .unwrap()[0];
         let callee_output =
-            callee_builder.add_instruction(AddOperation, Vec::new(), vec![printed, printed]).unwrap()[0];
+            callee_builder.add_instruction(AddOperation::new(), Vec::new(), vec![printed, printed]).unwrap()[0];
         let callee = std::rc::Rc::new(unproject_plain_program(
             callee_builder.build(vec![callee_output], vec![Placeholder], vec![Placeholder]).unwrap(),
         ));
@@ -13231,7 +13246,7 @@ mod tests {
         let carry = body_builder.add_input(scalar_f64.clone());
         let x = body_builder.add_input(scalar_f64.clone());
         let printed = body_builder.add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![x]).unwrap()[0];
-        let sum = body_builder.add_instruction(AddOperation, Vec::new(), vec![carry, printed]).unwrap()[0];
+        let sum = body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, printed]).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
@@ -13358,7 +13373,7 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
             let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
-            let next = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
+            let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();

@@ -36,10 +36,10 @@ use ryft_core::operations::manipulation::{
     UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
-    AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
-    ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaxOperation, MinOperation, MulOperation,
-    NegOperation, PowOperation, ReduceOperation, RemOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
+    AbsOperation, AddOperation, AddOperationProvider, Atan2Operation, CeilOperation, CosOperation, DivOperation,
+    DotOperation, ErfOperation, ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaxOperation,
+    MinOperation, MulOperation, NegOperation, PowOperation, ReduceOperation, RemOperation, RoundOperation,
+    RsqrtOperation, ScaledDotOperation, SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
 };
 use ryft_core::operations::random::RngBitGeneratorOperation;
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
@@ -417,38 +417,38 @@ impl_array_operation_conversion!(
     OneLikeOperation<ArrayType>,
     ConstantOperation<ReferenceArray>,
     CoordinateBasisOperation<ArrayType>,
-    AbsOperation,
-    NegOperation,
-    AddOperation,
-    SubOperation,
-    MulOperation,
-    DivOperation,
-    SinOperation,
-    CosOperation,
-    Atan2Operation,
-    ExpOperation,
-    LogOperation,
-    SqrtOperation,
-    RsqrtOperation,
-    TanhOperation,
-    LogisticOperation,
-    ErfOperation,
-    PowOperation,
-    SignOperation,
-    FloorOperation,
-    CeilOperation,
-    RoundOperation,
-    MaxOperation,
-    MinOperation,
-    RemOperation,
-    NotOperation,
-    AndOperation,
-    OrOperation,
-    XorOperation,
-    ComplexOperation,
-    ConjugateOperation,
-    RealOperation,
-    ImaginaryOperation,
+    AbsOperation<ArrayType>,
+    NegOperation<ArrayType>,
+    AddOperation<ArrayType>,
+    SubOperation<ArrayType>,
+    MulOperation<ArrayType>,
+    DivOperation<ArrayType>,
+    SinOperation<ArrayType>,
+    CosOperation<ArrayType>,
+    Atan2Operation<ArrayType>,
+    ExpOperation<ArrayType>,
+    LogOperation<ArrayType>,
+    SqrtOperation<ArrayType>,
+    RsqrtOperation<ArrayType>,
+    TanhOperation<ArrayType>,
+    LogisticOperation<ArrayType>,
+    ErfOperation<ArrayType>,
+    PowOperation<ArrayType>,
+    SignOperation<ArrayType>,
+    FloorOperation<ArrayType>,
+    CeilOperation<ArrayType>,
+    RoundOperation<ArrayType>,
+    MaxOperation<ArrayType>,
+    MinOperation<ArrayType>,
+    RemOperation<ArrayType>,
+    NotOperation<ArrayType>,
+    AndOperation<ArrayType>,
+    OrOperation<ArrayType>,
+    XorOperation<ArrayType>,
+    ComplexOperation<ArrayType>,
+    ConjugateOperation<ArrayType>,
+    RealOperation<ArrayType>,
+    ImaginaryOperation<ArrayType>,
     DotOperation,
     ScaledDotOperation,
     DotProductAttentionOperation,
@@ -497,6 +497,15 @@ where
 {
     fn zero_operation(r#type: ArrayProgramType) -> Result<Self, ProgramError> {
         Ok(ArrayProgramOperation::<Capture::Projected>::zero_operation(r#type)?.into())
+    }
+}
+
+impl<Capture> AddOperationProvider<ArrayProgramType> for XlaOperation<Capture>
+where
+    Capture: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    fn add_operation(r#type: &ArrayProgramType) -> Result<Self, ProgramError> {
+        Ok(ArrayProgramOperation::<Capture::Projected>::add_operation(r#type)?.into())
     }
 }
 
@@ -1794,9 +1803,12 @@ mod tests {
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
             let literal = builder.add_constant(XlaConstant::new(0, r#type.clone()));
-            let shifted = builder.add_instruction(AddOperation, Vec::new(), vec![known_input, literal]).unwrap()[0];
-            let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![runtime_input, literal]).unwrap()[0];
-            let product = builder.add_instruction(MulOperation, Vec::new(), vec![shifted, runtime_input]).unwrap()[0];
+            let shifted =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, literal]).unwrap()[0];
+            let scaled =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![runtime_input, literal]).unwrap()[0];
+            let product =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![shifted, runtime_input]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![shifted, scaled, product],

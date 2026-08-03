@@ -1804,7 +1804,7 @@ where
         >,
     <D as Domain>::Operation: From<RematerializeOperation<<D as Domain>::Type>>
         + ResidualZeroProvider<D::Type>
-        + From<AddOperation>
+        + From<AddOperation<D::Type>>
         + TransposableOperation<<D as Domain>::Constant, <D as Domain>::Operation>
         + DifferentiableOperation<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>
         + DifferentiableOperation<
@@ -2196,7 +2196,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let next = builder
-                .add_instruction(crate::operations::math::MulOperation, Vec::new(), vec![carry, dot])
+                .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![carry, dot])
                 .unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 2], vec![Placeholder; 1])
@@ -2408,11 +2408,11 @@ mod tests {
                 )
                 .unwrap()[0];
             let trigonometric = if cosine {
-                builder.add_instruction(CosOperation, Vec::new(), vec![dot]).unwrap()[0]
+                builder.add_instruction(CosOperation::new(), Vec::new(), vec![dot]).unwrap()[0]
             } else {
-                builder.add_instruction(SinOperation, Vec::new(), vec![dot]).unwrap()[0]
+                builder.add_instruction(SinOperation::new(), Vec::new(), vec![dot]).unwrap()[0]
             };
-            let output = builder.add_instruction(MulOperation, Vec::new(), vec![dot, trigonometric]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![dot, trigonometric]).unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         }
 
@@ -3413,7 +3413,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let next = builder
-                .add_instruction(crate::operations::math::MulOperation, Vec::new(), vec![carry, dot])
+                .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![carry, dot])
                 .unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![next, dot], vec![Placeholder; 2], vec![Placeholder; 2])
@@ -3912,7 +3912,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(scalar_type.clone());
             let doubled = builder
-                .add_instruction(crate::operations::math::MulOperation, Vec::new(), vec![state, state])
+                .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![state, state])
                 .unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
         }

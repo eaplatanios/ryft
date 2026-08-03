@@ -992,7 +992,7 @@ mod tests {
         let builder = tracing_context.builder().clone();
         let atom = builder.borrow_mut().add_input(DataType::F64);
         let tracer = tracing_context.tracer(atom, None);
-        let output = tracer.unary(NegOperation);
+        let output = tracer.unary(NegOperation::new());
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         let output_atom = output.atom_id().expect("unary output should remain live");
         let program = builder
@@ -1018,7 +1018,7 @@ mod tests {
         let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let output = lhs.binary(&rhs, AddOperation);
+        let output = lhs.binary(&rhs, AddOperation::new());
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         let output_atom = output.atom_id().expect("binary output should remain live");
         let program = builder
@@ -1045,7 +1045,7 @@ mod tests {
         let atom_b = context_b.builder().borrow_mut().add_input(DataType::F64);
         let tracer_a = context_a.tracer(atom_a, None);
         let tracer_b = context_b.tracer(atom_b, None);
-        let output = tracer_a.binary(&tracer_b, AddOperation);
+        let output = tracer_a.binary(&tracer_b, AddOperation::new());
         assert!(matches!(output.state(), TracerState::Poison));
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
@@ -1153,7 +1153,7 @@ mod tests {
         let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let outputs = tracing_context.stage_operation(AddOperation, Vec::new(), &[&lhs, &rhs]).unwrap();
+        let outputs = tracing_context.stage_operation(AddOperation::new(), Vec::new(), &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].state(), &TracerState::Live(AtomId::new(2)));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
@@ -1183,7 +1183,7 @@ mod tests {
         let tracer_a = context_a.tracer(atom_a, None);
         let tracer_b = context_b.tracer(atom_b, None);
         assert!(matches!(
-            context_a.stage_operation(AddOperation, Vec::new(), &[&tracer_a, &tracer_b]),
+            context_a.stage_operation(AddOperation::new(), Vec::new(), &[&tracer_a, &tracer_b]),
             Err(ProgramError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
@@ -1195,13 +1195,13 @@ mod tests {
         let builder_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         builder.borrow_mut().error = Some(builder_error.clone());
         let tracer = tracing_context.tracer(atom, None);
-        let outputs = tracing_context.stage_operation(NegOperation, Vec::new(), &[&tracer]).unwrap();
+        let outputs = tracing_context.stage_operation(NegOperation::new(), Vec::new(), &[&tracer]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].state(), &TracerState::Poison));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error.clone()));
         assert!(matches!(
-            tracing_context.stage_operation(AddOperation, Vec::new(), &[&tracer]),
+            tracing_context.stage_operation(AddOperation::new(), Vec::new(), &[&tracer]),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == "expected 2 inputs but got 1",
         ));
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
@@ -1213,7 +1213,7 @@ mod tests {
         let rhs_atom = builder.borrow_mut().add_input(DataType::F32);
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let result = tracing_context.stage_operation(AddOperation, Vec::new(), &[&lhs, &rhs]);
+        let result = tracing_context.stage_operation(AddOperation::new(), Vec::new(), &[&lhs, &rhs]);
         assert!(matches!(
             result,
             Err(ProgramError::Type(TypeError::Invalid { message }))
@@ -1393,7 +1393,7 @@ mod tests {
         // as a root trace would.
         let lhs = nested.input(DataType::F64);
         let rhs = nested.input(DataType::F64);
-        let outputs = nested.stage_operation(AddOperation, Vec::new(), &[&lhs, &rhs]).unwrap();
+        let outputs = nested.stage_operation(AddOperation::new(), Vec::new(), &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
@@ -1415,7 +1415,7 @@ mod tests {
 
         // Runtime captures are not owned by the nested context. They delegate to the enclosing capturing context,
         // so a value captured through the nested context lands in the parent's shared capture table.
-        let capturing_parent = TracingContext::<CaptureReference<DataType>, NegOperation, Scalar>::new();
+        let capturing_parent = TracingContext::<CaptureReference<DataType>, NegOperation<DataType>, Scalar>::new();
         let nested = NestedTracingContext::new(capturing_parent.clone());
         let reference = nested.capture(Scalar::from(7.0)).expect("capture should delegate to the enclosing context");
         assert_eq!(reference.r#type().into_owned(), DataType::F64);

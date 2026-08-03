@@ -921,7 +921,7 @@ mod tests {
     fn sin_program(r#type: &ArrayType) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(r#type.clone());
-        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -931,11 +931,11 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
         let dx = builder.add_input(r#type.clone());
-        let y = builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
-        let cosine = builder.add_instruction(CosOperation, Vec::new(), vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x]).unwrap()[0];
         let two = builder.add_constant(Array::scalar(2.0));
-        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![two, cosine]).unwrap()[0];
-        let tangent = builder.add_instruction(MulOperation, Vec::new(), vec![scaled, dx]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![two, cosine]).unwrap()[0];
+        let tangent = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, dx]).unwrap()[0];
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -945,8 +945,8 @@ mod tests {
     fn sin_forward_program(r#type: &ArrayType) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
-        let y = builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
-        let residual = builder.add_instruction(CosOperation, Vec::new(), vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
+        let residual = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x]).unwrap()[0];
         builder.build(vec![y, residual], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap()
     }
 
@@ -959,8 +959,8 @@ mod tests {
         let residual = builder.add_input(r#type.clone());
         let cotangent = builder.add_input(r#type.clone());
         let three = builder.add_constant(Array::scalar(3.0));
-        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![three, residual]).unwrap()[0];
-        let gradient = builder.add_instruction(MulOperation, Vec::new(), vec![scaled, cotangent]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![three, residual]).unwrap()[0];
+        let gradient = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, cotangent]).unwrap()[0];
         builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -990,7 +990,7 @@ mod tests {
     fn scalar_sin_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -999,11 +999,11 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(DataType::F64);
         let dx = builder.add_input(DataType::F64);
-        let y = builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
-        let cosine = builder.add_instruction(CosOperation, Vec::new(), vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x]).unwrap()[0];
         let two = builder.add_constant(Scalar::from(2.0));
-        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![two, cosine]).unwrap()[0];
-        let tangent = builder.add_instruction(MulOperation, Vec::new(), vec![scaled, dx]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![two, cosine]).unwrap()[0];
+        let tangent = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, dx]).unwrap()[0];
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -1015,7 +1015,7 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(DataType::F64);
         builder.add_input(DataType::F64);
-        let y = builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
         let tangent = builder.add_constant(Scalar::from(1.0));
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
@@ -1026,8 +1026,8 @@ mod tests {
     fn scalar_sin_forward_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(DataType::F64);
-        let y = builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
-        let residual = builder.add_instruction(CosOperation, Vec::new(), vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
+        let residual = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x]).unwrap()[0];
         builder.build(vec![y, residual], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap()
     }
 
@@ -1037,8 +1037,8 @@ mod tests {
         let residual = builder.add_input(DataType::F64);
         let cotangent = builder.add_input(DataType::F64);
         let three = builder.add_constant(Scalar::from(3.0));
-        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![three, residual]).unwrap()[0];
-        let gradient = builder.add_instruction(MulOperation, Vec::new(), vec![scaled, cotangent]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![three, residual]).unwrap()[0];
+        let gradient = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, cotangent]).unwrap()[0];
         builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
