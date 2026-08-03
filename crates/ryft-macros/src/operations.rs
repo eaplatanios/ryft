@@ -1169,8 +1169,11 @@ impl OperationVariant {
 }
 
 /// Builds the generics used by the generated [`Operation`] and [`Display`] implementations: the enum generics
-/// without defaults, plus one `Payload: Operation<Type = T>` predicate per bare generic payload (concrete payloads
-/// already implement [`Operation`] on their own).
+/// without defaults, plus one `Payload: Operation<Type = T>` predicate per variant payload. For bare generic
+/// payloads the predicate is a real constraint; for concrete payloads it is how the derive rejects a payload whose
+/// associated [`Operation::Type`] disagrees with the family's primary type — the dispatcher bodies type-check under
+/// the equality assumption, so a mismatch surfaces as one associated-type error on the generated implementation
+/// instead of a pile of forwarded-signature mismatches.
 fn operation_generics(
     generics: &syn::Generics,
     variants: &[OperationVariant],
@@ -1178,12 +1181,17 @@ fn operation_generics(
     operation_type: &syn::Type,
 ) -> syn::Generics {
     let mut generics = generics.without_defaults();
-    let generic_operation_bounds = variants.iter().filter(|variant| variant.is_generic_extension).map(|variant| {
-        let payload_type = &variant.payload_type;
-        let predicate: syn::WherePredicate = syn::parse_quote!(#payload_type: #ryft::Operation<Type = #operation_type>);
-        predicate
-    });
-    generics.make_where_clause().predicates.extend(generic_operation_bounds);
+    let mut seen_payload_types = std::collections::HashSet::new();
+    let payload_operation_bounds = variants
+        .iter()
+        .filter(|variant| seen_payload_types.insert(variant.payload_type.to_token_stream().to_string()))
+        .map(|variant| {
+            let payload_type = &variant.payload_type;
+            let predicate: syn::WherePredicate =
+                syn::parse_quote!(#payload_type: #ryft::Operation<Type = #operation_type>);
+            predicate
+        });
+    generics.make_where_clause().predicates.extend(payload_operation_bounds);
     generics
 }
 
