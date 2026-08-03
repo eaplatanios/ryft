@@ -320,7 +320,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for RecursiveTransposit
 
 impl<
     V: Value<Type: DifferentiableType>,
-    O: TransposableOperation<V, O> + ResidualZeroProvider<V::Type> + From<AddOperation>,
+    O: TransposableOperation<V, O> + ResidualZeroProvider<V::Type> + From<AddOperation<V::Type>>,
 > TranspositionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O>
 {
     #[inline]
@@ -440,7 +440,7 @@ pub trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::T
 impl<
     T: DifferentiableType,
     V: Value<Type = T>,
-    O: TransposableOperation<V, O> + ResidualZeroProvider<T> + From<AddOperation>,
+    O: TransposableOperation<V, O> + ResidualZeroProvider<T> + From<AddOperation<T>>,
 > RegionRef<'_, V, O>
 {
     /// Transposes this borrowed linear _pushforward_ [`Region`](crate::Region) into its reverse-mode _pullback_.
@@ -505,7 +505,7 @@ impl<
         ///   - `adjoints`: Per-primal-atom table storing the currently accumulated cotangent atom, if any.
         ///   - `atom`: Primal atom whose cotangent is being accumulated.
         ///   - `contribution`: Staged cotangent atom to add into `atom`'s adjoint slot.
-        fn accumulate<V: Value, O: Operation<V::Type> + From<AddOperation>>(
+        fn accumulate<V: Value, O: Operation<V::Type> + From<AddOperation<V::Type>>>(
             builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
             adjoints: &mut [Option<AtomId>],
             atom: AtomId,
@@ -525,8 +525,11 @@ impl<
             *adjoint = Some(match *adjoint {
                 Some(existing) => {
                     let mut builder_borrow = builder.borrow_mut();
-                    let outputs =
-                        builder_borrow.add_instruction(AddOperation, Vec::new(), vec![existing, contribution])?;
+                    let outputs = builder_borrow.add_instruction(
+                        AddOperation::<V::Type>::new(),
+                        Vec::new(),
+                        vec![existing, contribution],
+                    )?;
                     check_count!("output", outputs, 1, ProgramError);
                     outputs[0]
                 }
@@ -962,7 +965,7 @@ impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where
     T: DifferentiableType,
     V: Value<Type = T>,
-    O: TransposableOperation<V, O> + ResidualZeroProvider<T> + From<AddOperation>,
+    O: TransposableOperation<V, O> + ResidualZeroProvider<T> + From<AddOperation<T>>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -1213,7 +1216,7 @@ pub trait ReverseModeDifferentiate:
                        + DifferentiableOperation<PartialEvaluationContext<Self>>
                        + TransposableOperation<Self::Constant, Self::Operation>
                        + ResidualZeroProvider<Self::Type>
-                       + From<AddOperation>,
+                       + From<AddOperation<Self::Type>>,
     >
 {
     /// Reverse-mode-differentiates `function` at `primals`, returning the primal output and a reusable [`Pullback`],
@@ -1402,7 +1405,7 @@ where
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
         + ResidualZeroProvider<C::Type>
-        + From<AddOperation>,
+        + From<AddOperation<C::Type>>,
 {
 }
 
@@ -1426,7 +1429,7 @@ pub fn vjp<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
                 > + ResidualZeroProvider<V::Type>
-                               + From<AddOperation>,
+                               + From<AddOperation<V::Type>>,
             >,
         >,
     F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
@@ -1960,9 +1963,9 @@ mod tests {
         }
     }
 
-    impl From<AddOperation> for TestLinearOperation {
+    impl From<AddOperation<DataType>> for TestLinearOperation {
         #[inline]
-        fn from(_operation: AddOperation) -> Self {
+        fn from(_operation: AddOperation<DataType>) -> Self {
             Self::Add
         }
     }
@@ -2370,8 +2373,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let known = builder.add_input(DataType::F64);
         let linear = builder.add_input(DataType::F64);
-        let known_square = builder.add_instruction(MulOperation, Vec::new(), vec![known, known]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, Vec::new(), vec![known_square, linear]).unwrap()[0];
+        let known_square = builder.add_instruction(MulOperation::new(), Vec::new(), vec![known, known]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![known_square, linear]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(
                 vec![known_square, product],

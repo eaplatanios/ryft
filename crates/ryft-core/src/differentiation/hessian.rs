@@ -412,7 +412,7 @@ pub trait HessianDifferentiate:
             PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<Self>>>,
         > + TransposableOperation<Self::Constant, Self::Operation>
                        + ResidualZeroProvider<Self::Type>
-                       + From<AddOperation>,
+                       + From<AddOperation<Self::Type>>,
     >
 {
     define_hessian_function_in_trait!(
@@ -457,7 +457,7 @@ where
         + DifferentiableOperation<PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<C>>>>
         + TransposableOperation<C::Constant, C::Operation>
         + ResidualZeroProvider<C::Type>
-        + From<AddOperation>,
+        + From<AddOperation<C::Type>>,
 {
 }
 

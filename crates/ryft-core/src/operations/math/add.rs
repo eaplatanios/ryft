@@ -106,7 +106,7 @@ mod tests {
     fn test_add() {
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &AddOperation,
+                &AddOperation::<DataType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Scalar::from(2.0f32), Scalar::from(3.5f64)],
@@ -115,7 +115,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &AddOperation,
+                &AddOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::scalar(2.0), Array::vector(vec![3.5, -1.0])],
@@ -124,7 +124,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &AddOperation,
+                &AddOperation::<DataType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Scalar::from(Complex::new(1.0f64, 2.0)), Scalar::from(Complex::new(0.5f64, -1.0))],

@@ -315,7 +315,7 @@ impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
     pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     where
         V::Type: DifferentiableType,
-        O: TransposableOperation<V, O> + ResidualZeroProvider<V::Type> + From<AddOperation>,
+        O: TransposableOperation<V, O> + ResidualZeroProvider<V::Type> + From<AddOperation<V::Type>>,
     {
         // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
         // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are
@@ -2218,7 +2218,7 @@ mod tests {
         // its tangent.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2247,7 +2247,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::F64(2.0));
-        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![input, constant]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant]).unwrap()[0];
         let severed = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![scaled]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![scaled, constant, severed], vec![Placeholder], vec![Placeholder; 3])
@@ -2304,7 +2304,7 @@ mod tests {
         // whose trailing output is the `cos(x)` residual, and the linear tangent sub-program `(ẋ, r) ↦ r · ẋ`.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2354,7 +2354,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::F64(2.0));
-        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![input, constant]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![scaled, constant], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();

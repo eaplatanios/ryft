@@ -48,9 +48,7 @@ use crate::operations::manipulation::{
     LegacyReshapeOperation, Pad, PadOperation, Reshape, ReshapeOperation, ReshapeParameters, ScatterDimensionNumbers,
     ScatterOperation, ScatterReductionKind, Slice, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
-use crate::operations::math::{
-    AddOperation, AddOperationProvider, DivOperation, MulOperation, Reduce, ReduceOperation, ReductionKind,
-};
+use crate::operations::math::{AddOperation, DivOperation, MulOperation, Reduce, ReduceOperation, ReductionKind};
 use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
 use crate::parameters::Parameter;
 use crate::partial::{
@@ -727,14 +725,10 @@ impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayType>> for ArrayProgramO
     }
 }
 
-impl<A: Value<Type = ArrayType>> AddOperationProvider<ArrayProgramType> for ArrayProgramOperation<A> {
-    fn add_operation(r#type: &ArrayProgramType) -> Result<Self, ProgramError> {
-        match r#type {
-            ArrayProgramType::Array(_) => Ok(Self::Array(ArrayOperation::Add(AddOperation::new()))),
-            ArrayProgramType::Dimension(_) => {
-                Err(TypeError::invalid("cannot add first-class dimension cotangents").into())
-            }
-        }
+impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(_operation: AddOperation<ArrayProgramType>) -> Self {
+        Self::Array(ArrayOperation::Add(AddOperation::new()))
     }
 }
 

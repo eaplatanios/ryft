@@ -361,7 +361,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
                 + DifferentiableOperation<PartialEvaluationContext<Self>>
                 + TransposableOperation<Self::Constant, Self::Operation>
                 + ResidualZeroProvider<Self::Type>
-                + From<AddOperation>
+                + From<AddOperation<Self::Type>>
         ],
     );
 
@@ -376,7 +376,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
                 + DifferentiableOperation<PartialEvaluationContext<Self>>
                 + TransposableOperation<Self::Constant, Self::Operation>
                 + ResidualZeroProvider<Self::Type>
-                + From<AddOperation>
+                + From<AddOperation<Self::Type>>
         ],
     );
 
@@ -392,7 +392,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
                 + DifferentiableOperation<PartialEvaluationContext<Self>>
                 + TransposableOperation<Self::Constant, Self::Operation>
                 + ResidualZeroProvider<Self::Type>
-                + From<AddOperation>
+                + From<AddOperation<Self::Type>>
         ],
     );
 
@@ -408,7 +408,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
                 + DifferentiableOperation<PartialEvaluationContext<Self>>
                 + TransposableOperation<Self::Constant, Self::Operation>
                 + ResidualZeroProvider<Self::Type>
-                + From<AddOperation>
+                + From<AddOperation<Self::Type>>
         ],
     );
 }
@@ -620,7 +620,7 @@ define_jacobian_function!(
                 <V::ExecutionDomain as Domain>::Operation,
             >
             + ResidualZeroProvider<V::Type>
-            + From<AddOperation>
+            + From<AddOperation<V::Type>>
     ],
 );
 
@@ -650,7 +650,7 @@ define_jacobian_function!(
                 <V::ExecutionDomain as Domain>::Operation,
             >
             + ResidualZeroProvider<V::Type>
-            + From<AddOperation>
+            + From<AddOperation<V::Type>>
     ],
 );
 
@@ -679,7 +679,7 @@ define_jacobian_auxiliary_function!(
                 <V::ExecutionDomain as Domain>::Operation,
             >
             + ResidualZeroProvider<V::Type>
-            + From<AddOperation>
+            + From<AddOperation<V::Type>>
     ],
 );
 
@@ -707,7 +707,7 @@ define_jacobian_auxiliary_function!(
                 <V::ExecutionDomain as Domain>::Operation,
             >
             + ResidualZeroProvider<V::Type>
-            + From<AddOperation>
+            + From<AddOperation<V::Type>>
     ],
 );
 
@@ -916,7 +916,7 @@ pub(crate) fn jacobian_reverse_in_context<
                            + DifferentiableOperation<PartialEvaluationContext<C>>
                            + TransposableOperation<C::Constant, C::Operation>
                            + ResidualZeroProvider<C::Type>
-                           + From<AddOperation>,
+                           + From<AddOperation<C::Type>>,
         >,
     I: Parameterized<
             C::Value,

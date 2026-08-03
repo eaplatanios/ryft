@@ -97,7 +97,7 @@ where
 
     #[inline]
     fn residual_stack_add() -> Self {
-        Self::from(ArrayProgramOperation::<A>::from(AddOperation::new()))
+        Self::from(ArrayProgramOperation::<A>::from(AddOperation::<ArrayType>::new()))
     }
 
     #[inline]
