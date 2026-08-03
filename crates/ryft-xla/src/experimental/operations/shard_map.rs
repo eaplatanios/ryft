@@ -1428,14 +1428,12 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let known_input = builder.add_input(array_type.clone());
         let runtime_input = builder.add_input(array_type.clone());
-        let doubled = builder
-            .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![known_input, known_input])
-            .unwrap()[0];
+        let doubled =
+            builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, known_input]).unwrap()[0];
         let product =
             builder.add_instruction(MulOperation::new(), Vec::new(), vec![known_input, runtime_input]).unwrap()[0];
-        let sum = builder
-            .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![runtime_input, known_input])
-            .unwrap()[0];
+        let sum =
+            builder.add_instruction(AddOperation::new(), Vec::new(), vec![runtime_input, known_input]).unwrap()[0];
         FlatTracedShardMap::from_parts(
             shard_map,
             vec![array_type.clone(), array_type.clone()],

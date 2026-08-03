@@ -2102,14 +2102,16 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       predicate per member).
 - [x] Exercise the design through inference, eager interpretation, tracing, PE, batching, JVP, VJP, transposition,
       rendering, region import (experiment), and XLA lowering (adoption; 434 XLA library tests).
-- [ ] Simplify the three projected-operation helper signatures and every call site after `Operation::Type` makes the
+- [x] Simplify the three projected-operation helper signatures and every call site after `Operation::Type` makes the
       member type recoverable from the projected operation: `jvp_projected_operation` and
       `transpose_projected_operation` must require no turbofish, while `batch_projected_operation` must drop its
       explicit member-type argument and either infer its projected batching policy from the final policy contracts or
       keep that one irreducible policy selection explicit. Do not retain inferred generic placeholders or introduce a
       marker/wrapper solely to relocate the same type annotation. Add compile-checked direct-call fixtures pinning the
-      final syntax. (Still open; the related 34 pre-existing `AddOperation::<X>::new()` turbofishes in `ryft-xla`
-      stem from `XlaOperation`'s two `From<AddOperation<_>>` impls and belong to this item's scope.)
+      final syntax. Completed 2026-08-03: all three helpers now infer the projected member type from the operation
+      argument and are called without helper turbofishes; batching selects its member policy through
+      `BatchingPolicy::Projected`; the duplicate direct homogeneous-array `AddOperation` conversions were
+      deleted; and all 34 `ryft-xla` `AddOperation::<X>::new()` annotations were removed.
 - [x] Add compile-fail tests proving one payload cannot acquire two semantic type contracts and a homogeneous enum
       cannot combine mismatched payload types (`error_multiple_operation_types` pins E0119;
       `error_mismatched_payload_type` pins the derive-boundary rejection).

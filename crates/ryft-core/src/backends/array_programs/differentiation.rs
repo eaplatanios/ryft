@@ -99,7 +99,7 @@ where
 
     #[inline]
     fn residual_stack_add() -> Self {
-        Self::from(ArrayProgramOperation::<A>::from(AddOperation::<ArrayType>::new()))
+        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::Add(AddOperation::new())))
     }
 
     #[inline]
@@ -136,7 +136,7 @@ where
         + From<WhileOperation<ArrayProgramType>>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + ZeroOperationProvider<ArrayProgramType>,
-    ArrayOperation<A>: DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+    ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -1699,7 +1699,7 @@ impl<
         + ZeroOperationProvider<ArrayProgramType>,
 > TransposableOperation<V, O> for ArrayProgramOperation<A>
 where
-    ArrayOperation<A>: TransposableOperation<A, ArrayOperation<A>>,
+    ArrayOperation<A>: Operation<Type = ArrayType> + TransposableOperation<A, ArrayOperation<A>>,
     ProjectedValue<ArrayType, Tracer<TracingContext<V, O>>>:
         BroadcastDerivativeAlignment + ElementwiseDerivativeAlignment<ArrayType> + Transpose,
 {

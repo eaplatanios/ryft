@@ -1706,18 +1706,12 @@ where
 ///   - `outputs`: Composite output cotangents, represented as live traced values or structural zeros.
 pub fn transpose_projected_operation<
     T: DifferentiableType,
+    P: Operation<Type = T> + TransposableOperation<<V as ValueProjection<T>>::Projected, P>,
     V: Value<Type: DifferentiableType + From<T>> + ValueProjection<T, Projected: Value<Type = T>>,
-    O: Operation<Type = V::Type>
-        + OperationProjection<
-            T,
-            Projected: TransposableOperation<
-                <V as ValueProjection<T>>::Projected,
-                <O as OperationProjection<T>>::Projected,
-            >,
-        >,
+    O: Operation<Type = V::Type> + OperationProjection<T, Projected = P>,
 >(
     context: &mut TracingContext<V, O>,
-    operation: &<O as OperationProjection<T>>::Projected,
+    operation: &P,
     inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>
@@ -1726,8 +1720,7 @@ where
 {
     // Stage the native member rule in an isolated member-typed trace. The completed rule program is converted back to
     // the composite type before it is attached to `context`, so primitive transpose rules never need composite types.
-    let mut rule_context =
-        TracingContext::<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>::new();
+    let mut rule_context = TracingContext::<<V as ValueProjection<T>>::Projected, P>::new();
 
     // Build the member rule's boundary and the matching source atoms together. Unknown primals contribute only their
     // projected types. Known primals become leading member-program inputs and their composite atoms become the leading
@@ -3014,9 +3007,9 @@ mod tests {
         let mut context = TracingContext::<ProjectedProgramValue, ProjectedProgramOperation>::new();
         let member_type = ProjectedProgramType::Third(ProjectedMemberType::<2>);
         let output_cotangent = context.input(member_type.clone());
-        let cotangents = transpose_projected_operation::<ProjectedMemberType<2>, _, _>(
+        let cotangents = transpose_projected_operation(
             &mut context,
-            &ProjectedMemberOperation,
+            &ProjectedMemberOperation::<2>,
             &[PartialValue::Unknown(member_type.clone())],
             &[MaybeZero::Value(output_cotangent.clone())],
         )
@@ -3031,9 +3024,9 @@ mod tests {
         // Known primal inputs are replay operands rather than linear inputs, so the member rule returns a structural
         // zero for them. Structural-zero output cotangents also cross the adapter without becoming replay values.
         let known_input = context.input(member_type.clone());
-        let cotangents = transpose_projected_operation::<ProjectedMemberType<2>, _, _>(
+        let cotangents = transpose_projected_operation(
             &mut context,
-            &ProjectedMemberOperation,
+            &ProjectedMemberOperation::<2>,
             &[PartialValue::Known(known_input)],
             &[MaybeZero::Value(output_cotangent)],
         )
@@ -3042,9 +3035,9 @@ mod tests {
             cotangents.as_slice(),
             [MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>))],
         ));
-        let cotangents = transpose_projected_operation::<ProjectedMemberType<2>, _, _>(
+        let cotangents = transpose_projected_operation(
             &mut context,
-            &ProjectedMemberOperation,
+            &ProjectedMemberOperation::<2>,
             &[PartialValue::Unknown(member_type.clone())],
             &[MaybeZero::Zero(member_type)],
         )

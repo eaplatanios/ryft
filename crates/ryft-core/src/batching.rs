@@ -822,6 +822,21 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// widening when they need an ordinary [`Region`](crate::Region) boundary.
     type BatchedProgram;
 
+    /// [`BatchingPolicy`] used to batch an [`Operation`] after projecting a composite [`Context`] onto one of its
+    /// member types. Projection changes the value and operation families seen by the batching rule, but it must
+    /// preserve the outer transform's mapped-axis extent representation. For example, projecting an array operation
+    /// out of an array-or-dimension context produces an ordinary array context, while its batch extent must remain
+    /// the outer program's first-class dimension value rather than becoming a static `usize`. [`Self::Projected`]
+    /// identifies the member policy that provides that compatible representation. Homogeneous policies project to
+    /// themselves.
+    ///
+    /// Note that this type is associated with the outer policy instead of being derived solely from either context type
+    /// because a context describes the program universe, not how a particular batching transform carries its extent.
+    /// The same projected context can therefore require different policies when reached from outer policies with
+    /// different extent representations. Since [`BatchingPolicy`] is itself parameterized by `C`, implementations
+    /// can still select a different projected policy for different outer context types when necessary.
+    type Projected: Copy + Clone + Debug;
+
     /// Wraps a parent-owned packed value with the requested mapped axis, validating and normalizing that axis.
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError>;
 
@@ -1085,6 +1100,7 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPoli
     type Batch = ArrayBatch<C::Value>;
     type Extent = usize;
     type BatchedProgram = BatchedProgram<C::Constant, C::Operation>;
+    type Projected = Self;
 
     #[inline]
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
@@ -1196,6 +1212,7 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
     type Batch = P::Batch;
     type Extent = P::Extent;
     type BatchedProgram = P::BatchedProgram;
+    type Projected = Self;
 
     #[inline]
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
@@ -2539,8 +2556,9 @@ pub(crate) fn normalized_batch_axis_type(
 /// this function from a composite operation dispatcher when the operation is [`Region`](crate::Region)-free and every
 /// operand and result belongs to the same projectable member type `T`. It converts the packed input values to the
 /// member value family, preserves the outer batch axes and mapped extent, runs the member's existing batching rule,
-/// and converts the results back to the composite value family. This keeps homogeneous member rules independent of
-/// the enclosing composite type.
+/// and converts the results back to the composite value family. The outer policy's
+/// [`Projected`](BatchingPolicy::Projected) selects the member policy that represents that same extent.
+/// This keeps homogeneous member rules independent of the enclosing composite type.
 ///
 /// Operations with mixed member types or attached regions require an explicit composite batching rule instead.
 ///
@@ -2552,9 +2570,8 @@ pub(crate) fn normalized_batch_axis_type(
 ///   - `inputs`: Packed composite batches corresponding to the operation's operands.
 pub fn batch_projected_operation<
     T: Type,
-    O: Operation<Type = T> + BatchableOperation<ProjectedContext<C, T>, Q>,
-    P: BatchingPolicy<C>,
-    Q: BatchingPolicy<ProjectedContext<C, T>, Extent = P::Extent>,
+    O: Operation<Type = T> + BatchableOperation<ProjectedContext<C, T>, P::Projected>,
+    P: BatchingPolicy<C, Projected: BatchingPolicy<ProjectedContext<C, T>, Extent = P::Extent>>,
     C: Context<
             Value: ValueProjection<T, Projected: Value<Type = T>>,
             Constant: ValueProjection<T, Projected: Value<Type = T>>,
@@ -2565,7 +2582,7 @@ pub fn batch_projected_operation<
     operation: &O,
     inputs: &[P::Batch],
 ) -> Result<Vec<P::Batch>, BatchingError> {
-    let projected_context = BatchingContext::<_, Q>::with_policy(
+    let projected_context = BatchingContext::<_, P::Projected>::with_policy(
         ProjectedContext::new(context.parent().clone()),
         context.axis_extent().clone(),
     )
@@ -2574,15 +2591,18 @@ pub fn batch_projected_operation<
     let inputs = inputs
         .iter()
         .map(|input| {
-            Q::batch(<C::Value as ValueProjection<T>>::into_projected(P::value(input).clone())?, P::batch_axis(input))
+            P::Projected::batch(
+                <C::Value as ValueProjection<T>>::into_projected(P::value(input).clone())?,
+                P::batch_axis(input),
+            )
         })
         .collect::<Result<Vec<_>, BatchingError>>()?;
     operation
         .batch(&projected_context, &EmptyRegionDriver, inputs.as_slice())?
         .into_iter()
         .map(|output| {
-            let batch_axis = Q::batch_axis(&output);
-            let value = <C::Value as ValueProjection<T>>::from_projected(Q::value(&output).clone());
+            let batch_axis = P::Projected::batch_axis(&output);
+            let value = <C::Value as ValueProjection<T>>::from_projected(P::Projected::value(&output).clone());
             P::batch(value, batch_axis)
         })
         .collect()
@@ -2660,6 +2680,7 @@ mod tests {
         type Batch = ProjectedBatch<C::Value>;
         type Extent = usize;
         type BatchedProgram = BatchedProgram<C::Constant, C::Operation>;
+        type Projected = ProjectedMemberBatching<2>;
 
         fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
             if !batch_axis.is_replicated() && !matches!(value, ProjectedProgramValue::First(_)) {
@@ -2740,6 +2761,7 @@ mod tests {
         type Batch = ProjectedBatch<C::Value>;
         type Extent = usize;
         type BatchedProgram = BatchedProgram<C::Constant, C::Operation>;
+        type Projected = Self;
 
         fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
             Ok(ProjectedBatch { value, batch_axis })
@@ -4055,12 +4077,7 @@ mod tests {
         let input = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
             ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
         );
-        let outputs = batch_projected_operation::<ProjectedMemberType<2>, _, _, ProjectedMemberBatching<2>, _>(
-            &context,
-            &ProjectedMemberOperation,
-            &[input],
-        )
-        .unwrap();
+        let outputs = batch_projected_operation(&context, &ProjectedMemberOperation::<2>, &[input]).unwrap();
         assert_eq!(
             outputs,
             vec![ProjectedBatch {

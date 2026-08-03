@@ -419,7 +419,6 @@ impl_array_operation_conversion!(
     CoordinateBasisOperation<ArrayType>,
     AbsOperation<ArrayType>,
     NegOperation<ArrayType>,
-    AddOperation<ArrayType>,
     SubOperation<ArrayType>,
     MulOperation<ArrayType>,
     DivOperation<ArrayType>,
@@ -1787,9 +1786,8 @@ mod tests {
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
             let literal = builder.add_constant(XlaConstant::new(0, r#type.clone()));
-            let shifted = builder
-                .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![known_input, literal])
-                .unwrap()[0];
+            let shifted =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, literal]).unwrap()[0];
             let scaled =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![runtime_input, literal]).unwrap()[0];
             let product =

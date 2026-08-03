@@ -718,13 +718,6 @@ impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayProgram
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayType>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: AddOperation<ArrayType>) -> Self {
-        Self::Array(ArrayOperation::Add(operation))
-    }
-}
-
 impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
     #[inline]
     fn from(_operation: AddOperation<ArrayProgramType>) -> Self {

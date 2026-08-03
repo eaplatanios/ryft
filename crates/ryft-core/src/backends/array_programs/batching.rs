@@ -190,6 +190,7 @@ impl<C: Context<Type = ArrayProgramType>> BatchingPolicy<C> for ArrayProgramBatc
     type Batch = ArrayProgramBatch<C::Value>;
     type Extent = C::Value;
     type BatchedProgram = ThreadedExtentBatchedProgram<C::Constant, C::Operation>;
+    type Projected = ArrayBatching<DynamicArrayBatchingPolicy>;
 
     #[inline]
     fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
@@ -322,6 +323,7 @@ where
         <C::Constant as ValueProjection<ArrayType>>::Projected,
         <C::Operation as OperationProjection<ArrayType>>::Projected,
     >;
+    type Projected = Self;
 
     #[inline]
     fn batch(
@@ -1122,12 +1124,11 @@ where
         .map(|(true_output, false_output)| match true_output.unbatched_type() {
             ArrayProgramType::Array(_) => {
                 <&ArrayType>::try_from(false_output.unbatched_type())?;
-                let mut selected =
-                    batch_projected_operation::<ArrayType, _, _, ArrayBatching<DynamicArrayBatchingPolicy>, _>(
-                        context,
-                        &SelectOperation::<ArrayType>::new(),
-                        &[predicate.clone(), true_output, false_output],
-                    )?;
+                let mut selected = batch_projected_operation(
+                    context,
+                    &SelectOperation::<ArrayType>::new(),
+                    &[predicate.clone(), true_output, false_output],
+                )?;
                 check_count!("output", selected, 1, ProgramError);
                 Ok(selected.remove(0))
             }
@@ -2201,11 +2202,7 @@ where
             Self::Condition(_) => batch_condition::<A, _, _>(context, driver, inputs),
             Self::While(operation) => batch_while(operation, context, driver, inputs),
             Self::Scan(operation) => batch_scan(operation, context, driver, inputs),
-            Self::Array(operation) => {
-                batch_projected_operation::<ArrayType, _, _, ArrayBatching<DynamicArrayBatchingPolicy>, _>(
-                    context, operation, inputs,
-                )
-            }
+            Self::Array(operation) => batch_projected_operation(context, operation, inputs),
             Self::Dimension(operation) => {
                 for input in inputs {
                     input.validate_replicated_dimension()?;
