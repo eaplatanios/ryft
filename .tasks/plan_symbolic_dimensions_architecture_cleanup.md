@@ -1989,6 +1989,24 @@ concatenate and shard-map coverage, all 1,112 core tests, all 433 passing XLA te
 ignore, and strict-warning rustdoc tests for both crates. All production dual-contract prerequisites are now resolved;
 the compile-fail gate remains.
 
+The eighth P8a prerequisite slice adds the pre-prototype compile-fail regression gate. One core trybuild fixture pins
+the former alternate contract for all 16 production payload families migrated in the prerequisite slices, while one
+XLA fixture pins the old mixed JIT-call contract and the deleted homogeneous shard-map contract. Every failure occurs
+at the intended `Operation<WrongType>` obligation. This finite gate detects regression to the exact contracts removed
+by Phase 8a; Phase 2's associated `Operation::Type` remains responsible for making *any* second contract structurally
+unrepresentable and for rejecting mismatched homogeneous enums. Both trybuild harnesses, formatting, and diff hygiene
+pass. The one-contract prerequisites are complete and the bounded associated-type prototype is next.
+
+A follow-up custom-call parity slice completes the portable contract without adding another operation family.
+`ArrayType::layout` is the single source of truth for explicit FFI buffer layouts; flat array input/output aliases are
+validated by `CustomCallOperation<T>` and lower to StableHLO output-operand aliases; and side-effecting calls now share
+the hidden `Effect::OrderedIo` token chain with `PrintOperation` while pure calls remain token-free. The same lowering
+supports homogeneous and bounded-dynamic composite calls, including aliased dynamic outputs. Exact StableHLO fixtures
+cover complete layout lists, multi-result alias paths, hidden token layouts, and mixed result extents; CPU execution
+passes for a non-default column-major call and an aliased side-effecting call. Verification passed all 1,112 core
+tests, all 434 passing XLA tests plus its one intentional benchmark ignore, strict core doctests (52 passed and 16
+intentionally ignored), XLA doctests, formatting, and diff hygiene.
+
 ### Phase 8: enforce contracts and consolidate operation declarations
 
 - [x] Begin only after Phases 1 through 7 have removed implicit replay and overlapping mixed constructors. Capture the
@@ -2016,6 +2034,9 @@ the compile-fail gate remains.
         distinct typed instantiations of one public operation family without duplicating padding semantics or rules.
   - [x] Retain only the canonical composite contract on `ShardMapOperation<V>` and delete its obsolete homogeneous
         contract and unreachable always-rejecting batching rule.
+- [x] Add pre-prototype compile-fail regression coverage pinning the former alternate contract for every migrated
+      production payload family in core and XLA. Keep the associated-type universal and homogeneous-enum failures in
+      the prototype gate below.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
       `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
       `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and

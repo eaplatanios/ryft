@@ -11523,7 +11523,7 @@ mod tests {
     fn test_to_mlir_module_for_program_lowers_custom_call() {
         use ryft_core::operations::custom_call::CustomCallOperation;
         use ryft_core::operations::debugging::PrintOperation;
-        use ryft_core::types::{StridedLayout, TiledLayout};
+        use ryft_core::types::{StridedLayout, Tile, TileDimension, TiledLayout};
 
         // A side-effecting custom call lowers its typed attributes, complete memory-layout lists, buffer alias,
         // and one hidden ordered-I/O token. A second side-effecting call consumes that token even though the first
@@ -11610,6 +11610,24 @@ mod tests {
             ),
             Err(LoweringError::UnsupportedOp {
                 op: "custom_call with strided array layout 'strided{12,4}'".to_string(),
+            }),
+        );
+        let invalid_permutation_type =
+            test_matrix_type(2, 3).with_layout(Some(TiledLayout::new(vec![0, 0], Vec::new()).into()));
+        assert_eq!(
+            lower_custom_call_layout(&invalid_permutation_type),
+            Err(LoweringError::UnsupportedOp {
+                op: "custom_call with invalid array layout 'tiled{0,0}' for rank-2 type \
+                     'f32[2, 3][layout=tiled{0,0}]'"
+                    .to_string(),
+            }),
+        );
+        let tiled_type = test_matrix_type(2, 3)
+            .with_layout(Some(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(2)])]).into()));
+        assert_eq!(
+            lower_custom_call_layout(&tiled_type),
+            Err(LoweringError::UnsupportedOp {
+                op: "custom_call with tiled array layout 'tiled{1,0:T(2)}'".to_string(),
             }),
         );
     }
