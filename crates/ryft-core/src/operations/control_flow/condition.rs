@@ -7,9 +7,12 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::backends::array_programs::ArrayProgramValue;
+use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, require_equal_dimensions};
+use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, ProgramBatchingOutputAxesPolicy,
+    BatchingError, ProgramBatchingOutputAxesPolicy, batch_projected_operation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -20,21 +23,24 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperationProvider};
 use crate::operations::control_flow::{Select, SelectOperation};
-use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::dimensions::{DimensionRequirementOperation, DimensionSizeOperation};
+use crate::operations::manipulation::{
+    BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation,
+};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
 use crate::programs::builders::ProgramBuilder;
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Concretizable, Value};
+use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, DataType};
+use crate::types::{ArrayProgramType, ArrayType, DataType, DimensionType};
 
 // TODO(eaplatanios): Review this.
 
@@ -981,6 +987,137 @@ where
             Ok(selected.remove(0))
         })
         .collect()
+}
+
+/// Composite array-program batching rule for [`ConditionOperation`].
+///
+/// A replicated predicate preserves one structural condition whose transformed branches explicitly thread the
+/// mapped extent. A mapped predicate replays both pure branches and selects their array outputs per item. First-class
+/// dimension outputs remain replicated, so the mapped-predicate path requires both branches to produce the same
+/// dimension value.
+impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ConditionOperation<ArrayProgramValue<A>>
+where
+    A: Value<Type = ArrayType>,
+    C: Context<
+            Type = ArrayProgramType,
+            Operation: From<BroadcastOperation>
+                           + From<ConditionOperation<ArrayProgramValue<A>>>
+                           + From<DimensionOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + OperationProjection<ArrayType>
+                           + OperationProjection<DimensionType>,
+        >,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Select + Transpose + Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected:
+        From<LegacyBroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
+    <C::Operation as OperationProjection<DimensionType>>::Projected: From<DimensionRequirementOperation>,
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayProgramBatching>,
+        driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let Some((predicate, operands)) = inputs.split_first() else {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "cannot batch a condition operation with no predicate input".to_string(),
+            });
+        };
+        <&ArrayType>::try_from(predicate.unbatched_type())?;
+
+        if predicate.batch_axis().is_replicated() {
+            let operand_axes = operands.iter().map(ArrayProgramBatch::batch_axis).collect::<Vec<_>>();
+            let true_region = driver.region(0)?;
+            let false_region = driver.region(1)?;
+            let true_axes = driver
+                .batch_program(context, true_region, operand_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
+                .output_axes()
+                .to_vec();
+            let false_axes = driver
+                .batch_program(
+                    context,
+                    false_region,
+                    operand_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )?
+                .output_axes()
+                .to_vec();
+            check_count!("output", false_axes, true_axes.len(), ProgramError);
+            let output_axes = true_axes
+                .iter()
+                .zip(false_axes)
+                .map(|(true_axis, false_axis)| if true_axis.is_replicated() { false_axis } else { *true_axis })
+                .collect::<Vec<_>>();
+            let (true_branch, _) = driver
+                .batch_program(
+                    context,
+                    true_region,
+                    operand_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
+                )?
+                .into_parts();
+            let (false_branch, _) = driver
+                .batch_program(
+                    context,
+                    false_region,
+                    operand_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
+                )?
+                .into_parts();
+
+            let mut packed_inputs = Vec::with_capacity(inputs.len() + 1);
+            packed_inputs.push(predicate.value().clone());
+            packed_inputs.push(context.axis_extent().clone());
+            packed_inputs.extend(operands.iter().map(|operand| operand.value().clone()));
+            let mut outputs =
+                context.parent().bind(self.clone(), vec![true_branch, false_branch], packed_inputs.as_slice())?;
+            check_count!("output", outputs, output_axes.len() + 1, ProgramError);
+            outputs.remove(0);
+            return outputs
+                .into_iter()
+                .zip(output_axes)
+                .map(|(output, axis)| ArrayProgramBatch::new(output, axis))
+                .collect();
+        }
+
+        let true_region = driver.region(0)?;
+        let false_region = driver.region(1)?;
+        if !true_region.effects().is_pure() || !false_region.effects().is_pure() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "cannot batch a condition with a batch-varying predicate and effectful branches because \
+                          observable effects cannot be selected per batch item"
+                    .to_string(),
+            });
+        }
+        let true_outputs = driver.batch_region(context, 0, operands.to_vec())?;
+        let false_outputs = driver.batch_region(context, 1, operands.to_vec())?;
+        check_count!("output", false_outputs, true_outputs.len(), ProgramError);
+        true_outputs
+            .into_iter()
+            .zip(false_outputs)
+            .map(|(true_output, false_output)| match true_output.unbatched_type() {
+                ArrayProgramType::Array(_) => {
+                    <&ArrayType>::try_from(false_output.unbatched_type())?;
+                    let mut selected = batch_projected_operation(
+                        context,
+                        &SelectOperation::<ArrayType>::new(),
+                        &[predicate.clone(), true_output, false_output],
+                    )?;
+                    check_count!("output", selected, 1, ProgramError);
+                    Ok(selected.remove(0))
+                }
+                ArrayProgramType::Dimension(_) => {
+                    true_output.validate_replicated_dimension()?;
+                    false_output.validate_replicated_dimension()?;
+                    require_equal_dimensions(context.parent(), true_output.value(), false_output.value())?;
+                    Ok(true_output)
+                }
+            })
+            .collect()
+    }
 }
 
 /// Capture-free forward-mode (JVP) rule for [`ConditionOperation`], staging **one fused** jvp `condition` as an
