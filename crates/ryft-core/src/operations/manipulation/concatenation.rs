@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::axes::Axis;
 use crate::batching::{
@@ -20,51 +21,86 @@ use crate::programs::atoms::MaybeZero;
 use crate::programs::effects::{Effect, Effects};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, Shape};
 
+// TODO(eaplatanios): Review this.
+
 /// Canonical operation name for [`ConcatenateOperation`].
 pub const CONCATENATE_OPERATION_NAME: &str = "concatenate";
 
-/// [`Operation`] that joins array operands along one axis using an explicit result-extent operand.
-/// Refer to the documentation of [`Concatenate`] for general concatenation semantics.
+/// [`Operation`] that joins array operands along one axis. Refer to the documentation of [`Concatenate`] for general
+/// concatenation semantics.
+///
+/// The type parameter selects the operand contract without introducing a separate concatenation operation:
+///
+///   - `ConcatenateOperation<ArrayType>` accepts only the arrays being concatenated.
+///   - `ConcatenateOperation<ArrayProgramType>` additionally accepts one trailing first-class result extent.
+///
+/// Both forms carry the same normalized axis and share all concatenation semantics. Converting between them only
+/// reparameterizes the operation family.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ConcatenateOperation {
+pub struct ConcatenateOperation<T: Type> {
     /// Axis along which the operands are joined.
     axis: usize,
+
+    /// Type universe that determines the operation's operand contract.
+    marker: PhantomData<fn() -> T>,
 }
 
-impl ConcatenateOperation {
+impl ConcatenateOperation<ArrayType> {
     /// Creates a new [`ConcatenateOperation`] that joins rank-`rank` operands along `axis`.
     #[inline]
     pub fn new<A: Into<Axis>>(axis: A, rank: usize) -> Result<Self, TypeError> {
         let axis = axis.into();
-        axis.normalize(rank).map(|axis| Self { axis }).map_err(|_| {
+        axis.normalize(rank).map(|axis| Self { axis, marker: PhantomData }).map_err(|_| {
             TypeError::invalid(format!(
                 "'{}' axis {axis} is out of bounds for operands of rank {rank}",
                 CONCATENATE_OPERATION_NAME,
             ))
         })
     }
+}
 
+impl<T: Type> ConcatenateOperation<T> {
     /// Returns the axis along which this [`ConcatenateOperation`] joins its operands.
     #[inline]
     pub fn axis(&self) -> usize {
         self.axis
     }
-}
 
-impl Display for ConcatenateOperation {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        <Self as Operation<ArrayProgramType>>::render(self, formatter, 0)
+    /// Renders this payload independently of its homogeneous or composite operation contract.
+    fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, CONCATENATE_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("axis", self.axis))
     }
 }
 
-impl Operation<ArrayProgramType> for ConcatenateOperation {
+impl From<ConcatenateOperation<ArrayType>> for ConcatenateOperation<ArrayProgramType> {
+    #[inline]
+    fn from(operation: ConcatenateOperation<ArrayType>) -> Self {
+        Self { axis: operation.axis, marker: PhantomData }
+    }
+}
+
+impl From<ConcatenateOperation<ArrayProgramType>> for ConcatenateOperation<ArrayType> {
+    #[inline]
+    fn from(operation: ConcatenateOperation<ArrayProgramType>) -> Self {
+        Self { axis: operation.axis, marker: PhantomData }
+    }
+}
+
+impl<T: Type> Display for ConcatenateOperation<T> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render_operation(formatter, 0)
+    }
+}
+
+impl Operation<ArrayProgramType> for ConcatenateOperation<ArrayProgramType> {
     #[inline]
     fn name(&self) -> &'static str {
         CONCATENATE_OPERATION_NAME
@@ -123,24 +159,22 @@ impl Operation<ArrayProgramType> for ConcatenateOperation {
 
     #[inline]
     fn effects(&self) -> Effects {
-        // TODO(eaplatanios): Update this in Phase 8.
+        // TODO(eaplatanios): Update this when Phase 8 introduces the authoritative operation declaration.
         // This is a deliberate over-approximation. A mixed concatenate whose input extents are all static and whose
         // result extent is a provably equal exact constant needs no runtime check (inference above already rejects
-        // static mismatches), but `effects` sees only the payload and the shared `axis` payload cannot carry the extent
-        // signature without duplicating input/operand-derived shape metadata. The Phase 8 dual-contract resolution
-        // gives the mixed contract its own newtype payload, which owns the extent signature the way the dimension
-        // arithmetic payloads do and makes this effect conditional on the same bounds-proof predicate.
+        // static mismatches), but `effects` sees only this axis-only payload and cannot derive the operand extent
+        // signature. The authoritative operation declaration will add the irreducible mixed extent metadata and make
+        // this effect conditional on the same bounds-proof predicate used by inference.
         Effects::single(Effect::OrderedAssertion)
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CONCATENATE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("axis", self.axis))
+        self.render_operation(formatter, indentation)
     }
 }
 
-impl Operation<ArrayType> for ConcatenateOperation {
+impl Operation<ArrayType> for ConcatenateOperation<ArrayType> {
     #[inline]
     fn name(&self) -> &'static str {
         CONCATENATE_OPERATION_NAME
@@ -161,12 +195,11 @@ impl Operation<ArrayType> for ConcatenateOperation {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CONCATENATE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("axis", self.axis))
+        self.render_operation(formatter, indentation)
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> for ConcatenateOperation {
+impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> for ConcatenateOperation<ArrayType> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -178,16 +211,17 @@ impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> 
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: From<ConcatenateOperation>>> PartiallyEvaluatableOperation<C>
-    for ConcatenateOperation
+impl<C: Context<Type = ArrayType, Operation: From<ConcatenateOperation<ArrayType>>>> PartiallyEvaluatableOperation<C>
+    for ConcatenateOperation<ArrayType>
 {
 }
 
 impl_differentiable_operation! {
-    ConcatenateOperation,
+    ConcatenateOperation<ArrayType>,
     jvp<C>
     where
-        C: Context<Type = ArrayType, Value: Concatenate, Operation: From<ConcatenateOperation>> + Zero<C::Value>,
+        C: Context<Type = ArrayType, Value: Concatenate, Operation: From<ConcatenateOperation<ArrayType>>>
+            + Zero<C::Value>,
     {
         |operation, context, _driver, inputs| {
             // Forward-mode rule for `ConcatenateOperation`. Concatenation is linear in every input, so its tangent
@@ -271,9 +305,9 @@ impl_differentiable_operation! {
 }
 
 impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>, P: ArrayBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatching<P>> for ConcatenateOperation
+    BatchableOperation<C, ArrayBatching<P>> for ConcatenateOperation<ArrayType>
 where
-    ConcatenateOperation: InterpretableOperation<C>,
+    ConcatenateOperation<ArrayType>: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -403,8 +437,9 @@ impl Concatenate for ArrayType {
     }
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ConcatenateOperation>>>>
-    Concatenate for V
+impl<V: Value<Type = ArrayType>> Concatenate for V
+where
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<ConcatenateOperation<ArrayType>>>,
 {
     fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
         inputs: I,
@@ -413,8 +448,8 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     where
         V: 'i,
     {
-        // Any context-carrying value concatenates by binding a `ConcatenateOperation` through its own context. The
-        // `From<ConcatenateOperation>` bound makes this disjoint from the eager value types (whose operation is
+        // Any context-carrying value concatenates by binding a `ConcatenateOperation<ArrayType>` through its own
+        // context. The conversion bound makes this disjoint from the eager value types (whose operation is
         // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
         // implementations.
         let mut inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
@@ -608,13 +643,14 @@ mod tests {
     #[test]
     fn test_explicit_concatenate_operation() {
         let operation = ConcatenateOperation::new(-2, 2).unwrap();
+        let mixed_operation = ConcatenateOperation::<ArrayProgramType>::from(operation.clone());
         assert_eq!(operation.axis(), 0);
-        assert_eq!(Operation::<ArrayProgramType>::name(&operation), CONCATENATE_OPERATION_NAME);
+        assert_eq!(Operation::<ArrayProgramType>::name(&mixed_operation), CONCATENATE_OPERATION_NAME);
         assert_eq!(operation.to_string(), "concatenate [axis=0]");
-        assert_eq!(Operation::<ArrayProgramType>::effects(&operation), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(Operation::<ArrayProgramType>::effects(&mixed_operation), Effects::single(Effect::OrderedAssertion),);
         assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::PURE);
         let infer = |input_types: &[ArrayProgramType]| {
-            Operation::<ArrayProgramType>::infer_output_types(&operation, input_types, &[])
+            Operation::<ArrayProgramType>::infer_output_types(&mixed_operation, input_types, &[])
         };
 
         let first_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
@@ -717,7 +753,7 @@ mod tests {
         );
         assert_eq!(
             Operation::<ArrayProgramType>::infer_output_types(
-                &ConcatenateOperation::new(1, 2).unwrap(),
+                &ConcatenateOperation::<ArrayProgramType>::from(ConcatenateOperation::new(1, 2).unwrap()),
                 &[
                     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
                     DimensionValue::constant(1).unwrap().r#type().clone().into(),
@@ -879,7 +915,7 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the captured axis.
-        let mut builder = ProgramBuilder::<Array, ConcatenateOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ConcatenateOperation<ArrayType>>::new();
         let program_first = builder.add_input(first_type);
         let program_second = builder.add_input(second_type);
         let program_output =

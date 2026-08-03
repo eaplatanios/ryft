@@ -125,7 +125,7 @@ where
     Broadcast(BroadcastOperation),
 
     /// Concatenates arrays with an explicit result extent.
-    Concatenate(ConcatenateOperation),
+    Concatenate(ConcatenateOperation<ArrayProgramType>),
 
     /// Calls a foreign kernel with explicit dynamic result extents.
     CustomCall(CustomCallOperation<ArrayProgramType>),
@@ -383,7 +383,8 @@ impl_composite_operation_conversion!(
     DimensionToScalarOperation,
     ReshapeOperation,
     BroadcastOperation,
-    ConcatenateOperation,
+    ConcatenateOperation<ArrayType>,
+    ConcatenateOperation<ArrayProgramType>,
     CustomCallOperation<ArrayType>,
     CustomCallOperation<ArrayProgramType>,
     PadOperation<ArrayType>,

@@ -1774,12 +1774,14 @@ where
 }
 
 // TODO(eaplatanios): Move this to the module where `ConcatenateOperation` is defined.
-impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching> for ConcatenateOperation
+impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching>
+    for ConcatenateOperation<ArrayProgramType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<BroadcastOperation>
-        + From<ConcatenateOperation>
+        + From<ConcatenateOperation<ArrayType>>
+        + From<ConcatenateOperation<ArrayProgramType>>
         + From<DimensionOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
@@ -2157,7 +2159,8 @@ where
     C::Operation: From<ArrayProgramOperation<A>>
         + From<LinearCallOperation<ArrayProgramType>>
         + From<BroadcastOperation>
-        + From<ConcatenateOperation>
+        + From<ConcatenateOperation<ArrayType>>
+        + From<ConcatenateOperation<ArrayProgramType>>
         + From<ConditionOperation<ArrayProgramValue<A>>>
         + From<DimensionSizeOperation>
         + From<OneOperation<ArrayType>>

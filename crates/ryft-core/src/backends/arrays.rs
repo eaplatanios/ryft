@@ -168,7 +168,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Reshape(LegacyReshapeOperation),
     Broadcast(LegacyBroadcastOperation),
     Pad(PadOperation<ArrayType>),
-    Concatenate(ConcatenateOperation),
+    Concatenate(ConcatenateOperation<ArrayType>),
     Gather(GatherOperation),
     Scatter(ScatterOperation),
     Slice(SliceOperation),

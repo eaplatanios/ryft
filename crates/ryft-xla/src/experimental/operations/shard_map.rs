@@ -1,9 +1,6 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use ryft_core::batching::{
-    ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-};
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationError, TransposableOperation,
@@ -46,7 +43,7 @@ pub struct ShardMapOperation<V> {
     /// Global output types declared at the shard-map boundary.
     output_types: Vec<ArrayType>,
 
-    /// Phantom marker tying the op to the traced leaf type it will replay with.
+    /// Phantom marker tying the operation to the traced leaf type it will replay with.
     marker: PhantomData<fn() -> V>,
 }
 
@@ -206,32 +203,6 @@ fn shard_map_body_interface<T: Type>(
     Ok(interface)
 }
 
-impl<V: Value<Type = ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        "shard_map"
-    }
-
-    #[inline]
-    fn region_slots(&self) -> &'static [RegionSlot] {
-        const { &[RegionSlot::computation("body")] }
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        shard_map_body_interface(region_interfaces, self.input_types.len(), self.output_types.len())?;
-        infer_shard_map_output_types(
-            <Self as Operation<ArrayType>>::name(self),
-            self.input_types.as_slice(),
-            self.output_types.as_slice(),
-            input_types,
-        )
-    }
-}
-
 impl<V: Clone> Operation<ArrayProgramType> for ShardMapOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
@@ -258,7 +229,7 @@ impl<V: Clone> Operation<ArrayProgramType> for ShardMapOperation<V> {
             <&ArrayType>::try_from(r#type)?;
         }
         Ok(infer_shard_map_output_types(
-            <Self as Operation<ArrayProgramType>>::name(self),
+            self.name(),
             self.input_types.as_slice(),
             self.output_types.as_slice(),
             input_types.as_slice(),
@@ -266,27 +237,6 @@ impl<V: Clone> Operation<ArrayProgramType> for ShardMapOperation<V> {
         .into_iter()
         .map(Into::into)
         .collect())
-    }
-}
-
-/// Batching rule for [`ShardMapOperation`]: batching through a staged `shard_map` boundary has no rule yet — the
-/// mapped batch axis would need to compose with the boundary's global-to-local sharding on both sides — so batching
-/// is rejected for every context.
-impl<Constant, C> BatchableOperation<C, ArrayBatching> for ShardMapOperation<Constant>
-where
-    Constant: Value<Type = ArrayType>,
-    C: Context<Type = ArrayType>,
-{
-    fn batch<D: BatchingDriver<C, ArrayBatching>>(
-        &self,
-        _context: &BatchingContext<C, ArrayBatching>,
-        _driver: &D,
-        _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        Err(BatchingError::UnsupportedOperation {
-            message: "missing batching rule for operation 'shard_map'".to_string(),
-        }
-        .into())
     }
 }
 

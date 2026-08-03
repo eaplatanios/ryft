@@ -1863,7 +1863,8 @@ where
             // Static concatenation uses the established homogeneous pullback, which slices the output cotangent at
             // cumulative input offsets. The explicit result extent is a non-differentiable shape input and has a
             // structural-zero cotangent.
-            let array_operation = Self::Array(ArrayOperation::from(operation.clone()));
+            let array_operation =
+                Self::Array(ArrayOperation::from(ConcatenateOperation::<ArrayType>::from(operation.clone())));
             let mut cotangents = array_operation.transpose(context, driver, array_inputs, outputs)?;
             cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()));
             return Ok(cotangents);

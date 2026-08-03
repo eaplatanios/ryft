@@ -1977,6 +1977,18 @@ execution, batching, differentiation, transposition, and XLA lowering select the
 Verification passed the focused core and XLA custom-call/padding tests, both test-target checks, all 1,112 core tests,
 and all 433 passing XLA tests plus its one intentional benchmark ignore. Concatenate and shard-map remain pending.
 
+The seventh P8a prerequisite slice parameterizes `ConcatenateOperation<T>` and removes shard map's obsolete
+homogeneous contract. Concatenate's `ArrayType` and `ArrayProgramType` instantiations now own the homogeneous and mixed
+explicit-result-extent signatures, respectively, while sharing the same normalized axis and semantic implementations.
+The later authoritative-declaration step still owns concatenate's conditional assertion-effect metadata, avoiding
+premature duplication of operand-derived extent metadata in this prerequisite. `ShardMapOperation<V>` now retains only
+its live composite contract: its homogeneous contract had no production consumer after the composite-body migration,
+and its projected batching rule only returned an unreachable unsupported-operation error. The composite shard-map
+contract continues to enforce the array-only public boundary. Verification passed both test-target checks, focused
+concatenate and shard-map coverage, all 1,112 core tests, all 433 passing XLA tests plus its one intentional benchmark
+ignore, and strict-warning rustdoc tests for both crates. All production dual-contract prerequisites are now resolved;
+the compile-fail gate remains.
+
 ### Phase 8: enforce contracts and consolidate operation declarations
 
 - [x] Begin only after Phases 1 through 7 have removed implicit replay and overlapping mixed constructors. Capture the
@@ -1990,7 +2002,7 @@ and all 433 passing XLA tests plus its one intentional benchmark ignore. Concate
       conversion), retaining constructor inference and one shared transform rule per semantic operation.
 - [x] Apply the proven pattern to the remaining region/call payloads (`While`, rematerialization, custom JVP/VJP, and
       XLA JIT call). Each concrete payload instantiation now has exactly one contract.
-- [ ] Resolve the genuinely mixed/homogeneous dual-contract payloads before adding `Operation::Type`. Each concrete
+- [x] Resolve the genuinely mixed/homogeneous dual-contract payloads before adding `Operation::Type`. Each concrete
       payload instantiation must have exactly one contract without duplicating semantics.
   - [x] Parameterize `CompareOperation<T>` so its homogeneous and mixed contracts belong to distinct concrete payload
         instantiations while retaining shared semantics.
@@ -1998,10 +2010,12 @@ and all 433 passing XLA tests plus its one intentional benchmark ignore. Concate
         belong to distinct concrete payload instantiations while retaining shared semantics.
   - [x] Parameterize `CustomCallOperation<T>` so its homogeneous and mixed explicit-result-extent contracts belong to
         distinct typed instantiations of one public operation family without duplicating foreign-kernel semantics.
-  - [ ] Resolve `ConcatenateOperation`.
+  - [x] Parameterize `ConcatenateOperation<T>` so its homogeneous and mixed explicit-result-extent contracts belong
+        to distinct typed instantiations while retaining shared semantics.
   - [x] Parameterize `PadOperation<T>` so its homogeneous and mixed explicit-result-extent contracts belong to
         distinct typed instantiations of one public operation family without duplicating padding semantics or rules.
-  - [ ] Resolve `ShardMapOperation<V>`.
+  - [x] Retain only the canonical composite contract on `ShardMapOperation<V>` and delete its obsolete homogeneous
+        contract and unreachable always-rejecting batching rule.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
       `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
       `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and
@@ -2023,7 +2037,7 @@ and all 433 passing XLA tests plus its one intentional benchmark ignore. Concate
       Phase 0.
 - [ ] Produce a mechanical migration count for all crates, not only `ryft-core`.
 - [ ] Gate: adopt the associated-type trait only if it enforces the already-established canonical signatures with no
-      trait-solver regression, no wrapper layer beyond the three approved localized type parameters, and a neutral or
+      trait-solver regression, no wrapper layer beyond the approved localized type-indexed payloads, and a neutral or
       smaller final generic surface.
 - [ ] Fallback gate: if rejected, implement the smallest sealed one-contract marker that prohibits dual semantics and
       document why the associated type failed. Do not leave the invariant conventional.
@@ -2034,9 +2048,10 @@ and all 433 passing XLA tests plus its one intentional benchmark ignore. Concate
       dispatch surface for `ArrayProgramOperation`, matching the homogeneous families instead of introducing a second
       generator syntax. Prerequisites, both scheduled elsewhere: every semantic rule has moved off the enum match onto
       a colocated payload implementation (the P6 differentiation relocation plus the existing composite-`jvp` TODO),
-      and each dual-contract variant wraps a dedicated newtype payload (e.g. `DynamicZero(DynamicZeroOperation)` over
-      `ZeroOperation<ArrayType>`) so one payload never carries two semantic contracts. The mixed concatenate newtype
-      additionally owns its extent signature the way the dimension arithmetic payloads do, making its
+      and each dual-contract variant carries a dedicated typed payload instantiation (or a semantic mixed payload when
+      its stored metadata differs) so one concrete payload never carries two semantic contracts. The mixed
+      concatenate representation additionally owns its extent signature the way the dimension arithmetic payloads do,
+      making its
       `OrderedAssertion` effect conditional on the same bounds-proof predicate so bounds-proven concatenates stop
       being permanently effectful (today's shared `{ axis }` payload cannot express that without duplicating
       operand-derived shape metadata; the over-approximation is documented at the payload's `effects`). Extend the
@@ -2045,7 +2060,7 @@ and all 433 passing XLA tests plus its one intentional benchmark ignore. Concate
       project-delegate-lift arm by calling the existing projection helpers rather than inlining boundary logic, and
       batching-policy selection through `<PrimaryType as BatchableType>::Policy` instead of the hard-coded homogeneous
       `ArrayBatching<P>` family, so the same attribute serves both universes with no new syntax. The variant member
-      markers and newtyped mixed payloads are irreducible declaration content, not ceremony: which universe a
+      markers and typed mixed payloads are irreducible declaration content, not ceremony: which universe a
       variant's payload speaks must be declared exactly once, on the declaration. Sequence this after P5d and P6 so
       the transform rules the derive delegates to have stopped moving, and land it with the associated-type
       `Operation` prototype so the one-contract compile-fail gates and the dispatch generation are one review unit.

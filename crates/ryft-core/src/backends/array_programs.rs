@@ -316,7 +316,7 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     Broadcast(BroadcastOperation),
 
     /// Mixed operation that concatenates array operands using one trailing result-extent operand.
-    Concatenate(ConcatenateOperation),
+    Concatenate(ConcatenateOperation<ArrayProgramType>),
 
     /// Mixed foreign-kernel call whose trailing dimension operands define its dynamic output axes.
     CustomCall(CustomCallOperation<ArrayProgramType>),
@@ -447,9 +447,16 @@ impl<A: Value<Type = ArrayType>> From<BroadcastOperation> for ArrayProgramOperat
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<ConcatenateOperation> for ArrayProgramOperation<A> {
+impl<A: Value<Type = ArrayType>> From<ConcatenateOperation<ArrayType>> for ArrayProgramOperation<A> {
     #[inline]
-    fn from(operation: ConcatenateOperation) -> Self {
+    fn from(operation: ConcatenateOperation<ArrayType>) -> Self {
+        Self::Concatenate(operation.into())
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<ConcatenateOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: ConcatenateOperation<ArrayProgramType>) -> Self {
         Self::Concatenate(operation)
     }
 }
