@@ -279,7 +279,7 @@ impl<
 /// [`Instruction`](crate::Instruction) being transposed and to nested transposition work over those regions.
 /// The transposition engine constructs a [`TranspositionDriver`] for every instruction. [`RegionDriver`] provides
 /// structural region access, while this trait adds transposition-specific recursion.
-pub trait TranspositionDriver<V: Value, O: Operation<V::Type>>: RegionDriver<V, O> {
+pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDriver<V, O> {
     /// Transposes `region` according to the input linearity mask, re-entering the active transposition machinery,
     /// and returns the transposed standalone [`Program`].
     fn transpose_program(
@@ -289,7 +289,7 @@ pub trait TranspositionDriver<V: Value, O: Operation<V::Type>>: RegionDriver<V, 
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>;
 }
 
-impl<V: Value, O: Operation<V::Type>> TranspositionDriver<V, O> for EmptyRegionDriver {
+impl<V: Value, O: Operation<Type = V::Type>> TranspositionDriver<V, O> for EmptyRegionDriver {
     #[inline]
     fn transpose_program(
         &self,
@@ -302,12 +302,12 @@ impl<V: Value, O: Operation<V::Type>> TranspositionDriver<V, O> for EmptyRegionD
 
 /// [`TranspositionDriver`] scoped to one replayed linear [`Instruction`](crate::Instruction), borrowing exactly the
 /// [`Region`](crate::Region)s attached to that instruction.
-struct RecursiveTranspositionDriver<'r, V: Value, O: Operation<V::Type>> {
+struct RecursiveTranspositionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// Borrowed attached [`Region`](crate::Region)(crate::Region)s, in region order.
     regions: Vec<RegionRef<'r, V, O>>,
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
@@ -407,7 +407,7 @@ impl<
 ///     Constant(ConstantOperation<V>),
 /// }
 /// ```
-pub trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::Type> {
+pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation<Type = V::Type> {
     /// Applies this operation's transpose rule to the provided symbolic output cotangents, computing `x̄ = Lᵀ(ȳ)` for
     /// the linear map `y = L(x)` this operation stages. The returned vector must contain one entry per operation input.
     /// Each [`MaybeZero::Value`] entry is a staged cotangent contribution in the active [`TracingContext`], and each
@@ -505,7 +505,7 @@ impl<
         ///   - `adjoints`: Per-primal-atom table storing the currently accumulated cotangent atom, if any.
         ///   - `atom`: Primal atom whose cotangent is being accumulated.
         ///   - `contribution`: Staged cotangent atom to add into `atom`'s adjoint slot.
-        fn accumulate<V: Value, O: Operation<V::Type> + From<AddOperation<V::Type>>>(
+        fn accumulate<V: Value, O: Operation<Type = V::Type> + From<AddOperation<V::Type>>>(
             builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
             adjoints: &mut [Option<AtomId>],
             atom: AtomId,
@@ -572,7 +572,7 @@ impl<
         ///   - `materialization_state`: Per-source-instruction traversal state used for memoization
         ///      and cycle detection.
         ///   - `atom`: ID of the known source atom to materialize in the pullback builder.
-        fn materialize_known<V: Value, O: Operation<V::Type>>(
+        fn materialize_known<V: Value, O: Operation<Type = V::Type>>(
             program: RegionRef<'_, V, O>,
             instruction_by_output: &[Option<usize>],
             linear: &[bool],
@@ -1707,7 +1707,7 @@ where
 pub fn transpose_projected_operation<
     T: DifferentiableType,
     V: Value<Type: DifferentiableType + From<T>> + ValueProjection<T, Projected: Value<Type = T>>,
-    O: Operation<V::Type>
+    O: Operation<Type = V::Type>
         + OperationProjection<
             T,
             Projected: TransposableOperation<
@@ -1889,7 +1889,9 @@ mod tests {
         Zero(ZeroOperation<DataType>),
     }
 
-    impl Operation<DataType> for TestLinearOperation {
+    impl Operation for TestLinearOperation {
+        type Type = DataType;
+
         #[inline]
         fn name(&self) -> &'static str {
             match self {

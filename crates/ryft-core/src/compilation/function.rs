@@ -395,7 +395,7 @@ impl Default for JitCacheCapacities {
 /// region by [`Rc`] identity. The concrete operation family decides how that boundary lowers and how batching,
 /// differentiation, partial evaluation, and other transforms rewrite it. This keeps higher-order call semantics with
 /// the operation that owns them while allowing the lifecycle and capture plumbing to remain backend-neutral.
-pub trait CompiledCallOperation<Constant: Value>: Operation<Constant::Type> + Sized {
+pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Type> + Sized {
     /// Constructs a call operation. The accompanying [`Context::bind`] supplies its callee through a shared-callee
     /// region driver.
     fn compiled_call() -> Self;
@@ -1552,7 +1552,9 @@ mod tests {
     #[derive(Clone, Debug)]
     struct NegateOperation;
 
-    impl Operation<DataType> for NegateOperation {
+    impl Operation for NegateOperation {
+        type Type = DataType;
+
         fn name(&self) -> &'static str {
             "test_negate"
         }

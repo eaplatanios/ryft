@@ -283,7 +283,7 @@ impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>, F: Fn(&V) -> R
 pub fn unary_elementwise_jvp<
     T: DifferentiableType,
     V: ElementwiseDerivativeAlignment<T>,
-    O: Operation<T>,
+    O: Operation<Type = T>,
     PrimalFn: Fn(&V) -> Result<V, ProgramError>,
     TangentFn: FnOnce(UnaryElementwiseJvpOperands<'_, T, V, PrimalFn>) -> Result<V, DifferentiationError>,
 >(
@@ -365,7 +365,7 @@ impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementw
 pub fn binary_elementwise_jvp<
     T: DifferentiableType,
     V: std::ops::Add<Output = V> + ElementwiseDerivativeAlignment<T>,
-    O: Operation<T>,
+    O: Operation<Type = T>,
     PrimalFn: FnOnce(&V, &V) -> Result<V, ProgramError>,
     LeftTangentTermFn: FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
     RightTangentTermFn: FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
@@ -505,7 +505,9 @@ mod tests {
         #[derive(Clone)]
         struct BooleanOutputOperation;
 
-        impl Operation<DataType> for BooleanOutputOperation {
+        impl Operation for BooleanOutputOperation {
+            type Type = DataType;
+
             fn name(&self) -> &'static str {
                 "boolean_output"
             }

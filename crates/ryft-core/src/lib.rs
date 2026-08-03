@@ -90,7 +90,9 @@ pub(crate) mod tests {
         WithRegions(&'static [RegionSlot]),
     }
 
-    impl Operation<DataType> for TestRegionOperation {
+    impl Operation for TestRegionOperation {
+        type Type = DataType;
+
         fn name(&self) -> &'static str {
             match self {
                 Self::Add => "add",

@@ -125,7 +125,10 @@ pub trait ResidualZeroProvider<T: Type>: ZeroOperationProvider<T> {
     /// represents an input-free zero operation. Families whose zero consumes runtime geometry override this function
     /// so that value-level binding, residualization, and builder-level staging share one operation assembly.
     #[inline]
-    fn zero_operation_with_residuals<R: Clone>(r#type: T, residuals: &[R]) -> Result<(Self, Vec<R>), ProgramError> {
+    fn zero_operation_with_residuals<R: Clone>(r#type: T, residuals: &[R]) -> Result<(Self, Vec<R>), ProgramError>
+    where
+        Self: Operation<Type = T>,
+    {
         if !residuals.is_empty() {
             return Err(ProgramError::InvalidArgument {
                 message: format!("input-free zero expected 0 residuals but got {}", residuals.len()),
@@ -137,7 +140,7 @@ pub trait ResidualZeroProvider<T: Type>: ZeroOperationProvider<T> {
 
 // Every operation family that absorbs a type-only `ZeroOperation` has an input-free zero, and so the defaulted
 // residual protocol applies verbatim. Composite families without that conversion implement the protocol directly.
-impl<T: Type, O: Operation<T> + From<ZeroOperation<T>>> ResidualZeroProvider<T> for O {}
+impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> ResidualZeroProvider<T> for O {}
 
 /// Captures the runtime values needed to materialize a zero of `r#type` and validates the operation family's residual
 /// protocol. [`ResidualZeroProvider::zero_residual_types`] declares the residual signature, while
@@ -716,7 +719,9 @@ impl<T: DifferentiableType> Display for LinearCallOperation<T> {
     }
 }
 
-impl<T: DifferentiableType> Operation<T> for LinearCallOperation<T> {
+impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         // The two forms render under distinct names so rendered programs and the diagnostics built from this name
@@ -973,7 +978,7 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
 
 impl<
     V: Value<Type: DifferentiableType>,
-    O: Operation<V::Type> + ZeroOperationProvider<V::Type> + From<LinearCallOperation<V::Type>>,
+    O: Operation<Type = V::Type> + ZeroOperationProvider<V::Type> + From<LinearCallOperation<V::Type>>,
 > TransposableOperation<V, O> for LinearCallOperation<V::Type>
 {
     fn transpose<D: TranspositionDriver<V, O>>(

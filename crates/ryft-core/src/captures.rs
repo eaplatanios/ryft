@@ -176,7 +176,9 @@ where
     }
 }
 
-impl<T: Type, O: Operation<T>, C: Value<Type = T>> CapturingContext for TracingContext<CaptureReference<T>, O, C> {
+impl<T: Type, O: Operation<Type = T>, C: Value<Type = T>> CapturingContext
+    for TracingContext<CaptureReference<T>, O, C>
+{
     type Capture = C;
 
     #[inline]
@@ -258,7 +260,7 @@ pub struct ClosedProgram<
 
 impl<
     V: Value,
-    O: Operation<V::Type>,
+    O: Operation<Type = V::Type>,
     Input: Parameterized<CaptureReference<V::Type>>,
     Output: Parameterized<CaptureReference<V::Type>>,
 > ClosedProgram<V, O, Input, Output>

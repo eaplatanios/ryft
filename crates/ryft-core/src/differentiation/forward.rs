@@ -140,7 +140,7 @@ impl<V: Typed + Display> Display for DifferentiationDual<V> {
 /// This is the domain-free, interpretation-free core shared by every linearization entry point. It carries only the
 /// two sub-programs and the residual count that relates them, leaving the concrete primal outputs to be recovered by
 /// callers that interpret [`primal`](Self::primal) under a value semantics of their choice.
-pub struct Linearization<V: Value, O: Operation<V::Type>> {
+pub struct Linearization<V: Value, O: Operation<Type = V::Type>> {
     /// Nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal outputs
     /// `y = f(x)` followed by the residuals `r`, its trailing [`residual_count`](Self::residual_count) outputs, which
     /// form the residual environment consumed by the tangent sub-program.
@@ -156,7 +156,7 @@ pub struct Linearization<V: Value, O: Operation<V::Type>> {
     residual_count: usize,
 }
 
-impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     /// Creates a new [`Linearization`] from its parts, validating the boundary contract documented on [`Linearization`]
     /// where `primal` produces its primal outputs followed by its trailing `residual_count` residuals, and `tangent`
     /// consumes one tangent input per non-zero differential input followed by those same residuals and produces one
@@ -691,7 +691,7 @@ struct RecursiveDifferentiationDriver<'r, D> {
     driver: &'r D,
 }
 
-impl<V: Value, O: Operation<V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
+impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
     for RecursiveDifferentiationDriver<'_, D>
 {
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
@@ -739,6 +739,9 @@ where
     }
 }
 
+// TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
+//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
+//  context type is built from `Self` (E0284); the equality is enforced per method through `where` clauses instead.
 /// Represents [`Operation`]s that support forward-mode differentiation (i.e., computing Jacobian-Vector Products).
 /// Reading an operation as a function `y = f(x₁, …, xₙ)` from its operands to its outputs, the [`jvp`](Self::jvp)
 /// function propagates [`DifferentiationDual`]s through it. Each input dual `(xᵢ, ẋᵢ)` pairs an operand with its
@@ -771,7 +774,14 @@ where
 ///     [`DifferentiationDriver`], whose concrete implementation establishes the finite program-level bounds at its
 ///     construction site. Output-level semantic queries such as [`Operation::is_zero`] are forwarded by the base
 ///     operation dispatcher and therefore introduce no additional witness bounds.
-pub trait DifferentiableOperation<C: Context>: Operation<C::Type> {
+///
+/// The super-trait is plain [`Operation`] rather than `Operation<Type = C::Type>` because the current trait solver
+/// cannot discharge that projection equality at implementation heads whose differentiation context is itself built
+/// from `Self`. The equality is instead required per method through `where Self: Operation<Type = C::Type>`, so a
+/// payload whose [`Operation::Type`] disagrees with `C::Type` cannot be differentiated in `C`: the requirement is
+/// restated by the derived dispatcher's per-payload predicates and by the composite dispatchers, and any mismatched
+/// payload is rejected with a type-mismatch error at its use site.
+pub trait DifferentiableOperation<C: Context>: Operation {
     /// Applies this operation's capture-free forward-mode rule, mapping the input duals `(xᵢ, ẋᵢ)` to the output duals
     /// `(y, ẏ) = (f(x), Σᵢ (∂f/∂xᵢ)(x) · ẋᵢ)` where `f` is the function this operation computes. The returned vector
     /// must be aligned with this operation's outputs, each element pairing a primal output value with its tangent, both
@@ -788,7 +798,9 @@ pub trait DifferentiableOperation<C: Context>: Operation<C::Type> {
         context: &C,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+    where
+        Self: Operation<Type = C::Type>;
 }
 
 /// [`DifferentiationDual`] flowing through a forward-mode [`DifferentiationContext`]. The function being differentiated
@@ -1077,7 +1089,7 @@ where
     }
 }
 
-impl<V: Value<Type: DifferentiableType>, O: Operation<V::Type>> RegionRef<'_, V, O>
+impl<V: Value<Type: DifferentiableType>, O: Operation<Type = V::Type>> RegionRef<'_, V, O>
 where
     O: PartiallyEvaluatableOperation<TracingContext<V, O>>
         + DifferentiableOperation<TracingContext<V, O>>
@@ -1524,7 +1536,7 @@ where
     }
 }
 
-impl<V: Value<Type: DifferentiableType>, O: Operation<V::Type>> Program<V, O, Vec<V>, Vec<V>>
+impl<V: Value<Type: DifferentiableType>, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>>
 where
     O: PartiallyEvaluatableOperation<TracingContext<V, O>>
         + DifferentiableOperation<TracingContext<V, O>>
@@ -2081,7 +2093,7 @@ pub fn jvp_projected_operation<
 ///   - `source`: Primal program atom from which the provider obtains runtime geometry.
 ///   - `r#type`: Type of the zero that will later be materialized.
 ///   - `site`: Description of the capture site included in malformed-program diagnostics.
-fn capture_and_validate_zero_residual_atoms<V: Value, O: ResidualZeroProvider<V::Type>>(
+fn capture_and_validate_zero_residual_atoms<V: Value, O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type>>(
     builder: &mut ProgramBuilder<V, O>,
     source: AtomId,
     r#type: &V::Type,

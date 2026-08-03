@@ -97,7 +97,9 @@ impl<'r, D> EagerInterpretationDriver<'r, D> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O> for EagerInterpretationDriver<'_, D> {
+impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
+    for EagerInterpretationDriver<'_, D>
+{
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
@@ -108,7 +110,7 @@ impl<V: Value, O: Operation<V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O> 
     }
 }
 
-impl<V: Value, O: Operation<V::Type> + InterpretableOperation<EagerContext<V, O>>, D: RegionDriver<V, O>>
+impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContext<V, O>>, D: RegionDriver<V, O>>
     InterpretationDriver<EagerContext<V, O>> for EagerInterpretationDriver<'_, D>
 {
     #[inline]
@@ -122,13 +124,25 @@ impl<V: Value, O: Operation<V::Type> + InterpretableOperation<EagerContext<V, O>
     }
 }
 
+// TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
+//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose context
+//  type is built from `Self` (E0284), and a per-method `where Self: Operation<Type = C::Type>` clause reproduces the
+//  same failure for the composite eager dispatcher in `backends::array_programs`.
 /// Represents [`Operation`]s that can be interpreted (i.e., executed) over a chosen value semantics. The interpretation
 /// [`Domain`] `C` is the single source of truth for the type, value, and operation families participating in
 /// interpretation. The contract deliberately requires only [`Domain`] and not [`Context`] as [`EagerContext`]'s
 /// [`Context`] implementation requires `O: InterpretableOperation<Self>`, and making [`Context`] itself reachable from
 /// this trait would make that obligation self-referential and overflow the trait solver. Implementations therefore add
 /// only the context capabilities they actually consume (e.g., `C: Zero<C::Value>` for nullary construction).
-pub trait InterpretableOperation<C: Domain>: Operation<C::Type> {
+///
+/// The super-trait is plain [`Operation`] rather than `Operation<Type = C::Type>` because the current trait solver
+/// cannot discharge that projection equality at implementation heads whose interpretation domain is itself built from
+/// `Self`, which is exactly the shape of every eager operation-family dispatcher. Restating the equality per method
+/// fails for the same reason, so this contract relies on its use sites: an operation whose [`Operation::Type`]
+/// disagrees with `C::Type` is rejected by the [`Domain::Operation`] item bound, by [`Program`]'s
+/// `O: Operation<Type = V::Type>` requirement, and by the homogeneous-family and `#[derive(Operation)]`
+/// dispatcher boundaries that store the payload.
+pub trait InterpretableOperation<C: Domain>: Operation {
     /// Interprets this [`Operation`] given the provided input values and returns the resulting output values.
     ///
     /// # Parameters
@@ -148,7 +162,7 @@ pub trait InterpretableOperation<C: Domain>: Operation<C::Type> {
 impl<
     T: Type,
     V: Value<Type = T>,
-    O: Operation<T>,
+    O: Operation<Type = T>,
     Input: Parameterized<V, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<V>,
 > Program<V, O, Input, Output>
@@ -297,7 +311,9 @@ impl<
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, O, Input, Output> {
+impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<V, O, Input, Output>
+{
     /// Interprets/executes this [`Program`]'s [`Instruction`]s using the caller-supplied value and error semantics.
     /// Transforms and backends specialize this interpretation by choosing a runtime value type `V`, an error type `E`,
     /// a constant-lifting closure `lift_fn`, and an instruction-interpretation closure `interpret_fn`. Inputs and
@@ -340,7 +356,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
     /// Interprets this borrowed [`Region`](crate::Region) through the provided [`Context`] using flat input and output
     /// values. The region and every nested region attached to its [`Instruction`]s are replayed directly from the
     /// source arena. When the provided context stages an unchanged nested region, one replay-scoped mapping preserves
@@ -734,7 +750,9 @@ mod tests {
         #[derive(Clone)]
         struct WrongShapeOperation;
 
-        impl Operation<ArrayType> for WrongShapeOperation {
+        impl Operation for WrongShapeOperation {
+            type Type = ArrayType;
+
             fn name(&self) -> &'static str {
                 "wrong_shape"
             }

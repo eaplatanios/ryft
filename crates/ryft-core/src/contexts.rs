@@ -152,7 +152,7 @@ pub trait Domain: Sized {
     type Constant: Value<Type = Self::Type>;
 
     /// [`Operation`] representation supported by this [`Domain`] for ordinary traced [`Program`]s.
-    type Operation: Operation<Self::Type>;
+    type Operation: Operation<Type = Self::Type>;
 }
 
 /// Active context that can *apply* an [`Operation`] to values, layered on top of the passive [`Domain`] substrate.
@@ -284,12 +284,12 @@ pub trait Context: Domain + Clone {
 /// eager value contexts that only materialize constants and expose context capabilities such as zero, one, fill, etc.
 /// Code that binds or batches a richer operation family should still specify `O` explicitly, such as
 /// `EagerContext<V, ArrayOperation<V>>`.
-pub struct EagerContext<V: Value, O: Operation<V::Type> = ConstantOperation<V>> {
+pub struct EagerContext<V: Value, O: Operation<Type = V::Type> = ConstantOperation<V>> {
     /// [`PhantomData`] marker tying this zero-sized context to its associated types.
     marker: PhantomData<fn() -> (V, O)>,
 }
 
-impl<V: Value, O: Operation<V::Type>> EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> EagerContext<V, O> {
     /// Creates a new [`EagerContext`].
     #[inline]
     pub const fn new() -> Self {
@@ -297,37 +297,37 @@ impl<V: Value, O: Operation<V::Type>> EagerContext<V, O> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Copy for EagerContext<V, O> {}
+impl<V: Value, O: Operation<Type = V::Type>> Copy for EagerContext<V, O> {}
 
-impl<V: Value, O: Operation<V::Type>> Clone for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Clone for EagerContext<V, O> {
     #[inline]
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> std::fmt::Debug for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> std::fmt::Debug for EagerContext<V, O> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("EagerContext")
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Default for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Default for EagerContext<V, O> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Domain for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Domain for EagerContext<V, O> {
     type Type = V::Type;
     type Value = V;
     type Constant = V;
     type Operation = O;
 }
 
-impl<V: Value, O: Operation<V::Type> + InterpretableOperation<Self>> Context for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Context for EagerContext<V, O> {
     #[inline]
     fn lift(&self, constant: V) -> Result<V, ProgramError> {
         Ok(constant)
@@ -1014,7 +1014,9 @@ pub(crate) mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) struct ProjectedMemberOperation<const MEMBER: u8>;
 
-    impl<const MEMBER: u8> Operation<ProjectedMemberType<MEMBER>> for ProjectedMemberOperation<MEMBER> {
+    impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
+        type Type = ProjectedMemberType<MEMBER>;
+
         fn name(&self) -> &'static str {
             "projected_member"
         }
@@ -1044,8 +1046,11 @@ pub(crate) mod tests {
         }
     }
 
-    impl<const MEMBER: u8, V: Value<Type = ProjectedMemberType<MEMBER>>, O: Operation<ProjectedMemberType<MEMBER>>>
-        TransposableOperation<V, O> for ProjectedMemberOperation<MEMBER>
+    impl<
+        const MEMBER: u8,
+        V: Value<Type = ProjectedMemberType<MEMBER>>,
+        O: Operation<Type = ProjectedMemberType<MEMBER>>,
+    > TransposableOperation<V, O> for ProjectedMemberOperation<MEMBER>
     {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
@@ -1097,7 +1102,9 @@ pub(crate) mod tests {
         }
     }
 
-    impl Operation<ProjectedProgramType> for ProjectedProgramOperation {
+    impl Operation for ProjectedProgramOperation {
+        type Type = ProjectedProgramType;
+
         fn name(&self) -> &'static str {
             match self {
                 Self::First(operation) => operation.name(),
@@ -1395,7 +1402,9 @@ pub(crate) mod tests {
             fail_region_input_inference: bool,
         }
 
-        impl Operation<DataType> for StagingRegionOperation {
+        impl Operation for StagingRegionOperation {
+            type Type = DataType;
+
             fn name(&self) -> &'static str {
                 "staging_region"
             }
@@ -1436,7 +1445,9 @@ pub(crate) mod tests {
         #[derive(Clone)]
         struct IdentityInstantiatingRegionOperation;
 
-        impl Operation<ArrayType> for IdentityInstantiatingRegionOperation {
+        impl Operation for IdentityInstantiatingRegionOperation {
+            type Type = ArrayType;
+
             fn name(&self) -> &'static str {
                 "identity_instantiating_region"
             }
