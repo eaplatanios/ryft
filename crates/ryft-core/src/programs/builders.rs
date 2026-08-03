@@ -570,8 +570,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(2.0f64));
-        let v0 = builder.add_instruction(NegOperation, Vec::new(), vec![i0]).unwrap()[0];
-        let v1 = builder.add_instruction(AddOperation, Vec::new(), vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1]).unwrap()[0];
         assert_eq!(builder.input_ids, vec![i0, i1]);
         assert!(matches!(
             builder.atoms.get(i0.index()),
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn test_program_builder_rejects_unbound_instruction_inputs() {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let v0 = builder.add_instruction(AddOperation, Vec::new(), vec![AtomId::new(42), AtomId::new(99)]);
+        let v0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![AtomId::new(42), AtomId::new(99)]);
         assert!(matches!(v0, Err(ProgramError::UnboundAtomId { id }) if id == AtomId::new(42)));
     }
 
@@ -672,7 +672,7 @@ mod tests {
         let mut input_output_overlap_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = input_output_overlap_builder.add_input(DataType::F64);
         input_output_overlap_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Neg(NegOperation),
+            ScalarOperation::Neg(NegOperation::new()),
             vec![input],
             vec![input],
             Vec::new(),
@@ -691,13 +691,13 @@ mod tests {
         let input = duplicate_output_builder.add_input(DataType::F64);
         let output = duplicate_output_builder.add_variable(DataType::F64);
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Neg(NegOperation),
+            ScalarOperation::Neg(NegOperation::new()),
             vec![input],
             vec![output],
             Vec::new(),
         ));
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Neg(NegOperation),
+            ScalarOperation::Neg(NegOperation::new()),
             vec![input],
             vec![output],
             Vec::new(),

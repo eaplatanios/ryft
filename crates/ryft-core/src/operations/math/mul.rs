@@ -25,7 +25,7 @@ fn infer_mul_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayTy
     // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
     // and the recomputed state is reattached afterward.
     let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
-    let output = MulOperation.infer_elementwise_broadcast_type(&stripped)?;
+    let output = MulOperation::<ArrayType>::new().infer_elementwise_broadcast_type(&stripped)?;
     let left_unreduced = input_types[0].unreduced_axes();
     let left_reduced = input_types[0].reduced_axes();
     let right_unreduced = input_types[1].unreduced_axes();
@@ -116,13 +116,13 @@ impl_differentiable_elementwise_operation! {
     transpose<V, O>
     where
         V::Type: DifferentiableType,
-        O: From<MulOperation>,
+        O: From<MulOperation<V::Type>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         [left = @linear, right = @known] =>
-            |output_cotangent| right.binary(output_cotangent, MulOperation);
+            |output_cotangent| right.binary(output_cotangent, MulOperation::new());
         [left = @known, right = @linear] =>
-            |output_cotangent| left.binary(output_cotangent, MulOperation);
+            |output_cotangent| left.binary(output_cotangent, MulOperation::new());
     },
 }
 
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_mul() {
-        let operation = MulOperation;
+        let operation = MulOperation::<DataType>::new();
 
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
@@ -218,7 +218,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
+                &MulOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::scalar(2.0), Array::scalar(3.5)],
@@ -287,8 +287,8 @@ mod tests {
 
         // Unreduced over `x` times reduced over `x` is the partial-sum-times-replicated case: the product stays
         // unreduced over `x`, and the reduced marker is cleared.
-        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(
-            &MulOperation,
+        let output = <MulOperation<ArrayType> as Operation<ArrayType>>::infer_output_types(
+            &MulOperation::new(),
             &[unreduced("x"), reduced("x")],
             &[],
         )
@@ -298,7 +298,7 @@ mod tests {
 
         // Two operands both unreduced cannot be multiplied (the product of two partial sums is not a partial sum).
         check_operation_type_inference!(
-            operation = MulOperation,
+            operation = MulOperation::new(),
             cases = [{
                 input_types = [unreduced("x"), unreduced("x")],
                 error = format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced"),
@@ -307,7 +307,7 @@ mod tests {
 
         // Unreduced over `x` requires the other operand to be reduced over exactly `x`, not a different axis.
         check_operation_type_inference!(
-            operation = MulOperation,
+            operation = MulOperation::new(),
             cases = [{
                 input_types = [unreduced("x"), reduced("y")],
                 error = format!(
@@ -318,8 +318,8 @@ mod tests {
         );
 
         // Two operands reduced over the same axis multiply to a value reduced over that axis.
-        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(
-            &MulOperation,
+        let output = <MulOperation<ArrayType> as Operation<ArrayType>>::infer_output_types(
+            &MulOperation::new(),
             &[reduced("x"), reduced("x")],
             &[],
         )
@@ -330,7 +330,7 @@ mod tests {
         // A reduced operand cannot be multiplied by an otherwise replicated operand because the result would inherit
         // a reduction marker that does not describe both inputs.
         check_operation_type_inference!(
-            operation = MulOperation,
+            operation = MulOperation::new(),
             cases = [{
                 input_types = [reduced("x"), vector_type()],
                 error = format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes"),
@@ -342,7 +342,7 @@ mod tests {
     fn test_mul_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = MulOperation,
+            operation = MulOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -358,7 +358,7 @@ mod tests {
     fn test_mul_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = MulOperation,
+            operation = MulOperation::new(),
             cases = [{
                 primals = [Array::scalar(2.0), Array::scalar(5.0)],
                 tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_mul_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = MulOperation, inputs = [2.0, 3.5], expected = 7.0,);
+        check_operation_partial_evaluation!(operation = MulOperation::new(), inputs = [2.0, 3.5], expected = 7.0,);
     }
 
     #[test]
@@ -411,7 +411,7 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         check_operation_transposition!(
             @exact,
-            operation = MulOperation,
+            operation = MulOperation::new(),
             cases = [
                 {
                     inputs = [

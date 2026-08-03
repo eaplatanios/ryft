@@ -149,7 +149,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = SignOperation,
+            operation = SignOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -158,7 +158,7 @@ mod tests {
     fn test_sign_batching() {
         check_operation_batching!(
             @exact,
-            operation = SignOperation,
+            operation = SignOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]))],
@@ -171,7 +171,7 @@ mod tests {
     fn test_sign_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = SignOperation,
+            operation = SignOperation::new(),
             cases = [{
                 primals = [Array::scalar(-2.0)],
                 tangents = [Array::scalar(1.0)],
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_sign_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = SignOperation, inputs = [-0.7], expected = -1.0,);
+        check_operation_partial_evaluation!(operation = SignOperation::new(), inputs = [-0.7], expected = -1.0,);
     }
 
     #[test]

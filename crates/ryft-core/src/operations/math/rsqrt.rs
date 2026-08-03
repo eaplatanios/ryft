@@ -111,7 +111,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = RsqrtOperation,
+            operation = RsqrtOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -120,7 +120,7 @@ mod tests {
     fn test_rsqrt_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = RsqrtOperation,
+            operation = RsqrtOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 4.0]))],
@@ -134,7 +134,7 @@ mod tests {
         let expected_tangent = 3.0 * -(1.0 / (2.0 * 4.0f64.powf(1.5)));
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = RsqrtOperation,
+            operation = RsqrtOperation::new(),
             cases = [{
                 primals = [Array::scalar(4.0)],
                 tangents = [Array::scalar(3.0)],
@@ -158,14 +158,14 @@ mod tests {
 
     #[test]
     fn test_rsqrt_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = RsqrtOperation, inputs = [4.0], expected = 0.5,);
+        check_operation_partial_evaluation!(operation = RsqrtOperation::new(), inputs = [4.0], expected = 0.5,);
     }
 
     #[test]
     fn test_rsqrt_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = RsqrtOperation,
+            operation = RsqrtOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

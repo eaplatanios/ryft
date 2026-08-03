@@ -111,7 +111,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = CosOperation,
+            operation = CosOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -120,7 +120,7 @@ mod tests {
     fn test_cos_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = CosOperation,
+            operation = CosOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]))],
@@ -133,7 +133,7 @@ mod tests {
     fn test_cos_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = CosOperation,
+            operation = CosOperation::new(),
             cases = [{
                 primals = [Array::scalar(2.0)],
                 tangents = [Array::scalar(3.0)],
@@ -172,7 +172,7 @@ mod tests {
         // The widened staged tangent program computes the coefficient in the widened differential representation.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
-        let output = builder.add_instruction(CosOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
@@ -195,14 +195,14 @@ mod tests {
 
     #[test]
     fn test_cos_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = CosOperation, inputs = [0.5], expected = 0.5f64.cos(),);
+        check_operation_partial_evaluation!(operation = CosOperation::new(), inputs = [0.5], expected = 0.5f64.cos(),);
     }
 
     #[test]
     fn test_cos_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = CosOperation,
+            operation = CosOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

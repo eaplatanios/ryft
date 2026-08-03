@@ -112,7 +112,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = LogOperation,
+            operation = LogOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -121,7 +121,7 @@ mod tests {
     fn test_log_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = LogOperation,
+            operation = LogOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]))],
@@ -134,7 +134,7 @@ mod tests {
     fn test_log_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = LogOperation,
+            operation = LogOperation::new(),
             cases = [{
                 primals = [Array::scalar(0.7)],
                 tangents = [Array::scalar(3.0)],
@@ -171,7 +171,7 @@ mod tests {
         // representation.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
-        let output = builder.add_instruction(LogOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(LogOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
@@ -192,14 +192,14 @@ mod tests {
 
     #[test]
     fn test_log_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = LogOperation, inputs = [0.7], expected = 0.7f64.ln(),);
+        check_operation_partial_evaluation!(operation = LogOperation::new(), inputs = [0.7], expected = 0.7f64.ln(),);
     }
 
     #[test]
     fn test_log_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = LogOperation,
+            operation = LogOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

@@ -112,7 +112,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = SqrtOperation,
+            operation = SqrtOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -121,7 +121,7 @@ mod tests {
     fn test_sqrt_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = SqrtOperation,
+            operation = SqrtOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]))],
@@ -134,7 +134,7 @@ mod tests {
     fn test_sqrt_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = SqrtOperation,
+            operation = SqrtOperation::new(),
             cases = [{
                 primals = [Array::scalar(2.0)],
                 tangents = [Array::scalar(3.0)],
@@ -173,7 +173,7 @@ mod tests {
         // instead of converting the narrower primal output.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
-        let output = builder.add_instruction(SqrtOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SqrtOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
@@ -196,14 +196,14 @@ mod tests {
 
     #[test]
     fn test_sqrt_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = SqrtOperation, inputs = [4.0], expected = 2.0,);
+        check_operation_partial_evaluation!(operation = SqrtOperation::new(), inputs = [4.0], expected = 2.0,);
     }
 
     #[test]
     fn test_sqrt_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = SqrtOperation,
+            operation = SqrtOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

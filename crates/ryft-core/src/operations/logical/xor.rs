@@ -93,7 +93,7 @@ mod tests {
         // Check mixed mapped/replicated batching.
         check_operation_batching!(
             @exact,
-            operation = XorOperation,
+            operation = XorOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -106,7 +106,7 @@ mod tests {
 
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
-            operation = XorOperation,
+            operation = XorOperation::new(),
             inputs = [Scalar::from(true), Scalar::from(false)],
             expected = Scalar::from(true),
         );

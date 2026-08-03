@@ -22,7 +22,7 @@ define_arithmetic_dimension_operation!(
     infer_bounds = infer_bounds,
 );
 
-impl OperationProvider<DimensionType> for AddOperation {
+impl OperationProvider<DimensionType> for AddOperation<DimensionType> {
     type Operation = DimensionAddOperation;
 
     fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {

@@ -111,7 +111,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = SinOperation,
+            operation = SinOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -120,7 +120,7 @@ mod tests {
     fn test_sin_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = SinOperation,
+            operation = SinOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]))],
@@ -133,7 +133,7 @@ mod tests {
     fn test_sin_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = SinOperation,
+            operation = SinOperation::new(),
             cases = [{
                 primals = [Array::scalar(2.0)],
                 tangents = [Array::scalar(3.0)],
@@ -171,7 +171,7 @@ mod tests {
         // The widened staged tangent program computes the coefficient in the widened differential representation.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
-        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
@@ -193,14 +193,14 @@ mod tests {
 
     #[test]
     fn test_sin_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = SinOperation, inputs = [0.5], expected = 0.5f64.sin(),);
+        check_operation_partial_evaluation!(operation = SinOperation::new(), inputs = [0.5], expected = 0.5f64.sin(),);
     }
 
     #[test]
     fn test_sin_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = SinOperation,
+            operation = SinOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

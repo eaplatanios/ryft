@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn test_neg() {
-        let operation = NegOperation;
+        let operation = NegOperation::<DataType>::new();
 
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
@@ -124,7 +124,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
+                &NegOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::scalar(2.0)],
@@ -175,7 +175,7 @@ mod tests {
             )
             .unwrap();
         check_operation_type_inference!(
-            operation = NegOperation,
+            operation = NegOperation::new(),
             cases = [{
                 input_types = [unreduced.clone()],
                 output_types = [unreduced],
@@ -190,7 +190,7 @@ mod tests {
             )
             .unwrap();
         check_operation_type_inference!(
-            operation = NegOperation,
+            operation = NegOperation::new(),
             cases = [{
                 input_types = [reduced.clone()],
                 output_types = [reduced],
@@ -202,7 +202,7 @@ mod tests {
     fn test_neg_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = NegOperation,
+            operation = NegOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
@@ -215,7 +215,7 @@ mod tests {
     fn test_neg_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = NegOperation,
+            operation = NegOperation::new(),
             cases = [{
                 primals = [Array::scalar(2.0)],
                 tangents = [Array::scalar(3.0)],
@@ -233,14 +233,14 @@ mod tests {
 
     #[test]
     fn test_neg_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = NegOperation, inputs = [2.0], expected = -2.0,);
+        check_operation_partial_evaluation!(operation = NegOperation::new(), inputs = [2.0], expected = -2.0,);
     }
 
     #[test]
     fn test_neg_transposition() {
         check_operation_transposition!(
             @exact,
-            operation = NegOperation,
+            operation = NegOperation::new(),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
                 output_cotangents = [Array::scalar(3.0)],

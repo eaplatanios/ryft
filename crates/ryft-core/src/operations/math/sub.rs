@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_sub() {
-        let operation = SubOperation;
+        let operation = SubOperation::<DataType>::new();
 
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
@@ -116,7 +116,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
+                &SubOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::scalar(2.0), Array::scalar(3.5)],
@@ -164,7 +164,7 @@ mod tests {
         };
 
         check_operation_type_inference!(
-            operation = SubOperation,
+            operation = SubOperation::new(),
             cases = [
                 {
                     input_types = [unreduced(), unreduced()],
@@ -182,7 +182,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @mismatched_reduced,
-            operation = SubOperation,
+            operation = SubOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -191,7 +191,7 @@ mod tests {
     fn test_sub_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = SubOperation,
+            operation = SubOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -207,7 +207,7 @@ mod tests {
     fn test_sub_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = SubOperation,
+            operation = SubOperation::new(),
             cases = [{
                 primals = [Array::scalar(5.0), Array::scalar(2.0)],
                 tangents = [Array::scalar(3.0), Array::scalar(1.0)],
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_sub_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = SubOperation, inputs = [2.0, 3.5], expected = -1.5,);
+        check_operation_partial_evaluation!(operation = SubOperation::new(), inputs = [2.0, 3.5], expected = -1.5,);
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         check_operation_transposition!(
             @exact,
-            operation = SubOperation,
+            operation = SubOperation::new(),
             cases = [
                 {
                     inputs = [

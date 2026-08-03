@@ -1260,7 +1260,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let factor = builder.add_constant(Array::scalar(factor));
-        let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, factor]).unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1269,7 +1269,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)])));
         let factor = builder.add_constant(Array::scalar(factor));
-        let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, factor]).unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1372,7 +1372,7 @@ mod tests {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::scalar(DataType::F64);
         let operation = ConditionOperation::<Array>::new();
-        let true_branch = scalar_branch(ArrayOperation::Add(AddOperation));
+        let true_branch = scalar_branch(ArrayOperation::Add(AddOperation::new()));
         let false_branch = scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation::new()));
         let interfaces = vec![branch_interface(&true_branch), branch_interface(&false_branch)];
 
@@ -1603,8 +1603,9 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(operand_type.clone());
             let one = builder.add_constant(Array::from_f64s(operand_type.clone(), vec![1.0]));
-            let output =
-                builder.add_instruction(ArrayOperation::Div(DivOperation), Vec::new(), vec![one, input]).unwrap()[0];
+            let output = builder
+                .add_instruction(ArrayOperation::Div(DivOperation::new()), Vec::new(), vec![one, input])
+                .unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let identity_branch = {
@@ -1928,8 +1929,8 @@ mod tests {
                     let mut outputs = input.context().bind(
                         ArrayOperation::Condition(ConditionOperation::new()),
                         vec![
-                            scalar_branch(ArrayOperation::Add(AddOperation)),
-                            scalar_branch(ArrayOperation::Sin(SinOperation)),
+                            scalar_branch(ArrayOperation::Add(AddOperation::new())),
+                            scalar_branch(ArrayOperation::Sin(SinOperation::new())),
                         ],
                         &[predicate, input.clone()],
                     )?;

@@ -959,7 +959,7 @@ where
         + From<LegacyBroadcastOperation>
         + From<ReduceOperation>
         + From<SelectOperation<ArrayType>>
-        + From<AndOperation>
+        + From<AndOperation<ArrayType>>
         + From<WhileOperation<ArrayType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
@@ -1243,12 +1243,12 @@ where
     O: Operation<ArrayType>
         + From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
-        + From<AddOperation>
+        + From<AddOperation<ArrayType>>
         + From<LegacyBroadcastOperation>
         + From<DynamicUpdateSliceOperation>
         + From<SelectOperation<ArrayType>>
         + From<ReduceOperation>
-        + From<AndOperation>,
+        + From<AndOperation<ArrayType>>,
 {
     #[inline]
     fn residual_stack_zero(r#type: ArrayType) -> Self {
@@ -1272,7 +1272,7 @@ where
 
     #[inline]
     fn residual_stack_add() -> Self {
-        Self::from(AddOperation)
+        Self::from(AddOperation::new())
     }
 
     #[inline]
@@ -1287,7 +1287,7 @@ where
 
     #[inline]
     fn mask_and() -> Self {
-        Self::from(AndOperation)
+        Self::from(AndOperation::new())
     }
 }
 
@@ -2329,7 +2329,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
-        let next_state = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
+        let next_state = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
         builder.build(vec![next_state], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -2611,9 +2611,9 @@ mod tests {
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
             let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![counter]).unwrap()[0];
-            let next_counter = builder.add_instruction(SubOperation, Vec::new(), vec![counter, one]).unwrap()[0];
-            let ksq = builder.add_instruction(MulOperation, Vec::new(), vec![k, k]).unwrap()[0];
-            let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, ksq]).unwrap()[0];
+            let next_counter = builder.add_instruction(SubOperation::new(), Vec::new(), vec![counter, one]).unwrap()[0];
+            let ksq = builder.add_instruction(MulOperation::new(), Vec::new(), vec![k, k]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation::new(), Vec::new(), vec![acc, ksq]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(
                     vec![next_counter, next_acc, k],
@@ -2738,8 +2738,8 @@ mod tests {
             let x = builder.add_input(state_type.clone());
             let k = builder.add_input(state_type.clone());
             let one = builder.add_constant(Array::from_f64s(state_type.clone(), vec![1.0]));
-            let inverse = builder.add_instruction(DivOperation, Vec::new(), vec![one, k]).unwrap()[0];
-            let next_x = builder.add_instruction(AddOperation, Vec::new(), vec![x, inverse]).unwrap()[0];
+            let inverse = builder.add_instruction(DivOperation::new(), Vec::new(), vec![one, k]).unwrap()[0];
+            let next_x = builder.add_instruction(AddOperation::new(), Vec::new(), vec![x, inverse]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![next_x, k], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -2816,8 +2816,8 @@ mod tests {
             let counter = builder.add_input(scalar());
             let acc = builder.add_input(scalar());
             let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![counter]).unwrap()[0];
-            let next_counter = builder.add_instruction(SubOperation, Vec::new(), vec![counter, one]).unwrap()[0];
-            let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, counter]).unwrap()[0];
+            let next_counter = builder.add_instruction(SubOperation::new(), Vec::new(), vec![counter, one]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation::new(), Vec::new(), vec![acc, counter]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(
                     vec![next_counter, next_acc],
@@ -2896,7 +2896,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
             let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
-            let next_state = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
+            let next_state = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
             builder.build(vec![next_state], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let operation = WhileOperation::new();
@@ -2937,7 +2937,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
             let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
-            let next_state = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
+            let next_state = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
             let printed =
                 builder.add_instruction(PrintOperation::new("state"), Vec::new(), vec![next_state]).unwrap()[0];
             builder.build(vec![printed], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -3421,7 +3421,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(scalar_f64);
         let two = builder.add_constant(Array::scalar(2.0));
-        let doubled = builder.add_instruction(MulOperation, Vec::new(), vec![state, two]).unwrap()[0];
+        let doubled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, two]).unwrap()[0];
         let body = builder
             .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3437,7 +3437,7 @@ mod tests {
         let input = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let printed = body_builder.add_instruction(PrintOperation::new("state"), Vec::new(), vec![input]).unwrap()[0];
         let two = body_builder.add_constant(Array::scalar(2.0));
-        let output = body_builder.add_instruction(MulOperation, Vec::new(), vec![printed, two]).unwrap()[0];
+        let output = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![printed, two]).unwrap()[0];
         let body = body_builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         (WhileOperation::new(), vec![condition, body])
     }
@@ -3452,7 +3452,7 @@ mod tests {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(scalar_f64);
-        let squared = builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
         let body = builder
             .build::<Vec<Array>, Vec<Array>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3469,7 +3469,7 @@ mod tests {
     ) -> (WhileOperation<ArrayType>, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
-        let squared = builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
         let body = builder
             .build::<Vec<Array>, Vec<Array>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3609,7 +3609,8 @@ mod tests {
             .unwrap();
         let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let body_state = body_builder.add_input(vector_f64.clone());
-        let squared = body_builder.add_instruction(MulOperation, Vec::new(), vec![body_state, body_state]).unwrap()[0];
+        let squared =
+            body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![body_state, body_state]).unwrap()[0];
         let body = body_builder
             .build::<Vec<Array>, Vec<Array>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3748,7 +3749,7 @@ mod tests {
         let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let body_state = body_builder.add_input(scalar_f64);
         let one = body_builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![body_state]).unwrap()[0];
-        let next = body_builder.add_instruction(SubOperation, Vec::new(), vec![body_state, one]).unwrap()[0];
+        let next = body_builder.add_instruction(SubOperation::new(), Vec::new(), vec![body_state, one]).unwrap()[0];
         let body = body_builder
             .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3842,8 +3843,10 @@ mod tests {
         let body_counter = body_builder.add_input(scalar_f64.clone());
         let body_value = body_builder.add_input(scalar_f64);
         let one = body_builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![body_counter]).unwrap()[0];
-        let next_counter = body_builder.add_instruction(SubOperation, Vec::new(), vec![body_counter, one]).unwrap()[0];
-        let doubled = body_builder.add_instruction(AddOperation, Vec::new(), vec![body_value, body_value]).unwrap()[0];
+        let next_counter =
+            body_builder.add_instruction(SubOperation::new(), Vec::new(), vec![body_counter, one]).unwrap()[0];
+        let doubled =
+            body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![body_value, body_value]).unwrap()[0];
         let body = body_builder
             .build::<Vec<Array>, Vec<Array>>(vec![next_counter, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
@@ -4046,9 +4049,9 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
             let state = builder.add_input(float_type.clone());
             let counter = builder.add_input(counter_type.clone());
-            let squared = builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
+            let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
             let one = builder.add_constant(Array::new(counter_type.clone(), vec![Scalar::I64(1)]).unwrap());
-            let incremented = builder.add_instruction(AddOperation, Vec::new(), vec![counter, one]).unwrap()[0];
+            let incremented = builder.add_instruction(AddOperation::new(), Vec::new(), vec![counter, one]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![squared, incremented], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -4167,7 +4170,7 @@ mod tests {
         let body = {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let state = builder.add_input(DataType::F64);
-            let squared = builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
+            let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
             builder
                 .build::<Vec<Scalar>, Vec<Scalar>>(vec![squared], vec![Placeholder], vec![Placeholder])
                 .unwrap()

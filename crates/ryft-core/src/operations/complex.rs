@@ -5,7 +5,7 @@ use crate::macros::{
 use crate::operations::constants::{Zero, ZeroLikeOperation};
 use crate::operations::math::NegOperation;
 use crate::programs::MaybeZero;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
@@ -80,9 +80,10 @@ define_elementwise_operation!(
 );
 
 impl_differentiable_operation! {
-    ComplexOperation,
+    <T> ComplexOperation<T>,
     jvp<C>
     where
+        T: Type,
         C::Type: DifferentiableType,
         C: Zero<C::Value>,
         C::Value: Complex,
@@ -110,8 +111,9 @@ impl_differentiable_operation! {
     },
     transpose<V, O>
     where
+        T: Type,
         V::Type: DifferentiableType,
-        O: From<NegOperation> + From<RealOperation> + From<ImaginaryOperation>,
+        O: From<NegOperation<V::Type>> + From<RealOperation<V::Type>> + From<ImaginaryOperation<V::Type>>,
     {
         |_operation, _context, _driver, inputs, outputs| {
             // Transpose rule for the linear [`ComplexOperation`]. Under the bilinear (i.e., conjugation-free) pairing
@@ -126,8 +128,8 @@ impl_differentiable_operation! {
                 MaybeZero::Zero(_) =>
                     inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect(),
                 MaybeZero::Value(output_cotangent) => vec![
-                    MaybeZero::Value(output_cotangent.unary(RealOperation)),
-                    MaybeZero::Value(output_cotangent.unary(NegOperation).unary(ImaginaryOperation)),
+                    MaybeZero::Value(output_cotangent.unary(RealOperation::new())),
+                    MaybeZero::Value(output_cotangent.unary(NegOperation::new()).unary(ImaginaryOperation::new())),
                 ],
             })
         }
@@ -163,9 +165,10 @@ define_elementwise_operation!(
 );
 
 impl_differentiable_operation! {
-    ConjugateOperation,
+    <T> ConjugateOperation<T>,
     jvp<C>
     where
+        T: Type,
         C::Type: DifferentiableType,
         C::Value: Conjugate,
     {
@@ -184,8 +187,9 @@ impl_differentiable_operation! {
     },
     transpose<V, O>
     where
+        T: Type,
         V::Type: DifferentiableType,
-        O: From<ConjugateOperation>,
+        O: From<ConjugateOperation<V::Type>>,
     {
         |_operation, _context, _driver, inputs, outputs| {
             // Transpose rule for the ℝ-linear [`ConjugateOperation`]. Under the bilinear (i.e., conjugation-free)
@@ -196,7 +200,7 @@ impl_differentiable_operation! {
             Ok(match &outputs[0] {
                 MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
                 MaybeZero::Value(output_cotangent) =>
-                    vec![MaybeZero::Value(output_cotangent.unary(ConjugateOperation))],
+                    vec![MaybeZero::Value(output_cotangent.unary(ConjugateOperation::new()))],
             })
         }
     },
@@ -229,9 +233,10 @@ define_elementwise_operation!(
 );
 
 impl_differentiable_operation! {
-    RealOperation,
+    <T> RealOperation<T>,
     jvp<C>
     where
+        T: Type,
         C::Type: DifferentiableType,
         C::Value: Real,
     {
@@ -250,8 +255,9 @@ impl_differentiable_operation! {
     },
     transpose<V, O>
     where
+        T: Type,
         V::Type: DifferentiableType,
-        O: From<ComplexOperation> + From<ZeroLikeOperation<V::Type>>,
+        O: From<ComplexOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
     {
         |_operation, _context, _driver, inputs, outputs| {
             // Transpose rule for the ℝ-linear [`RealOperation`]. Under the bilinear (i.e., conjugation-free) pairing
@@ -263,7 +269,7 @@ impl_differentiable_operation! {
                 MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
                 MaybeZero::Value(output_cotangent) => {
                     let zero = output_cotangent.unary(ZeroLikeOperation::new());
-                    vec![MaybeZero::Value(output_cotangent.binary(&zero, ComplexOperation))]
+                    vec![MaybeZero::Value(output_cotangent.binary(&zero, ComplexOperation::new()))]
                 }
             })
         }
@@ -297,9 +303,10 @@ define_elementwise_operation!(
 );
 
 impl_differentiable_operation! {
-    ImaginaryOperation,
+    <T> ImaginaryOperation<T>,
     jvp<C>
     where
+        T: Type,
         C::Type: DifferentiableType,
         C::Value: Imaginary,
     {
@@ -318,8 +325,9 @@ impl_differentiable_operation! {
     },
     transpose<V, O>
     where
+        T: Type,
         V::Type: DifferentiableType,
-        O: From<NegOperation> + From<ComplexOperation> + From<ZeroLikeOperation<V::Type>>,
+        O: From<NegOperation<V::Type>> + From<ComplexOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
     {
         |_operation, _context, _driver, inputs, outputs| {
             // Transpose rule for the ℝ-linear [`ImaginaryOperation`]. Under the bilinear (i.e., conjugation-free)
@@ -332,8 +340,8 @@ impl_differentiable_operation! {
                 MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
                 MaybeZero::Value(output_cotangent) => {
                     let zero = output_cotangent.unary(ZeroLikeOperation::new());
-                    let negated = output_cotangent.unary(NegOperation);
-                    vec![MaybeZero::Value(zero.binary(&negated, ComplexOperation))]
+                    let negated = output_cotangent.unary(NegOperation::new());
+                    vec![MaybeZero::Value(zero.binary(&negated, ComplexOperation::new()))]
                 }
             })
         }
@@ -368,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_complex() {
-        let operation = ComplexOperation;
+        let operation = ComplexOperation::<DataType>::new();
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -380,7 +388,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
+                &ComplexOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::scalar(1.5), Array::scalar(-2.0)],
@@ -417,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_conjugate() {
-        let operation = ConjugateOperation;
+        let operation = ConjugateOperation::<DataType>::new();
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -429,7 +437,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
+                &ConjugateOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
@@ -458,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_real() {
-        let operation = RealOperation;
+        let operation = RealOperation::<DataType>::new();
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -470,7 +478,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
+                &RealOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
@@ -503,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_imaginary() {
-        let operation = ImaginaryOperation;
+        let operation = ImaginaryOperation::<DataType>::new();
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -515,7 +523,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
+                &ImaginaryOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],

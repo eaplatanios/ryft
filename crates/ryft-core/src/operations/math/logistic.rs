@@ -112,7 +112,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = LogisticOperation,
+            operation = LogisticOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -121,7 +121,7 @@ mod tests {
     fn test_logistic_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = LogisticOperation,
+            operation = LogisticOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]))],
@@ -139,7 +139,7 @@ mod tests {
         let expected_tangent = 3.0 * logistic * (1.0 - logistic);
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = LogisticOperation,
+            operation = LogisticOperation::new(),
             cases = [{
                 primals = [Array::scalar(0.7)],
                 tangents = [Array::scalar(3.0)],
@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn test_logistic_partial_evaluation() {
         check_operation_partial_evaluation!(
-            operation = LogisticOperation,
+            operation = LogisticOperation::new(),
             inputs = [0.7],
             expected = 1.0 / (1.0 + (-0.7f64).exp()),
         );
@@ -176,7 +176,7 @@ mod tests {
     fn test_logistic_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = LogisticOperation,
+            operation = LogisticOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

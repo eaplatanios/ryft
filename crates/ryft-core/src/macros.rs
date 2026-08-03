@@ -491,10 +491,11 @@ macro_rules! define_arithmetic_dimension_capability {
     };
 }
 
-/// Defines the structural implementations shared by elementwise operations. The generated base
-/// includes the unit operation struct, its [`Display`](std::fmt::Display), [`Operation`](crate::Operation),
-/// [`ElementwiseOperation`](crate::ElementwiseOperation), [`InterpretableOperation`](crate::InterpretableOperation),
-/// and [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementations.
+/// Defines the structural implementations shared by elementwise operations. The generated base includes a zero-sized
+/// operation marker parameterized by its [`Type`](crate::Type) universe, its [`Display`](std::fmt::Display),
+/// [`Operation`](crate::Operation), [`ElementwiseOperation`](crate::ElementwiseOperation),
+/// [`InterpretableOperation`](crate::InterpretableOperation), and
+/// [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementations.
 ///
 /// # Examples
 ///
@@ -537,7 +538,7 @@ macro_rules! define_arithmetic_dimension_capability {
 ///
 ///   - `@unary` / `@binary`: Selects the operation arity.
 ///   - `$(#[$documentation])*`: Documentation attributes attached to the generated operation struct.
-///   - `$operation`: Identifier of the generated unit-struct operation (e.g., `SinOperation`).
+///   - `$operation`: Identifier of the generated type-parameterized operation marker (e.g., `SinOperation`).
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `SIN_OPERATION_NAME`).
 ///   - `$capability`: Identifier of the value-level capability trait bound by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Sin`).
@@ -568,31 +569,7 @@ macro_rules! define_elementwise_operation {
         $(, check_data_types = [$($(@$data_type_check:ident)+),* $(,)?])?
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
-        $(#[$documentation])*
-        #[derive(Clone, Debug)]
-        pub struct $operation<__T: $crate::Type>(::std::marker::PhantomData<fn() -> __T>);
-
-        impl<__T: $crate::Type> $operation<__T> {
-            /// Creates a new operation marker for the inferred type universe.
-            #[inline]
-            pub const fn new() -> Self {
-                Self(::std::marker::PhantomData)
-            }
-        }
-
-        impl<__T: $crate::Type> ::std::default::Default for $operation<__T> {
-            #[inline]
-            fn default() -> Self {
-                Self::new()
-            }
-        }
-
-        impl<__T: $crate::Type> ::std::fmt::Display for $operation<__T> {
-            #[inline]
-            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                formatter.write_str($name)
-            }
-        }
+        $crate::define_elementwise_operation!(@marker [$(#[$documentation])*] $operation, $name);
 
         impl $crate::Operation<$crate::DataType> for $operation<$crate::DataType> {
             #[inline]
@@ -694,31 +671,7 @@ macro_rules! define_elementwise_operation {
         $(, check_data_types = [$($(@$data_type_selector:ident)+),* $(,)?])?
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
-        $(#[$documentation])*
-        #[derive(Clone, Debug)]
-        pub struct $operation<__T: $crate::Type>(::std::marker::PhantomData<fn() -> __T>);
-
-        impl<__T: $crate::Type> $operation<__T> {
-            /// Creates a new operation marker for the inferred type universe.
-            #[inline]
-            pub const fn new() -> Self {
-                Self(::std::marker::PhantomData)
-            }
-        }
-
-        impl<__T: $crate::Type> ::std::default::Default for $operation<__T> {
-            #[inline]
-            fn default() -> Self {
-                Self::new()
-            }
-        }
-
-        impl<__T: $crate::Type> ::std::fmt::Display for $operation<__T> {
-            #[inline]
-            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                formatter.write_str($name)
-            }
-        }
+        $crate::define_elementwise_operation!(@marker [$(#[$documentation])*] $operation, $name);
 
         impl $crate::Operation<$crate::DataType> for $operation<$crate::DataType> {
             #[inline]
@@ -810,6 +763,43 @@ macro_rules! define_elementwise_operation {
             $operation<__C::Type>: $crate::Operation<__C::Type>,
             __C::Operation: ::std::convert::From<$operation<__C::Type>>,
         {
+        }
+    };
+
+    // This internal branch defines the zero-sized, type-indexed marker shared by both public operation arities.
+    (@marker [$($documentation:tt)*] $operation:ident, $name:ident) => {
+        $($documentation)*
+        #[derive(Clone)]
+        pub struct $operation<__T: $crate::Type>(::std::marker::PhantomData<fn() -> __T>);
+
+        impl<__T: $crate::Type> $operation<__T> {
+            // TODO(eaplatanios): Make this docstring "Creates a new [`OperationName`]."
+            /// Creates a new operation marker for the inferred type universe.
+            #[inline]
+            pub const fn new() -> Self {
+                Self(::std::marker::PhantomData)
+            }
+        }
+
+        impl<__T: $crate::Type> ::std::default::Default for $operation<__T> {
+            #[inline]
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl<__T: $crate::Type> ::std::fmt::Debug for $operation<__T> {
+            #[inline]
+            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                formatter.write_str(::std::stringify!($operation))
+            }
+        }
+
+        impl<__T: $crate::Type> ::std::fmt::Display for $operation<__T> {
+            #[inline]
+            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                formatter.write_str($name)
+            }
         }
     };
 
@@ -2781,10 +2771,10 @@ macro_rules! impl_nullary_batchable_operation {
 /// directly rather than delegating to the fallible capability trait keeps the eager arms' bounds minimal (e.g.,
 /// no `Type = ArrayType` pin is needed on the batching arm).
 ///
-/// Binary invocations may provide a unit-struct operation directly or use `provider = ProviderTrait` when the operation
-/// type depends on the program's [`Type`](crate::Type) family. A provider constructs its associated operation from both
-/// operand types. Provider-construction failures poison ordinary staged tracers and fail immediately for direct-binding
-/// transform tracers and projected member views, preserving each value family's established error behavior.
+/// Binary invocations use a fallible capability whose provider selects the operation for the value's
+/// [`Type`](crate::Type) family. Provider-construction failures poison ordinary staged tracers and fail immediately
+/// for direct-binding transform tracers and projected member views, preserving each value family's established error
+/// behavior.
 ///
 /// # Parameters
 ///
@@ -2970,11 +2960,13 @@ macro_rules! define_tracer_operator {
 /// Cases are expanded independently, so one invocation may cover different [`Type`](crate::Type) families such as
 /// [`DataType`](crate::DataType) and [`ArrayType`](crate::ArrayType). A case whose input and output types do not
 /// identify the family, most commonly an empty-input error case, may declare it explicitly with `type = ...`. The
-/// `@elementwise @unary` and `@elementwise @binary` selectors check an elementwise operation's data-type inference
-/// together with its lifting to representative, metadata-bearing [`ArrayType`](crate::ArrayType)s. Their successful
-/// cases declare input element data types and the expected output element data type; rejected cases declare the exact
-/// data-type inference diagnostic. The macro also provides selectors for shared sharding rejection contracts whose
-/// generated mesh fixtures would otherwise obscure the behavior under test:
+/// `operation_family` form constructs a type-parameterized operation marker independently for each case, allowing one
+/// invocation to cover several type universes without erasing the marker's type contract. The `@elementwise @unary` and
+/// `@elementwise @binary` selectors check an elementwise operation's data-type inference together with its lifting to
+/// representative, metadata-bearing [`ArrayType`](crate::ArrayType)s. Their successful cases declare input element data
+/// types and the expected output element data type; rejected cases declare the exact data-type inference diagnostic.
+/// The macro also provides selectors for shared sharding rejection contracts whose generated mesh fixtures would
+/// otherwise obscure the behavior under test:
 ///
 ///   - `@elementwise @unary`: Checks unary element-type inference and successful array-type lifting.
 ///   - `@elementwise @binary`: Checks binary element-type inference and successful array-type lifting.
@@ -3036,6 +3028,18 @@ macro_rules! define_tracer_operator {
 ///     case, in result order.
 #[macro_export]
 macro_rules! check_operation_type_inference {
+    // TODO(eaplatanios): Why do we need this branch?
+    // This branch constructs a type-parameterized operation marker independently for every heterogeneous case.
+    (
+        operation_family = $operation:ident,
+        cases = [$( { $($case:tt)* } ),+ $(,)?] $(,)?
+    ) => {{
+        $({
+            let operation = $operation::new();
+            $crate::check_operation_type_inference!(@case operation, { $($case)* });
+        })+
+    }};
+
     // This branch checks unary element-type cases and lifts every successful case through a representative array type.
     // It leaves rejected cases in the data-type universe because custom array inference may own a more specific error.
     (
@@ -3224,6 +3228,8 @@ macro_rules! check_operation_type_inference {
             error = $message:expr $(,)?
         }
     ) => {
+        // TODO(eaplatanios): What is going on with this line?
+        let _ = &$array_operation;
         $crate::check_operation_type_inference!(@case $data_operation, {
             input_types = [$input_data_type],
             error = $message,
@@ -3278,6 +3284,8 @@ macro_rules! check_operation_type_inference {
             error = $message:expr $(,)?
         }
     ) => {
+        // TODO(eaplatanios): What is going on with this line?
+        let _ = &$array_operation;
         $crate::check_operation_type_inference!(@case $data_operation, {
             input_types = [$left_data_type, $right_data_type],
             error = $message,
@@ -5324,7 +5332,7 @@ mod tests {
             }
 
             fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-                Operation::infer_output_types(self, input_types, &[])
+                Operation::<ArrayType>::infer_output_types(self, input_types, &[])
             }
         }
 
@@ -5368,7 +5376,7 @@ mod tests {
         );
 
         check_operation_type_inference!(
-            operation = AddOperation::new(),
+            operation_family = AddOperation,
             cases = [
                 {
                     input_types = [DataType::F32, DataType::F64],
@@ -5673,6 +5681,9 @@ mod tests {
     fn test_define_elementwise_operation_unary() {
         let data_operation = TestUnaryOperation::<DataType>::new();
         let array_operation = TestUnaryOperation::<ArrayType>::new();
+        assert_eq!(size_of::<TestUnaryOperation<DataType>>(), 0);
+        assert_eq!(size_of::<TestUnaryOperation<ArrayType>>(), 0);
+        assert_eq!(TestUnaryOperation::<DataType>::default().to_string(), TEST_UNARY_OPERATION_NAME);
         assert_eq!(format!("{data_operation:?}"), "TestUnaryOperation");
         assert_eq!(format!("{data_operation}"), TEST_UNARY_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::name(&data_operation), TEST_UNARY_OPERATION_NAME);
@@ -5748,6 +5759,9 @@ mod tests {
     fn test_define_elementwise_operation_binary() {
         let data_operation = TestBinaryOperation::<DataType>::new();
         let array_operation = TestBinaryOperation::<ArrayType>::new();
+        assert_eq!(size_of::<TestBinaryOperation<DataType>>(), 0);
+        assert_eq!(size_of::<TestBinaryOperation<ArrayType>>(), 0);
+        assert_eq!(TestBinaryOperation::<DataType>::default().to_string(), TEST_BINARY_OPERATION_NAME);
         assert_eq!(format!("{data_operation:?}"), "TestBinaryOperation");
         assert_eq!(format!("{data_operation}"), TEST_BINARY_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::name(&data_operation), TEST_BINARY_OPERATION_NAME);

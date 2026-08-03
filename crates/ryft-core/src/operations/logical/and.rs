@@ -111,7 +111,7 @@ mod tests {
         // Check both mixed mapped/replicated operand orderings.
         check_operation_batching!(
             @exact,
-            operation = AndOperation,
+            operation = AndOperation::new(),
             axis_size = 2,
             cases = [
                 {
@@ -143,7 +143,7 @@ mod tests {
 
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
-            operation = AndOperation,
+            operation = AndOperation::new(),
             inputs = [Scalar::from(true), Scalar::from(false)],
             expected = Scalar::from(false),
         );

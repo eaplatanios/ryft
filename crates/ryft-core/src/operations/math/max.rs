@@ -179,7 +179,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = MaxOperation,
+            operation = MaxOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -188,7 +188,7 @@ mod tests {
     fn test_max_batching() {
         check_operation_batching!(
             @exact,
-            operation = MaxOperation,
+            operation = MaxOperation::new(),
             axis_size = 2,
             cases = [
                 {
@@ -213,7 +213,7 @@ mod tests {
     fn test_max_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = MaxOperation,
+            operation = MaxOperation::new(),
             cases = [
                 {
                     primals = [Array::scalar(2.0), Array::scalar(1.0)],
@@ -250,7 +250,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(MaxOperation, Vec::new(), vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(MaxOperation::new(), Vec::new(), vec![left, right]).unwrap()[0];
         let jvp_program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn test_max_partial_evaluation() {
         check_operation_partial_evaluation!(
-            operation = MaxOperation,
+            operation = MaxOperation::new(),
             inputs = [Scalar::from(0.7), Scalar::from(0.3)],
             expected = Scalar::from(0.7),
         );
@@ -275,7 +275,7 @@ mod tests {
     fn test_max_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = MaxOperation,
+            operation = MaxOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }

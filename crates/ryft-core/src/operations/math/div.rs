@@ -44,11 +44,11 @@ impl_differentiable_elementwise_operation! {
     transpose<V, O>
     where
         V::Type: DifferentiableType,
-        O: From<DivOperation>,
+        O: From<DivOperation<V::Type>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         [numerator = @linear, denominator = @known] =>
-            |output_cotangent| output_cotangent.binary(&denominator, DivOperation);
+            |output_cotangent| output_cotangent.binary(&denominator, DivOperation::new());
     },
 }
 
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_div() {
-        let operation = DivOperation;
+        let operation = DivOperation::<DataType>::new();
 
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
@@ -144,7 +144,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
+                &DivOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::scalar(7.0), Array::scalar(2.0)],
@@ -212,7 +212,7 @@ mod tests {
             .unwrap();
         let unreduced_error = || "'div' does not support unreduced operands";
         check_operation_type_inference!(
-            operation = DivOperation,
+            operation = DivOperation::new(),
             cases = [
                 {
                     input_types = [unreduced.clone(), plain.clone()],
@@ -230,7 +230,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @mismatched_reduced,
-            operation = DivOperation,
+            operation = DivOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -239,7 +239,7 @@ mod tests {
     fn test_div_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = DivOperation,
+            operation = DivOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -255,7 +255,7 @@ mod tests {
     fn test_div_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = DivOperation,
+            operation = DivOperation::new(),
             cases = [{
                 primals = [Array::scalar(6.0), Array::scalar(2.0)],
                 tangents = [Array::scalar(3.0), Array::scalar(4.0)],
@@ -280,7 +280,7 @@ mod tests {
     fn test_div_differentiation_preserves_small_tangents() {
         let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let smallest_positive = f64::from_bits(1);
-        let outputs = DivOperation
+        let outputs = DivOperation::<DataType>::new()
             .jvp(
                 &context,
                 &EmptyRegionDriver,
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_div_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = DivOperation, inputs = [7.0, 2.0], expected = 3.5,);
+        check_operation_partial_evaluation!(operation = DivOperation::new(), inputs = [7.0, 2.0], expected = 3.5,);
     }
 
     #[test]
@@ -317,7 +317,7 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         check_operation_transposition!(
             @approx(epsilon = 1e-12),
-            operation = DivOperation,
+            operation = DivOperation::new(),
             cases = [
                 {
                     inputs = [

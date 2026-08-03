@@ -146,7 +146,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = PowOperation,
+            operation = PowOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -155,7 +155,7 @@ mod tests {
     fn test_pow_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = PowOperation,
+            operation = PowOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -171,7 +171,7 @@ mod tests {
     fn test_pow_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = PowOperation,
+            operation = PowOperation::new(),
             cases = [
                 {
                     primals = [Array::scalar(2.0), Array::scalar(3.0)],
@@ -193,7 +193,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let base = builder.add_input(ArrayType::scalar(DataType::F64));
         let exponent = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(PowOperation, Vec::new(), vec![base, exponent]).unwrap()[0];
+        let output = builder.add_instruction(PowOperation::new(), Vec::new(), vec![base, exponent]).unwrap()[0];
         let jvp_program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()
@@ -225,14 +225,14 @@ mod tests {
 
     #[test]
     fn test_pow_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = PowOperation, inputs = [2.0, 3.0], expected = 8.0,);
+        check_operation_partial_evaluation!(operation = PowOperation::new(), inputs = [2.0, 3.0], expected = 8.0,);
     }
 
     #[test]
     fn test_pow_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = PowOperation,
+            operation = PowOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }

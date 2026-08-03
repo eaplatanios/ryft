@@ -101,7 +101,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = RoundOperation,
+            operation = RoundOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -110,7 +110,7 @@ mod tests {
     fn test_round_batching() {
         check_operation_batching!(
             @exact,
-            operation = RoundOperation,
+            operation = RoundOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 1.5]))],
@@ -123,7 +123,7 @@ mod tests {
     fn test_round_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = RoundOperation,
+            operation = RoundOperation::new(),
             cases = [{
                 primals = [Array::scalar(2.4)],
                 tangents = [Array::scalar(1.0)],
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_round_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = RoundOperation, inputs = [2.5], expected = 2.0,);
+        check_operation_partial_evaluation!(operation = RoundOperation::new(), inputs = [2.5], expected = 2.0,);
     }
 
     #[test]

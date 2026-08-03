@@ -1720,7 +1720,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(3.0f64));
-        let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, c0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.input_types(), vec![DataType::F64]);
         assert_eq!(program.output_types(), vec![DataType::F64]);
@@ -1743,8 +1743,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
-        let v0 = builder.add_instruction(NegOperation, Vec::new(), vec![i0]).unwrap()[0];
-        let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![o0], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -1794,7 +1794,7 @@ mod tests {
         // Test a program with two outputs that are copies of the same value.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F32);
-        let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder
             .build::<Scalar, (Scalar, Scalar)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder))
             .unwrap();
@@ -1826,7 +1826,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let v0 = builder.add_variable(DataType::F64);
-        let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, v0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, v0]).unwrap()[0];
         assert!(matches!(
             builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder),
             Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
@@ -1838,9 +1838,9 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::from(3.0f64));
-        let scaled = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![scaled, constant]).unwrap()[0];
-        let dead_output = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
+        let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, constant]).unwrap()[0];
+        let dead_output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
 
         assert_eq!(
@@ -1863,10 +1863,10 @@ mod tests {
         let dead_input = builder.add_input(DataType::F64);
         let live_constant = builder.add_constant(Scalar::from(3.0f64));
         let dead_constant = builder.add_constant(Scalar::from(5.0f64));
-        let scaled = builder.add_instruction(NegOperation, Vec::new(), vec![live_input]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![scaled, live_constant]).unwrap()[0];
+        let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![live_input]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, live_constant]).unwrap()[0];
         let dead_output =
-            builder.add_instruction(AddOperation, Vec::new(), vec![dead_input, dead_constant]).unwrap()[0];
+            builder.add_instruction(AddOperation::new(), Vec::new(), vec![dead_input, dead_constant]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -1975,8 +1975,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::from(3.0f64));
-        let negated = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
-        let combined = builder.add_instruction(AddOperation, Vec::new(), vec![negated, constant]).unwrap()[0];
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let combined = builder.add_instruction(AddOperation::new(), Vec::new(), vec![negated, constant]).unwrap()[0];
         let output = builder
             .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![combined, constant])
             .unwrap()[0];
@@ -1992,7 +1992,7 @@ mod tests {
                         assert_eq!(operation.direction(), ComparisonDirection::LessThan);
                         ScalarOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan))
                     }
-                    ScalarOperation::Add(_) => ScalarOperation::Mul(MulOperation),
+                    ScalarOperation::Add(_) => ScalarOperation::Mul(MulOperation::new()),
                     operation => operation.clone(),
                 })
             })
@@ -2036,8 +2036,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
-        let v0 = builder.add_instruction(NegOperation, Vec::new(), vec![i0]).unwrap()[0];
-        let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![o0], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -2144,7 +2144,8 @@ mod tests {
         // exercises identity preservation, while the otherwise-unused entry constant exercises value lifting.
         let mut branch_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let branch_input = branch_builder.add_input(array_type.clone());
-        let branch_output = branch_builder.add_instruction(NegOperation, Vec::new(), vec![branch_input]).unwrap()[0];
+        let branch_output =
+            branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_input]).unwrap()[0];
         let scan_carry = branch_builder.add_constant(Array::scalar(1.0_f64));
         let scan_stack = branch_builder.add_constant(Array::vector(vec![2.0_f64, 3.0]));
         let scan_capture = Array::vector(vec![5.0_f64, 6.0]);
@@ -2281,8 +2282,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(2.0f64));
         let c1 = builder.add_constant(Scalar::from(3.0f64));
-        let _ = builder.add_instruction(AddOperation, Vec::new(), vec![i0, c0]).unwrap()[0];
-        let v1 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, c1]).unwrap()[0];
+        let _ = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0]).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1]).unwrap()[0];
         let program = builder
             .build::<Scalar, (Scalar, Scalar)>(vec![v1, v1], Placeholder, (Placeholder, Placeholder))
             .unwrap();
@@ -2320,7 +2321,7 @@ mod tests {
         let build = || {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let input = builder.add_input(DataType::F64);
-            let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![input, input]).unwrap()[0];
+            let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
             let _printed = builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input]).unwrap()[0];
             builder.build::<Scalar, Scalar>(vec![doubled], Placeholder, Placeholder).unwrap()
         };
@@ -2402,8 +2403,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(CloneCountingValue::new(2.0, Rc::clone(&value_clone_count)));
         let c1 = builder.add_constant(CloneCountingValue::new(3.0, Rc::clone(&value_clone_count)));
-        let v0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, c0]).unwrap()[0];
-        let v1 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, c1]).unwrap()[0];
+        let v0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0]).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1]).unwrap()[0];
         let program = builder
             .build::<CloneCountingValue, (CloneCountingValue, CloneCountingValue)>(
                 vec![v1, v1],
@@ -2455,8 +2456,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(2.0f64));
-        let v0 = builder.add_instruction(NegOperation, Vec::new(), vec![i0]).unwrap()[0];
-        let v1 = builder.add_instruction(AddOperation, Vec::new(), vec![v0, c0]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, c0]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![v1], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -2507,7 +2508,7 @@ mod tests {
         // kept alive.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input]).unwrap();
         let effectful = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         let (filtered, live) = effectful.filtered(&[input], &[output], &[]).unwrap();
@@ -2534,8 +2535,8 @@ mod tests {
             let i0 = builder.add_input(DataType::F64);
             let i1 = builder.add_input(DataType::F64);
             let c0 = builder.add_constant(Scalar::from(2.0f64));
-            let v0 = builder.add_instruction(NegOperation, Vec::new(), vec![i0]).unwrap()[0];
-            let v1 = builder.add_instruction(AddOperation, Vec::new(), vec![v0, c0]).unwrap()[0];
+            let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
+            let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, c0]).unwrap()[0];
             let program = builder
                 .build::<(Scalar, Scalar), Scalar>(vec![v1], (Placeholder, Placeholder), Placeholder)
                 .unwrap();

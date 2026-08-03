@@ -2779,7 +2779,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = builder.add_input(r#type.clone());
         let x = builder.add_input(r#type);
-        let product = builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
         builder
             .build(vec![product, product], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -2789,7 +2789,7 @@ mod tests {
     fn doubling_body() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
-        let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -2962,7 +2962,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = builder.add_input(scalar_f64.clone());
         let x = builder.add_input(scalar_f64.clone());
-        let product = builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
         let no_output_body = builder
             .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
@@ -3233,8 +3233,8 @@ mod tests {
             let carry = builder.add_input(carry_type.clone());
             let x = builder.add_input(carry_type.clone());
             let one = builder.add_constant(Array::from_f64s(carry_type.clone(), vec![1.0]));
-            let inverse = builder.add_instruction(DivOperation, Vec::new(), vec![one, carry]).unwrap()[0];
-            let y = builder.add_instruction(MulOperation, Vec::new(), vec![inverse, x]).unwrap()[0];
+            let inverse = builder.add_instruction(DivOperation::new(), Vec::new(), vec![one, carry]).unwrap()[0];
+            let y = builder.add_instruction(MulOperation::new(), Vec::new(), vec![inverse, x]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![carry, y], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -3371,9 +3371,9 @@ mod tests {
             let k = builder.add_input(scalar());
             let x = builder.add_input(scalar());
             let printed = builder.add_instruction(PrintOperation::new("k"), Vec::new(), vec![k]).unwrap()[0];
-            let ksq = builder.add_instruction(MulOperation, Vec::new(), vec![printed, k]).unwrap()[0];
-            let kx = builder.add_instruction(MulOperation, Vec::new(), vec![ksq, x]).unwrap()[0];
-            let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, kx]).unwrap()[0];
+            let ksq = builder.add_instruction(MulOperation::new(), Vec::new(), vec![printed, k]).unwrap()[0];
+            let kx = builder.add_instruction(MulOperation::new(), Vec::new(), vec![ksq, x]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation::new(), Vec::new(), vec![acc, kx]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(
                     vec![next_acc, k, next_acc],
@@ -3497,9 +3497,9 @@ mod tests {
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
             let x = builder.add_input(scalar());
-            let ksq = builder.add_instruction(MulOperation, Vec::new(), vec![k, k]).unwrap()[0];
-            let kx = builder.add_instruction(MulOperation, Vec::new(), vec![ksq, x]).unwrap()[0];
-            let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, kx]).unwrap()[0];
+            let ksq = builder.add_instruction(MulOperation::new(), Vec::new(), vec![k, k]).unwrap()[0];
+            let kx = builder.add_instruction(MulOperation::new(), Vec::new(), vec![ksq, x]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation::new(), Vec::new(), vec![acc, kx]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(
                     vec![next_acc, k, next_acc],
@@ -3585,8 +3585,8 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let c = builder.add_input(scalar());
             let x = builder.add_input(scalar());
-            let xsq = builder.add_instruction(MulOperation, Vec::new(), vec![x, x]).unwrap()[0];
-            let next = builder.add_instruction(AddOperation, Vec::new(), vec![c, xsq]).unwrap()[0];
+            let xsq = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, x]).unwrap()[0];
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![c, xsq]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![next, xsq], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -3652,9 +3652,9 @@ mod tests {
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
             let x = builder.add_input(scalar());
-            let ksq = builder.add_instruction(MulOperation, Vec::new(), vec![k, k]).unwrap()[0];
-            let kx = builder.add_instruction(MulOperation, Vec::new(), vec![ksq, x]).unwrap()[0];
-            let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, kx]).unwrap()[0];
+            let ksq = builder.add_instruction(MulOperation::new(), Vec::new(), vec![k, k]).unwrap()[0];
+            let kx = builder.add_instruction(MulOperation::new(), Vec::new(), vec![ksq, x]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation::new(), Vec::new(), vec![acc, kx]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(
                     vec![next_acc, k, next_acc],
@@ -3930,7 +3930,8 @@ mod tests {
             let accumulator = builder.add_input(ArrayType::scalar(DataType::F64));
             let key = builder.add_input(ArrayType::scalar(DataType::U64));
             let slice = builder.add_input(ArrayType::scalar(DataType::F64));
-            let product = builder.add_instruction(MulOperation, Vec::new(), vec![accumulator, slice]).unwrap()[0];
+            let product =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![accumulator, slice]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(
                     vec![product, key, product],

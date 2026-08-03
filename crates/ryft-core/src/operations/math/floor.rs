@@ -98,7 +98,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = FloorOperation,
+            operation = FloorOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -107,7 +107,7 @@ mod tests {
     fn test_floor_batching() {
         check_operation_batching!(
             @exact,
-            operation = FloorOperation,
+            operation = FloorOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.5]))],
@@ -120,7 +120,7 @@ mod tests {
     fn test_floor_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = FloorOperation,
+            operation = FloorOperation::new(),
             cases = [{
                 primals = [Array::scalar(-2.5)],
                 tangents = [Array::scalar(1.0)],
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_floor_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = FloorOperation, inputs = [2.7], expected = 2.0,);
+        check_operation_partial_evaluation!(operation = FloorOperation::new(), inputs = [2.7], expected = 2.0,);
     }
 
     #[test]

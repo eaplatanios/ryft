@@ -451,8 +451,8 @@ where
     C::Operation: From<ReduceOperation>
         + From<LegacyBroadcastOperation>
         + From<CompareOperation<ArrayType>>
-        + From<DivOperation>
-        + From<MulOperation>,
+        + From<DivOperation<ArrayType>>
+        + From<MulOperation<ArrayType>>,
     C::Value: Reduce
         + LegacyBroadcast
         + Compare<C::Value>
@@ -527,7 +527,7 @@ where
     O: Operation<ArrayType>
         + From<LegacyBroadcastOperation>
         + From<ConstantOperation<crate::backends::arrays::Array>>
-        + From<MulOperation>,
+        + From<MulOperation<ArrayType>>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

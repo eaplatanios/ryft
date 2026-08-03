@@ -20,7 +20,7 @@ define_arithmetic_dimension_operation!(
     infer_bounds = infer_bounds,
 );
 
-impl OperationProvider<DimensionType> for DivOperation {
+impl OperationProvider<DimensionType> for DivOperation<DimensionType> {
     type Operation = DimensionDivFloorOperation;
 
     fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {

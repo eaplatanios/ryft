@@ -20,7 +20,7 @@ define_arithmetic_dimension_operation!(
     infer_bounds = infer_bounds,
 );
 
-impl OperationProvider<DimensionType> for MulOperation {
+impl OperationProvider<DimensionType> for MulOperation<DimensionType> {
     type Operation = DimensionMulOperation;
 
     fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {

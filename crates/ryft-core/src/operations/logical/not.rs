@@ -92,7 +92,7 @@ mod tests {
         // Check mapped and replicated batching behavior.
         check_operation_batching!(
             @exact,
-            operation = NotOperation,
+            operation = NotOperation::new(),
             axis_size = 2,
             cases = [
                 {
@@ -108,7 +108,7 @@ mod tests {
 
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
-            operation = NotOperation,
+            operation = NotOperation::new(),
             inputs = [Scalar::from(true)],
             expected = Scalar::from(false),
         );

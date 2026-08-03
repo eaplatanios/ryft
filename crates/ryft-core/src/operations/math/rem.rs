@@ -170,7 +170,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = RemOperation,
+            operation = RemOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -179,7 +179,7 @@ mod tests {
     fn test_rem_batching() {
         check_operation_batching!(
             @exact,
-            operation = RemOperation,
+            operation = RemOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -195,7 +195,7 @@ mod tests {
     fn test_rem_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = RemOperation,
+            operation = RemOperation::new(),
             cases = [{
                 primals = [Array::scalar(7.5), Array::scalar(2.0)],
                 tangents = [Array::scalar(3.0), Array::scalar(5.0)],
@@ -208,14 +208,14 @@ mod tests {
 
     #[test]
     fn test_rem_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = RemOperation, inputs = [7.5, 2.0], expected = 1.5,);
+        check_operation_partial_evaluation!(operation = RemOperation::new(), inputs = [7.5, 2.0], expected = 1.5,);
     }
 
     #[test]
     fn test_rem_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = RemOperation,
+            operation = RemOperation::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
