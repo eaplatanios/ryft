@@ -610,7 +610,7 @@ mod tests {
         let right_calls = Cell::new(0);
         let left_primal = Scalar::from(2.0f64);
         let right_primal = Scalar::from(5.0f64);
-        let compare = CompareOperation::new(ComparisonDirection::LessThan);
+        let compare = CompareOperation::<DataType>::new(ComparisonDirection::LessThan);
 
         let outputs = binary_elementwise_jvp(
             &AddOperation::<DataType>::new(),

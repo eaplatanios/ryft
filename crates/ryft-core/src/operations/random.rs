@@ -177,7 +177,11 @@ fn validate_rng_bit_generator_types(
     Ok(())
 }
 
-impl Operation<ArrayType> for RngBitGeneratorOperation<ArrayType> {
+/// Homogeneous bit-generation contract: the single input is the generator state and the declared bits output must be
+/// statically shaped.
+impl Operation for RngBitGeneratorOperation<ArrayType> {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         RNG_BIT_GENERATOR_OPERATION_NAME
@@ -198,19 +202,21 @@ impl Operation<ArrayType> for RngBitGeneratorOperation<ArrayType> {
         Ok(vec![input_types[0].clone(), self.output_type.clone()])
     }
 
-    fn rename_type_identities(
-        &self,
-        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
-    ) -> Result<Self, TypeError> {
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         self.renamed(renaming)
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         self.render_operation(formatter, indentation)
     }
 }
 
-impl Operation<ArrayProgramType> for RngBitGeneratorOperation<ArrayProgramType> {
+/// Composite bit-generation contract: the generator state is followed by one explicit first-class extent operand per
+/// dynamic bits axis, each of which must define the dimension variable that the declared bits axis refers to.
+impl Operation for RngBitGeneratorOperation<ArrayProgramType> {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         RNG_BIT_GENERATOR_OPERATION_NAME
@@ -240,10 +246,7 @@ impl Operation<ArrayProgramType> for RngBitGeneratorOperation<ArrayProgramType> 
         Ok(vec![state_type.clone().into(), self.output_type.clone().into()])
     }
 
-    fn rename_type_identities(
-        &self,
-        renaming: &TypeIdentityRenaming<<ArrayProgramType as Type>::Identity>,
-    ) -> Result<Self, TypeError> {
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         self.renamed(renaming)
     }
 
@@ -723,7 +726,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::ShardingDimension;
-    use crate::types::{ArrayProgramType, DimensionBounds, DimensionType, DimensionVariable};
+    use crate::types::{DimensionBounds, DimensionType, DimensionVariable};
 
     use super::*;
 
@@ -838,7 +841,7 @@ mod tests {
     #[test]
     fn test_rng_bit_generator() {
         let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(5));
-        assert_eq!(Operation::<ArrayType>::name(&operation), RNG_BIT_GENERATOR_OPERATION_NAME);
+        assert_eq!(operation.name(), RNG_BIT_GENERATOR_OPERATION_NAME);
         assert_eq!(operation.algorithm(), RandomAlgorithm::ThreeFry);
         assert_eq!(operation.output_type(), &bits_type(5));
         assert_eq!(operation.to_string(), "rng_bit_generator [algorithm=three_fry, output_type=u32[5]]");
@@ -875,8 +878,7 @@ mod tests {
             ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent_variable.clone())]));
         let dynamic_operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, dynamic_bits_type.clone());
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &dynamic_operation,
+            dynamic_operation.infer_output_types(
                 &[RandomAlgorithm::ThreeFry.state_type().into(), DimensionType::new(extent_variable.clone()).into(),],
                 &[],
             ),
@@ -917,7 +919,7 @@ mod tests {
     #[test]
     fn test_rng_bit_generator_type_inference() {
         // Wrong state shape and wrong state data type are rejected against the algorithm's state contract.
-        let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(4));
+        let operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, bits_type(4));
         check_operation_type_inference!(
             operation = operation,
             cases = [
@@ -935,7 +937,7 @@ mod tests {
         // Floating-point bits outputs are rejected; every unsigned-integer width is accepted.
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         check_operation_type_inference!(
-            operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, output_type),
+            operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, output_type),
             cases = [{
                 input_types = [RandomAlgorithm::ThreeFry.state_type()],
                 error = "'rng_bit_generator' does not support output data type f32",
@@ -944,7 +946,7 @@ mod tests {
         for data_type in [DataType::U8, DataType::U16, DataType::U64] {
             let output_type = ArrayType::new(data_type, Shape::new(vec![Dimension::Static(4)]));
             check_operation_type_inference!(
-                operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, output_type.clone()),
+                operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, output_type.clone()),
                 cases = [{
                     input_types = [RandomAlgorithm::ThreeFry.state_type()],
                     output_types = [RandomAlgorithm::ThreeFry.state_type(), output_type],

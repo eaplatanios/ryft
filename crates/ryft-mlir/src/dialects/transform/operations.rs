@@ -18,7 +18,7 @@ pub trait AlternativesOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the handles yielded by the successful alternative region.
     fn yielded_results(&self) -> impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>> {
-        Operation::results(self).map(|result| result.map(ValueRef::from))
+        self.results().map(|result| result.map(ValueRef::from))
     }
 
     /// Returns the alternative regions, attempted in operation order.

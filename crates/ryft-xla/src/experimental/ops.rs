@@ -36,10 +36,10 @@ use ryft_core::operations::manipulation::{
     UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
-    AbsOperation, AddOperation, AddOperationProvider, Atan2Operation, CeilOperation, CosOperation, DivOperation,
-    DotOperation, ErfOperation, ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaxOperation,
-    MinOperation, MulOperation, NegOperation, PowOperation, ReduceOperation, RemOperation, RoundOperation,
-    RsqrtOperation, ScaledDotOperation, SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
+    AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
+    ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaxOperation, MinOperation, MulOperation,
+    NegOperation, PowOperation, ReduceOperation, RemOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
 };
 use ryft_core::operations::random::RngBitGeneratorOperation;
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
@@ -500,12 +500,13 @@ where
     }
 }
 
-impl<Capture> AddOperationProvider<ArrayProgramType> for XlaOperation<Capture>
+impl<Capture> From<AddOperation<ArrayProgramType>> for XlaOperation<Capture>
 where
     Capture: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    fn add_operation(r#type: &ArrayProgramType) -> Result<Self, ProgramError> {
-        Ok(ArrayProgramOperation::<Capture::Projected>::add_operation(r#type)?.into())
+    #[inline]
+    fn from(operation: AddOperation<ArrayProgramType>) -> Self {
+        ArrayProgramOperation::<Capture::Projected>::from(operation).into()
     }
 }
 
@@ -618,85 +619,85 @@ macro_rules! dispatch_operation {
             XlaOperation::DynamicIota(operation) => operation.$method($($argument),*),
             XlaOperation::Array(operation) => operation.$method($($argument),*),
             XlaOperation::Dimension(operation) => operation.$method($($argument),*),
-            XlaOperation::Compare(operation) => Operation::<ArrayProgramType>::$method(operation, $($argument),*),
+            XlaOperation::Compare(operation) => Operation::$method(operation, $($argument),*),
             XlaOperation::DimensionSize(operation) => operation.$method($($argument),*),
             XlaOperation::DimensionFromScalar(operation) => operation.$method($($argument),*),
             XlaOperation::DimensionToScalar(operation) => operation.$method($($argument),*),
             XlaOperation::Reshape(operation) => operation.$method($($argument),*),
             XlaOperation::Broadcast(operation) => operation.$method($($argument),*),
             XlaOperation::Concatenate(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::CustomCall(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
-            XlaOperation::Pad(operation) => Operation::<ArrayProgramType>::$method(operation, $($argument),*),
+            XlaOperation::Pad(operation) => Operation::$method(operation, $($argument),*),
             XlaOperation::DynamicShapeSlice(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::RngBitGenerator(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
-            XlaOperation::AllGather(operation) => Operation::<ArrayType>::$method(operation, $($argument),*),
-            XlaOperation::PSumScatter(operation) => Operation::<ArrayType>::$method(operation, $($argument),*),
-            XlaOperation::AllToAll(operation) => Operation::<ArrayType>::$method(operation, $($argument),*),
+            XlaOperation::AllGather(operation) => Operation::$method(operation, $($argument),*),
+            XlaOperation::PSumScatter(operation) => Operation::$method(operation, $($argument),*),
+            XlaOperation::AllToAll(operation) => Operation::$method(operation, $($argument),*),
             XlaOperation::Condition(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
-            XlaOperation::While(operation) => Operation::<ArrayProgramType>::$method(operation, $($argument),*),
-            XlaOperation::Scan(operation) => Operation::<ArrayProgramType>::$method(operation, $($argument),*),
+            XlaOperation::While(operation) => Operation::$method(operation, $($argument),*),
+            XlaOperation::Scan(operation) => Operation::$method(operation, $($argument),*),
             XlaOperation::CustomJvp(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::CustomVjp(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::LinearCall(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::Rematerialize(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::JitCall(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::ShardMap(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
         }
     };
 }
 
 macro_rules! dispatch_higher_operation {
-    // Delegates one `Operation<ArrayProgramType>` method to the active XLA-owned higher-order payload.
+    // Delegates one `Operation<Type = ArrayProgramType>` method to the active XLA-owned higher-order payload.
     ($operation:expr, $method:ident $(, $argument:expr)* $(,)?) => {
         match $operation {
             XlaOperation::Condition(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::While(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::Scan(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::CustomJvp(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::CustomVjp(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::LinearCall(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::Rematerialize(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::JitCall(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             XlaOperation::ShardMap(operation) => {
-                Operation::<ArrayProgramType>::$method(operation, $($argument),*)
+                Operation::$method(operation, $($argument),*)
             }
             _ => unreachable!("member and mixed operations are handled by the canonical core operation family"),
         }
@@ -713,10 +714,12 @@ where
     }
 }
 
-impl<C> Operation<ArrayProgramType> for XlaOperation<C>
+impl<C> Operation for XlaOperation<C>
 where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
+    type Type = ArrayProgramType;
+
     fn name(&self) -> &'static str {
         dispatch_operation!(self, name)
     }
@@ -764,33 +767,15 @@ where
             return Ok(operation.rename_type_identities(renaming)?.into());
         }
         match self {
-            Self::Condition(operation) => {
-                Ok(Self::Condition(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::While(operation) => {
-                Ok(Self::While(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::Scan(operation) => {
-                Ok(Self::Scan(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::CustomJvp(operation) => {
-                Ok(Self::CustomJvp(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::CustomVjp(operation) => {
-                Ok(Self::CustomVjp(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::LinearCall(operation) => {
-                Ok(Self::LinearCall(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::Rematerialize(operation) => {
-                Ok(Self::Rematerialize(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::JitCall(operation) => {
-                Ok(Self::JitCall(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
-            Self::ShardMap(operation) => {
-                Ok(Self::ShardMap(Operation::<ArrayProgramType>::rename_type_identities(operation, renaming)?))
-            }
+            Self::Condition(operation) => Ok(Self::Condition(operation.rename_type_identities(renaming)?)),
+            Self::While(operation) => Ok(Self::While(operation.rename_type_identities(renaming)?)),
+            Self::Scan(operation) => Ok(Self::Scan(operation.rename_type_identities(renaming)?)),
+            Self::CustomJvp(operation) => Ok(Self::CustomJvp(operation.rename_type_identities(renaming)?)),
+            Self::CustomVjp(operation) => Ok(Self::CustomVjp(operation.rename_type_identities(renaming)?)),
+            Self::LinearCall(operation) => Ok(Self::LinearCall(operation.rename_type_identities(renaming)?)),
+            Self::Rematerialize(operation) => Ok(Self::Rematerialize(operation.rename_type_identities(renaming)?)),
+            Self::JitCall(operation) => Ok(Self::JitCall(operation.rename_type_identities(renaming)?)),
+            Self::ShardMap(operation) => Ok(Self::ShardMap(operation.rename_type_identities(renaming)?)),
             _ => unreachable!("member and mixed operations are handled by the canonical core operation family"),
         }
     }
@@ -842,7 +827,7 @@ where
         + Concretizable<bool>,
     C: Context<Type = ArrayProgramType, Constant = Constant, Operation = XlaOperation<Constant>> + Zero<C::Value>,
     C::Value: Concretizable<bool>,
-    ArrayProgramOperation<Constant::Projected>: DifferentiableOperation<C>,
+    ArrayProgramOperation<Constant::Projected>: Operation<Type = ArrayProgramType> + DifferentiableOperation<C>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -971,7 +956,9 @@ fn ensure_call_input_types<T: Type>(
     Ok(())
 }
 
-impl<T: Type> Operation<T> for JitCallOperation<T> {
+impl<T: Type> Operation for JitCallOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         "jit_call"
@@ -994,7 +981,7 @@ impl<T: Type> Operation<T> for JitCallOperation<T> {
             )));
         }
         let callee_interface = &region_interfaces[0];
-        ensure_call_input_types(<Self as Operation<T>>::name(self), callee_interface.input_types(), input_types)?;
+        ensure_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
         Ok(callee_interface.output_types().to_vec())
     }
 }
@@ -1535,12 +1522,9 @@ mod tests {
         let operation = JitCallOperation::new();
 
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
-                std::slice::from_ref(&dimension_type),
-                std::slice::from_ref(&interface),
-            )
-            .unwrap(),
+            operation
+                .infer_output_types(std::slice::from_ref(&dimension_type), std::slice::from_ref(&interface))
+                .unwrap(),
             vec![array_type, dimension_type],
         );
     }
@@ -1803,8 +1787,9 @@ mod tests {
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
             let literal = builder.add_constant(XlaConstant::new(0, r#type.clone()));
-            let shifted =
-                builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, literal]).unwrap()[0];
+            let shifted = builder
+                .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![known_input, literal])
+                .unwrap()[0];
             let scaled =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![runtime_input, literal]).unwrap()[0];
             let product =

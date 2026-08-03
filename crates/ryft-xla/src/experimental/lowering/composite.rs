@@ -5,7 +5,7 @@ use ryft_core::backends::dimensions::DimensionOperation;
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::dimensions::DimensionRequirementOperation;
 use ryft_core::programs::effects::Effect;
-use ryft_core::programs::{Operation as CoreOperation, ProgramError};
+use ryft_core::programs::{Operation, ProgramError};
 use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -336,8 +336,7 @@ where
                         <&DimensionType>::try_from(right_type).map_err(|error| LoweringError::Tracing(error.into()))?;
                     // Bounds-proven arithmetic lowers without assertion overhead. Otherwise, preserve eager checked
                     // semantics with one diagnostic runtime check on the ordered-assertion chain.
-                    let requires_runtime_assertion =
-                        CoreOperation::<DimensionType>::effects(operation).contains(Effect::OrderedAssertion);
+                    let requires_runtime_assertion = operation.effects().contains(Effect::OrderedAssertion);
                     if requires_runtime_assertion {
                         lower_dimension_arithmetic_assertion(
                             operation,

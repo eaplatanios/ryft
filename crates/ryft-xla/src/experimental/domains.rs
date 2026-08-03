@@ -492,7 +492,7 @@ impl<'c> InterpretableOperation<XlaDomain<'c>> for ShardMapOperation<XlaConstant
 /// Returns the single [`ArrayType`] produced by a nullary additive/multiplicative identity operation
 /// ([`ZERO_OPERATION_NAME`] / [`ONE_OPERATION_NAME`]). The identity fast path in [`Context::bind`] materializes these
 /// constants directly through the runtime client instead of compiling a program.
-fn eager_identity_output_type<O: Operation<ArrayProgramType>>(operation: &O) -> Result<ArrayType, ProgramError> {
+fn eager_identity_output_type<O: Operation<Type = ArrayProgramType>>(operation: &O) -> Result<ArrayType, ProgramError> {
     let mut output_types = operation.infer_output_types(&[], &[])?;
     if output_types.len() != 1 {
         return Err(TypeError::invalid(format!(
@@ -5392,7 +5392,7 @@ mod tests {
 
         let left = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let right = f32_vector(&client, &mesh, &[10.0, 20.0, 30.0, 40.0]);
-        let outputs = domain.bind(AddOperation::new(), Vec::new(), &[left, right]).unwrap();
+        let outputs = domain.bind(AddOperation::<ArrayType>::new(), Vec::new(), &[left, right]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![11.0, 22.0, 33.0, 44.0]);
@@ -5499,17 +5499,17 @@ mod tests {
 
         let left = f32_vector(&client, &mesh, &[1.0, 2.0]);
         let right = f32_vector(&client, &mesh, &[3.0, 4.0]);
-        let first = domain.bind(AddOperation::new(), Vec::new(), &[left.clone(), right.clone()]).unwrap();
+        let first = domain.bind(AddOperation::<ArrayType>::new(), Vec::new(), &[left.clone(), right.clone()]).unwrap();
         assert_eq!(domain.parent().cache_size(), 1);
 
-        let second = domain.bind(AddOperation::new(), Vec::new(), &[left, right]).unwrap();
+        let second = domain.bind(AddOperation::<ArrayType>::new(), Vec::new(), &[left, right]).unwrap();
         assert_eq!(domain.parent().cache_size(), 1, "a repeated eager operation must be a compile-cache hit");
         assert_eq!(read_f32s(&client, &first[0]), read_f32s(&client, &second[0]));
 
         // A different input signature compiles (and caches) a distinct executable.
         let wider_left = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let wider_right = f32_vector(&client, &mesh, &[4.0, 5.0, 6.0]);
-        domain.bind(AddOperation::new(), Vec::new(), &[wider_left, wider_right]).unwrap();
+        domain.bind(AddOperation::<ArrayType>::new(), Vec::new(), &[wider_left, wider_right]).unwrap();
         assert_eq!(domain.parent().cache_size(), 2);
     }
 
@@ -5552,7 +5552,9 @@ mod tests {
         let doubled = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
-            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder
+                .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![input, input])
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -5685,7 +5687,9 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let state = builder.add_input(scalar_type.clone().into());
             let one = builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![]).unwrap()[0];
-            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
+            let next = builder
+                .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![state, one])
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -5719,7 +5723,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.bind(AddOperation::new(), Vec::new(), &[input.clone(), input]).unwrap();
+        let outputs = domain.bind(AddOperation::<ArrayType>::new(), Vec::new(), &[input.clone(), input]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         let output = &outputs[0];
@@ -5753,7 +5757,9 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let one = builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![]).unwrap()[0];
-            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, one]).unwrap()[0];
+            let next = builder
+                .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![carry, one])
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![next, next],
@@ -5792,7 +5798,9 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let one = builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![]).unwrap()[0];
-            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, one]).unwrap()[0];
+            let next = builder
+                .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![carry, one])
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -5828,7 +5836,9 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let x = builder.add_input(scalar_type.clone().into());
-            let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
+            let sum = builder
+                .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![carry, x])
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -5867,7 +5877,9 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let x = builder.add_input(scalar_type.clone().into());
-            let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
+            let sum = builder
+                .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![carry, x])
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -5967,7 +5979,9 @@ mod tests {
         let body_program = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(local_type.clone().into());
-            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder
+                .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![input, input])
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -6086,7 +6100,7 @@ mod tests {
         let left = f32_vector(&client, &mesh, &[1.0, 2.0]);
         let right = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         assert!(matches!(
-            domain.bind(AddOperation::new(), Vec::new(), &[left, right]),
+            domain.bind(AddOperation::<ArrayType>::new(), Vec::new(), &[left, right]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "'add' input types are not broadcast-compatible",
         ));

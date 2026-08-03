@@ -570,7 +570,7 @@ where
     Leaf: Value<Type = ArrayType>,
     Leaf::DispatchDomain: Context<Type = ArrayType>,
     <Leaf::DispatchDomain as Domain>::Operation: From<O>,
-    O: Operation<ArrayType>,
+    O: Operation<Type = ArrayType>,
 {
     fn bind_leaf<Leaf, O>(
         input: Leaf,
@@ -581,7 +581,7 @@ where
         Leaf: Value<Type = ArrayType>,
         Leaf::DispatchDomain: Context<Type = ArrayType>,
         <Leaf::DispatchDomain as Domain>::Operation: From<O>,
-        O: Operation<ArrayType>,
+        O: Operation<Type = ArrayType>,
     {
         let input_type = input.r#type();
         if sharding.rank() != input_type.rank() {

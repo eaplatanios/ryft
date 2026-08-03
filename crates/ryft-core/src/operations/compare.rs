@@ -88,7 +88,12 @@ impl<T: Type> Display for CompareOperation<T> {
     }
 }
 
-impl<T: Broadcastable + ElementType> Operation<T> for CompareOperation<T> {
+/// Homogeneous comparison contract: the two operands are broadcast together and the broadcasted element type is
+/// replaced by [`DataType::Boolean`]. This covers every element-bearing type universe, including [`DataType`] and
+/// [`ArrayType`].
+impl<T: Broadcastable + ElementType> Operation for CompareOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         COMPARE_OPERATION_NAME
@@ -122,7 +127,11 @@ impl<T: Broadcastable + ElementType> Operation<T> for CompareOperation<T> {
     }
 }
 
-impl Operation<ArrayProgramType> for CompareOperation<ArrayProgramType> {
+/// Composite comparison contract: both operands are first-class dimensions and the predicate is ordinary rank-zero
+/// Boolean array data rather than another dimension value.
+impl Operation for CompareOperation<ArrayProgramType> {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         COMPARE_OPERATION_NAME
@@ -140,7 +149,6 @@ impl Operation<ArrayProgramType> for CompareOperation<ArrayProgramType> {
         Ok(vec![ArrayType::scalar(DataType::Boolean).into()])
     }
 
-    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, COMPARE_OPERATION_NAME)?
             .bracketed(|operation| operation.field("direction", self.direction))
@@ -155,13 +163,13 @@ impl ElementwiseOperation for CompareOperation<ArrayType> {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
+        Operation::infer_output_types(self, input_types, &[])
     }
 }
 
 impl<C: Domain> InterpretableOperation<C> for CompareOperation<C::Type>
 where
-    CompareOperation<C::Type>: Operation<C::Type>,
+    CompareOperation<C::Type>: Operation<Type = C::Type>,
     C::Value: Compare<C::Value>,
 {
     fn interpret<D: InterpretationDriver<C>>(
@@ -178,7 +186,7 @@ where
 impl<C: Context<Operation: From<CompareOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
     for CompareOperation<C::Type>
 where
-    CompareOperation<C::Type>: Operation<C::Type>,
+    CompareOperation<C::Type>: Operation<Type = C::Type>,
 {
 }
 
@@ -388,28 +396,19 @@ mod tests {
         let right = DimensionType::new(DimensionVariable::new("right", bounds));
         let operation = CompareOperation::<ArrayProgramType>::new(ComparisonDirection::LessThan);
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
-                &[left.clone().into(), right.clone().into()],
-                &[],
-            ),
+            operation.infer_output_types(&[left.clone().into(), right.clone().into()], &[]),
             Ok(vec![ArrayType::scalar(DataType::Boolean).into()]),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
-                &[ArrayType::scalar(DataType::I64).into(), right.clone().into()],
-                &[],
-            ),
+            operation.infer_output_types(&[ArrayType::scalar(DataType::I64).into(), right.clone().into()], &[]),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(&operation, &[left.clone().into()], &[]),
+            operation.infer_output_types(&[left.clone().into()], &[]),
             Err(TypeError::invalid("expected 2 inputs but got 1")),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
+            operation.infer_output_types(
                 &[left.into(), right.into()],
                 &[RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE)],
             ),

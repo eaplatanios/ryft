@@ -203,7 +203,9 @@ fn shard_map_body_interface<T: Type>(
     Ok(interface)
 }
 
-impl<V: Clone> Operation<ArrayProgramType> for ShardMapOperation<V> {
+impl<V: Clone> Operation for ShardMapOperation<V> {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         "shard_map"
@@ -1158,19 +1160,12 @@ mod tests {
             RegionInterface::new(vec![composite_array_type.clone()], vec![composite_array_type.clone()], Effects::PURE);
 
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
-                std::slice::from_ref(&composite_array_type),
-                std::slice::from_ref(&array_body),
-            ),
+            operation
+                .infer_output_types(std::slice::from_ref(&composite_array_type), std::slice::from_ref(&array_body)),
             Ok(vec![composite_array_type.clone()]),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
-                std::slice::from_ref(&composite_array_type),
-                &[],
-            ),
+            operation.infer_output_types(std::slice::from_ref(&composite_array_type), &[]),
             Err(TypeError::invalid("expected 1 region but got 0")),
         );
 
@@ -1179,19 +1174,14 @@ mod tests {
             DimensionBounds::positive(Some(8)).unwrap(),
         )));
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
-                std::slice::from_ref(&dimension_type),
-                std::slice::from_ref(&array_body),
-            ),
+            operation.infer_output_types(std::slice::from_ref(&dimension_type), std::slice::from_ref(&array_body)),
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
 
         let dimension_input_body =
             RegionInterface::new(vec![dimension_type.clone()], vec![composite_array_type.clone()], Effects::PURE);
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
+            operation.infer_output_types(
                 std::slice::from_ref(&composite_array_type),
                 std::slice::from_ref(&dimension_input_body),
             ),
@@ -1201,8 +1191,7 @@ mod tests {
         let dimension_output_body =
             RegionInterface::new(vec![composite_array_type.clone()], vec![dimension_type], Effects::PURE);
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
+            operation.infer_output_types(
                 std::slice::from_ref(&composite_array_type),
                 std::slice::from_ref(&dimension_output_body),
             ),
@@ -1439,12 +1428,14 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let known_input = builder.add_input(array_type.clone());
         let runtime_input = builder.add_input(array_type.clone());
-        let doubled =
-            builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, known_input]).unwrap()[0];
+        let doubled = builder
+            .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![known_input, known_input])
+            .unwrap()[0];
         let product =
             builder.add_instruction(MulOperation::new(), Vec::new(), vec![known_input, runtime_input]).unwrap()[0];
-        let sum =
-            builder.add_instruction(AddOperation::new(), Vec::new(), vec![runtime_input, known_input]).unwrap()[0];
+        let sum = builder
+            .add_instruction(AddOperation::<ArrayProgramType>::new(), Vec::new(), vec![runtime_input, known_input])
+            .unwrap()[0];
         FlatTracedShardMap::from_parts(
             shard_map,
             vec![array_type.clone(), array_type.clone()],
