@@ -2219,6 +2219,25 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       tree. Confirm that the public first-class dimension capabilities cover the intended ergonomics; do not recreate
       wrapper types merely to satisfy the old module-move wording. If a neutral public alias/API is still needed, add
       only the smallest capability-based surface after the operation and transform families settle.
+- [ ] After Phase 8 has moved every operation-specific batching algorithm to its payload owner, replace the historical
+      asymmetric module layout with a symmetric batching hierarchy:
+  - [ ] Keep universe-neutral contracts and machinery in the `batching` module root (`BatchingPolicy`,
+        `BatchingPolicyProjection`, `BatchableType`, contexts/tracers/drivers, `BatchedProgram`, transform entrypoints,
+        and projected-operation helpers).
+  - [ ] Move the `ArrayType` specialization to `batching::arrays` (`ArrayBatch`, `ArrayBatching`,
+        `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, their policy/recursive/entrypoint implementations, and
+        shared array-axis mechanics).
+  - [ ] Move the `ArrayProgramType` specialization to `batching::array_programs` (`ArrayProgramBatch`,
+        `ArrayProgramBatching`, `ThreadedExtentBatchedProgram`, `DynamicArrayBatchingPolicy`,
+        `ReplicatedDimensionBatchingPolicy`, their policy/projection/recursive/entrypoint implementations, and shared
+        first-class-extent mechanics).
+  - [ ] Keep operation-specific `BatchableOperation` implementations and operation-owned policy extensions such as
+        `LinearCallBatchingPolicy` beside their operation payloads rather than moving them into either specialization
+        module.
+  - [ ] Gate: neither specialization module contains an outer operation dispatcher or operation-specific batching
+        algorithm, and `backends` contains concrete eager values/operation families rather than transform policy types.
+        Update every in-repo path directly and decide the intentional `batching` facade during this move without adding
+        compatibility re-exports.
 - [ ] Audit names after responsibilities settle; rename only where the final name is materially clearer.
 - [ ] Known residual from the P4b audit: `ryft-xla/src/profile_guided.rs` names `ArrayProgramValue<Array>` in the
       `where` clauses of two public functions (`interpret` and `profile_baseline`). Bounds only — no public value
