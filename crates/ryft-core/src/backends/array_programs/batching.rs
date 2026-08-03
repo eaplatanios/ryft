@@ -1854,7 +1854,9 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching> for CustomCallOperation {
+impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching>
+    for CustomCallOperation<ArrayProgramType>
+{
     fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
         &self,
         _context: &BatchingContext<C, ArrayProgramBatching>,
@@ -1870,7 +1872,7 @@ impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatc
     }
 }
 
-impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching> for PadOperation
+impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching> for PadOperation<ArrayProgramType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
@@ -1879,7 +1881,7 @@ where
         + From<DimensionOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<OneOperation<ArrayType>>
-        + From<PadOperation>
+        + From<PadOperation<ArrayType>>
         + OperationProjection<ArrayType, Projected: From<SelectOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>,
 {
     fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
@@ -1918,7 +1920,11 @@ where
         else {
             return Ok(context
                 .parent()
-                .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>())?
+                .bind(
+                    PadOperation::<ArrayType>::from(self.clone()),
+                    Vec::new(),
+                    &inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>(),
+                )?
                 .into_iter()
                 .map(ArrayProgramBatch::replicated)
                 .collect());
@@ -2155,7 +2161,7 @@ where
         + From<ConditionOperation<ArrayProgramValue<A>>>
         + From<DimensionSizeOperation>
         + From<OneOperation<ArrayType>>
-        + From<PadOperation>
+        + From<PadOperation<ArrayType>>
         + From<RngBitGeneratorOperation<ArrayProgramType>>
         + From<ReshapeOperation>
         + From<ScanOperation<ArrayProgramValue<A>>>

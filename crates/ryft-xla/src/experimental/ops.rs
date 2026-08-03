@@ -128,10 +128,10 @@ where
     Concatenate(ConcatenateOperation),
 
     /// Calls a foreign kernel with explicit dynamic result extents.
-    CustomCall(CustomCallOperation),
+    CustomCall(CustomCallOperation<ArrayProgramType>),
 
     /// Pads an array with explicit result extents.
-    Pad(PadOperation),
+    Pad(PadOperation<ArrayProgramType>),
 
     /// Slices an array using first-class start and size dimensions.
     DynamicShapeSlice(DynamicShapeSliceOperation),
@@ -384,8 +384,10 @@ impl_composite_operation_conversion!(
     ReshapeOperation,
     BroadcastOperation,
     ConcatenateOperation,
-    CustomCallOperation,
-    PadOperation,
+    CustomCallOperation<ArrayType>,
+    CustomCallOperation<ArrayProgramType>,
+    PadOperation<ArrayType>,
+    PadOperation<ArrayProgramType>,
     RngBitGeneratorOperation<ArrayProgramType>,
     AllGatherOperation,
     PSumScatterOperation,

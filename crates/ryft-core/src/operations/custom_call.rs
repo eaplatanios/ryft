@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
 use crate::batching::{
@@ -96,6 +97,17 @@ impl From<f64> for CustomCallAttribute {
 /// kernel ABI: only the leading array operands are passed to the kernel. Eager execution and backend lowering use the
 /// trailing operands to verify or attach the declared logical sizes to the returned buffers.
 ///
+/// The type parameter selects that operand contract without introducing a second semantic operation:
+///
+///   - `CustomCallOperation<ArrayType>` accepts only the foreign kernel's array operands and is suitable for
+///     homogeneous array programs whose result extents are fully described by their array types.
+///   - `CustomCallOperation<ArrayProgramType>` additionally accepts the trailing first-class dimension operands
+///     described above and is suitable for mixed array/dimension programs.
+///
+/// Both forms carry the same target, output declarations, attributes, effects, rendering, and backend-kernel
+/// semantics. Conversion into the mixed form only reparameterizes the operation family; it moves the existing
+/// descriptor without copying its owned metadata.
+///
 /// The XLA backend lowers this operation to a
 /// [`stablehlo.custom_call`](https://openxla.org/stablehlo/spec#custom_call) using the typed FFI calling convention
 /// (`api_version = 4`), with the attributes carried as the `backend_config` dictionary. Handlers are registered with
@@ -126,7 +138,7 @@ impl From<f64> for CustomCallAttribute {
 /// belong in the owning backend's lowering (or in a backend-owned wrapper operation), not here. If a
 /// configuration knob only makes sense for one backend, it does not belong on this operation.
 #[derive(Clone, Debug)]
-pub struct CustomCallOperation {
+pub struct CustomCallOperation<T: Type> {
     /// Name under which the foreign kernel is registered with the executing backend.
     target_name: String,
 
@@ -138,9 +150,12 @@ pub struct CustomCallOperation {
 
     /// Whether the call has observable side effects beyond its returned outputs.
     has_side_effect: bool,
+
+    /// Type universe that determines the operation's operand contract.
+    marker: PhantomData<fn() -> T>,
 }
 
-impl CustomCallOperation {
+impl CustomCallOperation<ArrayType> {
     /// Creates a new [`CustomCallOperation`] with the provided target name and declared output types.
     ///
     /// # Parameters
@@ -149,9 +164,17 @@ impl CustomCallOperation {
     ///   - `output_types`: Declared output types of the call, returned verbatim by type inference.
     #[inline]
     pub fn new<N: Into<String>>(target_name: N, output_types: Vec<ArrayType>) -> Self {
-        Self { target_name: target_name.into(), output_types, attributes: Vec::new(), has_side_effect: false }
+        Self {
+            target_name: target_name.into(),
+            output_types,
+            attributes: Vec::new(),
+            has_side_effect: false,
+            marker: PhantomData,
+        }
     }
+}
 
+impl<T: Type> CustomCallOperation<T> {
     /// Returns a copy of this [`CustomCallOperation`] with the provided typed configuration attribute appended.
     #[inline]
     pub fn with_attribute<N: Into<String>, V: Into<CustomCallAttribute>>(mut self, name: N, value: V) -> Self {
@@ -189,15 +212,68 @@ impl CustomCallOperation {
     pub fn has_side_effect(&self) -> bool {
         self.has_side_effect
     }
-}
 
-impl Display for CustomCallOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayProgramType>::render(self, formatter, 0)
+    /// Returns this payload with every declared output identity renamed according to `renaming`.
+    fn renamed(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
+        Ok(Self {
+            target_name: self.target_name.clone(),
+            output_types: self
+                .output_types
+                .iter()
+                .map(|r#type| r#type.rename_identities(renaming))
+                .collect::<Result<Vec<_>, _>>()?,
+            attributes: self.attributes.clone(),
+            has_side_effect: self.has_side_effect,
+            marker: PhantomData,
+        })
+    }
+
+    /// Renders this payload independently of its homogeneous or composite operation contract.
+    fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, CUSTOM_CALL_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("target", &self.target_name)?;
+            for (name, value) in &self.attributes {
+                operation.field(name, value)?;
+            }
+            if self.has_side_effect {
+                operation.field("has_side_effect", true)?;
+            }
+            Ok(())
+        })
     }
 }
 
-impl Operation<ArrayType> for CustomCallOperation {
+impl From<CustomCallOperation<ArrayType>> for CustomCallOperation<ArrayProgramType> {
+    fn from(operation: CustomCallOperation<ArrayType>) -> Self {
+        Self {
+            target_name: operation.target_name,
+            output_types: operation.output_types,
+            attributes: operation.attributes,
+            has_side_effect: operation.has_side_effect,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl From<CustomCallOperation<ArrayProgramType>> for CustomCallOperation<ArrayType> {
+    fn from(operation: CustomCallOperation<ArrayProgramType>) -> Self {
+        Self {
+            target_name: operation.target_name,
+            output_types: operation.output_types,
+            attributes: operation.attributes,
+            has_side_effect: operation.has_side_effect,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Type> Display for CustomCallOperation<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render_operation(formatter, 0)
+    }
+}
+
+impl Operation<ArrayType> for CustomCallOperation<ArrayType> {
     #[inline]
     fn name(&self) -> &'static str {
         CUSTOM_CALL_OPERATION_NAME
@@ -221,33 +297,15 @@ impl Operation<ArrayType> for CustomCallOperation {
         &self,
         renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
     ) -> Result<Self, TypeError> {
-        Ok(Self {
-            target_name: self.target_name.clone(),
-            output_types: self
-                .output_types
-                .iter()
-                .map(|r#type| r#type.rename_identities(renaming))
-                .collect::<Result<Vec<_>, _>>()?,
-            attributes: self.attributes.clone(),
-            has_side_effect: self.has_side_effect,
-        })
+        self.renamed(renaming)
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CUSTOM_CALL_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("target", &self.target_name)?;
-            for (name, value) in &self.attributes {
-                operation.field(name, value)?;
-            }
-            if self.has_side_effect {
-                operation.field("has_side_effect", true)?;
-            }
-            Ok(())
-        })
+        self.render_operation(formatter, indentation)
     }
 }
 
-impl Operation<ArrayProgramType> for CustomCallOperation {
+impl Operation<ArrayProgramType> for CustomCallOperation<ArrayProgramType> {
     #[inline]
     fn name(&self) -> &'static str {
         CUSTOM_CALL_OPERATION_NAME
@@ -291,20 +349,20 @@ impl Operation<ArrayProgramType> for CustomCallOperation {
 
     #[inline]
     fn effects(&self) -> Effects {
-        Operation::<ArrayType>::effects(self)
+        if self.has_side_effect { Effects::single(Effect::OrderedIo) } else { Effects::PURE }
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
-        Operation::<ArrayType>::rename_type_identities(self, renaming)
+        self.renamed(renaming)
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, indentation)
+        self.render_operation(formatter, indentation)
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> for CustomCallOperation {
+impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> for CustomCallOperation<ArrayType> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -316,7 +374,8 @@ impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> f
 }
 
 impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for CustomCallOperation
+    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>
+    for CustomCallOperation<ArrayProgramType>
 {
     fn interpret<D: InterpretationDriver<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>>(
         &self,
@@ -343,7 +402,8 @@ impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
             .iter()
             .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
             .collect::<Result<Vec<_>, _>>()?;
-        let outputs = A::custom_call(self, array_inputs.iter().copied())?;
+        let kernel_operation = CustomCallOperation::<ArrayType>::from(self.clone());
+        let outputs = A::custom_call(&kernel_operation, array_inputs.iter().copied())?;
         check_count!("output", outputs, self.output_types.len(), ProgramError);
         let mut output_extents = output_extents.into_iter();
         for (output_index, (output, output_type)) in outputs.iter().zip(&self.output_types).enumerate() {
@@ -370,17 +430,17 @@ impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate). An all-known custom call folds into the
 /// known side (executing there only if the known-side context can run foreign kernels), and a side-effecting
 /// residual call survives dead-code elimination because [`Operation::effects`] is not [`Effects::PURE`].
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for CustomCallOperation where
-    C::Operation: From<CustomCallOperation>
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for CustomCallOperation<ArrayType> where
+    C::Operation: From<CustomCallOperation<ArrayType>>
 {
 }
 
 impl_differentiable_operation! {
-    CustomCallOperation,
+    CustomCallOperation<ArrayType>,
     jvp<C>
     where
         C: Context<Type = ArrayType>,
-        C::Operation: From<CustomCallOperation>,
+        C::Operation: From<CustomCallOperation<ArrayType>>,
     {
         |operation, _context, _driver, _inputs| {
             // Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error
@@ -402,7 +462,7 @@ impl_differentiable_operation! {
 /// Foreign kernels are opaque, so there is no batching rule to derive: batching reports an error, and callers
 /// should invoke a kernel that understands the batch axis instead.
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for CustomCallOperation
+    for CustomCallOperation<ArrayType>
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -427,23 +487,23 @@ pub trait CustomCall: Sized {
     /// Calls the foreign kernel described by `operation` with the provided inputs, returning one value per
     /// declared output type, and a [`ProgramError`] if something goes wrong.
     fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
-        operation: &CustomCallOperation,
+        operation: &CustomCallOperation<ArrayType>,
         inputs: I,
     ) -> Result<Vec<Self>, ProgramError>
     where
         Self: 'a;
 }
 
-/// Any context-carrying value calls foreign kernels by binding a [`CustomCallOperation`] through its own context.
-/// The `From<CustomCallOperation>` bound makes this disjoint from the eager reference value types (whose context
-/// operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the transform
-/// tracers and backend-owned values without conflicting with concrete implementations.
+/// Any context-carrying value calls foreign kernels by binding a [`CustomCallOperation<ArrayType>`] through its own
+/// context. The conversion bound makes this disjoint from the eager reference value types (whose context operation is
+/// [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the transform tracers and
+/// backend-owned values without conflicting with concrete implementations.
 impl<V: Value<Type = ArrayType>> CustomCall for V
 where
-    V::DispatchDomain: Context<Operation: From<CustomCallOperation>>,
+    V::DispatchDomain: Context<Operation: From<CustomCallOperation<ArrayType>>>,
 {
     fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
-        operation: &CustomCallOperation,
+        operation: &CustomCallOperation<ArrayType>,
         inputs: I,
     ) -> Result<Vec<Self>, ProgramError>
     where
@@ -542,7 +602,10 @@ mod tests {
                 Dimension::Dynamic(columns.clone()),
             ]),
         );
-        let dynamic_operation = CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_output_type.clone()]);
+        let dynamic_operation = CustomCallOperation::<ArrayProgramType>::from(CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![dynamic_output_type.clone()],
+        ));
         let input_types = vec![
             vector_type().into(),
             DimensionType::new(rows.clone()).into(),

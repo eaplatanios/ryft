@@ -344,7 +344,10 @@ where
 /// Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for SliceOperation
 where
-    O: Operation<ArrayType> + From<UpdateSliceOperation> + From<PadOperation> + From<ZeroOperation<ArrayType>>,
+    O: Operation<ArrayType>
+        + From<UpdateSliceOperation>
+        + From<PadOperation<ArrayType>>
+        + From<ZeroOperation<ArrayType>>,
     Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(

@@ -1929,7 +1929,6 @@ pub fn differentiable_dot_product_attention<D>(
     sliding_window: Option<usize>,
     dropout: Option<(f64, u64)>,
 ) -> CustomVjp<
-    D,
     impl Fn(DotProductAttentionInputs<D>) -> Result<DomainTracer<D>, ProgramError>,
     impl Fn(DotProductAttentionInputs<D>) -> Result<(DomainTracer<D>, DotProductAttentionResiduals<D>), ProgramError>,
     impl Fn(DotProductAttentionResiduals<D>, DomainTracer<D>) -> Result<DotProductAttentionInputs<D>, ProgramError>,
@@ -1994,7 +1993,6 @@ pub fn differentiable_dot_product_attention_with_bias<D>(
     sliding_window: Option<usize>,
     dropout: Option<(f64, u64)>,
 ) -> CustomVjp<
-    D,
     impl Fn(DotProductAttentionInputsWithBias<D>) -> Result<DomainTracer<D>, ProgramError>,
     impl Fn(
         DotProductAttentionInputsWithBias<D>,
@@ -2098,7 +2096,6 @@ pub fn differentiable_dot_product_attention_with_sequence_lengths<D>(
     sliding_window: Option<usize>,
     dropout: Option<(f64, u64)>,
 ) -> CustomVjp<
-    D,
     impl Fn(DotProductAttentionInputsWithSequenceLengths<D>) -> Result<DomainTracer<D>, ProgramError>,
     impl Fn(
         DotProductAttentionInputsWithSequenceLengths<D>,

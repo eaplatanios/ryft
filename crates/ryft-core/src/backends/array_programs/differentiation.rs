@@ -188,9 +188,9 @@ where
                     let output_extents =
                         residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
                     let operand_shape = residuals.retain_shape::<A, _>(context, array_inputs[0].primal())?;
-                    let forward_operation = operation.clone();
+                    let forward_operation = PadOperation::<ArrayType>::from(operation.clone());
                     let forward_output_extents = output_extents.clone();
-                    let transpose_operation = operation.clone();
+                    let transpose_operation = PadOperation::<ArrayType>::from(operation.clone());
                     let transpose_operand_type = operand_cotangent_type.clone();
                     let transpose_padding_type =
                         <&ArrayType>::try_from(array_inputs[1].primal().r#type().as_ref())?.cotangent();
@@ -1818,7 +1818,7 @@ where
             // Exact extents make the mixed instruction identical to the established homogeneous pad map. Delegate
             // that pullback for the two differentiable array operands and assign structural-zero cotangents to the
             // trailing extent values.
-            let array_operation = Self::Array(ArrayOperation::from(operation.clone()));
+            let array_operation = Self::Array(ArrayOperation::from(PadOperation::<ArrayType>::from(operation.clone())));
             let mut cotangents = array_operation.transpose(context, driver, array_inputs, outputs)?;
             cotangents.extend(output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())));
             return Ok(cotangents);

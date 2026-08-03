@@ -2587,7 +2587,7 @@ mod tests {
         // The custom backward rule triples the true gradient (expressed through addition to avoid constant lifting),
         // so a matching gradient proves the user-authored rule — not the true derivative — governs reverse mode
         // through the rematerialized region.
-        let custom = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+        let custom = custom_vjp(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| {
@@ -3860,7 +3860,7 @@ mod tests {
         // Phase 0 boundary pin: the custom-VJP *forward* program is replayed through the linearization, so the
         // declared residual's producing instruction is the replayed internal `cos` — not the opaque call — while the
         // user-owned backward program contributes no candidates at all.
-        let custom = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+        let custom = custom_vjp(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| Ok(residual * cotangent),

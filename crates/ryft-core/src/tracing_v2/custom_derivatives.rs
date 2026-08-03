@@ -175,13 +175,12 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 /// original operation is bound unchanged and the outputs stay replicated. Otherwise every input is aligned to
 /// carry the batch axis at axis `0` (replicated inputs are broadcast, matching the convention that every
 /// custom-call input is mapped at axis `0`) and every output carries the batch axis at axis `0`.
-pub(crate) fn stage_rewrapped_custom_call<C, P: ArrayBatchingPolicy<C>, MakeOperationFn>(
+pub(crate) fn stage_rewrapped_custom_call<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>, MakeOperationFn>(
     context: &BatchingContext<C, ArrayBatching<P>>,
     inputs: &[ArrayBatch<<C as Domain>::Value>],
     make_operation: MakeOperationFn,
 ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
 where
-    C: Context<Type = ArrayType>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
     MakeOperationFn: FnOnce(
         Option<usize>,
@@ -223,10 +222,10 @@ where
 /// at axis `0`.
 pub(crate) fn batch_rewrapped_program<
     C: Context<Type = ArrayType>,
-    M: ArrayBatchingPolicy<C>,
-    D: BatchingDriver<C, ArrayBatching<M>>,
+    P: ArrayBatchingPolicy<C>,
+    D: BatchingDriver<C, ArrayBatching<P>>,
 >(
-    context: &BatchingContext<C, ArrayBatching<M>>,
+    context: &BatchingContext<C, ArrayBatching<P>>,
     driver: &D,
     index: usize,
 ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
@@ -246,7 +245,7 @@ pub(crate) fn batch_rewrapped_program<
 
 /// Batching rule for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
 /// derivative survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>> for CustomJvpOperation<ArrayType>
+impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for CustomJvpOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
@@ -255,9 +254,9 @@ where
         + From<LegacyBroadcastOperation>
         + From<CustomJvpOperation<ArrayType>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<M>>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -318,51 +317,49 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
 impl_non_transposable_operation!(<T> CustomJvpOperation<T> where T: DifferentiableType);
 
 /// Function with a user-supplied JVP rule, built by [`custom_jvp`]. It stores the primal and JVP closures together
-/// with a phantom marker pinning the [`Domain`] and the tracer-tree types named by those closure signatures; refer to
-/// the documentation of [`custom_jvp`] for the calling convention, the tracing semantics, and when to reach for a
-/// custom JVP.
-pub struct CustomJvp<D: Domain, P, J, IT, OT> {
+/// with a phantom marker pinning the tracer-tree types named by those closure signatures; refer to the documentation
+/// of [`custom_jvp`] for the calling convention, the tracing semantics, and when to reach for a custom JVP.
+pub struct CustomJvp<Primal, Jvp, Inputs, Outputs> {
     /// Closure computing the primal output tree from the primal input tree.
-    primal: P,
+    primal: Primal,
 
     /// Closure computing `(outputs, output_tangents)` from `(inputs, input_tangents)`.
-    jvp: J,
+    jvp: Jvp,
 
-    /// Phantom marker pinning the [`Domain`] and the input and output tracer-tree types named by the closure
-    /// signatures. The domain is a pure type witness, so no domain value is stored.
-    marker: PhantomData<fn() -> (D, IT, OT)>,
+    /// Phantom marker pinning the input and output tracer-tree types named by the closure signatures. The [`Domain`]
+    /// whose universe the rules are traced into is recovered from the values passed to [`CustomJvp::call`], and so the
+    /// wrapper stores neither a domain value nor a domain type witness.
+    marker: PhantomData<fn() -> (Inputs, Outputs)>,
 }
 
-impl<D, P, J, IT, OT> CustomJvp<D, P, J, IT, OT>
+impl<Primal, Jvp, Inputs, Outputs> CustomJvp<Primal, Jvp, Inputs, Outputs>
 where
-    D: Domain<Type: DifferentiableType>,
-    P: Fn(IT) -> Result<OT, ProgramError>,
-    J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
-    D::Operation: From<CustomJvpOperation<D::Type>>,
-    IT: Parameterized<DomainTracer<D>>,
-    IT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-    OT: Parameterized<DomainTracer<D>>,
-    OT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-    IT::To<D::Type>: Clone
-        + Parameterized<D::Type, Family = IT::Family, To<DomainTracer<D>> = IT, To<D::Constant> = IT::To<D::Constant>>,
-    OT::To<D::Type>:
-        Parameterized<D::Type, Family = OT::Family, To<DomainTracer<D>> = OT, To<D::Constant> = OT::To<D::Constant>>,
+    Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
+    Jvp: Fn(Inputs, Inputs) -> Result<(Outputs, Outputs), ProgramError>,
 {
     /// Stages this custom-JVP function on the provided tracer input tree and returns its output tree, tracing the
     /// stored closures into programs specialized to the input types. Differentiation of the staged call replays the
     /// JVP rule instead of differentiating the primal body, in both forward and reverse mode.
-    pub fn call<V, ICT>(&self, input: ICT) -> Result<<OT::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
+    ///
+    /// The [`Domain`] `D` whose universe the two rule programs are traced into is the
+    /// [`DispatchDomain`](Value::DispatchDomain) of the values this is called with, which is exactly the context the
+    /// call is staged into. It is therefore recovered from `input` and never has to be named at a construction or call
+    /// site, while the stored closures still pin the tracer trees that universe must produce.
+    pub fn call<D, V, InputValues>(
+        &self,
+        input: InputValues,
+    ) -> Result<<Outputs::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
     where
-        V: Value<Type = D::Type>,
-        V::DispatchDomain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
-        IT::Family: ParameterizedFamily<V>,
-        OT::Family: ParameterizedFamily<V>,
-        ICT: Parameterized<V, Family = IT::Family, To<D::Type> = IT::To<D::Type>>,
-        <OT::To<D::Type> as Parameterized<D::Type>>::To<V>: Parameterized<
-                V,
-                Family = OT::Family,
-                ParameterStructure = <OT::To<D::Type> as Parameterized<D::Type>>::ParameterStructure,
-            >,
+        D: Context<Type: DifferentiableType, Value = V>,
+        V: Value<Type = D::Type, DispatchDomain = D>,
+        D::Operation: From<CustomJvpOperation<D::Type>>,
+        Inputs: Parameterized<DomainTracer<D>>,
+        Inputs::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
+        Outputs: Parameterized<DomainTracer<D>>,
+        Outputs::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant> + ParameterizedFamily<V>,
+        Inputs::To<D::Type>: Clone + Parameterized<D::Type, Family = Inputs::Family, To<DomainTracer<D>> = Inputs>,
+        Outputs::To<D::Type>: Parameterized<D::Type, Family = Outputs::Family, To<DomainTracer<D>> = Outputs>,
+        InputValues: Parameterized<V, Family = Inputs::Family, To<D::Type> = Inputs::To<D::Type>>,
     {
         let mut input_values = Vec::new();
         let input_types = input
@@ -389,8 +386,8 @@ where
     }
 }
 
-/// Creates a [`CustomJvp`] function from a primal closure and a JVP-rule closure over trees of the [`Domain`] `D`'s
-/// tracers — the ergonomic analogue of JAX's
+/// Creates a [`CustomJvp`] function from a primal closure and a JVP-rule closure over trees of [`DomainTracer`]s —
+/// the ergonomic analogue of JAX's
 /// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
 /// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
 ///
@@ -416,18 +413,18 @@ where
 ///
 /// # Tracing semantics
 ///
-/// Nothing is traced at construction time: each [`CustomJvp::call`] reads the input types off its tracer arguments,
-/// traces both closures into programs specialized to those types, validates the rule signature, and stages one
-/// [`CustomJvpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
-/// lazily at transform time. The primal closure is kept separate from the JVP closure for efficiency rather than
-/// necessity: the JVP rule computes both the outputs and their tangents, so deriving the primal from it would make
-/// every un-differentiated call pay for tangent computation. Interpretation, batching, and backend lowering replay the
-/// lean primal program, and the JVP program runs only under differentiation.
-pub fn custom_jvp<D, P, J, IT, OT>(primal: P, jvp: J) -> CustomJvp<D, P, J, IT, OT>
+/// Nothing is traced at construction time: each [`CustomJvp::call`] recovers the tracing [`Domain`] from the values it
+/// is called with, reads the input types off those arguments, traces both closures into programs specialized to those
+/// types, validates the rule signature, and stages one [`CustomJvpOperation`] into the caller's staging context —
+/// mirroring how JAX traces rule functions into jaxprs lazily at transform time. The primal closure is kept separate
+/// from the JVP closure for efficiency rather than necessity: the JVP rule computes both the outputs and their
+/// tangents, so deriving the primal from it would make every un-differentiated call pay for tangent computation.
+/// Interpretation, batching, and backend lowering replay the lean primal program, and the JVP program runs only under
+/// differentiation.
+pub fn custom_jvp<Primal, Jvp, Inputs, Outputs>(primal: Primal, jvp: Jvp) -> CustomJvp<Primal, Jvp, Inputs, Outputs>
 where
-    D: Domain<Type: DifferentiableType>,
-    P: Fn(IT) -> Result<OT, ProgramError>,
-    J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
+    Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
+    Jvp: Fn(Inputs, Inputs) -> Result<(Outputs, Outputs), ProgramError>,
 {
     CustomJvp { primal, jvp, marker: PhantomData }
 }
@@ -623,7 +620,7 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 
 /// Batching rule for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward programs so
 /// the custom derivative survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>> for CustomVjpOperation<ArrayType>
+impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for CustomVjpOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
@@ -632,9 +629,9 @@ where
         + From<LegacyBroadcastOperation>
         + From<CustomVjpOperation<ArrayType>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<M>>,
+        context: &BatchingContext<C, ArrayBatching<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
@@ -744,59 +741,58 @@ where
 impl_non_transposable_operation!(<T> CustomVjpOperation<T> where T: DifferentiableType);
 
 /// Function with user-supplied forward/backward (VJP) rules, built by [`custom_vjp`]. It stores the primal, forward,
-/// and backward closures together with a phantom marker pinning the [`Domain`] and the tracer-tree types named by those
-/// closure signatures; refer to the documentation of [`custom_vjp`] for the calling convention, the tracing semantics,
-/// and when to reach for a custom VJP.
-pub struct CustomVjp<D: Domain, P, F, B, IT, OT, RT> {
+/// and backward closures together with a phantom marker pinning the tracer-tree types named by those closure
+/// signatures; refer to the documentation of [`custom_vjp`] for the calling convention, the tracing semantics, and
+/// when to reach for a custom VJP.
+pub struct CustomVjp<Primal, Forward, Backward, Inputs, Outputs, Residuals> {
     /// Closure computing the primal output tree from the primal input tree.
-    primal: P,
+    primal: Primal,
 
     /// Closure computing `(outputs, residuals)` from the primal input tree.
-    forward: F,
+    forward: Forward,
 
     /// Closure computing the input cotangent tree from `(residuals, output_cotangents)`.
-    backward: B,
+    backward: Backward,
 
-    /// Phantom marker pinning the [`Domain`] and the input, output, and residual tracer-tree types named by the
-    /// closure signatures. The domain is a pure type witness, so no domain value is stored.
-    marker: PhantomData<fn() -> (D, IT, OT, RT)>,
+    /// Phantom marker pinning the input, output, and residual tracer-tree types named by the closure signatures. The
+    /// [`Domain`] whose universe the rules are traced into is recovered from the values passed to [`CustomVjp::call`],
+    /// and so the wrapper stores neither a domain value nor a domain type witness.
+    marker: PhantomData<fn() -> (Inputs, Outputs, Residuals)>,
 }
 
-impl<D, P, F, B, IT, OT, RT> CustomVjp<D, P, F, B, IT, OT, RT>
+impl<Primal, Forward, Backward, Inputs, Outputs, Residuals>
+    CustomVjp<Primal, Forward, Backward, Inputs, Outputs, Residuals>
 where
-    D: Domain<Type: DifferentiableType>,
-    P: Fn(IT) -> Result<OT, ProgramError>,
-    F: Fn(IT) -> Result<(OT, RT), ProgramError>,
-    B: Fn(RT, OT) -> Result<IT, ProgramError>,
-    D::Operation: From<CustomVjpOperation<D::Type>>,
-    IT: Parameterized<DomainTracer<D>>,
-    IT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-    OT: Parameterized<DomainTracer<D>>,
-    OT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-    RT: Parameterized<DomainTracer<D>>,
-    RT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-    IT::To<D::Type>: Clone
-        + Parameterized<D::Type, Family = IT::Family, To<DomainTracer<D>> = IT, To<D::Constant> = IT::To<D::Constant>>,
-    OT::To<D::Type>: Clone
-        + Parameterized<D::Type, Family = OT::Family, To<DomainTracer<D>> = OT, To<D::Constant> = OT::To<D::Constant>>,
-    RT::To<D::Type>:
-        Parameterized<D::Type, Family = RT::Family, To<DomainTracer<D>> = RT, To<D::Constant> = RT::To<D::Constant>>,
+    Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
+    Forward: Fn(Inputs) -> Result<(Outputs, Residuals), ProgramError>,
+    Backward: Fn(Residuals, Outputs) -> Result<Inputs, ProgramError>,
 {
     /// Stages this custom-VJP function on the provided tracer input tree and returns its output tree, tracing the
     /// stored closures into programs specialized to the input types. Reverse-mode differentiation of the staged
     /// call replays the backward rule on the forward rule's residuals instead of differentiating the primal body.
-    pub fn call<V, ICT>(&self, input: ICT) -> Result<<OT::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
+    ///
+    /// The [`Domain`] `D` whose universe the three rule programs are traced into is the
+    /// [`DispatchDomain`](Value::DispatchDomain) of the values this is called with, which is exactly the context the
+    /// call is staged into. It is therefore recovered from `input` and never has to be named at a construction or call
+    /// site, while the stored closures still pin the tracer trees that universe must produce.
+    pub fn call<D, V, InputValues>(
+        &self,
+        input: InputValues,
+    ) -> Result<<Outputs::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
     where
-        V: Value<Type = D::Type>,
-        V::DispatchDomain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
-        IT::Family: ParameterizedFamily<V>,
-        OT::Family: ParameterizedFamily<V>,
-        ICT: Parameterized<V, Family = IT::Family, To<D::Type> = IT::To<D::Type>>,
-        <OT::To<D::Type> as Parameterized<D::Type>>::To<V>: Parameterized<
-                V,
-                Family = OT::Family,
-                ParameterStructure = <OT::To<D::Type> as Parameterized<D::Type>>::ParameterStructure,
-            >,
+        D: Context<Type: DifferentiableType, Value = V>,
+        V: Value<Type = D::Type, DispatchDomain = D>,
+        D::Operation: From<CustomVjpOperation<D::Type>>,
+        Inputs: Parameterized<DomainTracer<D>>,
+        Inputs::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
+        Outputs: Parameterized<DomainTracer<D>>,
+        Outputs::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant> + ParameterizedFamily<V>,
+        Residuals: Parameterized<DomainTracer<D>>,
+        Residuals::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
+        Inputs::To<D::Type>: Clone + Parameterized<D::Type, Family = Inputs::Family, To<DomainTracer<D>> = Inputs>,
+        Outputs::To<D::Type>: Clone + Parameterized<D::Type, Family = Outputs::Family, To<DomainTracer<D>> = Outputs>,
+        Residuals::To<D::Type>: Parameterized<D::Type, Family = Residuals::Family, To<DomainTracer<D>> = Residuals>,
+        InputValues: Parameterized<V, Family = Inputs::Family, To<D::Type> = Inputs::To<D::Type>>,
     {
         let mut input_values = Vec::new();
         let input_types = input
@@ -831,8 +827,8 @@ where
     }
 }
 
-/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over trees of the [`Domain`] `D`'s
-/// tracers — the ergonomic analogue of JAX's
+/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over trees of [`DomainTracer`]s —
+/// the ergonomic analogue of JAX's
 /// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
 /// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair.
 ///
@@ -867,21 +863,25 @@ where
 ///
 /// # Tracing semantics
 ///
-/// Nothing is traced at construction time: each [`CustomVjp::call`] reads the input types off its tracer arguments,
-/// traces the closures into programs specialized to those types, validates the rule signatures, and stages one
-/// [`CustomVjpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
-/// lazily at transform time. The primal closure is kept separate from the forward closure for efficiency rather than
-/// necessity: an un-differentiated call should not pay for residual computation. Interpretation, batching, and backend
-/// lowering replay the lean primal program, and the residual-producing forward program runs only under reverse-mode
+/// Nothing is traced at construction time: each [`CustomVjp::call`] recovers the tracing [`Domain`] from the values it
+/// is called with, reads the input types off those arguments, traces the closures into programs specialized to those
+/// types, validates the rule signatures, and stages one [`CustomVjpOperation`] into the caller's staging context —
+/// mirroring how JAX traces rule functions into jaxprs lazily at transform time. The primal closure is kept separate
+/// from the forward closure for efficiency rather than necessity: an un-differentiated call should not pay for residual
+/// computation. Interpretation, batching, and backend lowering replay the lean primal program, and the
+/// residual-producing forward program runs only under reverse-mode
 /// differentiation. Callers that do not care about the distinction can pass the same body for both — accepting that the
 /// residual outputs are dead code outside of differentiation — which mirrors the common JAX idiom of writing `f_fwd` as
 /// `return f(x), residuals`.
-pub fn custom_vjp<D, P, F, B, IT, OT, RT>(primal: P, forward: F, backward: B) -> CustomVjp<D, P, F, B, IT, OT, RT>
+pub fn custom_vjp<Primal, Forward, Backward, Inputs, Outputs, Residuals>(
+    primal: Primal,
+    forward: Forward,
+    backward: Backward,
+) -> CustomVjp<Primal, Forward, Backward, Inputs, Outputs, Residuals>
 where
-    D: Domain<Type: DifferentiableType>,
-    P: Fn(IT) -> Result<OT, ProgramError>,
-    F: Fn(IT) -> Result<(OT, RT), ProgramError>,
-    B: Fn(RT, OT) -> Result<IT, ProgramError>,
+    Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
+    Forward: Fn(Inputs) -> Result<(Outputs, Residuals), ProgramError>,
+    Backward: Fn(Residuals, Outputs) -> Result<Inputs, ProgramError>,
 {
     CustomVjp { primal, forward, backward, marker: PhantomData }
 }
@@ -1512,7 +1512,7 @@ mod tests {
         // primal outputs and the rest are residuals, and the backward region consumes one cotangent per output. The
         // deliberately wrong rule scales the first output's contribution by 2 and the second's by 3, so seeding one
         // output cotangent at a time isolates each term of the custom backward.
-        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+        let function = custom_vjp(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 Ok(((x.sin()?, x.cos()?), (x.cos()?, x.sin()?)))
@@ -1546,7 +1546,7 @@ mod tests {
         // user backward defines the residual as `cos(x)`, so at `x = 0.7` and a unit cotangent the input cotangent is
         // `cos(0.7)`.
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+        let function = custom_vjp(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| Ok(residual * cotangent),
@@ -1601,7 +1601,7 @@ mod tests {
     #[test]
     fn test_custom_jvp_wrapper_traces_closures_lazily() {
         // No manual programs: the wrapper traces the closures at the call site, specialized to the input types.
-        let function = custom_jvp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _>(
+        let function = custom_jvp(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, dx| {
                 // The deliberately wrong rule `jvp(x, dx) = (sin(x), cos(x) * dx + cos(x) * dx)` doubles the true
@@ -1628,7 +1628,7 @@ mod tests {
         // Arity mismatches are compile-time errors under the structured signatures, but shape mismatches remain
         // runtime concerns: this rule produces a scalar tangent for a vector-valued function, so the traced JVP
         // program fails the signature validation that `CustomJvpOperation` performs at the call site.
-        let function = custom_jvp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _>(
+        let function = custom_jvp(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, dx| {
                 Ok((x.sin()?, dx.dot(&dx, &DotDimensionNumbers::inner_product())))
@@ -1647,7 +1647,7 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_wrapper_governs_reverse_mode() {
-        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+        let function = custom_vjp(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| {
@@ -1670,7 +1670,7 @@ mod tests {
         // captured `triple` closure plays the role of a JAX `nondiff_argnums` argument: static configuration
         // visible to the rule closures without being differentiated or stored as a residual.
         let repeats = 3usize;
-        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+        let function = custom_vjp(
             |(x, y): (
                 DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
                 DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
@@ -1701,10 +1701,10 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_wrapper_supports_empty_residuals() {
-        // A forward rule that saves nothing (`RT = ()`) exercises the zero-residual carrier path: the backward rule
-        // depends only on the output cotangent, so the deliberately wrong `backward(cotangent) = 2 * cotangent` makes
-        // the gradient the constant `2` instead of `cos(x)`.
-        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+        // A forward rule that saves nothing (`Residuals = ()`) exercises the zero-residual carrier path: the backward
+        // rule depends only on the output cotangent, so the deliberately wrong `backward(cotangent) = 2 * cotangent`
+        // makes the gradient the constant `2` instead of `cos(x)`.
+        let function = custom_vjp(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, ())),
             |(), cotangent: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(cotangent.clone() + cotangent),
@@ -1721,7 +1721,7 @@ mod tests {
         // Mapping only the first input exercises the replicated broadcast in the re-wrapping batch rule: the
         // unmapped operand is broadcast into the batch (the all-inputs-mapped-at-0 convention) and the batched call
         // still computes per-item products.
-        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+        let function = custom_vjp(
             |(x, y): (
                 DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
                 DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
@@ -1747,7 +1747,7 @@ mod tests {
     #[test]
     fn test_scalar_custom_vjp_wrapper_governs_reverse_mode() {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let function = custom_vjp::<EagerContext<Scalar, ScalarOperation<Scalar>>, _, _, _, _, _, _>(
+        let function = custom_vjp(
             |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| {
@@ -1764,7 +1764,7 @@ mod tests {
     fn test_custom_derivative_wrappers_use_zero_space_boundaries() {
         type ScalarContext = EagerContext<Scalar, ScalarOperation<Scalar>>;
 
-        let function = custom_jvp::<ScalarContext, _, _, _, _>(
+        let function = custom_jvp(
             |token: DomainTracer<ScalarContext>| Ok(token),
             |token: DomainTracer<ScalarContext>, tangent| Ok((token, tangent)),
         );
@@ -1773,7 +1773,7 @@ mod tests {
             Ok((Scalar::Token, Scalar::Zero)),
         );
 
-        let function = custom_vjp::<ScalarContext, _, _, _, _, _, _>(
+        let function = custom_vjp(
             |token: DomainTracer<ScalarContext>| Ok(token),
             |token: DomainTracer<ScalarContext>| Ok((token.clone(), token)),
             |_residual: DomainTracer<ScalarContext>, cotangent| Ok(cotangent),

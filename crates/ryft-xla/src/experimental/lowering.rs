@@ -1565,7 +1565,7 @@ fn lower_reshape_shape<'b, 'c: 'b, 't: 'c>(
     Ok(shape.result(0).expect("stablehlo.concatenate should return one result").as_ref())
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for PadOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for PadOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1583,8 +1583,8 @@ fn validate_pad_interior_padding(value: usize) -> Result<(), LoweringError> {
 }
 
 /// Lowers a pad through the shared StableHLO path used by plain, generic-array, and shard-map dispatch.
-fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
-    operation: &PadOperation,
+fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+    operation: &PadOperation<T>,
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     block: &mut B,
@@ -3496,8 +3496,8 @@ fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// becomes `has_side_effect`, and its declared output types are lowered verbatim. Handlers are resolved by the XLA
 /// runtime through the target name at execution time (e.g., registered via `ryft-pjrt`'s
 /// `Client::register_ffi_handler`).
-fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &CustomCallOperation,
+fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType>(
+    operation: &CustomCallOperation<T>,
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     block: &mut BlockRef<'b, 'c, 't>,

@@ -319,10 +319,10 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     Concatenate(ConcatenateOperation),
 
     /// Mixed foreign-kernel call whose trailing dimension operands define its dynamic output axes.
-    CustomCall(CustomCallOperation),
+    CustomCall(CustomCallOperation<ArrayProgramType>),
 
     /// Mixed padding operation with one explicit result-extent operand per output axis.
-    Pad(PadOperation),
+    Pad(PadOperation<ArrayProgramType>),
 
     /// Mixed slice whose starts and output sizes are first-class dimension operands.
     DynamicShapeSlice(DynamicShapeSliceOperation),
@@ -454,16 +454,30 @@ impl<A: Value<Type = ArrayType>> From<ConcatenateOperation> for ArrayProgramOper
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<CustomCallOperation> for ArrayProgramOperation<A> {
+impl<A: Value<Type = ArrayType>> From<CustomCallOperation<ArrayType>> for ArrayProgramOperation<A> {
     #[inline]
-    fn from(operation: CustomCallOperation) -> Self {
+    fn from(operation: CustomCallOperation<ArrayType>) -> Self {
+        Self::CustomCall(operation.into())
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<CustomCallOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: CustomCallOperation<ArrayProgramType>) -> Self {
         Self::CustomCall(operation)
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<PadOperation> for ArrayProgramOperation<A> {
+impl<A: Value<Type = ArrayType>> From<PadOperation<ArrayType>> for ArrayProgramOperation<A> {
     #[inline]
-    fn from(operation: PadOperation) -> Self {
+    fn from(operation: PadOperation<ArrayType>) -> Self {
+        Self::Pad(operation.into())
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<PadOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
+    #[inline]
+    fn from(operation: PadOperation<ArrayProgramType>) -> Self {
         Self::Pad(operation)
     }
 }

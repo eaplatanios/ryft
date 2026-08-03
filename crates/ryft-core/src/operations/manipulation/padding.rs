@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::axes::Axis;
 use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
@@ -21,7 +22,7 @@ use crate::operations::math::{ReduceOperation, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError};
 use crate::sharding::Sharding;
@@ -37,8 +38,19 @@ pub const PAD_OPERATION_NAME: &str = "pad";
 
 /// [`Operation`] that expands its first operand by adding edge and interior padding filled with its second (scalar)
 /// operand. Refer to the documentation of [`Pad`] for more information.
+///
+/// The type parameter selects the operand contract without introducing a separate dynamic-padding operation:
+///
+///   - `PadOperation<ArrayType>` accepts the input and padding-value arrays. It is used in homogeneous array programs
+///     whose output extents are fully described by the inferred array type.
+///   - `PadOperation<ArrayProgramType>` additionally accepts one first-class dimension operand for each dynamic output
+///     axis. It is used in mixed array/dimension programs that must carry those logical result extents explicitly.
+///
+/// The padding amounts remain static configuration in both forms. This distinction is therefore unrelated to
+/// StableHLO's `dynamic_pad`, whose padding amounts are runtime operands. Converting between the two Ryft forms only
+/// reparameterizes the operation family and moves the existing padding vectors without copying them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PadOperation {
+pub struct PadOperation<T: Type> {
     /// Padding added before the first element of each input axis.
     edge_padding_low: Vec<i64>,
 
@@ -47,9 +59,12 @@ pub struct PadOperation {
 
     /// Padding added between any two adjacent elements of each input axis.
     interior_padding: Vec<usize>,
+
+    /// Type universe that determines the operation's operand contract.
+    marker: PhantomData<fn() -> T>,
 }
 
-impl PadOperation {
+impl PadOperation<ArrayType> {
     /// Creates a new [`PadOperation`] with the provided edge and interior padding amounts. The three vectors must
     /// share one length (one entry per input axis); whether that shared length matches the input rank is validated
     /// during type inference, once an input type is known.
@@ -68,9 +83,11 @@ impl PadOperation {
             ))
             .into());
         }
-        Ok(Self { edge_padding_low, edge_padding_high, interior_padding })
+        Ok(Self { edge_padding_low, edge_padding_high, interior_padding, marker: PhantomData })
     }
+}
 
+impl<T: Type> PadOperation<T> {
     /// Returns the padding added before the first element of each input axis.
     #[inline]
     pub fn edge_padding_low(&self) -> &[i64] {
@@ -88,15 +105,46 @@ impl PadOperation {
     pub fn interior_padding(&self) -> &[usize] {
         self.interior_padding.as_slice()
     }
-}
 
-impl Display for PadOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayProgramType>::render(self, formatter, 0)
+    /// Renders this payload independently of its homogeneous or composite operation contract.
+    fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, PAD_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("edge_padding_low", format_args!("{:?}", self.edge_padding_low))?;
+            operation.field("edge_padding_high", format_args!("{:?}", self.edge_padding_high))?;
+            operation.field("interior_padding", format_args!("{:?}", self.interior_padding))
+        })
     }
 }
 
-impl Operation<ArrayType> for PadOperation {
+impl From<PadOperation<ArrayType>> for PadOperation<ArrayProgramType> {
+    fn from(operation: PadOperation<ArrayType>) -> Self {
+        Self {
+            edge_padding_low: operation.edge_padding_low,
+            edge_padding_high: operation.edge_padding_high,
+            interior_padding: operation.interior_padding,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl From<PadOperation<ArrayProgramType>> for PadOperation<ArrayType> {
+    fn from(operation: PadOperation<ArrayProgramType>) -> Self {
+        Self {
+            edge_padding_low: operation.edge_padding_low,
+            edge_padding_high: operation.edge_padding_high,
+            interior_padding: operation.interior_padding,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Type> Display for PadOperation<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render_operation(formatter, 0)
+    }
+}
+
+impl Operation<ArrayType> for PadOperation<ArrayType> {
     #[inline]
     fn name(&self) -> &'static str {
         PAD_OPERATION_NAME
@@ -121,15 +169,11 @@ impl Operation<ArrayType> for PadOperation {
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, PAD_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("edge_padding_low", format_args!("{:?}", self.edge_padding_low))?;
-            operation.field("edge_padding_high", format_args!("{:?}", self.edge_padding_high))?;
-            operation.field("interior_padding", format_args!("{:?}", self.interior_padding))
-        })
+        self.render_operation(formatter, indentation)
     }
 }
 
-impl Operation<ArrayProgramType> for PadOperation {
+impl Operation<ArrayProgramType> for PadOperation<ArrayProgramType> {
     #[inline]
     fn name(&self) -> &'static str {
         PAD_OPERATION_NAME
@@ -286,11 +330,11 @@ impl Operation<ArrayProgramType> for PadOperation {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, indentation)
+        self.render_operation(formatter, indentation)
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadOperation {
+impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadOperation<ArrayType> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -308,7 +352,8 @@ impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadO
 }
 
 impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for PadOperation
+    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>
+    for PadOperation<ArrayProgramType>
 {
     fn interpret<D: InterpretationDriver<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>>(
         &self,
@@ -343,16 +388,16 @@ impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
 
 /// Partial evaluation defers to the default fold-or-residualize behavior of
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for PadOperation where
-    C::Operation: From<PadOperation>
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for PadOperation<ArrayType> where
+    C::Operation: From<PadOperation<ArrayType>>
 {
 }
 
 /// Forward-mode rule for [`PadOperation`]: `pad` is linear in both the operand and the padding value, so the
 /// tangent pads the operand tangent with the padding-value tangent using the same padding amounts.
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for PadOperation
+impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for PadOperation<ArrayType>
 where
-    C::Operation: From<PadOperation>,
+    C::Operation: From<PadOperation<ArrayType>>,
     C::Value: Pad,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -395,11 +440,11 @@ where
 ///     cotangents at input positions from contaminating this contribution.
 ///
 /// Symbolic-zero cotangents propagate unchanged.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for PadOperation
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for PadOperation<ArrayType>
 where
     O: Operation<ArrayType>
         + From<OneOperation<ArrayType>>
-        + From<PadOperation>
+        + From<PadOperation<ArrayType>>
         + From<SelectOperation<ArrayType>>
         + From<SliceOperation>
         + From<ReduceOperation>
@@ -535,11 +580,11 @@ where
 /// padding value is vectorized with a constant-size mask construction: pad the operand with zero, pad an all-true
 /// input mask with false, broadcast the per-item padding values over the padded result, and select those values at
 /// padding positions.
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for PadOperation
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for PadOperation<ArrayType>
 where
     C: Context<Type = ArrayType> + One<C::Value> + Zero<C::Value>,
     C::Value: LegacyBroadcast + Pad + Select + Transpose,
-    PadOperation: InterpretableOperation<C>,
+    PadOperation<ArrayType>: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -906,13 +951,13 @@ impl Pad for ArrayType {
     }
 }
 
-/// Any context-carrying value pads by binding a [`PadOperation`] through its own context. The `From<PadOperation>`
-/// bound makes this disjoint from the eager value types (whose context operation is `ConstantOperation`), so it covers
-/// the transform tracers without conflicting with the concrete implementations.
+/// Any context-carrying value pads by binding a [`PadOperation<ArrayType>`] through its own context. The conversion
+/// bound makes this disjoint from the eager value types (whose context operation is `ConstantOperation`), so it
+/// covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> Pad for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<PadOperation>,
+    <V::DispatchDomain as Domain>::Operation: From<PadOperation<ArrayType>>,
 {
     fn pad(
         &self,
@@ -1029,9 +1074,10 @@ mod tests {
         );
         assert_eq!(input_type.pad(&padding_value_type, &[1], &[2], &[1]), Ok(output_type.clone()));
         let output_extent = DimensionValue::constant(8).unwrap();
+        let composite_operation = PadOperation::<ArrayProgramType>::from(operation.clone());
         assert_eq!(
             Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
+                &composite_operation,
                 &[input_type.clone().into(), padding_value_type.clone().into(), output_extent.r#type().clone().into(),],
                 &[],
             ),
@@ -1039,7 +1085,7 @@ mod tests {
         );
         assert_eq!(
             Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
+                &composite_operation,
                 &[
                     input_type.clone().into(),
                     padding_value_type.clone().into(),
@@ -1052,7 +1098,7 @@ mod tests {
         );
         assert_eq!(
             Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
+                &composite_operation,
                 &[
                     input_type.clone().into(),
                     padding_value_type.clone().into(),
@@ -1075,7 +1121,8 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(input_variable.clone())]));
         let dynamic_output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(output_variable.clone())]));
-        let dynamic_operation = PadOperation::new(vec![1], vec![1], vec![0]).unwrap();
+        let dynamic_operation =
+            PadOperation::<ArrayProgramType>::from(PadOperation::new(vec![1], vec![1], vec![0]).unwrap());
         assert_eq!(
             Operation::<ArrayProgramType>::infer_output_types(
                 &dynamic_operation,
@@ -1113,7 +1160,7 @@ mod tests {
         );
         assert_eq!(
             Operation::<ArrayProgramType>::infer_output_types(
-                &PadOperation::new(vec![-1], vec![0], vec![0]).unwrap(),
+                &PadOperation::<ArrayProgramType>::from(PadOperation::new(vec![-1], vec![0], vec![0]).unwrap()),
                 &[
                     zero_bounded_input.into(),
                     padding_value_type.clone().into(),
@@ -1194,7 +1241,7 @@ mod tests {
         assert_eq!(output[0].to_f64s(), vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]);
         let output =
             InterpretableOperation::<EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>>::interpret(
-                &operation,
+                &composite_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[
@@ -1247,7 +1294,7 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes all three padding vectors.
-        let mut builder = ProgramBuilder::<Array, PadOperation>::new();
+        let mut builder = ProgramBuilder::<Array, PadOperation<ArrayType>>::new();
         let program_input = builder.add_input(input_type);
         let program_padding_value = builder.add_input(padding_value_type);
         let program_output =

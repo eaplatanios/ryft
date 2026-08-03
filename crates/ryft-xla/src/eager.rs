@@ -702,7 +702,7 @@ mod tests {
             let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![output_type.clone()]);
             Ok(CustomCall::custom_call(&operation, std::slice::from_ref(x))?.remove(0))
         };
-        let function = custom_vjp::<ArrayXlaDomain<'_>, _, _, _, _, _, _>(
+        let function = custom_vjp(
             {
                 let add_one = add_one.clone();
                 move |x: DomainTracer<ArrayXlaDomain<'_>>| add_one(&x)

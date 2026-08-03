@@ -167,7 +167,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Transpose(TransposeOperation),
     Reshape(LegacyReshapeOperation),
     Broadcast(LegacyBroadcastOperation),
-    Pad(PadOperation),
+    Pad(PadOperation<ArrayType>),
     Concatenate(ConcatenateOperation),
     Gather(GatherOperation),
     Scatter(ScatterOperation),
@@ -188,7 +188,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Tag(TagOperation<ArrayType>),
     Rematerialize(RematerializeOperation<ArrayType>),
     Print(PrintOperation<ArrayType>),
-    CustomCall(CustomCallOperation),
+    CustomCall(CustomCallOperation<ArrayType>),
     CustomJvp(CustomJvpOperation<ArrayType>),
     CustomVjp(CustomVjpOperation<ArrayType>),
     LinearCall(LinearCallOperation<ArrayType>),
@@ -1081,7 +1081,7 @@ impl CustomCall for Array {
     /// The reference array backend has no foreign-kernel registry, so custom calls always report an
     /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
     fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
-        operation: &CustomCallOperation,
+        operation: &CustomCallOperation<ArrayType>,
         _inputs: I,
     ) -> Result<Vec<Self>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {

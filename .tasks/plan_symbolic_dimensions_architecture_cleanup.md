@@ -1968,6 +1968,15 @@ type universe from the receiving context. Focused random, composite batching, an
 all 1,112 core tests and all 433 passing XLA tests (with one intentional benchmark ignore); the custom-call,
 concatenate, pad, and shard-map payloads remain pending.
 
+The sixth P8a prerequisite slice parameterizes `CustomCallOperation<T>` and `PadOperation<T>`. Their `ArrayType`
+instantiations own the homogeneous contracts, while their `ArrayProgramType` instantiations own the mixed contracts
+with explicit result extents. Each remains one public, type-indexed operation family rather than acquiring a nominal
+`Dynamic*` adapter. Shared configuration, rendering, validation, and lowering remain single implementations;
+conversion at a family boundary moves the existing owned metadata without allocating or copying it. Composite eager
+execution, batching, differentiation, transposition, and XLA lowering select the appropriate typed instantiation.
+Verification passed the focused core and XLA custom-call/padding tests, both test-target checks, all 1,112 core tests,
+and all 433 passing XLA tests plus its one intentional benchmark ignore. Concatenate and shard-map remain pending.
+
 ### Phase 8: enforce contracts and consolidate operation declarations
 
 - [x] Begin only after Phases 1 through 7 have removed implicit replay and overlapping mixed constructors. Capture the
@@ -1987,7 +1996,12 @@ concatenate, pad, and shard-map payloads remain pending.
         instantiations while retaining shared semantics.
   - [x] Parameterize `RngBitGeneratorOperation<T>` so its homogeneous static-shape and mixed explicit-extent contracts
         belong to distinct concrete payload instantiations while retaining shared semantics.
-  - [ ] Resolve `CustomCallOperation`, `ConcatenateOperation`, `PadOperation`, and `ShardMapOperation<V>`.
+  - [x] Parameterize `CustomCallOperation<T>` so its homogeneous and mixed explicit-result-extent contracts belong to
+        distinct typed instantiations of one public operation family without duplicating foreign-kernel semantics.
+  - [ ] Resolve `ConcatenateOperation`.
+  - [x] Parameterize `PadOperation<T>` so its homogeneous and mixed explicit-result-extent contracts belong to
+        distinct typed instantiations of one public operation family without duplicating padding semantics or rules.
+  - [ ] Resolve `ShardMapOperation<V>`.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
       `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
       `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and
@@ -2069,6 +2083,13 @@ concatenate, pad, and shard-map payloads remain pending.
       positions — but it is public-signature/rustdoc surface; tighten or accept explicitly during this cleanup.
 - [ ] Update every in-repo use site directly without compatibility re-exports.
 - [ ] Update rustdoc, examples, error links, and behavioral JAX fixtures.
+- [ ] Close the foreign-call batching gap as an isolated transform/API review after the operation contracts settle.
+      Follow JAX's current direction rather than copying the deprecated `ffi_call(vmap_method = ...)` parameter:
+      prototype a general user-defined custom batching rule that can wrap foreign calls, and retain it only if one
+      implementation composes through homogeneous and mixed programs, nested batching, JIT, AD, partial evaluation,
+      ordered effects, and first-class dynamic output extents. Add small convenience rules only where they reproduce
+      the useful `sequential`, `sequential_unrolled`, `expand_dims`, `broadcast_all`, and `legacy_vectorized`
+      behaviors without introducing a second batching path.
 - [ ] Run targeted searches for every old canonical path and classify all remaining matches.
 - [ ] Gate: core language semantics no longer appear to be backend implementation details.
 
