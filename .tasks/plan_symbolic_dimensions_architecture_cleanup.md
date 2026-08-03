@@ -317,8 +317,15 @@ semantic implementations merely to avoid the trait migration.
 **ADOPTED (2026-08-02).** The full-scale worktree experiment (`experiment/p8-assoc-type` @ `50e86f964`; evidence in
 its `EXPERIMENT_NOTES.md` and `EXPERIMENT_E0284_PROBE.rs`) passed all five gates: trait solving stable, derive output
 slightly smaller with the homogeneous-family invariant compiler-enforced, bound spellings 623 → 295 with all 199
-disambiguation turbofishes deleted, no inference-only wrapper (3 universe-dispatch traits carry real per-universe
-algorithm bodies), and ~2,100-line ~92%-mechanical churn splittable along review seams. An earlier prototype's two
+trait-disambiguation turbofishes in the experiment's scope (core + macros) deleted, no inference-only wrapper (the 3
+universe-dispatch traits used at the time carried real per-universe algorithm bodies; all three were subsequently
+removed — see the gate item in the Phase 8 checklist), and ~2,100-line ~92%-mechanical churn splittable along review
+seams. Count scopes, to avoid ledger confusion: the experiment deleted 199 turbofishes (core + macros at the
+experiment boundary); the live adoption deleted 242 (all crates at the adoption boundary); both counts are
+trait-disambiguation turbofishes, distinct from payload-constructor marker spellings such as `AddOperation::<X>::new()`,
+which remain and belong to the open projected-helper item (full census in the P8a plan's post-adoption note: 474
+lines, ~250 currently necessary, ~212 removable today — dominated by 132 redundant
+`ArrayProgramOperation::<A>::from(...)` spellings). An earlier prototype's two
 failure classes were diagnosed as (1) E0283 from per-instantiation `Operation` impls — eliminated by the blanket-impl
 discipline (one `impl<T: Universe> Operation for FooOperation<T>` per payload family) — and (2) E0284 from
 supertraits projecting `Self`'s operation type through a context built from `Self` — an independent current-solver

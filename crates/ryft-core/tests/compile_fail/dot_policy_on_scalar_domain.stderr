@@ -11,7 +11,7 @@ help: the trait `RematerializationPolicy<ArrayType, O>` is implemented for `Dots
    |
    | / impl<O> RematerializationPolicy<ArrayType, O> for DotsSaveable
    | | where
-   | |     O: Operation<ArrayType>,
+   | |     O: Operation<Type = ArrayType>,
    | |     for<'a> &'a O: TryInto<&'a DotOperation>,
    | |_____________________________________________^
 note: required by a bound in `ryft_core::tracing_v2::Rematerialize::<D, B, IT, OT, P>::with_policy`

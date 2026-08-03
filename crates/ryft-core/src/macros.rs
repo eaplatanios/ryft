@@ -815,17 +815,17 @@ macro_rules! define_elementwise_operation {
     };
 
     // This internal branch invokes caller-provided data-type inference for either operation arity.
-    (@infer_data_types [$infer_data_types:expr] @$arity:ident $input_types:expr $(, $name:ident)?) => {
+    (@infer_data_types [$infer_data_types:expr] @$arity:ident $input_types:expr $(, $name:ident)? $(,)?) => {
         ($infer_data_types)($input_types)
     };
 
     // This internal branch supplies the default type-preserving inference for unary operations.
-    (@infer_data_types [] @unary $input_types:expr) => {
+    (@infer_data_types [] @unary $input_types:expr $(,)?) => {
         Ok::<Vec<$crate::DataType>, $crate::TypeError>(vec![$input_types[0]])
     };
 
     // This internal branch supplies the default broadcasting inference for binary data types.
-    (@infer_data_types [] @binary $input_types:expr, $name:ident) => {
+    (@infer_data_types [] @binary $input_types:expr, $name:ident $(,)?) => {
         $crate::Broadcastable::broadcast(&$input_types[0], &$input_types[1])
             .map(|output| vec![output])
             .map_err(|_| $crate::TypeError::invalid(format!("'{}' input types are not broadcast-compatible", $name)))
@@ -834,7 +834,7 @@ macro_rules! define_elementwise_operation {
     // This internal branch invokes caller-provided array-type inference instead of structural lifting.
     (
         @infer_array_types [$infer_array_types:expr] [$($infer_data_types:expr)?] @$arity:ident
-        $operation:expr, $input_types:expr $(, $name:ident)?
+        $operation:expr, $input_types:expr $(, $name:ident)? $(,)?
     ) => {
         ($infer_array_types)($input_types)
     };
@@ -842,7 +842,7 @@ macro_rules! define_elementwise_operation {
     // This internal branch prepares unary element data types for the default array-structure lifting path.
     (
         @infer_array_types [] [$($infer_data_types:expr)?] @unary
-        $operation:expr, $input_types:expr
+        $operation:expr, $input_types:expr $(,)?
     ) => {{
         let input_data_types = [$input_types[0].data_type()];
         $crate::define_elementwise_operation!(
@@ -854,7 +854,7 @@ macro_rules! define_elementwise_operation {
     // This internal branch prepares both binary element data types for the default array-structure lifting path.
     (
         @infer_array_types [] [$($infer_data_types:expr)?] @binary
-        $operation:expr, $input_types:expr, $name:ident
+        $operation:expr, $input_types:expr, $name:ident $(,)?
     ) => {{
         let input_data_types = [$input_types[0].data_type(), $input_types[1].data_type()];
         $crate::define_elementwise_operation!(
@@ -2518,11 +2518,6 @@ macro_rules! impl_non_differentiable_operation {
         $crate::impl_non_differentiable_operation!(@impl [$($generic),+] ($operation) {});
     };
 
-    // This branch accepts a non-generic operation with additional well-formedness bounds.
-    ($operation:ty where $($bounds:tt)+) => {
-        $crate::impl_non_differentiable_operation!(@impl [] ($operation) { $($bounds)+ });
-    };
-
     // This branch accepts the common non-generic operation form.
     ($operation:ty $(,)?) => {
         $crate::impl_non_differentiable_operation!(@impl [] ($operation) {});
@@ -2587,11 +2582,6 @@ macro_rules! impl_non_transposable_operation {
         $crate::impl_non_transposable_operation!(@impl [$($generic),+] ($operation) {});
     };
 
-    // This branch accepts a non-generic operation with additional well-formedness bounds.
-    ($operation:ty where $($bounds:tt)+) => {
-        $crate::impl_non_transposable_operation!(@impl [] ($operation) { $($bounds)+ });
-    };
-
     // This branch accepts the common non-generic operation form.
     ($operation:ty $(,)?) => {
         $crate::impl_non_transposable_operation!(@impl [] ($operation) {});
@@ -2654,11 +2644,6 @@ macro_rules! impl_nullary_transposable_operation {
         $crate::impl_nullary_transposable_operation!(@impl [$($generic),+] ($operation) {});
     };
 
-    // This branch accepts a non-generic nullary operation with additional well-formedness bounds.
-    ($operation:ty where $($bounds:tt)+) => {
-        $crate::impl_nullary_transposable_operation!(@impl [] ($operation) { $($bounds)+ });
-    };
-
     // This branch accepts the common non-generic nullary operation form.
     ($operation:ty $(,)?) => {
         $crate::impl_nullary_transposable_operation!(@impl [] ($operation) {});
@@ -2717,11 +2702,6 @@ macro_rules! impl_nullary_batchable_operation {
     // This branch accepts a generic replicated operation whose interpretation supplies all required bounds.
     (@replicated <$($generic:ident),+> $operation:ty $(,)?) => {
         $crate::impl_nullary_batchable_operation!(@impl_replicated [$($generic),+] ($operation) {});
-    };
-
-    // This branch accepts a non-generic replicated operation with additional well-formedness bounds.
-    (@replicated $operation:ty where $($bounds:tt)+) => {
-        $crate::impl_nullary_batchable_operation!(@impl_replicated [] ($operation) { $($bounds)+ });
     };
 
     // This branch accepts the common non-generic replicated operation form.
@@ -4454,7 +4434,9 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::batching::{ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, BatchingTracer};
+    use crate::batching::{
+        ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, BatchingError, BatchingTracer,
+    };
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
@@ -4861,7 +4843,7 @@ mod tests {
     }
 
     impl InterpretableOperation<EagerContext<Array, TestNullaryOperation<ArrayType>>> for TestNullaryOperation<ArrayType> {
-        fn interpret<D: crate::InterpretationDriver<EagerContext<Array, TestNullaryOperation<ArrayType>>>>(
+        fn interpret<D: InterpretationDriver<EagerContext<Array, TestNullaryOperation<ArrayType>>>>(
             &self,
             _context: &EagerContext<Array, TestNullaryOperation<ArrayType>>,
             _driver: &D,
@@ -4874,49 +4856,6 @@ mod tests {
 
     impl_nullary_transposable_operation!(<T> TestNullaryOperation<T> where T: Type);
     impl_nullary_batchable_operation!(@replicated <T> TestNullaryOperation<T> where T: Type);
-
-    /// Nullary operation used to instantiate the non-generic `where` macro forms.
-    #[derive(Clone, Debug, Default)]
-    struct TestWhereNullaryOperation<T: Type>(PhantomData<fn() -> T>);
-
-    impl<T: Type> Display for TestWhereNullaryOperation<T> {
-        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("test_where_nullary")
-        }
-    }
-
-    impl<T: Type> Operation for TestWhereNullaryOperation<T> {
-        type Type = T;
-
-        fn name(&self) -> &'static str {
-            "test_where_nullary"
-        }
-
-        fn infer_output_types(
-            &self,
-            input_types: &[T],
-            _region_interfaces: &[crate::RegionInterface<T>],
-        ) -> Result<Vec<T>, TypeError> {
-            check_count!("input", input_types, 0, TypeError);
-            Ok(Vec::new())
-        }
-    }
-
-    impl<C: Domain> InterpretableOperation<C> for TestWhereNullaryOperation<C::Type> {
-        fn interpret<D: crate::InterpretationDriver<C>>(
-            &self,
-            _context: &C,
-            _driver: &D,
-            inputs: &[C::Value],
-        ) -> Result<Vec<C::Value>, ProgramError> {
-            check_count!("input", inputs, 0, ProgramError);
-            Ok(Vec::new())
-        }
-    }
-
-    impl_non_differentiable_operation!(TestWhereNullaryOperation<ArrayType> where DataType: Type);
-    impl_nullary_transposable_operation!(TestWhereNullaryOperation<DataType> where DataType: Type);
-    impl_nullary_batchable_operation!(@replicated TestWhereNullaryOperation<ArrayType> where DataType: Type);
 
     /// Generic nullary operation used to instantiate generic macro forms.
     struct TestGenericNullaryOperation<T>(PhantomData<fn() -> T>);
@@ -6238,7 +6177,6 @@ mod tests {
         {
         }
 
-        assert_differentiable::<TestWhereNullaryOperation<ArrayType>>();
         assert_differentiable::<TestBoundedNullaryOperation<ArrayType>>();
     }
 
@@ -6296,7 +6234,6 @@ mod tests {
 
         fn assert_transposable<O: Operation<Type = DataType> + TransposableOperation<Scalar, O>>() {}
 
-        assert_transposable::<TestWhereNullaryOperation<DataType>>();
         assert_transposable::<TestGenericNullaryOperation<DataType>>();
         assert_transposable::<TestBoundedNullaryOperation<DataType>>();
     }
@@ -6322,7 +6259,7 @@ mod tests {
             >>::batch(
                 &operation, &context, &EmptyRegionDriver, &[ArrayBatch::replicated(Array::scalar(1.0))],
             ),
-            Err(crate::BatchingError::Program(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
+            Err(BatchingError::Program(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
         ));
 
         fn assert_batchable<O>()
@@ -6333,7 +6270,6 @@ mod tests {
         {
         }
 
-        assert_batchable::<TestWhereNullaryOperation<ArrayType>>();
         assert_batchable::<TestGenericNullaryOperation<ArrayType>>();
         assert_batchable::<TestBoundedNullaryOperation<ArrayType>>();
     }
