@@ -1952,6 +1952,14 @@ mixed/homogeneous dual payloads and compile-fail gate remain separate review uni
 strict core doctests (52 passed, 16 intentionally ignored), both test-target checks, and both macro unit/integration
 and trybuild suites.
 
+The fourth P8a prerequisite slice resolves the most diagnostic genuinely mixed payload.
+`CompareOperation<DataType>` and `CompareOperation<ArrayType>` now share the homogeneous comparison contract, while
+`CompareOperation<ArrayProgramType>` alone owns the mixed dimension-to-Boolean-array contract. The payload's type
+parameter is inferred at ordinary bind and operation-family conversion sites; there is no alias, default type
+argument, projection adapter, or duplicated inference algorithm. Focused core and XLA compare tests and both complete
+test-target checks pass. The remaining random-bit-generator, custom-call, concatenate, pad, and shard-map payloads are
+still pending as separate review units.
+
 ### Phase 8: enforce contracts and consolidate operation declarations
 
 - [x] Begin only after Phases 1 through 7 have removed implicit replay and overlapping mixed constructors. Capture the
@@ -1967,6 +1975,10 @@ and trybuild suites.
       XLA JIT call). Each concrete payload instantiation now has exactly one contract.
 - [ ] Resolve the genuinely mixed/homogeneous dual-contract payloads before adding `Operation::Type`. Each concrete
       payload instantiation must have exactly one contract without duplicating semantics.
+  - [x] Parameterize `CompareOperation<T>` so its homogeneous and mixed contracts belong to distinct concrete payload
+        instantiations while retaining shared semantics.
+  - [ ] Resolve `RngBitGeneratorOperation`, `CustomCallOperation`, `ConcatenateOperation`, `PadOperation`, and
+        `ShardMapOperation<V>`.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
       `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
       `DimensionSizeOperation`, one mixed stored-type constructor contract, `ReshapeOperation`, and

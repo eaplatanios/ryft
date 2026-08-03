@@ -1,16 +1,17 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_elementwise_operation};
+use crate::macros::check_count;
 use crate::operations::ElementwiseOperation;
 use crate::operations::manipulation::conversion::ElementType;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::TypeError;
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::{ProjectedValue, Value};
 use crate::types::{ArrayProgramType, ArrayType, DataType, DimensionType};
 
@@ -44,19 +45,33 @@ impl Display for ComparisonDirection {
     }
 }
 
-/// [`Operation`] that performs pairwise comparisons. Refer to [`Compare`] for its elementwise and first-class
-/// dimension semantics.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CompareOperation {
+/// [`Operation`] that performs pairwise comparisons in the `T` type universe. [`DataType`] and [`ArrayType`]
+/// instantiations provide homogeneous elementwise comparison, while [`ArrayProgramType`] provides the mixed
+/// first-class-dimension comparison whose Boolean predicate is ordinary array data. Refer to [`Compare`] for the
+/// corresponding value-level semantics.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct CompareOperation<T: Type> {
     /// [`ComparisonDirection`] used by this [`CompareOperation`].
     direction: ComparisonDirection,
+
+    /// Type universe whose comparison contract this payload represents.
+    type_marker: PhantomData<T>,
 }
 
-impl CompareOperation {
+impl<T: Type> Copy for CompareOperation<T> {}
+
+impl<T: Type> Clone for CompareOperation<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: Type> CompareOperation<T> {
     /// Creates a new [`CompareOperation`] with the provided [`ComparisonDirection`].
     #[inline]
     pub fn new(direction: ComparisonDirection) -> Self {
-        Self { direction }
+        Self { direction, type_marker: PhantomData }
     }
 
     /// Returns the [`ComparisonDirection`] used by this [`CompareOperation`].
@@ -66,13 +81,14 @@ impl CompareOperation {
     }
 }
 
-impl Display for CompareOperation {
+impl<T: Type> Display for CompareOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, 0)
+        OperationFormatter::new(formatter, 0, COMPARE_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("direction", self.direction))
     }
 }
 
-impl<T: Broadcastable + ElementType> Operation<T> for CompareOperation {
+impl<T: Broadcastable + ElementType> Operation<T> for CompareOperation<T> {
     #[inline]
     fn name(&self) -> &'static str {
         COMPARE_OPERATION_NAME
@@ -106,7 +122,7 @@ impl<T: Broadcastable + ElementType> Operation<T> for CompareOperation {
     }
 }
 
-impl Operation<ArrayProgramType> for CompareOperation {
+impl Operation<ArrayProgramType> for CompareOperation<ArrayProgramType> {
     #[inline]
     fn name(&self) -> &'static str {
         COMPARE_OPERATION_NAME
@@ -131,7 +147,7 @@ impl Operation<ArrayProgramType> for CompareOperation {
     }
 }
 
-impl ElementwiseOperation for CompareOperation {
+impl ElementwiseOperation for CompareOperation<ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         2
@@ -143,9 +159,9 @@ impl ElementwiseOperation for CompareOperation {
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for CompareOperation
+impl<C: Domain> InterpretableOperation<C> for CompareOperation<C::Type>
 where
-    CompareOperation: Operation<C::Type>,
+    CompareOperation<C::Type>: Operation<C::Type>,
     C::Value: Compare<C::Value>,
 {
     fn interpret<D: InterpretationDriver<C>>(
@@ -159,12 +175,15 @@ where
     }
 }
 
-impl<C: Context<Operation: From<CompareOperation>>> PartiallyEvaluatableOperation<C> for CompareOperation where
-    CompareOperation: Operation<C::Type>
+impl<C: Context<Operation: From<CompareOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
+    for CompareOperation<C::Type>
+where
+    CompareOperation<C::Type>: Operation<C::Type>,
 {
 }
 
-impl_differentiable_elementwise_operation!(@non_differentiable CompareOperation);
+crate::impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Broadcastable + ElementType);
+crate::impl_non_transposable_operation!(<T> CompareOperation<T> where T: Broadcastable + ElementType);
 
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing
@@ -234,7 +253,7 @@ pub trait Compare<Output = Self>: Sized {
     }
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compare<V> for V {
+impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation<V::Type>>>>> Compare<V> for V {
     #[inline]
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
         Ok(self
@@ -247,7 +266,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compa
 impl<V: Value<Type = ArrayProgramType>> Compare<V> for ProjectedValue<DimensionType, V>
 where
     V::DispatchDomain: Context<Type = ArrayProgramType>,
-    <V::DispatchDomain as Domain>::Operation: From<CompareOperation>,
+    <V::DispatchDomain as Domain>::Operation: From<CompareOperation<V::Type>>,
 {
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<V, ProgramError> {
         Ok(self
@@ -270,7 +289,7 @@ mod tests {
     use crate::differentiation::DifferentiationError;
     use crate::differentiation::forward::{DifferentiationTracer, jvp};
     use crate::differentiation::reverse::TransposableOperation;
-    use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
     use crate::parameters::Placeholder;
@@ -281,7 +300,10 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::programs::values::ValueProjection;
     use crate::tracing::{Tracer, TracingContext};
-    use crate::types::{ArrayProgramType, ArrayType, DataType, DimensionBounds, DimensionType, DimensionVariable};
+    use crate::types::{
+        ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Layout,
+        Memory, Shape, StridedLayout,
+    };
 
     use super::*;
 
@@ -322,37 +344,49 @@ mod tests {
 
     #[test]
     fn test_compare_type_inference() {
-        check_operation_type_inference!(
-            @elementwise @binary,
-            operation = CompareOperation::new(ComparisonDirection::LessThan),
-            cases = [
-                {
-                    input_data_types = [DataType::F32, DataType::F64],
-                    output_data_types = [DataType::Boolean],
-                },
-                {
-                    input_data_types = [DataType::F8E3M4, DataType::F32],
-                    error = "comparison input types are not broadcast-compatible",
-                },
-                {
-                    input_data_types = [DataType::C64, DataType::C64],
-                    error = "cannot apply an ordered comparison to unordered complex operands of types c64 and c64",
-                },
-            ],
+        let ordered_scalar = CompareOperation::<DataType>::new(ComparisonDirection::LessThan);
+        assert_eq!(
+            ordered_scalar.infer_output_types(&[DataType::F32, DataType::F64], &[]),
+            Ok(vec![DataType::Boolean]),
         );
-        check_operation_type_inference!(
-            @elementwise @binary,
-            operation = CompareOperation::new(ComparisonDirection::Equal),
-            cases = [{
-                input_data_types = [DataType::C64, DataType::C64],
-                output_data_types = [DataType::Boolean],
-            }],
+        assert_eq!(
+            ordered_scalar.infer_output_types(&[DataType::F8E3M4, DataType::F32], &[]),
+            Err(TypeError::invalid("comparison input types are not broadcast-compatible")),
+        );
+        assert_eq!(
+            ordered_scalar.infer_output_types(&[DataType::C64, DataType::C64], &[]),
+            Err(TypeError::invalid(
+                "cannot apply an ordered comparison to unordered complex operands of types c64 and c64",
+            )),
+        );
+
+        // The array contract applies the same element-type rule while preserving the broadcasted structural metadata.
+        let left = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
+            .with_memory(Memory::Host { pinned: true });
+        let right = left.clone().with_data_type(DataType::F64);
+        let ordered_array = CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan);
+        assert_eq!(
+            Operation::infer_output_types(&ordered_array, &[left.clone(), right], &[]),
+            Ok(vec![left.clone().with_data_type(DataType::Boolean)]),
+        );
+
+        let equality_scalar = CompareOperation::<DataType>::new(ComparisonDirection::Equal);
+        assert_eq!(
+            equality_scalar.infer_output_types(&[DataType::C64, DataType::C64], &[]),
+            Ok(vec![DataType::Boolean]),
+        );
+        let equality_array = CompareOperation::<ArrayType>::new(ComparisonDirection::Equal);
+        let complex = left.with_data_type(DataType::C64);
+        assert_eq!(
+            Operation::infer_output_types(&equality_array, &[complex.clone(), complex.clone()], &[]),
+            Ok(vec![complex.with_data_type(DataType::Boolean)]),
         );
 
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
         let left = DimensionType::new(DimensionVariable::new("left", bounds));
         let right = DimensionType::new(DimensionVariable::new("right", bounds));
-        let operation = CompareOperation::new(ComparisonDirection::LessThan);
+        let operation = CompareOperation::<ArrayProgramType>::new(ComparisonDirection::LessThan);
         assert_eq!(
             Operation::<ArrayProgramType>::infer_output_types(
                 &operation,

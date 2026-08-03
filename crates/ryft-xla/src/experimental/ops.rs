@@ -107,7 +107,7 @@ where
     Dimension(DimensionOperation<DimensionValue>),
 
     /// Mixed comparison of two dimensions producing Boolean array data.
-    Compare(CompareOperation),
+    Compare(CompareOperation<ArrayProgramType>),
 
     /// Reads an array extent as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
@@ -377,7 +377,7 @@ impl_composite_operation_conversion!(
     ZeroOperation<ArrayType>,
     OneOperation<ArrayType>,
     IotaOperation<ArrayType>,
-    CompareOperation,
+    CompareOperation<ArrayProgramType>,
     DimensionSizeOperation,
     DimensionFromScalarOperation,
     DimensionToScalarOperation,

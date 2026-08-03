@@ -95,7 +95,7 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Conjugate(ConjugateOperation),
     Real(RealOperation),
     Imaginary(ImaginaryOperation),
-    Compare(CompareOperation),
+    Compare(CompareOperation<DataType>),
     Select(SelectOperation<DataType>),
     While(WhileOperation<DataType>),
     ConvertElementType(ConvertElementTypeOperation<DataType>),

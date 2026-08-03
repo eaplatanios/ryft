@@ -175,7 +175,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     UpdateSlice(UpdateSliceOperation),
     DynamicSlice(DynamicSliceOperation),
     DynamicUpdateSlice(DynamicUpdateSliceOperation),
-    Compare(CompareOperation),
+    Compare(CompareOperation<ArrayType>),
     Select(SelectOperation<ArrayType>),
     Condition(ConditionOperation<V>),
     While(WhileOperation<ArrayType>),

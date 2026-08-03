@@ -450,7 +450,7 @@ impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReduceOperatio
 where
     C::Operation: From<ReduceOperation>
         + From<LegacyBroadcastOperation>
-        + From<CompareOperation>
+        + From<CompareOperation<ArrayType>>
         + From<DivOperation>
         + From<MulOperation>,
     C::Value: Reduce

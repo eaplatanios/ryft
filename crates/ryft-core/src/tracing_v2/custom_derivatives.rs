@@ -603,16 +603,16 @@ where
         // already staged carrier) rejects it as unsupported. Restate that rejection in `custom_vjp` vocabulary instead
         // of leaking the carrier's internals, matching the clear error JAX raises when forward-mode autodiff is
         // applied to a `custom_vjp` function.
-        let output_tangents = context
-            .bind(carrier, vec![backward_region.to_program()], &carrier_operands)
-            .map_err(|error| match error {
+        let output_tangents = context.bind(carrier, vec![backward_region.to_program()], &carrier_operands).map_err(
+            |error| match error {
                 ProgramError::UnsupportedOperation { .. } => ProgramError::UnsupportedOperation {
                     message: "cannot apply forward-mode differentiation to a custom_vjp call; it supports only \
                               reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or 'jacobian_reverse')"
                         .to_string(),
                 },
                 error => error,
-            })?;
+            },
+        )?;
         check_count!("output", output_tangents, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -1049,14 +1049,11 @@ mod tests {
 
         // Verify the operation's identity, rendering, and region contract: the primal program is a computation region
         // and the user JVP program is a rule region, in that order.
-        assert_eq!(Operation::<ArrayType>::name(&operation), CUSTOM_JVP_OPERATION_NAME);
+        assert_eq!(operation.name(), CUSTOM_JVP_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "custom_jvp");
-        assert_eq!(
-            Operation::<ArrayType>::region_slots(&operation),
-            &[RegionSlot::computation("primal"), RegionSlot::rule("jvp")],
-        );
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 0), Some(RegionRole::Computation));
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 1), Some(RegionRole::Rule));
+        assert_eq!(operation.region_slots(), &[RegionSlot::computation("primal"), RegionSlot::rule("jvp")]);
+        assert_eq!(operation.region_role(0), Some(RegionRole::Computation));
+        assert_eq!(operation.region_role(1), Some(RegionRole::Rule));
 
         // The primal region receives the call inputs and the JVP region receives `(inputs..., input tangents...)`.
         let primal_interface = sin_program(&scalar).interface();
@@ -1071,8 +1068,7 @@ mod tests {
 
         // A rule that satisfies the interface contract makes the call produce the primal outputs.
         assert_eq!(
-            operation
-                .infer_output_types(std::slice::from_ref(&scalar), &[primal_interface, jvp_interface]),
+            operation.infer_output_types(std::slice::from_ref(&scalar), &[primal_interface, jvp_interface]),
             Ok(vec![scalar.clone()]),
         );
 
@@ -1328,15 +1324,15 @@ mod tests {
 
         // Verify the operation's identity, rendering, and region contract: the primal program is a computation region
         // followed by the user forward and backward rule regions.
-        assert_eq!(Operation::<ArrayType>::name(&operation), CUSTOM_VJP_OPERATION_NAME);
+        assert_eq!(operation.name(), CUSTOM_VJP_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "custom_vjp");
         assert_eq!(
-            Operation::<ArrayType>::region_slots(&operation),
+            operation.region_slots(),
             &[RegionSlot::computation("primal"), RegionSlot::rule("forward"), RegionSlot::rule("backward")],
         );
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 0), Some(RegionRole::Computation));
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 1), Some(RegionRole::Rule));
-        assert_eq!(Operation::<ArrayType>::region_role(&operation, 2), Some(RegionRole::Rule));
+        assert_eq!(operation.region_role(0), Some(RegionRole::Computation));
+        assert_eq!(operation.region_role(1), Some(RegionRole::Rule));
+        assert_eq!(operation.region_role(2), Some(RegionRole::Rule));
 
         // The primal and forward regions receive the call inputs, and the backward region receives the forward
         // region's trailing residuals followed by one cotangent per primal output.
@@ -1370,16 +1366,10 @@ mod tests {
         let cotangent_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()));
         let differential_primal_interface =
             RegionInterface::new(vec![primal_type.clone()], vec![primal_type.clone()], Effects::PURE);
-        let differential_forward_interface = RegionInterface::new(
-            vec![primal_type.clone()],
-            vec![primal_type.clone(), scalar.clone()],
-            Effects::PURE,
-        );
-        let differential_backward_interface = RegionInterface::new(
-            vec![scalar.clone(), cotangent_type.clone()],
-            vec![cotangent_type],
-            Effects::PURE,
-        );
+        let differential_forward_interface =
+            RegionInterface::new(vec![primal_type.clone()], vec![primal_type.clone(), scalar.clone()], Effects::PURE);
+        let differential_backward_interface =
+            RegionInterface::new(vec![scalar.clone(), cotangent_type.clone()], vec![cotangent_type], Effects::PURE);
         assert_eq!(
             operation.infer_output_types(
                 std::slice::from_ref(&primal_type),
@@ -1534,11 +1524,7 @@ mod tests {
              (first, second)| {
                 let from_first = cosine * first;
                 let from_second = sine * second;
-                Ok(from_first.clone()
-                    + from_first
-                    + from_second.clone()
-                    + from_second.clone()
-                    + from_second)
+                Ok(from_first.clone() + from_first + from_second.clone() + from_second.clone() + from_second)
             },
         );
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
@@ -1721,9 +1707,7 @@ mod tests {
         let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, ())),
-            |(), cotangent: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                Ok(cotangent.clone() + cotangent)
-            },
+            |(), cotangent: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(cotangent.clone() + cotangent),
         );
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(|x| function.call(x).unwrap(), Array::scalar(2.0))

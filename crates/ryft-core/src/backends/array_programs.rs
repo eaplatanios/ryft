@@ -298,7 +298,7 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// [`ArrayOperation::Compare`]. This variant does not permit array-dimension or dimension-array comparisons; it
     /// reuses [`CompareOperation`] for the dimension-dimension signature whose result crosses from the dimension
     /// member kind to the array member kind.
-    Compare(CompareOperation),
+    Compare(CompareOperation<ArrayProgramType>),
 
     /// Mixed operation that reads an array axis as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
@@ -405,9 +405,9 @@ impl<A: Value<Type = ArrayType>> From<ScanOperation<ArrayProgramValue<A>>> for A
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<CompareOperation> for ArrayProgramOperation<A> {
+impl<A: Value<Type = ArrayType>> From<CompareOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
     #[inline]
-    fn from(operation: CompareOperation) -> Self {
+    fn from(operation: CompareOperation<ArrayProgramType>) -> Self {
         Self::Compare(operation)
     }
 }
