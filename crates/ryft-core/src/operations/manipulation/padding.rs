@@ -144,7 +144,9 @@ impl<T: Type> Display for PadOperation<T> {
     }
 }
 
-impl Operation<ArrayType> for PadOperation<ArrayType> {
+impl Operation for PadOperation<ArrayType> {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         PAD_OPERATION_NAME
@@ -173,7 +175,9 @@ impl Operation<ArrayType> for PadOperation<ArrayType> {
     }
 }
 
-impl Operation<ArrayProgramType> for PadOperation<ArrayProgramType> {
+impl Operation for PadOperation<ArrayProgramType> {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         PAD_OPERATION_NAME
@@ -442,7 +446,7 @@ where
 /// Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for PadOperation<ArrayType>
 where
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<OneOperation<ArrayType>>
         + From<PadOperation<ArrayType>>
         + From<SelectOperation<ArrayType>>
@@ -1012,7 +1016,7 @@ mod tests {
         let operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap();
 
         // Operation identity and accessors.
-        assert_eq!(Operation::<ArrayType>::name(&operation), PAD_OPERATION_NAME);
+        assert_eq!(operation.name(), PAD_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "pad [edge_padding_low=[1], edge_padding_high=[2], interior_padding=[1]]");
         assert_eq!(operation.edge_padding_low(), &[1]);
         assert_eq!(operation.edge_padding_high(), &[2]);
@@ -1076,16 +1080,14 @@ mod tests {
         let output_extent = DimensionValue::constant(8).unwrap();
         let composite_operation = PadOperation::<ArrayProgramType>::from(operation.clone());
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &composite_operation,
+            composite_operation.infer_output_types(
                 &[input_type.clone().into(), padding_value_type.clone().into(), output_extent.r#type().clone().into(),],
                 &[],
             ),
             Ok(vec![output_type.clone().into()]),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &composite_operation,
+            composite_operation.infer_output_types(
                 &[
                     input_type.clone().into(),
                     padding_value_type.clone().into(),
@@ -1097,8 +1099,7 @@ mod tests {
             Err(TypeError::invalid("'pad' output extent on axis 0 must be 8 but is 7")),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &composite_operation,
+            composite_operation.infer_output_types(
                 &[
                     input_type.clone().into(),
                     padding_value_type.clone().into(),
@@ -1124,8 +1125,7 @@ mod tests {
         let dynamic_operation =
             PadOperation::<ArrayProgramType>::from(PadOperation::new(vec![1], vec![1], vec![0]).unwrap());
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &dynamic_operation,
+            dynamic_operation.infer_output_types(
                 &[
                     dynamic_input_type.clone().into(),
                     padding_value_type.clone().into(),
@@ -1137,8 +1137,7 @@ mod tests {
         );
         let narrow_output = DimensionVariable::new("narrow", DimensionBounds::new(3, Some(6)).unwrap());
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &dynamic_operation,
+            dynamic_operation.infer_output_types(
                 &[
                     dynamic_input_type.into(),
                     padding_value_type.clone().into(),
@@ -1159,16 +1158,19 @@ mod tests {
             ))]),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &PadOperation::<ArrayProgramType>::from(PadOperation::new(vec![-1], vec![0], vec![0]).unwrap()),
-                &[
-                    zero_bounded_input.into(),
-                    padding_value_type.clone().into(),
-                    DimensionType::new(DimensionVariable::new("cropped", DimensionBounds::new(0, Some(4)).unwrap(),))
+            PadOperation::<ArrayProgramType>::from(PadOperation::new(vec![-1], vec![0], vec![0]).unwrap())
+                .infer_output_types(
+                    &[
+                        zero_bounded_input.into(),
+                        padding_value_type.clone().into(),
+                        DimensionType::new(DimensionVariable::new(
+                            "cropped",
+                            DimensionBounds::new(0, Some(4)).unwrap(),
+                        ))
                         .into(),
-                ],
-                &[],
-            ),
+                    ],
+                    &[],
+                ),
             Err(TypeError::invalid(
                 "'pad' output size is negative (-1) on dynamic axis 0 at its minimum input extent 0",
             )),

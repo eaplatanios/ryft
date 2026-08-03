@@ -58,7 +58,9 @@ impl<T: ElementType> Display for ConvertElementTypeOperation<T> {
     }
 }
 
-impl<T: ElementType> Operation<T> for ConvertElementTypeOperation<T> {
+impl<T: ElementType> Operation for ConvertElementTypeOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         CONVERT_ELEMENT_TYPE_OPERATION_NAME
@@ -263,7 +265,7 @@ mod tests {
         // Check operation metadata and exact inference, including structural array metadata and token rejection.
         let scalar_operation = ConvertElementTypeOperation::<DataType>::new(DataType::F32);
         let array_operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32);
-        assert_eq!(Operation::<DataType>::name(&scalar_operation), CONVERT_ELEMENT_TYPE_OPERATION_NAME);
+        assert_eq!(scalar_operation.name(), CONVERT_ELEMENT_TYPE_OPERATION_NAME);
         assert_eq!(scalar_operation.data_type(), DataType::F32);
         assert_eq!(scalar_operation.to_string(), "convert_element_type [data_type=f32]");
 

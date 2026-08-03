@@ -88,11 +88,13 @@ pub struct DimensionToScalarOperation;
 impl Display for DimensionToScalarOperation {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        <Self as Operation<ArrayProgramType>>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
-impl Operation<ArrayProgramType> for DimensionToScalarOperation {
+impl Operation for DimensionToScalarOperation {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         DIMENSION_TO_SCALAR_OPERATION_NAME

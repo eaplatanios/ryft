@@ -62,11 +62,13 @@ impl<T: Type> PrintOperation<T> {
 
 impl<T: Type> Display for PrintOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<T>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
-impl<T: Type> Operation<T> for PrintOperation<T> {
+impl<T: Type> Operation for PrintOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         PRINT_OPERATION_NAME
@@ -180,11 +182,8 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
 
         assert_eq!(operation.label(), "x");
-        assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::single(Effect::OrderedIo));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[scalar_type.clone()], &[]),
-            Ok(vec![scalar_type])
-        );
+        assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
+        assert_eq!(Operation::infer_output_types(&operation, &[scalar_type.clone()], &[]), Ok(vec![scalar_type]));
         assert_eq!(operation.to_string(), "print [label=x]");
     }
 

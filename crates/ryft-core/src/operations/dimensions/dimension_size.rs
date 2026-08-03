@@ -192,11 +192,13 @@ impl DimensionSizeOperation {
 impl Display for DimensionSizeOperation {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        <Self as Operation<ArrayProgramType>>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
-impl Operation<ArrayProgramType> for DimensionSizeOperation {
+impl Operation for DimensionSizeOperation {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         DIMENSION_SIZE_OPERATION_NAME

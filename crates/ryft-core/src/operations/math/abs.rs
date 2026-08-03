@@ -269,7 +269,7 @@ mod tests {
 
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = AbsOperation::new(),
+            operation = AbsOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F32)],
         );
     }
@@ -400,7 +400,7 @@ mod tests {
     fn test_abs_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = AbsOperation::new(),
+            operation = AbsOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

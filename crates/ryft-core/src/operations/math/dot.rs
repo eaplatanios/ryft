@@ -563,7 +563,9 @@ impl Display for DotOperation {
     }
 }
 
-impl Operation<ArrayType> for DotOperation {
+impl Operation for DotOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         DOT_OPERATION_NAME
@@ -760,7 +762,7 @@ where
 /// `f8 × f8 → f32` dot) so the produced cotangent matches the operand's cotangent representation exactly.
 impl<
     V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<ConvertElementTypeOperation<ArrayType>> + From<DotOperation>,
+    O: Operation<Type = ArrayType> + From<ConvertElementTypeOperation<ArrayType>> + From<DotOperation>,
 > TransposableOperation<V, O> for DotOperation
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -1024,11 +1026,13 @@ impl ScaledDotOperation {
 
 impl Display for ScaledDotOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
-impl Operation<ArrayType> for ScaledDotOperation {
+impl Operation for ScaledDotOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         SCALED_DOT_OPERATION_NAME
@@ -1244,7 +1248,7 @@ where
 /// operands are rejected exactly like the bilinear [`DotOperation`] case.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ScaledDotOperation
 where
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<LegacyBroadcastOperation>
         + From<ConvertElementTypeOperation<ArrayType>>
         + From<DotOperation>

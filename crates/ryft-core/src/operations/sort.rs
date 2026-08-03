@@ -110,7 +110,7 @@ impl SortOperation {
 
 impl Display for SortOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 

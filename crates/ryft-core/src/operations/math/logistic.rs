@@ -112,7 +112,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = LogisticOperation::new(),
+            operation = LogisticOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -176,7 +176,7 @@ mod tests {
     fn test_logistic_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = LogisticOperation::new(),
+            operation = LogisticOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

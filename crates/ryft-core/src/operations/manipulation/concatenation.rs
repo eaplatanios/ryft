@@ -100,7 +100,9 @@ impl<T: Type> Display for ConcatenateOperation<T> {
     }
 }
 
-impl Operation<ArrayProgramType> for ConcatenateOperation<ArrayProgramType> {
+impl Operation for ConcatenateOperation<ArrayProgramType> {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         CONCATENATE_OPERATION_NAME
@@ -174,7 +176,9 @@ impl Operation<ArrayProgramType> for ConcatenateOperation<ArrayProgramType> {
     }
 }
 
-impl Operation<ArrayType> for ConcatenateOperation<ArrayType> {
+impl Operation for ConcatenateOperation<ArrayType> {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         CONCATENATE_OPERATION_NAME
@@ -239,7 +243,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: Operation<ArrayType> + From<SliceOperation>,
+        O: Operation<Type = ArrayType> + From<SliceOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
     {
         |operation, context, _driver, inputs, outputs| {
@@ -645,13 +649,11 @@ mod tests {
         let operation = ConcatenateOperation::new(-2, 2).unwrap();
         let mixed_operation = ConcatenateOperation::<ArrayProgramType>::from(operation.clone());
         assert_eq!(operation.axis(), 0);
-        assert_eq!(Operation::<ArrayProgramType>::name(&mixed_operation), CONCATENATE_OPERATION_NAME);
+        assert_eq!(mixed_operation.name(), CONCATENATE_OPERATION_NAME);
         assert_eq!(operation.to_string(), "concatenate [axis=0]");
-        assert_eq!(Operation::<ArrayProgramType>::effects(&mixed_operation), Effects::single(Effect::OrderedAssertion),);
-        assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::PURE);
-        let infer = |input_types: &[ArrayProgramType]| {
-            Operation::<ArrayProgramType>::infer_output_types(&mixed_operation, input_types, &[])
-        };
+        assert_eq!(mixed_operation.effects(), Effects::single(Effect::OrderedAssertion),);
+        assert_eq!(operation.effects(), Effects::PURE);
+        let infer = |input_types: &[ArrayProgramType]| mixed_operation.infer_output_types(input_types, &[]);
 
         let first_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         let second_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
@@ -752,14 +754,14 @@ mod tests {
             ))),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &ConcatenateOperation::<ArrayProgramType>::from(ConcatenateOperation::new(1, 2).unwrap()),
-                &[
-                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
-                    DimensionValue::constant(1).unwrap().r#type().clone().into(),
-                ],
-                &[],
-            ),
+            ConcatenateOperation::<ArrayProgramType>::from(ConcatenateOperation::new(1, 2).unwrap())
+                .infer_output_types(
+                    &[
+                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
+                        DimensionValue::constant(1).unwrap().r#type().clone().into(),
+                    ],
+                    &[],
+                ),
             Err(TypeError::invalid(format!(
                 "'{}' axis 1 is out of bounds for operands of rank 1",
                 CONCATENATE_OPERATION_NAME,
@@ -784,7 +786,7 @@ mod tests {
         let operation = ConcatenateOperation::new(0, 2).unwrap();
 
         // Operation identity and accessors.
-        assert_eq!(Operation::<ArrayType>::name(&operation), CONCATENATE_OPERATION_NAME);
+        assert_eq!(operation.name(), CONCATENATE_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "concatenate [axis=0]");
         assert_eq!(operation.axis(), 0);
 

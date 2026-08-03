@@ -198,12 +198,12 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = Atan2Operation::new(),
+            operation = Atan2Operation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
         check_operation_type_inference!(
             @reject @mismatched_reduced,
-            operation = Atan2Operation::new(),
+            operation = Atan2Operation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -309,7 +309,7 @@ mod tests {
     fn test_atan2_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = Atan2Operation::new(),
+            operation = Atan2Operation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }

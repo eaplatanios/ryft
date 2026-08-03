@@ -88,11 +88,13 @@ impl ReshapeOperation {
 impl Display for ReshapeOperation {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        <Self as Operation<ArrayProgramType>>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
-impl Operation<ArrayProgramType> for ReshapeOperation {
+impl Operation for ReshapeOperation {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         RESHAPE_OPERATION_NAME
@@ -557,7 +559,9 @@ impl Display for LegacyReshapeOperation {
     }
 }
 
-impl Operation<ArrayType> for LegacyReshapeOperation {
+impl Operation for LegacyReshapeOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         RESHAPE_OPERATION_NAME
@@ -650,7 +654,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: Operation<ArrayType> + From<LegacyReshapeOperation> + From<TransposeOperation>,
+        O: Operation<Type = ArrayType> + From<LegacyReshapeOperation> + From<TransposeOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Reshape + Transpose,
     {
         |operation, _context, _driver, inputs, outputs| {

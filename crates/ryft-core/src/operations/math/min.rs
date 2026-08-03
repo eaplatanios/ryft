@@ -178,7 +178,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = MinOperation::new(),
+            operation = MinOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -262,7 +262,7 @@ mod tests {
     fn test_min_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = MinOperation::new(),
+            operation = MinOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }

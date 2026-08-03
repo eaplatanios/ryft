@@ -233,7 +233,9 @@ impl Display for ReduceOperation {
     }
 }
 
-impl Operation<ArrayType> for ReduceOperation {
+impl Operation for ReduceOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         match self.kind {
@@ -524,7 +526,7 @@ where
 /// differentiable.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperation
 where
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<LegacyBroadcastOperation>
         + From<ConstantOperation<crate::backends::arrays::Array>>
         + From<MulOperation<ArrayType>>,

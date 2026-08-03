@@ -179,7 +179,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = MaxOperation::new(),
+            operation = MaxOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -275,7 +275,7 @@ mod tests {
     fn test_max_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = MaxOperation::new(),
+            operation = MaxOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }

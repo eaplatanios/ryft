@@ -86,7 +86,9 @@ impl<T: Type> Display for CoordinateBasisOperation<T> {
     }
 }
 
-impl Operation<ArrayType> for CoordinateBasisOperation<ArrayType> {
+impl Operation for CoordinateBasisOperation<ArrayType> {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         COORDINATE_BASIS_OPERATION_NAME

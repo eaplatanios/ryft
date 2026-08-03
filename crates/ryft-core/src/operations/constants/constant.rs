@@ -67,7 +67,9 @@ impl<V: Value> Display for ConstantOperation<V> {
     }
 }
 
-impl<V: Value> Operation<V::Type> for ConstantOperation<V> {
+impl<V: Value> Operation for ConstantOperation<V> {
+    type Type = V::Type;
+
     #[inline]
     fn name(&self) -> &'static str {
         CONSTANT_OPERATION_NAME
@@ -154,7 +156,7 @@ pub trait Constant<V, C> {
     fn constant(&self, value: C) -> Result<V, ProgramError>;
 }
 
-impl<V: Value, O: Operation<V::Type>> Constant<V, V> for EagerContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Constant<V, V> for EagerContext<V, O> {
     #[inline]
     fn constant(&self, value: V) -> Result<V, ProgramError> {
         Ok(value)

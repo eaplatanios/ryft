@@ -380,7 +380,9 @@ impl<T: Type> CustomCallOperation<T> {
     }
 }
 
-impl Operation<ArrayType> for CustomCallOperation<ArrayType> {
+impl Operation for CustomCallOperation<ArrayType> {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         CUSTOM_CALL_OPERATION_NAME
@@ -414,7 +416,9 @@ impl Operation<ArrayType> for CustomCallOperation<ArrayType> {
     }
 }
 
-impl Operation<ArrayProgramType> for CustomCallOperation<ArrayProgramType> {
+impl Operation for CustomCallOperation<ArrayProgramType> {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         CUSTOM_CALL_OPERATION_NAME
@@ -680,8 +684,8 @@ mod tests {
         );
         assert_eq!(operation.input_output_aliases(), &[CustomCallInputOutputAlias::new(0, 0)]);
         assert!(operation.has_side_effect());
-        assert_eq!(Operation::<ArrayType>::name(&operation), CUSTOM_CALL_OPERATION_NAME);
-        assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::single(Effect::OrderedIo));
+        assert_eq!(operation.name(), CUSTOM_CALL_OPERATION_NAME);
+        assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
         assert_eq!(operation.infer_output_types(&[vector_type()], &[]), Ok(vec![vector_type()]),);
         // Long attribute lists wrap onto one line per field.
         assert_eq!(
@@ -701,7 +705,7 @@ mod tests {
         );
 
         let pure = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
-        assert_eq!(Operation::<ArrayType>::effects(&pure), Effects::PURE);
+        assert_eq!(pure.effects(), Effects::PURE);
         assert_eq!(pure.to_string(), "custom_call [target=ryft.test.add_one]");
         let roundtrip =
             CustomCallOperation::<ArrayType>::from(CustomCallOperation::<ArrayProgramType>::from(operation.clone()));
@@ -769,8 +773,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &aliased_dynamic_operation,
+            aliased_dynamic_operation.infer_output_types(
                 &[
                     dynamic_output_type.clone().into(),
                     DimensionType::new(rows.clone()).into(),
@@ -780,13 +783,9 @@ mod tests {
             ),
             Ok(vec![dynamic_output_type.clone().into()]),
         );
+        assert_eq!(dynamic_operation.infer_output_types(&input_types, &[]), Ok(vec![dynamic_output_type.into()]));
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(&dynamic_operation, &input_types, &[]),
-            Ok(vec![dynamic_output_type.into()]),
-        );
-        assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &dynamic_operation,
+            dynamic_operation.infer_output_types(
                 &[vector_type().into(), DimensionType::new(columns).into(), DimensionType::new(rows).into()],
                 &[],
             ),
@@ -796,8 +795,7 @@ mod tests {
             )),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &dynamic_operation,
+            dynamic_operation.infer_output_types(
                 &[DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap(),))
                     .into()],
                 &[],

@@ -50,7 +50,9 @@ impl<T: Type> Display for SelectOperation<T> {
     }
 }
 
-impl Operation<DataType> for SelectOperation<DataType> {
+impl Operation for SelectOperation<DataType> {
+    type Type = DataType;
+
     #[inline]
     fn name(&self) -> &'static str {
         SELECT_OPERATION_NAME
@@ -83,7 +85,9 @@ impl Operation<DataType> for SelectOperation<DataType> {
     }
 }
 
-impl Operation<ArrayType> for SelectOperation<ArrayType> {
+impl Operation for SelectOperation<ArrayType> {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         SELECT_OPERATION_NAME
@@ -142,7 +146,7 @@ impl ElementwiseOperation for SelectOperation<ArrayType> {
 
 impl<T: Type, C: Domain<Type = T, Value: Select>> InterpretableOperation<C> for SelectOperation<T>
 where
-    Self: Operation<C::Type>,
+    Self: Operation<Type = C::Type>,
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -163,7 +167,7 @@ where
 impl<T: Type, C: Context<Type = T, Operation: From<SelectOperation<T>>>> PartiallyEvaluatableOperation<C>
     for SelectOperation<T>
 where
-    Self: Operation<T>,
+    Self: Operation<Type = T>,
 {
 }
 
@@ -383,8 +387,8 @@ mod tests {
         let array_operation = SelectOperation::<ArrayType>::new();
 
         // Check operation identity in both supported type universes.
-        assert_eq!(Operation::<DataType>::name(&scalar_operation), SELECT_OPERATION_NAME);
-        assert_eq!(Operation::<ArrayType>::name(&array_operation), SELECT_OPERATION_NAME);
+        assert_eq!(scalar_operation.name(), SELECT_OPERATION_NAME);
+        assert_eq!(array_operation.name(), SELECT_OPERATION_NAME);
         assert_eq!(format!("{scalar_operation}"), SELECT_OPERATION_NAME);
         assert_eq!(format!("{array_operation}"), SELECT_OPERATION_NAME);
 

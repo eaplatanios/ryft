@@ -149,7 +149,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = SignOperation::new(),
+            operation = SignOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

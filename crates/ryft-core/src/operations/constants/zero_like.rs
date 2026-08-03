@@ -37,7 +37,9 @@ impl<T: Type> Display for ZeroLikeOperation<T> {
     }
 }
 
-impl<T: Type> Operation<T> for ZeroLikeOperation<T> {
+impl<T: Type> Operation for ZeroLikeOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         ZERO_LIKE_OPERATION_NAME
@@ -139,8 +141,8 @@ mod tests {
 
         // Verify the operation's identity, zero metadata, rendering, and eager interpretation.
         let operation = ZeroLikeOperation::<DataType>::new();
-        assert!(Operation::<DataType>::is_zero(&operation, 0));
-        assert!(!Operation::<DataType>::is_zero(&operation, 1));
+        assert!(operation.is_zero(0));
+        assert!(!operation.is_zero(1));
         assert_eq!(format!("{operation}"), ZERO_LIKE_OPERATION_NAME);
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(

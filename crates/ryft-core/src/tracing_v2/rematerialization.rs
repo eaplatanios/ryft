@@ -2141,8 +2141,8 @@ mod tests {
     #[test]
     fn test_rematerialize_effects_only_include_the_primal_region() {
         let operation = RematerializeOperation::<ArrayType>::new();
-        assert_eq!(Operation::region_role(&operation, 0), Some(RegionRole::Computation));
-        assert!((1..4).all(|index| Operation::region_role(&operation, index) == Some(RegionRole::Rule)));
+        assert_eq!(operation.region_role(0), Some(RegionRole::Computation));
+        assert!((1..4).all(|index| operation.region_role(index) == Some(RegionRole::Rule)));
     }
 
     #[test]

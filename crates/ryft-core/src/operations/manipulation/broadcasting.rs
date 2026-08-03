@@ -82,7 +82,9 @@ impl Display for BroadcastOperation {
     }
 }
 
-impl Operation<ArrayProgramType> for BroadcastOperation {
+impl Operation for BroadcastOperation {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         BROADCAST_OPERATION_NAME
@@ -159,7 +161,9 @@ impl Display for LegacyBroadcastOperation {
     }
 }
 
-impl Operation<ArrayType> for LegacyBroadcastOperation {
+impl Operation for LegacyBroadcastOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         BROADCAST_OPERATION_NAME
@@ -240,7 +244,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: Operation<ArrayType>
+        O: Operation<Type = ArrayType>
             + From<LegacyBroadcastOperation>
             + From<ConvertElementTypeOperation<ArrayType>>
             + From<ReduceOperation>

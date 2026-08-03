@@ -24,7 +24,7 @@ pub(crate) trait TemporalResidualType: Type {
 ///
 /// Returning `None` means the residual already uses its storage representation. Returning an operation makes the
 /// conversion visible in the generated program before stacking or after slicing one iteration's stored value.
-pub(crate) trait TemporalResidualOperation<T: TemporalResidualType>: Operation<T> {
+pub(crate) trait TemporalResidualOperation<T: TemporalResidualType>: Operation<Type = T> {
     /// Returns the operation that converts a residual to temporal storage, if conversion is required.
     fn residual_to_storage(residual_type: &T) -> Result<Option<Self>, TypeError>;
 

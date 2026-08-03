@@ -212,7 +212,7 @@ mod tests {
             .unwrap();
         let unreduced_error = || "'div' does not support unreduced operands";
         check_operation_type_inference!(
-            operation = DivOperation::new(),
+            operation = DivOperation::<ArrayType>::new(),
             cases = [
                 {
                     input_types = [unreduced.clone(), plain.clone()],
@@ -230,7 +230,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @mismatched_reduced,
-            operation = DivOperation::new(),
+            operation = DivOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }

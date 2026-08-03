@@ -461,7 +461,9 @@ impl Display for DimensionRequirementOperation {
     }
 }
 
-impl Operation<DimensionType> for DimensionRequirementOperation {
+impl Operation for DimensionRequirementOperation {
+    type Type = DimensionType;
+
     #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()

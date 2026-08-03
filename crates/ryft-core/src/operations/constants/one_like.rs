@@ -37,7 +37,9 @@ impl<T: Type> Display for OneLikeOperation<T> {
     }
 }
 
-impl<T: Type> Operation<T> for OneLikeOperation<T> {
+impl<T: Type> Operation for OneLikeOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         ONE_LIKE_OPERATION_NAME

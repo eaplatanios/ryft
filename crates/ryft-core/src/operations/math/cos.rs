@@ -111,7 +111,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = CosOperation::new(),
+            operation = CosOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -202,7 +202,7 @@ mod tests {
     fn test_cos_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = CosOperation::new(),
+            operation = CosOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

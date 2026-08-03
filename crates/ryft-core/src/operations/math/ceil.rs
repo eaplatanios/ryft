@@ -98,7 +98,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = CeilOperation::new(),
+            operation = CeilOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

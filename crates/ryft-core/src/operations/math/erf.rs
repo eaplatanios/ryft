@@ -135,7 +135,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = ErfOperation::new(),
+            operation = ErfOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -195,7 +195,7 @@ mod tests {
     fn test_erf_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = ErfOperation::new(),
+            operation = ErfOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

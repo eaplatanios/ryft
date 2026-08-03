@@ -56,7 +56,7 @@ pub use dimension_to_scalar::{
 /// Each nominal operation owns its bounds formula and is paired with a value capability. This trait centralizes the
 /// common two-input type validation and fresh-result contract without imposing a concrete backend value
 /// representation.
-pub trait ArithmeticDimensionOperation: Operation<DimensionType> {
+pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
     /// Returns the declared left operand type.
     fn left_type(&self) -> &DimensionType;
 
@@ -243,7 +243,7 @@ mod tests {
 
         let unexpected = test_dimension_type("unexpected", 0, 6);
         assert_eq!(
-            Operation::infer_output_types(&operation, &[unexpected.clone(), right.clone()], &[],),
+            Operation::infer_output_types(&operation, &[unexpected.clone(), right.clone()], &[]),
             Err(TypeError::invalid(format!(
                 "'dimension_add' input 0 has type {unexpected} but the operation was constructed for type {left}",
             ))),

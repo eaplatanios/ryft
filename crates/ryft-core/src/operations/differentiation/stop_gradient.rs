@@ -53,7 +53,9 @@ impl<T: Type> Display for StopGradientOperation<T> {
     }
 }
 
-impl Operation<DataType> for StopGradientOperation<DataType> {
+impl Operation for StopGradientOperation<DataType> {
+    type Type = DataType;
+
     #[inline]
     fn name(&self) -> &'static str {
         STOP_GRADIENT_OPERATION_NAME
@@ -70,7 +72,9 @@ impl Operation<DataType> for StopGradientOperation<DataType> {
     }
 }
 
-impl Operation<ArrayType> for StopGradientOperation<ArrayType> {
+impl Operation for StopGradientOperation<ArrayType> {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         STOP_GRADIENT_OPERATION_NAME
@@ -89,7 +93,7 @@ impl Operation<ArrayType> for StopGradientOperation<ArrayType> {
 
 impl<T: Type, C: Domain<Type = T>> InterpretableOperation<C> for StopGradientOperation<T>
 where
-    Self: Operation<C::Type>,
+    Self: Operation<Type = C::Type>,
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -108,7 +112,7 @@ where
 impl<T: Type, C: Context<Type = T>> PartiallyEvaluatableOperation<C> for StopGradientOperation<T>
 where
     C::Operation: From<StopGradientOperation<T>>,
-    Self: Operation<T>,
+    Self: Operation<Type = T>,
 {
 }
 

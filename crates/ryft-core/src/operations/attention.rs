@@ -192,11 +192,13 @@ impl DotProductAttentionOperation {
 
 impl Display for DotProductAttentionOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
-impl Operation<ArrayType> for DotProductAttentionOperation {
+impl Operation for DotProductAttentionOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         DOT_PRODUCT_ATTENTION_OPERATION_NAME
@@ -363,11 +365,13 @@ impl DotProductAttentionBackwardOperation {
 
 impl Display for DotProductAttentionBackwardOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
-impl Operation<ArrayType> for DotProductAttentionBackwardOperation {
+impl Operation for DotProductAttentionBackwardOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME
@@ -926,7 +930,7 @@ fn batch_attention_merge_reshape<C, O, P: ArrayBatchingPolicy<C>>(
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType, Value: LegacyBroadcast + Reduce + Reshape + Transpose>,
-    O: Operation<ArrayType> + InterpretableBatchableOperation<C, ArrayBatching<P>>,
+    O: Operation<Type = ArrayType> + InterpretableBatchableOperation<C, ArrayBatching<P>>,
 {
     let output_count = |input_types: &[ArrayType]| -> Result<usize, BatchingError> {
         Ok(operation.infer_output_types(input_types, &[]).map_err(ProgramError::from)?.len())

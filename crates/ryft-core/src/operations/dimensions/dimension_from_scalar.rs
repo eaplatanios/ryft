@@ -144,11 +144,13 @@ impl DimensionFromScalarOperation {
 impl Display for DimensionFromScalarOperation {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        <Self as Operation<ArrayProgramType>>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
-impl Operation<ArrayProgramType> for DimensionFromScalarOperation {
+impl Operation for DimensionFromScalarOperation {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         DIMENSION_FROM_SCALAR_OPERATION_NAME

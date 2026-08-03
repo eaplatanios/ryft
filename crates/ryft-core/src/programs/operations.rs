@@ -570,7 +570,7 @@ mod tests {
         // Check required inference and the default operation contract.
         assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
         assert_eq!(
-            Operation::infer_output_types(&operation, &[], &[]),
+            operation.infer_output_types(&[], &[]),
             Err(TypeError::invalid("expected 1 input but got 0".to_string())),
         );
         let region_interfaces = [
@@ -578,17 +578,14 @@ mod tests {
             RegionInterface::new(vec![DataType::I32], vec![DataType::I64], Effects::PURE),
         ];
 
-        assert_eq!(Operation::region_slots(&operation), &[]);
-        assert_eq!(Operation::region_role(&operation, 0), None);
+        assert_eq!(operation.region_slots(), &[]);
+        assert_eq!(operation.region_role(0), None);
         assert_eq!(operation.infer_region_input_types(&[DataType::F64], &region_interfaces), Ok(vec![None, None]),);
-        assert_eq!(Operation::output_region_provenance(&operation, 0), Vec::new());
-        assert!(!Operation::is_zero(&operation, 0));
-        assert_eq!(Operation::effects(&operation), Effects::PURE);
-        assert!(Operation::rename_type_identities(&operation, &TypeIdentityRenaming::new()).is_ok());
-        assert_eq!(
-            std::fmt::from_fn(|formatter| Operation::render(&operation, formatter, 0)).to_string(),
-            "stop_gradient",
-        );
+        assert_eq!(operation.output_region_provenance(0), Vec::new());
+        assert!(!operation.is_zero(0));
+        assert_eq!(operation.effects(), Effects::PURE);
+        assert!(operation.rename_type_identities(&TypeIdentityRenaming::new()).is_ok());
+        assert_eq!(std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(), "stop_gradient");
 
         /// Test operation that makes every [`Operation`] method's forwarding observable.
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -651,26 +648,26 @@ mod tests {
         let operation = Box::new(ForwardingOperation { renamed: false });
         let region_interfaces = [RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE)];
 
-        assert_eq!(Operation::name(&operation), "forwarding");
-        assert_eq!(Operation::region_slots(&operation), &[RegionSlot::computation("body")]);
-        assert_eq!(Operation::region_role(&operation, 0), Some(RegionRole::Computation));
-        assert_eq!(Operation::region_role(&operation, 1), None);
+        assert_eq!(operation.name(), "forwarding");
+        assert_eq!(operation.region_slots(), &[RegionSlot::computation("body")]);
+        assert_eq!(operation.region_role(0), Some(RegionRole::Computation));
+        assert_eq!(operation.region_role(1), None);
         assert_eq!(
             operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
             Ok(vec![Some(vec![DataType::F32])]),
         );
         assert_eq!(operation.infer_output_types(&[DataType::F32], &region_interfaces), Ok(vec![DataType::F64]),);
         assert_eq!(
-            Operation::output_region_provenance(&operation, 3),
+            operation.output_region_provenance(3),
             vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],
         );
-        assert!(!Operation::is_zero(&operation, 1));
-        assert!(Operation::is_zero(&operation, 2));
-        assert_eq!(Operation::effects(&operation), Effects::single(Effect::OrderedIo));
+        assert!(!operation.is_zero(1));
+        assert!(operation.is_zero(2));
+        assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
         assert_eq!(
-            Operation::rename_type_identities(&operation, &TypeIdentityRenaming::new()),
+            operation.rename_type_identities(&TypeIdentityRenaming::new()),
             Ok(Box::new(ForwardingOperation { renamed: true })),
         );
-        assert_eq!(std::fmt::from_fn(|formatter| Operation::render(&operation, formatter, 0)).to_string(), "forwarded",);
+        assert_eq!(std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(), "forwarded",);
     }
 }

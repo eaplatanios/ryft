@@ -293,7 +293,9 @@ impl Display for GatherOperation {
     }
 }
 
-impl Operation<ArrayType> for GatherOperation {
+impl Operation for GatherOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         GATHER_OPERATION_NAME
@@ -497,7 +499,7 @@ pub(crate) fn validate_unique_in_range(
 /// structural zero, and a zero output cotangent stays a structural zero.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for GatherOperation
 where
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScatterOperation>,
+    O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<ScatterOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

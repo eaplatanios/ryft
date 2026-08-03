@@ -87,7 +87,9 @@ impl Display for IotaOperation<ArrayType> {
     }
 }
 
-impl Operation<ArrayType> for IotaOperation<ArrayType> {
+impl Operation for IotaOperation<ArrayType> {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         IOTA_OPERATION_NAME

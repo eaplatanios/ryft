@@ -170,7 +170,9 @@ impl Display for TransposeOperation {
     }
 }
 
-impl Operation<ArrayType> for TransposeOperation {
+impl Operation for TransposeOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         TRANSPOSE_OPERATION_NAME
@@ -239,7 +241,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: Operation<ArrayType> + From<TransposeOperation>,
+        O: Operation<Type = ArrayType> + From<TransposeOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Transpose,
     {
         |operation, _context, _driver, inputs, outputs| {
@@ -790,26 +792,22 @@ mod tests {
         // cotangent transposes.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let primal = context.input(cycle_input_type.clone());
-        let duals = DifferentiableOperation::jvp(
-            &TransposeOperation::new([2, 0, 1]),
-            &context,
-            &EmptyRegionDriver,
-            &[DifferentiationDual::new_with_zero_tangent(primal)],
-        )
-        .unwrap();
+        let duals = TransposeOperation::new([2, 0, 1])
+            .jvp(&context, &EmptyRegionDriver, &[DifferentiationDual::new_with_zero_tangent(primal)])
+            .unwrap();
         assert!(duals[0].tangent().is_zero());
         assert_eq!(duals[0].tangent().r#type().as_ref(), &cycle_output_type.tangent());
         assert_eq!(context.builder().borrow().instructions().len(), 1);
 
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let contributions = TransposableOperation::transpose(
-            &TransposeOperation::new([2, 0, 1]),
-            &mut context,
-            &EmptyRegionDriver,
-            &[PartialValue::Unknown(cycle_input_type.clone())],
-            &[MaybeZero::Zero(cycle_output_type.cotangent())],
-        )
-        .unwrap();
+        let contributions = TransposeOperation::new([2, 0, 1])
+            .transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(cycle_input_type.clone())],
+                &[MaybeZero::Zero(cycle_output_type.cotangent())],
+            )
+            .unwrap();
         assert!(contributions[0].is_zero());
         assert_eq!(contributions[0].r#type().as_ref(), &cycle_input_type.cotangent());
         assert!(context.builder().borrow().instructions().is_empty());

@@ -53,7 +53,9 @@ impl<T: Type> Display for ZeroOperation<T> {
     }
 }
 
-impl<T: Type> Operation<T> for ZeroOperation<T> {
+impl<T: Type> Operation for ZeroOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         ZERO_OPERATION_NAME
@@ -109,17 +111,29 @@ impl_non_differentiable_operation!(<T> ZeroOperation<T> where T: Type);
 impl_nullary_transposable_operation!(<T> ZeroOperation<T> where T: Type);
 impl_nullary_batchable_operation!(@replicated ZeroOperation<ArrayType>);
 
+// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound once the next-generation trait solver
+//  stabilizes. The current solver cannot discharge this projection equality at implementation heads whose context type
+//  is built from `Self` (E0284); the equality is enforced per method through a `where` clause instead.
 /// Supplies the canonical zero [`Operation`] of a program type's operation family. [`Self::zero_operation`] covers
 /// zeros that can be constructed from a type without operands, which is all that staging and eager materialization
 /// need. Differentiation additionally must materialize zeros whose runtime geometry is unavailable from the type alone
 /// (e.g., disconnected cotangents with dynamic axes). That residual protocol is transform-owned and lives on
 /// [`ResidualZeroProvider`](crate::ResidualZeroProvider).
-pub trait ZeroOperationProvider<T: Type>: Operation<T> {
+///
+/// The super-trait is plain [`Operation`] rather than `Operation<Type = T>` because the current trait solver cannot
+/// discharge that projection equality where this provider is requested through a context's operation family, which is
+/// how every transform requests it. The equality is instead required by [`zero_operation`](Self::zero_operation)
+/// itself, so a provider whose [`Operation::Type`] disagrees with `T` cannot construct anything: the requirement is
+/// restated by the residual-zero protocol and by transform call sites, and any mismatched implementation is rejected
+/// with a type-mismatch error there.
+pub trait ZeroOperationProvider<T: Type>: Operation {
     /// Constructs an [`Operation`] that materializes a zero of `r#type` without operands.
-    fn zero_operation(r#type: T) -> Result<Self, ProgramError>;
+    fn zero_operation(r#type: T) -> Result<Self, ProgramError>
+    where
+        Self: Operation<Type = T>;
 }
 
-impl<T: Type, O: Operation<T> + From<ZeroOperation<T>>> ZeroOperationProvider<T> for O {
+impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> ZeroOperationProvider<T> for O {
     #[inline]
     fn zero_operation(r#type: T) -> Result<Self, ProgramError> {
         Ok(Self::from(ZeroOperation::new(r#type)))
@@ -235,8 +249,8 @@ mod tests {
         // Verify the operation's stored type, identity, zero metadata, rendering, and eager interpretation.
         let operation = ZeroOperation::new(DataType::F64);
         assert_eq!(operation.name(), ZERO_OPERATION_NAME);
-        assert!(Operation::<DataType>::is_zero(&operation, 0));
-        assert!(!Operation::<DataType>::is_zero(&operation, 1));
+        assert!(operation.is_zero(0));
+        assert!(!operation.is_zero(1));
         assert_eq!(format!("{operation}"), "zero [type=f64]");
         assert_eq!(operation.r#type(), &DataType::F64);
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![DataType::F64]));
@@ -272,16 +286,13 @@ mod tests {
         let dynamic_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&ZeroOperation::new(dynamic_type.clone()), &[], &[]),
+            ZeroOperation::new(dynamic_type.clone()).infer_output_types(&[], &[]),
             Err(TypeError::invalid(
                 "'zero' cannot construct type f32[rows, 3] without operands because it references identity rows",
             )),
         );
         let dimension_type = DimensionType::new(rows);
-        assert_eq!(
-            Operation::<DimensionType>::infer_output_types(&ZeroOperation::new(dimension_type.clone()), &[], &[]),
-            Ok(vec![dimension_type]),
-        );
+        assert_eq!(ZeroOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
 
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Scalar, ZeroOperation<DataType>>::new();

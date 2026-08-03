@@ -95,7 +95,7 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 ///     rejects transposition, exactly like JAX's `while_loop`.
 ///
 /// The `T` parameter fixes the loop's type universe in the payload itself. Consequently, one concrete
-/// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<T>`](Operation) contract even though the shared
+/// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<Type = T>`](Operation) contract even though the shared
 /// implementation supports scalar, array, and composite array-program loops.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhileOperation<T: Type> {
@@ -155,7 +155,7 @@ impl<T: Type> Default for WhileOperation<T> {
 
 impl<T: WhileTypeSemantics> Display for WhileOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<T>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
@@ -317,7 +317,9 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
     Ok((condition_interface, body_interface))
 }
 
-impl<T: WhileTypeSemantics> Operation<T> for WhileOperation<T> {
+impl<T: WhileTypeSemantics> Operation for WhileOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         WHILE_OPERATION_NAME
@@ -479,7 +481,7 @@ where
     V: Value<Type = ArrayType>,
     C: Context<Type = ArrayType, Constant = V, Operation = O>,
     C::Value: PartialEq,
-    O: Operation<ArrayType> + From<WhileOperation<ArrayType>>,
+    O: Operation<Type = ArrayType> + From<WhileOperation<ArrayType>>,
 {
     fn partially_evaluate_while<D: PartialEvaluationDriver<C>>(
         operation: &WhileOperation<ArrayType>,
@@ -794,7 +796,7 @@ where
     V: Value,
     V::Type: WhileTypeSemantics,
     C: Context<Constant = V, Operation = O>,
-    O: Operation<V::Type> + From<WhileOperation<V::Type>>,
+    O: Operation<Type = V::Type> + From<WhileOperation<V::Type>>,
     D: PartialEvaluationDriver<C>,
 {
     let state_types = body.input_types();
@@ -954,7 +956,7 @@ impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> fo
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
         + From<ReduceOperation>
@@ -1180,7 +1182,7 @@ pub(crate) trait WhileResidualStackType: DifferentiableType + TemporalResidualTy
 /// tangent scan body. Composite implementations own the visible dimension/scalar gateway operations; homogeneous
 /// array implementations return `None` for both gateway hooks.
 pub(crate) trait WhileResidualStackOperation<T: WhileResidualStackType, A>:
-    Operation<T> + TemporalResidualOperation<T>
+    Operation<Type = T> + TemporalResidualOperation<T>
 {
     /// Constructs a zero for a statically shaped array-backed state type.
     fn residual_stack_zero(r#type: T) -> Self;
@@ -1214,7 +1216,7 @@ impl TemporalResidualType for ArrayType {
     }
 }
 
-impl<O: Operation<ArrayType>> TemporalResidualOperation<ArrayType> for O {
+impl<O: Operation<Type = ArrayType>> TemporalResidualOperation<ArrayType> for O {
     #[inline]
     fn residual_to_storage(_residual_type: &ArrayType) -> Result<Option<Self>, TypeError> {
         Ok(None)
@@ -1240,7 +1242,7 @@ impl WhileResidualStackType for ArrayType {
 
 impl<A, O> WhileResidualStackOperation<ArrayType, A> for O
 where
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
         + From<AddOperation<ArrayType>>
@@ -2217,7 +2219,7 @@ where
 impl<V: Value, O> TransposableOperation<V, O> for WhileOperation<V::Type>
 where
     V::Type: WhileTypeSemantics,
-    O: Operation<V::Type>,
+    O: Operation<Type = V::Type>,
 {
     /// Rejects transposition. This rule is only reachable for *unbounded* staged while loops — the doubled-state
     /// linear loop staged by the [`WhileOperation`] JVP rule, which recomputes primal state *forward* through
@@ -2356,11 +2358,7 @@ mod tests {
         let operation = WhileOperation::new();
 
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
-                state_types.as_slice(),
-                &[condition_interface, body_interface.clone()],
-            ),
+            operation.infer_output_types(state_types.as_slice(), &[condition_interface, body_interface.clone()]),
             Ok(state_types.clone()),
         );
 
@@ -2370,11 +2368,7 @@ mod tests {
             Effects::PURE,
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
-                state_types.as_slice(),
-                &[batched_condition_interface, body_interface],
-            ),
+            operation.infer_output_types(state_types.as_slice(), &[batched_condition_interface, body_interface]),
             Err(TypeError::invalid(
                 "'while' loop with a batched predicate cannot carry first-class dimension state \
                  dimension<extent ∈ [1, 8)>"
@@ -2392,11 +2386,8 @@ mod tests {
         let interfaces = vec![region_interface(&condition), region_interface(&body)];
 
         // Operation identity, declared region slots, and payload-free rendering.
-        assert_eq!(Operation::<ArrayType>::name(&operation), WHILE_OPERATION_NAME);
-        assert_eq!(
-            Operation::<ArrayType>::region_slots(&operation),
-            &[RegionSlot::computation("condition"), RegionSlot::computation("body")],
-        );
+        assert_eq!(operation.name(), WHILE_OPERATION_NAME);
+        assert_eq!(operation.region_slots(), &[RegionSlot::computation("condition"), RegionSlot::computation("body")]);
         assert_eq!(format!("{operation}"), "while");
 
         // Type inference validates the region interfaces and the input types, and returns the state types.
@@ -3044,7 +3035,7 @@ mod tests {
         }
     }
 
-    impl<O: Operation<ArrayType>> Zero<TestValue> for EagerContext<TestValue, O> {
+    impl<O: Operation<Type = ArrayType>> Zero<TestValue> for EagerContext<TestValue, O> {
         fn zero(&self, value_type: &ArrayType) -> Result<TestValue, ProgramError> {
             match value_type.data_type() {
                 DataType::Boolean => Ok(TestValue::Bool(false)),
@@ -3057,7 +3048,7 @@ mod tests {
         }
     }
 
-    impl<O: Operation<ArrayType>> One<TestValue> for EagerContext<TestValue, O> {
+    impl<O: Operation<Type = ArrayType>> One<TestValue> for EagerContext<TestValue, O> {
         fn one(&self, value_type: &ArrayType) -> Result<TestValue, ProgramError> {
             match value_type.data_type() {
                 DataType::Boolean => Ok(TestValue::Bool(true)),
@@ -3100,19 +3091,21 @@ mod tests {
         }
     }
 
-    impl Operation<ArrayType> for TestOperation {
+    impl Operation for TestOperation {
+        type Type = ArrayType;
+
         #[inline]
         fn name(&self) -> &'static str {
             match self {
                 Self::Sub => SUB_OPERATION_NAME,
                 Self::IsPositive => "is_positive",
-                Self::While(while_operation) => Operation::<ArrayType>::name(while_operation),
+                Self::While(while_operation) => while_operation.name(),
             }
         }
 
         fn region_slots(&self) -> &'static [RegionSlot] {
             match self {
-                Self::While(while_operation) => Operation::<ArrayType>::region_slots(while_operation),
+                Self::While(while_operation) => while_operation.region_slots(),
                 _ => &[],
             }
         }
@@ -3138,7 +3131,7 @@ mod tests {
 
         fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
             match self {
-                Self::While(while_operation) => Operation::<ArrayType>::render(while_operation, formatter, indentation),
+                Self::While(while_operation) => while_operation.render(formatter, indentation),
                 _ => Display::fmt(self, formatter),
             }
         }

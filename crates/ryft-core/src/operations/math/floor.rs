@@ -98,7 +98,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = FloorOperation::new(),
+            operation = FloorOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

@@ -143,7 +143,9 @@ impl Display for DynamicShapeSliceOperation {
     }
 }
 
-impl Operation<ArrayProgramType> for DynamicShapeSliceOperation {
+impl Operation for DynamicShapeSliceOperation {
+    type Type = ArrayProgramType;
+
     #[inline]
     fn name(&self) -> &'static str {
         "dynamic_shape_slice"
@@ -245,7 +247,9 @@ impl Display for SliceOperation {
     }
 }
 
-impl Operation<ArrayType> for SliceOperation {
+impl Operation for SliceOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         SLICE_OPERATION_NAME
@@ -344,7 +348,7 @@ where
 /// Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for SliceOperation
 where
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<UpdateSliceOperation>
         + From<PadOperation<ArrayType>>
         + From<ZeroOperation<ArrayType>>,
@@ -701,7 +705,9 @@ impl Display for UpdateSliceOperation {
     }
 }
 
-impl Operation<ArrayType> for UpdateSliceOperation {
+impl Operation for UpdateSliceOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         UPDATE_SLICE_OPERATION_NAME
@@ -783,7 +789,7 @@ where
 /// Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for UpdateSliceOperation
 where
-    O: Operation<ArrayType> + From<SliceOperation> + From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
+    O: Operation<Type = ArrayType> + From<SliceOperation> + From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
     Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -1022,7 +1028,9 @@ impl Display for DynamicSliceOperation {
     }
 }
 
-impl Operation<ArrayType> for DynamicSliceOperation {
+impl Operation for DynamicSliceOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         DYNAMIC_SLICE_OPERATION_NAME
@@ -1298,7 +1306,9 @@ impl Display for DynamicUpdateSliceOperation {
     }
 }
 
-impl Operation<ArrayType> for DynamicUpdateSliceOperation {
+impl Operation for DynamicUpdateSliceOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         DYNAMIC_UPDATE_SLICE_OPERATION_NAME
@@ -1582,7 +1592,7 @@ where
 /// The start indices receive structural zeros, and a zero output cotangent stays a structural zero.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicSliceOperation
 where
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<DynamicUpdateSliceOperation>,
+    O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<DynamicUpdateSliceOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1621,7 +1631,7 @@ where
 /// Reads the known scalar integer start-index operands of a dynamic slicing operation from the pullback. Each entry of
 /// `inputs` is the start index's [`PartialValue`]; the dispatch guarantees a [`Known`](PartialValue::Known) operand
 /// carries its pullback value, so each tracer is read directly.
-fn read_known_start_indices<V: Value<Type = ArrayType>, O: Operation<ArrayType>>(
+fn read_known_start_indices<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>>(
     inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
 ) -> Vec<Tracer<TracingContext<V, O>>> {
     inputs
@@ -1641,7 +1651,7 @@ fn read_known_start_indices<V: Value<Type = ArrayType>, O: Operation<ArrayType>>
 /// zeros, and a zero output cotangent stays a structural zero.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicUpdateSliceOperation
 where
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<ZeroOperation<ArrayType>>
         + From<DynamicUpdateSliceOperation>
         + From<DynamicSliceOperation>,
@@ -1848,7 +1858,7 @@ pub(crate) fn batch_by_item_expansion<C, O, P: ArrayBatchingPolicy<C>>(
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
-    O: InterpretableOperation<C>,
+    O: Operation<Type = ArrayType> + InterpretableOperation<C>,
 {
     if inputs.is_empty() {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());

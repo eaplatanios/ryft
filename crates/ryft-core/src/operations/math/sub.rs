@@ -164,7 +164,7 @@ mod tests {
         };
 
         check_operation_type_inference!(
-            operation = SubOperation::new(),
+            operation = SubOperation::<ArrayType>::new(),
             cases = [
                 {
                     input_types = [unreduced(), unreduced()],
@@ -182,7 +182,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @mismatched_reduced,
-            operation = SubOperation::new(),
+            operation = SubOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }

@@ -112,7 +112,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = SqrtOperation::new(),
+            operation = SqrtOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -203,7 +203,7 @@ mod tests {
     fn test_sqrt_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = SqrtOperation::new(),
+            operation = SqrtOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

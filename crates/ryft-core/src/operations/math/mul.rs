@@ -287,7 +287,7 @@ mod tests {
 
         // Unreduced over `x` times reduced over `x` is the partial-sum-times-replicated case: the product stays
         // unreduced over `x`, and the reduced marker is cleared.
-        let output = <MulOperation<ArrayType> as Operation<ArrayType>>::infer_output_types(
+        let output = <MulOperation<ArrayType> as Operation>::infer_output_types(
             &MulOperation::new(),
             &[unreduced("x"), reduced("x")],
             &[],
@@ -298,7 +298,7 @@ mod tests {
 
         // Two operands both unreduced cannot be multiplied (the product of two partial sums is not a partial sum).
         check_operation_type_inference!(
-            operation = MulOperation::new(),
+            operation = MulOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [unreduced("x"), unreduced("x")],
                 error = format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced"),
@@ -307,7 +307,7 @@ mod tests {
 
         // Unreduced over `x` requires the other operand to be reduced over exactly `x`, not a different axis.
         check_operation_type_inference!(
-            operation = MulOperation::new(),
+            operation = MulOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [unreduced("x"), reduced("y")],
                 error = format!(
@@ -318,7 +318,7 @@ mod tests {
         );
 
         // Two operands reduced over the same axis multiply to a value reduced over that axis.
-        let output = <MulOperation<ArrayType> as Operation<ArrayType>>::infer_output_types(
+        let output = <MulOperation<ArrayType> as Operation>::infer_output_types(
             &MulOperation::new(),
             &[reduced("x"), reduced("x")],
             &[],
@@ -330,7 +330,7 @@ mod tests {
         // A reduced operand cannot be multiplied by an otherwise replicated operand because the result would inherit
         // a reduction marker that does not describe both inputs.
         check_operation_type_inference!(
-            operation = MulOperation::new(),
+            operation = MulOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [reduced("x"), vector_type()],
                 error = format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes"),

@@ -148,10 +148,12 @@ fn validated_branch_interfaces<'i, T: Type>(
     Ok((true_interface, false_interface))
 }
 
-impl<F: Value> Operation<F::Type> for ConditionOperation<F>
+impl<F: Value> Operation for ConditionOperation<F>
 where
     F::Type: ConditionTypeSemantics,
 {
+    type Type = F::Type;
+
     #[inline]
     fn name(&self) -> &'static str {
         CONDITION_OPERATION_NAME
@@ -261,7 +263,7 @@ impl<V, O, C> PartiallyEvaluatableOperation<C> for ConditionOperation<V>
 where
     V: Value + Concretizable<bool>,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
-    O: Operation<V::Type> + From<ConditionOperation<V>> + ZeroOperationProvider<V::Type>,
+    O: Operation<Type = V::Type> + From<ConditionOperation<V>> + ZeroOperationProvider<V::Type>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -368,7 +370,7 @@ where
 
 /// Bookkeeping for one branch of [`split_condition_by_knownness`]: the branch's partitioned programs, boundary
 /// mappings, and residual edges.
-struct ConditionBranchSplit<V: Value, O: Operation<V::Type>> {
+struct ConditionBranchSplit<V: Value, O: Operation<Type = V::Type>> {
     /// Known-side program reified by partitioning the branch through a fresh staging context.
     known_program: Program<V, O, Vec<V>, Vec<V>>,
 
@@ -415,7 +417,7 @@ fn split_condition_by_knownness<V, O, C, D: PartialEvaluationDriver<C>>(
 where
     V: Value,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
-    O: Operation<V::Type> + From<ConditionOperation<V>> + ZeroOperationProvider<V::Type>,
+    O: Operation<Type = V::Type> + From<ConditionOperation<V>> + ZeroOperationProvider<V::Type>,
 {
     let true_branch = driver.region(0)?;
     let false_branch = driver.region(1)?;
@@ -849,7 +851,7 @@ impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> fo
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: Concretizable<bool> + LegacyBroadcast + Transpose + Select,
-    O: Operation<ArrayType>
+    O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
         + From<SelectOperation<ArrayType>>
@@ -1061,7 +1063,7 @@ where
 impl<V, O> TransposableOperation<V, O> for ConditionOperation<V>
 where
     V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
-    O: Operation<V::Type> + ZeroOperationProvider<V::Type> + From<ConditionOperation<V>>,
+    O: Operation<Type = V::Type> + ZeroOperationProvider<V::Type> + From<ConditionOperation<V>>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1114,7 +1116,7 @@ pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
     V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
-    O: Operation<V::Type> + ZeroOperationProvider<V::Type> + From<ConditionOperation<V>>,
+    O: Operation<Type = V::Type> + ZeroOperationProvider<V::Type> + From<ConditionOperation<V>>,
 {
     // A condition with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -1345,16 +1347,11 @@ mod tests {
         input_types.extend(branch_inputs);
 
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
-                input_types.as_slice(),
-                &[branch_interface.clone(), branch_interface],
-            ),
+            operation.infer_output_types(input_types.as_slice(), &[branch_interface.clone(), branch_interface]),
             Ok(branch_outputs),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
+            operation.infer_output_types(
                 &[dimension_type],
                 &[
                     RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE),

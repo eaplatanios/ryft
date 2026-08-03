@@ -101,7 +101,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = RoundOperation::new(),
+            operation = RoundOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

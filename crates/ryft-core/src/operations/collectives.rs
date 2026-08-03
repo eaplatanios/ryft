@@ -317,7 +317,9 @@ impl Display for CollectiveOperation {
     }
 }
 
-impl Operation<ArrayType> for CollectiveOperation {
+impl Operation for CollectiveOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         match self.kind {
@@ -536,7 +538,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: Operation<ArrayType> + From<CollectiveOperation>,
+        O: Operation<Type = ArrayType> + From<CollectiveOperation>,
     {
         |operation, context, _driver, inputs, outputs| {
             // Transpose rule for [`CollectiveOperation`]. `psum`/`pmean` are self-adjoint, so the operand cotangent is
@@ -1630,11 +1632,13 @@ macro_rules! shape_changing_collective {
 
         impl Display for $operation {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                Operation::<ArrayType>::render(self, formatter, 0)
+                self.render(formatter, 0)
             }
         }
 
-        impl Operation<ArrayType> for $operation {
+        impl Operation for $operation {
+            type Type = ArrayType;
+
             #[inline]
             fn name(&self) -> &'static str {
                 $operation_name
@@ -2786,7 +2790,7 @@ where
 impl<V, O> TransposableOperation<V, O> for AllGatherOperation
 where
     V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<PSumScatterOperation>,
+    O: Operation<Type = ArrayType> + From<PSumScatterOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -2818,7 +2822,7 @@ where
 impl<V, O> TransposableOperation<V, O> for PSumScatterOperation
 where
     V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<AllGatherOperation>,
+    O: Operation<Type = ArrayType> + From<AllGatherOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -2847,7 +2851,7 @@ where
 impl<V, O> TransposableOperation<V, O> for PpermuteOperation
 where
     V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<PpermuteOperation>,
+    O: Operation<Type = ArrayType> + From<PpermuteOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -2872,7 +2876,7 @@ where
 impl<V, O> TransposableOperation<V, O> for AllToAllOperation
 where
     V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<AllToAllOperation>,
+    O: Operation<Type = ArrayType> + From<AllToAllOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -2907,8 +2911,8 @@ fn transpose_shape_changing_collective<V, O, A>(
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>
 where
     V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<A>,
-    A: Operation<ArrayType>,
+    O: Operation<Type = ArrayType> + From<A>,
+    A: Operation<Type = ArrayType>,
 {
     check_count!("input", inputs, 1, ProgramError);
     check_count!("output", outputs, 1, ProgramError);

@@ -111,7 +111,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = RsqrtOperation::new(),
+            operation = RsqrtOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -165,7 +165,7 @@ mod tests {
     fn test_rsqrt_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = RsqrtOperation::new(),
+            operation = RsqrtOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

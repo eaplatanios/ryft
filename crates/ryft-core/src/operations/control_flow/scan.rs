@@ -194,7 +194,7 @@ impl<Capture: Value> ScanOperation<Capture> {
 
 impl<Capture: Value<Type: ScanTypeSemantics>> Display for ScanOperation<Capture> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<Capture::Type>::render(self, formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
@@ -542,7 +542,7 @@ impl TemporalResidualType for DataType {
     }
 }
 
-impl<O: Operation<DataType>> TemporalResidualOperation<DataType> for O {
+impl<O: Operation<Type = DataType>> TemporalResidualOperation<DataType> for O {
     #[inline]
     fn residual_to_storage(_residual_type: &DataType) -> Result<Option<Self>, TypeError> {
         Ok(None)
@@ -736,11 +736,13 @@ fn validated_scan_interface<'i, T: ScanTypeSemantics>(
     Ok(body_interface)
 }
 
-impl<T, Capture> Operation<T> for ScanOperation<Capture>
+impl<T, Capture> Operation for ScanOperation<Capture>
 where
     T: ScanTypeSemantics,
     Capture: Value<Type = T>,
 {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         SCAN_OPERATION_NAME
@@ -1077,7 +1079,7 @@ where
     V: Value<Type: ScanTypeSemantics + TemporalResidualType>,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
     C::Value: PartialEq,
-    O: Operation<V::Type> + From<ScanOperation<V>> + TemporalResidualOperation<V::Type>,
+    O: Operation<Type = V::Type> + From<ScanOperation<V>> + TemporalResidualOperation<V::Type>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -1289,7 +1291,7 @@ fn split_scan_by_knownness<V, O, C, PartitionRegion>(
 where
     V: Value<Type: ScanTypeSemantics + TemporalResidualType>,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
-    O: Operation<V::Type> + From<ScanOperation<V>> + TemporalResidualOperation<V::Type>,
+    O: Operation<Type = V::Type> + From<ScanOperation<V>> + TemporalResidualOperation<V::Type>,
     PartitionRegion: FnMut(&[bool]) -> Result<PartitionedProgram<V, O>, ProgramError>,
 {
     let carry_count = scan.carry_count;
@@ -2176,7 +2178,7 @@ fn permute_live_scan_body<V, O>(
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value,
-    O: Operation<V::Type>,
+    O: Operation<Type = V::Type>,
 {
     let input_order = live_scan_signature_permutation(input_has_tangent, carry_count)?;
     let output_order = live_scan_signature_permutation(output_has_tangent, carry_count)?;
@@ -2221,7 +2223,7 @@ fn reorder_program_boundary<V, O>(
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value,
-    O: Operation<V::Type>,
+    O: Operation<Type = V::Type>,
 {
     fn inverse_order(order: &[usize], length: usize, label: &str) -> Result<Vec<usize>, ProgramError> {
         if order.len() != length {
@@ -2279,7 +2281,7 @@ where
     V: Value,
     V::Type: ScanTypeSemantics + ScanTransposition<V, F, Target>,
     F: Value<Type = V::Type>,
-    Target: Operation<V::Type>,
+    Target: Operation<Type = V::Type>,
 {
     fn transpose<D: TranspositionDriver<V, Target>>(
         &self,
@@ -2302,7 +2304,7 @@ pub(crate) trait ScanTransposition<V, F, Target>: Type
 where
     V: Value<Type = Self>,
     F: Value<Type = Self>,
-    Target: Operation<Self>,
+    Target: Operation<Type = Self>,
 {
     /// Applies the type family's `scan` transpose rule using the loop's driver; refer to the documentation of
     /// [`TransposableOperation::transpose`] for the contract.
@@ -2332,7 +2334,7 @@ impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayType
 where
     V: Value<Type = ArrayType>,
     F: Value<Type = ArrayType>,
-    Target: Operation<ArrayType> + ZeroOperationProvider<ArrayType> + From<ScanOperation<F>>,
+    Target: Operation<Type = ArrayType> + ZeroOperationProvider<ArrayType> + From<ScanOperation<F>>,
 {
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
@@ -2349,7 +2351,7 @@ impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayProgramType
 where
     V: Value<Type = ArrayProgramType>,
     F: Value<Type = ArrayProgramType>,
-    Target: Operation<ArrayProgramType> + ZeroOperationProvider<ArrayProgramType> + From<ScanOperation<F>>,
+    Target: Operation<Type = ArrayProgramType> + ZeroOperationProvider<ArrayProgramType> + From<ScanOperation<F>>,
 {
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
@@ -2373,7 +2375,7 @@ fn transpose_array_scan<V, F, Target, D>(
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
     F: Value<Type = V::Type>,
-    Target: Operation<V::Type> + ZeroOperationProvider<V::Type> + From<ScanOperation<F>>,
+    Target: Operation<Type = V::Type> + ZeroOperationProvider<V::Type> + From<ScanOperation<F>>,
     D: TranspositionDriver<V, Target>,
 {
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -2413,7 +2415,7 @@ impl<V, F, Target> ScanTransposition<V, F, Target> for DataType
 where
     V: Value<Type = DataType>,
     F: Value<Type = DataType>,
-    Target: Operation<DataType> + ZeroOperationProvider<DataType> + From<ScanOperation<F>>,
+    Target: Operation<Type = DataType> + ZeroOperationProvider<DataType> + From<ScanOperation<F>>,
 {
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
@@ -2509,7 +2511,7 @@ pub fn transpose_primal_scan<V, O, F, D: TranspositionDriver<V, O>>(
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
     F: Value<Type = V::Type>,
-    O: Operation<V::Type> + ZeroOperationProvider<V::Type> + From<ScanOperation<F>>,
+    O: Operation<Type = V::Type> + ZeroOperationProvider<V::Type> + From<ScanOperation<F>>,
 {
     // A scan with only zero output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -2658,7 +2660,7 @@ fn thread_known_carries<V, O>(
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value<Type: DifferentiableType>,
-    O: Operation<V::Type>,
+    O: Operation<Type = V::Type>,
 {
     let linear_carry_count = operand_linear[..carry_count].iter().filter(|&&linear| linear).count();
     let body_output_count = body_output_types.len();
@@ -2825,30 +2827,18 @@ mod tests {
         let input_types = vec![dimension_type.clone(), stacked_type.clone()];
 
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_region_input_types(
-                &operation,
-                input_types.as_slice(),
-                std::slice::from_ref(&body_interface),
-            ),
+            operation.infer_region_input_types(input_types.as_slice(), std::slice::from_ref(&body_interface)),
             Ok(vec![None]),
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &operation,
-                input_types.as_slice(),
-                std::slice::from_ref(&body_interface),
-            ),
+            operation.infer_output_types(input_types.as_slice(), std::slice::from_ref(&body_interface)),
             Ok(vec![dimension_type.clone(), stacked_type]),
         );
 
         let captured_dimension = ScanOperation::<CaptureReference<ArrayProgramType>>::new(1, 3)
             .with_captures(vec![CaptureReference::new(0, dimension_type.clone())]);
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &captured_dimension,
-                input_types.as_slice(),
-                std::slice::from_ref(&body_interface),
-            ),
+            captured_dimension.infer_output_types(input_types.as_slice(), std::slice::from_ref(&body_interface)),
             Err(TypeError::invalid(
                 "scan capture 0 must be a stacked array but got dimension<extent ∈ [1, 8)>".to_string(),
             )),
@@ -2860,11 +2850,8 @@ mod tests {
             Effects::PURE,
         );
         assert_eq!(
-            Operation::<ArrayProgramType>::infer_output_types(
-                &ScanOperation::<CaptureReference<ArrayProgramType>>::new(1, 3),
-                &[dimension_type.clone(), dimension_type.clone()],
-                &[invalid_body_interface],
-            ),
+            ScanOperation::<CaptureReference<ArrayProgramType>>::new(1, 3)
+                .infer_output_types(&[dimension_type.clone(), dimension_type.clone()], &[invalid_body_interface]),
             Err(TypeError::invalid(
                 "scan stacked body input 1 must be an array but got dimension<extent ∈ [1, 8)>".to_string(),
             )),
@@ -2893,9 +2880,9 @@ mod tests {
 
         // Operation identity, declared region slots, output provenance, and accessors.
         assert_eq!(operation.name(), SCAN_OPERATION_NAME);
-        assert_eq!(Operation::<ArrayType>::region_slots(&operation), &[RegionSlot::computation("body")]);
+        assert_eq!(operation.region_slots(), &[RegionSlot::computation("body")]);
         assert_eq!(
-            Operation::<ArrayType>::output_region_provenance(&operation, 1),
+            operation.output_region_provenance(1),
             vec![OutputRegionProvenance { region_index: 0, output_index: 1 }],
         );
         assert_eq!(operation.carry_count(), 1);

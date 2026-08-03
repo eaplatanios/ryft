@@ -53,7 +53,9 @@ impl<T: Type> Display for OneOperation<T> {
     }
 }
 
-impl<T: Type> Operation<T> for OneOperation<T> {
+impl<T: Type> Operation for OneOperation<T> {
+    type Type = T;
+
     #[inline]
     fn name(&self) -> &'static str {
         ONE_OPERATION_NAME
@@ -244,16 +246,13 @@ mod tests {
         let dynamic_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&OneOperation::new(dynamic_type), &[], &[]),
+            OneOperation::new(dynamic_type).infer_output_types(&[], &[]),
             Err(TypeError::invalid(
                 "'one' cannot construct type f32[rows, 3] without operands because it references identity rows",
             )),
         );
         let dimension_type = DimensionType::new(rows);
-        assert_eq!(
-            Operation::<DimensionType>::infer_output_types(&OneOperation::new(dimension_type.clone()), &[], &[]),
-            Ok(vec![dimension_type]),
-        );
+        assert_eq!(OneOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
 
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Scalar, OneOperation<DataType>>::new();

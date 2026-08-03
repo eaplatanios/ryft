@@ -108,7 +108,7 @@ mod tests {
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = TanhOperation::new(),
+            operation = TanhOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -173,7 +173,7 @@ mod tests {
     fn test_tanh_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = TanhOperation::new(),
+            operation = TanhOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }

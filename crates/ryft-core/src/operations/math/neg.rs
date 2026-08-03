@@ -175,7 +175,7 @@ mod tests {
             )
             .unwrap();
         check_operation_type_inference!(
-            operation = NegOperation::new(),
+            operation = NegOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [unreduced.clone()],
                 output_types = [unreduced],
@@ -190,7 +190,7 @@ mod tests {
             )
             .unwrap();
         check_operation_type_inference!(
-            operation = NegOperation::new(),
+            operation = NegOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [reduced.clone()],
                 output_types = [reduced],

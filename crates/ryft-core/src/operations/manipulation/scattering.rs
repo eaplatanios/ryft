@@ -307,7 +307,9 @@ impl Display for ScatterOperation {
     }
 }
 
-impl Operation<ArrayType> for ScatterOperation {
+impl Operation for ScatterOperation {
+    type Type = ArrayType;
+
     #[inline]
     fn name(&self) -> &'static str {
         SCATTER_OPERATION_NAME
@@ -421,7 +423,7 @@ where
 /// structural zero. Non-additive combiners are not linear and are rejected.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ScatterOperation
 where
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<GatherOperation>,
+    O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<GatherOperation>,
     Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
