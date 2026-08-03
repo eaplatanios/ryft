@@ -324,7 +324,7 @@ macro_rules! define_arithmetic_dimension_operation {
         impl ::std::fmt::Display for $operation {
             #[inline]
             fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                <$operation as $crate::programs::operations::Operation<$crate::types::DimensionType>>::render(
+                <$operation as $crate::programs::operations::Operation>::render(
                     self,
                     formatter,
                     0,
@@ -332,7 +332,9 @@ macro_rules! define_arithmetic_dimension_operation {
             }
         }
 
-        impl $crate::programs::operations::Operation<$crate::types::DimensionType> for $operation {
+        impl $crate::programs::operations::Operation for $operation {
+            type Type = $crate::types::DimensionType;
+
             #[inline]
             fn name(&self) -> &'static str {
                 $name
@@ -571,7 +573,9 @@ macro_rules! define_elementwise_operation {
     ) => {
         $crate::define_elementwise_operation!(@marker [$(#[$documentation])*] $operation, $name);
 
-        impl $crate::Operation<$crate::DataType> for $operation<$crate::DataType> {
+        impl $crate::Operation for $operation<$crate::DataType> {
+            type Type = $crate::DataType;
+
             #[inline]
             fn name(&self) -> &'static str {
                 $name
@@ -586,16 +590,16 @@ macro_rules! define_elementwise_operation {
                 $crate::check_count!("input", input_types, 1, TypeError);
                 $($($crate::check_types!($(@$data_type_check)+, $name, input_types);)*)?
                 let output_types: Result<Vec<$crate::DataType>, $crate::TypeError> =
-                    $crate::define_elementwise_operation!(
-                    @infer_data_types [$($infer_data_types)?] @unary input_types
-                );
+                    $crate::define_elementwise_operation!(@infer_data_types [$($infer_data_types)?] @unary input_types);
                 let output_types = output_types?;
                 $crate::check_count!("output", output_types, 1, TypeError);
                 Ok(output_types)
             }
         }
 
-        impl $crate::Operation<$crate::ArrayType> for $operation<$crate::ArrayType> {
+        impl $crate::Operation for $operation<$crate::ArrayType> {
+            type Type = $crate::ArrayType;
+
             #[inline]
             fn name(&self) -> &'static str {
                 $name
@@ -627,8 +631,9 @@ macro_rules! define_elementwise_operation {
                 $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
                 let output_types: Result<Vec<$crate::ArrayType>, $crate::TypeError> =
                     $crate::define_elementwise_operation!(
-                    @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @unary self, input_types
-                );
+                        @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @unary self,
+                        input_types,
+                    );
                 let output_types = output_types?;
                 $crate::check_count!("output", output_types, 1, TypeError);
                 Ok(output_types)
@@ -638,7 +643,7 @@ macro_rules! define_elementwise_operation {
         impl<__C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<__C>
             for $operation<__C::Type>
         where
-            $operation<__C::Type>: $crate::Operation<__C::Type>,
+            $operation<__C::Type>: $crate::Operation<Type = __C::Type>,
         {
             #[inline]
             fn interpret<__D: $crate::InterpretationDriver<__C>>(
@@ -654,7 +659,7 @@ macro_rules! define_elementwise_operation {
 
         impl<__C: $crate::Context> $crate::PartiallyEvaluatableOperation<__C> for $operation<__C::Type>
         where
-            $operation<__C::Type>: $crate::Operation<__C::Type>,
+            $operation<__C::Type>: $crate::Operation<Type = __C::Type>,
             __C::Operation: ::std::convert::From<$operation<__C::Type>>,
         {
         }
@@ -673,7 +678,9 @@ macro_rules! define_elementwise_operation {
     ) => {
         $crate::define_elementwise_operation!(@marker [$(#[$documentation])*] $operation, $name);
 
-        impl $crate::Operation<$crate::DataType> for $operation<$crate::DataType> {
+        impl $crate::Operation for $operation<$crate::DataType> {
+            type Type = $crate::DataType;
+
             #[inline]
             fn name(&self) -> &'static str {
                 $name
@@ -689,15 +696,18 @@ macro_rules! define_elementwise_operation {
                 $($($crate::check_types!($(@$data_type_selector)+, $name, input_types);)*)?
                 let output_types: Result<Vec<$crate::DataType>, $crate::TypeError> =
                     $crate::define_elementwise_operation!(
-                    @infer_data_types [$($infer_data_types)?] @binary input_types, $name
-                );
+                        @infer_data_types [$($infer_data_types)?] @binary input_types,
+                        $name,
+                    );
                 let output_types = output_types?;
                 $crate::check_count!("output", output_types, 1, TypeError);
                 Ok(output_types)
             }
         }
 
-        impl $crate::Operation<$crate::ArrayType> for $operation<$crate::ArrayType> {
+        impl $crate::Operation for $operation<$crate::ArrayType> {
+            type Type = $crate::ArrayType;
+
             #[inline]
             fn name(&self) -> &'static str {
                 $name
@@ -733,8 +743,10 @@ macro_rules! define_elementwise_operation {
                 $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
                 let output_types: Result<Vec<$crate::ArrayType>, $crate::TypeError> =
                     $crate::define_elementwise_operation!(
-                    @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @binary self, input_types, $name
-                );
+                        @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @binary self,
+                        input_types,
+                        $name,
+                    );
                 let output_types = output_types?;
                 $crate::check_count!("output", output_types, 1, TypeError);
                 Ok(output_types)
@@ -744,7 +756,7 @@ macro_rules! define_elementwise_operation {
         impl<__C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<__C>
             for $operation<__C::Type>
         where
-            $operation<__C::Type>: $crate::Operation<__C::Type>,
+            $operation<__C::Type>: $crate::Operation<Type = __C::Type>,
         {
             #[inline]
             fn interpret<__D: $crate::InterpretationDriver<__C>>(
@@ -760,7 +772,7 @@ macro_rules! define_elementwise_operation {
 
         impl<__C: $crate::Context> $crate::PartiallyEvaluatableOperation<__C> for $operation<__C::Type>
         where
-            $operation<__C::Type>: $crate::Operation<__C::Type>,
+            $operation<__C::Type>: $crate::Operation<Type = __C::Type>,
             __C::Operation: ::std::convert::From<$operation<__C::Type>>,
         {
         }
@@ -1035,7 +1047,7 @@ macro_rules! define_elementwise_capability {
 ///     transpose<V, O>
 ///     where
 ///         V: Value<Type = ArrayType>,
-///         O: Operation<ArrayType> + From<LegacyBroadcastOperation>,
+///         O: Operation<Type = ArrayType> + From<LegacyBroadcastOperation>,
 ///     {
 ///         |operation, context, driver, inputs, outputs| {
 ///             broadcast_transpose(operation, context, driver, inputs, outputs)
@@ -1273,7 +1285,7 @@ macro_rules! impl_differentiable_operation {
     ) => {
         impl<$context: $crate::Context $(, $generic)*> $crate::DifferentiableOperation<$context> for $operation
         where
-            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+            $operation: $crate::Operation<Type = <$context as $crate::Domain>::Type>,
             $($bounds)*
         {
             fn jvp<__D: $crate::DifferentiationDriver<$context>>(
@@ -1300,11 +1312,11 @@ macro_rules! impl_differentiable_operation {
     ) => {
         impl<
             $value: $crate::Value,
-            $operations: $crate::Operation<<$value as $crate::Typed>::Type>,
+            $operations: $crate::Operation<Type = <$value as $crate::Typed>::Type>,
             $($generic,)*
         > $crate::TransposableOperation<$value, $operations> for $operation
         where
-            $operation: $crate::Operation<<$value as $crate::Typed>::Type>,
+            $operation: $crate::Operation<Type = <$value as $crate::Typed>::Type>,
             $($bounds)*
         {
             fn transpose<__D: $crate::TranspositionDriver<$value, $operations>>(
@@ -1465,10 +1477,10 @@ macro_rules! impl_differentiable_elementwise_operation {
         impl<
             $type: $crate::DifferentiableType,
             __V: $crate::Value<Type = $type>,
-            __O: $crate::Operation<$type>,
+            __O: $crate::Operation<Type = $type>,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
-            $operation: $crate::Operation<$type>,
+            $operation: $crate::Operation<Type = $type>,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -1522,10 +1534,10 @@ macro_rules! impl_differentiable_elementwise_operation {
         impl<
             $type: $crate::Type,
             __V: $crate::Value<Type = $type>,
-            __O: $crate::Operation<$type>,
+            __O: $crate::Operation<Type = $type>,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
-            $operation: $crate::Operation<$type>,
+            $operation: $crate::Operation<Type = $type>,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -1565,10 +1577,10 @@ macro_rules! impl_differentiable_elementwise_operation {
             __T: $crate::DifferentiableType,
             __P: $crate::Type,
             __V: $crate::Value<Type = __T>,
-            __O: $crate::Operation<__T>,
+            __O: $crate::Operation<Type = __T>,
         > $crate::TransposableOperation<__V, __O> for $operation<__P>
         where
-            $operation<__P>: $crate::Operation<__T>,
+            $operation<__P>: $crate::Operation<Type = __T>,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -1932,10 +1944,10 @@ macro_rules! impl_differentiable_elementwise_operation {
             __T: $($transpose_type_bound)+,
             $($generic: $crate::Type,)*
             __V: $crate::Value<Type = __T>,
-            __O: $crate::Operation<__T> $($transpose_operation_bounds)*,
+            __O: $crate::Operation<Type = __T> $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
-            $operation: $crate::Operation<__T>,
+            $operation: $crate::Operation<Type = __T>,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -2036,11 +2048,11 @@ macro_rules! impl_differentiable_elementwise_operation {
             __T: $crate::DifferentiableType,
             $($generic: $crate::Type,)*
             __V: $crate::Value<Type = __T>,
-            __O: $crate::Operation<__T> $($transpose_operation_bounds)*,
+            __O: $crate::Operation<Type = __T> $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $crate::Tracer<$crate::TracingContext<__V, __O>>: $crate::ElementwiseDerivativeAlignment<__T>,
-            $operation: $crate::Operation<__T>,
+            $operation: $crate::Operation<Type = __T>,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -2065,7 +2077,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                             })
                             .collect()),
                     $crate::MaybeZero::Value(cotangent) => {
-                        let operation_name = $crate::Operation::<__T>::name(self);
+                        let operation_name = $crate::Operation::name(self);
                         Ok(vec![
                             $crate::impl_differentiable_elementwise_operation!(
                         @linear_transpose_contribution $left_sign, operation_name, &inputs[0], cotangent
@@ -2522,7 +2534,7 @@ macro_rules! impl_non_differentiable_operation {
         where
             __C::Type: $crate::DifferentiableType,
             __C::Operation: ::std::convert::From<$operation>,
-            $operation: $crate::Operation<__C::Type>,
+            $operation: $crate::Operation<Type = __C::Type>,
             $($bounds)*
         {
             #[inline]
@@ -2590,12 +2602,12 @@ macro_rules! impl_non_transposable_operation {
         impl<
             __T: $crate::Type,
             __V: $crate::Value<Type = __T>,
-            __O: $crate::Operation<__T>
+            __O: $crate::Operation<Type = __T>
             $(, $generic)*
         >
             $crate::TransposableOperation<__V, __O> for $operation
         where
-            $operation: $crate::Operation<__T>,
+            $operation: $crate::Operation<Type = __T>,
             $($bounds)*
         {
             #[inline]
@@ -2610,7 +2622,7 @@ macro_rules! impl_non_transposable_operation {
                 $crate::DifferentiationError,
             > {
                 Err($crate::ProgramError::UnsupportedOperation {
-                    message: format!("operation `{}` is not transposable", $crate::Operation::<__T>::name(self)),
+                    message: format!("operation `{}` is not transposable", $crate::Operation::name(self)),
                 }
                 .into())
             }
@@ -2654,10 +2666,10 @@ macro_rules! impl_nullary_transposable_operation {
 
     // This internal helper emits the transposition implementation shared by every public invocation form.
     (@impl [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
-        impl<__T: $crate::Type, __V: $crate::Value<Type = __T>, __O: $crate::Operation<__T> $(, $generic)*>
+        impl<__T: $crate::Type, __V: $crate::Value<Type = __T>, __O: $crate::Operation<Type = __T> $(, $generic)*>
             $crate::TransposableOperation<__V, __O> for $operation
         where
-            $operation: $crate::Operation<__T>,
+            $operation: $crate::Operation<Type = __T>,
             $($bounds)*
         {
             #[inline]
@@ -2672,7 +2684,7 @@ macro_rules! impl_nullary_transposable_operation {
                 $crate::DifferentiationError,
             > {
                 $crate::check_count!("input", inputs, 0, ProgramError);
-                let output_count = $crate::Operation::<__T>::infer_output_types(self, &[], &[])?.len();
+                let output_count = $crate::Operation::infer_output_types(self, &[], &[])?.len();
                 $crate::check_count!("output", outputs, output_count, ProgramError);
                 Ok(Vec::new())
             }
@@ -3001,7 +3013,7 @@ macro_rules! define_tracer_operator {
 /// # use ryft_core::{ArrayType, DataType, SinOperation, check_operation_type_inference};
 /// check_operation_type_inference!(
 ///     @reject @unreduced,
-///     operation = SinOperation::new(),
+///     operation = SinOperation::<ArrayType>::new(),
 ///     input_types = [ArrayType::scalar(DataType::F64)],
 /// );
 /// ```
@@ -3070,7 +3082,7 @@ macro_rules! check_operation_type_inference {
         input_types = [$($input_type:expr),+ $(,)?] $(,)?
     ) => {{
         let operation = $operation;
-        let descriptor = $crate::programs::operations::Operation::<$crate::types::ArrayType>::name(&operation);
+        let descriptor = $crate::programs::operations::Operation::name(&operation);
         let mesh = $crate::sharding::LogicalMesh::new(vec![
             $crate::sharding::MeshAxis::new("x", 2, $crate::sharding::MeshAxisType::Explicit).unwrap(),
         ])
@@ -3102,7 +3114,7 @@ macro_rules! check_operation_type_inference {
         input_types = [$left_type:expr, $right_type:expr $(,)?] $(,)?
     ) => {{
         let operation = $operation;
-        let descriptor = $crate::programs::operations::Operation::<$crate::types::ArrayType>::name(&operation);
+        let descriptor = $crate::programs::operations::Operation::name(&operation);
         let mesh = $crate::sharding::LogicalMesh::new(vec![
             $crate::sharding::MeshAxis::new("x", 2, $crate::sharding::MeshAxisType::Explicit).unwrap(),
         ])
@@ -3156,7 +3168,7 @@ macro_rules! check_operation_type_inference {
     ) => {{
         let input_types = [$($input_type),*];
         assert_eq!(
-            $crate::programs::operations::Operation::<$type>::infer_output_types(
+            $crate::programs::operations::Operation::infer_output_types(
                 &$operation,
                 input_types.as_slice(),
                 &[],
@@ -3178,7 +3190,7 @@ macro_rules! check_operation_type_inference {
         let input_data_type = $input_data_type;
         let output_data_types: ::std::vec::Vec<$crate::types::DataType> = ::std::vec![$($output_data_type),*];
         assert_eq!(
-            $crate::programs::operations::Operation::<$crate::types::DataType>::infer_output_types(
+            $crate::programs::operations::Operation::infer_output_types(
                 &$data_operation,
                 &[input_data_type],
                 &[],
@@ -3192,7 +3204,7 @@ macro_rules! check_operation_type_inference {
         .with_layout($crate::types::Layout::Strided($crate::types::StridedLayout::new(vec![3, 1])))
         .with_memory($crate::types::Memory::Host { pinned: true });
         assert_eq!(
-            $crate::programs::operations::Operation::<$crate::types::ArrayType>::infer_output_types(
+            $crate::programs::operations::Operation::infer_output_types(
                 &array_operation,
                 ::std::slice::from_ref(&input_type),
                 &[],
@@ -3232,7 +3244,7 @@ macro_rules! check_operation_type_inference {
         let right_data_type = $right_data_type;
         let output_data_types: ::std::vec::Vec<$crate::types::DataType> = ::std::vec![$($output_data_type),*];
         assert_eq!(
-            $crate::programs::operations::Operation::<$crate::types::DataType>::infer_output_types(
+            $crate::programs::operations::Operation::infer_output_types(
                 &$data_operation,
                 &[left_data_type, right_data_type],
                 &[],
@@ -3247,7 +3259,7 @@ macro_rules! check_operation_type_inference {
         .with_memory($crate::types::Memory::Host { pinned: true });
         let right_type = left_type.clone().with_data_type(right_data_type);
         assert_eq!(
-            $crate::programs::operations::Operation::<$crate::types::ArrayType>::infer_output_types(
+            $crate::programs::operations::Operation::infer_output_types(
                 &array_operation,
                 &[left_type.clone(), right_type],
                 &[],
@@ -3285,7 +3297,7 @@ macro_rules! check_operation_type_inference {
     ) => {{
         let input_types = [$($input_type),*];
         assert_eq!(
-            $crate::programs::operations::Operation::<$type>::infer_output_types(
+            $crate::programs::operations::Operation::infer_output_types(
                 &$operation,
                 input_types.as_slice(),
                 &[],
@@ -4814,7 +4826,9 @@ mod tests {
         }
     }
 
-    impl Operation<DataType> for TestNullaryOperation<DataType> {
+    impl Operation for TestNullaryOperation<DataType> {
+        type Type = DataType;
+
         fn name(&self) -> &'static str {
             "test_nullary"
         }
@@ -4829,7 +4843,9 @@ mod tests {
         }
     }
 
-    impl Operation<ArrayType> for TestNullaryOperation<ArrayType> {
+    impl Operation for TestNullaryOperation<ArrayType> {
+        type Type = ArrayType;
+
         fn name(&self) -> &'static str {
             "test_nullary"
         }
@@ -4861,15 +4877,17 @@ mod tests {
 
     /// Nullary operation used to instantiate the non-generic `where` macro forms.
     #[derive(Clone, Debug, Default)]
-    struct TestWhereNullaryOperation;
+    struct TestWhereNullaryOperation<T: Type>(PhantomData<fn() -> T>);
 
-    impl Display for TestWhereNullaryOperation {
+    impl<T: Type> Display for TestWhereNullaryOperation<T> {
         fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("test_where_nullary")
         }
     }
 
-    impl<T: Type> Operation<T> for TestWhereNullaryOperation {
+    impl<T: Type> Operation for TestWhereNullaryOperation<T> {
+        type Type = T;
+
         fn name(&self) -> &'static str {
             "test_where_nullary"
         }
@@ -4884,7 +4902,7 @@ mod tests {
         }
     }
 
-    impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for TestWhereNullaryOperation {
+    impl<C: Domain> InterpretableOperation<C> for TestWhereNullaryOperation<C::Type> {
         fn interpret<D: crate::InterpretationDriver<C>>(
             &self,
             _context: &C,
@@ -4896,32 +4914,34 @@ mod tests {
         }
     }
 
-    impl_non_differentiable_operation!(TestWhereNullaryOperation where DataType: Type);
-    impl_nullary_transposable_operation!(TestWhereNullaryOperation where DataType: Type);
-    impl_nullary_batchable_operation!(@replicated TestWhereNullaryOperation where DataType: Type);
+    impl_non_differentiable_operation!(TestWhereNullaryOperation<ArrayType> where DataType: Type);
+    impl_nullary_transposable_operation!(TestWhereNullaryOperation<DataType> where DataType: Type);
+    impl_nullary_batchable_operation!(@replicated TestWhereNullaryOperation<ArrayType> where DataType: Type);
 
     /// Generic nullary operation used to instantiate generic macro forms.
-    struct TestGenericNullaryOperation<Marker>(PhantomData<fn() -> Marker>);
+    struct TestGenericNullaryOperation<T>(PhantomData<fn() -> T>);
 
-    impl<Marker> Clone for TestGenericNullaryOperation<Marker> {
+    impl<T> Clone for TestGenericNullaryOperation<T> {
         fn clone(&self) -> Self {
             Self(PhantomData)
         }
     }
 
-    impl<Marker> Debug for TestGenericNullaryOperation<Marker> {
+    impl<T> Debug for TestGenericNullaryOperation<T> {
         fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("TestGenericNullaryOperation")
         }
     }
 
-    impl<Marker> Display for TestGenericNullaryOperation<Marker> {
+    impl<T> Display for TestGenericNullaryOperation<T> {
         fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("test_generic_nullary")
         }
     }
 
-    impl<T: Type, Marker> Operation<T> for TestGenericNullaryOperation<Marker> {
+    impl<T: Type> Operation for TestGenericNullaryOperation<T> {
+        type Type = T;
+
         fn name(&self) -> &'static str {
             "test_generic_nullary"
         }
@@ -4936,7 +4956,7 @@ mod tests {
         }
     }
 
-    impl<C: Domain<Type = ArrayType>, Marker> InterpretableOperation<C> for TestGenericNullaryOperation<Marker> {
+    impl<C: Domain> InterpretableOperation<C> for TestGenericNullaryOperation<C::Type> {
         fn interpret<D: crate::InterpretationDriver<C>>(
             &self,
             _context: &C,
@@ -4953,27 +4973,29 @@ mod tests {
     impl_nullary_batchable_operation!(@replicated <D> TestGenericNullaryOperation<D>);
 
     /// Generic nullary operation used to instantiate generic-plus-`where` macro forms.
-    struct TestBoundedNullaryOperation<Marker>(PhantomData<fn() -> Marker>);
+    struct TestBoundedNullaryOperation<T>(PhantomData<fn() -> T>);
 
-    impl<Marker> Clone for TestBoundedNullaryOperation<Marker> {
+    impl<T> Clone for TestBoundedNullaryOperation<T> {
         fn clone(&self) -> Self {
             Self(PhantomData)
         }
     }
 
-    impl<Marker> Debug for TestBoundedNullaryOperation<Marker> {
+    impl<T> Debug for TestBoundedNullaryOperation<T> {
         fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("TestBoundedNullaryOperation")
         }
     }
 
-    impl<Marker> Display for TestBoundedNullaryOperation<Marker> {
+    impl<T> Display for TestBoundedNullaryOperation<T> {
         fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("test_bounded_nullary")
         }
     }
 
-    impl<T: Type, Marker> Operation<T> for TestBoundedNullaryOperation<Marker> {
+    impl<T: Type> Operation for TestBoundedNullaryOperation<T> {
+        type Type = T;
+
         fn name(&self) -> &'static str {
             "test_bounded_nullary"
         }
@@ -4988,7 +5010,7 @@ mod tests {
         }
     }
 
-    impl<C: Domain<Type = ArrayType>, Marker> InterpretableOperation<C> for TestBoundedNullaryOperation<Marker> {
+    impl<C: Domain> InterpretableOperation<C> for TestBoundedNullaryOperation<C::Type> {
         fn interpret<D: crate::InterpretationDriver<C>>(
             &self,
             _context: &C,
@@ -5216,18 +5238,16 @@ mod tests {
         // The generated operation owns stable operand metadata and the result name and bounds needed to infer a fresh
         // program-atom identity.
         assert_eq!(format!("{operation}"), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME);
-        assert_eq!(Operation::<DimensionType>::name(&operation), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,);
+        assert_eq!(operation.name(), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,);
         assert_eq!(operation.left_type(), &left_type);
         assert_eq!(operation.right_type(), &right_type);
         assert_eq!(operation.result_bounds(), DimensionBounds::new(3, Some(9)).unwrap());
-        let result =
-            Operation::<DimensionType>::infer_output_types(&operation, &[left_type.clone(), right_type.clone()], &[])
-                .unwrap();
+        let result = Operation::infer_output_types(&operation, &[left_type.clone(), right_type.clone()], &[]).unwrap();
         assert_ne!(result[0].variable(), left_type.variable());
         assert_ne!(result[0].variable(), right_type.variable());
         assert_eq!(result[0].bounds(), operation.result_bounds());
         assert_eq!(
-            Operation::<DimensionType>::infer_output_types(&operation, std::slice::from_ref(&left_type), &[]),
+            Operation::infer_output_types(&operation, std::slice::from_ref(&left_type), &[]),
             Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
         );
         fn assert_arithmetic_dimension_operation<O: ArithmeticDimensionOperation>() {}
@@ -5292,7 +5312,9 @@ mod tests {
             }
         }
 
-        impl<T: Type> Operation<T> for TestMultiOutputOperation<T> {
+        impl<T: Type> Operation for TestMultiOutputOperation<T> {
+            type Type = T;
+
             fn name(&self) -> &'static str {
                 "test_multi_output"
             }
@@ -5313,7 +5335,7 @@ mod tests {
             }
 
             fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-                Operation::<ArrayType>::infer_output_types(self, input_types, &[])
+                Operation::infer_output_types(self, input_types, &[])
             }
         }
 
@@ -5385,13 +5407,13 @@ mod tests {
 
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = SinOperation::new(),
+            operation = SinOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
 
         check_operation_type_inference!(
             @reject @mismatched_reduced,
-            operation = AddOperation::new(),
+            operation = AddOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
@@ -5455,7 +5477,9 @@ mod tests {
         #[derive(Clone)]
         struct TestPairOperation;
 
-        impl Operation<ArrayType> for TestPairOperation {
+        impl Operation for TestPairOperation {
+            type Type = ArrayType;
+
             fn name(&self) -> &'static str {
                 "test_pair"
             }
@@ -5657,7 +5681,7 @@ mod tests {
         );
         check_operation_transposition!(
             @rejected,
-            operation = SinOperation::new(),
+            operation = SinOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
@@ -5671,39 +5695,33 @@ mod tests {
         assert_eq!(TestUnaryOperation::<DataType>::default().to_string(), TEST_UNARY_OPERATION_NAME);
         assert_eq!(format!("{data_operation:?}"), "TestUnaryOperation");
         assert_eq!(format!("{data_operation}"), TEST_UNARY_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::name(&data_operation), TEST_UNARY_OPERATION_NAME);
+        assert_eq!(data_operation.name(), TEST_UNARY_OPERATION_NAME);
         assert_eq!(ElementwiseOperation::input_count(&array_operation), 1);
+        assert_eq!(data_operation.infer_output_types(&[DataType::F32], &[]), Ok(vec![DataType::F32]));
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::F32], &[]),
-            Ok(vec![DataType::F32])
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_operation, &[], &[]),
+            data_operation.infer_output_types(&[], &[]),
             Err(TypeError::invalid("expected 1 input but got 0".to_string())),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::Boolean], &[]),
+            data_operation.infer_output_types(&[DataType::Boolean], &[]),
             Err(TypeError::invalid("'test_unary' does not support input data type bool".to_string())),
         );
+        assert_eq!(data_operation.infer_output_types(&[DataType::I64], &[]), Ok(vec![DataType::I64]),);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::I64], &[]),
-            Ok(vec![DataType::I64]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::C64], &[]),
+            data_operation.infer_output_types(&[DataType::C64], &[]),
             Err(TypeError::invalid("'test_unary' does not support input data type c64".to_string())),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::F32)], &[]),
+            Operation::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::F32)], &[]),
             Ok(vec![ArrayType::scalar(DataType::F32)]),
         );
         let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&array_operation, std::slice::from_ref(&matrix_type), &[]),
+            Operation::infer_output_types(&array_operation, std::slice::from_ref(&matrix_type), &[]),
             Ok(vec![matrix_type]),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::C64)], &[]),
+            Operation::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::C64)], &[]),
             Err(TypeError::invalid("'test_unary' does not support input data type c64".to_string())),
         );
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -5711,7 +5729,7 @@ mod tests {
             .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&array_operation, &[unreduced_type], &[]),
+            Operation::infer_output_types(&array_operation, &[unreduced_type], &[]),
             Err(TypeError::invalid("'test_unary' does not support unreduced operands".to_string())),
         );
         assert_eq!(
@@ -5749,36 +5767,30 @@ mod tests {
         assert_eq!(TestBinaryOperation::<DataType>::default().to_string(), TEST_BINARY_OPERATION_NAME);
         assert_eq!(format!("{data_operation:?}"), "TestBinaryOperation");
         assert_eq!(format!("{data_operation}"), TEST_BINARY_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::name(&data_operation), TEST_BINARY_OPERATION_NAME);
+        assert_eq!(data_operation.name(), TEST_BINARY_OPERATION_NAME);
         assert_eq!(ElementwiseOperation::input_count(&array_operation), 2);
+        assert_eq!(data_operation.infer_output_types(&[DataType::F32, DataType::F64], &[]), Ok(vec![DataType::F64]),);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::F32, DataType::F64], &[]),
-            Ok(vec![DataType::F64]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::F32], &[]),
+            data_operation.infer_output_types(&[DataType::F32], &[]),
             Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::Boolean, DataType::Boolean], &[]),
+            data_operation.infer_output_types(&[DataType::Boolean, DataType::Boolean], &[]),
             Err(TypeError::invalid("'test_binary' does not support input data type bool".to_string())),
         );
+        assert_eq!(data_operation.infer_output_types(&[DataType::I64, DataType::I64], &[]), Ok(vec![DataType::I64]),);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::I64, DataType::I64], &[]),
-            Ok(vec![DataType::I64]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_operation, &[DataType::C64, DataType::C64], &[]),
+            data_operation.infer_output_types(&[DataType::C64, DataType::C64], &[]),
             Err(TypeError::invalid("'test_binary' does not support input data type c64".to_string())),
         );
         let scalar_type = ArrayType::scalar(DataType::F32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&array_operation, &[scalar_type, vector_type.clone()], &[]),
+            Operation::infer_output_types(&array_operation, &[scalar_type, vector_type.clone()], &[]),
             Ok(vec![vector_type]),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
+            Operation::infer_output_types(
                 &array_operation,
                 &[ArrayType::scalar(DataType::C64), ArrayType::scalar(DataType::C64)],
                 &[],
@@ -5797,7 +5809,7 @@ mod tests {
             .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_unreduced_axes(["y"]).unwrap())
             .unwrap();
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&array_operation, &[unreduced_x, unreduced_y], &[]),
+            Operation::infer_output_types(&array_operation, &[unreduced_x, unreduced_y], &[]),
             Err(TypeError::invalid("'test_binary' operands must be unreduced over the same axes".to_string())),
         );
         assert_eq!(
@@ -5828,14 +5840,11 @@ mod tests {
     fn test_define_elementwise_operation_custom_inference() {
         let data_magnitude = TestMagnitudeOperation::<DataType>::new();
         let array_magnitude = TestMagnitudeOperation::<ArrayType>::new();
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_magnitude, &[DataType::C64], &[]),
-            Ok(vec![DataType::F32]),
-        );
+        assert_eq!(data_magnitude.infer_output_types(&[DataType::C64], &[]), Ok(vec![DataType::F32]),);
         let complex_vector = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(2)]));
         let real_vector = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&array_magnitude, std::slice::from_ref(&complex_vector), &[],),
+            Operation::infer_output_types(&array_magnitude, std::slice::from_ref(&complex_vector), &[]),
             Ok(vec![real_vector.clone()]),
         );
         assert_eq!(
@@ -5845,19 +5854,16 @@ mod tests {
 
         let data_strict_add = TestStrictAddOperation::<DataType>::new();
         let array_strict_add = TestStrictAddOperation::<ArrayType>::new();
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&data_strict_add, &[DataType::F32, DataType::F64], &[]),
-            Ok(vec![DataType::F64]),
-        );
+        assert_eq!(data_strict_add.infer_output_types(&[DataType::F32, DataType::F64], &[]), Ok(vec![DataType::F64]),);
         let scalar = ArrayType::scalar(DataType::F32);
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&array_strict_add, &[scalar.clone(), scalar.clone()], &[],),
+            Operation::infer_output_types(&array_strict_add, &[scalar.clone(), scalar.clone()], &[]),
             Ok(vec![scalar.clone()]),
         );
         let vector = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let expected = Err(TypeError::invalid("test strict-add inputs must have identical array types".to_string()));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&array_strict_add, &[scalar.clone(), vector.clone()], &[],),
+            Operation::infer_output_types(&array_strict_add, &[scalar.clone(), vector.clone()], &[]),
             expected.clone(),
         );
         assert_eq!(ElementwiseOperation::infer_output_types(&array_strict_add, &[scalar, vector]), expected);
@@ -5869,7 +5875,7 @@ mod tests {
         let output = context.input(DataType::F32).test_unary().unwrap();
         let builder = output.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_UNARY_OPERATION_NAME);
+        assert_eq!(builder.instructions()[0].operation().name(), TEST_UNARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs().len(), 1);
         assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
     }
@@ -5882,7 +5888,7 @@ mod tests {
         let output = left.test_binary(&right).unwrap();
         let builder = output.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_BINARY_OPERATION_NAME);
+        assert_eq!(builder.instructions()[0].operation().name(), TEST_BINARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs(), &[left.atom_id().unwrap(), right.atom_id().unwrap()]);
         assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
     }
@@ -6217,23 +6223,23 @@ mod tests {
         assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
 
         // The generic form produces the same implementation shape without constraining its marker parameter.
-        let operation = TestGenericNullaryOperation::<()>(PhantomData);
+        let operation = TestGenericNullaryOperation::<ArrayType>(PhantomData);
         let outputs = operation
-            .jvp(&EagerContext::<Array, TestGenericNullaryOperation<()>>::new(), &EmptyRegionDriver, &[])
+            .jvp(&EagerContext::<Array, TestGenericNullaryOperation<ArrayType>>::new(), &EmptyRegionDriver, &[])
             .unwrap();
         assert!(outputs.is_empty());
 
         // The `where` forms remain usable for both non-generic and generic operation types.
         fn assert_differentiable<O>()
         where
-            O: Operation<ArrayType>
+            O: Operation<Type = ArrayType>
                 + InterpretableOperation<EagerContext<Array, O>>
                 + DifferentiableOperation<EagerContext<Array, O>>,
         {
         }
 
-        assert_differentiable::<TestWhereNullaryOperation>();
-        assert_differentiable::<TestBoundedNullaryOperation<()>>();
+        assert_differentiable::<TestWhereNullaryOperation<ArrayType>>();
+        assert_differentiable::<TestBoundedNullaryOperation<ArrayType>>();
     }
 
     #[test]
@@ -6288,11 +6294,11 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidOutputCount { expected: 2, actual: 0 })),
         ));
 
-        fn assert_transposable<O: Operation<DataType> + TransposableOperation<Scalar, O>>() {}
+        fn assert_transposable<O: Operation<Type = DataType> + TransposableOperation<Scalar, O>>() {}
 
-        assert_transposable::<TestWhereNullaryOperation>();
-        assert_transposable::<TestGenericNullaryOperation<()>>();
-        assert_transposable::<TestBoundedNullaryOperation<()>>();
+        assert_transposable::<TestWhereNullaryOperation<DataType>>();
+        assert_transposable::<TestGenericNullaryOperation<DataType>>();
+        assert_transposable::<TestBoundedNullaryOperation<DataType>>();
     }
 
     #[test]
@@ -6321,15 +6327,15 @@ mod tests {
 
         fn assert_batchable<O>()
         where
-            O: Operation<ArrayType>
+            O: Operation<Type = ArrayType>
                 + InterpretableOperation<EagerContext<Array, O>>
                 + BatchableOperation<EagerContext<Array, O>, ArrayBatching>,
         {
         }
 
-        assert_batchable::<TestWhereNullaryOperation>();
-        assert_batchable::<TestGenericNullaryOperation<()>>();
-        assert_batchable::<TestBoundedNullaryOperation<()>>();
+        assert_batchable::<TestWhereNullaryOperation<ArrayType>>();
+        assert_batchable::<TestGenericNullaryOperation<ArrayType>>();
+        assert_batchable::<TestBoundedNullaryOperation<ArrayType>>();
     }
 
     #[test]
@@ -6340,7 +6346,7 @@ mod tests {
         let output = input.apply_unary();
         let builder = output.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_UNARY_OPERATION_NAME);
+        assert_eq!(builder.instructions()[0].operation().name(), TEST_UNARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs(), &[input_id]);
         drop(builder);
 
@@ -6382,7 +6388,7 @@ mod tests {
         let output = left.apply_binary(right);
         let builder = output.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_BINARY_OPERATION_NAME);
+        assert_eq!(builder.instructions()[0].operation().name(), TEST_BINARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs(), &input_ids);
         drop(builder);
 
@@ -6433,7 +6439,7 @@ mod tests {
         let output = left.apply_provided_binary(right);
         let builder = output.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_BINARY_OPERATION_NAME,);
+        assert_eq!(builder.instructions()[0].operation().name(), TEST_BINARY_OPERATION_NAME,);
         assert_eq!(builder.instructions()[0].inputs(), &input_ids);
         drop(builder);
 
