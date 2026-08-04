@@ -949,7 +949,8 @@ where
 ///      semantic [`iteration_bound`](WhileOperation::with_iteration_bound) (so bounded loops stay reverse-capable
 ///      under `batch`).
 ///   3. When the predicate output is *batched* (per-item termination), every state element is widened to a batched
-///      element, the condition is re-batched with its predicate output instantiated at axis `0`, and one
+///      element, the condition's predicate output is instantiated at axis `0` (re-batching the condition only when its
+///      natural predicate axis is not already `0`), and one
 ///      [`WhileOperation`] is bound directly with that batched predicate (mirroring JAX's
 ///      `_while_loop_batching_rule`). The predicate's `[axis_size]` shape is a prefix of every widened state shape,
 ///      so the bound loop satisfies the relaxed predicate contract and its consumers own the masked semantics:
@@ -1028,11 +1029,14 @@ where
         // Batch the condition at the stabilized axes; a batched predicate output means per-item termination, in
         // which case every state element participates in per-item masking and is therefore widened to a batched
         // element before the masked loop structure is built.
-        let (mut batched_condition, mut condition_axes) = driver
-            .batch_program(context, condition_region, state_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
-            .into_parts();
-        check_count!("output", condition_axes, 1, ProgramError);
-        let batch_varying = !condition_axes[0].is_replicated();
+        let mut batched_condition = driver.batch_program(
+            context,
+            condition_region,
+            state_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        check_count!("output", batched_condition.output_axes(), 1, ProgramError);
+        let batch_varying = !batched_condition.output_axes()[0].is_replicated();
         if batch_varying && state_axes.iter().any(|axis| axis.is_replicated()) {
             state_axes = vec![BatchAxis::new(0); state_count];
             let (widened_body, body_axes) = driver
@@ -1045,15 +1049,13 @@ where
                 .into_parts();
             check_count!("output", body_axes, state_count, ProgramError);
             batched_body = widened_body;
-            (batched_condition, condition_axes) = driver
-                .batch_program(
-                    context,
-                    condition_region,
-                    state_axes.as_slice(),
-                    ProgramBatchingOutputAxesPolicy::Natural,
-                )?
-                .into_parts();
-            check_count!("output", condition_axes, 1, ProgramError);
+            batched_condition = driver.batch_program(
+                context,
+                condition_region,
+                state_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )?;
+            check_count!("output", batched_condition.output_axes(), 1, ProgramError);
         }
 
         // Widen the parent state values whose elements became batched (their batch axis is materialized through a
@@ -1067,6 +1069,7 @@ where
 
         // Replicated predicate: stage one while over the batched condition and body directly.
         if !batch_varying {
+            let batched_condition = batched_condition.into_parts().0;
             let batched_while = WhileOperation::new().with_iteration_bound(self.iteration_bound())?;
             let outputs = context.parent().bind(batched_while, vec![batched_condition, batched_body], &state_values)?;
             check_count!("output", outputs, state_count, ProgramError);
@@ -1087,16 +1090,16 @@ where
         // staged loop satisfies the relaxed predicate contract, and the loop's consumers own the masked semantics:
         // eager interpretation continues while any per-item predicate is true and freezes finished items through
         // `WhilePredicate::mask_select`, and the XLA lowering
-        // reduces the predicate with `or` and masks carry updates with a broadcast select.
-        let (batched_condition, condition_axes) = driver
-            .batch_program(
-                context,
-                condition_region,
-                state_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0)]),
-            )?
-            .into_parts();
-        check_count!("output", condition_axes, 1, ProgramError);
+        // reduces the predicate with `or` and masks carry updates with a broadcast select. The condition batched above
+        // used these same state axes, so a predicate that naturally landed on axis 0 keeps that program instead of
+        // being replayed for an alignment that would stage nothing.
+        let batched_condition = context.align_batched_program_outputs(
+            driver,
+            condition_region,
+            state_axes.as_slice(),
+            batched_condition,
+            &[BatchAxis::new(0)],
+        )?;
         let batched_while = WhileOperation::new().with_iteration_bound(self.iteration_bound())?;
         let outputs = context.parent().bind(batched_while, vec![batched_condition, batched_body], &state_values)?;
         check_count!("output", outputs, state_count, ProgramError);
@@ -1184,17 +1187,15 @@ where
                 }
             }
             if !widened {
-                batched_body = Some(
-                    driver
-                        .batch_program(
-                            context,
-                            body_region,
-                            state_axes.as_slice(),
-                            ProgramBatchingOutputAxesPolicy::AlignEachTo(state_axes.clone()),
-                        )?
-                        .into_parts()
-                        .0,
-                );
+                // The stabilizing pass already used these input axes, so when its discovered (normalized) output axes
+                // equal the state axes it *is* the aligned body and is kept as-is instead of being rebuilt.
+                batched_body = Some(context.align_batched_program_outputs(
+                    driver,
+                    body_region,
+                    state_axes.as_slice(),
+                    candidate,
+                    state_axes.as_slice(),
+                )?);
                 break;
             }
         }
@@ -2497,6 +2498,7 @@ mod tests {
     use crate::operations::math::{AddOperation, DivOperation, MulOperation, SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::Parameter;
     use crate::programs::effects::Effects;
+    use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
     use crate::types::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
 
@@ -3996,6 +3998,38 @@ mod tests {
         assert!(rendered.contains("iteration_bound=2"), "{rendered}");
         let output = program.interpret(Array::vector(vec![3.0, 1.0, 2.0])).unwrap();
         assert_eq!(output.to_f64s(), vec![1.0, 0.0, 0.0]);
+    }
+
+    /// The rule batches the condition with natural output axes to detect per-item termination and then instantiates its
+    /// predicate at axis 0. `AlignEachTo` stages axis movement only where a natural axis differs from a mapped target,
+    /// so a predicate that already landed on axis 0 over unchanged state axes keeps its discovery program: batching the
+    /// countdown loop performs one structural pass per region instead of re-batching the condition a second time.
+    #[test]
+    fn test_while_batching_reuses_the_naturally_aligned_batched_predicate_program() {
+        let (countdown_operation, countdown_regions) = countdown_while_operation();
+        let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let builder = parent.builder().clone();
+        let packed_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let state_atom = builder.borrow_mut().add_input(packed_type.clone());
+        let state = parent.tracer(state_atom, None);
+        let context = BatchingContext::new(parent, 3);
+        let inputs = vec![ArrayBatch::new(packed_type, state, BatchAxis::new(0)).unwrap()];
+        let driver = CountingBatchingDriver::new(&countdown_regions);
+        let outputs = countdown_operation.batch(&context, &driver, inputs.as_slice()).unwrap();
+        assert_eq!(driver.batch_program_calls(), 2);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<Array, Array>(vec![outputs[0].value().atom_id().unwrap()], Placeholder, Placeholder)
+            .unwrap();
+
+        // The staged loop keeps the relaxed batched predicate and its masked per-item semantics.
+        let rendered = program.to_string();
+        assert_eq!(rendered.matches("= while").count(), 1, "{rendered}");
+        assert!(rendered.contains("%2:bool[3] = compare"), "{rendered}");
+        assert_eq!(program.interpret(Array::vector(vec![3.0, 1.0, 2.0])).unwrap().to_f64s(), vec![0.0, 0.0, 0.0]);
     }
 
     /// Builds the `while (counter > 0) { (counter, value) = (counter - 1, value + value) }` loop whose predicate

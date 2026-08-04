@@ -895,41 +895,48 @@ where
         }
 
         // Replicated (abstract) predicate: batch both branches at the operand batch axes with natural output axes to
-        // discover which outputs each branch batches (the discovery programs are discarded), join the two answers into
-        // one output layout — preferring the true branch's natural axis when both are batched — and re-batch each
-        // branch instantiated at the joined targets so the branch signatures agree. This is the two-pass shape of
-        // JAX's `_cond_batching_rule` (`batch_jaxpr` with `instantiate=out_bat`).
+        // discover which outputs each branch batches, join the two answers into one output layout — preferring the
+        // true branch's natural axis when both are batched — and instantiate each branch at the joined targets so the
+        // branch signatures agree. This is the two-pass shape of JAX's `_cond_batching_rule` (`batch_jaxpr` with
+        // `instantiate=out_bat`). Each branch is instantiated independently through
+        // `BatchingContext::align_batched_program_outputs`, which keeps a discovery program whose (normalized) natural
+        // axes already equal the joined targets because an aligned replay of it would rebuild the identical program.
         let operand_axes = operand_inputs.iter().map(|input| input.batch_axis()).collect::<Vec<_>>();
         let true_region = driver.region(0)?;
         let false_region = driver.region(1)?;
-        let (_, true_axes) = driver
-            .batch_program(context, true_region, operand_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
-            .into_parts();
-        let (_, false_axes) = driver
-            .batch_program(context, false_region, operand_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
-            .into_parts();
-        check_count!("output", false_axes, true_axes.len(), ProgramError);
-        let output_axes: Vec<BatchAxis> = true_axes
+        let true_program = driver.batch_program(
+            context,
+            true_region,
+            operand_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let false_program = driver.batch_program(
+            context,
+            false_region,
+            operand_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        check_count!("output", false_program.output_axes(), true_program.output_axes().len(), ProgramError);
+        let output_axes: Vec<BatchAxis> = true_program
+            .output_axes()
             .iter()
-            .zip(false_axes.iter())
+            .zip(false_program.output_axes())
             .map(|(true_axis, false_axis)| if true_axis.is_replicated() { *false_axis } else { *true_axis })
             .collect();
-        let (batched_true_branch, _) = driver
-            .batch_program(
-                context,
-                true_region,
-                operand_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
-            )?
-            .into_parts();
-        let (batched_false_branch, _) = driver
-            .batch_program(
-                context,
-                false_region,
-                operand_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
-            )?
-            .into_parts();
+        let batched_true_branch = context.align_batched_program_outputs(
+            driver,
+            true_region,
+            operand_axes.as_slice(),
+            true_program,
+            output_axes.as_slice(),
+        )?;
+        let batched_false_branch = context.align_batched_program_outputs(
+            driver,
+            false_region,
+            operand_axes.as_slice(),
+            false_program,
+            output_axes.as_slice(),
+        )?;
 
         // Stage one condition over the batched branches with the unbatched predicate passed through.
         let batched_condition = ConditionOperation::new();
@@ -1032,41 +1039,43 @@ where
             let operand_axes = operands.iter().map(ArrayProgramBatch::batch_axis).collect::<Vec<_>>();
             let true_region = driver.region(0)?;
             let false_region = driver.region(1)?;
-            let true_axes = driver
-                .batch_program(context, true_region, operand_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
+            let true_program = driver.batch_program(
+                context,
+                true_region,
+                operand_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )?;
+            let false_program = driver.batch_program(
+                context,
+                false_region,
+                operand_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )?;
+            check_count!("output", false_program.output_axes(), true_program.output_axes().len(), ProgramError);
+            let output_axes = true_program
                 .output_axes()
-                .to_vec();
-            let false_axes = driver
-                .batch_program(
-                    context,
-                    false_region,
-                    operand_axes.as_slice(),
-                    ProgramBatchingOutputAxesPolicy::Natural,
-                )?
-                .output_axes()
-                .to_vec();
-            check_count!("output", false_axes, true_axes.len(), ProgramError);
-            let output_axes = true_axes
                 .iter()
-                .zip(false_axes)
-                .map(|(true_axis, false_axis)| if true_axis.is_replicated() { false_axis } else { *true_axis })
+                .zip(false_program.output_axes())
+                .map(|(true_axis, false_axis)| if true_axis.is_replicated() { *false_axis } else { *true_axis })
                 .collect::<Vec<_>>();
-            let (true_branch, _) = driver
-                .batch_program(
-                    context,
-                    true_region,
-                    operand_axes.as_slice(),
-                    ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
-                )?
-                .into_parts();
-            let (false_branch, _) = driver
-                .batch_program(
-                    context,
-                    false_region,
-                    operand_axes.as_slice(),
-                    ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
-                )?
-                .into_parts();
+
+            // Each branch is instantiated at the joined targets independently. A branch whose discovered (normalized)
+            // axes already equal those targets keeps its discovery program because an aligned replay of it would
+            // rebuild the identical program.
+            let true_branch = context.align_batched_program_outputs(
+                driver,
+                true_region,
+                operand_axes.as_slice(),
+                true_program,
+                output_axes.as_slice(),
+            )?;
+            let false_branch = context.align_batched_program_outputs(
+                driver,
+                false_region,
+                operand_axes.as_slice(),
+                false_program,
+                output_axes.as_slice(),
+            )?;
 
             let mut packed_inputs = Vec::with_capacity(inputs.len() + 1);
             packed_inputs.push(predicate.value().clone());
@@ -1359,6 +1368,7 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::programs::effects::Effects;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
     use crate::tracing::Trace;
     use crate::types::{DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
@@ -1891,6 +1901,117 @@ mod tests {
         let operand = Array::vector(vec![1.0, 4.0, 9.0]);
         assert_eq!(program.interpret((truthy, operand.clone())).unwrap().to_f64s(), vec![2.0, 8.0, 18.0]);
         assert_eq!(program.interpret((falsy, operand)).unwrap().to_f64s(), vec![3.0, 12.0, 27.0]);
+    }
+
+    /// The replicated-predicate rule discovers each branch's natural output axes before instantiating both branches at
+    /// the joined layout. `AlignEachTo` stages axis movement only where a natural axis differs from a mapped target, so
+    /// a branch whose discovered axes already equal the joined targets keeps its discovery program and the rule
+    /// performs one structural pass for it instead of two.
+    #[test]
+    fn test_condition_batching_reuses_naturally_aligned_branch_programs() {
+        let packed_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand_values = Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // Both branches scale the batched operand per batch item, so both discover axis 0 and the joined layout equals
+        // each branch's discovered layout: the rule batches each branch exactly once.
+        let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let builder = parent.builder().clone();
+        let predicate_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
+        let operand_atom = builder.borrow_mut().add_input(packed_type.clone());
+        let predicate = parent.tracer(predicate_atom, None);
+        let operand = parent.tracer(operand_atom, None);
+        let context = BatchingContext::new(parent, 2);
+        let inputs = vec![
+            ArrayBatch::replicated(predicate),
+            ArrayBatch::new(packed_type.clone(), operand, BatchAxis::new(0)).unwrap(),
+        ];
+        let regions = vec![vector_scale_branch(3, 2.0), vector_scale_branch(3, 3.0)];
+        let driver = CountingBatchingDriver::new(&regions);
+        let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap();
+        assert_eq!(driver.batch_program_calls(), 2);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Array, Array), Array>(
+                vec![outputs[0].value().atom_id().unwrap()],
+                (Placeholder, Placeholder),
+                Placeholder,
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[2, 3] .
+                let %2:f64[2, 3] = condition %0 %1 [
+                    true={
+                        lambda %0:f64[2, 3] .
+                        let %1:f64[] = const
+                            %2:f64[2, 3] = broadcast [output_type=f64[2, 3], output_axes=[]] %1
+                            %3:f64[2, 3] = mul %0 %2
+                        in (%3)
+                    },
+                    false={
+                        lambda %0:f64[2, 3] .
+                        let %1:f64[] = const
+                            %2:f64[2, 3] = broadcast [output_type=f64[2, 3], output_axes=[]] %1
+                            %3:f64[2, 3] = mul %0 %2
+                        in (%3)
+                    },
+                ]
+                in (%2)"},
+        );
+        assert_eq!(
+            program.interpret((truthy.clone(), operand_values.clone())).unwrap().to_f64s(),
+            vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0],
+        );
+        assert_eq!(
+            program.interpret((falsy.clone(), operand_values.clone())).unwrap().to_f64s(),
+            vec![3.0, 6.0, 9.0, 12.0, 15.0, 18.0],
+        );
+
+        // A replicated false-branch output disagrees with the joined layout, so only that branch is re-batched to
+        // broadcast its output across the batch: three structural passes in total.
+        let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let builder = parent.builder().clone();
+        let predicate_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
+        let operand_atom = builder.borrow_mut().add_input(packed_type.clone());
+        let predicate = parent.tracer(predicate_atom, None);
+        let operand = parent.tracer(operand_atom, None);
+        let context = BatchingContext::new(parent, 2);
+        let inputs = vec![
+            ArrayBatch::replicated(predicate),
+            ArrayBatch::new(packed_type.clone(), operand, BatchAxis::new(0)).unwrap(),
+        ];
+        let regions = vec![vector_scale_branch(3, 2.0), constant_vector_branch(vec![10.0, 20.0, 30.0])];
+        let driver = CountingBatchingDriver::new(&regions);
+        let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap();
+        assert_eq!(driver.batch_program_calls(), 3);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Array, Array), Array>(
+                vec![outputs[0].value().atom_id().unwrap()],
+                (Placeholder, Placeholder),
+                Placeholder,
+            )
+            .unwrap();
+        assert_eq!(
+            program.interpret((truthy, operand_values.clone())).unwrap().to_f64s(),
+            vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0],
+        );
+
+        // The re-batched false branch broadcasts its replicated constant across the batch, so every batch item
+        // receives the same constant vector.
+        assert_eq!(
+            program.interpret((falsy, operand_values)).unwrap().to_f64s(),
+            vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0],
+        );
     }
 
     #[test]

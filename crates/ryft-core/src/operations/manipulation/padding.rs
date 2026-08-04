@@ -2,6 +2,9 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::axes::Axis;
+use crate::backends::array_programs::batching::{
+    ArrayProgramBatch, ArrayProgramBatching, align_array_batch, array_dimension,
+};
 use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue, LinearResiduals};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
@@ -22,7 +25,9 @@ use crate::operations::dimensions::{
     DimensionAddOperation, DimensionMulOperation, DimensionSaturatingSubOperation, DimensionSize,
     DimensionSizeOperation,
 };
-use crate::operations::manipulation::{DynamicShapeSliceOperation, LegacyBroadcast, SliceOperation, Transpose};
+use crate::operations::manipulation::{
+    BroadcastOperation, DynamicShapeSliceOperation, LegacyBroadcast, SliceOperation, Transpose,
+};
 use crate::operations::math::{ReduceOperation, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
@@ -996,6 +1001,176 @@ where
         let output = C::Value::select(&mask, &padded, &broadcasted_padding)?;
         let output_type = output.r#type().into_owned();
         Ok(vec![ArrayBatch::new(output_type, output, BatchAxis::from_position(batch_axis))?])
+    }
+}
+
+/// Batching rule for mixed [`PadOperation<ArrayProgramType>`] instructions. Explicit result extents remain
+/// replicated. When the scalar padding value varies across the batch, the rule pads with zero and uses a padded mask
+/// to select the broadcast per-item padding value without changing `pad`'s scalar operand contract.
+impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching> for PadOperation<ArrayProgramType>
+where
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
+    C::Operation: From<BroadcastOperation>
+        + From<DimensionOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + From<OneOperation<ArrayType>>
+        + From<PadOperation<ArrayType>>
+        + OperationProjection<ArrayType, Projected: From<SelectOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>,
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayProgramBatching>,
+        _driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        if inputs.len() < 2 {
+            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+        }
+        let (array_inputs, output_extents) = inputs.split_at(2);
+        let [operand, padding_value] = array_inputs else {
+            unreachable!();
+        };
+        <&ArrayType>::try_from(operand.unbatched_type())?;
+        <&ArrayType>::try_from(padding_value.unbatched_type())?;
+        for extent in output_extents {
+            extent.validate_replicated_dimension()?;
+        }
+        let operand_type = <&ArrayType>::try_from(operand.value().r#type().as_ref())?.clone();
+        let padding_value_type = <&ArrayType>::try_from(padding_value.value().r#type().as_ref())?.clone();
+        let operand_batch = ArrayBatch::new(
+            operand_type,
+            <C::Value as ValueProjection<ArrayType>>::into_projected(operand.value().clone())?,
+            operand.batch_axis(),
+        )?;
+        let padding_value_batch = ArrayBatch::new(
+            padding_value_type,
+            <C::Value as ValueProjection<ArrayType>>::into_projected(padding_value.value().clone())?,
+            padding_value.batch_axis(),
+        )?;
+        let Some(batch_axis) = operand_batch
+            .batch_axis_position()
+            .or(Some(0).filter(|_| !padding_value_batch.batch_axis().is_replicated()))
+        else {
+            return Ok(context
+                .parent()
+                .bind(
+                    PadOperation::<ArrayType>::from(self.clone()),
+                    Vec::new(),
+                    &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .map(ArrayProgramBatch::replicated)
+                .collect());
+        };
+
+        let operand_batch = align_array_batch(context, operand.clone(), Axis::from(batch_axis))?;
+        let operand_batch = ArrayBatch::new(
+            <&ArrayType>::try_from(operand_batch.value().r#type().as_ref())?.clone(),
+            <C::Value as ValueProjection<ArrayType>>::into_projected(operand_batch.into_value())?,
+            BatchAxis::from_position(batch_axis),
+        )?;
+        let mut edge_padding_low = self.edge_padding_low().to_vec();
+        edge_padding_low.insert(batch_axis, 0);
+        let mut edge_padding_high = self.edge_padding_high().to_vec();
+        edge_padding_high.insert(batch_axis, 0);
+        let mut interior_padding = self.interior_padding().to_vec();
+        interior_padding.insert(batch_axis, 0);
+        let operation = PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?;
+        let mut lifted_output_extents = Vec::with_capacity(output_extents.len() + 1);
+        lifted_output_extents.extend(output_extents[..batch_axis].iter().map(|extent| extent.value().clone()));
+        lifted_output_extents.push(context.axis_extent().clone());
+        lifted_output_extents.extend(output_extents[batch_axis..].iter().map(|extent| extent.value().clone()));
+
+        if padding_value_batch.batch_axis().is_replicated() {
+            let mut lifted_inputs = Vec::with_capacity(lifted_output_extents.len() + 2);
+            lifted_inputs.push(<C::Value as ValueProjection<ArrayType>>::from_projected(operand_batch.into_value()));
+            lifted_inputs.push(padding_value.value().clone());
+            lifted_inputs.extend(lifted_output_extents);
+            return context
+                .parent()
+                .bind(operation, Vec::new(), lifted_inputs.as_slice())?
+                .into_iter()
+                .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(batch_axis)))
+                .collect();
+        }
+
+        // `pad` requires a scalar padding operand. Pad the aligned input with zero, build a Boolean mask for its
+        // original positions, broadcast the mapped padding values across the result, and select them only outside
+        // those positions.
+        let array_context = ProjectedContext::<C, ArrayType>::new(context.parent().clone());
+        let padding_scalar_type = padding_value_batch.unbatched_type();
+        let zero_padding =
+            <C::Value as ValueProjection<ArrayType>>::from_projected(array_context.zero(&padding_scalar_type)?);
+        let operand = <C::Value as ValueProjection<ArrayType>>::from_projected(operand_batch.into_value());
+        let mut padded_inputs = Vec::with_capacity(lifted_output_extents.len() + 2);
+        padded_inputs.push(operand.clone());
+        padded_inputs.push(zero_padding);
+        padded_inputs.extend(lifted_output_extents.iter().cloned());
+        let mut padded = context.parent().bind(operation.clone(), Vec::new(), padded_inputs.as_slice())?;
+        check_count!("output", padded, 1, ProgramError);
+        let padded = padded.remove(0);
+
+        let operand_type = <&ArrayType>::try_from(operand.r#type().as_ref())?
+            .clone()
+            .with_data_type(DataType::Boolean)
+            .with_layout(None);
+        let mask_input_dimensions = operand_type
+            .shape()
+            .dimensions()
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, dimension)| {
+                matches!(dimension, Dimension::Dynamic(_)).then(|| {
+                    if axis == batch_axis {
+                        Ok(context.axis_extent().clone())
+                    } else {
+                        array_dimension(context.parent(), &operand, axis)
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()?;
+        let mut mask_input =
+            context
+                .parent()
+                .bind(OneOperation::new(operand_type), Vec::new(), mask_input_dimensions.as_slice())?;
+        check_count!("output", mask_input, 1, ProgramError);
+        let mask_input = mask_input.remove(0);
+        let mask_padding_type = padding_scalar_type.with_data_type(DataType::Boolean).with_layout(None);
+        let mask_padding =
+            <C::Value as ValueProjection<ArrayType>>::from_projected(array_context.zero(&mask_padding_type)?);
+        let mut mask_inputs = Vec::with_capacity(lifted_output_extents.len() + 2);
+        mask_inputs.push(mask_input);
+        mask_inputs.push(mask_padding);
+        mask_inputs.extend(lifted_output_extents.iter().cloned());
+        let mut mask = context.parent().bind(operation, Vec::new(), mask_inputs.as_slice())?;
+        check_count!("output", mask, 1, ProgramError);
+        let mask = mask.remove(0);
+
+        let mut broadcast_inputs = Vec::with_capacity(lifted_output_extents.len() + 1);
+        broadcast_inputs.push(<C::Value as ValueProjection<ArrayType>>::from_projected(
+            padding_value_batch.move_axis(0)?.into_value(),
+        ));
+        broadcast_inputs.extend(lifted_output_extents);
+        let mut broadcasted_padding = context.parent().bind(
+            BroadcastOperation::new(vec![batch_axis]),
+            Vec::new(),
+            broadcast_inputs.as_slice(),
+        )?;
+        check_count!("output", broadcasted_padding, 1, ProgramError);
+        let broadcasted_padding = broadcasted_padding.remove(0);
+
+        let mask = <C::Value as ValueProjection<ArrayType>>::into_projected(mask)?;
+        let padded = <C::Value as ValueProjection<ArrayType>>::into_projected(padded)?;
+        let broadcasted_padding = <C::Value as ValueProjection<ArrayType>>::into_projected(broadcasted_padding)?;
+        let mut output =
+            array_context.bind(SelectOperation::new(), Vec::new(), &[mask, padded, broadcasted_padding])?;
+        check_count!("output", output, 1, ProgramError);
+        Ok(vec![ArrayProgramBatch::new(
+            <C::Value as ValueProjection<ArrayType>>::from_projected(output.remove(0)),
+            BatchAxis::from_position(batch_axis),
+        )?])
     }
 }
 

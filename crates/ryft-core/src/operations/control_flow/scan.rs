@@ -1693,8 +1693,9 @@ where
 ///      scan's carry types are loop-invariant, so a replicated carry whose next-carry output is batched *becomes*
 ///      batched, and the rule widens that carry's input axis and re-batches until the body is axis-invariant (the
 ///      iteration count is bounded by the carry count because every non-final pass widens at least one carry —
-///      JAX's `carry_bat` fixed point). A final pass instantiates the body's outputs at the joined axes
-///      ([`ProgramBatchingOutputAxesPolicy::AlignEachTo`], mirroring JAX's `instantiate=carry_bat`).
+///      JAX's `carry_bat` fixed point). The body's outputs are then instantiated at the joined axes
+///      ([`ProgramBatchingOutputAxesPolicy::AlignEachTo`], mirroring JAX's `instantiate=carry_bat`), reusing the
+///      stabilizing pass's own program when its natural axes already are those joined axes.
 ///   3. Widened parent carry inits gain their batch axis through staged broadcasts, and one [`ScanOperation`] over
 ///      the batched body is bound into the parent with the same carry count, length, `reverse`, and (lowering-only)
 ///      `unroll` factor. Final carries come back at the carry axes, and stacked outputs at their per-iteration axes
@@ -1750,27 +1751,31 @@ where
             // Iterate the carry batch axes to a fixed point (bounded by the carry count; see the rule doc). Each
             // pass discovers the body's natural output axes; the pass that widens nothing determines the stacked
             // outputs' per-iteration axes.
-            let mut y_axes = None;
+            let mut stabilized = None;
             for _ in 0..=carry_count {
                 let mut iteration_axes = carry_axes.clone();
                 iteration_axes.extend(slice_axes.iter().copied());
-                let (_, output_axes) = driver
-                    .batch_program(context, body, iteration_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
-                    .into_parts();
-                check_count!("output", output_axes, body_output_count, ProgramError);
+                let candidate = driver.batch_program(
+                    context,
+                    body,
+                    iteration_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )?;
+                check_count!("output", candidate.output_axes(), body_output_count, ProgramError);
                 let mut widened = false;
-                for (carry_axis, output_axis) in carry_axes.iter_mut().zip(output_axes.iter()) {
+                for (carry_axis, output_axis) in carry_axes.iter_mut().zip(candidate.output_axes()) {
                     if carry_axis.is_replicated() && !output_axis.is_replicated() {
                         *carry_axis = BatchAxis::new(0);
                         widened = true;
                     }
                 }
                 if !widened {
-                    y_axes = Some(output_axes[carry_count..].to_vec());
+                    let y_axes = candidate.output_axes()[carry_count..].to_vec();
+                    stabilized = Some((candidate, y_axes));
                     break;
                 }
             }
-            let Some(y_axes) = y_axes else {
+            let Some((stabilized_body, y_axes)) = stabilized else {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
                         "scan batching failed to stabilize the carry batch axes within {carry_count} widening passes",
@@ -1779,19 +1784,19 @@ where
             };
 
             // Instantiate the body's outputs at the joined axes so its next-carry outputs align with its carry
-            // inputs across iterations.
+            // inputs across iterations. The stabilizing pass already used these input axes, so when its discovered
+            // (normalized) output axes equal the joined targets it *is* the aligned program and is kept as-is.
             let mut iteration_axes = carry_axes.clone();
             iteration_axes.extend(slice_axes.iter().copied());
             let mut target_axes = carry_axes.clone();
             target_axes.extend(y_axes.iter().copied());
-            let (batched_body, _) = driver
-                .batch_program(
-                    context,
-                    body,
-                    iteration_axes.as_slice(),
-                    ProgramBatchingOutputAxesPolicy::AlignEachTo(target_axes),
-                )?
-                .into_parts();
+            let batched_body = context.align_batched_program_outputs(
+                driver,
+                body,
+                iteration_axes.as_slice(),
+                stabilized_body,
+                target_axes.as_slice(),
+            )?;
 
             // Widen the parent carry inits whose elements became batched (their batch axis is materialized through
             // a staged broadcast) and stage one batched scan over the batched body.
@@ -2127,7 +2132,7 @@ where
 
         // Iterate carry axes to a fixed point. A first-class dimension cannot widen because composite batching does
         // not admit mapped dimension values.
-        let mut output_slice_axes = None;
+        let mut stabilized = None;
         for _ in 0..=carry_count {
             let iteration_axes = carry_axes.iter().chain(slice_axes.iter()).copied().collect::<Vec<_>>();
             let candidate = driver.batch_program(
@@ -2153,11 +2158,12 @@ where
                 }
             }
             if !widened {
-                output_slice_axes = Some(candidate.output_axes()[carry_count..].to_vec());
+                let output_slice_axes = candidate.output_axes()[carry_count..].to_vec();
+                stabilized = Some((candidate, output_slice_axes));
                 break;
             }
         }
-        let Some(output_slice_axes) = output_slice_axes else {
+        let Some((stabilized_body, output_slice_axes)) = stabilized else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
                     "scan batching failed to stabilize the carry batch axes within {carry_count} widening passes",
@@ -2165,16 +2171,17 @@ where
             });
         };
 
+        // The stabilizing pass already used these input axes, so when its discovered (normalized) output axes equal
+        // the joined targets it *is* the aligned program and is kept as-is instead of being rebuilt.
         let iteration_axes = carry_axes.iter().chain(slice_axes.iter()).copied().collect::<Vec<_>>();
         let target_axes = carry_axes.iter().chain(output_slice_axes.iter()).copied().collect::<Vec<_>>();
-        let (batched_body, _) = driver
-            .batch_program(
-                context,
-                body,
-                iteration_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(target_axes),
-            )?
-            .into_parts();
+        let batched_body = context.align_batched_program_outputs(
+            driver,
+            body,
+            iteration_axes.as_slice(),
+            stabilized_body,
+            target_axes.as_slice(),
+        )?;
         for (carry, axis) in carries.iter_mut().zip(carry_axes.iter()) {
             if !axis.is_replicated() && carry.batch_axis().is_replicated() {
                 *carry = align_array_batch(context, carry.clone(), Axis::from(0))?;
@@ -2913,6 +2920,7 @@ mod tests {
     use crate::programs::effects::Effects;
     use crate::programs::{Program, ProgramBuilder};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
     use crate::tracing::Trace;
     use crate::types::{DataType, DimensionBounds, DimensionType, DimensionVariable, Memory};
@@ -4439,6 +4447,84 @@ mod tests {
         let outputs = program.interpret((Array::scalar(1.0), xs)).unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![24.0, 210.0]);
         assert_eq!(outputs[1].to_f64s(), vec![2.0, 6.0, 24.0, 5.0, 30.0, 210.0]);
+    }
+
+    /// The structural rule iterates the body's carry axes to a fixed point with natural output axes and then
+    /// instantiates the body at the joined carry and stacked-slice axes. `AlignEachTo` stages axis movement only where
+    /// a natural axis differs from a mapped target, so when the stabilizing pass already discovered those targets its
+    /// program *is* the aligned body and is not rebuilt.
+    #[test]
+    fn test_scan_batching_reuses_the_stabilized_body_discovery_program() {
+        let regions = vec![product_body()];
+
+        // Both carries and stacked slices are batched from the start, and the stacked input already carries its batch
+        // axis off the leading scan dimension, so the first pass widens nothing and its discovered axes already equal
+        // the joined targets: exactly one structural pass.
+        let parent = DomainTracingContext::<TestEagerContext>::new();
+        let builder = parent.builder().clone();
+        let carry_atom = builder.borrow_mut().add_input(f64_type(&[2]));
+        let xs_atom = builder.borrow_mut().add_input(f64_type(&[3, 2]));
+        let carry = parent.tracer(carry_atom, None);
+        let xs = parent.tracer(xs_atom, None);
+        let context = BatchingContext::new(parent, 2);
+        let inputs = vec![
+            ArrayBatch::new(f64_type(&[2]), carry, BatchAxis::new(0)).unwrap(),
+            ArrayBatch::new(f64_type(&[3, 2]), xs, BatchAxis::new(1)).unwrap(),
+        ];
+        let driver = CountingBatchingDriver::new(&regions);
+        let outputs = TestScanOperation::new(1, 3).batch(&context, &driver, inputs.as_slice()).unwrap();
+        assert_eq!(driver.batch_program_calls(), 1);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Array, Array), Vec<Array>>(
+                vec![outputs[0].value().atom_id().unwrap(), outputs[1].value().atom_id().unwrap()],
+                (Placeholder, Placeholder),
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:f64[3, 2] .
+                let %2:f64[2], %3:f64[3, 2] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                    body={
+                        lambda %0:f64[2], %1:f64[2] .
+                        let %2:f64[2] = mul %0 %1
+                        in (%2, %2)
+                    },
+                ]
+                in (%2, %3)"},
+        );
+        let outputs = program
+            .interpret((
+                Array::from_f64s(f64_type(&[2]), vec![1.0, 1.0]),
+                Array::from_f64s(f64_type(&[3, 2]), vec![2.0, 5.0, 3.0, 6.0, 4.0, 7.0]),
+            ))
+            .unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![24.0, 210.0]);
+        assert_eq!(outputs[1].to_f64s(), vec![2.0, 5.0, 6.0, 30.0, 24.0, 210.0]);
+
+        // A replicated carry whose next-carry output is batched widens once, so the fixed point runs two natural
+        // passes. The second (stabilizing) pass is still reused instead of being replayed a third time.
+        let parent = DomainTracingContext::<TestEagerContext>::new();
+        let builder = parent.builder().clone();
+        let carry_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let xs_atom = builder.borrow_mut().add_input(f64_type(&[2, 3]));
+        let carry = parent.tracer(carry_atom, None);
+        let xs = parent.tracer(xs_atom, None);
+        let context = BatchingContext::new(parent, 2);
+        let inputs =
+            vec![ArrayBatch::replicated(carry), ArrayBatch::new(f64_type(&[2, 3]), xs, BatchAxis::new(0)).unwrap()];
+        let driver = CountingBatchingDriver::new(&regions);
+        let outputs = TestScanOperation::new(1, 3).batch(&context, &driver, inputs.as_slice()).unwrap();
+        assert_eq!(driver.batch_program_calls(), 2);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
     }
 
     #[test]

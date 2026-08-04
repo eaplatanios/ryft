@@ -1822,6 +1822,33 @@ impl<
     }
 }
 
+/// Batching rule for a member [`Operation`] whose instruction has a mixed signature in a parent operation universe.
+/// If this operation has native type `T` while the enclosing operation family uses type `U`, an ordinary
+/// [`BatchableOperation`] implementation can describe only the homogeneous `T -> T` contract because its
+/// [`batch`](BatchableOperation::batch) method requires `Self::Type = C::Type`. This trait instead receives the parent
+/// [`BatchingContext`] and its `U`-typed batches, allowing the rule to account for operands or results belonging to
+/// other members of `U`.
+///
+/// Shape-changing collectives are the motivating example. Their native array operation consumes one array, whereas
+/// their array-or-dimension instruction consumes that array followed by first-class result extents. Operation-family
+/// dispatchers should use this trait only when the parent signature differs from the operation's native
+/// [`Operation::Type`].
+pub trait MemberBatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation {
+    /// Applies this member operation's batching rule in its enclosing parent operation universe.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active parent [`BatchingContext`] through which the rule stages mixed operations.
+    ///   - `driver`: Instruction-scoped [`BatchingDriver`] exposing any attached regions.
+    ///   - `inputs`: Parent-universe batches in the mixed instruction's operand order.
+    fn batch_in_parent<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<Vec<P::Batch>, BatchingError>;
+}
+
 /// Policy for choosing a batched [`Program`]'s output axes. Program batching always replays the program over packed
 /// values whose mapped batch axes are specified by the caller. This policy controls how the replayed output tracers are
 /// packaged into the resulting program.

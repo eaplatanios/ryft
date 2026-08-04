@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use crate::backends::array_programs::LinearResiduals;
+use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -140,6 +141,73 @@ impl Operation for ReshapeOperation {
             }
             Ok(())
         })
+    }
+}
+
+/// Batching rule for [`ReshapeOperation`]. Explicit output extents remain replicated shape values. A mapped input is
+/// canonicalized to a leading batch axis, and that axis is inserted into both the reshape geometry and output
+/// sharding before the mixed operation is replayed.
+impl<C> BatchableOperation<C, ArrayProgramBatching> for ReshapeOperation
+where
+    C: Context<Type = ArrayProgramType, Operation: From<ReshapeOperation>>,
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayProgramBatching>,
+        _driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let Some((input, output_extents)) = inputs.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+        };
+        <&ArrayType>::try_from(input.unbatched_type())?;
+        for extent in output_extents {
+            extent.validate_replicated_dimension()?;
+        }
+
+        if input.batch_axis().is_replicated() {
+            return Ok(context
+                .parent()
+                .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>())?
+                .into_iter()
+                .map(ArrayProgramBatch::replicated)
+                .collect());
+        }
+
+        let batched_type = <&ArrayType>::try_from(input.value().r#type().as_ref())?.clone();
+        let moved_input = ArrayBatch::new(
+            batched_type,
+            <C::Value as ValueProjection<ArrayType>>::into_projected(input.value().clone())?,
+            input.batch_axis(),
+        )?
+        .move_axis(0)?;
+        let moved_input = <C::Value as ValueProjection<ArrayType>>::from_projected(moved_input.into_value());
+
+        let mut operation = Self::new();
+        if let Some(dimensions) = self.dimensions() {
+            let mut lifted_dimensions = Vec::with_capacity(dimensions.len() + 1);
+            lifted_dimensions.push(0);
+            lifted_dimensions.extend(dimensions.iter().map(|dimension| dimension + 1));
+            operation = operation.with_dimensions(lifted_dimensions);
+        }
+        if let Some(output_sharding) = self.output_sharding() {
+            operation = operation.with_output_sharding(lift_output_sharding_for_leading_batch_axis(
+                output_sharding,
+                context.axis_sharding().clone(),
+            )?);
+        }
+
+        let mut lifted_inputs = Vec::with_capacity(inputs.len() + 1);
+        lifted_inputs.push(moved_input);
+        lifted_inputs.push(context.axis_extent().clone());
+        lifted_inputs.extend(output_extents.iter().map(|extent| extent.value().clone()));
+        context
+            .parent()
+            .bind(operation, Vec::new(), lifted_inputs.as_slice())?
+            .into_iter()
+            .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(0)))
+            .collect()
     }
 }
 

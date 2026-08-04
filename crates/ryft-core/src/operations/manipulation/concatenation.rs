@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 
 use crate::axes::Axis;
 use crate::backends::array_programs::LinearResiduals;
+use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, align_array_batch};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -21,7 +22,9 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::{ConstantOperation, Zero, ZeroOperation};
 use crate::operations::dimensions::{DimensionAddOperation, DimensionSizeOperation};
-use crate::operations::manipulation::{DynamicShapeSliceOperation, LegacyBroadcast, SliceOperation, Transpose};
+use crate::operations::manipulation::{
+    BroadcastOperation, DynamicShapeSliceOperation, LegacyBroadcast, SliceOperation, Transpose,
+};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
@@ -559,6 +562,87 @@ where
             materialized.as_slice(),
             &[BatchAxis::from_position(batch_axis)],
         )
+    }
+}
+
+/// Batching rule for mixed [`ConcatenateOperation<ArrayProgramType>`] instructions. The trailing result extent stays
+/// replicated, while array operands are aligned on one physical mapped axis before concatenation.
+impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching>
+    for ConcatenateOperation<ArrayProgramType>
+where
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
+    C::Operation: From<ConcatenateOperation<ArrayType>>
+        + From<ConcatenateOperation<ArrayProgramType>>
+        + From<BroadcastOperation>
+        + From<DimensionOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + OperationProjection<ArrayType>,
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayProgramBatching>,
+        _driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let Some((result_extent, inputs)) = inputs.split_last() else {
+            return Err(TypeError::invalid(format!(
+                "'{CONCATENATE_OPERATION_NAME}' expects at least one array followed by its result extent",
+            ))
+            .into());
+        };
+        if inputs.is_empty() {
+            return match result_extent.unbatched_type() {
+                ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
+                    "'{CONCATENATE_OPERATION_NAME}' expects a trailing result-extent dimension",
+                ))
+                .into()),
+                ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
+                    "'{CONCATENATE_OPERATION_NAME}' expects at least one array before its result extent",
+                ))
+                .into()),
+            };
+        }
+        // A mapped extent would authorize a different output shape for each batch item, which requires a ragged
+        // representation. Concatenate therefore accepts only one replicated result extent.
+        result_extent.validate_replicated_dimension()?;
+
+        let Some(batch_axis) = inputs.iter().find_map(ArrayProgramBatch::batch_axis_position) else {
+            return Ok(context
+                .parent()
+                .bind(
+                    self.clone(),
+                    Vec::new(),
+                    &inputs
+                        .iter()
+                        .chain(std::iter::once(result_extent))
+                        .map(|input| input.value().clone())
+                        .collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .map(ArrayProgramBatch::replicated)
+                .collect());
+        };
+
+        // Align every packed array on one mapped axis. Replicated operands gain that axis using the transform's
+        // declared sharding, so each batch item concatenates the corresponding per-item arrays.
+        let aligned_inputs = inputs
+            .iter()
+            .cloned()
+            .map(|input| align_array_batch(context, input, Axis::from(batch_axis)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
+        let first_type = aligned_inputs[0].value().r#type();
+        let first_type = <&ArrayType>::try_from(first_type.as_ref())?;
+        let operation = ConcatenateOperation::new(lifted_axis, first_type.rank())?;
+        let mut lifted_inputs = aligned_inputs.into_iter().map(ArrayProgramBatch::into_value).collect::<Vec<_>>();
+        lifted_inputs.push(result_extent.value().clone());
+        context
+            .parent()
+            .bind(operation, Vec::new(), lifted_inputs.as_slice())?
+            .into_iter()
+            .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(batch_axis)))
+            .collect()
     }
 }
 

@@ -2163,11 +2163,11 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [x] Relocate the P8b3b reshape rules.
     - [x] Relocate the P8b3c broadcast rules.
     - [x] Relocate the P8b3d pad rules and close P8b3.
-  - [ ] Continue P8b4 with the remaining mixed-operation transform rules.
+  - [x] Continue P8b4 with the remaining mixed-operation transform rules.
     - [x] Relocate the P8b4a comparison, custom-call, and RNG rules.
     - [x] Relocate the P8b4b collective differentiation and transposition rules.
-    - [ ] Relocate the P8b4c collective batching rules.
-    - [ ] Relocate the P8b4d remaining mixed structural and batching rules, then close P8b4.
+    - [x] Relocate the P8b4c collective batching rules.
+    - [x] Relocate the P8b4d remaining mixed structural and batching rules, then close P8b4.
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
 - [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.
 - [ ] Make `#[derive(Operation)]` with `#[ryft(dispatch(batching, differentiation, transposition))]` the mechanical
@@ -3639,3 +3639,18 @@ evaluation, and the mapped-batching rejection, so Phase 12 was scoped as verific
 introduction, and the gateway's own compiled lowering was assigned to Phase 7 as recorded by P4c and is now complete.
 The `DimensionType` motivation rustdoc added earlier the same day overstated the provenance restriction ("never from
 array data") and was corrected in the same session to name the gateway as the single checked exception.
+
+### Phase 8 P8b4 closure: mixed-operation transform ownership (2026-08-03)
+
+Completed P8b4c and P8b4d together. Explicit-extent collective batching now lives beside the all-gather,
+sum-scatter, and all-to-all payloads and reuses the homogeneous matching-axis kernels without reconstructing dynamic
+geometry from array metadata. The remaining mixed batching algorithms moved beside dynamic-shape slice, reshape,
+broadcast, concatenate, and pad. `MemberBatchableOperation` records the exceptional contract for native member
+payloads whose parent instruction has a mixed signature, parallel to the existing member JVP and transposition
+capabilities.
+
+The array-program batching dispatcher now performs only projected dispatch, direct payload dispatch, member dispatch,
+and the previously documented shared zero/one/iota constructor classification that the later derive marker must
+generate. The obsolete backend-local collective helpers and mixed-operation algorithms were deleted. All core tests,
+integration and compile-fail tests, runnable doctests, and all runnable XLA library tests passed. The detailed
+implementation and verification ledger is recorded in `.tasks/plan_p8b_array_program_operation_declaration.md`.

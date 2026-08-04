@@ -66,11 +66,20 @@ pub use types::*;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::cell::Cell;
+
+    use crate::batching::{
+        BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
+        RecursiveBatchingDriver, RecursiveBatchingPolicy,
+    };
+    use crate::contexts::Context;
     use crate::macros::check_count;
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::operations::Operation;
-    use crate::programs::regions::{RegionInterface, RegionSlot};
+    use crate::programs::programs::Program;
+    use crate::programs::regions::{RegionDriver, RegionInterface, RegionRef, RegionSlot};
     use crate::programs::types::TypeError;
+    use crate::programs::values::Value;
     use crate::types::DataType;
 
     /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`](crate::Region) machinery
@@ -143,6 +152,66 @@ pub(crate) mod tests {
                 Self::Add | Self::WithRegions(_) => Effects::PURE,
                 Self::Effectful => Effects::single(Effect::OrderedIo),
             }
+        }
+    }
+
+    /// [`BatchingDriver`] that counts the structural [`batch_program`](BatchingDriver::batch_program) requests a
+    /// region-carrying batching rule makes, delegating every request to the ordinary [`RecursiveBatchingDriver`] over
+    /// the same regions. Region-carrying rules discover their nested programs' natural output axes before instantiating
+    /// them at reconciled targets, and reuse a discovery program when its axes already match. This fixture lets rule
+    /// tests pin how many structural passes such a rule actually performs, which a program rendering alone cannot
+    /// observe.
+    pub(crate) struct CountingBatchingDriver<'r, V: Value, O: Operation<Type = V::Type>> {
+        /// [`Region`]s attached to the operation application under test, in operation-defined order.
+        regions: &'r Vec<Program<V, O, Vec<V>, Vec<V>>>,
+
+        /// Number of structural program-batching requests observed so far.
+        batch_program_calls: Cell<usize>,
+    }
+
+    impl<'r, V: Value, O: Operation<Type = V::Type>> CountingBatchingDriver<'r, V, O> {
+        /// Creates a new [`CountingBatchingDriver`] over the provided attached regions.
+        pub(crate) fn new(regions: &'r Vec<Program<V, O, Vec<V>, Vec<V>>>) -> Self {
+            Self { regions, batch_program_calls: Cell::new(0) }
+        }
+
+        /// Returns the number of structural program-batching requests observed so far.
+        pub(crate) fn batch_program_calls(&self) -> usize {
+            self.batch_program_calls.get()
+        }
+    }
+
+    impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for CountingBatchingDriver<'_, V, O> {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
+        where
+            V: 'r,
+            O: 'r,
+        {
+            self.regions.regions()
+        }
+    }
+
+    impl<C: Context, P: RecursiveBatchingPolicy<C>> BatchingDriver<C, P>
+        for CountingBatchingDriver<'_, C::Constant, C::Operation>
+    {
+        fn batch_region(
+            &self,
+            context: &BatchingContext<C, P>,
+            index: usize,
+            inputs: Vec<P::Batch>,
+        ) -> Result<Vec<P::Batch>, BatchingError> {
+            RecursiveBatchingDriver::new(self.regions).batch_region(context, index, inputs)
+        }
+
+        fn batch_program(
+            &self,
+            context: &BatchingContext<C, P>,
+            region: RegionRef<'_, C::Constant, C::Operation>,
+            input_axes: &[BatchAxis],
+            output_axes_policy: ProgramBatchingOutputAxesPolicy,
+        ) -> Result<P::BatchedProgram, BatchingError> {
+            self.batch_program_calls.set(self.batch_program_calls.get() + 1);
+            RecursiveBatchingDriver::new(self.regions).batch_program(context, region, input_axes, output_axes_policy)
         }
     }
 }
