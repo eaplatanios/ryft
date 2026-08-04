@@ -44,13 +44,14 @@ use std::marker::PhantomData;
 use thiserror::Error;
 
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchedProgram, BatchingContext,
+    BatchingDriver, BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::linear::ResidualZeroProvider;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation,
+    LinearCallBatchingPolicy, TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -354,13 +355,18 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
 
 crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: Type);
 
-/// Batching rule for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
-/// programs so the rematerialization boundary survives `batch` under eager and staging parents alike; see
-/// `BatchingContext::batch_wrapped_operation`.
+/// Batching rule for [`RematerializeOperation`]. The primal and forward regions receive the wrapper operands' existing
+/// axes, forward-tail residuals retain their natural axes, and the tangent region receives those residual axes followed
+/// by the input-tangent axes. Corresponding primal, forward, and tangent outputs are reconciled to one axis. The
+/// backward region receives the residual and reconciled output-cotangent axes, and mapped cotangents for replicated
+/// primal inputs are summed back to replication. Rebuilding all four regions keeps the rematerialization boundary and
+/// its `prevent_cse` policy intact without imposing a wrapper-wide axis position.
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for RematerializeOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
+    ArrayBatching<P>: LinearCallBatchingPolicy<C>
+        + BatchingPolicy<C, Batch = ArrayBatch<C::Value>, BatchedProgram = BatchedProgram<C::Constant, C::Operation>>,
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
@@ -373,7 +379,118 @@ where
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        context.batch_wrapped_operation(driver, O::from(*self), inputs)
+        let input_axes = inputs.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
+        let primal_region = driver.region(0)?;
+        let forward_region = driver.region(1)?;
+        let backward_region = driver.region(2)?;
+        let tangent_region = driver.region(3)?;
+
+        let naturally_batched_primal = driver.batch_program(
+            context,
+            primal_region,
+            input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let primal_output_axes = naturally_batched_primal.output_axes();
+        let naturally_batched_forward = driver.batch_program(
+            context,
+            forward_region,
+            input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let forward_output_axes = naturally_batched_forward.output_axes();
+        if forward_output_axes.len() < primal_output_axes.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "batched rematerialize forward region produced {} outputs which is fewer than its {} primal outputs",
+                forward_output_axes.len(),
+                primal_output_axes.len(),
+            ))
+            .into());
+        }
+        let (forward_primal_output_axes, residual_axes) = forward_output_axes.split_at(primal_output_axes.len());
+        let residual_axes = residual_axes.to_vec();
+
+        // The tangent region consumes the exact forward tail followed by one tangent per wrapper input. Its natural
+        // output axes participate in the same boundary decision as the ordinary primal and forward-prefix outputs.
+        let tangent_input_axes = residual_axes.iter().copied().chain(input_axes.iter().copied()).collect::<Vec<_>>();
+        let naturally_batched_tangent = driver.batch_program(
+            context,
+            tangent_region,
+            tangent_input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let tangent_output_axes = naturally_batched_tangent.output_axes();
+        check_count!("output", tangent_output_axes, primal_output_axes.len(), ProgramError);
+
+        let output_axes = primal_output_axes
+            .iter()
+            .copied()
+            .zip(forward_primal_output_axes.iter().copied())
+            .zip(tangent_output_axes.iter().copied())
+            .map(|((primal, forward), tangent)| {
+                [primal, forward, tangent].into_iter().find(|axis| !axis.is_replicated()).unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let primal = context.align_batched_program_outputs(
+            driver,
+            primal_region,
+            input_axes.as_slice(),
+            naturally_batched_primal,
+            output_axes.as_slice(),
+        )?;
+        let forward_required_output_axes =
+            output_axes.iter().copied().chain(residual_axes.iter().copied()).collect::<Vec<_>>();
+        let forward = context.align_batched_program_outputs(
+            driver,
+            forward_region,
+            input_axes.as_slice(),
+            naturally_batched_forward,
+            forward_required_output_axes.as_slice(),
+        )?;
+        let tangent = context.align_batched_program_outputs(
+            driver,
+            tangent_region,
+            tangent_input_axes.as_slice(),
+            naturally_batched_tangent,
+            output_axes.as_slice(),
+        )?;
+
+        // The backward region maps `(forward_tail..., output_cotangents...)` to input cotangents. Its structurally
+        // movable axes are aligned during batching; adaptation sums a mapped cotangent when the corresponding primal
+        // input was replicated.
+        let backward_input_axes = residual_axes.iter().copied().chain(output_axes.iter().copied()).collect::<Vec<_>>();
+        let batched_backward = driver.batch_program(
+            context,
+            backward_region,
+            backward_input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(input_axes.clone()),
+        )?;
+        let (backward, backward_output_axes) = <ArrayBatching<P> as BatchingPolicy<C>>::adapt_batched_program(
+            batched_backward,
+            Some(input_axes.as_slice()),
+            <ArrayBatching<P> as LinearCallBatchingPolicy<C>>::sum_mapped_cotangents,
+        )?
+        .into_parts();
+        if backward_output_axes != input_axes {
+            return Err(BatchingError::MisalignedBatchAxes {
+                message: format!(
+                    "batched rematerialize backward output axes {backward_output_axes:?} do not match input axes \
+                     {input_axes:?}",
+                ),
+            });
+        }
+
+        let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        let outputs =
+            context
+                .parent()
+                .bind(O::from(*self), vec![primal, forward, backward, tangent], input_values.as_slice())?;
+        check_count!("output", outputs, output_axes.len(), ProgramError);
+        outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, axis))
+            .collect()
     }
 }
 
@@ -2032,13 +2149,14 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::batching::BatchAxis;
+    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::operations::math::{Cos, Dot, DotDimensionNumbers, Sin};
     use crate::operations::tag::Tag;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::regions::RegionRole;
+    use crate::sharding::ShardingDimension;
     use crate::types::{ArrayType, DataType, Dimension, Memory, Shape};
 
     /// Shorthand for the policy contract over the `Array` array domain used throughout these tests.
@@ -2809,7 +2927,7 @@ mod tests {
     fn test_rematerialization_survives_batching_with_preserved_residual_structure() {
         use crate::batching::Batch;
 
-        // Batching a rematerialized call re-wraps it around batched programs instead of inlining the primal, so
+        // Batching a rematerialized call preserves it around batched programs instead of inlining the primal, so
         // the memory-saving structure survives `vmap`: the staged program holds exactly one rematerialize call whose
         // batched forward program still stores only the body output and the region input plus the policy-saved
         // residuals — each now carrying the batch axis.
@@ -2851,13 +2969,55 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialization_batching_preserves_nonzero_natural_axes_across_all_regions() {
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| x.sin(),
+        );
+        let (_, program) =
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), vector_type(3)).unwrap();
+        let program = program.to_flat_program();
+
+        // Each logical item is a length-3 vector, packed column-wise with the mapped dimension at axis 1. The primal,
+        // forward tail, tangent, and backward computations are all elementwise, so none needs to move that axis.
+        let (batched, output_axes) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(1)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(1)]);
+        assert_eq!(batched.instructions().len(), 1);
+        let instruction = &batched.instructions()[0];
+        let ArrayOperation::Rematerialize(operation) = instruction.operation() else {
+            panic!("batching must preserve the rematerialization wrapper");
+        };
+        assert!(operation.prevent_cse());
+        for region in instruction.regions() {
+            let region = batched.region_ref(*region).unwrap();
+            assert!(
+                region
+                    .input_types()
+                    .iter()
+                    .chain(region.output_types().iter())
+                    .all(|r#type| r#type.rank() == 2 && r#type.shape().dimensions()[1] == Dimension::Static(2))
+            );
+        }
+
+        let input = Array::matrix(3, 2, vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5]);
+        let expected = Array::matrix(
+            3,
+            2,
+            vec![0.0f64.sin(), 0.5f64.sin(), 1.0f64.sin(), 1.5f64.sin(), 2.0f64.sin(), 2.5f64.sin()],
+        );
+        assert_eq!(batched.interpret(vec![input]).unwrap(), vec![expected]);
+    }
+
+    #[test]
     fn test_rematerialized_gradients_are_correct_through_batching() {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
         use crate::operations::math::{Reduce, ReductionKind};
 
-        // `grad(vmap(rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(f)))`: the gradient flows through the re-wrapped batched call's derived
-        // backward program and matches the analytic per-item gradients.
+        // `grad(vmap(rematerialize(f)))`: the gradient flows through the preserved batched call's derived backward
+        // program and matches the analytic per-item gradients.
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
@@ -3297,7 +3457,7 @@ mod tests {
         use crate::differentiation::LinearizationTracer;
         use crate::operations::math::{Reduce, ReductionKind};
 
-        // `vmap` re-wraps the rematerialized call around batched programs, and the offloaded saved residual keeps
+        // `vmap` preserves the rematerialized call around batched programs, and the offloaded saved residual keeps
         // its host placement with the batch axis prepended to its shape.
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));

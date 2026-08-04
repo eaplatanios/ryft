@@ -1981,33 +1981,32 @@ impl<C: Context<Type: BatchableType<Policy: BatchingPolicy<C>>>>
 impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>, P: ArrayBatchingPolicy<C>>
     BatchingContext<C, ArrayBatching<P>>
 {
-    // TODO(eaplatanios): Review this.
-    /// Returns `naturally_batched_program` unchanged when its output axes already equal `required_output_axes`, or
-    /// structurally batches `region` again while aligning its live outputs to those required axes.
+    /// Returns `batched_program` unchanged when its output axes already equal `required_output_axes`, or structurally
+    /// batches `region` again while aligning its live outputs to those required axes.
     ///
     /// Region-carrying operation rules use this after discovering and semantically reconciling natural output axes
-    /// across related regions. This method only performs the mechanical output-boundary alignment; it deliberately
-    /// does not decide which axes correspond or which one should win. A mapped required axis moves a naturally mapped
-    /// output or broadcasts a naturally replicated output. Callers must never use this method to collapse a mapped
-    /// output to replicated, because that requires operation-specific semantics such as cotangent summation.
+    /// across related regions. This method only performs the mechanical output-boundary alignment. It deliberately does
+    /// not decide which axes correspond or which one should win. A mapped required axis moves a naturally mapped output
+    /// or broadcasts a naturally replicated output. Callers must never use this method to collapse a mapped output to
+    /// replicated, because that requires [`Operation`]-specific semantics such as cotangent summation.
     ///
     /// # Parameters
     ///
     ///   - `driver`: [`BatchingDriver`] that structurally transforms `region` if alignment is required.
-    ///   - `region`: Source region from which `naturally_batched_program` was produced.
-    ///   - `input_axes`: Batch axes used to produce `naturally_batched_program` and to perform any aligned replay.
-    ///   - `naturally_batched_program`: Region already structurally batched with natural output axes.
+    ///   - `region`: Source [`Region`](crate::Region) from which `batched_program` was produced.
+    ///   - `input_axes`: Batch axes used to produce `batched_program` and to perform any aligned replay.
+    ///   - `batched_program`: Region already structurally batched with natural output axes.
     ///   - `required_output_axes`: Semantically reconciled output axes required by the region's consumer.
     pub(crate) fn align_batched_program_outputs<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
         driver: &D,
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
-        naturally_batched_program: BatchedProgram<C::Constant, C::Operation>,
+        batched_program: BatchedProgram<C::Constant, C::Operation>,
         required_output_axes: &[BatchAxis],
     ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
-        if naturally_batched_program.output_axes() == required_output_axes {
-            return Ok(naturally_batched_program.into_parts().0);
+        if batched_program.output_axes() == required_output_axes {
+            return Ok(batched_program.into_parts().0);
         }
         let aligned_program = driver.batch_program(
             self,
@@ -3572,6 +3571,64 @@ mod tests {
         let context = context.with_axis_name("items".to_string()).with_axis_sharding(ShardingDimension::sharded(["x"]));
         assert_eq!(context.axis_name(), Some("items"));
         assert_eq!(context.axis_sharding(), &ShardingDimension::sharded(["x"]));
+    }
+
+    #[test]
+    fn test_batching_context_align_batched_program_outputs() {
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let (_, source_program) =
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|inputs: Vec<_>| Ok(inputs), vec![vector_type])
+                .unwrap();
+        let input_axes = [BatchAxis::new(1)];
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+
+        // A program whose natural output axes already match the required axes is returned without asking the driver
+        // to replay it. Using the empty driver pins that fast path because any replay through it would fail.
+        let batched_program = source_program
+            .entry_region_ref()
+            .batched(2, ShardingDimension::Replicated, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
+        let unchanged_program = context
+            .align_batched_program_outputs(
+                &EmptyRegionDriver,
+                source_program.entry_region_ref(),
+                input_axes.as_slice(),
+                batched_program,
+                &[BatchAxis::new(1)],
+            )
+            .unwrap();
+        let axis_one_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        assert_eq!(unchanged_program.input_types(), std::slice::from_ref(&axis_one_type));
+        assert_eq!(unchanged_program.output_types(), std::slice::from_ref(&axis_one_type));
+        assert!(unchanged_program.instructions().is_empty());
+
+        // Requiring axis 0 instead causes one aligned replay of the source region. The input retains its axis-1 packed
+        // layout, while the live output is transposed to the requested axis-0 layout.
+        let regions = vec![source_program];
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let region = driver.region(0).unwrap();
+        let batched_program = region
+            .batched(2, ShardingDimension::Replicated, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
+        let aligned_program = context
+            .align_batched_program_outputs(
+                &driver,
+                region,
+                input_axes.as_slice(),
+                batched_program,
+                &[BatchAxis::new(0)],
+            )
+            .unwrap();
+        let axis_zero_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        assert_eq!(aligned_program.input_types(), std::slice::from_ref(&axis_one_type));
+        assert_eq!(aligned_program.output_types(), std::slice::from_ref(&axis_zero_type));
+        assert_eq!(aligned_program.instructions().len(), 1);
+        assert!(matches!(aligned_program.instructions()[0].operation(), ArrayOperation::Transpose(_)));
+        assert_eq!(
+            aligned_program.interpret(vec![Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])]),
+            Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]),
+        );
     }
 
     #[test]

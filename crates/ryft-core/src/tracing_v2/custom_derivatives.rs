@@ -2,12 +2,13 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchedProgram, BatchingContext,
+    BatchingDriver, BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation,
+    LinearCallBatchingPolicy, LinearCallOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_non_transposable_operation};
@@ -35,11 +36,11 @@ pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 /// separate from the JVP program means un-differentiated calls never pay for tangent computation.
 ///
 /// The transforms treat a staged call as follows: interpretation replays the primal region; partial evaluation folds a
-/// call whose operands are all known and otherwise residualizes it unchanged; batching re-wraps the call around
-/// batched copies of both regions so the custom derivative survives a `batch` applied *before* differentiation; and
-/// differentiation replays the user JVP region instead of differentiating the primal body, so the user-supplied
-/// derivative governs both forward and reverse mode. Refer to the documentation of [`custom_jvp`] for the full
-/// semantics and for when to reach for a custom JVP.
+/// call whose operands are all known and otherwise residualizes it unchanged; batching preserves the call around
+/// axis-reconciled copies of both regions so the custom derivative survives a `batch` applied *before*
+/// differentiation; and differentiation replays the user JVP region instead of differentiating the primal body, so
+/// the user-supplied derivative governs both forward and reverse mode. Refer to the documentation of [`custom_jvp`]
+/// for the full semantics and for when to reach for a custom JVP.
 ///
 /// This operation is deliberately non-transposable, which does not restrict reverse-mode differentiation. Reverse mode
 /// linearizes first, and the `jvp` rule replays the user JVP program as plain primitive operations, so the operation
@@ -161,8 +162,11 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 {
 }
 
-/// Batching rule for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
-/// derivative survives `batch`; see `BatchingContext::batch_wrapped_operation`.
+/// Batching rule for [`CustomJvpOperation`]. The primal region receives the wrapper operands' existing batch axes,
+/// while the JVP region receives those axes twice: once for its primal inputs and once for their tangents. For each
+/// output, the rule reconciles the ordinary primal, JVP-primal, and JVP-tangent axes, aligns the three corresponding
+/// values to that axis, and records the reconciled axis on the wrapper result. This preserves naturally replicated
+/// outputs and nonzero mapped axes while keeping the custom derivative attached for later differentiation.
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for CustomJvpOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
@@ -178,7 +182,69 @@ where
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        context.batch_wrapped_operation(driver, O::from(*self), inputs)
+        let input_axes = inputs.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
+        let primal_region = driver.region(0)?;
+        let jvp_region = driver.region(1)?;
+
+        // Discover the axes produced by the ordinary primal computation without imposing a wrapper-wide layout.
+        let naturally_batched_primal = driver.batch_program(
+            context,
+            primal_region,
+            input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let primal_output_axes = naturally_batched_primal.output_axes();
+
+        // The JVP region consumes `(primals..., tangents...)`. A tangent has the same packed batch-axis position as
+        // its corresponding primal input, so the region receives the outer input-axis signature twice.
+        let jvp_input_axes = input_axes.iter().copied().chain(input_axes.iter().copied()).collect::<Vec<_>>();
+        let naturally_batched_jvp = driver.batch_program(
+            context,
+            jvp_region,
+            jvp_input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let jvp_output_axes = naturally_batched_jvp.output_axes();
+        check_count!("output", jvp_output_axes, 2 * primal_output_axes.len(), ProgramError);
+        let (jvp_primal_output_axes, jvp_tangent_output_axes) = jvp_output_axes.split_at(primal_output_axes.len());
+
+        // Corresponding primal and tangent results must have one packed type at the custom-JVP boundary. Prefer the
+        // ordinary primal's mapped position, then the JVP primal's, then the tangent's; mapped always wins over
+        // replicated so reconciliation never discards batch variation.
+        let output_axes = primal_output_axes
+            .iter()
+            .copied()
+            .zip(jvp_primal_output_axes.iter().copied())
+            .zip(jvp_tangent_output_axes.iter().copied())
+            .map(|((primal, jvp_primal), tangent)| {
+                [primal, jvp_primal, tangent].into_iter().find(|axis| !axis.is_replicated()).unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let primal = context.align_batched_program_outputs(
+            driver,
+            primal_region,
+            input_axes.as_slice(),
+            naturally_batched_primal,
+            output_axes.as_slice(),
+        )?;
+        let jvp_required_output_axes =
+            output_axes.iter().copied().chain(output_axes.iter().copied()).collect::<Vec<_>>();
+        let jvp = context.align_batched_program_outputs(
+            driver,
+            jvp_region,
+            jvp_input_axes.as_slice(),
+            naturally_batched_jvp,
+            jvp_required_output_axes.as_slice(),
+        )?;
+
+        let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        let outputs = context.parent().bind(O::from(*self), vec![primal, jvp], input_values.as_slice())?;
+        check_count!("output", outputs, output_axes.len(), ProgramError);
+        outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, axis))
+            .collect()
     }
 }
 
@@ -357,13 +423,14 @@ pub const CUSTOM_VJP_OPERATION_NAME: &str = "custom_vjp";
 /// computation.
 ///
 /// The transforms treat a staged call as follows: interpretation replays the primal region; partial evaluation folds a
-/// call whose operands are all known and otherwise residualizes it unchanged; batching re-wraps the call around
-/// batched copies of all three regions so the custom derivative survives a `batch` applied *before* differentiation;
-/// and differentiation replays the forward region for the primal outputs and residuals and stages one transpose-only
-/// [`LinearCallOperation`] carrier for the output tangents, whose transpose replays the user backward program — so
-/// reverse mode uses exactly the user-supplied gradient. Because that carrier rejects interpretation, forward-mode
-/// differentiation of a staged call is rejected, matching JAX's reverse-mode-only `custom_vjp` semantics. Refer to the
-/// documentation of [`custom_vjp`] for the full semantics and for when to reach for a custom VJP.
+/// call whose operands are all known and otherwise residualizes it unchanged; batching preserves the call around
+/// axis-reconciled copies of all three regions so the custom derivative survives a `batch` applied *before*
+/// differentiation; and differentiation replays the forward region for the primal outputs and residuals and stages a
+/// transpose-only [`LinearCallOperation`] carrier for the output tangents, whose transpose replays the user backward
+/// program, so reverse mode uses exactly the user-supplied gradient. Because that carrier rejects interpretation,
+/// forward-mode differentiation of a staged call is rejected, matching JAX's reverse-mode-only `custom_vjp`
+/// semantics. Refer to the documentation of [`custom_vjp`] for the full semantics and for when to reach for a custom
+/// VJP.
 ///
 /// This operation is deliberately non-transposable, which does not restrict reverse-mode differentiation. Reverse mode
 /// linearizes first, and the `jvp` rule replaces the operation with the transpose-only carrier described above — the
@@ -534,12 +601,17 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 {
 }
 
-/// Batching rule for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward programs so
-/// the custom derivative survives `batch`; see `BatchingContext::batch_wrapped_operation`.
+/// Batching rule for [`CustomVjpOperation`]. The primal and forward regions receive the wrapper operands' existing
+/// axes; corresponding primal outputs are reconciled while forward residuals keep their natural axes. The backward
+/// region then receives those residual axes followed by the reconciled output-cotangent axes, and its input
+/// cotangents are aligned back to the original operand axes. A cotangent that is mapped for a replicated primal input
+/// is summed across the mapped axis, as required by the transpose of replication.
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for CustomVjpOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
+    ArrayBatching<P>: LinearCallBatchingPolicy<C>
+        + BatchingPolicy<C, Batch = ArrayBatch<C::Value>, BatchedProgram = BatchedProgram<C::Constant, C::Operation>>,
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>
@@ -551,7 +623,97 @@ where
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        context.batch_wrapped_operation(driver, O::from(*self), inputs)
+        let input_axes = inputs.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
+        let primal_region = driver.region(0)?;
+        let forward_region = driver.region(1)?;
+        let backward_region = driver.region(2)?;
+
+        let naturally_batched_primal = driver.batch_program(
+            context,
+            primal_region,
+            input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let primal_output_axes = naturally_batched_primal.output_axes();
+        let naturally_batched_forward = driver.batch_program(
+            context,
+            forward_region,
+            input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let forward_output_axes = naturally_batched_forward.output_axes();
+        if forward_output_axes.len() < primal_output_axes.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "batched custom_vjp forward region produced {} outputs which is fewer than its {} primal outputs",
+                forward_output_axes.len(),
+                primal_output_axes.len(),
+            ))
+            .into());
+        }
+        let (forward_primal_output_axes, residual_axes) = forward_output_axes.split_at(primal_output_axes.len());
+
+        // The ordinary primal and the primal prefix of the forward rule must expose one physical wrapper boundary.
+        // Residuals are internal to the derivative rule and retain the axes naturally produced by the forward region.
+        let output_axes = primal_output_axes
+            .iter()
+            .copied()
+            .zip(forward_primal_output_axes.iter().copied())
+            .map(|(primal, forward)| {
+                [primal, forward].into_iter().find(|axis| !axis.is_replicated()).unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let residual_axes = residual_axes.to_vec();
+        let primal = context.align_batched_program_outputs(
+            driver,
+            primal_region,
+            input_axes.as_slice(),
+            naturally_batched_primal,
+            output_axes.as_slice(),
+        )?;
+        let forward_required_output_axes =
+            output_axes.iter().copied().chain(residual_axes.iter().copied()).collect::<Vec<_>>();
+        let forward = context.align_batched_program_outputs(
+            driver,
+            forward_region,
+            input_axes.as_slice(),
+            naturally_batched_forward,
+            forward_required_output_axes.as_slice(),
+        )?;
+
+        // The backward rule maps `(residuals..., output_cotangents...)` to input cotangents. Align mapped results to
+        // their primal input positions while they are live; adaptation then sums the only non-structural mismatch,
+        // namely a mapped cotangent corresponding to a replicated primal input.
+        let backward_input_axes = residual_axes.iter().copied().chain(output_axes.iter().copied()).collect::<Vec<_>>();
+        let batched_backward = driver.batch_program(
+            context,
+            backward_region,
+            backward_input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(input_axes.clone()),
+        )?;
+        let (backward, backward_output_axes) = <ArrayBatching<P> as BatchingPolicy<C>>::adapt_batched_program(
+            batched_backward,
+            Some(input_axes.as_slice()),
+            <ArrayBatching<P> as LinearCallBatchingPolicy<C>>::sum_mapped_cotangents,
+        )?
+        .into_parts();
+        if backward_output_axes != input_axes {
+            return Err(BatchingError::MisalignedBatchAxes {
+                message: format!(
+                    "batched custom_vjp backward output axes {backward_output_axes:?} do not match input axes \
+                     {input_axes:?}",
+                ),
+            });
+        }
+
+        let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        let outputs =
+            context.parent().bind(O::from(*self), vec![primal, forward, backward], input_values.as_slice())?;
+        check_count!("output", outputs, output_axes.len(), ProgramError);
+        outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, axis))
+            .collect()
     }
 }
 
@@ -798,9 +960,13 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::axes::AxisIndexOperation;
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::batching::{Batch, BatchAxis};
+    use crate::batching::{
+        ArrayBatch, ArrayBatching, Batch, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy,
+        RecursiveBatchingDriver,
+    };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::jacobian::jacobian_reverse;
     use crate::differentiation::{ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate};
@@ -812,6 +978,7 @@ mod tests {
     use crate::programs::effects::Effects;
     use crate::programs::regions::RegionRole;
     use crate::programs::{Program, ProgramBuilder};
+    use crate::sharding::ShardingDimension;
     use crate::types::{DataType, Dimension, Shape};
 
     use super::*;
@@ -891,6 +1058,22 @@ mod tests {
             ArrayOperation::CustomVjp(CustomVjpOperation::new()),
             vec![sin_program(r#type), sin_forward_program(r#type), tripled_sin_backward_program(r#type)],
         )
+    }
+
+    /// Builds one flat program that binds `operation` with `regions` to inputs of `input_types`.
+    fn wrapped_call_program(
+        input_types: Vec<ArrayType>,
+        operation: ArrayOperation<Array>,
+        regions: Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>,
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::new();
+        let region_ids =
+            regions.iter().map(|region| builder.import_region(region.entry_region_ref())).collect::<Vec<_>>();
+        let input_count = input_types.len();
+        let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let outputs = builder.add_instruction(operation, region_ids, inputs).unwrap().to_vec();
+        let output_count = outputs.len();
+        builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
     }
 
     /// Builds the scalar `f(x) = sin(x)` program.
@@ -1049,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_jvp_batches_by_rewrapping_the_call() {
+    fn test_custom_jvp_batches_the_attached_regions() {
         let scalar = test_type(&[]);
         let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
@@ -1069,9 +1252,108 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_jvp_batching_preserves_and_reconciles_natural_output_axes() {
+        let vector_type = test_type(&[3]);
+
+        // The primal has one mapped identity output, one naturally replicated constant output, and one replicated
+        // constant whose JVP tangent is mapped. The third pair forces reconciliation to mapped without forcing the
+        // independently replicated second pair to acquire a batch axis.
+        let primal = {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(vector_type.clone());
+            let replicated = builder.add_constant(Array::vector(vec![4.0, 5.0, 6.0]));
+            let reconciled = builder.add_constant(Array::vector(vec![7.0, 8.0, 9.0]));
+            builder.build(vec![input, replicated, reconciled], vec![Placeholder], vec![Placeholder; 3]).unwrap()
+        };
+        let jvp = {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(vector_type.clone());
+            let tangent = builder.add_input(vector_type.clone());
+            let replicated = builder.add_constant(Array::vector(vec![4.0, 5.0, 6.0]));
+            let reconciled = builder.add_constant(Array::vector(vec![7.0, 8.0, 9.0]));
+            let zero = builder.add_constant(Array::vector(vec![0.0, 0.0, 0.0]));
+            builder
+                .build(
+                    vec![input, replicated, reconciled, tangent, zero, tangent],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 6],
+                )
+                .unwrap()
+        };
+        let program = wrapped_call_program(
+            vec![vector_type],
+            ArrayOperation::CustomJvp(CustomJvpOperation::new()),
+            vec![primal, jvp],
+        );
+
+        // Mapping the input at packed axis 1 preserves that position for varying outputs. The independent constant
+        // remains replicated, while the third primal constant is broadcast only because its corresponding tangent
+        // varies at axis 1. None of the attached regions transposes that natural axis to a wrapper-wide convention.
+        let (batched, output_axes) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(1)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(1), BatchAxis::replicated(), BatchAxis::new(1)]);
+        assert_eq!(batched.instructions().len(), 1);
+        let instruction = &batched.instructions()[0];
+        assert!(matches!(instruction.operation(), ArrayOperation::CustomJvp(_)));
+        assert!(instruction.regions().iter().all(|region| {
+            batched
+                .region_ref(*region)
+                .unwrap()
+                .instructions()
+                .iter()
+                .all(|instruction| !matches!(instruction.operation(), ArrayOperation::Transpose(_)))
+        }));
+
+        let input = Array::matrix(3, 2, vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0]);
+        assert_eq!(
+            batched.interpret(vec![input.clone()]).unwrap(),
+            vec![input, Array::vector(vec![4.0, 5.0, 6.0]), Array::matrix(3, 2, vec![7.0, 7.0, 8.0, 8.0, 9.0, 9.0]),],
+        );
+    }
+
+    #[test]
+    fn test_custom_jvp_batching_discovers_named_axis_outputs_with_replicated_inputs() {
+        let scalar_type = test_type(&[]);
+        let primal = {
+            let mut builder = ProgramBuilder::new();
+            builder.add_input(scalar_type.clone());
+            let index = builder
+                .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new())
+                .unwrap()[0];
+            builder.build(vec![index], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let jvp = {
+            let mut builder = ProgramBuilder::new();
+            builder.add_input(scalar_type.clone());
+            builder.add_input(scalar_type);
+            let index = builder
+                .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new())
+                .unwrap()[0];
+            let tangent = builder.add_constant(Array::scalar(Scalar::Zero));
+            builder.build(vec![index, tangent], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
+        };
+        let regions = vec![primal, jvp];
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
+            .with_axis_name("items".to_string());
+
+        // No operand carries a mapped axis, but `axis_index("items")` observes the active transform inside both
+        // regions and naturally produces a mapped output. Batching must therefore inspect the regions rather than
+        // assuming that all-replicated wrapper inputs imply all-replicated wrapper outputs.
+        let outputs = CustomJvpOperation::new()
+            .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(1.0))])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value(), &Array::vector(vec![Scalar::U64(0), Scalar::U64(1), Scalar::U64(2)]));
+    }
+
+    #[test]
     fn test_custom_jvp_survives_batching_and_governs_the_batched_gradient() {
         // Differentiating *through* a batch of the custom call must still use the (deliberately doubled) custom
-        // rule: batching re-wraps the call around batched programs instead of inlining the primal, so the
+        // rule: batching preserves the call around batched programs instead of inlining the primal, so the
         // custom derivative survives `batch` — mirroring JAX's `vmap`-of-`custom_jvp` semantics.
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
@@ -1625,9 +1907,8 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_wrapper_batching_broadcasts_replicated_inputs() {
-        // Mapping only the first input exercises the replicated broadcast in the re-wrapping batch rule: the
-        // unmapped operand is broadcast into the batch (the all-inputs-mapped-at-0 convention) and the batched call
-        // still computes per-item products.
+        // Mapping only the first input verifies that the replicated operand remains shared at the wrapper boundary
+        // while operations inside its regions broadcast it only where per-item multiplication requires alignment.
         let function = custom_vjp(
             |(x, y): (
                 DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
@@ -1649,6 +1930,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.to_f64s(), vec![10.0, 15.0, 20.0]);
+    }
+
+    #[test]
+    fn test_custom_vjp_batching_preserves_residual_axes_and_sums_replicated_input_cotangents() {
+        let scalar_type = test_type(&[]);
+        let primal = {
+            let mut builder = ProgramBuilder::new();
+            let x = builder.add_input(scalar_type.clone());
+            let y = builder.add_input(scalar_type.clone());
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, y]).unwrap()[0];
+            builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap()
+        };
+        let forward = {
+            let mut builder = ProgramBuilder::new();
+            let x = builder.add_input(scalar_type.clone());
+            let y = builder.add_input(scalar_type.clone());
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, y]).unwrap()[0];
+            builder.build(vec![output, x, y], vec![Placeholder; 2], vec![Placeholder; 3]).unwrap()
+        };
+        let backward = {
+            let mut builder = ProgramBuilder::new();
+            let x = builder.add_input(scalar_type.clone());
+            let y = builder.add_input(scalar_type.clone());
+            let cotangent = builder.add_input(scalar_type.clone());
+            let x_cotangent = builder.add_instruction(MulOperation::new(), Vec::new(), vec![y, cotangent]).unwrap()[0];
+            let y_cotangent = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, cotangent]).unwrap()[0];
+            builder.build(vec![x_cotangent, y_cotangent], vec![Placeholder; 3], vec![Placeholder; 2]).unwrap()
+        };
+        let program = wrapped_call_program(
+            vec![scalar_type.clone(), scalar_type],
+            ArrayOperation::CustomVjp(CustomVjpOperation::new()),
+            vec![primal, forward, backward],
+        );
+
+        // `x` varies across the batch while `y` is shared. The forward residuals therefore carry axes `(0, None)`.
+        // The backward rule naturally produces both cotangents mapped, but `y`'s cotangent must be summed back to the
+        // replicated position rather than leaking a mapped axis through the wrapper contract.
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        let instruction = &batched.instructions()[0];
+        assert!(matches!(instruction.operation(), ArrayOperation::CustomVjp(_)));
+        let forward = batched.region_ref(instruction.regions()[1]).unwrap();
+        assert_eq!(forward.output_types(), &[test_type(&[2]), test_type(&[2]), test_type(&[]),],);
+        let backward = batched.region_ref(instruction.regions()[2]).unwrap();
+        assert_eq!(backward.output_types(), &[test_type(&[2]), test_type(&[])]);
+        assert!(
+            backward
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), ArrayOperation::Reduce(_))),
+            "the cotangent of the replicated input must be summed across the mapped axis",
+        );
+        assert_eq!(
+            batched.interpret(vec![Array::vector(vec![2.0, 3.0]), Array::scalar(5.0)]).unwrap(),
+            vec![Array::vector(vec![10.0, 15.0])],
+        );
     }
 
     #[test]
