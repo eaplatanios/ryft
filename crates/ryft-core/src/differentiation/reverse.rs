@@ -437,6 +437,35 @@ pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operati
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>;
 }
 
+/// Transposition rule for a member [`Operation`] whose instruction has a mixed signature in a parent operation
+/// universe. If this operation has native type `T` while the enclosing operation family uses type `U`, an ordinary
+/// [`TransposableOperation`] implementation can describe only the homogeneous `T -> T` contract. This trait instead
+/// receives the parent [`TracingContext`] and its `U`-typed inputs and outputs, allowing the rule to account for
+/// additional operands or results belonging to other members of `U`.
+///
+/// Shape-changing collectives are the motivating example. Their native array operation consumes one array,
+/// whereas their array-or-dimension variant consumes that array followed by first-class output extents. The member
+/// transposition rule delegates the array contribution through [`transpose_projected_operation`] and returns structural
+/// zero cotangents for the extent operands. Operation-family dispatchers should use this trait only for member payloads
+/// whose parent signature differs from their native [`Operation::Type`].
+pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation {
+    /// Applies this member operation's transpose rule in its enclosing parent operation universe.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active parent [`TracingContext`] in which the rule stages operations.
+    ///   - `driver`: Instruction-scoped [`TranspositionDriver`] exposing any attached regions.
+    ///   - `inputs`: Parent-universe primal knowledge in the mixed instruction's operand order.
+    ///   - `outputs`: Parent-universe cotangents for the mixed instruction's results.
+    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TracingContext<V, O>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>;
+}
+
 impl<
     T: DifferentiableType,
     V: Value<Type = T>,
