@@ -75,10 +75,12 @@
 //!
 //! Implement [`DifferentiableType`] for types that possess tangent and cotangent spaces. Implement
 //! [`DifferentiableOperation`] for primitive JVP rules. Rules should express tangent behavior through the provided
-//! context and preserve symbolic zeros where possible. Implement [`TransposableOperation`] for linear primitives that
-//! may occur in a pushforward. Higher-order [`Operation`](crate::Operation) logic belongs with the operation whose
-//! instruction attaches to the nested [`Region`](crate::Region). Wrapper operation enums should provide family dispatch
-//! and forward to those payload rules.
+//! context and preserve symbolic zeros where possible. Implement [`ProjectedDifferentiableOperation`] when a
+//! homogeneous member operation needs values from an enclosing composite context while constructing its derivative.
+//! Ordinary homogeneous projected rules should use [`jvp_projected_operation`]. Implement [`TransposableOperation`]
+//! for linear primitives that may occur in a pushforward. Higher-order [`Operation`](crate::Operation) logic belongs
+//! with the operation whose instruction attaches to the nested [`Region`](crate::Region). Wrapper operation enums
+//! should provide family dispatch and forward to those payload rules.
 
 pub mod elementwise;
 pub mod forward;
@@ -102,7 +104,8 @@ pub use elementwise::{
 };
 pub use forward::{
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,
-    ForwardModeDifferentiate, Linearization, LinearizationTracer, Pushforward, jvp, jvp_projected_operation, linearize,
+    ForwardModeDifferentiate, Linearization, LinearizationTracer, ProjectedDifferentiableOperation, Pushforward, jvp,
+    jvp_projected_operation, linearize,
 };
 pub use hessian::{
     Hessian, HessianBlock, HessianDifferentiate, hessian, hessian_holomorphic, hessian_holomorphic_with_aux,

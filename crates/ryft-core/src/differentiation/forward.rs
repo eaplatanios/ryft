@@ -803,6 +803,51 @@ pub trait DifferentiableOperation<C: Context>: Operation {
         Self: Operation<Type = C::Type>;
 }
 
+/// Forward-mode rule for a homogeneous member [`Operation`] whose Jacobian-Vector Product (JVP) must execute in an
+/// enclosing composite [`Context`]. If this operation has member type `T` and the outer context has type `U`, then
+/// [`OperationProjection<T>`](OperationProjection) identifies the homogeneous operation family embedded in `U`,
+/// while [`ValueProjection<T>`](ValueProjection) identifies its value and constant representations.
+/// [`jvp_projected_operation`] first converts every input from the composite value type to the member value type,
+/// applies the ordinary member rule in [`ProjectedContext<C, T>`](ProjectedContext), and then converts its outputs back
+/// to composite values. A rule executed that way can work only with values of member type `T`. This trait instead gives
+/// the rule the original composite values and the enclosing context `C`, allowing the rule to use values from other
+/// members of `U` when constructing the derivative.
+///
+/// This distinction matters for rules such as dynamically shaped slicing. The primal operation remains an ordinary
+/// [`ArrayType`](crate::ArrayType) operation, but its linearization must retain first-class dimension values in an
+/// [`ArrayProgramType`](crate::ArrayProgramType) program. Implementing [`DifferentiableOperation<C>`] directly cannot
+/// express that relationship because its [`jvp`](DifferentiableOperation::jvp) method deliberately requires
+/// `Self::Type = C::Type`. This trait preserves that same-universe invariant while making projected cross-universe
+/// differentiation explicit.
+///
+/// Composite operation-family dispatchers should use this trait only for projected members whose derivative requires
+/// outer-universe values. Members whose inputs, outputs, and derivative all remain within `T` should continue using
+/// [`jvp_projected_operation`].
+pub trait ProjectedDifferentiableOperation<
+    C: Context<
+            Type: DifferentiableType + From<Self::Type>,
+            Value: ValueProjection<Self::Type, Projected: Value<Type = Self::Type>>,
+            Constant: ValueProjection<Self::Type, Projected: Value<Type = Self::Type>>,
+            Operation: OperationProjection<Self::Type>,
+        >,
+>: Operation<Type: DifferentiableType>
+{
+    /// Applies this projected member's Jacobian-Vector Product (JVP) rule (i.e., its [`DifferentiableOperation::jvp`])
+    /// using values from the enclosing composite context.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Enclosing composite [`Context`] through which the rule stages member and mixed operations.
+    ///   - `driver`: Instruction-scoped [`DifferentiationDriver`] that exposes any attached [`Region`](crate::Region)s.
+    ///   - `inputs`: Composite primal/tangent pairs aligned with this operation's operands.
+    fn jvp_projected<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
+}
+
 /// [`DifferentiationDual`] flowing through a forward-mode [`DifferentiationContext`]. The function being differentiated
 /// operates on [`DifferentiationTracer`]s directly, so each operation the closure performs (e.g., `x + y`, `x.sin()`,
 /// etc.) dispatches its [`jvp`](DifferentiableOperation::jvp) rule through [`Context::bind`] on the stamped

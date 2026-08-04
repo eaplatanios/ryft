@@ -11,7 +11,7 @@ use crate::differentiation::forward::jvp_projected_operation;
 use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, LinearCallOperation,
+    ElementwiseDerivativeAlignment, LinearCallOperation, ProjectedDifferentiableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -333,35 +333,27 @@ where
     }
 }
 
-impl SliceOperation {
-    /// Applies the array-program JVP rule, retaining exact extent residuals for a dynamically shaped operand and
-    /// otherwise delegating to the ordinary projected [`ArrayType`] rule.
-    ///
-    /// This is an inherent method rather than a [`DifferentiableOperation`] implementation because
-    /// [`SliceOperation`] remains an `ArrayType` operation while the context here has [`ArrayProgramType`]. The
-    /// composite family dispatcher calls this method only for its projected slice member.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Composite context in which primal and linear-call operations are staged.
-    ///   - `inputs`: Composite primal/tangent pairs for the slice operand.
-    pub(crate) fn jvp_array_program<C>(
+/// Projected array-program JVP rule for [`SliceOperation`]. A dynamically shaped operand retains its exact extents as
+/// ordinary residual values; a static operand delegates to the homogeneous projected rule.
+impl<C> ProjectedDifferentiableOperation<C> for SliceOperation
+where
+    C: Context<Type = ArrayProgramType>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation:
+        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+        + From<PadOperation<ArrayType>>
+        + From<SliceOperation>
+        + From<UpdateSliceOperation>
+        + From<ZeroOperation<ArrayType>>,
+{
+    fn jvp_projected<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        C: Context<Type = ArrayProgramType>,
-        C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-        C::Operation:
-            From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
-        <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
-            + From<PadOperation<ArrayType>>
-            + From<SliceOperation>
-            + From<UpdateSliceOperation>
-            + From<ZeroOperation<ArrayType>>,
-    {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let [operand] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
@@ -1226,34 +1218,27 @@ where
     }
 }
 
-impl DynamicSliceOperation {
-    /// Applies the array-program JVP rule, retaining exact extent and start-index residuals for a dynamically shaped
-    /// operand and otherwise delegating to the ordinary projected [`ArrayType`] rule.
-    ///
-    /// This is an inherent method rather than a [`DifferentiableOperation`] implementation because
-    /// [`DynamicSliceOperation`] remains an `ArrayType` operation while the context here has [`ArrayProgramType`]. The
-    /// composite family dispatcher calls this method only for its projected dynamic-slice member.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Composite context in which primal and linear-call operations are staged.
-    ///   - `inputs`: Composite primal/tangent pairs for the operand and scalar start indices.
-    pub(crate) fn jvp_array_program<C>(
+/// Projected array-program JVP rule for [`DynamicSliceOperation`]. A dynamically shaped operand retains its exact
+/// extents and scalar start indices as ordinary residual values; a static operand delegates to the homogeneous
+/// projected rule.
+impl<C> ProjectedDifferentiableOperation<C> for DynamicSliceOperation
+where
+    C: Context<Type = ArrayProgramType>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation:
+        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+        + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>
+        + From<ZeroOperation<ArrayType>>,
+{
+    fn jvp_projected<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
-        C: Context<Type = ArrayProgramType>,
-        C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-        C::Operation:
-            From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
-        <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
-            + From<DynamicSliceOperation>
-            + From<DynamicUpdateSliceOperation>
-            + From<ZeroOperation<ArrayType>>,
-    {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let (operand, start_indices) =
             inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
         let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();

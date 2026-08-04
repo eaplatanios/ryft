@@ -6,7 +6,7 @@
 //! in one capability-specific module avoids duplicating the composite context bounds across operation payloads while
 //! removing the mathematics from the central operation-family module.
 
-use crate::differentiation::forward::jvp_projected_operation;
+use crate::differentiation::forward::{ProjectedDifferentiableOperation, jvp_projected_operation};
 use crate::differentiation::reverse::transpose_projected_operation;
 use crate::operations::control_flow::{
     TemporalResidualOperation, TemporalResidualType, WhileResidualStackOperation, WhileResidualStackType,
@@ -453,10 +453,10 @@ where
             return jvp_array_program_while(operation, context, driver, inputs);
         }
         if let Self::Array(ArrayOperation::Slice(operation)) = self {
-            return operation.jvp_array_program(context, inputs);
+            return operation.jvp_projected(context, driver, inputs);
         }
         if let Self::Array(ArrayOperation::DynamicSlice(operation)) = self {
-            return operation.jvp_array_program(context, inputs);
+            return operation.jvp_projected(context, driver, inputs);
         }
         if let Self::Array(ArrayOperation::DynamicUpdateSlice(_)) = self {
             if inputs.len() < 2 {
