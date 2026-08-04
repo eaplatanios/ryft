@@ -103,7 +103,7 @@ use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::BindingRegionDriver;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{ProjectedValue, ProjectedValueRef, Value, ValueProjection};
+use crate::programs::values::{ProjectedValue, Value, ValueProjection};
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
 /// [`Atom`](crate::Atom) or _poisoned_, meaning that it corresponds to an error.
@@ -270,7 +270,7 @@ where
 {
     type Projected = ProjectedValue<T, Self>;
     type ProjectedRef<'v>
-        = ProjectedValueRef<'v, T, Self>
+        = ProjectedValue<T, &'v Self>
     where
         Self: 'v,
         T: 'v;
@@ -285,7 +285,7 @@ where
     where
         T: 'v,
     {
-        Ok(ProjectedValueRef::new(self, <&T>::try_from(&self.r#type)?))
+        Ok(ProjectedValue::new(self, <&T>::try_from(&self.r#type)?.clone()))
     }
 
     #[inline]

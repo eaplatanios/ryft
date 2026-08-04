@@ -33,8 +33,8 @@ pub use batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation,
     BatchableType, BatchedProgram, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
     BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DimensionSource,
-    InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
-    StaticArrayBatchingPolicy, batch, batch_projected_operation,
+    InterpretableBatchableOperation, MemberBatchableOperation, ProgramBatchingOutputAxesPolicy,
+    RecursiveBatchingPolicy, StaticArrayBatchingPolicy, batch, batch_projected_operation,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
@@ -42,7 +42,9 @@ pub use compilation::*;
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::*;
 pub use errors::{CustomError, Error, MaybeFallible};
-pub use interpretation::{InterpretableOperation, InterpretationDriver, interpret_projected_operation};
+pub use interpretation::{
+    InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
+};
 pub use operations::*;
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

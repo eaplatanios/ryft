@@ -134,8 +134,8 @@ pub use effects::{Effect, Effects};
 pub use identities::{NoIdentity, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 pub use instructions::{Instruction, InstructionId};
 pub use operations::{
-    Operation, OperationFormatter, OperationProjection, OperationProvider, infer_projected_operation_output_types,
-    infer_projected_operation_region_input_types,
+    MemberOperation, Operation, OperationFormatter, OperationProjection, OperationProvider,
+    infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 pub use programs::{FlatProgram, Program, ProgramLiveSets};
 pub use regions::{
@@ -144,7 +144,7 @@ pub use regions::{
     RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
 };
 pub use types::{Type, TypeError, TypeRefinements, Typed};
-pub use values::{Concretizable, ProjectedValue, ProjectedValueRef, Value, ValueId, ValueProjection};
+pub use values::{Concretizable, ProjectedValue, Value, ValueId, ValueProjection};
 
 /// Represents errors related to [`Program`]s in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]

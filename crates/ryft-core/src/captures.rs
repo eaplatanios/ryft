@@ -29,7 +29,7 @@ use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::programs::Program;
 use crate::programs::regions::RegionArena;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{ProjectedValueRef, Value, ValueProjection};
+use crate::programs::values::{ProjectedValue, Value, ValueProjection};
 use crate::tracing::{NestedTracingContext, TracingContext};
 
 /// Reference to a value captured outside a staged [`Program`]. A program stores only this lifetime-free reference
@@ -115,7 +115,7 @@ where
 {
     type Projected = CaptureReference<P>;
     type ProjectedRef<'v>
-        = ProjectedValueRef<'v, P, Self>
+        = ProjectedValue<P, &'v Self>
     where
         Self: 'v,
         P: 'v;
@@ -130,7 +130,7 @@ where
     where
         P: 'v,
     {
-        Ok(ProjectedValueRef::new(self, <&P>::try_from(&self.r#type)?))
+        Ok(ProjectedValue::new(self, <&P>::try_from(&self.r#type)?.clone()))
     }
 
     #[inline]
