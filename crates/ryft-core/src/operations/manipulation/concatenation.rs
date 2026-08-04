@@ -21,7 +21,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::{ConstantOperation, Zero, ZeroOperation};
-use crate::operations::dimensions::{DimensionAddOperation, DimensionSizeOperation};
+use crate::operations::dimensions::{DimensionAddOperation, DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::{
     BroadcastOperation, DynamicShapeSliceOperation, LegacyBroadcast, SliceOperation, Transpose,
 };
@@ -171,12 +171,12 @@ impl Operation for ConcatenateOperation<ArrayProgramType> {
 
     #[inline]
     fn effects(&self) -> Effects {
-        // TODO(eaplatanios): Update this when Phase 8 introduces the authoritative operation declaration.
+        // TODO(eaplatanios): Replace the axis-only mixed payload with one that can classify this effect precisely.
         // This is a deliberate over-approximation. A mixed concatenate whose input extents are all static and whose
         // result extent is a provably equal exact constant needs no runtime check (inference above already rejects
         // static mismatches), but `effects` sees only this axis-only payload and cannot derive the operand extent
-        // signature. The authoritative operation declaration will add the irreducible mixed extent metadata and make
-        // this effect conditional on the same bounds-proof predicate used by inference.
+        // signature. A later effect-precision slice can add the irreducible mixed extent metadata and make this effect
+        // conditional on the same bounds-proof predicate used by inference.
         Effects::single(Effect::OrderedAssertion)
     }
 
@@ -225,8 +225,72 @@ impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> 
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: From<ConcatenateOperation<ArrayType>>>> PartiallyEvaluatableOperation<C>
-    for ConcatenateOperation<ArrayType>
+impl<C> InterpretableOperation<C> for ConcatenateOperation<ArrayProgramType>
+where
+    C: Domain<Type = ArrayProgramType>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        if driver.region_count() != 0 {
+            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
+        }
+        let Some((result_extent, inputs)) = inputs.split_last() else {
+            return Err(TypeError::invalid(format!(
+                "'{CONCATENATE_OPERATION_NAME}' expects at least one array followed by its result extent",
+            ))
+            .into());
+        };
+        if inputs.is_empty() {
+            return match <C::Value as ValueProjection<DimensionType>>::into_projected(result_extent.clone()) {
+                Err(_) => Err(TypeError::invalid(format!(
+                    "'{CONCATENATE_OPERATION_NAME}' expects a trailing result-extent dimension",
+                ))
+                .into()),
+                Ok(_) => Err(TypeError::invalid(format!(
+                    "'{CONCATENATE_OPERATION_NAME}' expects at least one array before its result extent",
+                ))
+                .into()),
+            };
+        }
+        let result_extent =
+            <C::Value as ValueProjection<DimensionType>>::into_projected(result_extent.clone())?.extent();
+        let inputs = inputs
+            .iter()
+            .cloned()
+            .map(<C::Value as ValueProjection<ArrayType>>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        let actual_extent = inputs.iter().try_fold(0usize, |extent, input| {
+            extent.checked_add(input.dimension_size(self.axis())?).ok_or_else(|| {
+                ProgramError::from(TypeError::invalid(format!(
+                    "'{CONCATENATE_OPERATION_NAME}' result extent overflows usize",
+                )))
+            })
+        })?;
+        if result_extent != actual_extent {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "'{CONCATENATE_OPERATION_NAME}' result extent must equal the sum of input axis {} extents; \
+                     expected {actual_extent} but got {result_extent}",
+                    self.axis(),
+                ),
+            });
+        }
+        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(
+            <<C::Value as ValueProjection<ArrayType>>::Projected as Concatenate>::concatenate(&inputs, self.axis())?,
+        )])
+    }
+}
+
+impl<T: Type, C: Context<Type = T, Operation: From<ConcatenateOperation<T>>>> PartiallyEvaluatableOperation<C>
+    for ConcatenateOperation<T>
+where
+    ConcatenateOperation<T>: Operation<Type = T>,
 {
 }
 

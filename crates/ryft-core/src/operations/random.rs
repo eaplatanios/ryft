@@ -331,10 +331,10 @@ impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RngBitGeneratorOperation<ArrayType> where
-    C::Operation: From<RngBitGeneratorOperation<ArrayType>>
+impl<T: Type, C: Context<Type = T, Operation: From<RngBitGeneratorOperation<T>>>> PartiallyEvaluatableOperation<C>
+    for RngBitGeneratorOperation<T>
+where
+    RngBitGeneratorOperation<T>: Operation<Type = T>,
 {
 }
 

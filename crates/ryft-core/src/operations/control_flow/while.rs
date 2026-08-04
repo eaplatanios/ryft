@@ -175,8 +175,14 @@ impl<T: WhileTypeSemantics> Display for WhileOperation<T> {
 /// whose condition returns a batched predicate and the loop's consumers implement the masked semantics.
 ///
 /// [`DataType`] conditions must produce a scalar Boolean data type. [`ArrayProgramType`] conditions must produce a
-/// Boolean array member and may carry mixed array/dimension state under a scalar predicate. A batched predicate cannot
-/// carry a first-class dimension because one scalar extent cannot represent independently masked per-item state.
+/// Boolean array member and may carry mixed array/dimension state. Under a batched predicate the prefix requirement
+/// applies to the array members only, since a first-class dimension carries no shape, and such a dimension carry must
+/// additionally be *loop-invariant*: one dimension value cannot represent independently masked per-item extents, but
+/// masking a carry that the body forwards unchanged is the identity. Eager interpretation enforces that invariance
+/// dynamically through [`ArrayProgramValue`](crate::backends::array_programs::ArrayProgramValue)'s
+/// [`mask_select`](WhilePredicate::mask_select), which returns equal dimension carries unchanged and falls back to
+/// scalar-predicate concretization — an error under a batched predicate — for distinct ones. Structural composite
+/// batching relies on this relaxation to thread its loop-invariant mapped extent through batch-varying loops.
 ///
 /// The loop-carried state rule is otherwise identical for every type family: the condition and body consume the same
 /// state signature, and the body returns the next state with that same signature.
@@ -258,10 +264,11 @@ impl WhileTypeSemantics for ArrayProgramType {
             return Ok(());
         }
         for state_type in state_types {
+            // A first-class dimension carries no shape, so the predicate-prefix requirement does not apply to it. Such
+            // a carry must instead be loop-invariant, which `WhilePredicate::mask_select` enforces dynamically (refer
+            // to the documentation of `WhileTypeSemantics`).
             let Self::Array(state_type) = state_type else {
-                return Err(TypeError::invalid(format!(
-                    "'while' loop with a batched predicate cannot carry first-class dimension state {state_type}"
-                )));
+                continue;
             };
             let state_shape = state_type.shape();
             let is_prefix = predicate_shape.rank() <= state_shape.rank()
@@ -1117,8 +1124,10 @@ where
 ///
 /// Array carries use the same monotonic mapped-axis fixed point as homogeneous array loops. First-class dimensions
 /// remain replicated loop state, and the transformed condition and body explicitly thread the mapped extent through
-/// their region boundaries. A batch-varying predicate rejects dimension state because one shared extent cannot encode
-/// independently masked values for different batch items.
+/// their region boundaries. Under a batch-varying predicate the replicated dimension carries ride through the loop as
+/// loop-invariant state that per-item masking never touches (the relaxed [`WhileTypeSemantics`] contract documents that
+/// invariance requirement), while *mapped* dimension inputs and dimension outputs that would widen into per-item
+/// extents remain rejected.
 impl<C> BatchableOperation<C, ArrayProgramBatching> for WhileOperation<ArrayProgramType>
 where
     C: Context<
@@ -1217,36 +1226,38 @@ where
         check_count!("output", batched_condition.output_axes(), 1, ProgramError);
         let batch_varying = !batched_condition.output_axes()[0].is_replicated();
         if batch_varying {
-            if let Some(dimension) =
-                inputs.iter().find(|input| matches!(input.unbatched_type(), ArrayProgramType::Dimension(_)))
-            {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "cannot batch a while loop with a batch-varying predicate and first-class dimension state {} \
-                         because one replicated dimension cannot represent per-item loop state",
-                        dimension.unbatched_type(),
-                    ),
-                });
-            }
-
-            // Per-item termination masks every array carry, so widen any still-replicated arrays and rebuild both
-            // regions at the final invariant boundary. The predicate itself is forced to leading axis 0.
-            state_axes.fill(BatchAxis::new(0));
-            batched_body = driver
-                .batch_program(
+            // Per-item termination masks every array carry, so the masked invariant boundary widens every array carry
+            // to the leading axis and forces the predicate itself to axis 0, and both regions are rebuilt there.
+            // Dimension carries stay replicated — they are loop-invariant passthrough state that masking never touches
+            // — so they are neither widened nor a reason to rebuild. When that boundary already equals the discovered
+            // one and the predicate naturally landed on axis 0, the rebuilds would replay identical programs, so the
+            // discovery body and condition are kept instead.
+            let masked_state_axes = state_axes
+                .iter()
+                .zip(inputs.iter())
+                .map(|(axis, input)| match input.unbatched_type() {
+                    ArrayProgramType::Array(_) => BatchAxis::new(0),
+                    ArrayProgramType::Dimension(_) => *axis,
+                })
+                .collect::<Vec<_>>();
+            if masked_state_axes != state_axes || batched_condition.output_axes()[0] != BatchAxis::new(0) {
+                state_axes = masked_state_axes;
+                batched_body = driver
+                    .batch_program(
+                        context,
+                        body_region,
+                        state_axes.as_slice(),
+                        ProgramBatchingOutputAxesPolicy::AlignEachTo(state_axes.clone()),
+                    )?
+                    .into_parts()
+                    .0;
+                batched_condition = driver.batch_program(
                     context,
-                    body_region,
+                    condition_region,
                     state_axes.as_slice(),
-                    ProgramBatchingOutputAxesPolicy::AlignEachTo(state_axes.clone()),
-                )?
-                .into_parts()
-                .0;
-            batched_condition = driver.batch_program(
-                context,
-                condition_region,
-                state_axes.as_slice(),
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0)]),
-            )?;
+                    ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0)]),
+                )?;
+            }
         }
 
         for (value, axis) in state.iter_mut().zip(state_axes.iter()) {
@@ -1361,6 +1372,12 @@ pub(crate) trait WhileResidualStackType: DifferentiableType + TemporalResidualTy
 
     /// Projects an array member from this type family.
     fn array_type(&self) -> Result<&ArrayType, TypeError>;
+
+    /// Returns the array member that a batched-predicate mask/select applies to, or `None` for a first-class dimension
+    /// carry. Such a carry is loop-invariant under a batched predicate, so masking it is the identity and it is exempt
+    /// from the per-element selection the masked normal form builds (refer to the documentation of
+    /// [`WhileTypeSemantics`]).
+    fn maskable_array_type(&self) -> Option<&ArrayType>;
 }
 
 /// Operation-family constructors required by the shared bounded-`while` residual-stack algorithm.
@@ -1425,6 +1442,11 @@ impl WhileResidualStackType for ArrayType {
     #[inline]
     fn array_type(&self) -> Result<&ArrayType, TypeError> {
         Ok(self)
+    }
+
+    #[inline]
+    fn maskable_array_type(&self) -> Option<&ArrayType> {
+        Some(self)
     }
 }
 
@@ -1921,30 +1943,6 @@ where
     }
 }
 
-/// Applies the composite array-program `while` JVP policy without requiring the enclosing operation family to expose
-/// a borrowed `WhileOperation` projection. Composite dispatch already owns the concrete operation payload, so the
-/// recursive projection used by the generic eager shortcut would be redundant.
-pub(crate) fn jvp_array_program_while<C, D: DifferentiationDriver<C>>(
-    operation: &WhileOperation<ArrayProgramType>,
-    context: &C,
-    driver: &D,
-    inputs: &[DifferentiationDual<C::Value>],
-) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-where
-    C: Context<Type = ArrayProgramType> + Zero<C::Value>,
-    C::Constant: ValueProjection<ArrayType>,
-    C::Value: Concretizable<bool>,
-    C::Operation: ZeroOperationProvider<ArrayProgramType>
-        + From<ConditionOperation<C::Constant>>
-        + From<WhileOperation<ArrayProgramType>>
-        + From<ScanOperation<C::Constant>>
-        + WhileResidualStackOperation<ArrayProgramType, <C::Constant as ValueProjection<ArrayType>>::Projected>,
-{
-    let condition = driver.region(0)?.to_program();
-    let body = driver.region(1)?.to_program();
-    <ArrayProgramType as WhileJvp<C>>::jvp_while(operation, &condition, &body, context, driver, inputs)
-}
-
 /// Stages **one fused** doubled-state forward-mode `while` as an ordinary primal-enum operation over the shared
 /// builder — the analogue of
 /// [JAX's `jvp` of `lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html), which
@@ -2324,11 +2322,13 @@ where
 
 /// Rewrites a while loop's condition and body into the scalar-predicate *masked form* over the augmented state
 /// `[state..., active_mask]`: the masked condition reduces the mask with a Boolean `any` over every predicate axis,
-/// and the masked body replays the original body for candidate updates, selects per state element between the
-/// candidate and the carried state under the (broadcast) mask, recomputes the per-item predicate on the new state,
-/// and ANDs it into the mask. The bounded while forward-mode rule uses this normal form for batched-predicate loops,
-/// whose counter- and stack-augmented differentiation state is not predicate-prefixed and therefore needs the loop's
-/// masking made explicit as program data hanging off a scalar predicate.
+/// and the masked body replays the original body for candidate updates, selects per array state element between the
+/// candidate and the carried state under the (broadcast) mask, recomputes the per-item predicate on the new state, and
+/// ANDs it into the mask. A first-class dimension carry is loop-invariant under a batched predicate, so it carries no
+/// selection and its candidate is forwarded directly (refer to the documentation of [`WhileTypeSemantics`]). The
+/// bounded while forward-mode rule uses this normal form for batched-predicate loops, whose counter- and
+/// stack-augmented differentiation state is not predicate-prefixed and therefore needs the loop's masking made
+/// explicit as program data hanging off a scalar predicate.
 fn masked_while_programs<V, O, A>(
     condition: &Program<V, O, Vec<V>, Vec<V>>,
     body: &Program<V, O, Vec<V>, Vec<V>>,
@@ -2365,9 +2365,17 @@ where
             check_count!("output", candidates, state_count, ProgramError);
             let mut next_state = Vec::with_capacity(state_count);
             for ((candidate, carried), state_type) in candidates.iter().zip(state).zip(state_types.iter()) {
+                // A first-class dimension carry is loop-invariant under a batched predicate (the contract documented
+                // on `WhileTypeSemantics`), so masking it is the identity and the body's candidate result is threaded
+                // on directly. This matches eager interpretation, whose `mask_select` returns equal dimension carries
+                // unchanged, and the XLA lowering's batched-predicate masking.
+                let Some(state_array_type) = state_type.maskable_array_type() else {
+                    next_state.push(candidate.clone());
+                    continue;
+                };
                 // The mask broadcasts to each state element's shape so the selection is per predicate item; a state
                 // element already shaped like the mask reuses it directly.
-                let element_mask_type = ArrayType::new(DataType::Boolean, state_type.array_type()?.shape().clone());
+                let element_mask_type = ArrayType::new(DataType::Boolean, state_array_type.shape().clone());
                 let element_mask = if element_mask_type == *mask_type.array_type()? {
                     mask.clone()
                 } else {
@@ -2486,6 +2494,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::batching::batch;
@@ -2535,8 +2544,10 @@ mod tests {
     fn test_while_composite_type_contract() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let dimension_type = ArrayProgramType::Dimension(DimensionType::new(extent.clone()));
-        let array_type =
-            ArrayProgramType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])));
+        let array_type = ArrayProgramType::Array(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent.clone())]),
+        ));
         let state_types = vec![dimension_type.clone(), array_type.clone()];
         let condition_interface = RegionInterface::new(
             state_types.clone(),
@@ -2551,16 +2562,34 @@ mod tests {
             Ok(state_types.clone()),
         );
 
+        // A batched predicate is legal alongside first-class dimension state: the dimension member carries no shape, so
+        // the prefix requirement applies to the array member only, and the loop-invariance requirement on a dimension
+        // carry is enforced dynamically during interpretation rather than by this contract.
         let batched_condition_interface = RegionInterface::new(
+            state_types.clone(),
+            vec![ArrayProgramType::Array(ArrayType::new(
+                DataType::Boolean,
+                Shape::new(vec![Dimension::Dynamic(extent)]),
+            ))],
+            Effects::PURE,
+        );
+        assert_eq!(
+            operation
+                .infer_output_types(state_types.as_slice(), &[batched_condition_interface, body_interface.clone()]),
+            Ok(state_types.clone()),
+        );
+
+        // The prefix requirement still holds for every array member under a batched predicate.
+        let mismatched_condition_interface = RegionInterface::new(
             state_types.clone(),
             vec![ArrayProgramType::Array(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])))],
             Effects::PURE,
         );
         assert_eq!(
-            operation.infer_output_types(state_types.as_slice(), &[batched_condition_interface, body_interface]),
+            operation.infer_output_types(state_types.as_slice(), &[mismatched_condition_interface, body_interface]),
             Err(TypeError::invalid(
-                "'while' loop with a batched predicate cannot carry first-class dimension state \
-                 dimension<extent ∈ [1, 8)>"
+                "'while' condition predicate shape must be a prefix of every array state shape, but predicate bool[2] \
+                 is not a prefix of state f32[extent]"
                     .to_string(),
             )),
         );
@@ -4030,6 +4059,185 @@ mod tests {
         assert_eq!(rendered.matches("= while").count(), 1, "{rendered}");
         assert!(rendered.contains("%2:bool[3] = compare"), "{rendered}");
         assert_eq!(program.interpret(Array::vector(vec![3.0, 1.0, 2.0])).unwrap().to_f64s(), vec![0.0, 0.0, 0.0]);
+    }
+
+    /// Composite array-program region program over the reference [`Array`] backend.
+    type CompositeRegionProgram = Program<
+        ArrayProgramValue<Array>,
+        ArrayProgramOperation<Array>,
+        Vec<ArrayProgramValue<Array>>,
+        Vec<ArrayProgramValue<Array>>,
+    >;
+
+    /// Builds the composite per-item countdown loop `while (x > 0) { x = x - 1 }` over one scalar `f64` array state
+    /// element, returning its condition and body programs in `while` region order.
+    fn composite_countdown_while_regions() -> Vec<CompositeRegionProgram> {
+        let scalar_f64 = ArrayProgramType::Array(ArrayType::scalar(DataType::F64));
+        let mut condition_builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let condition_state = condition_builder.add_input(scalar_f64.clone());
+        let zero = condition_builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new())),
+                Vec::new(),
+                vec![condition_state],
+            )
+            .unwrap()[0];
+        let predicate = condition_builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::Compare(CompareOperation::new(
+                    ComparisonDirection::GreaterThan,
+                ))),
+                Vec::new(),
+                vec![condition_state, zero],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![predicate],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let body_state = body_builder.add_input(scalar_f64);
+        let one = body_builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::OneLike(OneLikeOperation::new())),
+                Vec::new(),
+                vec![body_state],
+            )
+            .unwrap()[0];
+        let next = body_builder
+            .add_instruction(
+                ArrayProgramOperation::Array(ArrayOperation::Sub(SubOperation::new())),
+                Vec::new(),
+                vec![body_state, one],
+            )
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![next],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        vec![condition, body]
+    }
+
+    /// The composite rule batches the condition with natural output axes to detect per-item termination and rebuilds
+    /// both regions only when that widening changes the invariant boundary: with every array carry already mapped at
+    /// axis 0 and a predicate that naturally landed on axis 0, the rebuilds would replay the exact same programs, so
+    /// the discovery body and condition are kept and batching the per-item countdown loop performs one structural
+    /// pass per region.
+    #[test]
+    fn test_composite_while_batching_reuses_naturally_aligned_batch_varying_programs() {
+        type EagerParent = EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+
+        let countdown_regions = composite_countdown_while_regions();
+
+        // Batching batch items [3, 1, 2] under an eager parent performs exactly one structural pass per region (the
+        // fixed-point discovery body and the natural condition) and interprets the loop with its masked per-item
+        // semantics: every batch item counts down to 0 even though the items terminate after different trip counts.
+        let context = BatchingContext::<_, ArrayProgramBatching>::new(
+            EagerParent::new(),
+            ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()),
+        );
+        let inputs = vec![
+            ArrayProgramBatch::new(ArrayProgramValue::Array(Array::vector(vec![3.0, 1.0, 2.0])), BatchAxis::new(0))
+                .unwrap(),
+        ];
+        let driver = CountingBatchingDriver::new(&countdown_regions);
+        let countdown_operation = WhileOperation::<ArrayProgramType>::new();
+        let outputs = countdown_operation.batch(&context, &driver, inputs.as_slice()).unwrap();
+        assert_eq!(driver.batch_program_calls(), 2);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value(), &ArrayProgramValue::Array(Array::vector(vec![0.0, 0.0, 0.0])));
+
+        // The skipped alignment rebuilds are byte-identical to the discovery programs the rule kept: replaying each
+        // region with `AlignEachTo` at the already-aligned axes (each region returns one output — the predicate or
+        // the state — whose target is axis 0) renders exactly the natural discovery program.
+        let state_axes = [BatchAxis::new(0)];
+        for region in &countdown_regions {
+            let natural = driver
+                .batch_program(
+                    &context,
+                    region.entry_region_ref(),
+                    state_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap();
+            let aligned = driver
+                .batch_program(
+                    &context,
+                    region.entry_region_ref(),
+                    state_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0)]),
+                )
+                .unwrap();
+            assert_eq!(natural.into_parts().0.to_string(), aligned.into_parts().0.to_string());
+        }
+    }
+
+    /// Pins that composite batching of a batch-varying `while` loop stages under tracing. The rule threads the
+    /// loop-invariant mapped extent as leading loop state next to the batched `bool[batch]` predicate, which the type
+    /// contract used to reject outright ("a batched predicate cannot carry first-class dimension state"), so staging
+    /// this shape previously failed. The relaxed contract accepts a loop-invariant dimension carry, and interpreting
+    /// the staged loop exercises the masked eager path over that carry.
+    #[test]
+    fn test_composite_while_batching_stages_batched_predicate_loops_under_tracing() {
+        type TraceContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let batch_type = DimensionType::new(batch.clone());
+        let trace = TraceContext::new();
+        let batch_extent = trace.input(batch_type.clone().into());
+        let state =
+            trace.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone())])).into());
+        let input_ids = [batch_extent.clone(), state.clone()].map(|input| input.atom_id().unwrap());
+        let context = BatchingContext::<_, ArrayProgramBatching>::new(trace.clone(), batch_extent);
+        let outputs = context
+            .bind(
+                ArrayProgramOperation::While(WhileOperation::new()),
+                composite_countdown_while_regions(),
+                &[BatchingTracer::new(context.clone(), ArrayProgramBatch::new(state, BatchAxis::new(0)).unwrap())],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+
+        // Exactly one `while` is staged, and it carries the threaded extent ahead of the mapped array state. The
+        // condition returns the batched per-item predicate directly: no mask machinery is staged, because the loop's
+        // consumers own the masked semantics.
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![outputs[0].batch().value().atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let [r#while] = program.entry_region().instructions() else {
+            panic!("composite while batching should stage exactly one instruction");
+        };
+        assert!(matches!(r#while.operation(), ArrayProgramOperation::While(_)));
+        assert_eq!(r#while.inputs(), &[input_ids[0], input_ids[1]]);
+        let rendered = program.to_string();
+        assert!(rendered.contains("bool[batch]"), "{rendered}");
+        assert!(!rendered.contains("reduce_any"), "{rendered}");
+
+        // Interpreting the staged loop over batch items [3, 1, 2] counts every item down to 0 under the masked
+        // semantics while the loop-invariant extent carry rides through unchanged.
+        let outputs = program
+            .interpret(vec![
+                ArrayProgramValue::Dimension(DimensionValue::new(batch_type, 3).unwrap()),
+                ArrayProgramValue::Array(Array::vector(vec![3.0, 1.0, 2.0])),
+            ])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], ArrayProgramValue::Array(Array::vector(vec![0.0, 0.0, 0.0])));
     }
 
     /// Builds the `while (counter > 0) { (counter, value) = (counter - 1, value + value) }` loop whose predicate

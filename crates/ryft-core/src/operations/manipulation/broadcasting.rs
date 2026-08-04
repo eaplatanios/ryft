@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+use crate::backends::arrays::BroadcastKernel;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -24,7 +25,10 @@ use crate::operations::manipulation::reshaping::{
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::math::{Reduce, ReduceOperation, ReductionKind};
 use crate::operations::sharding::ReshardOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation,
+};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
@@ -126,6 +130,67 @@ impl Operation for BroadcastOperation {
             }
             Ok(())
         })
+    }
+}
+
+impl<C> InterpretableOperation<C> for BroadcastOperation
+where
+    C: Domain<Type = ArrayProgramType>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + BroadcastKernel>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        if driver.region_count() != 0 {
+            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
+        }
+        let Some((input, output_extents)) = inputs.split_first() else {
+            return Err(TypeError::invalid("'broadcast' expects an array followed by its output extents").into());
+        };
+        let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
+        let output_shape = Shape::new(
+            output_extents
+                .iter()
+                .cloned()
+                .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
+                .map(|result| result.map(|extent| Dimension::Static(extent.extent())))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let output_type = infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, self)?;
+        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(
+            input.broadcast_to_type(output_type, self.output_axes())?,
+        )])
+    }
+}
+
+impl<C: Context<Type = ArrayProgramType, Operation: From<BroadcastOperation>>> PartiallyEvaluatableOperation<C>
+    for BroadcastOperation
+{
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        if self.output_sharding().is_none()
+            && driver.region_count() == 0
+            && let Some(input) = inputs.first()
+            && let Ok(input_type) = <&ArrayType>::try_from(input.r#type().as_ref())
+            && input_type.static_shape().is_some()
+            && self.output_axes().iter().copied().eq(0..input_type.rank())
+            && self
+                .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?
+                == vec![input.r#type().into_owned()]
+        {
+            // A static identity broadcast cannot observe its exact dimension operands. Preserve the input directly
+            // so an unknown array does not leave a redundant broadcast in the residual program.
+            return Ok(vec![input.clone()]);
+        }
+        context.fold_or_residualize(self.clone(), driver.regions().map(|region| region.to_program()).collect(), inputs)
     }
 }
 

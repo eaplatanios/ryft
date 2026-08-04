@@ -400,10 +400,10 @@ impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for PadOperation<ArrayType> where
-    C::Operation: From<PadOperation<ArrayType>>
+impl<T: Type, C: Context<Type = T, Operation: From<PadOperation<T>>>> PartiallyEvaluatableOperation<C>
+    for PadOperation<T>
+where
+    PadOperation<T>: Operation<Type = T>,
 {
 }
 

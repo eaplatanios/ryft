@@ -9,7 +9,7 @@ pub use condition::{CONDITION_OPERATION_NAME, ConditionOperation, transpose_prim
 pub use scan::{SCAN_OPERATION_NAME, ScanOperation, transpose_primal_scan};
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
 pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics};
-pub(crate) use r#while::{WhileResidualStackOperation, WhileResidualStackType, jvp_array_program_while};
+pub(crate) use r#while::{WhileResidualStackOperation, WhileResidualStackType};
 
 /// Type-family storage policy for values that must cross an iteration boundary as stacked residuals.
 ///

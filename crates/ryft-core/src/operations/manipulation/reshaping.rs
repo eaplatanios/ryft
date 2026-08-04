@@ -19,7 +19,10 @@ use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::dimensions::DimensionSizeOperation;
 use crate::operations::manipulation::gathering::references_auto_axis;
 use crate::operations::manipulation::{Permutation, Transpose, TransposeOperation};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation,
+};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::identities::TypeIdentityRenaming;
@@ -141,6 +144,71 @@ impl Operation for ReshapeOperation {
             }
             Ok(())
         })
+    }
+}
+
+impl<C> InterpretableOperation<C> for ReshapeOperation
+where
+    C: Domain<Type = ArrayProgramType>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Reshape>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        if driver.region_count() != 0 {
+            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
+        }
+        let Some((input, output_extents)) = inputs.split_first() else {
+            return Err(TypeError::invalid("'reshape' expects an array followed by its output extents").into());
+        };
+        let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
+        let output_shape = Shape::new(
+            output_extents
+                .iter()
+                .cloned()
+                .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
+                .map(|result| result.map(|extent| Dimension::Static(extent.extent())))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let mut parameters = ReshapeParameters::new(output_shape);
+        if let Some(dimensions) = self.dimensions() {
+            parameters = parameters.with_dimensions(dimensions.clone());
+        }
+        if let Some(output_sharding) = self.output_sharding() {
+            parameters = parameters.with_output_sharding(output_sharding.clone());
+        }
+        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(input.reshape(parameters)?)])
+    }
+}
+
+impl<C: Context<Type = ArrayProgramType, Operation: From<ReshapeOperation>>> PartiallyEvaluatableOperation<C>
+    for ReshapeOperation
+{
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        if self.output_sharding().is_none()
+            && driver.region_count() == 0
+            && let Some(input) = inputs.first()
+            && let Ok(input_type) = <&ArrayType>::try_from(input.r#type().as_ref())
+            && input_type.static_shape().is_some()
+            && self.has_identity_dimensions(input_type.rank())
+            && self
+                .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?
+                == vec![input.r#type().into_owned()]
+        {
+            // A static identity reshape cannot observe its exact dimension operands. Preserve the input directly so
+            // an unknown array does not leave a redundant reshape in the residual program.
+            return Ok(vec![input.clone()]);
+        }
+        context.fold_or_residualize(self.clone(), driver.regions().map(|region| region.to_program()).collect(), inputs)
     }
 }
 

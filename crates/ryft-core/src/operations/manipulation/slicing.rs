@@ -18,7 +18,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::{ConstantOperation, Zero, ZeroLike, ZeroOperation};
-use crate::operations::dimensions::DimensionSizeOperation;
+use crate::operations::dimensions::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::{LegacyBroadcast, PadOperation, Reshape, Transpose};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -195,6 +195,137 @@ impl Operation for DynamicShapeSliceOperation {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("strides", format_args!("{:?}", self.strides)))
+    }
+}
+
+/// Eager interpretation of [`DynamicShapeSliceOperation`] resolves its first-class start and size operands and then
+/// delegates to the array value's ordinary static [`Slice`] implementation. Staged contexts bind the operation
+/// directly and therefore do not call this rule.
+impl<C> InterpretableOperation<C> for DynamicShapeSliceOperation
+where
+    C: Domain<Type = ArrayProgramType>,
+    C::Value: ValueProjection<ArrayType> + ValueProjection<DimensionType, Projected = DimensionValue>,
+    <C::Value as ValueProjection<ArrayType>>::Projected: DimensionSize<usize> + Slice,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        let Some((input, bounds)) = inputs.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        };
+        let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
+        let rank = input.r#type().rank();
+        check_count!("input", inputs, 1 + 2 * rank, ProgramError);
+        let starts = bounds[..rank]
+            .iter()
+            .cloned()
+            .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
+            .map(|result| result.map(|value| value.extent()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sizes = bounds[rank..]
+            .iter()
+            .cloned()
+            .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
+            .map(|result| result.map(|value| value.extent()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let limits = starts
+            .iter()
+            .zip(&sizes)
+            .zip(self.strides())
+            .enumerate()
+            .map(|(axis, ((start, size), stride))| {
+                let span = if *size == 0 {
+                    0
+                } else {
+                    size.checked_sub(1)
+                        .and_then(|size| size.checked_mul(*stride))
+                        .and_then(|span| span.checked_add(1))
+                        .ok_or_else(|| {
+                            TypeError::invalid(format!("'dynamic_shape_slice' span overflows usize on axis {axis}"))
+                        })?
+                };
+                let limit = start.checked_add(span).ok_or_else(|| {
+                    TypeError::invalid(format!("'dynamic_shape_slice' limit overflows usize on axis {axis}"))
+                })?;
+                let input_size = input.dimension_size(axis)?;
+                if limit > input_size {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "'dynamic_shape_slice' limit {limit} exceeds input axis {axis} extent {input_size}",
+                        ),
+                    });
+                }
+                Ok(limit)
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(input.slice(
+            &starts,
+            &limits,
+            self.strides(),
+        )?)])
+    }
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context<Type = ArrayProgramType>> PartiallyEvaluatableOperation<C> for DynamicShapeSliceOperation where
+    C::Operation: From<DynamicShapeSliceOperation>
+{
+}
+
+/// Forward-mode rule for [`DynamicShapeSliceOperation`]. The array operand is linear while the first-class starts and
+/// sizes are discrete shape metadata, so the primal and materialized array tangent are sliced with the same geometry.
+impl<C> DifferentiableOperation<C> for DynamicShapeSliceOperation
+where
+    C: Context<Type = ArrayProgramType> + Zero<C::Value>,
+    C::Operation: From<DynamicShapeSliceOperation>,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let Some((input, bounds)) = inputs.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+        };
+        let primal_bounds = bounds.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let mut primal_inputs = Vec::with_capacity(inputs.len());
+        primal_inputs.push(input.primal().clone());
+        primal_inputs.extend(primal_bounds.iter().cloned());
+        let mut primals = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
+        check_count!("output", primals, 1, ProgramError);
+
+        let mut tangent_inputs = Vec::with_capacity(inputs.len());
+        tangent_inputs.push(input.tangent().clone().materialize(context)?);
+        tangent_inputs.extend(primal_bounds);
+        let mut tangents = context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?;
+        check_count!("output", tangents, 1, ProgramError);
+        Ok(vec![DifferentiationDual::new(primals.remove(0), MaybeZero::Value(tangents.remove(0)))?])
+    }
+}
+
+/// Reverse-mode differentiation of [`DynamicShapeSliceOperation`] is not yet supported. Its transpose must scatter a
+/// possibly strided dynamic-size cotangent into an input whose own runtime extents may need to be retained as linear
+/// residuals; returning an explicit error preserves that requirement instead of silently producing an incorrect
+/// cotangent.
+impl<V: Value<Type = ArrayProgramType>, O: Operation<Type = ArrayProgramType>> TransposableOperation<V, O>
+    for DynamicShapeSliceOperation
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        _context: &mut TracingContext<V, O>,
+        _driver: &D,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "operation 'dynamic_shape_slice' does not yet support reverse-mode differentiation".to_string(),
+        }
+        .into())
     }
 }
 

@@ -537,12 +537,13 @@ impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate). An all-known custom call folds into the
-/// known side (executing there only if the known-side context can run foreign kernels), and a side-effecting
-/// residual call survives dead-code elimination because [`Operation::effects`] is not [`Effects::PURE`].
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for CustomCallOperation<ArrayType> where
-    C::Operation: From<CustomCallOperation<ArrayType>>
+// Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`. An all-known
+// custom call folds into the known side (executing there only if the known-side context can run foreign kernels), and a
+// side-effecting residual call survives dead-code elimination because `Operation::effects` is not `Effects::PURE`.
+impl<T: Type, C: Context<Type = T, Operation: From<CustomCallOperation<T>>>> PartiallyEvaluatableOperation<C>
+    for CustomCallOperation<T>
+where
+    CustomCallOperation<T>: Operation<Type = T>,
 {
 }
 
