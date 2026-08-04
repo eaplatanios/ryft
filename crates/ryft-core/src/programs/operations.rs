@@ -338,7 +338,10 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - Batching, differentiation, and transposition require selecting the corresponding dispatcher. Interpretation
 ///     and partial evaluation are always generated and therefore do not appear in the `dispatch(...)` attribute.
 ///
-/// ## Example
+/// ## Examples
+///
+/// A homogeneous operation family infers its operation and constant types from the enum's `Value<Type = T>` generic
+/// parameter and needs no enum-level attributes:
 ///
 /// ```rust
 /// # use ryft_core as ryft;
@@ -354,6 +357,45 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// let operation = BackendOperation::<Scalar>::from(ZeroOperation::new(DataType::F32));
 /// assert_eq!(operation.name(), "zero");
+/// ```
+///
+/// A composite operation family declares its operation and constant types explicitly, declares its member universes
+/// once with `members(...)`, and marks each non-native variant with its class. Unmarked variants are native to the
+/// composite type, `projected(U)` variants embed a whole member family behind a projection, and `mixed` variants
+/// default their data universe to the family's unique computational member:
+///
+/// ```rust
+/// # use ryft_core as ryft;
+/// # use ryft_core::{ArrayProgramType, ArrayType, DataType, Dimension, Operation, Shape, Value, ZeroOperation};
+/// # use ryft_core::backends::{Array, ArrayOperation, ArrayProgramValue, DimensionOperation, DimensionValue};
+/// # use ryft_core::operations::dimensions::DimensionSizeOperation;
+/// # use ryft_core::types::DimensionType;
+/// # use ryft_macros::Operation;
+///
+/// #[derive(Clone, Debug, Operation)]
+/// #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+/// #[ryft(members(ArrayType, structural(DimensionType)))]
+/// enum CompositeOperation<A: Value<Type = ArrayType>> {
+///     /// Mixed structural constructor whose operands are the stored type's dynamic extents, its data universe
+///     /// defaults to `ArrayType` (i.e., the unique computational member), and its transforms are fully generated.
+///     #[ryft(mixed(structural))]
+///     Zero(ZeroOperation<ArrayType>),
+///
+///     /// Projected computational member family that includes every homogeneous array operation, behind a projection.
+///     #[ryft(projected(ArrayType))]
+///     Array(ArrayOperation<A>),
+///
+///     /// Projected structural member family representing dimension bookkeeping with zero differential space.
+///     #[ryft(projected(DimensionType, structural))]
+///     Dimension(DimensionOperation<DimensionValue>),
+///
+///     /// Native mixed-signature payload that consumes an array and produces a first-class dimension.
+///     DimensionSize(DimensionSizeOperation),
+/// }
+///
+/// let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+/// let operation = CompositeOperation::<Array>::from(DimensionSizeOperation::new(&input_type, 0).unwrap());
+/// assert_eq!(operation.name(), "dimension_size");
 /// ```
 pub trait Operation: Clone {
     /// Canonical [`Type`] universe of this [`Operation`]. Every payload has exactly one operation contract, so
