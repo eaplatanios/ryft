@@ -133,7 +133,10 @@ pub use builders::ProgramBuilder;
 pub use effects::{Effect, Effects};
 pub use identities::{NoIdentity, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 pub use instructions::{Instruction, InstructionId};
-pub use operations::{Operation, OperationFormatter, OperationProjection, OperationProvider};
+pub use operations::{
+    Operation, OperationFormatter, OperationProjection, OperationProvider, infer_projected_operation_output_types,
+    infer_projected_operation_region_input_types,
+};
 pub use programs::{FlatProgram, Program, ProgramLiveSets};
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EmptyRegionDriver, OutputRegionProvenance,

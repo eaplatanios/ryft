@@ -42,7 +42,7 @@ pub use compilation::*;
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::*;
 pub use errors::{CustomError, Error, MaybeFallible};
-pub use interpretation::{InterpretableOperation, InterpretationDriver};
+pub use interpretation::{InterpretableOperation, InterpretationDriver, interpret_projected_operation};
 pub use operations::*;
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

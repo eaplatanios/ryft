@@ -272,6 +272,7 @@ impl OperationParser {
             .map(|mut variant| {
                 variant.program_payload_type =
                     substitute_type_idents(&variant.payload_type, &program_value_substitutions);
+                variant.class.substitute_type_idents(&program_value_substitutions);
                 variant
             })
             .collect();
@@ -461,13 +462,24 @@ impl OperationEnum {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation>::infer_output_types(
-                        #receiver,
-                        input_types,
-                        region_interfaces,
-                    )
+            match variant.class.member_type() {
+                Some(_) => quote! {
+                    Self::#variant_ident(operation) => {
+                        #ryft::infer_projected_operation_output_types(
+                            #receiver,
+                            input_types,
+                            region_interfaces,
+                        )
+                    },
+                },
+                None => quote! {
+                    Self::#variant_ident(operation) => {
+                        <#payload_type as #ryft::Operation>::infer_output_types(
+                            #receiver,
+                            input_types,
+                            region_interfaces,
+                        )
+                    },
                 },
             }
         });
@@ -502,13 +514,24 @@ impl OperationEnum {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation>::infer_region_input_types(
-                        #receiver,
-                        input_types,
-                        region_interfaces,
-                    )
+            match variant.class.member_type() {
+                Some(_) => quote! {
+                    Self::#variant_ident(operation) => {
+                        #ryft::infer_projected_operation_region_input_types(
+                            #receiver,
+                            input_types,
+                            region_interfaces,
+                        )
+                    },
+                },
+                None => quote! {
+                    Self::#variant_ident(operation) => {
+                        <#payload_type as #ryft::Operation>::infer_region_input_types(
+                            #receiver,
+                            input_types,
+                            region_interfaces,
+                        )
+                    },
                 },
             }
         });
@@ -645,14 +668,21 @@ impl OperationEnum {
             let variant_ident = &variant.ident;
             let payload_operation_type = &variant.program_payload_type;
             let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_operation_type as #ryft::InterpretableOperation<__Context>>::interpret(
-                        #receiver,
-                        context,
-                        driver,
-                        inputs,
-                    )
+            match variant.class.member_type() {
+                Some(_) => quote! {
+                    Self::#variant_ident(operation) => {
+                        #ryft::interpret_projected_operation(context, #receiver, driver, inputs)
+                    },
+                },
+                None => quote! {
+                    Self::#variant_ident(operation) => {
+                        <#payload_operation_type as #ryft::InterpretableOperation<__Context>>::interpret(
+                            #receiver,
+                            context,
+                            driver,
+                            inputs,
+                        )
+                    },
                 },
             }
         });
@@ -698,19 +728,25 @@ impl OperationEnum {
             >
         });
 
-        // Bare generic extension payloads residualize the complete enum operation instead of naming a payload rule.
-        where_clause
-            .predicates
-            .extend(self.variants.iter().filter(|variant| !variant.is_generic_extension).map(|variant| {
-                let operation_type = &variant.program_payload_type;
-                let predicate: syn::WherePredicate = syn::parse_quote! {
-                    #operation_type: #ryft::partial::PartiallyEvaluatableOperation<__Context>
-                };
-                predicate
-            }));
+        // Bare generic extension payloads and projected members use the complete enum operation's canonical
+        // fold-or-residualize path instead of naming a payload rule in the composite context. A member payload's own
+        // partial-evaluation rule belongs to its member context and cannot consume composite partial values without a
+        // second projection protocol.
+        where_clause.predicates.extend(
+            self.variants
+                .iter()
+                .filter(|variant| !variant.is_generic_extension && variant.class.member_type().is_none())
+                .map(|variant| {
+                    let operation_type = &variant.program_payload_type;
+                    let predicate: syn::WherePredicate = syn::parse_quote! {
+                        #operation_type: #ryft::partial::PartiallyEvaluatableOperation<__Context>
+                    };
+                    predicate
+                }),
+        );
         let arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            if variant.is_generic_extension {
+            if variant.is_generic_extension || variant.class.member_type().is_some() {
                 quote! {
                     Self::#variant_ident(_) => {
                         let regions = driver
@@ -1180,13 +1216,35 @@ impl OperationEnum {
                 >
             });
         }
-        where_clause.predicates.extend(self.variants.iter().map(|variant| {
+        where_clause.predicates.extend(self.variants.iter().filter_map(|variant| {
+            if variant.class.member_type().is_some() {
+                return None;
+            }
             let operation_type = &variant.program_payload_type;
             let predicate: syn::WherePredicate = syn::parse_quote! {
                 #operation_type: #ryft::InterpretableOperation<__Context>
             };
-            predicate
+            Some(predicate)
         }));
+        for (variant, member_type) in self
+            .variants
+            .iter()
+            .filter_map(|variant| variant.class.member_type().map(|r#type| (variant, r#type)))
+        {
+            let operation_type = &variant.program_payload_type;
+            where_clause.predicates.push(syn::parse_quote! {
+                <__Context as #ryft::Domain>::Value: #ryft::ValueProjection<
+                    #member_type,
+                    Projected: #ryft::Value<Type = #member_type>,
+                >
+            });
+            where_clause.predicates.push(syn::parse_quote! {
+                #operation_type: #ryft::InterpretableOperation<#ryft::EagerContext<
+                    <<__Context as #ryft::Domain>::Value as #ryft::ValueProjection<#member_type>>::Projected,
+                    #operation_type,
+                >>
+            });
+        }
         generics
     }
 }
@@ -1248,6 +1306,24 @@ impl OperationVariantClass {
             Self::ProjectedMember { member_type } | Self::ReplicatedMember { member_type } => member_type,
         }
     }
+
+    /// Returns the projected member type, or [`None`] for a composite-native variant.
+    fn member_type(&self) -> Option<&syn::Type> {
+        match self {
+            Self::CompositeNative => None,
+            Self::ProjectedMember { member_type } | Self::ReplicatedMember { member_type } => Some(member_type),
+        }
+    }
+
+    /// Applies program-value substitutions to the declared member type.
+    fn substitute_type_idents(&mut self, substitutions: &[(syn::Ident, syn::Type)]) {
+        match self {
+            Self::CompositeNative => {}
+            Self::ProjectedMember { member_type } | Self::ReplicatedMember { member_type } => {
+                *member_type = substitute_type_idents(member_type, substitutions);
+            }
+        }
+    }
 }
 
 impl OperationVariant {
@@ -1287,6 +1363,26 @@ fn operation_generics(
             predicate
         });
     generics.make_where_clause().predicates.extend(payload_operation_bounds);
+    let mut seen_member_types = std::collections::HashSet::new();
+    for member_type in variants
+        .iter()
+        .filter_map(|variant| variant.class.member_type())
+        .filter(|member_type| seen_member_types.insert(member_type.to_token_stream().to_string()))
+    {
+        let where_clause = generics.make_where_clause();
+        where_clause.predicates.push(syn::parse_quote! {
+            #member_type: #ryft::Type<
+                Identity = <#operation_type as #ryft::Type>::Identity,
+            >
+        });
+        where_clause.predicates.push(syn::parse_quote!(#operation_type: ::std::convert::From<#member_type>));
+        where_clause.predicates.push(syn::parse_quote! {
+            for<'__member_type> &'__member_type #member_type: ::std::convert::TryFrom<
+                &'__member_type #operation_type,
+                Error = #ryft::TypeError,
+            >
+        });
+    }
     generics
 }
 

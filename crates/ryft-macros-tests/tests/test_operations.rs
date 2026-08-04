@@ -54,6 +54,13 @@ struct RegionInterface<T: Type> {
     marker: PhantomData<T>,
 }
 
+impl<T: Type> RegionInterface<T> {
+    /// Creates a stand-in region interface.
+    fn new() -> Self {
+        Self { marker: PhantomData }
+    }
+}
+
 /// Stand-in for `ryft_core::OutputRegionProvenance`.
 #[derive(Debug, PartialEq, Eq)]
 struct OutputRegionProvenance {
@@ -62,7 +69,11 @@ struct OutputRegionProvenance {
 }
 
 /// Stand-in for `ryft_core::RegionDriver`.
-trait RegionDriver<V: Value, O: Operation<Type = V::Type>> {}
+trait RegionDriver<V: Value, O: Operation<Type = V::Type>> {
+    fn region_count(&self) -> usize {
+        0
+    }
+}
 
 /// Stand-in for `ryft_core::InterpretationDriver`.
 trait InterpretationDriver<C: Domain>: RegionDriver<C::Value, C::Operation> {}
@@ -153,6 +164,15 @@ impl<V: Value, O: Operation<Type = V::Type>> Context for TestContext<V, O> {
 /// pins with `Value<Type = …>` equality bounds.
 trait Value: Clone {
     type Type: Type;
+}
+
+/// Stand-in for `ryft_core::ValueProjection`.
+trait ValueProjection<T: Type>: Value {
+    type Projected: Value<Type = T>;
+
+    fn from_projected(value: Self::Projected) -> Self;
+
+    fn into_projected(self) -> Result<Self::Projected, TypeError>;
 }
 
 /// Stand-in for `ryft_core::Concretizable`.
@@ -264,14 +284,89 @@ trait Operation: Clone {
     }
 }
 
+/// Infers projected region input types using the same contract as `ryft_core`'s derive support helper.
+fn infer_projected_operation_region_input_types<T: Type, U: Type, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[U],
+    region_interfaces: &[RegionInterface<U>],
+) -> Result<Vec<Option<Vec<U>>>, TypeError>
+where
+    U: From<T>,
+    for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
+{
+    let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
+    Ok(operation
+        .infer_region_input_types(&input_types, &region_interfaces)?
+        .into_iter()
+        .map(|types| types.map(|types| types.into_iter().map(U::from).collect()))
+        .collect())
+}
+
+/// Infers projected output types using the same contract as `ryft_core`'s derive support helper.
+fn infer_projected_operation_output_types<T: Type, U: Type, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[U],
+    region_interfaces: &[RegionInterface<U>],
+) -> Result<Vec<U>, TypeError>
+where
+    U: From<T>,
+    for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
+{
+    let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
+    Ok(operation.infer_output_types(&input_types, &region_interfaces)?.into_iter().map(U::from).collect())
+}
+
+/// Projects a stand-in composite inference boundary to one member type.
+fn project_operation_boundary<T: Type, U: Type>(
+    input_types: &[U],
+    region_interfaces: &[RegionInterface<U>],
+) -> Result<(Vec<T>, Vec<RegionInterface<T>>), TypeError>
+where
+    for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
+{
+    Ok((
+        input_types.iter().map(|r#type| <&T>::try_from(r#type).cloned()).collect::<Result<_, _>>()?,
+        region_interfaces.iter().map(|_| RegionInterface::new()).collect(),
+    ))
+}
+
 /// Stand-in for `ryft_core::InterpretableOperation`.
-trait InterpretableOperation<C: Domain>: Operation<Type = C::Type> {
+trait InterpretableOperation<C: Domain>: Operation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError>;
+}
+
+/// Interprets a stand-in projected operation and lifts its outputs into the composite value family.
+fn interpret_projected_operation<C: Domain, T: Type, O, D>(
+    _context: &C,
+    operation: &O,
+    driver: &D,
+    inputs: &[C::Value],
+) -> Result<Vec<C::Value>, ProgramError>
+where
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
+    O: Operation<Type = T> + InterpretableOperation<EagerContext<<C::Value as ValueProjection<T>>::Projected, O>>,
+    D: InterpretationDriver<C>,
+{
+    if !operation.region_slots().is_empty() || driver.region_count() != 0 {
+        return Err(ProgramError);
+    }
+    let context = EagerContext::<<C::Value as ValueProjection<T>>::Projected, O> { marker: PhantomData };
+    let inputs = inputs
+        .iter()
+        .cloned()
+        .map(<C::Value as ValueProjection<T>>::into_projected)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ProgramError)?;
+    Ok(operation
+        .interpret(&context, &EmptyRegionDriver, &inputs)?
+        .into_iter()
+        .map(<C::Value as ValueProjection<T>>::from_projected)
+        .collect())
 }
 
 /// Stand-in for `ryft_core::TracingContext`. Mirrors the real context's defaulted capture parameter and its
@@ -610,6 +705,84 @@ impl From<ScalarFactor> for InterpretedScalarFactor {
     }
 }
 
+/// Test-only member type used to prove projected operation derivation is independent of any production type family.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectedMemberType<const MEMBER: u8>;
+
+impl<const MEMBER: u8> Type for ProjectedMemberType<MEMBER> {
+    type Identity = NoIdentity;
+}
+
+/// Composite type containing two unrelated projected member kinds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProjectedProgramType {
+    First(ProjectedMemberType<0>),
+    Third(ProjectedMemberType<2>),
+}
+
+impl Type for ProjectedProgramType {
+    type Identity = NoIdentity;
+}
+
+/// Test-only value belonging to one projected member kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectedMemberValue<const MEMBER: u8>(i64);
+
+impl<const MEMBER: u8> Value for ProjectedMemberValue<MEMBER> {
+    type Type = ProjectedMemberType<MEMBER>;
+}
+
+/// Composite value containing the same two member kinds as [`ProjectedProgramType`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProjectedProgramValue {
+    First(ProjectedMemberValue<0>),
+    Third(ProjectedMemberValue<2>),
+}
+
+impl Value for ProjectedProgramValue {
+    type Type = ProjectedProgramType;
+}
+
+macro_rules! impl_projected_test_member {
+    // Generates the type and value projection vocabulary for one test-only composite member.
+    ($member:literal, $variant:ident) => {
+        impl From<ProjectedMemberType<$member>> for ProjectedProgramType {
+            fn from(r#type: ProjectedMemberType<$member>) -> Self {
+                Self::$variant(r#type)
+            }
+        }
+
+        impl<'t> TryFrom<&'t ProjectedProgramType> for &'t ProjectedMemberType<$member> {
+            type Error = TypeError;
+
+            fn try_from(r#type: &'t ProjectedProgramType) -> Result<Self, Self::Error> {
+                match r#type {
+                    ProjectedProgramType::$variant(r#type) => Ok(r#type),
+                    _ => Err(TypeError),
+                }
+            }
+        }
+
+        impl ValueProjection<ProjectedMemberType<$member>> for ProjectedProgramValue {
+            type Projected = ProjectedMemberValue<$member>;
+
+            fn from_projected(value: Self::Projected) -> Self {
+                Self::$variant(value)
+            }
+
+            fn into_projected(self) -> Result<Self::Projected, TypeError> {
+                match self {
+                    Self::$variant(value) => Ok(value),
+                    _ => Err(TypeError),
+                }
+            }
+        }
+    };
+}
+
+impl_projected_test_member!(0, First);
+impl_projected_test_member!(2, Third);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TranspositionFactor(i64);
 
@@ -921,6 +1094,96 @@ impl<T: Type, Constant: Clone, C: Context<Type = T>> DifferentiableOperation<C> 
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Ok(vec![DifferentiationDual { label: "constant", marker: PhantomData }])
     }
+}
+
+/// Region-free operation family for one test-only projected member kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectedMemberOperation<const MEMBER: u8>;
+
+impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
+    type Type = ProjectedMemberType<MEMBER>;
+
+    fn name(&self) -> &'static str {
+        "projected"
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ProjectedMemberType<MEMBER>],
+        _region_interfaces: &[RegionInterface<ProjectedMemberType<MEMBER>>],
+    ) -> Result<Vec<ProjectedMemberType<MEMBER>>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+impl<const MEMBER: u8>
+    InterpretableOperation<EagerContext<ProjectedMemberValue<MEMBER>, ProjectedMemberOperation<MEMBER>>>
+    for ProjectedMemberOperation<MEMBER>
+{
+    fn interpret<
+        D: InterpretationDriver<EagerContext<ProjectedMemberValue<MEMBER>, ProjectedMemberOperation<MEMBER>>>,
+    >(
+        &self,
+        _context: &EagerContext<ProjectedMemberValue<MEMBER>, ProjectedMemberOperation<MEMBER>>,
+        _driver: &D,
+        inputs: &[ProjectedMemberValue<MEMBER>],
+    ) -> Result<Vec<ProjectedMemberValue<MEMBER>>, ProgramError> {
+        Ok(inputs.iter().map(|value| ProjectedMemberValue(value.0 + i64::from(MEMBER))).collect())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(crate = "crate")]
+enum ProjectedProgramOperation<V: Value<Type = ProjectedProgramType>> {
+    #[ryft(projected(ProjectedMemberType<0>))]
+    First(ProjectedMemberOperation<0>),
+
+    #[ryft(projected(ProjectedMemberType<2>))]
+    Third(ProjectedMemberOperation<2>),
+
+    Constant(ConstantOperation<ProjectedProgramType, V>),
+}
+
+#[test]
+fn test_operation_generates_projected_member_dispatch() {
+    use partial::PartiallyEvaluatableOperation as _;
+
+    type Operation = ProjectedProgramOperation<ProjectedProgramValue>;
+    type Context = EagerContext<ProjectedProgramValue, Operation>;
+
+    let first = Operation::from(ProjectedMemberOperation::<0>);
+    let third = Operation::from(ProjectedMemberOperation::<2>);
+    let first_type = ProjectedProgramType::First(ProjectedMemberType);
+    let third_type = ProjectedProgramType::Third(ProjectedMemberType);
+
+    // Base operation metadata and inference project to each declared member type and lift results back.
+    assert_eq!(first.name(), "projected");
+    assert_eq!(first.to_string(), "projected");
+    assert_eq!(first.infer_output_types(std::slice::from_ref(&first_type), &[]), Ok(vec![first_type.clone()]));
+    assert_eq!(first.infer_output_types(std::slice::from_ref(&third_type), &[]), Err(TypeError));
+    assert_eq!(
+        first.infer_region_input_types(std::slice::from_ref(&first_type), &[RegionInterface::new()]),
+        Ok(vec![None]),
+    );
+
+    // Eager interpretation executes in the selected member universe and lifts the result into the composite value.
+    assert_eq!(
+        third.interpret(
+            &Context { marker: PhantomData },
+            &EmptyRegionDriver,
+            &[ProjectedProgramValue::Third(ProjectedMemberValue(7))],
+        ),
+        Ok(vec![ProjectedProgramValue::Third(ProjectedMemberValue(9))]),
+    );
+
+    // Projected members use the outer operation's canonical fold-or-residualize path and therefore require no
+    // projected payload partial-evaluation implementation.
+    let partial_context = partial::PartialEvaluationContext::new(Context { marker: PhantomData });
+    assert!(third.partially_evaluate(&partial_context, &EmptyRegionDriver, &[]).unwrap().is_empty());
+
+    // Concrete member payload conversions retain their variant identity.
+    assert_eq!(<&ProjectedMemberOperation<0>>::try_from(&first), Ok(&ProjectedMemberOperation));
+    assert_eq!(<&ProjectedMemberOperation<2>>::try_from(&first), Err(()));
 }
 
 impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, F: Clone> TransposableOperation<V, O>
@@ -1709,6 +1972,15 @@ impl<V: Value, O: Operation<Type = V::Type>> Context for EagerContext<V, O> {
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> Zero<V> for EagerContext<V, O> {}
+
+impl<V: Value, O: Operation<Type = V::Type>, Stored: Clone> Constant<V, Stored> for EagerContext<V, O>
+where
+    V: From<Stored>,
+{
+    fn constant(&self, value: Stored) -> Result<V, ProgramError> {
+        Ok(V::from(value))
+    }
+}
 
 /// Stand-in for `ryft_core::BatchingContext`. Mirrors the real context's parent accessor and observable axis
 /// metadata, which active rules (e.g., named-axis collectives) inspect.

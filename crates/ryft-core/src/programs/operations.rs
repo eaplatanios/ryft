@@ -116,16 +116,18 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// Ryft provides a `#[derive(Operation)]` procedural macro via the `ryft-macros` crate for [`Operation`] sum types.
 /// It is meant for enums such as [`ScalarOperation`](crate::ScalarOperation), where every variant wraps one concrete
-/// operation payload and the enum should behave exactly like whichever payload it contains. The derived implementation
-/// generates:
+/// operation payload and the enum should behave exactly like whichever payload it contains. A variant is normally
+/// native to the enum's primary type; `#[ryft(projected(U))]` and `#[ryft(replicated(U))]` instead declare a payload
+/// whose native operation type is the member type `U`. The derived implementation generates:
 ///
 ///   - An [`Operation<Type = T>`](Operation) implementation whose semantic and rendering methods forward to the active
 ///     variant payload.
-///   - An [`InterpretableOperation<C>`](crate::InterpretableOperation) implementation that forwards
-///     [`interpret`](crate::InterpretableOperation::interpret) to the active variant payload. Operation-specific eager
-///     or staged interpretation semantics still live on the payload implementations; the enum is only a dispatcher.
-///   - A [`PartiallyEvaluatableOperation<C>`](crate::PartiallyEvaluatableOperation) implementation that likewise
-///     forwards to each concrete payload's partial-evaluation rule.
+///   - An [`InterpretableOperation<C>`](crate::InterpretableOperation) implementation that forwards native variants
+///     directly and projects member variants into their native eager value family. Operation-specific eager semantics
+///     still live on the payload implementations; the enum is only an adapter and dispatcher.
+///   - A [`PartiallyEvaluatableOperation<C>`](crate::PartiallyEvaluatableOperation) implementation that forwards native
+///     variants to their payload rules. Member variants use the enclosing operation's canonical fold-or-residualize
+///     path, avoiding a second projected partial-value protocol.
 ///   - Optional [`BatchableOperation`](crate::BatchableOperation),
 ///     [`DifferentiableOperation`](crate::DifferentiableOperation), and
 ///     [`TransposableOperation`](crate::TransposableOperation) dispatchers selected independently through
@@ -141,16 +143,16 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - Every variant must be a tuple variant with exactly one payload field.
 ///   - A payload may be stored directly as `Payload` or indirectly as `Box<Payload>`. Boxed variants still delegate to
 ///     `Payload`, and their generated `From<Payload>` implementation boxes the payload for the caller.
-///   - Every payload must implement [`Operation<Type = T>`](Operation), either because it is a concrete operation type
-///     whose implementation already exists or because the derivation macro adds a bound for a bare generic payload.
+///   - Every native payload must implement [`Operation<Type = T>`](Operation), where `T` is the enum's primary type.
+///     A member payload must instead implement `Operation<Type = U>` for the member type declared by its variant
+///     marker. The enclosing type and value families must provide the corresponding projection vocabulary.
 ///   - Bare generic payload variants such as `Extension(Extension)` do not receive `From` or `TryFrom` conversions.
 ///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
 ///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
 ///     generic payload by adding an `Extension: Operation<Type = T>` bound.
-///   - Each generated semantic dispatcher receives a corresponding bound on every payload, such as
-///     `Payload: InterpretableOperation<C>` or `Payload: BatchableOperation<C, ArrayBatching>`.
-///     Payload-specific value and context requirements belong on the payload's own semantic-trait implementation.
-///     Rust resolves those requirements through the generated payload bound without requiring the enum to repeat them.
+///   - Generated semantic dispatchers place their required bounds on the participating payloads. Payload-specific
+///     value and context requirements belong on the payload's own semantic-trait implementation; the enum does not
+///     duplicate them.
 ///   - Batching, differentiation, and transposition require selecting the corresponding dispatcher. Interpretation
 ///     and partial evaluation are always generated and therefore do not appear in the `dispatch(...)` attribute.
 ///
@@ -486,6 +488,104 @@ impl<O: Default + Operation> OperationProvider<O::Type> for O {
     }
 }
 
+/// Infers the region input types of a member [`Operation`] through a composite type boundary. Every composite input
+/// and attached-region [`RegionInterface`] is first projected to `T`; the inferred member types are then lifted back
+/// into `U`. Projection fails with the composite type's canonical wrong-member [`TypeError`].
+///
+/// This function supports code generated by `#[derive(Operation)]` for `#[ryft(projected(T))]` and
+/// `#[ryft(replicated(T))]` variants. Operation implementations normally call their payload's
+/// [`Operation::infer_region_input_types`] method directly.
+///
+/// # Parameters
+///
+///   - `operation`: Member operation whose native type is `T`.
+///   - `input_types`: Composite input types supplied to the enclosing operation.
+///   - `region_interfaces`: Composite interfaces of regions attached to the enclosing operation.
+pub fn infer_projected_operation_region_input_types<T: Type, I: Type + From<T>, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[I],
+    region_interfaces: &[RegionInterface<I>],
+) -> Result<Vec<Option<Vec<I>>>, TypeError>
+where
+    for<'t> &'t T: TryFrom<&'t I, Error = TypeError>,
+{
+    let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
+    Ok(operation
+        .infer_region_input_types(&input_types, &region_interfaces)?
+        .into_iter()
+        .map(|types| types.map(|types| types.into_iter().map(I::from).collect()))
+        .collect())
+}
+
+/// Infers the output types of a member [`Operation`] through a composite type boundary. Every composite input and
+/// attached-region [`RegionInterface`] is first projected to `T`; the inferred member outputs are then lifted back
+/// into `U`. Projection fails with the composite type's canonical wrong-member [`TypeError`].
+///
+/// This function supports code generated by `#[derive(Operation)]` for `#[ryft(projected(T))]` and
+/// `#[ryft(replicated(T))]` variants. Operation implementations normally call their payload's
+/// [`Operation::infer_output_types`] method directly.
+///
+/// # Parameters
+///
+///   - `operation`: Member operation whose native type is `T`.
+///   - `input_types`: Composite input types supplied to the enclosing operation.
+///   - `region_interfaces`: Composite interfaces of regions attached to the enclosing operation.
+pub fn infer_projected_operation_output_types<T: Type, I: Type + From<T>, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[I],
+    region_interfaces: &[RegionInterface<I>],
+) -> Result<Vec<I>, TypeError>
+where
+    for<'t> &'t T: TryFrom<&'t I, Error = TypeError>,
+{
+    let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
+    Ok(operation.infer_output_types(&input_types, &region_interfaces)?.into_iter().map(I::from).collect())
+}
+
+/// Projects one member [`Operation`]'s complete inference boundary from the enclosing composite type `U` to its native
+/// member type `T`. This includes every ordinary input type and both the input and output types of every attached
+/// [`RegionInterface`]. Region effects are structural metadata rather than member-typed values, so they are preserved
+/// unchanged.
+///
+/// Projection is atomic: if any boundary type belongs to another member kind, this function returns that conversion's
+/// [`TypeError`] before the member operation's inference rule runs. The returned collections are owned because the
+/// native inference APIs require `&[T]` and `RegionInterface<T>`, rather than borrowed member views whose containing
+/// values remain typed as `U`.
+///
+/// # Parameters
+///
+///   - `input_types`: Composite types of the member operation's ordinary operands.
+///   - `region_interfaces`: Composite input/output type contracts and effects of its attached regions.
+fn project_operation_boundary<T: Type, U: Type>(
+    input_types: &[U],
+    region_interfaces: &[RegionInterface<U>],
+) -> Result<(Vec<T>, Vec<RegionInterface<T>>), TypeError>
+where
+    for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
+{
+    Ok((
+        input_types.iter().map(|r#type| <&T>::try_from(r#type).cloned()).collect::<Result<_, _>>()?,
+        region_interfaces
+            .iter()
+            .map(|interface| {
+                Ok(RegionInterface::new(
+                    interface
+                        .input_types()
+                        .iter()
+                        .map(|r#type| <&T>::try_from(r#type).cloned())
+                        .collect::<Result<_, _>>()?,
+                    interface
+                        .output_types()
+                        .iter()
+                        .map(|r#type| <&T>::try_from(r#type).cloned())
+                        .collect::<Result<_, _>>()?,
+                    interface.effects(),
+                ))
+            })
+            .collect::<Result<_, TypeError>>()?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -496,7 +596,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::Effect;
-    use crate::types::DataType;
+    use crate::types::{ArrayProgramType, ArrayType, DataType};
 
     use super::*;
 
@@ -669,5 +769,58 @@ mod tests {
             Ok(Box::new(ForwardingOperation { renamed: true })),
         );
         assert_eq!(std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(), "forwarded",);
+    }
+
+    #[test]
+    fn test_infer_projected_operation_types() {
+        /// Member operation that exposes both projected inference paths.
+        #[derive(Clone)]
+        struct ProjectedOperation;
+
+        impl Operation for ProjectedOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "projected"
+            }
+
+            fn infer_region_input_types(
+                &self,
+                input_types: &[ArrayType],
+                region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<Option<Vec<ArrayType>>>, TypeError> {
+                Ok(vec![Some(input_types.to_vec()); region_interfaces.len()])
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                Ok(input_types
+                    .iter()
+                    .chain(region_interfaces.iter().flat_map(RegionInterface::output_types))
+                    .cloned()
+                    .collect())
+            }
+        }
+
+        let input_type = ArrayType::scalar(DataType::F32);
+        let region_output_type = ArrayType::scalar(DataType::F64);
+        let input_types = [ArrayProgramType::from(input_type.clone())];
+        let region_interfaces = [RegionInterface::new(
+            vec![ArrayProgramType::from(input_type.clone())],
+            vec![ArrayProgramType::from(region_output_type.clone())],
+            Effects::single(Effect::OrderedIo),
+        )];
+
+        assert_eq!(
+            infer_projected_operation_region_input_types(&ProjectedOperation, &input_types, &region_interfaces),
+            Ok(vec![Some(vec![ArrayProgramType::from(input_type.clone())])]),
+        );
+        assert_eq!(
+            infer_projected_operation_output_types(&ProjectedOperation, &input_types, &region_interfaces),
+            Ok(vec![ArrayProgramType::from(input_type), ArrayProgramType::from(region_output_type)]),
+        );
     }
 }

@@ -2170,6 +2170,12 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [x] Relocate the P8b4d remaining mixed structural and batching rules, then close P8b4.
   - [x] Extend the derive parser with typed `#[ryft(projected(T))]` and `#[ryft(replicated(T))]` class markers and pin
         all invalid declaration diagnostics.
+  - [x] Prove projected-member base dispatch through type inference, eager interpretation, PE, rendering, conversions,
+        and a second projected member type without array-program-specific generated code.
+  - [ ] Add the minimal outer-family declaration needed by production-shaped composite enums: deriving
+        `ArrayProgramOperation<A>` must select `ArrayProgramType` and `ArrayProgramValue<A>` even though its stored
+        generic `A` belongs to the projected `ArrayType` member. Do not add a phantom composite-value parameter or
+        redesign the enum's public generic merely to satisfy derive inference.
   - [ ] Generate and prove the complete projected-member and replicated-member vertical contracts before annotating
         `ArrayProgramOperation`.
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
