@@ -47,7 +47,7 @@ use crate::operations::manipulation::{
     DynamicShapeSliceOperation, DynamicUpdateSliceOperation, LegacyBroadcastOperation, LegacyReshapeOperation, Pad,
     PadOperation, Reshape, ReshapeOperation, ReshapeParameters, Slice, Transpose, TransposeOperation, UpdateSlice,
 };
-use crate::operations::math::{AddOperation, DivOperation, MulOperation, Reduce, ReduceOperation, ReductionKind};
+use crate::operations::math::{AddOperation, Reduce, ReduceOperation, ReductionKind};
 use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
 use crate::parameters::Parameter;
 use crate::partial::{
@@ -113,15 +113,23 @@ impl ExactShape {
     }
 
     /// Materializes one first-class dimension value per axis in this shape.
-    fn dimensions<A, C>(&self, context: &C, residuals: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
+    pub(crate) fn dimensions<C>(&self, context: &C, residuals: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
     where
-        A: Value<Type = ArrayType>,
-        C: Context<Type = ArrayProgramType, Operation: From<ArrayProgramOperation<A>>>,
+        C: Context<
+                Type = ArrayProgramType,
+                Operation: OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+            >,
     {
         self.0
             .iter()
             .map(|dimension| match dimension {
-                ExactShapeDimension::Static(extent) => dimension_constant::<A, _>(context, *extent),
+                ExactShapeDimension::Static(extent) => Ok(context
+                    .bind(
+                        DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(*extent)?)),
+                        Vec::new(),
+                        &[],
+                    )?
+                    .remove(0)),
                 ExactShapeDimension::Residual(index) => Ok(residuals[*index].clone()),
             })
             .collect()
@@ -160,7 +168,7 @@ impl<V: Value<Type = ArrayProgramType>> LinearResiduals<V> {
 
     /// Returns the retained residual values.
     #[inline]
-    fn values(&self) -> &[V] {
+    pub(crate) fn values(&self) -> &[V] {
         self.values.as_slice()
     }
 
