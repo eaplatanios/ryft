@@ -168,9 +168,9 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 /// [`CustomVjpOperation`], and [`RematerializeOperation`](super::rematerialization::RematerializeOperation). These
 /// operations attach semantic meaning to a set of region programs: a custom-JVP or custom-VJP wrapper determines
 /// which derivative rule later transforms must use, while a rematerialization wrapper preserves the recomputation
-/// boundary. Inlining only the primal region during batching would erase that meaning. Instead, the caller's
-/// `make_operation` closure supplies a wrapper of the same semantic kind around either the original regions or
-/// structurally batched replacements. Conceptually, for a custom JVP this performs:
+/// boundary. Inlining only the primal region during batching would erase that meaning. Instead, this function binds
+/// the supplied wrapper operation around either the original regions or structurally batched replacements.
+/// Conceptually, for a custom JVP this performs:
 ///
 /// ```text
 /// custom_jvp(primal, jvp)(x)
@@ -180,13 +180,12 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 ///
 /// The function has two paths:
 ///
-///   - If every input is replicated, it calls `make_operation(None)`, binds the returned operation with its unchanged
-///     regions and original packed values, and marks every output replicated.
-///   - If any input is mapped, it obtains the mapped-axis size, aligns every input to packed axis `0` through
-///     [`ArrayBatchingPolicy::match_axis`] (moving existing mapped axes and broadcasting replicated inputs), and calls
-///     `make_operation(Some(axis_size))`. The closure returns a fresh wrapper with region programs that use the same
-///     axis-`0` convention, normally constructed through [`batch_wrapped_program`]. The function binds that wrapper
-///     and marks every output as mapped at axis `0`.
+///   - If every input is replicated, it binds the operation with the driver's unchanged regions and original packed
+///     values, and marks every output replicated.
+///   - If any input is mapped, it aligns every input to packed axis `0` through
+///     [`ArrayBatchingPolicy::match_axis`] (moving existing mapped axes and broadcasting replicated inputs), batches
+///     every attached region through [`batch_wrapped_program`] using the same axis-`0` convention, binds the operation
+///     with those transformed regions, and marks every output as mapped at axis `0`.
 ///
 /// Binding always occurs through [`BatchingContext::parent`]. An eager parent therefore interprets the rewrapped
 /// operation immediately, while a staging parent records one wrapper operation with its attached regions in the
@@ -197,48 +196,49 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 /// # Parameters
 ///
 ///   - `context`: Active array batching context that supplies the mapped extent and owns axis alignment.
+///   - `driver`: Batching driver that provides and structurally transforms the wrapper's attached regions.
+///   - `operation`: Wrapper operation to bind around the original or structurally batched regions.
 ///   - `inputs`: Packed input batches of the wrapper operation.
-///   - `make_operation`: Constructs the wrapper operation and its attached region programs. `None` requests the
-///     unchanged replicated form; `Some(axis_size)` requests the axis-`0` batched form.
-pub(crate) fn batch_wrapped_operation<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>, MakeOperationFn>(
+pub(crate) fn batch_wrapped_operation<
+    C: Context<Type = ArrayType>,
+    P: ArrayBatchingPolicy<C>,
+    D: BatchingDriver<C, ArrayBatching<P>>,
+>(
     context: &BatchingContext<C, ArrayBatching<P>>,
+    driver: &D,
+    operation: C::Operation,
     inputs: &[ArrayBatch<<C as Domain>::Value>],
-    make_operation: MakeOperationFn,
 ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
 where
     <C as Domain>::Value: LegacyBroadcast + Transpose,
-    MakeOperationFn: FnOnce(
-        Option<usize>,
-    ) -> Result<
-        (C::Operation, Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>),
-        BatchingError,
-    >,
 {
-    if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
-        let (operation, operation_regions) = make_operation(None)?;
-        let parent_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let outputs = context.parent().bind(operation, operation_regions, &parent_inputs)?;
-        return outputs
-            .into_iter()
-            .map(|tracer| {
-                let packed_type = tracer.r#type().into_owned();
-                ArrayBatch::new(packed_type, tracer, BatchAxis::replicated())
-            })
-            .collect();
-    }
-    let axis_size = P::axis_size(context)?;
-    let aligned_inputs = inputs
-        .iter()
-        .map(|input| P::match_axis(context, input, Axis::from(0)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let (operation, operation_regions) = make_operation(Some(axis_size))?;
-    let parent_inputs = aligned_inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+    let (operation_regions, parent_inputs, output_batch_axis) =
+        if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
+            (
+                driver.regions().map(|region| region.to_program()).collect(),
+                inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+                BatchAxis::replicated(),
+            )
+        } else {
+            let aligned_inputs = inputs
+                .iter()
+                .map(|input| P::match_axis(context, input, Axis::from(0)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let region_count = driver.regions().count();
+            (
+                (0..region_count)
+                    .map(|index| batch_wrapped_program(context, driver, index))
+                    .collect::<Result<Vec<_>, _>>()?,
+                aligned_inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+                BatchAxis::new(0),
+            )
+        };
     let outputs = context.parent().bind(operation, operation_regions, &parent_inputs)?;
     outputs
         .into_iter()
         .map(|tracer| {
             let packed_type = tracer.r#type().into_owned();
-            ArrayBatch::new(packed_type, tracer, BatchAxis::new(0))
+            ArrayBatch::new(packed_type, tracer, output_batch_axis)
         })
         .collect()
 }
@@ -315,13 +315,7 @@ where
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        batch_wrapped_operation(context, inputs, |batched| match batched {
-            None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
-            Some(_) => Ok((
-                O::from(CustomJvpOperation::new()),
-                vec![batch_wrapped_program(context, driver, 0)?, batch_wrapped_program(context, driver, 1)?],
-            )),
-        })
+        batch_wrapped_operation(context, driver, O::from(*self), inputs)
     }
 }
 
@@ -692,17 +686,7 @@ where
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        batch_wrapped_operation(context, inputs, |batched| match batched {
-            None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
-            Some(_) => Ok((
-                O::from(CustomVjpOperation::new()),
-                vec![
-                    batch_wrapped_program(context, driver, 0)?,
-                    batch_wrapped_program(context, driver, 1)?,
-                    batch_wrapped_program(context, driver, 2)?,
-                ],
-            )),
-        })
+        batch_wrapped_operation(context, driver, O::from(*self), inputs)
     }
 }
 

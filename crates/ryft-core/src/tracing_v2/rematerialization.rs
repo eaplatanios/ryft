@@ -72,7 +72,7 @@ use crate::programs::regions::{Region, RegionId, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueId};
 use crate::tracing::{DomainTracer, Trace, TracingContext};
-use crate::tracing_v2::custom_derivatives::{batch_wrapped_operation, batch_wrapped_program};
+use crate::tracing_v2::custom_derivatives::batch_wrapped_operation;
 use crate::types::{ArrayType, Memory};
 
 /// Higher-order operation used by checkpointing/rematerialization.
@@ -373,18 +373,7 @@ where
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        batch_wrapped_operation(context, inputs, |batched| match batched {
-            None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
-            Some(_) => Ok((
-                O::from(RematerializeOperation::new().with_prevent_cse(self.prevent_cse)),
-                vec![
-                    batch_wrapped_program(context, driver, 0)?,
-                    batch_wrapped_program(context, driver, 1)?,
-                    batch_wrapped_program(context, driver, 2)?,
-                    batch_wrapped_program(context, driver, 3)?,
-                ],
-            )),
-        })
+        batch_wrapped_operation(context, driver, O::from(*self), inputs)
     }
 }
 
