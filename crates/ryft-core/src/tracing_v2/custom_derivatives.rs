@@ -162,45 +162,42 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 {
 }
 
-/// Batches a region-bearing wrapper operation without inlining away the wrapper itself.
+/// Batches a [`Region`](crate::Region)-bearing _wrapper_ [`Operation`] without inlining away the wrapper itself.
 ///
-/// This is the shared outer-boundary algorithm used by the batching rules for [`CustomJvpOperation`],
-/// [`CustomVjpOperation`], and [`RematerializeOperation`](crate::RematerializeOperation). These
-/// operations attach semantic meaning to a set of region programs: a custom-JVP or custom-VJP wrapper determines
-/// which derivative rule later transforms must use, while a rematerialization wrapper preserves the recomputation
-/// boundary. Inlining only the primal region during batching would erase that meaning. Instead, this function binds
-/// the supplied wrapper operation around either the original regions or structurally batched replacements.
-/// Conceptually, for a custom JVP this performs:
+/// This is the shared outer-boundary algorithm used by the batching rules for operations like
+/// [`CustomJvpOperation`](crate::CustomJvpOperation), [`CustomVjpOperation`](crate::CustomVjpOperation), and
+/// [`RematerializeOperation`](crate::RematerializeOperation), that attach semantic meaning to a set of region
+/// programs: a [`CustomJvpOperation`](crate::CustomJvpOperation) or a [`CustomVjpOperation`](crate::CustomVjpOperation)
+/// wrapper determines which derivative rule later transforms must use, while a rematerialization wrapper preserves the
+/// recomputation boundary. Inlining only the primal region during batching would erase that meaning. Instead, this
+/// function binds the supplied wrapper operation around either the original regions or structurally batched
+/// replacements. Conceptually, for a custom JVP this function performs the following transformation:
 ///
 /// ```text
-/// custom_jvp(primal, jvp)(x)
-///     -- batch -->
-/// custom_jvp(batch(primal), batch(jvp))(align_to_axis_0(x))
+/// custom_jvp(primal, jvp)(x) -- batch --> custom_jvp(batch(primal), batch(jvp))(align_to_axis_0(x))
 /// ```
 ///
 /// The function has two paths:
 ///
-///   - If every input is replicated, it binds the operation with the driver's unchanged regions and original packed
-///     values, and marks every output replicated.
-///   - If any input is mapped, it aligns every input to packed axis `0` through
-///     [`ArrayBatchingPolicy::match_axis`] (moving existing mapped axes and broadcasting replicated inputs), batches
-///     every attached region using the same axis-`0` convention, binds the operation with those transformed regions,
-///     and marks every output as mapped at axis `0`.
+///   - If every input is replicated, it binds the operation with the [`BatchingDriver`]'s unchanged regions and
+///     original packed values, and marks every output as replicated.
+///   - If any input is mapped, it aligns every input to packed axis `0` through [`ArrayBatchingPolicy::match_axis`]
+///     (moving existing mapped axes and broadcasting replicated inputs), batches every attached region using the same
+///     axis-`0` convention, binds the operation with those transformed regions, and marks every output as mapped at
+///     axis `0`.
 ///
 /// Binding always occurs through [`BatchingContext::parent`]. An eager parent therefore interprets the rewrapped
 /// operation immediately, while a staging parent records one wrapper operation with its attached regions in the
-/// enclosing trace. This helper is unrelated to the foreign-kernel
-/// [`CustomCallOperation`](crate::operations::custom_call::CustomCallOperation); "custom call" in its current name
-/// refers only to the custom-derivative call-like wrappers that originally motivated it.
+/// enclosing trace.
 ///
 /// # Parameters
 ///
-///   - `context`: Active array batching context that supplies the mapped extent and owns axis alignment.
-///   - `driver`: Batching driver that provides and structurally transforms the wrapper's attached regions.
-///   - `operation`: Wrapper operation to bind around the original or structurally batched regions.
-///   - `inputs`: Packed input batches of the wrapper operation.
+///   - `context`: Active array [`BatchingContext`] that supplies the mapped extent and owns axis alignment.
+///   - `driver`: [`BatchingDriver`] that provides and structurally transforms the wrapper's attached regions.
+///   - `operation`: Wrapper [`Operation`] to bind around the original or structurally batched regions.
+///   - `inputs`: Packed input [`ArrayBatch`]es of the wrapper operation.
 pub(crate) fn batch_wrapped_operation<
-    C: Context<Type = ArrayType>,
+    C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>,
     P: ArrayBatchingPolicy<C>,
     D: BatchingDriver<C, ArrayBatching<P>>,
 >(
@@ -208,10 +205,7 @@ pub(crate) fn batch_wrapped_operation<
     driver: &D,
     operation: C::Operation,
     inputs: &[ArrayBatch<<C as Domain>::Value>],
-) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
-where
-    <C as Domain>::Value: LegacyBroadcast + Transpose,
-{
+) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
     // A replicated wrapper needs no structural rewrite: preserve its attached regions exactly and pass each packed
     // value through unchanged. Its outputs remain replicated at this transform level.
     let (operation_regions, parent_inputs, output_batch_axis) =
