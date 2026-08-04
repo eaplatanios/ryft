@@ -36,9 +36,8 @@ use crate::operations::control_flow::{
 };
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::dimensions::{
-    DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMulOperation,
-    DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
-    DimensionToScalarOperation,
+    DimensionFromScalar, DimensionFromScalarOperation, DimensionMulOperation, DimensionSize, DimensionSizeOperation,
+    DimensionToScalar, DimensionToScalarOperation,
 };
 use crate::operations::manipulation::ConvertElementTypeOperation;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
@@ -65,8 +64,7 @@ use crate::programs::{AtomId, ProgramBuilder, ProgramError};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{
-    ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType,
-    DimensionVariable, Shape,
+    ArrayProgramType, ArrayType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable, Shape,
 };
 
 pub mod batching;
