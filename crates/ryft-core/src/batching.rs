@@ -1981,8 +1981,8 @@ impl<C: Context<Type: BatchableType<Policy: BatchingPolicy<C>>>>
 impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>, P: ArrayBatchingPolicy<C>>
     BatchingContext<C, ArrayBatching<P>>
 {
-    /// Returns `batched_program` unchanged when its output axes already equal `required_output_axes`, or structurally
-    /// batches `region` again while aligning its live outputs to those required axes.
+    /// Returns `batched_program` unchanged when its output axes already equal `target_output_axes`, or structurally
+    /// batches `region` again while aligning its live outputs to those target axes.
     ///
     /// Region-carrying operation rules use this after discovering and semantically reconciling natural output axes
     /// across related regions. This method only performs the mechanical output-boundary alignment. It deliberately does
@@ -1996,30 +1996,32 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>, P: ArrayB
     ///   - `region`: Source [`Region`](crate::Region) from which `batched_program` was produced.
     ///   - `input_axes`: Batch axes used to produce `batched_program` and to perform any aligned replay.
     ///   - `batched_program`: Region already structurally batched with natural output axes.
-    ///   - `required_output_axes`: Semantically reconciled output axes required by the region's consumer.
+    ///   - `target_output_axes`: Semantically reconciled output axes targeted by the region's consumer.
     pub(crate) fn align_batched_program_outputs<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
         driver: &D,
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         batched_program: BatchedProgram<C::Constant, C::Operation>,
-        required_output_axes: &[BatchAxis],
+        target_output_axes: &[BatchAxis],
     ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
-        if batched_program.output_axes() == required_output_axes {
+        if batched_program.output_axes() == target_output_axes {
             return Ok(batched_program.into_parts().0);
         }
         let aligned_program = driver.batch_program(
             self,
             region,
             input_axes,
-            ProgramBatchingOutputAxesPolicy::AlignEachTo(required_output_axes.to_vec()),
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(target_output_axes.to_vec()),
         )?;
-        if aligned_program.output_axes() != required_output_axes {
+        if aligned_program.output_axes() != target_output_axes {
+            let actual_output_axes =
+                aligned_program.output_axes().iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+            let target_output_axes = target_output_axes.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
             return Err(BatchingError::MisalignedBatchAxes {
                 message: format!(
-                    "batched region output axes {:?} do not match the semantically required axes {:?}",
-                    aligned_program.output_axes(),
-                    required_output_axes,
+                    "batched region output axes [{actual_output_axes}] do not match the target output axes \
+                     [{target_output_axes}]",
                 ),
             });
         }
