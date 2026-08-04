@@ -61,6 +61,7 @@ pub use tracing::{
     infer_output_type, trace,
 };
 pub use tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
+pub use tracing_v2::rematerialization::RematerializeOperation;
 pub use types::*;
 
 #[cfg(test)]

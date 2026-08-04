@@ -20,7 +20,7 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::operations::Operation;
 use crate::programs::regions::{RegionInterface, RegionSlot};
 use crate::programs::types::{TypeError, Typed};
-use crate::programs::{Program, ProgramError, Value};
+use crate::programs::{ProgramError, Value};
 use crate::tracing::{DomainTracer, Trace};
 use crate::types::ArrayType;
 
@@ -165,7 +165,7 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 /// Batches a region-bearing wrapper operation without inlining away the wrapper itself.
 ///
 /// This is the shared outer-boundary algorithm used by the batching rules for [`CustomJvpOperation`],
-/// [`CustomVjpOperation`], and [`RematerializeOperation`](super::rematerialization::RematerializeOperation). These
+/// [`CustomVjpOperation`], and [`RematerializeOperation`](crate::RematerializeOperation). These
 /// operations attach semantic meaning to a set of region programs: a custom-JVP or custom-VJP wrapper determines
 /// which derivative rule later transforms must use, while a rematerialization wrapper preserves the recomputation
 /// boundary. Inlining only the primal region during batching would erase that meaning. Instead, this function binds
@@ -184,8 +184,8 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 ///     values, and marks every output replicated.
 ///   - If any input is mapped, it aligns every input to packed axis `0` through
 ///     [`ArrayBatchingPolicy::match_axis`] (moving existing mapped axes and broadcasting replicated inputs), batches
-///     every attached region through [`batch_wrapped_program`] using the same axis-`0` convention, binds the operation
-///     with those transformed regions, and marks every output as mapped at axis `0`.
+///     every attached region using the same axis-`0` convention, binds the operation with those transformed regions,
+///     and marks every output as mapped at axis `0`.
 ///
 /// Binding always occurs through [`BatchingContext::parent`]. An eager parent therefore interprets the rewrapped
 /// operation immediately, while a staging parent records one wrapper operation with its attached regions in the
@@ -212,6 +212,8 @@ pub(crate) fn batch_wrapped_operation<
 where
     <C as Domain>::Value: LegacyBroadcast + Transpose,
 {
+    // A replicated wrapper needs no structural rewrite: preserve its attached regions exactly and pass each packed
+    // value through unchanged. Its outputs remain replicated at this transform level.
     let (operation_regions, parent_inputs, output_batch_axis) =
         if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
             (
@@ -220,20 +222,43 @@ where
                 BatchAxis::replicated(),
             )
         } else {
+            // Give the replacement wrapper one uniform physical calling convention. Existing mapped axes move to
+            // position 0, while replicated operands are broadcast across the context's mapped extent at position 0.
             let aligned_inputs = inputs
                 .iter()
                 .map(|input| P::match_axis(context, input, Axis::from(0)))
                 .collect::<Result<Vec<_>, _>>()?;
-            let region_count = driver.regions().count();
+
+            // Apply the same calling convention to every attached region. All region arguments enter mapped at axis
+            // 0, and `AlignAllTo(0)` broadcasts naturally replicated results or moves differently positioned mapped
+            // axes so every rewritten region has the signature expected by the replacement wrapper.
+            let operation_regions = driver
+                .regions()
+                .map(|region| {
+                    let input_batch_axes = vec![BatchAxis::new(0); region.input_types().len()];
+                    let (program, _) = driver
+                        .batch_program(
+                            context,
+                            region,
+                            input_batch_axes.as_slice(),
+                            ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
+                        )?
+                        .into_parts();
+                    Ok::<_, BatchingError>(program)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             (
-                (0..region_count)
-                    .map(|index| batch_wrapped_program(context, driver, index))
-                    .collect::<Result<Vec<_>, _>>()?,
+                operation_regions,
                 aligned_inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
                 BatchAxis::new(0),
             )
         };
+
+    // Keep the semantic wrapper intact under both eager and tracing parents: eager contexts interpret this bind,
+    // while tracing contexts stage the wrapper operation together with the selected region programs.
     let outputs = context.parent().bind(operation, operation_regions, &parent_inputs)?;
+
+    // Restore the transform-level carrier around each parent result using the convention selected above.
     outputs
         .into_iter()
         .map(|tracer| {
@@ -241,61 +266,6 @@ where
             ArrayBatch::new(packed_type, tracer, output_batch_axis)
         })
         .collect()
-}
-
-/// Structurally batches one nested region program for attachment to a batched wrapper operation.
-///
-/// Region-bearing operations such as [`CustomJvpOperation`], [`CustomVjpOperation`], and
-/// [`RematerializeOperation`](super::rematerialization::RematerializeOperation) preserve semantics that would be lost
-/// if batching simply inlined their primal regions. Their batching rules instead construct a new wrapper and attach
-/// batched versions of the original region programs. This function performs the inner-program half of that process;
-/// [`batch_wrapped_operation`] aligns and binds the outer wrapper operation.
-///
-/// The outer helper normalizes every mapped wrapper operand to packed axis `0`. Consequently, each argument of the
-/// selected region must also be declared mapped at axis `0`. This function obtains the region through
-/// [`BatchingDriver::region`], assigns that input-axis convention to every argument, and structurally transforms the
-/// program through [`BatchingDriver::batch_program`]. It requests
-/// [`ProgramBatchingOutputAxesPolicy::AlignAllTo`] at axis `0`, so outputs that would naturally remain replicated are
-/// broadcast and outputs mapped at another position are moved. The resulting program therefore has the uniform
-/// signature required by the replacement wrapper:
-///
-/// ```text
-/// region:          (A₁, …, Aₘ) → (B₁, …, Bₚ)
-/// batched region:  ([N] + A₁, …, [N] + Aₘ) → ([N] + B₁, …, [N] + Bₚ)
-///                            ^ axis 0                    ^ axis 0
-/// ```
-///
-/// This helper is used only on the mapped path of the outer wrapper's batching rule. If every wrapper input is
-/// replicated, the original regions are retained unchanged instead. It returns the standalone transformed
-/// [`Program`]; it neither constructs nor binds the enclosing wrapper operation.
-///
-/// # Parameters
-///
-///   - `context`: Active array batching context whose extent and sharding are used to transform the region.
-///   - `driver`: Batching driver that provides access to the wrapper's source regions and performs structural program
-///     batching.
-///   - `index`: Zero-based position of the source region attached to the wrapper operation.
-pub(crate) fn batch_wrapped_program<
-    C: Context<Type = ArrayType>,
-    P: ArrayBatchingPolicy<C>,
-    D: BatchingDriver<C, ArrayBatching<P>>,
->(
-    context: &BatchingContext<C, ArrayBatching<P>>,
-    driver: &D,
-    index: usize,
-) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
-    let region = driver.region(index)?;
-    let input_count = region.input_types().len();
-    let input_batch_axes = vec![BatchAxis::new(0); input_count];
-    let (program, _) = driver
-        .batch_program(
-            context,
-            region,
-            input_batch_axes.as_slice(),
-            ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
-        )?
-        .into_parts();
-    Ok(program)
 }
 
 /// Batching rule for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
@@ -943,9 +913,9 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::ProgramBuilder;
     use crate::programs::effects::Effects;
     use crate::programs::regions::RegionRole;
+    use crate::programs::{Program, ProgramBuilder};
     use crate::types::{DataType, Dimension, Shape};
 
     use super::*;

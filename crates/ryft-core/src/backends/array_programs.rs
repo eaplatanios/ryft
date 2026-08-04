@@ -46,7 +46,7 @@ use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation,
     DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, LegacyBroadcastOperation,
     LegacyReshapeOperation, Pad, PadOperation, Reshape, ReshapeOperation, ReshapeParameters, ScatterDimensionNumbers,
-    ScatterOperation, ScatterReductionKind, Slice, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    ScatterOperation, ScatterReductionKind, Slice, Transpose, TransposeOperation, UpdateSlice,
 };
 use crate::operations::math::{AddOperation, DivOperation, MulOperation, Reduce, ReduceOperation, ReductionKind};
 use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
@@ -85,7 +85,7 @@ enum ExactShapeDimension {
 
 /// Exact runtime shape whose dynamic axes refer to entries in a [`LinearResiduals`] list.
 #[derive(Clone, Debug)]
-struct ExactShape(Vec<ExactShapeDimension>);
+pub(crate) struct ExactShape(Vec<ExactShapeDimension>);
 
 impl ExactShape {
     /// Builds the canonical disconnected-cotangent shape plan and records each dynamic identity's first source axis.
@@ -129,7 +129,7 @@ impl ExactShape {
     }
 
     /// Returns the residual values required by dynamic array constructors, in dynamic-axis order.
-    fn dynamic_dimensions<V: Clone>(&self, residuals: &[V]) -> Vec<V> {
+    pub(crate) fn dynamic_dimensions<V: Clone>(&self, residuals: &[V]) -> Vec<V> {
         // Mixed array constructors consume one operand per dynamic axis. Expand deduplicated residual slots back into
         // axis order here, so repeated identities intentionally produce repeated operands.
         self.0
@@ -147,7 +147,7 @@ impl ExactShape {
 /// Dynamic dimensions are deduplicated by identity, so repeated axes and explicit dimension operands share one SSA
 /// residual. Ordinary array residuals remain positional and are never inspected.
 #[derive(Clone, Debug)]
-struct LinearResiduals<V: Value<Type = ArrayProgramType>> {
+pub(crate) struct LinearResiduals<V: Value<Type = ArrayProgramType>> {
     /// Residual values in linear-call operand order.
     values: Vec<V>,
 }
@@ -155,7 +155,7 @@ struct LinearResiduals<V: Value<Type = ArrayProgramType>> {
 impl<V: Value<Type = ArrayProgramType>> LinearResiduals<V> {
     /// Creates an empty residual list.
     #[inline]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { values: Vec::new() }
     }
 
@@ -167,7 +167,7 @@ impl<V: Value<Type = ArrayProgramType>> LinearResiduals<V> {
 
     /// Consumes this residual list and returns its values.
     #[inline]
-    fn into_values(self) -> Vec<V> {
+    pub(crate) fn into_values(self) -> Vec<V> {
         self.values
     }
 
@@ -190,16 +190,15 @@ impl<V: Value<Type = ArrayProgramType>> LinearResiduals<V> {
     }
 
     /// Retains an ordered value list and returns the residual index corresponding to each source value.
-    fn retain_all(&mut self, values: impl IntoIterator<Item = V>) -> Vec<usize> {
+    pub(crate) fn retain_all(&mut self, values: impl IntoIterator<Item = V>) -> Vec<usize> {
         values.into_iter().map(|value| self.retain(value)).collect()
     }
 
     /// Retains the exact runtime shape of `array`, reading only dynamic axes that are not already represented by a
     /// dimension residual with the same identity.
-    fn retain_shape<A, C>(&mut self, context: &C, array: &V) -> Result<ExactShape, ProgramError>
+    pub(crate) fn retain_shape<C>(&mut self, context: &C, array: &V) -> Result<ExactShape, ProgramError>
     where
-        A: Value<Type = ArrayType>,
-        C: Context<Type = ArrayProgramType, Value = V, Operation: From<ArrayProgramOperation<A>>>,
+        C: Context<Type = ArrayProgramType, Value = V, Operation: From<DimensionSizeOperation>>,
     {
         let array_type = array.r#type();
         let array_type = <&ArrayType>::try_from(array_type.as_ref())?;
@@ -220,11 +219,7 @@ impl<V: Value<Type = ArrayProgramType>> LinearResiduals<V> {
                         return Ok(ExactShapeDimension::Residual(index));
                     }
                     let extent = context
-                        .bind(
-                            ArrayProgramOperation::<A>::from(DimensionSizeOperation::new(array_type, axis)?),
-                            Vec::new(),
-                            std::slice::from_ref(array),
-                        )?
+                        .bind(DimensionSizeOperation::new(array_type, axis)?, Vec::new(), std::slice::from_ref(array))?
                         .remove(0);
                     Ok(ExactShapeDimension::Residual(self.retain(extent)))
                 }
@@ -2141,7 +2136,7 @@ mod tests {
     };
     use crate::operations::manipulation::{
         Broadcast, BroadcastOperation, ConcatenateOperation, GatherDimensionNumbers, GatherOperation, PadOperation,
-        ReshapeOperation, SliceOperation,
+        ReshapeOperation, SliceOperation, UpdateSliceOperation,
     };
     use crate::operations::math::{AddOperation, MulOperation};
     use crate::parameters::Placeholder;

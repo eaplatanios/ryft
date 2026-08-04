@@ -1,28 +1,31 @@
 use std::fmt::Display;
 
 use crate::axes::Axis;
+use crate::backends::array_programs::LinearResiduals;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
+use crate::differentiation::forward::jvp_projected_operation;
 use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment,
+    ElementwiseDerivativeAlignment, LinearCallOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroLike, ZeroOperation};
+use crate::operations::dimensions::DimensionSizeOperation;
 use crate::operations::manipulation::{LegacyBroadcast, PadOperation, Reshape, Transpose};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, Memory, Shape};
@@ -325,6 +328,121 @@ where
         let tangent = match inputs[0].tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(apply(tangent)?),
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+impl SliceOperation {
+    /// Applies the array-program JVP rule, retaining exact extent residuals for a dynamically shaped operand and
+    /// otherwise delegating to the ordinary projected [`ArrayType`] rule.
+    ///
+    /// This is an inherent method rather than a [`DifferentiableOperation`] implementation because
+    /// [`SliceOperation`] remains an `ArrayType` operation while the context here has [`ArrayProgramType`]. The
+    /// composite family dispatcher calls this method only for its projected slice member.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Composite context in which primal and linear-call operations are staged.
+    ///   - `inputs`: Composite primal/tangent pairs for the slice operand.
+    pub(crate) fn jvp_array_program<C>(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+    where
+        C: Context<Type = ArrayProgramType>,
+        C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C::Operation:
+            From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+        <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+            + From<PadOperation<ArrayType>>
+            + From<SliceOperation>
+            + From<UpdateSliceOperation>
+            + From<ZeroOperation<ArrayType>>,
+    {
+        let [operand] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+        };
+        let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+        if operand_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
+            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+            return jvp_projected_operation(context, &operation, inputs);
+        }
+
+        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+        let primal = context.bind(operation, Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
+        let tangent = match operand.tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Value(operand_tangent) => {
+                let mut residuals = LinearResiduals::new();
+                let operand_shape = residuals.retain_shape(context, operand.primal())?;
+                let forward_operation = self.clone();
+                let transpose_shape = operand_shape.clone();
+                let transpose_operand_type = operand_type.cotangent();
+                let transpose_starts = self.start_indices().to_vec();
+                let transpose_strides = self.strides().to_vec();
+                let tangent = LinearCallOperation::stage(
+                    context,
+                    residuals.into_values(),
+                    vec![operand_tangent.clone()],
+                    move |_, linear_inputs| {
+                        linear_inputs[0].dispatch_domain().bind(
+                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(forward_operation),
+                            Vec::new(),
+                            std::slice::from_ref(&linear_inputs[0]),
+                        )
+                    },
+                    move |residuals, output_cotangents| {
+                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let mut output_cotangent = output_cotangents[0].clone();
+                        let zero_extents = transpose_shape.dynamic_dimensions(residuals);
+                        let zeros = transpose_context
+                            .bind(
+                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
+                                    transpose_operand_type.clone(),
+                                )),
+                                Vec::new(),
+                                zero_extents.as_slice(),
+                            )?
+                            .remove(0);
+                        if transpose_strides.iter().any(|stride| *stride != 1) {
+                            let padding_value = transpose_context
+                                .bind(
+                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                        ZeroOperation::new(ArrayType::scalar(transpose_operand_type.data_type())),
+                                    ),
+                                    Vec::new(),
+                                    &[],
+                                )?
+                                .remove(0);
+                            output_cotangent = transpose_context
+                                .bind(
+                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                        PadOperation::new(
+                                            vec![0; transpose_operand_type.rank()],
+                                            vec![0; transpose_operand_type.rank()],
+                                            transpose_strides.iter().map(|stride| stride - 1).collect(),
+                                        )?,
+                                    ),
+                                    Vec::new(),
+                                    &[output_cotangent, padding_value],
+                                )?
+                                .remove(0);
+                        }
+                        transpose_context.bind(
+                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                UpdateSliceOperation::new(transpose_starts),
+                            ),
+                            Vec::new(),
+                            &[zeros, output_cotangent],
+                        )
+                    },
+                )?
+                .remove(0);
+                MaybeZero::Value(tangent)
+            }
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
@@ -1103,6 +1221,104 @@ where
         let tangent = match operand.tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.dynamic_slice(&primal_starts, self.sizes())?),
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+impl DynamicSliceOperation {
+    /// Applies the array-program JVP rule, retaining exact extent and start-index residuals for a dynamically shaped
+    /// operand and otherwise delegating to the ordinary projected [`ArrayType`] rule.
+    ///
+    /// This is an inherent method rather than a [`DifferentiableOperation`] implementation because
+    /// [`DynamicSliceOperation`] remains an `ArrayType` operation while the context here has [`ArrayProgramType`]. The
+    /// composite family dispatcher calls this method only for its projected dynamic-slice member.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Composite context in which primal and linear-call operations are staged.
+    ///   - `inputs`: Composite primal/tangent pairs for the operand and scalar start indices.
+    pub(crate) fn jvp_array_program<C>(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+    where
+        C: Context<Type = ArrayProgramType>,
+        C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C::Operation:
+            From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+        <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+            + From<DynamicSliceOperation>
+            + From<DynamicUpdateSliceOperation>
+            + From<ZeroOperation<ArrayType>>,
+    {
+        let (operand, start_indices) =
+            inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
+        let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+        if operand_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
+            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+            return jvp_projected_operation(context, &operation, inputs);
+        }
+
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+        let primal = context.bind(operation, Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let tangent = match operand.tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Value(operand_tangent) => {
+                // Start indices have zero differential spaces but remain ordinary residual SSA values because both
+                // the forward slice and its transpose need their concrete runtime values.
+                let mut residuals = LinearResiduals::new();
+                let start_indices = residuals.retain_all(start_indices.iter().map(|index| index.primal().clone()));
+                let operand_shape = residuals.retain_shape(context, operand.primal())?;
+                let forward_operation = self.clone();
+                let forward_start_indices = start_indices.clone();
+                let transpose_shape = operand_shape.clone();
+                let transpose_operand_type = operand_type.cotangent();
+                let tangent = LinearCallOperation::stage(
+                    context,
+                    residuals.into_values(),
+                    vec![operand_tangent.clone()],
+                    move |residuals, linear_inputs| {
+                        let mut slice_inputs = Vec::with_capacity(1 + forward_start_indices.len());
+                        slice_inputs.push(linear_inputs[0].clone());
+                        slice_inputs.extend(forward_start_indices.iter().map(|index| residuals[*index].clone()));
+                        linear_inputs[0].dispatch_domain().bind(
+                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(forward_operation),
+                            Vec::new(),
+                            slice_inputs.as_slice(),
+                        )
+                    },
+                    move |residuals, output_cotangents| {
+                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let zero_extents = transpose_shape.dynamic_dimensions(residuals);
+                        let zeros = transpose_context
+                            .bind(
+                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
+                                    transpose_operand_type.clone(),
+                                )),
+                                Vec::new(),
+                                zero_extents.as_slice(),
+                            )?
+                            .remove(0);
+                        let mut update_inputs = Vec::with_capacity(2 + start_indices.len());
+                        update_inputs.push(zeros);
+                        update_inputs.push(output_cotangents[0].clone());
+                        update_inputs.extend(start_indices.iter().map(|index| residuals[*index].clone()));
+                        transpose_context.bind(
+                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                DynamicUpdateSliceOperation,
+                            ),
+                            Vec::new(),
+                            update_inputs.as_slice(),
+                        )
+                    },
+                )?
+                .remove(0);
+                MaybeZero::Value(tangent)
+            }
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }

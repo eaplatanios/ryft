@@ -190,7 +190,7 @@ where
                     let mut residuals = LinearResiduals::new();
                     let output_extents =
                         residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-                    let operand_shape = residuals.retain_shape::<A, _>(context, array_inputs[0].primal())?;
+                    let operand_shape = residuals.retain_shape(context, array_inputs[0].primal())?;
                     let forward_operation = PadOperation::<ArrayType>::from(operation.clone());
                     let forward_output_extents = output_extents.clone();
                     let transpose_operation = PadOperation::<ArrayType>::from(operation.clone());
@@ -453,150 +453,10 @@ where
             return jvp_array_program_while(operation, context, driver, inputs);
         }
         if let Self::Array(ArrayOperation::Slice(operation)) = self {
-            let [operand] = inputs else {
-                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-            };
-            let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
-            if operand_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
-                let primal = context.bind(self.clone(), Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
-                let tangent = match operand.tangent() {
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-                    MaybeZero::Value(operand_tangent) => {
-                        let mut residuals = LinearResiduals::new();
-                        let operand_shape = residuals.retain_shape::<A, _>(context, operand.primal())?;
-                        let forward_operation = operation.clone();
-                        let transpose_shape = operand_shape.clone();
-                        let transpose_operand_type = operand_type.cotangent();
-                        let transpose_starts = operation.start_indices().to_vec();
-                        let transpose_strides = operation.strides().to_vec();
-                        let tangent = LinearCallOperation::stage(
-                            context,
-                            residuals.into_values(),
-                            vec![operand_tangent.clone()],
-                            move |_, linear_inputs| {
-                                linear_inputs[0].dispatch_domain().bind(
-                                    ArrayProgramOperation::<A>::Array(ArrayOperation::Slice(forward_operation)),
-                                    Vec::new(),
-                                    std::slice::from_ref(&linear_inputs[0]),
-                                )
-                            },
-                            move |residuals, output_cotangents| {
-                                let transpose_context = output_cotangents[0].dispatch_domain();
-                                let mut output_cotangent = output_cotangents[0].clone();
-                                let zero_extents = transpose_shape.dynamic_dimensions(residuals);
-                                let zeros = transpose_context
-                                    .bind(
-                                        ArrayProgramOperation::<A>::from(ZeroOperation::new(
-                                            transpose_operand_type.clone(),
-                                        )),
-                                        Vec::new(),
-                                        zero_extents.as_slice(),
-                                    )?
-                                    .remove(0);
-                                if transpose_strides.iter().any(|stride| *stride != 1) {
-                                    let padding_value = transpose_context
-                                        .bind(
-                                            ArrayProgramOperation::<A>::from(ZeroOperation::new(ArrayType::scalar(
-                                                transpose_operand_type.data_type(),
-                                            ))),
-                                            Vec::new(),
-                                            &[],
-                                        )?
-                                        .remove(0);
-                                    output_cotangent = transpose_context
-                                        .bind(
-                                            ArrayProgramOperation::<A>::Array(ArrayOperation::Pad(PadOperation::new(
-                                                vec![0; transpose_operand_type.rank()],
-                                                vec![0; transpose_operand_type.rank()],
-                                                transpose_strides.iter().map(|stride| stride - 1).collect(),
-                                            )?)),
-                                            Vec::new(),
-                                            &[output_cotangent, padding_value],
-                                        )?
-                                        .remove(0);
-                                }
-                                transpose_context.bind(
-                                    ArrayProgramOperation::<A>::Array(ArrayOperation::UpdateSlice(
-                                        UpdateSliceOperation::new(transpose_starts),
-                                    )),
-                                    Vec::new(),
-                                    &[zeros, output_cotangent],
-                                )
-                            },
-                        )?
-                        .remove(0);
-                        MaybeZero::Value(tangent)
-                    }
-                };
-                return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
-            }
+            return operation.jvp_array_program(context, inputs);
         }
         if let Self::Array(ArrayOperation::DynamicSlice(operation)) = self {
-            let (operand, start_indices) =
-                inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-            let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
-            if operand_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
-                let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-                let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
-                let tangent = match operand.tangent() {
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-                    MaybeZero::Value(operand_tangent) => {
-                        // Start indices have zero differential spaces but remain ordinary residual SSA values because
-                        // both the forward slice and its transpose need their concrete runtime values.
-                        let mut residuals = LinearResiduals::new();
-                        let start_indices =
-                            residuals.retain_all(start_indices.iter().map(|index| index.primal().clone()));
-                        let operand_shape = residuals.retain_shape::<A, _>(context, operand.primal())?;
-                        let forward_operation = operation.clone();
-                        let forward_start_indices = start_indices.clone();
-                        let transpose_shape = operand_shape.clone();
-                        let transpose_operand_type = operand_type.cotangent();
-                        let tangent = LinearCallOperation::stage(
-                            context,
-                            residuals.into_values(),
-                            vec![operand_tangent.clone()],
-                            move |residuals, linear_inputs| {
-                                let mut slice_inputs = Vec::with_capacity(1 + forward_start_indices.len());
-                                slice_inputs.push(linear_inputs[0].clone());
-                                slice_inputs
-                                    .extend(forward_start_indices.iter().map(|index| residuals[*index].clone()));
-                                linear_inputs[0].dispatch_domain().bind(
-                                    ArrayProgramOperation::<A>::Array(ArrayOperation::DynamicSlice(forward_operation)),
-                                    Vec::new(),
-                                    slice_inputs.as_slice(),
-                                )
-                            },
-                            move |residuals, output_cotangents| {
-                                let transpose_context = output_cotangents[0].dispatch_domain();
-                                let zero_extents = transpose_shape.dynamic_dimensions(residuals);
-                                let zeros = transpose_context
-                                    .bind(
-                                        ArrayProgramOperation::<A>::from(ZeroOperation::new(
-                                            transpose_operand_type.clone(),
-                                        )),
-                                        Vec::new(),
-                                        zero_extents.as_slice(),
-                                    )?
-                                    .remove(0);
-                                let mut update_inputs = Vec::with_capacity(2 + start_indices.len());
-                                update_inputs.push(zeros);
-                                update_inputs.push(output_cotangents[0].clone());
-                                update_inputs.extend(start_indices.iter().map(|index| residuals[*index].clone()));
-                                transpose_context.bind(
-                                    ArrayProgramOperation::<A>::Array(ArrayOperation::DynamicUpdateSlice(
-                                        DynamicUpdateSliceOperation,
-                                    )),
-                                    Vec::new(),
-                                    update_inputs.as_slice(),
-                                )
-                            },
-                        )?
-                        .remove(0);
-                        MaybeZero::Value(tangent)
-                    }
-                };
-                return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
-            }
+            return operation.jvp_array_program(context, inputs);
         }
         if let Self::Array(ArrayOperation::DynamicUpdateSlice(_)) = self {
             if inputs.len() < 2 {
@@ -624,12 +484,11 @@ where
                 let start_indices = residuals.retain_all(start_indices.iter().map(|index| index.primal().clone()));
                 let operand_is_live = !operand.tangent().is_zero();
                 let update_is_live = !update.tangent().is_zero();
-                let operand_shape = (!operand_is_live)
-                    .then(|| residuals.retain_shape::<A, _>(context, operand.primal()))
-                    .transpose()?;
+                let operand_shape =
+                    (!operand_is_live).then(|| residuals.retain_shape(context, operand.primal())).transpose()?;
                 let update_type = <&ArrayType>::try_from(update.primal().r#type().as_ref())?.clone();
                 let update_shape = (operand_is_live || !update_is_live)
-                    .then(|| residuals.retain_shape::<A, _>(context, update.primal()))
+                    .then(|| residuals.retain_shape(context, update.primal()))
                     .transpose()?;
                 let mut linear_values = Vec::with_capacity(usize::from(operand_is_live) + usize::from(update_is_live));
                 if let MaybeZero::Value(tangent) = operand.tangent() {
@@ -772,7 +631,7 @@ where
                     MaybeZero::Value(operand_tangent) => {
                         let mut residuals = LinearResiduals::new();
                         let indices_index = residuals.retain(indices.primal().clone());
-                        let operand_shape = residuals.retain_shape::<A, _>(context, operand.primal())?;
+                        let operand_shape = residuals.retain_shape(context, operand.primal())?;
                         let forward_operation = operation.clone();
                         let transpose_operand_type = operand_type.cotangent();
                         let dimensions = operation.dimensions();
@@ -840,7 +699,7 @@ where
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
                     MaybeZero::Value(operand_tangent) => {
                         let mut residuals = LinearResiduals::new();
-                        let operand_shape = residuals.retain_shape::<A, _>(context, operand.primal())?;
+                        let operand_shape = residuals.retain_shape(context, operand.primal())?;
                         let input_extents = operand_shape.dimensions::<A, _>(context, residuals.values())?;
                         let output_axes = (0..operand_type.rank())
                             .filter(|axis| !operation.axes().contains(axis))
@@ -971,7 +830,7 @@ where
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
                     MaybeZero::Value(operand_tangent) => {
                         let mut residuals = LinearResiduals::new();
-                        let operand_shape = residuals.retain_shape::<A, _>(context, operand.primal())?;
+                        let operand_shape = residuals.retain_shape(context, operand.primal())?;
                         let forward_operation = operation.clone();
                         let transpose_operand_type = operand_type.cotangent();
                         let transpose_axes = operation.axes().to_vec();
@@ -1120,7 +979,7 @@ where
                     let result_extent_index = residuals.retain(result_extent.primal().clone());
                     let mut input_shapes = Vec::with_capacity(array_inputs.len());
                     for input in array_inputs {
-                        input_shapes.push(residuals.retain_shape::<A, _>(context, input.primal())?);
+                        input_shapes.push(residuals.retain_shape(context, input.primal())?);
                     }
                     let forward_operation = operation.clone();
                     let transpose_axis = operation.axis();
@@ -1221,7 +1080,7 @@ where
                         let mut residuals = LinearResiduals::new();
                         let output_extents =
                             residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-                        let input_shape = residuals.retain_shape::<A, _>(context, array.primal())?;
+                        let input_shape = residuals.retain_shape(context, array.primal())?;
                         let permuted_input_shape =
                             ExactShape(source_axes.iter().map(|axis| input_shape.0[*axis]).collect());
 
@@ -1353,7 +1212,7 @@ where
                         let mut residuals = LinearResiduals::new();
                         let output_extents =
                             residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-                        let input_shape = residuals.retain_shape::<A, _>(context, array.primal())?;
+                        let input_shape = residuals.retain_shape(context, array.primal())?;
                         let forward_operation = operation.clone();
                         let forward_output_extents = output_extents.clone();
                         let transpose_output_axes = operation.output_axes().to_vec();
@@ -1470,7 +1329,7 @@ where
                     let mut residuals = LinearResiduals::new();
                     let output_extents =
                         residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-                    let input_shape = residuals.retain_shape::<A, _>(context, array.primal())?;
+                    let input_shape = residuals.retain_shape(context, array.primal())?;
                     let forward_operation = self.clone();
                     let forward_output_extents = output_extents.clone();
                     let transpose_operation = self.clone();
