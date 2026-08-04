@@ -72,7 +72,7 @@ use crate::programs::regions::{Region, RegionId, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueId};
 use crate::tracing::{DomainTracer, Trace, TracingContext};
-use crate::tracing_v2::custom_derivatives::{batch_rewrapped_program, stage_rewrapped_custom_call};
+use crate::tracing_v2::custom_derivatives::{batch_wrapped_operation, batch_wrapped_program};
 use crate::types::{ArrayType, Memory};
 
 /// Higher-order operation used by checkpointing/rematerialization.
@@ -357,7 +357,7 @@ crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: T
 
 /// Batching rule for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
 /// programs so the rematerialization boundary survives `batch` under eager and staging parents alike; see
-/// `stage_rewrapped_custom_call`.
+/// [`batch_wrapped_operation`](crate::tracing_v2::custom_derivatives::batch_wrapped_operation).
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for RematerializeOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
@@ -373,15 +373,15 @@ where
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        stage_rewrapped_custom_call(context, inputs, |batched| match batched {
+        batch_wrapped_operation(context, inputs, |batched| match batched {
             None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
             Some(_) => Ok((
                 O::from(RematerializeOperation::new().with_prevent_cse(self.prevent_cse)),
                 vec![
-                    batch_rewrapped_program(context, driver, 0)?,
-                    batch_rewrapped_program(context, driver, 1)?,
-                    batch_rewrapped_program(context, driver, 2)?,
-                    batch_rewrapped_program(context, driver, 3)?,
+                    batch_wrapped_program(context, driver, 0)?,
+                    batch_wrapped_program(context, driver, 1)?,
+                    batch_wrapped_program(context, driver, 2)?,
+                    batch_wrapped_program(context, driver, 3)?,
                 ],
             )),
         })
