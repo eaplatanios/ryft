@@ -2158,6 +2158,11 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [x] Relocate the P8b2a static and dynamic read-slice rules.
     - [x] Relocate the P8b2b dynamic-update-slice and gather rules.
     - [x] Relocate the P8b2c reduction rules and close P8b2.
+  - [ ] Continue P8b3 with the shape-operation differentiation and transposition rules.
+    - [x] Relocate the P8b3a concatenate rules.
+    - [ ] Relocate the P8b3b reshape rules.
+    - [ ] Relocate the P8b3c broadcast rules.
+    - [ ] Relocate the P8b3d pad rules and close P8b3.
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
 - [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.
 - [ ] Make `#[derive(Operation)]` with `#[ryft(dispatch(batching, differentiation, transposition))]` the mechanical

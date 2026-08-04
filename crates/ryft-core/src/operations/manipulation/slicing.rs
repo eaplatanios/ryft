@@ -94,6 +94,7 @@ pub struct SliceOperation {
     strides: Vec<usize>,
 }
 
+// TODO(eaplatanios): Why do we need this in addition to `DynamicSliceOperation`?
 /// Mixed slice operation whose inclusive starts and output sizes are first-class dimensions.
 ///
 /// Operands are ordered as `[array, starts..., sizes...]`, with one start and one size per array axis. The output

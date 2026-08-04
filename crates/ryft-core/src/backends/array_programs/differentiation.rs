@@ -129,10 +129,12 @@ where
     C::Value: Concretizable<bool> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<ArrayProgramOperation<A>>
         + From<BroadcastOperation>
+        + From<ConcatenateOperation<ArrayProgramType>>
         + From<ConditionOperation<C::Constant>>
         + From<DimensionFromScalarOperation>
         + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>
+        + From<DynamicShapeSliceOperation>
         + From<LinearCallOperation<ArrayProgramType>>
         + From<ScanOperation<C::Constant>>
         + From<WhileOperation<ArrayProgramType>>
@@ -469,134 +471,8 @@ where
         if let Self::Array(ArrayOperation::Reduce(operation)) = self {
             return operation.jvp_in_parent(context, driver, inputs);
         }
-        if let Self::Concatenate(_) = self {
-            let Some((result_extent, array_inputs)) = inputs.split_last() else {
-                return Err(TypeError::invalid(format!(
-                    "'{}' differentiation expects at least one array followed by its result extent",
-                    CONCATENATE_OPERATION_NAME,
-                ))
-                .into());
-            };
-            if array_inputs.is_empty() {
-                return match result_extent.primal().r#type().as_ref() {
-                    ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
-                        "'{}' differentiation expects a trailing result-extent dimension",
-                        CONCATENATE_OPERATION_NAME,
-                    ))
-                    .into()),
-                    ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
-                        "'{}' differentiation expects at least one array before its result extent",
-                        CONCATENATE_OPERATION_NAME,
-                    ))
-                    .into()),
-                };
-            }
-
-            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
-            let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
-                MaybeZero::Zero(primal.r#type().tangent())
-            } else {
-                // Concatenation is linear in its array operands. Materialize only the structural zero array tangents
-                // needed beside live tangents, and replay the primal result extent as an unchanged shape input.
-                let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
-                let mut tangent_inputs = array_inputs
-                    .iter()
-                    .map(|input| -> Result<C::Value, DifferentiationError> {
-                        let tangent = match input.tangent() {
-                            MaybeZero::Zero(r#type) => MaybeZero::Zero(<&ArrayType>::try_from(r#type)?.clone()),
-                            MaybeZero::Value(value) => MaybeZero::Value(
-                                <C::Value as ValueProjection<ArrayType>>::into_projected(value.clone())?,
-                            ),
-                        };
-                        Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(
-                            tangent.materialize(&projected_context)?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let input_cotangent_types = array_inputs
-                    .iter()
-                    .map(|input| <&ArrayType>::try_from(input.primal().r#type().as_ref()).map(ArrayType::cotangent))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if input_cotangent_types
-                    .iter()
-                    .flat_map(|r#type| r#type.shape().dimensions())
-                    .all(|dimension| matches!(dimension, Dimension::Static(_)))
-                {
-                    tangent_inputs.push(result_extent.primal().clone());
-                    MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
-                } else {
-                    let Self::Concatenate(operation) = self else {
-                        unreachable!();
-                    };
-                    let mut residuals = LinearResiduals::new();
-                    let result_extent_index = residuals.retain(result_extent.primal().clone());
-                    let mut input_shapes = Vec::with_capacity(array_inputs.len());
-                    for input in array_inputs {
-                        input_shapes.push(residuals.retain_shape(context, input.primal())?);
-                    }
-                    let forward_operation = operation.clone();
-                    let transpose_axis = operation.axis();
-                    let tangent = LinearCallOperation::stage(
-                        context,
-                        residuals.into_values(),
-                        tangent_inputs,
-                        move |residuals, linear_inputs| {
-                            let mut concatenate_inputs = linear_inputs.to_vec();
-                            concatenate_inputs.push(residuals[result_extent_index].clone());
-                            linear_inputs[0].dispatch_domain().bind(
-                                ArrayProgramOperation::<A>::from(forward_operation),
-                                Vec::new(),
-                                concatenate_inputs.as_slice(),
-                            )
-                        },
-                        move |residuals, output_cotangents| {
-                            let transpose_context = output_cotangents[0].dispatch_domain();
-                            let zero = dimension_constant::<A, _>(&transpose_context, 0)?;
-                            let mut offset = zero.clone();
-                            let mut cotangents = Vec::with_capacity(input_shapes.len());
-                            for (input_index, input_shape) in input_shapes.iter().enumerate() {
-                                let sizes = input_shape.dimensions(&transpose_context, residuals)?;
-                                let mut starts = vec![zero.clone(); sizes.len()];
-                                starts[transpose_axis] = offset.clone();
-                                let mut slice_inputs = Vec::with_capacity(1 + 2 * sizes.len());
-                                slice_inputs.push(output_cotangents[0].clone());
-                                slice_inputs.extend(starts);
-                                slice_inputs.extend(sizes.iter().cloned());
-                                cotangents.push(
-                                    transpose_context
-                                        .bind(
-                                            ArrayProgramOperation::<A>::from(DynamicShapeSliceOperation::new(
-                                                sizes.len(),
-                                            )),
-                                            Vec::new(),
-                                            slice_inputs.as_slice(),
-                                        )?
-                                        .remove(0),
-                                );
-                                if input_index + 1 < input_shapes.len() {
-                                    let offset_type = <&DimensionType>::try_from(offset.r#type().as_ref())?.clone();
-                                    let size_type =
-                                        <&DimensionType>::try_from(sizes[transpose_axis].r#type().as_ref())?.clone();
-                                    offset = transpose_context
-                                        .bind(
-                                            ArrayProgramOperation::<A>::from(DimensionOperation::Add(
-                                                DimensionAddOperation::new(&offset_type, &size_type)?,
-                                            )),
-                                            Vec::new(),
-                                            &[offset, sizes[transpose_axis].clone()],
-                                        )?
-                                        .remove(0);
-                                }
-                            }
-                            Ok(cotangents)
-                        },
-                    )?
-                    .remove(0);
-                    MaybeZero::Value(tangent)
-                }
-            };
-            return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
+        if let Self::Concatenate(operation) = self {
+            return operation.jvp(context, driver, inputs);
         }
         if let Self::Reshape(operation) = self {
             let Some((array, output_extents)) = inputs.split_first() else {
@@ -1255,50 +1131,7 @@ where
             return Ok(cotangents);
         }
         if let Self::Concatenate(operation) = self {
-            let Some((result_extent, array_inputs)) = inputs.split_last() else {
-                return Err(TypeError::invalid(format!(
-                    "'{}' transpose expects at least one array followed by its result extent",
-                    CONCATENATE_OPERATION_NAME,
-                ))
-                .into());
-            };
-            if array_inputs.is_empty() {
-                return match result_extent.r#type().as_ref() {
-                    ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
-                        "'{}' transpose expects a trailing result-extent dimension",
-                        CONCATENATE_OPERATION_NAME,
-                    ))
-                    .into()),
-                    ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
-                        "'{}' transpose expects at least one array before its result extent",
-                        CONCATENATE_OPERATION_NAME,
-                    ))
-                    .into()),
-                };
-            }
-            for input in array_inputs {
-                let input_type = input.r#type();
-                let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
-                if matches!(input_type.dimension(operation.axis()), Dimension::Dynamic(_)) {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "direct transposition of a dynamic '{}' requires linearization so its input extents can \
-                             be retained as residuals",
-                            CONCATENATE_OPERATION_NAME,
-                        ),
-                    }
-                    .into());
-                }
-            }
-
-            // Static concatenation uses the established homogeneous pullback, which slices the output cotangent at
-            // cumulative input offsets. The explicit result extent is a non-differentiable shape input and has a
-            // structural-zero cotangent.
-            let array_operation =
-                Self::Array(ArrayOperation::from(ConcatenateOperation::<ArrayType>::from(operation.clone())));
-            let mut cotangents = array_operation.transpose(context, driver, array_inputs, outputs)?;
-            cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()));
-            return Ok(cotangents);
+            return operation.transpose(context, driver, inputs, outputs);
         }
         if let Self::Broadcast(operation) = self {
             let Some((input, output_extents)) = inputs.split_first() else {

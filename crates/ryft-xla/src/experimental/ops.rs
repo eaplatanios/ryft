@@ -389,6 +389,7 @@ impl_composite_operation_conversion!(
     CustomCallOperation<ArrayProgramType>,
     PadOperation<ArrayType>,
     PadOperation<ArrayProgramType>,
+    DynamicShapeSliceOperation,
     RngBitGeneratorOperation<ArrayProgramType>,
     AllGatherOperation,
     PSumScatterOperation,
