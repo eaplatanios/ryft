@@ -4,8 +4,8 @@ use std::ops::Range;
 use crate::axes::Axis;
 use crate::backends::array_programs::batching::ArrayProgramBatching;
 use crate::batching::{
-    ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    BatchingPolicy, ProgramBatchingOutputAxesPolicy,
+    ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver,
+    BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationError;

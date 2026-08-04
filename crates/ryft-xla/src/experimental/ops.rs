@@ -3,8 +3,8 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use ryft_core::batching::{
-    ArrayBatch, ArrayBatching, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-    ProgramBatchingOutputAxesPolicy,
+    ArrayBatch, ArrayBatching, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver,
+    BatchingError, ProgramBatchingOutputAxesPolicy,
 };
 use ryft_core::captures::CaptureReference;
 use ryft_core::compilation::function::CompiledCallOperation;

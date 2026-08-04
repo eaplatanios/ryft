@@ -2239,9 +2239,14 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       only the smallest capability-based surface after the operation and transform families settle.
 - [ ] After Phase 8 has moved every operation-specific batching algorithm to its payload owner, replace the historical
       asymmetric module layout with a symmetric batching hierarchy:
+  - [x] Make `BatchedProgram` the universe-neutral carrier contract, rename the reusable exact-source-boundary carrier
+        to `BoundaryPreservingBatchedProgram`, require every `BatchingPolicy::BatchedProgram` to implement the contract,
+        and consolidate output-axis alignment into one policy-generic `BatchingContext` implementation. Concrete
+        carriers continue to validate their own boundary invariants and the generic contract never interprets or drops
+        policy-owned bookkeeping values.
   - [ ] Keep universe-neutral contracts and machinery in the `batching` module root (`BatchingPolicy`,
-        `BatchingPolicyProjection`, `BatchableType`, contexts/tracers/drivers, `BatchedProgram`, transform entrypoints,
-        and projected-operation helpers).
+        `BatchingPolicyProjection`, `BatchableType`, contexts/tracers/drivers, the `BatchedProgram` trait and
+        `BoundaryPreservingBatchedProgram` default carrier, transform entrypoints, and projected-operation helpers).
   - [ ] Move the `ArrayType` specialization to `batching::arrays` (`ArrayBatch`, `ArrayBatching`,
         `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, their policy/recursive/entrypoint implementations, and
         shared array-axis mechanics).
@@ -3654,3 +3659,22 @@ and the previously documented shared zero/one/iota constructor classification th
 generate. The obsolete backend-local collective helpers and mixed-operation algorithms were deleted. All core tests,
 integration and compile-fail tests, runnable doctests, and all runnable XLA library tests passed. The detailed
 implementation and verification ledger is recorded in `.tasks/plan_p8b_array_program_operation_declaration.md`.
+
+### Phase 9 early execution: universe-neutral batched-program carriers (2026-08-03)
+
+`BatchedProgram` is now the universe-neutral contract for structural batching results. The former concrete
+`BatchedProgram` became `BoundaryPreservingBatchedProgram`, the reusable carrier for policies whose transformed
+boundary exactly matches the source region, while `ThreadedExtentBatchedProgram` implements the same contract without
+weakening its leading extent-input/output forwarding checks. `BatchingPolicy::BatchedProgram` is constrained by the
+new trait, so future program universes must expose semantic output-axis metadata and lossless access to their complete
+policy-specific boundary.
+
+The two concrete `BatchingContext::align_batched_program_outputs` implementations were replaced by one policy-generic
+implementation in the core transform module. It compares and validates only semantic source-output axes and preserves
+all bookkeeping values carried by the selected program representation. Array and array-program control-flow rules now
+use the same core algorithm; their distinct boundary mechanics remain isolated in their concrete carriers and
+policies. The remaining Phase 9 module relocation is intentionally still pending.
+
+Verification passed `cargo check -p ryft-core --tests`, all 1,123 core library tests, all 52 runnable core doctests (16
+examples ignored), both 17-test macro integration suites including their compile-fail fixtures, all 434 runnable XLA
+library tests (one timing-sensitive benchmark ignored), formatting, and diff hygiene.

@@ -817,7 +817,9 @@ mod tests {
     use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
-    use crate::batching::{BatchAxis, BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy};
+    use crate::batching::{
+        BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
+    };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::macros::check_operation_type_inference;
     use crate::parameters::Placeholder;

@@ -1968,7 +1968,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, batch};
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::jacobian::{JacobianDifferentiate, jacobian_reverse};
     use crate::macros::{check_operation_transposition, check_operation_type_inference};

@@ -11,8 +11,8 @@ use crate::backends::array_programs::ArrayProgramValue;
 use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, require_equal_dimensions};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, ProgramBatchingOutputAxesPolicy, batch_projected_operation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
+    BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy, batch_projected_operation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{

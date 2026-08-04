@@ -2179,7 +2179,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::ProgramBatchingOutputAxesPolicy;
+    use crate::batching::{BatchedProgram, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
     use crate::differentiation::value_and_gradient;
     use crate::macros::{check_operation_transposition, check_operation_type_inference};

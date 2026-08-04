@@ -32,9 +32,9 @@ pub use backends::*;
 pub use batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation,
     BatchableType, BatchedProgram, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
-    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, DimensionSource, InterpretableBatchableOperation,
-    ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy, StaticArrayBatchingPolicy, batch,
-    batch_projected_operation,
+    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DimensionSource,
+    InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
+    StaticArrayBatchingPolicy, batch, batch_projected_operation,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};

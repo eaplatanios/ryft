@@ -188,7 +188,7 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
-    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, batch};
+    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{LinearizationTracer, gradient, jvp, value_and_gradient};
     use crate::macros::{

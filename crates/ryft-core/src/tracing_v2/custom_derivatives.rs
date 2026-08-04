@@ -610,8 +610,7 @@ impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> fo
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: LegacyBroadcast + Transpose,
-    ArrayBatching<P>: LinearCallBatchingPolicy<C>
-        + BatchingPolicy<C, Batch = ArrayBatch<C::Value>, BatchedProgram = BatchedProgram<C::Constant, C::Operation>>,
+    ArrayBatching<P>: LinearCallBatchingPolicy<C> + BatchingPolicy<C, Batch = ArrayBatch<C::Value>>,
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<LegacyBroadcastOperation>

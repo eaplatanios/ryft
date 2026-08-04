@@ -17,9 +17,9 @@ use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchAxisSpecification, BatchableOperation,
     BatchableType, BatchedProgram, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
-    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, DimensionSource, MemberBatchableOperation,
-    ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy, batch_axis_sharding,
-    batch_projected_operation, normalized_batch_axis_type,
+    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DimensionSource,
+    MemberBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
+    batch_axis_sharding, batch_projected_operation, normalized_batch_axis_type,
 };
 use crate::contexts::{Context, ProjectedContext, StagingContext, ValueResolution};
 use crate::differentiation::LinearCallOperation;
@@ -158,7 +158,8 @@ impl<V: Value<Type = ArrayProgramType>> Display for ArrayProgramBatch<V> {
 /// first-class mapped-extent SSA value. Their boundary has one additional leading dimension input and output:
 /// the input defines the identity referenced by every inserted dynamic batch dimension, and the output forwards that
 /// same atom so enclosing higher-order operations can carry it through the sealed region. Output-axis metadata
-/// excludes this bookkeeping output, and [`Self::into_parts`] documents the arity contract consumers must uphold.
+/// excludes this bookkeeping output, and [`BatchedProgram::into_parts`] documents the arity contract consumers must
+/// uphold.
 /// Consumers that instead need an ordinary [`Region`](crate::Region) boundary shed the widening through
 /// [`BatchingPolicy::adapt_batched_program`] and complete the adapted program's operands with
 /// [`BatchingPolicy::boundary_operands`].
@@ -226,7 +227,7 @@ impl<C: Context<Type = ArrayProgramType>> BatchingPolicy<C> for ArrayProgramBatc
         program: Self::BatchedProgram,
         required_output_axes: Option<&[BatchAxis]>,
         collapse_fn: CollapseFn,
-    ) -> Result<BatchedProgram<C::Constant, C::Operation>, BatchingError>
+    ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError>
     where
         CollapseFn: Fn(
             &TracingContext<C::Constant, C::Operation>,
@@ -235,7 +236,13 @@ impl<C: Context<Type = ArrayProgramType>> BatchingPolicy<C> for ArrayProgramBatc
         ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
     {
         let (program, output_axes) = program.into_parts();
-        BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 1, collapse_fn)
+        BoundaryPreservingBatchedProgram::from_widened_boundary(
+            program,
+            output_axes,
+            required_output_axes,
+            1,
+            collapse_fn,
+        )
     }
 }
 
@@ -272,19 +279,18 @@ impl<V: Value<Type = ArrayProgramType>, O: Operation<Type = ArrayProgramType>> T
 
         Ok(Self { program, output_axes })
     }
+}
 
-    /// Returns the mapped axes of the source region's outputs, excluding the bookkeeping-only threaded extent.
+impl<V: Value<Type = ArrayProgramType>, O: Operation<Type = ArrayProgramType>> BatchedProgram<V, O>
+    for ThreadedExtentBatchedProgram<V, O>
+{
     #[inline]
-    pub fn output_axes(&self) -> &[BatchAxis] {
+    fn output_axes(&self) -> &[BatchAxis] {
         self.output_axes.as_slice()
     }
 
-    /// Consumes this result and returns its transformed program and output axes.
-    ///
-    /// The returned program's boundary is `[extent, packed inputs...] -> [extent, packed outputs...]`:
-    /// callers must supply the mapped-extent dimension value as the leading operand and drop the leading forwarded
-    /// output, whose axis is deliberately absent from the returned output axes.
-    pub fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>) {
+    #[inline]
+    fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>) {
         (self.program, self.output_axes)
     }
 }
@@ -314,7 +320,7 @@ where
 {
     type Batch = ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>;
     type Extent = C::Value;
-    type BatchedProgram = BatchedProgram<
+    type BatchedProgram = BoundaryPreservingBatchedProgram<
         <C::Constant as ValueProjection<ArrayType>>::Projected,
         <C::Operation as OperationProjection<ArrayType>>::Projected,
     >;
@@ -353,7 +359,7 @@ where
         required_output_axes: Option<&[BatchAxis]>,
         collapse_fn: CollapseFn,
     ) -> Result<
-        BatchedProgram<
+        BoundaryPreservingBatchedProgram<
             <C::Constant as ValueProjection<ArrayType>>::Projected,
             <C::Operation as OperationProjection<ArrayType>>::Projected,
         >,
@@ -383,7 +389,13 @@ where
         >,
     {
         let (program, output_axes) = program.into_parts();
-        BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, collapse_fn)
+        BoundaryPreservingBatchedProgram::from_widened_boundary(
+            program,
+            output_axes,
+            required_output_axes,
+            0,
+            collapse_fn,
+        )
     }
 }
 
@@ -405,7 +417,7 @@ where
 {
     type Batch = <C::Value as ValueProjection<DimensionType>>::Projected;
     type Extent = C::Value;
-    type BatchedProgram = BatchedProgram<
+    type BatchedProgram = BoundaryPreservingBatchedProgram<
         <C::Constant as ValueProjection<DimensionType>>::Projected,
         <C::Operation as OperationProjection<DimensionType>>::Projected,
     >;
@@ -449,7 +461,7 @@ where
         required_output_axes: Option<&[BatchAxis]>,
         collapse_fn: CollapseFn,
     ) -> Result<
-        BatchedProgram<
+        BoundaryPreservingBatchedProgram<
             <C::Constant as ValueProjection<DimensionType>>::Projected,
             <C::Operation as OperationProjection<DimensionType>>::Projected,
         >,
@@ -479,7 +491,13 @@ where
         >,
     {
         let (program, output_axes) = program.into_parts();
-        BatchedProgram::from_widened_boundary(program, output_axes, required_output_axes, 0, collapse_fn)
+        BoundaryPreservingBatchedProgram::from_widened_boundary(
+            program,
+            output_axes,
+            required_output_axes,
+            0,
+            collapse_fn,
+        )
     }
 }
 
@@ -1089,59 +1107,6 @@ where
             .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
             .into_simplified()?;
         Ok(ThreadedExtentBatchedProgram::new(program, output_axes)?)
-    }
-}
-
-impl<C: Context<Type = ArrayProgramType>> BatchingContext<C, ArrayProgramBatching> {
-    /// Returns `batched_program`'s transformed program unchanged when its output axes already equal
-    /// `target_output_axes`, or structurally batches `region` again while aligning its live outputs to those target
-    /// axes. This is the extent-threading counterpart of
-    /// [`BatchingContext::align_batched_program_outputs`](BatchingContext::align_batched_program_outputs), and the
-    /// returned program keeps the widened `[extent, inputs...] -> [extent, outputs...]` boundary that
-    /// [`ThreadedExtentBatchedProgram`] documents.
-    ///
-    /// Region-carrying operation rules use this after discovering and semantically reconciling natural output axes
-    /// across related regions. This method only performs the mechanical output-boundary alignment. It deliberately does
-    /// not decide which axes correspond or which one should win. A mapped target axis moves a naturally mapped output
-    /// or broadcasts a naturally replicated output. Callers must never use this method to collapse a mapped output to
-    /// replicated, because that requires [`Operation`]-specific semantics such as cotangent summation.
-    ///
-    /// # Parameters
-    ///
-    ///   - `driver`: [`BatchingDriver`] that structurally transforms `region` if alignment is required.
-    ///   - `region`: Source [`Region`](crate::Region) from which `batched_program` was produced.
-    ///   - `input_axes`: Batch axes used to produce `batched_program` and to perform any aligned replay.
-    ///   - `batched_program`: Region already structurally batched with natural output axes.
-    ///   - `target_output_axes`: Semantically reconciled output axes targeted by the region's consumer.
-    pub(crate) fn align_batched_program_outputs<D: BatchingDriver<C, ArrayProgramBatching>>(
-        &self,
-        driver: &D,
-        region: RegionRef<'_, C::Constant, C::Operation>,
-        input_axes: &[BatchAxis],
-        batched_program: ThreadedExtentBatchedProgram<C::Constant, C::Operation>,
-        target_output_axes: &[BatchAxis],
-    ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
-        if batched_program.output_axes() == target_output_axes {
-            return Ok(batched_program.into_parts().0);
-        }
-        let aligned_program = driver.batch_program(
-            self,
-            region,
-            input_axes,
-            ProgramBatchingOutputAxesPolicy::AlignEachTo(target_output_axes.to_vec()),
-        )?;
-        if aligned_program.output_axes() != target_output_axes {
-            let actual_output_axes =
-                aligned_program.output_axes().iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
-            let target_output_axes = target_output_axes.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
-            return Err(BatchingError::MisalignedBatchAxes {
-                message: format!(
-                    "batched region output axes [{actual_output_axes}] do not match the target output axes \
-                     [{target_output_axes}]",
-                ),
-            });
-        }
-        Ok(aligned_program.into_parts().0)
     }
 }
 
