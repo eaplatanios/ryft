@@ -588,6 +588,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::marker::PhantomData;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -599,6 +601,64 @@ mod tests {
     use crate::types::{ArrayProgramType, ArrayType, DataType};
 
     use super::*;
+
+    /// Test operation that makes every [`Operation`] method's forwarding observable for an arbitrary type family.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ForwardingOperation<T: Type> {
+        /// Whether [`Operation::rename_type_identities`] has been called.
+        renamed: bool,
+
+        /// Type family whose operation contract this fixture implements.
+        marker: PhantomData<fn() -> T>,
+    }
+
+    impl<T: Type> Operation for ForwardingOperation<T> {
+        type Type = T;
+
+        fn name(&self) -> &'static str {
+            "forwarding"
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            const { &[RegionSlot::computation("body")] }
+        }
+
+        fn infer_region_input_types(
+            &self,
+            input_types: &[T],
+            _region_interfaces: &[RegionInterface<T>],
+        ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+            Ok(vec![Some(input_types.to_vec())])
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[T],
+            region_interfaces: &[RegionInterface<T>],
+        ) -> Result<Vec<T>, TypeError> {
+            Ok(input_types.iter().chain(region_interfaces[0].output_types()).cloned().collect())
+        }
+
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+            vec![OutputRegionProvenance { region_index: 0, output_index }]
+        }
+
+        fn is_zero(&self, output_index: usize) -> bool {
+            output_index == 2
+        }
+
+        fn effects(&self) -> Effects {
+            Effects::single(Effect::OrderedIo)
+        }
+
+        fn rename_type_identities(&self, _renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+            Ok(Self { renamed: true, marker: PhantomData })
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, _indentation: usize) -> std::fmt::Result {
+            formatter.write_str("forwarded")
+        }
+    }
 
     #[test]
     fn test_operation_formatter() {
@@ -687,65 +747,8 @@ mod tests {
         assert!(operation.rename_type_identities(&TypeIdentityRenaming::new()).is_ok());
         assert_eq!(std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(), "stop_gradient");
 
-        /// Test operation that makes every [`Operation`] method's forwarding observable.
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        struct ForwardingOperation {
-            renamed: bool,
-        }
-
-        impl Operation for ForwardingOperation {
-            type Type = DataType;
-
-            fn name(&self) -> &'static str {
-                "forwarding"
-            }
-
-            fn region_slots(&self) -> &'static [RegionSlot] {
-                const { &[RegionSlot::computation("body")] }
-            }
-
-            fn infer_region_input_types(
-                &self,
-                input_types: &[DataType],
-                _region_interfaces: &[RegionInterface<DataType>],
-            ) -> Result<Vec<Option<Vec<DataType>>>, TypeError> {
-                Ok(vec![Some(input_types.to_vec())])
-            }
-
-            fn infer_output_types(
-                &self,
-                _input_types: &[DataType],
-                region_interfaces: &[RegionInterface<DataType>],
-            ) -> Result<Vec<DataType>, TypeError> {
-                Ok(region_interfaces[0].output_types().to_vec())
-            }
-
-            fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-                vec![OutputRegionProvenance { region_index: 0, output_index }]
-            }
-
-            fn is_zero(&self, output_index: usize) -> bool {
-                output_index == 2
-            }
-
-            fn effects(&self) -> Effects {
-                Effects::single(Effect::OrderedIo)
-            }
-
-            fn rename_type_identities(
-                &self,
-                _renaming: &TypeIdentityRenaming<<DataType as Type>::Identity>,
-            ) -> Result<Self, TypeError> {
-                Ok(Self { renamed: true })
-            }
-
-            fn render(&self, formatter: &mut std::fmt::Formatter<'_>, _indentation: usize) -> std::fmt::Result {
-                formatter.write_str("forwarded")
-            }
-        }
-
         // Check that `Box<O>` forwards every method rather than silently falling back to a trait default.
-        let operation = Box::new(ForwardingOperation { renamed: false });
+        let operation = Box::new(ForwardingOperation::<DataType> { renamed: false, marker: PhantomData });
         let region_interfaces = [RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE)];
 
         assert_eq!(operation.name(), "forwarding");
@@ -756,7 +759,10 @@ mod tests {
             operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
             Ok(vec![Some(vec![DataType::F32])]),
         );
-        assert_eq!(operation.infer_output_types(&[DataType::F32], &region_interfaces), Ok(vec![DataType::F64]),);
+        assert_eq!(
+            operation.infer_output_types(&[DataType::F32], &region_interfaces),
+            Ok(vec![DataType::F32, DataType::F64]),
+        );
         assert_eq!(
             operation.output_region_provenance(3),
             vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],
@@ -766,45 +772,14 @@ mod tests {
         assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
         assert_eq!(
             operation.rename_type_identities(&TypeIdentityRenaming::new()),
-            Ok(Box::new(ForwardingOperation { renamed: true })),
+            Ok(Box::new(ForwardingOperation::<DataType> { renamed: true, marker: PhantomData })),
         );
         assert_eq!(std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(), "forwarded",);
     }
 
     #[test]
     fn test_infer_projected_operation_types() {
-        /// Member operation that exposes both projected inference paths.
-        #[derive(Clone)]
-        struct ProjectedOperation;
-
-        impl Operation for ProjectedOperation {
-            type Type = ArrayType;
-
-            fn name(&self) -> &'static str {
-                "projected"
-            }
-
-            fn infer_region_input_types(
-                &self,
-                input_types: &[ArrayType],
-                region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<Option<Vec<ArrayType>>>, TypeError> {
-                Ok(vec![Some(input_types.to_vec()); region_interfaces.len()])
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ArrayType],
-                region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
-                Ok(input_types
-                    .iter()
-                    .chain(region_interfaces.iter().flat_map(RegionInterface::output_types))
-                    .cloned()
-                    .collect())
-            }
-        }
-
+        let operation = ForwardingOperation::<ArrayType> { renamed: false, marker: PhantomData };
         let input_type = ArrayType::scalar(DataType::F32);
         let region_output_type = ArrayType::scalar(DataType::F64);
         let input_types = [ArrayProgramType::from(input_type.clone())];
@@ -813,13 +788,12 @@ mod tests {
             vec![ArrayProgramType::from(region_output_type.clone())],
             Effects::single(Effect::OrderedIo),
         )];
-
         assert_eq!(
-            infer_projected_operation_region_input_types(&ProjectedOperation, &input_types, &region_interfaces),
+            infer_projected_operation_region_input_types(&operation, &input_types, &region_interfaces),
             Ok(vec![Some(vec![ArrayProgramType::from(input_type.clone())])]),
         );
         assert_eq!(
-            infer_projected_operation_output_types(&ProjectedOperation, &input_types, &region_interfaces),
+            infer_projected_operation_output_types(&operation, &input_types, &region_interfaces),
             Ok(vec![ArrayProgramType::from(input_type), ArrayProgramType::from(region_output_type)]),
         );
     }
