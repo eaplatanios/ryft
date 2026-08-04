@@ -1,10 +1,8 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::axes::Axis;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, ProgramBatchingOutputAxesPolicy,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -30,8 +28,8 @@ pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 /// Higher-order [`Operation`] pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
 /// [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
 ///
-/// The two [`Program`]s are supplied as the operation's attached regions (via the region driver passed to
-/// [`Context::bind`]) in the region order `["primal", "jvp"]`, and [`Operation::infer_output_types`] validates the
+/// The two [`Program`](crate::Program)s are supplied as the operation's attached regions (via the region driver passed
+/// to [`Context::bind`]) in the region order `["primal", "jvp"]`, and [`Operation::infer_output_types`] validates the
 /// interface contract between them: the JVP region's inputs are the primal inputs followed by one tangent per primal
 /// input, and its outputs are the primal outputs followed by one tangent per primal output. Keeping the primal program
 /// separate from the JVP program means un-differentiated calls never pay for tangent computation.
@@ -154,7 +152,8 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomJv
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a
 /// [`CustomJvpOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
 /// residualizes unchanged.
 impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomJvpOperation<C::Type> where
@@ -162,117 +161,8 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 {
 }
 
-/// Batches a [`Region`](crate::Region)-bearing _wrapper_ [`Operation`] without inlining away the wrapper itself.
-///
-/// This is the shared outer-boundary algorithm used by the batching rules for operations like
-/// [`CustomJvpOperation`](crate::CustomJvpOperation), [`CustomVjpOperation`](crate::CustomVjpOperation), and
-/// [`RematerializeOperation`](crate::RematerializeOperation), that attach semantic meaning to a set of region
-/// programs: a [`CustomJvpOperation`](crate::CustomJvpOperation) or a [`CustomVjpOperation`](crate::CustomVjpOperation)
-/// wrapper determines which derivative rule later transforms must use, while a rematerialization wrapper preserves the
-/// recomputation boundary. Inlining only the primal region during batching would erase that meaning. Instead, this
-/// function binds the supplied wrapper operation around either the original regions or structurally batched
-/// replacements. On the mapped-input path, the custom-JVP case can be summarized as:
-///
-/// ```text
-/// xᵢ@0       = match_axis(xᵢ, 0)
-/// batch₀(f)  = structurally batch every input and output of f at axis 0
-///
-/// custom_jvp(primal, jvp)(x₁, …, xₘ) -- batch --> custom_jvp(batch₀(primal), batch₀(jvp))(x₁@0, …, xₘ@0)
-/// ```
-///
-/// Here, each `xᵢ` is an already-packed [`ArrayBatch`], not an individual logical array. `xᵢ@0` denotes the result of
-/// [`ArrayBatchingPolicy::match_axis`]: an existing mapped axis is moved to position `0`, while a replicated input is
-/// broadcast across the mapped extent with its new mapped axis at position `0`. `batch₀(f)` denotes structural program
-/// batching with every region argument declared mapped at axis `0` and every result aligned to axis `0`. The outer
-/// operands and attached regions therefore agree on one physical calling convention.
-///
-/// The function has two paths:
-///
-///   - If every input is replicated, it binds the operation with the [`BatchingDriver`]'s unchanged regions and
-///     original packed values, and marks every output as replicated.
-///   - If any input is mapped, it aligns every input to packed axis `0` through [`ArrayBatchingPolicy::match_axis`]
-///     (moving existing mapped axes and broadcasting replicated inputs), batches every attached region using the same
-///     axis-`0` convention, binds the operation with those transformed regions, and marks every output as mapped at
-///     axis `0`.
-///
-/// Binding always occurs through [`BatchingContext::parent`]. An eager parent therefore interprets the rewrapped
-/// operation immediately, while a staging parent records one wrapper operation with its attached regions in the
-/// enclosing trace.
-///
-/// # Parameters
-///
-///   - `context`: Active array [`BatchingContext`] that supplies the mapped extent and owns axis alignment.
-///   - `driver`: [`BatchingDriver`] that provides and structurally transforms the wrapper's attached regions.
-///   - `operation`: Wrapper [`Operation`] to bind around the original or structurally batched regions.
-///   - `inputs`: Packed input [`ArrayBatch`]es of the wrapper operation.
-pub(crate) fn batch_wrapped_operation<
-    C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>,
-    P: ArrayBatchingPolicy<C>,
-    D: BatchingDriver<C, ArrayBatching<P>>,
->(
-    context: &BatchingContext<C, ArrayBatching<P>>,
-    driver: &D,
-    operation: C::Operation,
-    inputs: &[ArrayBatch<<C as Domain>::Value>],
-) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-    // A replicated wrapper needs no structural rewrite: preserve its attached regions exactly and pass each packed
-    // value through unchanged. Its outputs remain replicated at this transform level.
-    let (operation_regions, parent_inputs, output_batch_axis) =
-        if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
-            (
-                driver.regions().map(|region| region.to_program()).collect(),
-                inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
-                BatchAxis::replicated(),
-            )
-        } else {
-            // Give the replacement wrapper one uniform physical calling convention. Existing mapped axes move to
-            // position 0, while replicated operands are broadcast across the context's mapped extent at position 0.
-            let aligned_inputs = inputs
-                .iter()
-                .map(|input| P::match_axis(context, input, Axis::from(0)))
-                .collect::<Result<Vec<_>, _>>()?;
-
-            // Apply the same calling convention to every attached region. All region arguments enter mapped at axis
-            // 0, and `AlignAllTo(0)` broadcasts naturally replicated results or moves differently positioned mapped
-            // axes so every rewritten region has the signature expected by the replacement wrapper.
-            let operation_regions = driver
-                .regions()
-                .map(|region| {
-                    let input_batch_axes = vec![BatchAxis::new(0); region.input_types().len()];
-                    let (program, _) = driver
-                        .batch_program(
-                            context,
-                            region,
-                            input_batch_axes.as_slice(),
-                            ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
-                        )?
-                        .into_parts();
-                    Ok::<_, BatchingError>(program)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            (
-                operation_regions,
-                aligned_inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
-                BatchAxis::new(0),
-            )
-        };
-
-    // Keep the semantic wrapper intact under both eager and tracing parents: eager contexts interpret this bind,
-    // while tracing contexts stage the wrapper operation together with the selected region programs.
-    let outputs = context.parent().bind(operation, operation_regions, &parent_inputs)?;
-
-    // Restore the transform-level carrier around each parent result using the convention selected above.
-    outputs
-        .into_iter()
-        .map(|tracer| {
-            let packed_type = tracer.r#type().into_owned();
-            ArrayBatch::new(packed_type, tracer, output_batch_axis)
-        })
-        .collect()
-}
-
 /// Batching rule for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
-/// derivative survives `batch`; see [`batch_wrapped_operation`].
+/// derivative survives `batch`; see `BatchingContext::batch_wrapped_operation`.
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for CustomJvpOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
@@ -288,7 +178,7 @@ where
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        batch_wrapped_operation(context, driver, O::from(*self), inputs)
+        context.batch_wrapped_operation(driver, O::from(*self), inputs)
     }
 }
 
@@ -296,7 +186,8 @@ where
 /// active context, staging its operations in the shared builder.
 ///
 /// The JVP program is already JVP-shaped over the primal operation family — it maps `(inputs..., input_tangents...)`
-/// to `(outputs..., output_tangents...)` — so the rule simply replays it through [`Program::interpret_in_context`]
+/// to `(outputs..., output_tangents...)` — so the rule simply replays it through
+/// [`Program::interpret_in_context`](crate::Program::interpret_in_context)
 /// over the dual inputs: the primal tracers followed by the tangent tracers feed the JVP program, and its outputs
 /// split into the primal outputs and the staged output tangents. Because the replayed program is straight-line
 /// primal-enum operations referencing those tracers directly, it introduces no symbolic capture and the enclosing
@@ -457,8 +348,8 @@ pub const CUSTOM_VJP_OPERATION_NAME: &str = "custom_vjp";
 /// Higher-order [`Operation`] pairing a primal program with user-supplied forward/backward (VJP) programs — the direct
 /// analogue of JAX's [`custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html).
 ///
-/// The three [`Program`]s are supplied as the operation's attached regions (via the region driver passed to
-/// [`Context::bind`]) in the region order `["primal", "forward", "backward"]`, and
+/// The three [`Program`](crate::Program)s are supplied as the operation's attached regions (via the region driver
+/// passed to [`Context::bind`]) in the region order `["primal", "forward", "backward"]`, and
 /// [`Operation::infer_output_types`] validates the interface contract between them: the forward region consumes the
 /// primal inputs and produces the primal outputs followed by arbitrarily many residual values, and the backward region
 /// consumes those residuals followed by one cotangent per primal output and produces one cotangent per primal input.
@@ -634,7 +525,8 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomVj
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a
 /// [`CustomVjpOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
 /// residualizes unchanged.
 impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomVjpOperation<C::Type> where
@@ -643,7 +535,7 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 }
 
 /// Batching rule for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward programs so
-/// the custom derivative survives `batch`; see [`batch_wrapped_operation`].
+/// the custom derivative survives `batch`; see `BatchingContext::batch_wrapped_operation`.
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for CustomVjpOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
@@ -659,7 +551,7 @@ where
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        batch_wrapped_operation(context, driver, O::from(*self), inputs)
+        context.batch_wrapped_operation(driver, O::from(*self), inputs)
     }
 }
 
@@ -669,7 +561,8 @@ where
 /// Unlike [`CustomJvpOperation`], a `custom_vjp` function has no forward tangent program, so the forward cannot
 /// compute the output tangents straight-line. Instead it reproduces — under the capture-free direct-transpose path —
 /// the same structure the capture-based reverse rule builds: the forward program (already an ordinary primal-enum
-/// program mapping `inputs -> (outputs..., residuals...)`) is replayed through [`Program::interpret_in_context`] over
+/// program mapping `inputs -> (outputs..., residuals...)`) is replayed through
+/// [`Program::interpret_in_context`](crate::Program::interpret_in_context) over
 /// the dual primals, recovering the primal outputs and the residuals; then one [`LinearCallOperation`] is staged over
 /// `[residuals..., input_tangents...]` with the residuals as ordinary *operands* (not capture factors). That carrier
 /// is opaque: it stands for the unknown tangent map and rejects interpretation, so a forward-mode use through it fails

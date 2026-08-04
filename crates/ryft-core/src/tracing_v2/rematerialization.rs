@@ -9,7 +9,7 @@
 //! # Derivation Pipeline
 //!
 //! Each [`Rematerialize::call`] traces the wrapped body, linearizes it (see
-//! [`Program::linearize`](crate::Program::linearize) — the linearization's primal sub-program computes the body
+//! [`Program::linearize`](Program::linearize) — the linearization's primal sub-program computes the body
 //! outputs followed by every demanded residual), and then derives the three programs of one staged
 //! [`RematerializeOperation`] as pure graph rewrites of the linearization's sub-programs:
 //!
@@ -72,7 +72,6 @@ use crate::programs::regions::{Region, RegionId, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueId};
 use crate::tracing::{DomainTracer, Trace, TracingContext};
-use crate::tracing_v2::custom_derivatives::batch_wrapped_operation;
 use crate::types::{ArrayType, Memory};
 
 /// Higher-order operation used by checkpointing/rematerialization.
@@ -357,7 +356,7 @@ crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: T
 
 /// Batching rule for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
 /// programs so the rematerialization boundary survives `batch` under eager and staging parents alike; see
-/// [`batch_wrapped_operation`](crate::tracing_v2::custom_derivatives::batch_wrapped_operation).
+/// `BatchingContext::batch_wrapped_operation`.
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for RematerializeOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
@@ -367,13 +366,14 @@ where
         + From<LegacyBroadcastOperation>
         + From<RematerializeOperation<ArrayType>>,
 {
+    #[inline]
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
         context: &BatchingContext<C, ArrayBatching<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        batch_wrapped_operation(context, driver, O::from(*self), inputs)
+        context.batch_wrapped_operation(driver, O::from(*self), inputs)
     }
 }
 
