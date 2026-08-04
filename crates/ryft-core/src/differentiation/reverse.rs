@@ -17,6 +17,7 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId, MaybeZero};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::effects::Effect;
+use crate::programs::identities::TypeIdentityPosition;
 use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::programs::Program;
 use crate::programs::regions::{
@@ -429,35 +430,6 @@ pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operati
     ///     is then [`PartialValue::Unknown`].
     ///   - `outputs`: Symbolic cotangents for the instruction's outputs, in operation-output order.
     fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>;
-}
-
-/// Transposition rule for a member [`Operation`] whose instruction has a mixed signature in a parent operation
-/// universe. If this operation has native type `T` while the enclosing operation family uses type `U`, an ordinary
-/// [`TransposableOperation`] implementation can describe only the homogeneous `T -> T` contract. This trait instead
-/// receives the parent [`TracingContext`] and its `U`-typed inputs and outputs, allowing the rule to account for
-/// additional operands or results belonging to other members of `U`.
-///
-/// Shape-changing collectives are the motivating example. Their native array operation consumes one array,
-/// whereas their array-or-dimension variant consumes that array followed by first-class output extents. The member
-/// transposition rule delegates the array contribution through [`transpose_projected_operation`] and returns structural
-/// zero cotangents for the extent operands. Operation-family dispatchers should use this trait only for member payloads
-/// whose parent signature differs from their native [`Operation::Type`].
-pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation {
-    /// Applies this member operation's transpose rule in its enclosing parent operation universe.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active parent [`TracingContext`] in which the rule stages operations.
-    ///   - `driver`: Instruction-scoped [`TranspositionDriver`] exposing any attached regions.
-    ///   - `inputs`: Parent-universe primal knowledge in the mixed instruction's operand order.
-    ///   - `outputs`: Parent-universe cotangents for the mixed instruction's results.
-    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
         driver: &D,
@@ -1828,6 +1800,107 @@ where
         .collect()
 }
 
+/// Applies a member operation's transpose rule to an instruction whose parent boundary is _mixed_, meaning that the
+/// instruction consumes its `T`-typed member operands together with operands belonging to other members of the parent
+/// type universe (e.g., the first-class dimensions that supply a dynamic result geometry), in any arrangement. Use this
+/// function from a composite operation dispatcher for a [`Region`](crate::Region)-free payload that keeps its native
+/// member operation type while its instruction crosses member kinds.
+///
+/// Each operand is classified individually rather than by position. An operand whose type projects into `T` is a _data_
+/// operand and every other operand is a parent-universe geometry operand. The data operands, in operand order, are
+/// delegated to the payload's ordinary homogeneous [`TransposableOperation`] rule through
+/// [`transpose_projected_operation`], and the returned cotangents are placed back at the positions those operands
+/// occupied. Every geometry operand receives a structural [`MaybeZero::Zero`] cotangent because parent-universe
+/// geometry operands only select the result shape and carry no differential contribution. This classification makes the
+/// helper independent of how the two operand kinds are arranged, so it handles interleaved signatures exactly like the
+/// data-operands-first arrangement every current payload uses. A payload with no data operands at all (i.e., a dynamic
+/// constructor whose operands are all extents) is a constant linear map, so no member rule runs.
+///
+/// Delegating reconstructs the member instruction from type metadata alone, so a mixed instruction whose operands carry
+/// runtime (i.e., [`Reference`](TypeIdentityPosition::Reference)-position) identities is rejected as recovering
+/// that geometry requires linearization, which retains it as explicit residuals.
+///
+/// # Parameters
+///
+///   - `context`: Active composite [`TracingContext`] the delegated member rule is spliced into.
+///   - `operation`: Region-free linear member operation whose instruction has a mixed parent boundary. Its homogeneous
+///     rule sees exactly the data operands, in the order they appear in the mixed instruction.
+///   - `inputs`: Per-operand primal knowledge in the mixed instruction's operand order.
+///   - `outputs`: Composite output cotangents, represented as live traced values or structural zeros.
+pub fn transpose_mixed_operation<
+    T: DifferentiableType,
+    P: Operation<Type = T>,
+    V: Value<Type: DifferentiableType + From<T>> + ValueProjection<T, Projected: Value<Type = T>>,
+    O: Operation<Type = V::Type> + OperationProjection<T>,
+>(
+    context: &mut TracingContext<V, O>,
+    operation: &P,
+    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>
+where
+    <O as OperationProjection<T>>::Projected:
+        From<P> + TransposableOperation<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>,
+    for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
+{
+    // Classify each operand by whether its type projects into the member universe. Data operands keep their operand
+    // order so the delegated member rule sees the same boundary it would see in a homogeneous instruction.
+    let is_data_operand =
+        inputs.iter().map(|input| <&T>::try_from(input.r#type().as_ref()).is_ok()).collect::<Vec<_>>();
+    let data_inputs = inputs
+        .iter()
+        .zip(is_data_operand.iter())
+        .filter(|(_, is_data_operand)| **is_data_operand)
+        .map(|(input, _)| input.clone())
+        .collect::<Vec<_>>();
+
+    // A mixed instruction with no member-typed operands stages a value that does not depend on any of them, so every
+    // operand receives a structural zero and the member rule is never consulted.
+    if data_inputs.is_empty() {
+        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
+    }
+
+    // The delegated member rule sees only the member-typed prefix, so it must be able to derive every cotangent shape
+    // from that prefix alone. A runtime identity anywhere in the mixed signature means the geometry lives in the
+    // parent-universe operands instead, and only linearization can retain it.
+    if inputs
+        .iter()
+        .any(|input| input.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference))
+    {
+        return Err(ProgramError::UnsupportedOperation {
+            // TODO(eaplatanios): This error message seems specific to "extents". Shouldn't it be more generic?
+            message: format!(
+                "direct '{}' transposition with dynamic extents requires linearization so that the primal geometry \
+                 can be retained as residuals",
+                operation.name(),
+            ),
+        }
+        .into());
+    }
+
+    // Delegate the data operands and place each returned cotangent back at the operand position it belongs to,
+    // giving every geometry operand a structural zero.
+    let member_operation = <O as OperationProjection<T>>::Projected::from(operation.clone());
+    let mut data_cotangents =
+        transpose_projected_operation(context, &member_operation, data_inputs.as_slice(), outputs)?.into_iter();
+    inputs
+        .iter()
+        .zip(is_data_operand)
+        .map(|(input, is_data_operand)| {
+            if is_data_operand {
+                data_cotangents.next().ok_or_else(|| {
+                    ProgramError::MalformedProgram(
+                        "mixed transposition adapter omitted a data-operand cotangent".to_string(),
+                    )
+                    .into()
+                })
+            } else {
+                Ok(MaybeZero::Zero(input.r#type().cotangent()))
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -2001,14 +2074,19 @@ mod tests {
         }
     }
 
+    // This mirrors the borrowed payload projection that `#[derive(Operation)]` generates,
+    // including its canonical wrong-payload diagnostic.
     impl<'o> TryFrom<&'o TestLinearOperation> for &'o ZeroOperation<DataType> {
-        type Error = ();
+        type Error = TypeError;
 
         #[inline]
-        fn try_from(value: &'o TestLinearOperation) -> Result<Self, ()> {
+        fn try_from(value: &'o TestLinearOperation) -> Result<Self, TypeError> {
             match value {
                 TestLinearOperation::Zero(zero) => Ok(zero),
-                _ => Err(()),
+                _ => Err(TypeError::invalid(format!(
+                    "cannot project operation '{}' into a 'ZeroOperation<DataType>' payload",
+                    value.name(),
+                ))),
             }
         }
     }
@@ -3075,5 +3153,164 @@ mod tests {
             cotangents.as_slice(),
             [MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>))],
         ));
+    }
+
+    #[test]
+    fn test_transpose_mixed_operation() {
+        // TODO(eaplatanios): Does this test really need to define new nested types? Can it reuse existing ones that
+        //  we have for other tests.
+        /// Test-only linear member operation consuming two member-typed data operands. No production mixed payload
+        /// interleaves its data and geometry operands, so this fixture is what pins that mixed transposition classifies
+        /// operands one by one instead of splitting the operand list at its first geometry operand.
+        #[derive(Clone, Debug)]
+        struct InterleavedMemberOperation;
+
+        impl Operation for InterleavedMemberOperation {
+            type Type = ProjectedMemberType<2>;
+
+            fn name(&self) -> &'static str {
+                "interleaved_member"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ProjectedMemberType<2>],
+                _region_interfaces: &[RegionInterface<ProjectedMemberType<2>>],
+            ) -> Result<Vec<ProjectedMemberType<2>>, TypeError> {
+                check_count!("input", input_types, 2, TypeError);
+                Ok(vec![ProjectedMemberType])
+            }
+        }
+
+        impl<V: Value<Type = ProjectedMemberType<2>>, O: Operation<Type = ProjectedMemberType<2>>>
+            TransposableOperation<V, O> for InterleavedMemberOperation
+        {
+            fn transpose<D: TranspositionDriver<V, O>>(
+                &self,
+                _context: &mut TracingContext<V, O>,
+                _driver: &D,
+                inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+                outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+            ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+                check_count!("input", inputs, 2, ProgramError);
+                check_count!("output", outputs, 1, ProgramError);
+                Ok(inputs
+                    .iter()
+                    .map(|input| match input {
+                        PartialValue::Unknown(_) => outputs[0].clone(),
+                        PartialValue::Known(_) => MaybeZero::Zero(input.r#type().cotangent()),
+                    })
+                    .collect())
+            }
+        }
+
+        /// Composite carrier whose canonical third-member projection is [`InterleavedMemberOperation`].
+        #[derive(Clone, Debug)]
+        struct InterleavedProgramOperation(InterleavedMemberOperation);
+
+        impl Operation for InterleavedProgramOperation {
+            type Type = ProjectedProgramType;
+
+            fn name(&self) -> &'static str {
+                self.0.name()
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[ProjectedProgramType],
+                _region_interfaces: &[RegionInterface<ProjectedProgramType>],
+            ) -> Result<Vec<ProjectedProgramType>, TypeError> {
+                Ok(vec![ProjectedProgramType::Third(ProjectedMemberType)])
+            }
+        }
+
+        impl From<InterleavedMemberOperation> for InterleavedProgramOperation {
+            fn from(operation: InterleavedMemberOperation) -> Self {
+                Self(operation)
+            }
+        }
+
+        impl OperationProjection<ProjectedMemberType<2>> for InterleavedProgramOperation {
+            type Projected = InterleavedMemberOperation;
+        }
+
+        type Context = TracingContext<ProjectedProgramValue, InterleavedProgramOperation>;
+
+        // Data operands at positions 0 and 2 are delegated to the member rule in that order, and the geometry operands
+        // between and after them receive structural zeros in their own member universe.
+        let data_type = ProjectedProgramType::Third(ProjectedMemberType::<2>);
+        let geometry_type = ProjectedProgramType::First(ProjectedMemberType::<0>);
+        let mut context = Context::new();
+        let output_cotangent = context.input(data_type.clone());
+        let cotangents = transpose_mixed_operation(
+            &mut context,
+            &InterleavedMemberOperation,
+            &[
+                PartialValue::Unknown(data_type.clone()),
+                PartialValue::Unknown(geometry_type.clone()),
+                PartialValue::Unknown(data_type.clone()),
+                PartialValue::Unknown(geometry_type.clone()),
+            ],
+            &[MaybeZero::Value(output_cotangent.clone())],
+        )
+        .unwrap();
+        let [
+            MaybeZero::Value(first_cotangent),
+            MaybeZero::Zero(second_cotangent_type),
+            MaybeZero::Value(third_cotangent),
+            MaybeZero::Zero(fourth_cotangent_type),
+        ] = cotangents.as_slice()
+        else {
+            panic!("mixed transposition must classify each operand individually: {cotangents:?}");
+        };
+        assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
+        assert_eq!(third_cotangent.atom_id(), output_cotangent.atom_id());
+        assert_eq!(second_cotangent_type, &geometry_type);
+        assert_eq!(fourth_cotangent_type, &geometry_type);
+
+        // Interleaved known data operands stay known operands of the member rule, so their structural zeros are the
+        // member rule's own and remain at their operand positions.
+        let known_data = context.input(data_type.clone());
+        let cotangents = transpose_mixed_operation(
+            &mut context,
+            &InterleavedMemberOperation,
+            &[
+                PartialValue::Known(known_data),
+                PartialValue::Unknown(geometry_type.clone()),
+                PartialValue::Unknown(data_type.clone()),
+            ],
+            &[MaybeZero::Value(output_cotangent.clone())],
+        )
+        .unwrap();
+        assert!(matches!(
+            cotangents.as_slice(),
+            [
+                MaybeZero::Zero(ProjectedProgramType::Third(_)),
+                MaybeZero::Zero(ProjectedProgramType::First(_)),
+                MaybeZero::Value(_),
+            ],
+        ));
+
+        // The data-operands-first arrangement every current payload uses degenerates to the same result, so the
+        // classification is a strict generalization of splitting the operand list at its first geometry operand.
+        let cotangents = transpose_mixed_operation(
+            &mut context,
+            &InterleavedMemberOperation,
+            &[
+                PartialValue::Unknown(data_type.clone()),
+                PartialValue::Unknown(data_type),
+                PartialValue::Unknown(geometry_type.clone()),
+            ],
+            &[MaybeZero::Value(output_cotangent.clone())],
+        )
+        .unwrap();
+        let [MaybeZero::Value(first_cotangent), MaybeZero::Value(second_cotangent), MaybeZero::Zero(geometry)] =
+            cotangents.as_slice()
+        else {
+            panic!("prefix-arranged mixed transposition must keep its previous result: {cotangents:?}");
+        };
+        assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
+        assert_eq!(second_cotangent.atom_id(), output_cotangent.atom_id());
+        assert_eq!(geometry, &geometry_type);
     }
 }
