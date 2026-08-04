@@ -130,6 +130,7 @@ where
     C::Operation: From<ArrayProgramOperation<A>>
         + From<ConditionOperation<C::Constant>>
         + From<DimensionFromScalarOperation>
+        + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>
         + From<LinearCallOperation<ArrayProgramType>>
         + From<ScanOperation<C::Constant>>
@@ -1615,6 +1616,12 @@ where
             };
             return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
         }
+        match self {
+            Self::DimensionSize(operation) => return operation.jvp(context, driver, inputs),
+            Self::DimensionFromScalar(operation) => return operation.jvp(context, driver, inputs),
+            Self::DimensionToScalar(operation) => return operation.jvp(context, driver, inputs),
+            _ => {}
+        }
         let dynamic_constant_type = match self {
             Self::Zero(operation) => Some(operation.r#type()),
             Self::DynamicOne(operation) => Some(operation.r#type()),
@@ -1626,16 +1633,20 @@ where
             // still need those runtime extents for materialization. Stage dynamic zero while the operands remain
             // available instead of leaving a type-only structural zero for the generic output boundary.
             let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+            let mut primals = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
+            check_count!("output", primals, 1, ProgramError);
+            let primal = primals.remove(0);
             let tangent_operation = ArrayProgramOperation::<A>::from(ZeroOperation::new(output_type.tangent()));
-            let tangent = context.bind(tangent_operation, Vec::new(), primal_inputs.as_slice())?.remove(0);
+            let mut tangents = context.bind(tangent_operation, Vec::new(), primal_inputs.as_slice())?;
+            check_count!("output", tangents, 1, ProgramError);
+            let tangent = tangents.remove(0);
             return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?]);
         }
 
         let Self::Array(operation) = self else {
-            // Dimension-only and mixed shape-observation operations carry no differential dependence. Replaying the
-            // primal through the composite context preserves their explicit SSA dependencies while structural zeros
-            // prevent first-class dimensions from entering the tangent program.
+            // Replicated structural members and the remaining composite-native discrete operations carry no
+            // differential dependence. Replaying the primal preserves their explicit SSA dependencies while
+            // structural zeros prevent first-class dimensions from entering the tangent program.
             return Ok(context
                 .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>())?
                 .into_iter()
@@ -1749,11 +1760,17 @@ where
                 );
             return scan.transpose(context, driver, inputs, outputs);
         }
+        match self {
+            Self::DimensionSize(operation) => return operation.transpose(context, driver, inputs, outputs),
+            Self::DimensionFromScalar(operation) => return operation.transpose(context, driver, inputs, outputs),
+            Self::DimensionToScalar(operation) => return operation.transpose(context, driver, inputs, outputs),
+            _ => {}
+        }
         if matches!(self, Self::Zero(_) | Self::DynamicOne(_) | Self::DynamicIota(_)) {
             check_count!("output", outputs, 1, ProgramError);
-            // A shaped constructor depends on its extent operands only as non-differentiable shape inputs. Its
-            // array value is constant with respect to those operands, so every extent receives a structural-zero
-            // cotangent regardless of the array output cotangent.
+            // A shaped constructor depends on its extent operands only as non-differentiable shape inputs. Its array
+            // value is constant with respect to those operands, so every extent receives a structural-zero cotangent
+            // regardless of the array output cotangent.
             return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
         }
         if matches!(self, Self::AllGather(_) | Self::PSumScatter(_) | Self::AllToAll(_)) {

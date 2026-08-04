@@ -2149,10 +2149,10 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
   - [x] P8b1a: move linear-call batching beside its payload, introduce the narrow `LinearCallBatchingPolicy` extension
         point for universe-specific cotangent collapse, and replace the homogeneous/composite operation adapters with
         one generic `BatchableOperation` implementation while leaving direct delegation in the outer dispatcher.
-  - [ ] Continue P8b1 with the condition/while/scan and trivial structural rules.
+  - [x] Continue P8b1 with the condition/while/scan and trivial structural rules.
     - [x] Relocate composite condition and while batching to their payload owners, leaving direct outer delegation.
     - [x] Relocate composite scan batching and close the P8b1b control-flow gate.
-    - [ ] Relocate the P8b1c trivial structural rules.
+    - [x] Relocate the P8b1c trivial structural rules.
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
 - [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.
 - [ ] Make `#[derive(Operation)]` with `#[ryft(dispatch(batching, differentiation, transposition))]` the mechanical

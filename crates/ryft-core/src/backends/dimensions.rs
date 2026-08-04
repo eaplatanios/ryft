@@ -3,7 +3,9 @@ use std::fmt::Display;
 
 use ryft_macros::{Operation, Parameter};
 
-use crate::contexts::EagerContext;
+use crate::backends::array_programs::batching::ReplicatedDimensionBatchingPolicy;
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::contexts::{Context, EagerContext, ProjectedContext};
 use crate::operations::constants::ConstantOperation;
 use crate::operations::dimensions::{
     DimensionAddOperation, DimensionDivFloorOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
@@ -15,11 +17,13 @@ use crate::operations::math::{Add, Div, Mul, Rem, Sub};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Concretizable, Value};
+use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::tracing::TracingContext;
-use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
+use crate::types::{
+    ArrayProgramType, DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
+};
 
 /// Closed [`Operation`] type for staged [`DimensionValue`] [`Program`](crate::Program)s.
 #[derive(Clone, Debug, Operation)]
@@ -35,6 +39,27 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Min(DimensionMinOperation),
     Max(DimensionMaxOperation),
     Requirement(DimensionRequirementOperation),
+}
+
+/// Composite batching executes homogeneous dimension operations only over replicated projected values. A mapped
+/// dimension is rejected by [`ReplicatedDimensionBatchingPolicy`] before this rule is called because representing one
+/// extent per batch item would require a ragged value model.
+impl<C: Context<Type = ArrayProgramType>>
+    BatchableOperation<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>
+    for DimensionOperation<DimensionValue>
+where
+    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Operation: OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+{
+    fn batch<D: BatchingDriver<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>,
+        _driver: &D,
+        inputs: &[<C::Value as ValueProjection<DimensionType>>::Projected],
+    ) -> Result<Vec<<C::Value as ValueProjection<DimensionType>>::Projected>, BatchingError> {
+        context.parent().bind(self.clone(), Vec::new(), inputs).map_err(Into::into)
+    }
 }
 
 /// [`TracingContext`] over [`DimensionValue`]s and [`DimensionOperation`]s.

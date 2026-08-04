@@ -35,7 +35,8 @@ use crate::operations::constants::{ConstantOperation, OneOperation, Zero, ZeroOp
 use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
 use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::dimensions::{
-    DimensionRequirement, DimensionRequirementOperation, DimensionSizeOperation, DimensionToScalarOperation,
+    DimensionFromScalarOperation, DimensionRequirement, DimensionRequirementOperation, DimensionSizeOperation,
+    DimensionToScalarOperation,
 };
 use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
 use crate::operations::manipulation::{
@@ -503,24 +504,6 @@ where
     C::Operation: OperationProjection<DimensionType>,
 {
     type Projected = ReplicatedDimensionBatchingPolicy;
-}
-
-impl<C: Context<Type = ArrayProgramType>>
-    BatchableOperation<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>
-    for DimensionOperation<DimensionValue>
-where
-    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Operation: OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-{
-    fn batch<D: BatchingDriver<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>>(
-        &self,
-        context: &BatchingContext<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>,
-        _driver: &D,
-        inputs: &[<C::Value as ValueProjection<DimensionType>>::Projected],
-    ) -> Result<Vec<<C::Value as ValueProjection<DimensionType>>::Projected>, BatchingError> {
-        context.parent().bind(self.clone(), Vec::new(), inputs).map_err(Into::into)
-    }
 }
 
 impl<C, T> ValueProjection<T> for BatchingTracer<C, ArrayProgramBatching>
@@ -1826,7 +1809,9 @@ where
         + From<ConcatenateOperation<ArrayType>>
         + From<ConcatenateOperation<ArrayProgramType>>
         + From<ConditionOperation<ArrayProgramValue<A>>>
+        + From<DimensionFromScalarOperation>
         + From<DimensionSizeOperation>
+        + From<DimensionToScalarOperation>
         + From<OneOperation<ArrayType>>
         + From<PadOperation<ArrayType>>
         + From<RngBitGeneratorOperation<ArrayProgramType>>
@@ -1846,8 +1831,8 @@ where
     ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
         match self {
             Self::Zero(_) | Self::DynamicOne(_) | Self::DynamicIota(_) => {
-                // Output extents are shared shape values. A mapped extent would request a different output shape
-                // for each batch item, which requires a ragged representation that ordinary array batching lacks.
+                // Output extents are shared shape values. A mapped extent would request a different output shape for
+                // each batch item, which requires a ragged representation that ordinary array batching lacks.
                 for extent in inputs {
                     extent.validate_replicated_dimension()?;
                 }
@@ -1856,7 +1841,7 @@ where
                     .bind(
                         self.clone(),
                         Vec::new(),
-                        &inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>(),
+                        &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
                     )?
                     .into_iter()
                     .map(ArrayProgramBatch::replicated)
@@ -1883,57 +1868,9 @@ where
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
-            Self::DimensionFromScalar(operation) => {
-                let [input] = inputs else {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-                };
-                <&ArrayType>::try_from(input.unbatched_type())?;
-                if !input.batch_axis.is_replicated() {
-                    return Err(BatchingError::MappedDimension {
-                        r#type: Box::new(operation.result_type().clone()),
-                        axis: input.batch_axis,
-                    });
-                }
-                Ok(context
-                    .parent()
-                    .bind(self.clone(), Vec::new(), std::slice::from_ref(&input.value))?
-                    .into_iter()
-                    .map(ArrayProgramBatch::replicated)
-                    .collect())
-            }
-            Self::DimensionToScalar(DimensionToScalarOperation) => {
-                let [input] = inputs else {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-                };
-                input.validate_replicated_dimension()?;
-                Ok(context
-                    .parent()
-                    .bind(self.clone(), Vec::new(), std::slice::from_ref(&input.value))?
-                    .into_iter()
-                    .map(ArrayProgramBatch::replicated)
-                    .collect())
-            }
-            Self::DimensionSize(operation) => {
-                let [input] = inputs else {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-                };
-                let input_type = input.value.r#type();
-                let batched_type = <&ArrayType>::try_from(input_type.as_ref())?;
-                let packed_axis = match input.batch_axis.axis() {
-                    Some(batch_axis) => {
-                        let batch_axis = batch_axis.normalize(batched_type.rank())?;
-                        if operation.axis() < batch_axis { operation.axis() } else { operation.axis() + 1 }
-                    }
-                    None => operation.axis(),
-                };
-                let operation = DimensionSizeOperation::new(batched_type, packed_axis)?;
-                Ok(context
-                    .parent()
-                    .bind(ArrayProgramOperation::<A>::from(operation), Vec::new(), std::slice::from_ref(&input.value))?
-                    .into_iter()
-                    .map(ArrayProgramBatch::replicated)
-                    .collect())
-            }
+            Self::DimensionFromScalar(operation) => operation.batch(context, driver, inputs),
+            Self::DimensionToScalar(operation) => operation.batch(context, driver, inputs),
+            Self::DimensionSize(operation) => operation.batch(context, driver, inputs),
             Self::Concatenate(operation) => operation.batch(context, driver, inputs),
             Self::CustomCall(operation) => operation.batch(context, driver, inputs),
             Self::Pad(operation) => operation.batch(context, driver, inputs),

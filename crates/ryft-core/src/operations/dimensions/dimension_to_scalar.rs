@@ -2,6 +2,8 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
@@ -139,6 +141,31 @@ impl<C: Domain<Type = ArrayProgramType, Value: DimensionToScalar<C::Value>>> Int
 impl<C: Context<Type = ArrayProgramType, Operation: From<DimensionToScalarOperation>>> PartiallyEvaluatableOperation<C>
     for DimensionToScalarOperation
 {
+}
+
+/// Batching converts one replicated first-class dimension into one replicated scalar array. Mapped dimension inputs
+/// are rejected by the composite batch carrier before conversion because ordinary array batching has no ragged shape
+/// representation.
+impl<C: Context<Type = ArrayProgramType, Operation: From<DimensionToScalarOperation>>>
+    BatchableOperation<C, ArrayProgramBatching> for DimensionToScalarOperation
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayProgramBatching>,
+        _driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+        };
+        input.validate_replicated_dimension()?;
+        Ok(context
+            .parent()
+            .bind(*self, Vec::new(), std::slice::from_ref(input.value()))?
+            .into_iter()
+            .map(ArrayProgramBatch::replicated)
+            .collect())
+    }
 }
 
 impl_non_differentiable_operation!(DimensionToScalarOperation);

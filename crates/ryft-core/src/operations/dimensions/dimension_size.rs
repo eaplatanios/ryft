@@ -8,9 +8,11 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::axes::Axis;
+use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
@@ -254,6 +256,42 @@ impl<C: Context<Type = ArrayProgramType, Operation: From<DimensionSizeOperation>
     for DimensionSizeOperation
 {
 }
+
+/// Batching reads the same logical array axis after accounting for an inserted packed batch axis. The resulting
+/// first-class dimension is shared shape metadata and therefore remains replicated.
+impl<C: Context<Type = ArrayProgramType, Operation: From<DimensionSizeOperation>>>
+    BatchableOperation<C, ArrayProgramBatching> for DimensionSizeOperation
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayProgramBatching>,
+        _driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+        };
+        let input_type = input.value().r#type();
+        let batched_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let packed_axis = match input.batch_axis().axis() {
+            Some(batch_axis) => {
+                let batch_axis = batch_axis.normalize(batched_type.rank())?;
+                if self.axis() < batch_axis { self.axis() } else { self.axis() + 1 }
+            }
+            None => self.axis(),
+        };
+        let operation = Self::new(batched_type, packed_axis)?;
+        Ok(context
+            .parent()
+            .bind(operation, Vec::new(), std::slice::from_ref(input.value()))?
+            .into_iter()
+            .map(ArrayProgramBatch::replicated)
+            .collect())
+    }
+}
+
+impl_non_differentiable_operation!(DimensionSizeOperation);
+impl_non_transposable_operation!(DimensionSizeOperation);
 
 #[cfg(test)]
 mod tests {

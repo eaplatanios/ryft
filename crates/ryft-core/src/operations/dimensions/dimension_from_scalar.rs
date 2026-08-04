@@ -7,6 +7,8 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
@@ -206,6 +208,36 @@ impl<C: Domain<Type = ArrayProgramType, Value: DimensionFromScalar<C::Value>>> I
 impl<C: Context<Type = ArrayProgramType, Operation: From<DimensionFromScalarOperation>>>
     PartiallyEvaluatableOperation<C> for DimensionFromScalarOperation
 {
+}
+
+/// Batching rejects mapped scalar inputs because converting one scalar per batch item would produce a ragged
+/// collection of first-class dimensions. A replicated scalar is converted once and remains replicated.
+impl<C: Context<Type = ArrayProgramType, Operation: From<DimensionFromScalarOperation>>>
+    BatchableOperation<C, ArrayProgramBatching> for DimensionFromScalarOperation
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayProgramBatching>,
+        _driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+        };
+        <&ArrayType>::try_from(input.unbatched_type())?;
+        if !input.batch_axis().is_replicated() {
+            return Err(BatchingError::MappedDimension {
+                r#type: Box::new(self.result_type().clone()),
+                axis: input.batch_axis(),
+            });
+        }
+        Ok(context
+            .parent()
+            .bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?
+            .into_iter()
+            .map(ArrayProgramBatch::replicated)
+            .collect())
+    }
 }
 
 impl_non_differentiable_operation!(DimensionFromScalarOperation);
