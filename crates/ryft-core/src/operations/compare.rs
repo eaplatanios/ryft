@@ -1,6 +1,8 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -190,8 +192,35 @@ where
 {
 }
 
-crate::impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Broadcastable + ElementType);
-crate::impl_non_transposable_operation!(<T> CompareOperation<T> where T: Broadcastable + ElementType);
+crate::impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Type);
+crate::impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
+
+/// Batching rule for first-class dimension comparison. Dimension operands describe one shared array shape and must
+/// therefore remain replicated; their Boolean array result is replicated ordinary data.
+impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching>
+    for CompareOperation<ArrayProgramType>
+where
+    C::Operation: From<CompareOperation<ArrayProgramType>>,
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayProgramBatching>,
+        _driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let [left, right] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+        };
+        left.validate_replicated_dimension()?;
+        right.validate_replicated_dimension()?;
+        Ok(context
+            .parent()
+            .bind(self.clone(), Vec::new(), &[left.value().clone(), right.value().clone()])?
+            .into_iter()
+            .map(ArrayProgramBatch::replicated)
+            .collect())
+    }
+}
 
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing

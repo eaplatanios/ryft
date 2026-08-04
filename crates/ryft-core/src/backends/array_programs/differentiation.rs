@@ -127,6 +127,7 @@ where
     C::Value: Concretizable<bool> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<ArrayProgramOperation<A>>
         + From<BroadcastOperation>
+        + From<CompareOperation<ArrayProgramType>>
         + From<ConcatenateOperation<ArrayProgramType>>
         + From<ConditionOperation<C::Constant>>
         + From<DimensionFromScalarOperation>
@@ -136,6 +137,7 @@ where
         + From<LinearCallOperation<ArrayProgramType>>
         + From<PadOperation<ArrayProgramType>>
         + From<ReshapeOperation>
+        + From<RngBitGeneratorOperation<ArrayProgramType>>
         + From<ScanOperation<C::Constant>>
         + From<WhileOperation<ArrayProgramType>>
         + From<ZeroOperation<ArrayType>>
@@ -157,14 +159,13 @@ where
             return operation.jvp(context, driver, inputs);
         }
         if let Self::CustomCall(operation) = self {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "custom call '{}' has no differentiation rule; wrap it with `custom_jvp` or `custom_vjp` to \
-                     provide one",
-                    operation.target_name(),
-                ),
-            }
-            .into());
+            return operation.jvp(context, driver, inputs);
+        }
+        if let Self::Compare(operation) = self {
+            return operation.jvp(context, driver, inputs);
+        }
+        if let Self::RngBitGenerator(operation) = self {
+            return operation.jvp(context, driver, inputs);
         }
         if matches!(self, Self::Condition(_)) {
             return ConditionOperation::<C::Constant>::new().jvp(context, driver, inputs);
@@ -469,19 +470,13 @@ where
             return operation.transpose(context, driver, inputs, outputs);
         }
         if let Self::CustomCall(operation) = self {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "custom call '{}' cannot be transposed because foreign kernels are opaque",
-                    operation.target_name(),
-                ),
-            }
-            .into());
+            return operation.transpose(context, driver, inputs, outputs);
         }
-        if matches!(self, Self::RngBitGenerator(_)) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "'rng_bit_generator' cannot be transposed because random bits are discrete".to_string(),
-            }
-            .into());
+        if let Self::Compare(operation) = self {
+            return operation.transpose(context, driver, inputs, outputs);
+        }
+        if let Self::RngBitGenerator(operation) = self {
+            return operation.transpose(context, driver, inputs, outputs);
         }
         if matches!(self, Self::Condition(_)) {
             return ConditionOperation::<V>::new().transpose(context, driver, inputs, outputs);

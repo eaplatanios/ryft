@@ -2,9 +2,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
-use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
@@ -549,11 +547,10 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for CustomCa
 }
 
 impl_differentiable_operation! {
-    CustomCallOperation<ArrayType>,
+    <T> CustomCallOperation<T>,
     jvp<C>
     where
-        C: Context<Type = ArrayType>,
-        C::Operation: From<CustomCallOperation<ArrayType>>,
+        T: Type,
     {
         |operation, _context, _driver, _inputs| {
             // Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error
@@ -574,15 +571,16 @@ impl_differentiable_operation! {
 
 /// Foreign kernels are opaque, so there is no batching rule to derive: batching reports an error, and callers
 /// should invoke a kernel that understands the batch axis instead.
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for CustomCallOperation<ArrayType>
+impl<C: Context, P: BatchingPolicy<C>> BatchableOperation<C, P> for CustomCallOperation<C::Type>
+where
+    CustomCallOperation<C::Type>: Operation<Type = C::Type>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, P>>(
         &self,
-        _context: &BatchingContext<C, ArrayBatching<P>>,
+        _context: &BatchingContext<C, P>,
         _driver: &D,
-        _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        _inputs: &[P::Batch],
+    ) -> Result<Vec<P::Batch>, BatchingError> {
         Err(BatchingError::UnsupportedOperation {
             message: format!(
                 "custom call '{}' has no batching rule; invoke a kernel that understands the batch axis instead",
@@ -641,17 +639,20 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::array_programs::batching::ArrayProgramBatching;
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
+    use crate::backends::dimensions::DimensionValue;
+    use crate::batching::{BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
+    use crate::differentiation::DifferentiationError;
+    use crate::differentiation::reverse::TransposableOperation;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::ShardingDimension;
-    use crate::tracing::{DomainTracer, Trace};
-    use crate::types::dimensions::{DimensionBounds, DimensionVariable};
-    use crate::types::{DataType, Dimension, DimensionType, Shape};
+    use crate::tracing::{DomainTracer, Trace, TracingContext};
+    use crate::types::{DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
 
     use super::*;
 
@@ -862,6 +863,50 @@ mod tests {
         assert!(matches!(
             program.batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural),
             Err(error) if error.to_string().contains("custom call 'ryft.test.add_one' has no batching rule"),
+        ));
+    }
+
+    #[test]
+    fn test_array_program_custom_call_rejects_transforms() {
+        let operation = CustomCallOperation::<ArrayProgramType>::from(CustomCallOperation::new(
+            "ryft.test.add_one",
+            vec![vector_type()],
+        ));
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(vector_type().into());
+        let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.jvp(),
+            Err(error)
+                if error.to_string()
+                    == "custom call 'ryft.test.add_one' has no differentiation rule; wrap it with `custom_jvp` or \
+                        `custom_vjp` to provide one",
+        ));
+
+        let batching_context = BatchingContext::<_, ArrayProgramBatching>::new(
+            EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new(),
+            ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        assert!(matches!(
+            operation.batch(&batching_context, &EmptyRegionDriver, &[]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message
+                    == "custom call 'ryft.test.add_one' has no batching rule; invoke a kernel that understands the \
+                        batch axis instead",
+        ));
+
+        let mut transposition_context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        assert!(matches!(
+            operation.transpose(&mut transposition_context, &EmptyRegionDriver, &[], &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `custom_call` is not transposable",
         ));
     }
 }
