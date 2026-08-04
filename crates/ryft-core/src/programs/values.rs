@@ -210,9 +210,9 @@ impl<V: Value<Type = ArrayType> + Concretizable<bool>> Concretizable<bool> for A
 ///     the member itself (e.g., `&A` and `A` for the array member), so no payload is ever cloned or copied.
 ///   - Values that refer to a program instead of containing data (e.g, a [`Tracer`] naming an [`Atom`](crate::Atom),
 ///     or a [`CaptureReference`] naming a capture-table entry) have no member payload to extract. They project to
-///     [`ProjectedValueRef`] and [`ProjectedValue`] views (or to a retyped copy of themselves, as [`CaptureReference`]
-///     does), which keep the original value and the program identity it carries intact and only narrow the type it
-///     reports.
+///     [`ProjectedValue`] views over the value itself or over a borrow of it (or to a retyped copy of themselves, as
+///     [`CaptureReference`] does for its owned form), which keep the original value and the program identity it
+///     carries intact and only narrow the type it reports.
 pub trait ValueProjection<T: Type>: Value {
     /// Owned representation of this [`Value`]'s `T`-typed member.
     type Projected: Typed<Type = T>;
@@ -227,7 +227,7 @@ pub trait ValueProjection<T: Type>: Value {
     /// Embeds an owned `T`-typed member representation back into this composite [`Value`] type.
     fn from_projected(value: Self::Projected) -> Self;
 
-    /// Returns a read-only view of this [`Value`] as its `T`-typed member, without cloning any payload.
+    /// Returns a read-only view of this [`Value`] as its `T`-typed member, without cloning any member payload.
     /// Returns a [`TypeError`] when this value holds a different member kind.
     fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
     where
@@ -239,12 +239,14 @@ pub trait ValueProjection<T: Type>: Value {
 }
 
 /// A [`Value`] whose reported [`Type`] has been narrowed to one member kind of its composite type, as returned by
-/// [`ValueProjection::into_projected`]. This wrapper exists for values that refer to a program rather than containing
-/// a member payload, such as a [`Tracer`] naming a Single Static Assignment (SSA) [`Atom`](crate::Atom) or a
-/// [`PartialTracer`] carrying known/unknown state. Such a value cannot be split into its member the way an enum of
-/// payloads can, so projecting it keeps the value intact (i.e., preserving the program identity it carries) and pairs
-/// it with the member type it was validated against. [`Typed`] consequently reports that member type rather than the
-/// value's original composite type.
+/// [`ValueProjection::projected`] and [`ValueProjection::into_projected`]. This wrapper exists for values that refer
+/// to a program rather than containing a member payload, such as a [`Tracer`] naming a Single Static Assignment (SSA)
+/// [`Atom`](crate::Atom) or a [`PartialTracer`] carrying known/unknown state. Such a value cannot be split into its
+/// member the way an enum of payloads can, so projecting it keeps the value intact (i.e., preserving the program
+/// identity it carries) and pairs it with the member type it was validated against. [`Typed`] consequently reports
+/// that member type rather than the value's original composite type. The wrapped value is owned for
+/// [`ValueProjection::Projected`] and borrowed (i.e., `ProjectedValue<T, &V>`) for [`ValueProjection::ProjectedRef`],
+/// so one type covers both the owned and the read-only projection.
 ///
 /// The projection alone does not define how [`Operation`](crate::Operation)s on the wrapped value dispatch.
 /// [`ProjectedContext`] provides that behavior through this type's blanket [`Value`] implementation whenever the
@@ -322,55 +324,6 @@ impl<T: Type, C, V: Concretizable<C>> Concretizable<C> for ProjectedValue<T, V> 
     }
 }
 
-/// Borrowed counterpart of [`ProjectedValue`], as returned by [`ValueProjection::projected`]. This view borrows both
-/// the original [`Value`] and the member [`Type`] it was validated against, so read-only consumers can treat a value
-/// as its member kind without cloning either. Like [`ProjectedValue`], it leaves the underlying value intact and
-/// reports the narrowed member type through [`Typed`]. Values whose type is stored directly (e.g., a [`Tracer`]'s
-/// staged type) can hand out this view. Values that compute their type on demand return an owning [`ProjectedValue`]
-/// from [`ValueProjection::projected`] instead, because a borrow cannot outlive the computed type.
-///
-/// This borrowed view deliberately does not implement [`Value`]. Applying an operation must be able to return newly
-/// produced owned values, while a `ProjectedValueRef<'v, T, V>` can only describe data and type metadata borrowed for
-/// `'v`. Use [`ProjectedValue`] when a projected member must flow through a [`Context`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub struct ProjectedValueRef<'v, T: Type, V: ?Sized> {
-    /// Original value, kept intact so the program identity it carries is preserved.
-    value: &'v V,
-
-    /// Member [`Type`] borrowed from the value's validated type metadata.
-    r#type: &'v T,
-}
-
-impl<'v, T: Type, V: ?Sized> ProjectedValueRef<'v, T, V> {
-    /// Constructs a new [`ProjectedValueRef`] after the caller has validated `type` against `value`.
-    #[inline]
-    pub(crate) fn new(value: &'v V, r#type: &'v T) -> Self {
-        Self { value, r#type }
-    }
-
-    /// Borrows the original value.
-    #[inline]
-    pub fn value(&self) -> &'v V {
-        self.value
-    }
-}
-
-impl<T: Type, V: Display + ?Sized> Display for ProjectedValueRef<'_, T, V> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.value.fmt(formatter)
-    }
-}
-
-impl<T: Type, V: ?Sized> Typed for ProjectedValueRef<'_, T, V> {
-    type Type = T;
-
-    #[inline]
-    fn r#type(&self) -> Cow<'_, T> {
-        Cow::Borrowed(self.r#type)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -437,23 +390,22 @@ mod tests {
     }
 
     #[test]
-    fn test_projected_value_and_projected_value_ref() {
+    fn test_projected_value() {
         let r#type = ArrayType::scalar(DataType::F32);
         let value = "value".to_string();
-        let projected = ProjectedValueRef::new(&value, &r#type);
-        assert_eq!(projected.value(), &value);
-        assert_eq!(projected.r#type(), Cow::Borrowed(&r#type));
-        assert_eq!(projected.to_string(), value);
-    }
 
-    #[test]
-    fn test_projected_value_ref() {
-        let r#type = ArrayType::scalar(DataType::F32);
-        let value = "value".to_string();
+        // Owned form, as returned by `ValueProjection::into_projected`.
         let projected = ProjectedValue::new(value.clone(), r#type.clone());
         assert_eq!(projected.value(), &value);
         assert_eq!(projected.r#type(), Cow::Borrowed(&r#type));
         assert_eq!(projected.to_string(), value);
         assert_eq!(projected.into_value(), "value");
+
+        // Borrowed form, as returned by `ValueProjection::projected`.
+        let projected = ProjectedValue::new(&value, r#type.clone());
+        assert_eq!(projected.value(), &&value);
+        assert_eq!(projected.r#type(), Cow::Borrowed(&r#type));
+        assert_eq!(projected.to_string(), value);
+        assert_eq!(projected.into_value(), &value);
     }
 }
