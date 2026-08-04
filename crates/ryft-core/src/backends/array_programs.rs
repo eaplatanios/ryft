@@ -44,8 +44,8 @@ use crate::operations::manipulation::ConvertElementTypeOperation;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation,
-    DynamicShapeSliceOperation, DynamicUpdateSliceOperation, LegacyBroadcastOperation, LegacyReshapeOperation, Pad,
-    PadOperation, Reshape, ReshapeOperation, ReshapeParameters, Slice, Transpose, TransposeOperation, UpdateSlice,
+    DynamicShapeSliceOperation, DynamicUpdateSliceOperation, LegacyBroadcastOperation, Pad, PadOperation, Reshape,
+    ReshapeOperation, ReshapeParameters, Slice, Transpose, UpdateSlice,
 };
 use crate::operations::math::{AddOperation, Reduce, ReduceOperation, ReductionKind};
 use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
@@ -146,6 +146,11 @@ impl ExactShape {
                 ExactShapeDimension::Residual(index) => Some(residuals[*index].clone()),
             })
             .collect()
+    }
+
+    /// Returns this exact shape reordered so output axis `i` is copied from source axis `axes[i]`.
+    pub(crate) fn reordered(&self, axes: &[usize]) -> Self {
+        Self(axes.iter().map(|axis| self.0[*axis]).collect())
     }
 }
 

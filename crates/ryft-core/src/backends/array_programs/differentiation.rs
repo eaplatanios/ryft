@@ -136,6 +136,7 @@ where
         + From<DimensionToScalarOperation>
         + From<DynamicShapeSliceOperation>
         + From<LinearCallOperation<ArrayProgramType>>
+        + From<ReshapeOperation>
         + From<ScanOperation<C::Constant>>
         + From<WhileOperation<ArrayProgramType>>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
@@ -475,126 +476,7 @@ where
             return operation.jvp(context, driver, inputs);
         }
         if let Self::Reshape(operation) = self {
-            let Some((array, output_extents)) = inputs.split_first() else {
-                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-            };
-            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
-            let tangent = match array.tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-                MaybeZero::Value(array_tangent) => {
-                    let input_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.clone();
-                    let input_cotangent_type = input_type.cotangent();
-                    let permuted_input_cotangent_type = match operation.dimensions() {
-                        Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
-                        None => input_cotangent_type.clone(),
-                    };
-                    if permuted_input_cotangent_type
-                        .shape()
-                        .dimensions()
-                        .iter()
-                        .all(|dimension| matches!(dimension, Dimension::Static(_)))
-                    {
-                        let mut tangent_inputs = Vec::with_capacity(inputs.len());
-                        tangent_inputs.push(array_tangent.clone());
-                        tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
-                        MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
-                    } else {
-                        // Record each distinct dynamic input extent while the source array is still available. The
-                        // values become ordinary trailing residual operands of the linear call below; repeated type
-                        // identities reuse the same SSA value in first-use order.
-                        let source_axes = operation.dimensions().map_or_else(
-                            || (0..input_type.rank()).collect::<Vec<_>>(),
-                            |dimensions| dimensions.to_vec(),
-                        );
-                        let mut residuals = LinearResiduals::new();
-                        let output_extents =
-                            residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-                        let input_shape = residuals.retain_shape(context, array.primal())?;
-                        let permuted_input_shape =
-                            ExactShape(source_axes.iter().map(|axis| input_shape.0[*axis]).collect());
-
-                        // The forward region is the ordinary tangent reshape over the canonical residuals-first
-                        // boundary `[residuals..., tangent]`. The input-extent residuals are unused here but share
-                        // one deterministic residual boundary with the transpose region.
-                        let forward_operation = operation.clone();
-                        let forward_output_extents = output_extents.clone();
-                        let transpose_operation = operation.clone();
-                        let transpose_target_type = input_cotangent_type.clone();
-                        let transpose_permuted_type = permuted_input_cotangent_type.clone();
-                        let tangent = LinearCallOperation::stage(
-                            context,
-                            residuals.into_values(),
-                            vec![array_tangent.clone()],
-                            move |residuals, linear_inputs| {
-                                let mut reshape_inputs = Vec::with_capacity(1 + forward_output_extents.len());
-                                reshape_inputs.push(linear_inputs[0].clone());
-                                reshape_inputs
-                                    .extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                                linear_inputs[0].dispatch_domain().bind(
-                                    ArrayProgramOperation::<A>::from(forward_operation),
-                                    Vec::new(),
-                                    reshape_inputs.as_slice(),
-                                )
-                            },
-                            move |residuals, output_cotangents| {
-                                let transpose_context = output_cotangents[0].dispatch_domain();
-                                let bridge_sharding = match (
-                                    transpose_permuted_type.sharding(),
-                                    <&ArrayType>::try_from(output_cotangents[0].r#type().as_ref())?.sharding(),
-                                ) {
-                                    (Some(sharding), _) => Some(sharding.clone()),
-                                    (None, Some(sharding)) => Some(Sharding::replicated(
-                                        sharding.mesh().clone(),
-                                        transpose_permuted_type.rank(),
-                                    )),
-                                    (None, None) => None,
-                                };
-                                let mut inverse_operation = ReshapeOperation::new();
-                                if let Some(bridge_sharding) = bridge_sharding {
-                                    inverse_operation = inverse_operation.with_output_sharding(bridge_sharding);
-                                }
-                                let mut inverse_inputs = Vec::with_capacity(transpose_permuted_type.rank() + 1);
-                                inverse_inputs.push(output_cotangents[0].clone());
-                                inverse_inputs.extend(permuted_input_shape.dimensions(&transpose_context, residuals)?);
-                                let cotangent = transpose_context
-                                    .bind(
-                                        ArrayProgramOperation::<A>::from(inverse_operation),
-                                        Vec::new(),
-                                        inverse_inputs.as_slice(),
-                                    )?
-                                    .remove(0);
-                                let cotangent = if let Some(dimensions) = transpose_operation.dimensions() {
-                                    transpose_context
-                                        .bind(
-                                            ArrayProgramOperation::<A>::Array(ArrayOperation::Transpose(
-                                                TransposeOperation::new(dimensions.inverse()?),
-                                            )),
-                                            Vec::new(),
-                                            std::slice::from_ref(&cotangent),
-                                        )?
-                                        .remove(0)
-                                } else {
-                                    cotangent
-                                };
-                                let cotangent_type = cotangent.r#type();
-                                let actual_type = <&ArrayType>::try_from(cotangent_type.as_ref())?;
-                                if actual_type != &transpose_target_type {
-                                    return Err(TypeError::invalid(format!(
-                                        "inverse reshape cotangent type {actual_type} does not match input cotangent \
-                                         type {transpose_target_type}",
-                                    ))
-                                    .into());
-                                }
-                                Ok(vec![cotangent])
-                            },
-                        )?
-                        .remove(0);
-                        MaybeZero::Value(tangent)
-                    }
-                }
-            };
-            return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
+            return operation.jvp(context, driver, inputs);
         }
         if let Self::Broadcast(_) = self {
             let Some((array, output_extents)) = inputs.split_first() else {
@@ -1168,46 +1050,7 @@ where
         }
 
         if let Self::Reshape(operation) = self {
-            let Some((input, output_extents)) = inputs.split_first() else {
-                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-            };
-            let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent();
-            let permuted_input_cotangent_type = match operation.dimensions() {
-                Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
-                None => input_cotangent_type.clone(),
-            };
-            if permuted_input_cotangent_type
-                .shape()
-                .dimensions()
-                .iter()
-                .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
-            {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: "direct transposition of a dynamic 'reshape' requires linearization so its input extents \
-                              are available as explicit residuals"
-                        .to_string(),
-                }
-                .into());
-            }
-
-            // Exact extents allow the homogeneous reshape rule to own inverse geometry, permutation, sharding, and
-            // cotangent alignment. The result cotangent has the primal reshape's output shape.
-            let output_type = match outputs {
-                [MaybeZero::Zero(r#type)] => <&ArrayType>::try_from(r#type)?.clone(),
-                [MaybeZero::Value(value)] => <&ArrayType>::try_from(value.r#type().as_ref())?.clone(),
-                _ => return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into()),
-            };
-            let mut parameters = ReshapeParameters::new(output_type.shape().clone());
-            if let Some(dimensions) = operation.dimensions() {
-                parameters = parameters.with_dimensions(dimensions.clone());
-            }
-            if let Some(output_sharding) = operation.output_sharding() {
-                parameters = parameters.with_output_sharding(output_sharding.clone());
-            }
-            let array_operation = Self::Array(ArrayOperation::from(LegacyReshapeOperation::new(parameters)));
-            let mut cotangents = array_operation.transpose(context, driver, std::slice::from_ref(input), outputs)?;
-            cotangents.extend(output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())));
-            return Ok(cotangents);
+            return operation.transpose(context, driver, inputs, outputs);
         }
 
         let Self::Array(operation) = self else {
