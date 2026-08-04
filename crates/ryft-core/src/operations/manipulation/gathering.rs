@@ -1,30 +1,33 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use crate::backends::array_programs::LinearResiduals;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
+use crate::differentiation::forward::jvp_projected_operation;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+    LinearCallOperation, MemberDifferentiableOperation, TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::dimensions::DimensionSizeOperation;
 use crate::operations::manipulation::{LegacyBroadcast, Reshape, Slice, Transpose, UpdateSlice};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Dimension, Shape};
+use crate::types::{ArrayProgramType, ArrayType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -374,6 +377,100 @@ where
         let tangent = match inputs[0].tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.gather(indices, self)?),
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+/// Projected array-program JVP rule for [`GatherOperation`]. A dynamically shaped operand retains its exact extents
+/// and indices as ordinary residual values; a static operand delegates to the homogeneous projected rule.
+impl<C> MemberDifferentiableOperation<C> for GatherOperation
+where
+    C: Context<Type = ArrayProgramType>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation:
+        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+        + From<GatherOperation>
+        + From<ScatterOperation>
+        + From<ZeroOperation<ArrayType>>,
+{
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let [operand, indices] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+        };
+        let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+        if operand_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
+            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+            return jvp_projected_operation(context, &operation, inputs);
+        }
+
+        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+        let primal = context
+            .bind(operation, Vec::new(), &[operand.primal().clone(), indices.primal().clone()])?
+            .remove(0);
+        let tangent = match operand.tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Value(operand_tangent) => {
+                let mut residuals = LinearResiduals::new();
+                let indices_index = residuals.retain(indices.primal().clone());
+                let operand_shape = residuals.retain_shape(context, operand.primal())?;
+                let forward_operation = self.clone();
+                let transpose_operand_type = operand_type.cotangent();
+                let dimensions = self.dimensions();
+                let transpose_operation = ScatterOperation::new(
+                    ScatterDimensionNumbers::new(
+                        dimensions.offset_dimensions().to_vec(),
+                        dimensions.collapsed_slice_dimensions().to_vec(),
+                        dimensions.start_index_map().to_vec(),
+                    )
+                    .with_batching_dimensions(
+                        dimensions.operand_batching_dimensions().to_vec(),
+                        dimensions.start_indices_batching_dimensions().to_vec(),
+                    ),
+                    ScatterReductionKind::Add,
+                )
+                .with_mode(self.mode())
+                .with_indices_are_sorted(self.indices_are_sorted())
+                .with_unique_indices(self.unique_indices());
+                let tangent = LinearCallOperation::stage(
+                    context,
+                    residuals.into_values(),
+                    vec![operand_tangent.clone()],
+                    move |residuals, linear_inputs| {
+                        linear_inputs[0].dispatch_domain().bind(
+                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(forward_operation),
+                            Vec::new(),
+                            &[linear_inputs[0].clone(), residuals[indices_index].clone()],
+                        )
+                    },
+                    move |residuals, output_cotangents| {
+                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let zeros = transpose_context
+                            .bind(
+                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
+                                    transpose_operand_type.clone(),
+                                )),
+                                Vec::new(),
+                                operand_shape.dynamic_dimensions(residuals).as_slice(),
+                            )?
+                            .remove(0);
+                        transpose_context.bind(
+                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(transpose_operation),
+                            Vec::new(),
+                            &[zeros, residuals[indices_index].clone(), output_cotangents[0].clone()],
+                        )
+                    },
+                )?
+                .remove(0);
+                MaybeZero::Value(tangent)
+            }
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }

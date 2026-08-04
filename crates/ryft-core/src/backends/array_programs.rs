@@ -44,9 +44,8 @@ use crate::operations::manipulation::ConvertElementTypeOperation;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation,
-    DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, LegacyBroadcastOperation,
-    LegacyReshapeOperation, Pad, PadOperation, Reshape, ReshapeOperation, ReshapeParameters, ScatterDimensionNumbers,
-    ScatterOperation, ScatterReductionKind, Slice, Transpose, TransposeOperation, UpdateSlice,
+    DynamicShapeSliceOperation, DynamicUpdateSliceOperation, LegacyBroadcastOperation, LegacyReshapeOperation, Pad,
+    PadOperation, Reshape, ReshapeOperation, ReshapeParameters, Slice, Transpose, TransposeOperation, UpdateSlice,
 };
 use crate::operations::math::{AddOperation, DivOperation, MulOperation, Reduce, ReduceOperation, ReductionKind};
 use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
@@ -172,7 +171,7 @@ impl<V: Value<Type = ArrayProgramType>> LinearResiduals<V> {
     }
 
     /// Retains `value`, deduplicating dynamic dimension definitions by identity, and returns its residual index.
-    fn retain(&mut self, value: V) -> usize {
+    pub(crate) fn retain(&mut self, value: V) -> usize {
         if let ArrayProgramType::Dimension(r#type) = value.r#type().as_ref()
             && r#type.extent().is_none()
             && let Some(index) = self.values.iter().position(|value| {
@@ -2135,8 +2134,9 @@ mod tests {
         DimensionAddOperation, DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation,
     };
     use crate::operations::manipulation::{
-        Broadcast, BroadcastOperation, ConcatenateOperation, GatherDimensionNumbers, GatherOperation, PadOperation,
-        ReshapeOperation, SliceOperation, UpdateSliceOperation,
+        Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, GatherDimensionNumbers,
+        GatherOperation, PadOperation, ReshapeOperation, ScatterDimensionNumbers, ScatterOperation,
+        ScatterReductionKind, SliceOperation, UpdateSliceOperation,
     };
     use crate::operations::math::{AddOperation, MulOperation};
     use crate::parameters::Placeholder;

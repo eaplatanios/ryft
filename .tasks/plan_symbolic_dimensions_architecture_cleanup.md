@@ -2156,7 +2156,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
   - [ ] Continue P8b2 with the extent-sensitive indexing rules.
     - [x] Add the generic projected-differentiation capability for member rules that require the composite context.
     - [x] Relocate the P8b2a static and dynamic read-slice rules.
-    - [ ] Relocate the P8b2b dynamic-update-slice and gather rules.
+    - [x] Relocate the P8b2b dynamic-update-slice and gather rules.
     - [ ] Relocate the P8b2c reduction rules and close P8b2.
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
 - [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.

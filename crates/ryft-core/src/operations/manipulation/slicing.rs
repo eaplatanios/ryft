@@ -11,7 +11,7 @@ use crate::differentiation::forward::jvp_projected_operation;
 use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, LinearCallOperation, ProjectedDifferentiableOperation,
+    ElementwiseDerivativeAlignment, LinearCallOperation, MemberDifferentiableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -335,7 +335,7 @@ where
 
 /// Projected array-program JVP rule for [`SliceOperation`]. A dynamically shaped operand retains its exact extents as
 /// ordinary residual values; a static operand delegates to the homogeneous projected rule.
-impl<C> ProjectedDifferentiableOperation<C> for SliceOperation
+impl<C> MemberDifferentiableOperation<C> for SliceOperation
 where
     C: Context<Type = ArrayProgramType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -348,7 +348,7 @@ where
         + From<UpdateSliceOperation>
         + From<ZeroOperation<ArrayType>>,
 {
-    fn jvp_projected<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
         _driver: &D,
@@ -1221,7 +1221,7 @@ where
 /// Projected array-program JVP rule for [`DynamicSliceOperation`]. A dynamically shaped operand retains its exact
 /// extents and scalar start indices as ordinary residual values; a static operand delegates to the homogeneous
 /// projected rule.
-impl<C> ProjectedDifferentiableOperation<C> for DynamicSliceOperation
+impl<C> MemberDifferentiableOperation<C> for DynamicSliceOperation
 where
     C: Context<Type = ArrayProgramType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1233,7 +1233,7 @@ where
         + From<DynamicUpdateSliceOperation>
         + From<ZeroOperation<ArrayType>>,
 {
-    fn jvp_projected<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
         _driver: &D,
@@ -1590,6 +1590,191 @@ where
             MaybeZero::Value(operand_tangent.dynamic_update_slice(&update_tangent, &primal_starts)?)
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+/// Projected array-program JVP rule for [`DynamicUpdateSliceOperation`]. Dynamically shaped operands retain their
+/// exact extents and scalar start indices as ordinary residual values; fully static operands delegate to the
+/// homogeneous projected rule.
+impl<C> MemberDifferentiableOperation<C> for DynamicUpdateSliceOperation
+where
+    C: Context<Type = ArrayProgramType>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation:
+        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+        + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>
+        + From<ZeroOperation<ArrayType>>,
+{
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        if inputs.len() < 2 {
+            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+        }
+        let operand = &inputs[0];
+        let update = &inputs[1];
+        let start_indices = &inputs[2..];
+        let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+        if operand_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
+            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(*self);
+            return jvp_projected_operation(context, &operation, inputs);
+        }
+
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(*self);
+        let primal = context.bind(operation, Vec::new(), primal_inputs.as_slice())?.remove(0);
+        if operand.tangent().is_zero() && update.tangent().is_zero() {
+            return Ok(vec![DifferentiationDual::new(primal.clone(), MaybeZero::Zero(primal.r#type().tangent()))?]);
+        }
+
+        // The integer starts are the ordinary primal residuals shared by the forward update and its two transpose
+        // branches. Input extents are retained only when a missing operand tangent must be materialized inside the
+        // forward region; otherwise the output cotangent itself supplies the base geometry to the transpose.
+        let mut residuals = LinearResiduals::new();
+        let start_indices = residuals.retain_all(start_indices.iter().map(|index| index.primal().clone()));
+        let operand_is_live = !operand.tangent().is_zero();
+        let update_is_live = !update.tangent().is_zero();
+        let operand_shape =
+            (!operand_is_live).then(|| residuals.retain_shape(context, operand.primal())).transpose()?;
+        let update_type = <&ArrayType>::try_from(update.primal().r#type().as_ref())?.clone();
+        let update_shape = (operand_is_live || !update_is_live)
+            .then(|| residuals.retain_shape(context, update.primal()))
+            .transpose()?;
+        let mut linear_values = Vec::with_capacity(usize::from(operand_is_live) + usize::from(update_is_live));
+        if let MaybeZero::Value(tangent) = operand.tangent() {
+            linear_values.push(tangent.clone());
+        }
+        if let MaybeZero::Value(tangent) = update.tangent() {
+            linear_values.push(tangent.clone());
+        }
+        let forward_operand_type = operand_type.tangent();
+        let forward_update_type = update_type.tangent();
+        let forward_start_indices = start_indices.clone();
+        let forward_operand_shape = operand_shape.clone();
+        let forward_update_shape = update_shape.clone();
+        let transpose_start_indices = start_indices.clone();
+        let transpose_update_shape = update_shape.clone();
+        let transpose_update_type = update_type.cotangent();
+        let update_sizes = if update_is_live {
+            transpose_update_type
+                .shape()
+                .dimensions()
+                .iter()
+                .enumerate()
+                .map(|(axis, dimension)| {
+                    dimension.value().ok_or_else(|| {
+                        TypeError::invalid(format!(
+                            "'dynamic_update_slice' transpose requires a static update extent but axis {axis} has \
+                             size {dimension}",
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let tangent = LinearCallOperation::stage(
+            context,
+            residuals.into_values(),
+            linear_values,
+            move |residuals, linear_inputs| {
+                let forward_context = linear_inputs[0].dispatch_domain();
+                let mut linear_index = 0;
+                let operand_tangent = if operand_is_live {
+                    let tangent = linear_inputs[linear_index].clone();
+                    linear_index += 1;
+                    tangent
+                } else {
+                    let extents = forward_operand_shape.as_ref().unwrap().dynamic_dimensions(residuals);
+                    forward_context
+                        .bind(
+                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
+                                forward_operand_type.clone(),
+                            )),
+                            Vec::new(),
+                            extents.as_slice(),
+                        )?
+                        .remove(0)
+                };
+                let update_tangent = if update_is_live {
+                    linear_inputs[linear_index].clone()
+                } else {
+                    let extents = forward_update_shape.as_ref().unwrap().dynamic_dimensions(residuals);
+                    forward_context
+                        .bind(
+                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
+                                forward_update_type.clone(),
+                            )),
+                            Vec::new(),
+                            extents.as_slice(),
+                        )?
+                        .remove(0)
+                };
+                let mut update_inputs = Vec::with_capacity(2 + forward_start_indices.len());
+                update_inputs.extend([operand_tangent, update_tangent]);
+                update_inputs.extend(forward_start_indices.iter().map(|index| residuals[*index].clone()));
+                forward_context.bind(
+                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(DynamicUpdateSliceOperation),
+                    Vec::new(),
+                    update_inputs.as_slice(),
+                )
+            },
+            move |residuals, output_cotangents| {
+                let transpose_context = output_cotangents[0].dispatch_domain();
+                let mut cotangents = Vec::with_capacity(usize::from(operand_is_live) + usize::from(update_is_live));
+                if operand_is_live {
+                    let extents = transpose_update_shape.as_ref().unwrap().dynamic_dimensions(residuals);
+                    let update_zero = transpose_context
+                        .bind(
+                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
+                                transpose_update_type.clone(),
+                            )),
+                            Vec::new(),
+                            extents.as_slice(),
+                        )?
+                        .remove(0);
+                    let mut input_cotangent_inputs = vec![output_cotangents[0].clone(), update_zero];
+                    input_cotangent_inputs
+                        .extend(transpose_start_indices.iter().map(|index| residuals[*index].clone()));
+                    cotangents.push(
+                        transpose_context
+                            .bind(
+                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                    DynamicUpdateSliceOperation,
+                                ),
+                                Vec::new(),
+                                input_cotangent_inputs.as_slice(),
+                            )?
+                            .remove(0),
+                    );
+                }
+                if update_is_live {
+                    let mut update_cotangent_inputs = vec![output_cotangents[0].clone()];
+                    update_cotangent_inputs
+                        .extend(transpose_start_indices.iter().map(|index| residuals[*index].clone()));
+                    cotangents.push(
+                        transpose_context
+                            .bind(
+                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                    DynamicSliceOperation::new(update_sizes),
+                                ),
+                                Vec::new(),
+                                update_cotangent_inputs.as_slice(),
+                            )?
+                            .remove(0),
+                    );
+                }
+                Ok(cotangents)
+            },
+        )?
+        .remove(0);
+        Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?])
     }
 }
 
