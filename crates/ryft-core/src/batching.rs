@@ -1986,7 +1986,7 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>, P: ArrayB
     ///
     /// Region-carrying operation rules use this after discovering and semantically reconciling natural output axes
     /// across related regions. This method only performs the mechanical output-boundary alignment. It deliberately does
-    /// not decide which axes correspond or which one should win. A mapped required axis moves a naturally mapped output
+    /// not decide which axes correspond or which one should win. A mapped target axis moves a naturally mapped output
     /// or broadcasts a naturally replicated output. Callers must never use this method to collapse a mapped output to
     /// replicated, because that requires [`Operation`]-specific semantics such as cotangent summation.
     ///
