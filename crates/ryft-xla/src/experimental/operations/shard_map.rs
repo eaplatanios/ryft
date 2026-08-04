@@ -1041,7 +1041,9 @@ mod tests {
     use std::ops::{Deref, DerefMut};
 
     use ryft_core::contexts::{Context, StagingContext};
-    use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};
+    use ryft_core::differentiation::{
+        DifferentiableType, DifferentiationError, TransposableOperation, TranspositionDriver,
+    };
     use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
@@ -1393,6 +1395,68 @@ mod tests {
 
         assert!(matches!(&contributions[..], [MaybeZero::Value(value)]
                 if value.r#type().as_ref() == &ArrayProgramType::Array(value_type)));
+    }
+
+    /// Reverse mode through a `shard_map` must reach [`transpose_primal_shard_map`] through the composite
+    /// [`XlaOperation`] transposition dispatcher, not just through a direct call to the payload rule. The dispatcher is
+    /// derived, so this pins that the `ShardMap` variant is dispatched as a composite-native payload and stages a
+    /// transposed `shard_map` instead of reporting the operation as non-transposable.
+    #[test]
+    fn test_shard_map_transposes_through_the_composite_operation_dispatcher() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let tangent_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(tangent_sharding.clone())
+            .unwrap();
+        let cotangent_type = tangent_type.cotangent();
+
+        let source = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(tangent_type.clone());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let transposed = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(cotangent_type.clone());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let driver = TestTranspositionDriver { source, transposed };
+        let shard_map = ShardMap::from_shardings(
+            mesh,
+            vec![tangent_sharding.clone()],
+            vec![tangent_sharding],
+            vec!["x".to_string()],
+            true,
+        );
+        let operation =
+            ShardMapOperation::from_boundary(shard_map, vec![tangent_type.clone()], vec![tangent_type.clone()]);
+        let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let output_cotangent = context.input(ArrayProgramType::Array(cotangent_type.clone()));
+
+        let cotangents = <XlaOperation as TransposableOperation<XlaConstant, XlaOperation>>::transpose(
+            &XlaOperation::ShardMap(Box::new(operation)),
+            &mut context,
+            &driver,
+            &[PartialValue::Unknown(ArrayProgramType::Array(tangent_type))],
+            &[MaybeZero::Value(output_cotangent)],
+        )
+        .expect("the composite dispatcher should reach the shard_map transpose rule");
+
+        assert!(matches!(&cotangents[..], [MaybeZero::Value(cotangent)]
+                if cotangent.r#type().as_ref() == &ArrayProgramType::Array(cotangent_type)));
+
+        // The staged pullback is a `shard_map` over the transposed body, so the manual region survives reverse mode.
+        let builder = context.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert!(matches!(builder.instructions()[0].operation(), XlaOperation::ShardMap(_)));
+        assert_eq!(builder.instructions()[0].regions().len(), 1);
     }
 
     /// Builds a one-input, one-output identity shard-map body whose global boundary carries no sharding, so its

@@ -1,4 +1,3 @@
-use std::fmt::Display;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -48,10 +47,8 @@ use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use ryft_core::programs::effects::Effects;
-use ryft_core::programs::identities::TypeIdentityRenaming;
-use ryft_core::programs::operations::{Operation, OperationProjection};
-use ryft_core::programs::regions::{CalleeRegionDriver, OutputRegionProvenance, RegionInterface, RegionSlot};
+use ryft_core::programs::operations::Operation;
+use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface, RegionSlot};
 use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, ProgramError, Value, ValueProjection};
 use ryft_core::tracing::{Tracer, TracingContext};
 
@@ -68,7 +65,7 @@ use ryft_core::operations::tag::TagOperation;
 use ryft_core::programs::types::{Type, TypeError, Typed};
 use ryft_core::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
-use ryft_core::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, DimensionVariable};
+use ryft_core::types::{ArrayProgramType, ArrayType, Dimension, DimensionType};
 
 use crate::experimental::operations::ShardMapOperation;
 
@@ -84,7 +81,17 @@ pub type XlaConstant = CaptureReference<ArrayProgramType>;
 /// instructions attach their nested computations as regions of the containing XLA program, so those regions can
 /// contain backend-specific operations such as [`jit_call`](JitCallOperation) and
 /// [`shard_map`](ShardMapOperation).
-#[derive(Clone, Debug)]
+///
+/// The [`Operation`] contract, the interpretation and partial-evaluation dispatchers, the forward-mode and
+/// transposition dispatchers, the member operation-family projections, and the payload conversions are all derived.
+/// The variant classes mirror [`ArrayProgramOperation`] exactly for the payloads the two families share, so both
+/// dispatchers report identical semantics for every shared member and mixed payload. Only the backend-owned surfaces
+/// stay handwritten: the normalizing conversions that select between a member and a mixed carrier, the zero and
+/// residual-zero providers, the canonical core-operation view used by lowering, and the MLIR lowering dispatch.
+#[derive(Clone, Debug, ryft_macros::Operation)]
+#[ryft(crate = "ryft_core", type = ArrayProgramType, constant = C)]
+#[ryft(members(ArrayType, structural(DimensionType)))]
+#[ryft(dispatch(differentiation, transposition))]
 pub enum XlaOperation<C = XlaConstant>
 where
     C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -92,18 +99,24 @@ where
     /// Mixed zero constructor whose explicit first-class dimension operands provide its dynamic result extents.
     /// This variant cannot be represented by the homogeneous array member because its signature crosses member
     /// kinds: it consumes dimension members and produces an array member.
+    #[ryft(mixed(structural), skip_from)]
     Zero(ZeroOperation<ArrayType>),
 
     /// Mixed one constructor with explicit dynamic-extent operands.
+    #[ryft(mixed(structural), skip_from)]
     DynamicOne(OneOperation<ArrayType>),
 
     /// Mixed iota constructor with explicit dynamic-extent operands.
+    #[ryft(mixed(structural), skip_from)]
     DynamicIota(IotaOperation<ArrayType>),
 
-    /// Homogeneous array operation.
+    /// Homogeneous array operation. Member zero constructors are promoted to their mixed composite carrier when an
+    /// array operation is lifted into this family.
+    #[ryft(projected(ArrayType), skip_from)]
     Array(ArrayOperation<C::Projected>),
 
     /// Homogeneous first-class-dimension operation.
+    #[ryft(projected(DimensionType, structural))]
     Dimension(DimensionOperation<DimensionValue>),
 
     /// Mixed comparison of two dimensions producing Boolean array data.
@@ -140,12 +153,15 @@ where
     RngBitGenerator(RngBitGeneratorOperation<ArrayProgramType>),
 
     /// Gathers values with one explicit extent per result axis.
+    #[ryft(mixed)]
     AllGather(AllGatherOperation),
 
     /// Scatters values with one explicit extent per result axis.
+    #[ryft(mixed)]
     PSumScatter(PSumScatterOperation),
 
     /// Exchanges values with one explicit extent per result axis.
+    #[ryft(mixed)]
     AllToAll(AllToAllOperation),
 
     /// Backend-owned condition whose attached branch regions can contain XLA operations.
@@ -185,10 +201,10 @@ where
 {
     #[inline]
     fn from(operation: ArrayOperation<C::Projected>) -> Self {
-        match operation {
-            ArrayOperation::Zero(operation) => ArrayProgramOperation::<C::Projected>::from(operation).into(),
-            operation => Self::Array(operation),
-        }
+        // Delegating to the composite family's conversion keeps constructor normalization and member control-flow
+        // promotion identical across both families: `Condition`, `While`, and `Scan` must become composite carriers
+        // because the projected `Array` variant cannot own composite regions.
+        ArrayProgramOperation::<C::Projected>::from(operation).into()
     }
 }
 
@@ -256,108 +272,10 @@ where
     }
 }
 
-impl<C> From<LinearCallOperation<ArrayProgramType>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: LinearCallOperation<ArrayProgramType>) -> Self {
-        Self::LinearCall(operation)
-    }
-}
-
-impl<C> From<DimensionOperation<DimensionValue>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: DimensionOperation<DimensionValue>) -> Self {
-        Self::Dimension(operation)
-    }
-}
-
-impl<C> From<JitCallOperation<ArrayProgramType>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: JitCallOperation<ArrayProgramType>) -> Self {
-        Self::JitCall(operation)
-    }
-}
-
-impl<C> From<ConditionOperation<C>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: ConditionOperation<C>) -> Self {
-        Self::Condition(operation)
-    }
-}
-
-impl<C> From<WhileOperation<ArrayProgramType>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: WhileOperation<ArrayProgramType>) -> Self {
-        Self::While(operation)
-    }
-}
-
-impl<C> From<ScanOperation<C>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: ScanOperation<C>) -> Self {
-        Self::Scan(operation)
-    }
-}
-
-impl<C> From<CustomJvpOperation<ArrayProgramType>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: CustomJvpOperation<ArrayProgramType>) -> Self {
-        Self::CustomJvp(operation)
-    }
-}
-
-impl<C> From<CustomVjpOperation<ArrayProgramType>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: CustomVjpOperation<ArrayProgramType>) -> Self {
-        Self::CustomVjp(operation)
-    }
-}
-
-impl<C> From<RematerializeOperation<ArrayProgramType>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: RematerializeOperation<ArrayProgramType>) -> Self {
-        Self::Rematerialize(operation)
-    }
-}
-
-impl<C> From<ShardMapOperation<C>> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: ShardMapOperation<C>) -> Self {
-        Self::ShardMap(Box::new(operation))
-    }
-}
-
 macro_rules! impl_composite_operation_conversion {
-    // Generates direct composite-operation conversions through the canonical core operation family.
+    // Generates the composite-operation conversions the derive cannot generate directly: the canonical constructors
+    // whose lift selects between the homogeneous member carrier and the mixed dimension-operand carrier, and the
+    // homogeneous-array payload forms of mixed operations whose canonical composite payload is type-promoted.
     ($($operation:ty),+ $(,)?) => {
         $(
             impl<C> From<$operation> for XlaOperation<C>
@@ -377,23 +295,9 @@ impl_composite_operation_conversion!(
     ZeroOperation<ArrayType>,
     OneOperation<ArrayType>,
     IotaOperation<ArrayType>,
-    CompareOperation<ArrayProgramType>,
-    DimensionSizeOperation,
-    DimensionFromScalarOperation,
-    DimensionToScalarOperation,
-    ReshapeOperation,
-    BroadcastOperation,
     ConcatenateOperation<ArrayType>,
-    ConcatenateOperation<ArrayProgramType>,
     CustomCallOperation<ArrayType>,
-    CustomCallOperation<ArrayProgramType>,
     PadOperation<ArrayType>,
-    PadOperation<ArrayProgramType>,
-    DynamicShapeSliceOperation,
-    RngBitGeneratorOperation<ArrayProgramType>,
-    AllGatherOperation,
-    PSumScatterOperation,
-    AllToAllOperation,
 );
 
 macro_rules! impl_array_operation_conversion {
@@ -476,20 +380,6 @@ impl_array_operation_conversion!(
     TagOperation<ArrayType>,
     PrintOperation<ArrayType>,
 );
-
-impl<C> OperationProjection<ArrayType> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    type Projected = ArrayOperation<C::Projected>;
-}
-
-impl<C> OperationProjection<DimensionType> for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    type Projected = DimensionOperation<DimensionValue>;
-}
 
 impl<Capture> ZeroOperationProvider<ArrayProgramType> for XlaOperation<Capture>
 where
@@ -587,298 +477,6 @@ where
             | Self::JitCall(_)
             | Self::ShardMap(_) => return None,
         })
-    }
-}
-
-impl<'operation, C> TryFrom<&'operation XlaOperation<C>> for &'operation WhileOperation<ArrayProgramType>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    type Error = ProgramError;
-
-    fn try_from(operation: &'operation XlaOperation<C>) -> Result<Self, Self::Error> {
-        let XlaOperation::While(operation) = operation else {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("expected a while operation but got '{}'", operation.name()),
-            });
-        };
-        Ok(operation)
-    }
-}
-
-macro_rules! dispatch_operation {
-    // Delegates one borrowed `Operation` method to the active payload without materializing the canonical core
-    // operation, so cheap per-instruction accessors (e.g., names, effects, and region slots) never clone payload
-    // vectors on program-construction and validation hot paths. The per-variant trait selection mirrors the
-    // corresponding delegation arms of `ArrayProgramOperation` exactly, so both dispatchers report identical
-    // semantics for shared member and mixed payloads.
-    ($operation:expr, $method:ident $(, $argument:expr)* $(,)?) => {
-        match $operation {
-            XlaOperation::Zero(operation) => operation.$method($($argument),*),
-            XlaOperation::DynamicOne(operation) => operation.$method($($argument),*),
-            XlaOperation::DynamicIota(operation) => operation.$method($($argument),*),
-            XlaOperation::Array(operation) => operation.$method($($argument),*),
-            XlaOperation::Dimension(operation) => operation.$method($($argument),*),
-            XlaOperation::Compare(operation) => Operation::$method(operation, $($argument),*),
-            XlaOperation::DimensionSize(operation) => operation.$method($($argument),*),
-            XlaOperation::DimensionFromScalar(operation) => operation.$method($($argument),*),
-            XlaOperation::DimensionToScalar(operation) => operation.$method($($argument),*),
-            XlaOperation::Reshape(operation) => operation.$method($($argument),*),
-            XlaOperation::Broadcast(operation) => operation.$method($($argument),*),
-            XlaOperation::Concatenate(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::CustomCall(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::Pad(operation) => Operation::$method(operation, $($argument),*),
-            XlaOperation::DynamicShapeSlice(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::RngBitGenerator(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::AllGather(operation) => Operation::$method(operation, $($argument),*),
-            XlaOperation::PSumScatter(operation) => Operation::$method(operation, $($argument),*),
-            XlaOperation::AllToAll(operation) => Operation::$method(operation, $($argument),*),
-            XlaOperation::Condition(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::While(operation) => Operation::$method(operation, $($argument),*),
-            XlaOperation::Scan(operation) => Operation::$method(operation, $($argument),*),
-            XlaOperation::CustomJvp(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::CustomVjp(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::LinearCall(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::Rematerialize(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::JitCall(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::ShardMap(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-        }
-    };
-}
-
-macro_rules! dispatch_higher_operation {
-    // Delegates one `Operation<Type = ArrayProgramType>` method to the active XLA-owned higher-order payload.
-    ($operation:expr, $method:ident $(, $argument:expr)* $(,)?) => {
-        match $operation {
-            XlaOperation::Condition(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::While(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::Scan(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::CustomJvp(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::CustomVjp(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::LinearCall(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::Rematerialize(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::JitCall(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            XlaOperation::ShardMap(operation) => {
-                Operation::$method(operation, $($argument),*)
-            }
-            _ => unreachable!("member and mixed operations are handled by the canonical core operation family"),
-        }
-    };
-}
-
-impl<C> Display for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<C> Operation for XlaOperation<C>
-where
-    C: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    type Type = ArrayProgramType;
-
-    fn name(&self) -> &'static str {
-        dispatch_operation!(self, name)
-    }
-
-    fn region_slots(&self) -> &'static [RegionSlot] {
-        dispatch_operation!(self, region_slots)
-    }
-
-    fn infer_region_input_types(
-        &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
-        match self.to_core_operation() {
-            Some(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            None => dispatch_higher_operation!(self, infer_region_input_types, input_types, region_interfaces),
-        }
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
-        match self.to_core_operation() {
-            Some(operation) => operation.infer_output_types(input_types, region_interfaces),
-            None => dispatch_higher_operation!(self, infer_output_types, input_types, region_interfaces),
-        }
-    }
-
-    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-        dispatch_operation!(self, output_region_provenance, output_index)
-    }
-
-    fn is_zero(&self, output_index: usize) -> bool {
-        dispatch_operation!(self, is_zero, output_index)
-    }
-
-    fn effects(&self) -> Effects {
-        dispatch_operation!(self, effects)
-    }
-
-    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
-        if let Some(operation) = self.to_core_operation() {
-            return Ok(operation.rename_type_identities(renaming)?.into());
-        }
-        match self {
-            Self::Condition(operation) => Ok(Self::Condition(operation.rename_type_identities(renaming)?)),
-            Self::While(operation) => Ok(Self::While(operation.rename_type_identities(renaming)?)),
-            Self::Scan(operation) => Ok(Self::Scan(operation.rename_type_identities(renaming)?)),
-            Self::CustomJvp(operation) => Ok(Self::CustomJvp(operation.rename_type_identities(renaming)?)),
-            Self::CustomVjp(operation) => Ok(Self::CustomVjp(operation.rename_type_identities(renaming)?)),
-            Self::LinearCall(operation) => Ok(Self::LinearCall(operation.rename_type_identities(renaming)?)),
-            Self::Rematerialize(operation) => Ok(Self::Rematerialize(operation.rename_type_identities(renaming)?)),
-            Self::JitCall(operation) => Ok(Self::JitCall(operation.rename_type_identities(renaming)?)),
-            Self::ShardMap(operation) => Ok(Self::ShardMap(operation.rename_type_identities(renaming)?)),
-            _ => unreachable!("member and mixed operations are handled by the canonical core operation family"),
-        }
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        dispatch_operation!(self, render, formatter, indentation)
-    }
-}
-
-impl<Constant, C> PartiallyEvaluatableOperation<C> for XlaOperation<Constant>
-where
-    Constant: PartialEq
-        + Value<Type = ArrayProgramType>
-        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
-        + Concretizable<bool>,
-    C: Context<Type = ArrayProgramType, Constant = Constant, Operation = XlaOperation<Constant>>,
-    C::Value: PartialEq,
-    ArrayProgramOperation<Constant::Projected>: PartiallyEvaluatableOperation<C>,
-{
-    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
-        &self,
-        context: &PartialEvaluationContext<C>,
-        driver: &D,
-        inputs: &[PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        if let Some(operation) = self.to_core_operation() {
-            return operation.partially_evaluate(context, driver, inputs);
-        }
-        match self {
-            Self::Condition(operation) => operation.partially_evaluate(context, driver, inputs),
-            Self::Scan(operation) => operation.partially_evaluate(context, driver, inputs),
-            Self::While(operation) => operation.partially_evaluate(context, driver, inputs),
-            Self::JitCall(operation) => operation.partially_evaluate(context, driver, inputs),
-            Self::ShardMap(operation) => operation.partially_evaluate(context, driver, inputs),
-            _ => context.fold_or_residualize(
-                self.clone(),
-                driver.regions().map(|region| region.to_program()).collect(),
-                inputs,
-            ),
-        }
-    }
-}
-
-impl<Constant, C> DifferentiableOperation<C> for XlaOperation<Constant>
-where
-    Constant: PartialEq
-        + Value<Type = ArrayProgramType>
-        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
-        + Concretizable<bool>,
-    C: Context<Type = ArrayProgramType, Constant = Constant, Operation = XlaOperation<Constant>> + Zero<C::Value>,
-    C::Value: Concretizable<bool>,
-    ArrayProgramOperation<Constant::Projected>: Operation<Type = ArrayProgramType> + DifferentiableOperation<C>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if let Some(operation) = self.to_core_operation() {
-            return operation.jvp(context, driver, inputs);
-        }
-        match self {
-            Self::Condition(operation) => operation.jvp(context, driver, inputs),
-            Self::Scan(operation) => operation.jvp(context, driver, inputs),
-            Self::While(operation) => operation.jvp(context, driver, inputs),
-            Self::LinearCall(operation) => operation.jvp(context, driver, inputs),
-            Self::JitCall(operation) => operation.jvp(context, driver, inputs),
-            Self::ShardMap(operation) => operation.jvp(context, driver, inputs),
-            _ => Err(ProgramError::UnsupportedOperation {
-                message: format!("operation '{}' has no differentiation rule", self.name()),
-            }
-            .into()),
-        }
-    }
-}
-
-impl<V> TransposableOperation<V, XlaOperation<V>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    ArrayProgramOperation<V::Projected>: TransposableOperation<V, XlaOperation<V>>,
-{
-    fn transpose<D: TranspositionDriver<V, XlaOperation<V>>>(
-        &self,
-        context: &mut TracingContext<V, XlaOperation<V>>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
-        if let Some(operation) = self.to_core_operation() {
-            return operation.transpose(context, driver, inputs, outputs);
-        }
-        match self {
-            Self::Condition(operation) => operation.transpose(context, driver, inputs, outputs),
-            Self::Scan(operation) => operation.transpose(context, driver, inputs, outputs),
-            Self::While(operation) => operation.transpose(context, driver, inputs, outputs),
-            Self::LinearCall(operation) => operation.transpose(context, driver, inputs, outputs),
-            Self::JitCall(operation) => operation.transpose(context, driver, inputs, outputs),
-            _ => Err(ProgramError::UnsupportedOperation {
-                message: format!("operation '{}' is not transposable", self.name()),
-            }
-            .into()),
-        }
     }
 }
 
@@ -1475,6 +1073,25 @@ mod tests {
         )))
         .into();
         assert!(matches!(zero, XlaOperation::Zero(_)));
+
+        // Member control flow must also promote to the composite carriers when it enters through the member family
+        // conversion: the projected `Array` variant cannot own composite regions, so landing there would make the
+        // staged regions unprojectable.
+        let condition: XlaOperation<XlaConstant> =
+            ArrayOperation::<XlaArrayConstant>::Condition(ConditionOperation::new()).into();
+        assert!(matches!(condition, XlaOperation::Condition(_)));
+        let r#while: XlaOperation<XlaConstant> =
+            ArrayOperation::<XlaArrayConstant>::While(WhileOperation::new().with_iteration_bound(3).unwrap()).into();
+        assert!(matches!(r#while, XlaOperation::While(operation) if operation.iteration_bound() == Some(3)));
+        let scan: XlaOperation<XlaConstant> =
+            ArrayOperation::<XlaArrayConstant>::Scan(ScanOperation::new(2, 5).with_reverse(true)).into();
+        assert!(matches!(
+            scan,
+            XlaOperation::Scan(operation)
+                if operation.carry_count() == 2
+                    && operation.length() == &Dimension::Static(5)
+                    && operation.reverse()
+        ));
     }
 
     #[test]

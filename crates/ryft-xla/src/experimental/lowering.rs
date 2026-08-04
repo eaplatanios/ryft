@@ -5712,6 +5712,13 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
                 .zip(body_inputs.iter())
                 .zip(state_types.iter())
                 .map(|((candidate, carried), state_type)| {
+                    // A first-class dimension carry is loop-invariant under a batched predicate (the contract
+                    // documented on `WhileTypeSemantics`), so masking it is the identity and the body's candidate
+                    // result is threaded on directly. This matches eager interpretation, whose `mask_select` returns
+                    // equal dimension carries unchanged.
+                    if matches!(state_type, ArrayProgramType::Dimension(_)) {
+                        return Ok(candidate);
+                    }
                     let state_type = <&ArrayType>::try_from(state_type).map_err(ProgramError::from)?;
                     // The predicate broadcasts to each state element's shape along its leading (prefix) axes; a
                     // state element already shaped like the predicate reuses it directly.
@@ -11177,6 +11184,121 @@ mod tests {
         // Body region: per-item masked state update under the recomputed predicate.
         assert!(stablehlo.contains("stablehlo.select"), "{stablehlo}");
         assert!(stablehlo.contains("tensor<3xi1>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_passes_loop_invariant_dimension_through_masked_batched_predicate_while() {
+        // A batched-predicate loop may also carry a first-class dimension, which the relaxed `WhileTypeSemantics`
+        // contract requires to be loop-invariant. Masking a loop-invariant carry is the identity, so the lowering
+        // threads the body's dimension result on directly: only the array carry gets a `stablehlo.select`, while the
+        // condition region still `or`-reduces the per-item predicate into the scalar continuation decision.
+        use ryft_core::operations::compare::CompareOperation;
+        use ryft_core::operations::constants::{OneLikeOperation, ZeroLikeOperation};
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let extent_type = DimensionType::new(extent.clone());
+        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let condition = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.0.add_input(extent_type.clone().into());
+            let state = builder.add_input(state_type.clone());
+            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
+            let predicate = builder
+                .add_instruction(
+                    XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(
+                        ComparisonDirection::GreaterThan,
+                    ))),
+                    Vec::new(),
+                    vec![state, zero],
+                )
+                .unwrap()[0];
+            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![predicate],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+        }
+        .unwrap();
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let carried_extent = builder.0.add_input(extent_type.into());
+            let state = builder.add_input(state_type.clone());
+            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
+            let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
+            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![carried_extent, next],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+        }
+        .unwrap();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let vector = builder.add_input(dynamic_vector_type.clone());
+        let state = builder.add_input(state_type.clone());
+        let extent = builder
+            .add_instruction(DimensionSizeOperation::new(&dynamic_vector_type, 0).unwrap(), Vec::new(), vec![vector])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                XlaOperation::While(WhileOperation::new()),
+                vec![condition_region, body_region],
+                vec![extent, state],
+            )
+            .unwrap()[1];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![dynamic_vector_type, state_type.clone()],
+            &state_type,
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The condition region `or`-reduces the carried `tensor<3xi1>` predicate, the array carry takes one
+        // `stablehlo.select` against the carried predicate, and the dimension carry (`%iterArg`) is returned
+        // unmasked exactly as the body produced it.
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<8xf32>, %arg1: tensor<3xf64>, %arg2: tensor<i32>) -> tensor<3xf64> {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<8xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %3 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<3xf64>
+                    %4 = stablehlo.compare GT, %arg1, %3, FLOAT : (tensor<3xf64>, tensor<3xf64>) -> tensor<3xi1>
+                    %5:3 = stablehlo.while(%iterArg = %2, %iterArg_0 = %arg1, %iterArg_1 = %4) : tensor<i64>, tensor<3xf64>, tensor<3xi1>
+                    cond {
+                      %c = stablehlo.constant dense<false> : tensor<i1>
+                      %6 = stablehlo.reduce(%iterArg_1 init: %c) applies stablehlo.or across dimensions = [0] : (tensor<3xi1>, tensor<i1>) -> tensor<i1>
+                      stablehlo.return %6 : tensor<i1>
+                    } do {
+                      %cst_2 = stablehlo.constant dense<1.000000e+00> : tensor<f64>
+                      %6 = stablehlo.broadcast_in_dim %cst_2, dims = [] : (tensor<f64>) -> tensor<3xf64>
+                      %7 = stablehlo.subtract %iterArg_0, %6 : tensor<3xf64>
+                      %8 = stablehlo.select %iterArg_1, %7, %iterArg_0 : tensor<3xi1>, tensor<3xf64>
+                      %cst_3 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                      %9 = stablehlo.broadcast_in_dim %cst_3, dims = [] : (tensor<f64>) -> tensor<3xf64>
+                      %10 = stablehlo.compare GT, %8, %9, FLOAT : (tensor<3xf64>, tensor<3xf64>) -> tensor<3xi1>
+                      stablehlo.return %iterArg, %8, %10 : tensor<i64>, tensor<3xf64>, tensor<3xi1>
+                    }
+                    return %5#1 : tensor<3xf64>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
