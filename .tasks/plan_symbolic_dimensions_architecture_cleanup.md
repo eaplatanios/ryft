@@ -2165,7 +2165,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [x] Relocate the P8b3d pad rules and close P8b3.
   - [ ] Continue P8b4 with the remaining mixed-operation transform rules.
     - [x] Relocate the P8b4a comparison, custom-call, and RNG rules.
-    - [ ] Relocate the P8b4b collective differentiation and transposition rules.
+    - [x] Relocate the P8b4b collective differentiation and transposition rules.
     - [ ] Relocate the P8b4c collective batching rules.
     - [ ] Relocate the P8b4d remaining mixed structural and batching rules, then close P8b4.
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
