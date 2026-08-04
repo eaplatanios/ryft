@@ -1972,6 +1972,110 @@ impl<C: Context<Type: BatchableType<Policy: BatchingPolicy<C>>>>
     }
 }
 
+impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>, P: ArrayBatchingPolicy<C>>
+    BatchingContext<C, ArrayBatching<P>>
+{
+    /// Batches a [`Region`](crate::Region)-bearing _wrapper_ [`Operation`] without inlining away the wrapper itself.
+    ///
+    /// This is the shared outer-boundary algorithm used by the batching rules for operations like
+    /// [`CustomJvpOperation`](crate::CustomJvpOperation), [`CustomVjpOperation`](crate::CustomVjpOperation), and
+    /// [`RematerializeOperation`](crate::RematerializeOperation), that attach meaning to a set of region programs:
+    /// a [`CustomJvpOperation`](crate::CustomJvpOperation) or a [`CustomVjpOperation`](crate::CustomVjpOperation)
+    /// wrapper determines which derivative rule later transforms must use, while a rematerialization wrapper preserves
+    /// the recomputation boundary. Inlining only the primal region during batching would erase that meaning. Instead,
+    /// this function binds the supplied wrapper operation around either the original regions or structurally batched
+    /// replacements. On the mapped-input path, the custom-JVP case can be summarized as:
+    ///
+    /// ```text
+    /// xᵢ@0       = match_axis(xᵢ, 0)
+    /// batch₀(f)  = structurally batch every input and output of f at axis 0
+    ///
+    /// custom_jvp(primal, jvp)(x₁, …, xₘ) -- batch --> custom_jvp(batch₀(primal), batch₀(jvp))(x₁@0, …, xₘ@0)
+    /// ```
+    ///
+    /// Here, each `xᵢ` is an already-packed [`ArrayBatch`], not an individual logical array. `xᵢ@0` denotes the result
+    /// of [`ArrayBatchingPolicy::match_axis`]: an existing mapped axis is moved to position `0`, while a replicated
+    /// input is broadcast across the mapped extent with its new mapped axis at position `0`. `batch₀(f)` denotes
+    /// structural program batching with every region argument declared mapped at axis `0` and every result aligned to
+    /// axis `0`. The outer operands and attached regions therefore agree on one physical calling convention.
+    ///
+    /// The function has two paths:
+    ///
+    ///   - If every input is replicated, it binds the operation with the [`BatchingDriver`]'s unchanged regions and
+    ///     original packed values, and marks every output as replicated.
+    ///   - If any input is mapped, it aligns every input to packed axis `0` through
+    ///     [`ArrayBatchingPolicy::match_axis`] (moving existing mapped axes and broadcasting replicated inputs),
+    ///     batches every attached region using the same axis-`0` convention, binds the operation with those transformed
+    ///     regions, and marks every output as mapped at axis `0`.
+    ///
+    /// Binding always occurs through [`Self::parent`]. An eager parent therefore interprets the rewrapped operation
+    /// immediately, while a staging parent records one wrapper operation with its attached regions in the enclosing
+    /// trace.
+    ///
+    /// # Parameters
+    ///
+    ///   - `driver`: [`BatchingDriver`] that provides and structurally transforms the wrapper's attached regions.
+    ///   - `operation`: Wrapper [`Operation`] to bind around the original or structurally batched regions.
+    ///   - `inputs`: Packed input [`ArrayBatch`]es of the wrapper operation.
+    pub(crate) fn batch_wrapped_operation<D: BatchingDriver<C, ArrayBatching<P>>>(
+        &self,
+        driver: &D,
+        operation: C::Operation,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // A replicated wrapper needs no structural rewrite. Preserve its attached regions exactly and pass
+        // each packed value through unchanged. Its outputs remain replicated at this transform level.
+        let (regions, inputs, output_batch_axis) = if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
+            (
+                driver.regions().map(|region| region.to_program()).collect(),
+                inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+                BatchAxis::replicated(),
+            )
+        } else {
+            // Give the replacement wrapper one uniform physical calling convention. Existing mapped axes move to
+            // position 0, while replicated operands are broadcast across the context's mapped extent at position 0.
+            let aligned_inputs = inputs
+                .iter()
+                .map(|input| P::match_axis(self, input, Axis::from(0)))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Apply the same calling convention to every attached region. All region arguments enter mapped at axis
+            // 0, and `AlignAllTo(0)` broadcasts naturally replicated results or moves differently positioned mapped
+            // axes so every rewritten region has the signature expected by the replacement wrapper.
+            let operation_regions = driver
+                .regions()
+                .map(|region| {
+                    let input_batch_axes = vec![BatchAxis::new(0); region.input_types().len()];
+                    let (program, _) = driver
+                        .batch_program(
+                            self,
+                            region,
+                            input_batch_axes.as_slice(),
+                            ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
+                        )?
+                        .into_parts();
+                    Ok::<_, BatchingError>(program)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (
+                operation_regions,
+                aligned_inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+                BatchAxis::new(0),
+            )
+        };
+
+        // Keep the semantic wrapper intact under both eager and tracing parents. Eager contexts interpret this bind,
+        // while tracing contexts stage the wrapper operation together with the selected region programs.
+        let outputs = self.parent().bind(operation, regions, &inputs)?;
+
+        // Restore the transform-level carrier around each parent result using the convention selected above.
+        outputs
+            .into_iter()
+            .map(|tracer| ArrayBatch::new(tracer.r#type().into_owned(), tracer, output_batch_axis))
+            .collect()
+    }
+}
+
 impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> Domain for BatchingContext<C, P> {
     type Type = C::Type;
     type Value = BatchingTracer<C, P>;
@@ -2632,6 +2736,7 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::{DomainTracingContext, Trace};
+    use crate::tracing_v2::custom_derivatives::CustomJvpOperation;
     use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
@@ -3493,6 +3598,65 @@ mod tests {
         let context = context.with_axis_name("items".to_string()).with_axis_sharding(ShardingDimension::sharded(["x"]));
         assert_eq!(context.axis_name(), Some("items"));
         assert_eq!(context.axis_sharding(), &ShardingDimension::sharded(["x"]));
+    }
+
+    #[test]
+    fn test_batching_context_batch_wrapped_operation() {
+        let per_item_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let primal = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(per_item_type.clone());
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let jvp = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let primal_input = builder.add_input(per_item_type.clone());
+            let tangent_input = builder.add_input(per_item_type);
+            builder
+                .build::<Vec<Array>, Vec<Array>>(
+                    vec![primal_input, tangent_input],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let regions = vec![primal, jvp];
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+
+        // A replicated wrapper retains its original region programs and passes its packed value through unchanged.
+        let replicated_input = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
+        let replicated_outputs = context
+            .batch_wrapped_operation(
+                &driver,
+                ArrayOperation::from(CustomJvpOperation::<ArrayType>::new()),
+                &[replicated_input],
+            )
+            .unwrap();
+        assert_eq!(replicated_outputs, vec![ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]))]);
+
+        // A mapped input at axis 1 is moved to axis 0. Both attached programs are structurally batched with matching
+        // axis-0 boundaries, allowing the preserved custom-JVP wrapper to bind against the aligned packed input.
+        let mapped_input = ArrayBatch::new(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
+            Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]),
+            BatchAxis::new(1),
+        )
+        .unwrap();
+        let mapped_outputs = context
+            .batch_wrapped_operation(
+                &driver,
+                ArrayOperation::from(CustomJvpOperation::<ArrayType>::new()),
+                &[mapped_input],
+            )
+            .unwrap();
+        let expected_output = ArrayBatch::new(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+            Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        assert_eq!(mapped_outputs, vec![expected_output]);
     }
 
     #[test]
