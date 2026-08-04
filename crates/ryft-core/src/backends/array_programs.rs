@@ -3,7 +3,6 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::axes::AxisIndexOperation;
 use crate::backends::arrays::{Array, ArrayOperation, BroadcastKernel};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::contexts::{Context, EagerContext, ProjectedContext};
@@ -17,10 +16,9 @@ use crate::macros::check_count;
 #[cfg(test)]
 use crate::operations::collectives::CollectiveOptions;
 use crate::operations::collectives::{
-    ALL_GATHER_OPERATION_NAME, ALL_TO_ALL_OPERATION_NAME, AllGatherOperation, AllGatherOutputVariance,
-    AllToAllOperation, CollectiveMode, PSUM_SCATTER_OPERATION_NAME, PSumScatterOperation, PpermuteOperation,
-    infer_explicit_all_gather_output_types, infer_explicit_all_to_all_output_types,
-    infer_explicit_psum_scatter_output_types,
+    ALL_GATHER_OPERATION_NAME, ALL_TO_ALL_OPERATION_NAME, AllGatherOperation, AllToAllOperation, CollectiveMode,
+    PSUM_SCATTER_OPERATION_NAME, PSumScatterOperation, PpermuteOperation, infer_explicit_all_gather_output_types,
+    infer_explicit_all_to_all_output_types, infer_explicit_psum_scatter_output_types,
 };
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::{
@@ -36,8 +34,8 @@ use crate::operations::control_flow::{
 };
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::dimensions::{
-    DimensionFromScalar, DimensionFromScalarOperation, DimensionMulOperation, DimensionSize, DimensionSizeOperation,
-    DimensionToScalar, DimensionToScalarOperation,
+    DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
+    DimensionToScalarOperation,
 };
 use crate::operations::manipulation::ConvertElementTypeOperation;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
@@ -63,9 +61,7 @@ use crate::programs::values::{Concretizable, ProjectedValue, Value, ValueProject
 use crate::programs::{AtomId, ProgramBuilder, ProgramError};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{
-    ArrayProgramType, ArrayType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable, Shape,
-};
+use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
 
 pub mod batching;
 mod differentiation;
@@ -237,23 +233,6 @@ impl<V: Value<Type = ArrayProgramType>> LinearResiduals<V> {
             .collect::<Result<Vec<_>, _>>()
             .map(ExactShape)
     }
-}
-
-/// Materializes one exact first-class dimension constant in a composite array-program context.
-fn dimension_constant<A, C>(context: &C, extent: usize) -> Result<C::Value, ProgramError>
-where
-    A: Value<Type = ArrayType>,
-    C: Context<Type = ArrayProgramType, Operation: From<ArrayProgramOperation<A>>>,
-{
-    Ok(context
-        .bind(
-            ArrayProgramOperation::<A>::from(DimensionOperation::from(ConstantOperation::new(
-                DimensionValue::constant(extent)?,
-            ))),
-            Vec::new(),
-            &[],
-        )?
-        .remove(0))
 }
 
 // TODO(eaplatanios): Review this module.
@@ -2136,7 +2115,7 @@ mod tests {
     use crate::differentiation::{DifferentiationTracer, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::collectives::{
-        AllGather, AllGatherOperation, AllToAllOperation, PSumScatter, PSumScatterOperation,
+        AllGather, AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, PSumScatter, PSumScatterOperation,
     };
     use crate::operations::constants::{ConstantOperation, ZeroOperation};
     use crate::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};

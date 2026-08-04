@@ -13,8 +13,9 @@
 use std::fmt::{Debug, Display};
 use std::ops::Mul as StdMul;
 
-use crate::axes::{AxisError, NamedAxes, NamedAxis};
-use crate::backends::dimensions::DimensionValue;
+use crate::axes::{AxisError, AxisIndexOperation, NamedAxes, NamedAxis};
+use crate::backends::array_programs::LinearResiduals;
+use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::backends::scalars::Scalar;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -23,25 +24,32 @@ use crate::batching::{
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+    LinearCallOperation, MemberDifferentiableOperation, MemberTransposableOperation, TransposableOperation,
+    TranspositionDriver, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::constants::{Fill, ZeroLike};
-use crate::operations::dimensions::{DimensionRequirement, DimensionSize};
+use crate::operations::constants::{ConstantOperation, Fill, ZeroLike};
+use crate::operations::dimensions::{
+    DimensionFromScalarOperation, DimensionMulOperation, DimensionRequirement, DimensionSize, DimensionSizeOperation,
+};
 use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
 use crate::operations::manipulation::slicing::resized_output_sharding;
-use crate::operations::manipulation::{Concatenate, LegacyBroadcast, Reshape, ReshapeParameters, Slice, Transpose};
+use crate::operations::manipulation::{
+    Concatenate, DynamicShapeSliceOperation, LegacyBroadcast, Reshape, ReshapeOperation, ReshapeParameters, Slice,
+    Transpose,
+};
 use crate::operations::math::{Div, Mul, Reduce, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::identities::TypeIdentityPosition;
+use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValue, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
+use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -2522,6 +2530,298 @@ pub trait PSwapAxes: AllToAll {
 
 impl<V: AllToAll> PSwapAxes for V {}
 
+/// Applies the mixed array-program JVP shared by shape-changing collectives whose transpose is another collective.
+/// Explicit output extents and the exact input shape become ordinary residuals of one linear call.
+fn jvp_shape_changing_collective_with_adjoint<C, Forward, Adjoint>(
+    operation: &Forward,
+    adjoint: Adjoint,
+    context: &C,
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+where
+    C: Context<Type = ArrayProgramType>,
+    C::Operation: From<Forward>
+        + From<Adjoint>
+        + From<DimensionSizeOperation>
+        + From<LinearCallOperation<ArrayProgramType>>
+        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+    Forward: Clone + Operation<Type = ArrayType>,
+    Adjoint: Operation<Type = ArrayType>,
+{
+    let Some((array, output_extents)) = inputs.split_first() else {
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+    };
+    let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+    let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+    let tangent = match array.tangent() {
+        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+        MaybeZero::Value(array_tangent) => {
+            let mut residuals = LinearResiduals::new();
+            let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+            let input_shape = residuals.retain_shape(context, array.primal())?;
+            let forward_operation = operation.clone();
+            let forward_output_extents = output_extents.clone();
+            let tangent = LinearCallOperation::stage(
+                context,
+                residuals.into_values(),
+                vec![array_tangent.clone()],
+                move |residuals, linear_inputs| {
+                    let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
+                    collective_inputs.push(linear_inputs[0].clone());
+                    collective_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                    linear_inputs[0].dispatch_domain().bind(forward_operation, Vec::new(), collective_inputs.as_slice())
+                },
+                move |residuals, output_cotangents| {
+                    let transpose_context = output_cotangents[0].dispatch_domain();
+                    let input_dimensions = input_shape.dimensions(&transpose_context, residuals)?;
+                    let mut adjoint_inputs = Vec::with_capacity(1 + input_dimensions.len());
+                    adjoint_inputs.push(output_cotangents[0].clone());
+                    adjoint_inputs.extend(input_dimensions);
+                    transpose_context.bind(adjoint, Vec::new(), adjoint_inputs.as_slice())
+                },
+            )?
+            .remove(0);
+            MaybeZero::Value(tangent)
+        }
+    };
+    Ok(vec![DifferentiationDual::new(primal, tangent)?])
+}
+
+/// Applies the mixed array-program JVP for invariant all-gather. Its transpose selects the current participant's
+/// gathered chunk using the retained input geometry and reshapes an untiled size-one participant axis away.
+fn jvp_invariant_all_gather<C>(
+    operation: &AllGatherOperation,
+    context: &C,
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+where
+    C: Context<Type = ArrayProgramType>,
+    C::Operation: From<AllGatherOperation>
+        + From<DimensionFromScalarOperation>
+        + From<DimensionSizeOperation>
+        + From<DynamicShapeSliceOperation>
+        + From<LinearCallOperation<ArrayProgramType>>
+        + From<ReshapeOperation>
+        + OperationProjection<ArrayType>
+        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
+{
+    let Some((array, output_extents)) = inputs.split_first() else {
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+    };
+    let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+    let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+    let tangent = match array.tangent() {
+        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+        MaybeZero::Value(array_tangent) => {
+            let mut residuals = LinearResiduals::new();
+            let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+            let input_shape = residuals.retain_shape(context, array.primal())?;
+            let forward_operation = operation.clone();
+            let forward_output_extents = output_extents.clone();
+            let transpose_operation = operation.clone();
+            let transpose_target_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent();
+            let tangent = LinearCallOperation::stage(
+                context,
+                residuals.into_values(),
+                vec![array_tangent.clone()],
+                move |residuals, linear_inputs| {
+                    let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
+                    collective_inputs.push(linear_inputs[0].clone());
+                    collective_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                    linear_inputs[0].dispatch_domain().bind(forward_operation, Vec::new(), collective_inputs.as_slice())
+                },
+                move |residuals, output_cotangents| {
+                    let transpose_context = output_cotangents[0].dispatch_domain();
+                    let input_dimensions = input_shape.dimensions(&transpose_context, residuals)?;
+                    let output_cotangent_type = output_cotangents[0].r#type();
+                    let output_cotangent_type = <&ArrayType>::try_from(output_cotangent_type.as_ref())?;
+                    let output_rank = output_cotangent_type.rank();
+                    let zero = transpose_context
+                        .bind(
+                            DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
+                            Vec::new(),
+                            &[],
+                        )?
+                        .remove(0);
+                    let chunk_extent = match transpose_operation.options().mode() {
+                        CollectiveMode::Tiled => input_dimensions[transpose_operation.concat_axis()].clone(),
+                        CollectiveMode::Untiled => transpose_context
+                            .bind(
+                                DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(1)?)),
+                                Vec::new(),
+                                &[],
+                            )?
+                            .remove(0),
+                    };
+                    let start = if transpose_operation.axis_size() == 1 {
+                        zero.clone()
+                    } else {
+                        let axis_index = transpose_context
+                            .bind(
+                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                    AxisIndexOperation::new(transpose_operation.axis_name().to_string()),
+                                ),
+                                Vec::new(),
+                                &[],
+                            )?
+                            .remove(0);
+                        let axis_index_variable = DimensionVariable::new(
+                            format!("{}_index", transpose_operation.axis_name()),
+                            crate::types::DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,
+                        );
+                        let axis_index = transpose_context
+                            .bind(
+                                DimensionFromScalarOperation::new(axis_index_variable),
+                                Vec::new(),
+                                std::slice::from_ref(&axis_index),
+                            )?
+                            .remove(0);
+                        let axis_index_type = <&DimensionType>::try_from(axis_index.r#type().as_ref())?.clone();
+                        let chunk_extent_type = <&DimensionType>::try_from(chunk_extent.r#type().as_ref())?.clone();
+                        transpose_context
+                            .bind(
+                                DimensionOperation::Mul(DimensionMulOperation::new(
+                                    &axis_index_type,
+                                    &chunk_extent_type,
+                                )?),
+                                Vec::new(),
+                                &[axis_index, chunk_extent.clone()],
+                            )?
+                            .remove(0)
+                    };
+                    let mut starts = vec![zero; output_rank];
+                    starts[transpose_operation.concat_axis()] = start;
+                    let mut slice_sizes = input_dimensions.clone();
+                    if transpose_operation.options().mode() == CollectiveMode::Untiled {
+                        slice_sizes.insert(transpose_operation.concat_axis(), chunk_extent);
+                    }
+                    let mut slice_inputs = Vec::with_capacity(1 + 2 * output_rank);
+                    slice_inputs.push(output_cotangents[0].clone());
+                    slice_inputs.extend(starts);
+                    slice_inputs.extend(slice_sizes);
+                    let selected = transpose_context
+                        .bind(DynamicShapeSliceOperation::new(output_rank), Vec::new(), slice_inputs.as_slice())?
+                        .remove(0);
+                    let mut reshape_inputs = Vec::with_capacity(1 + input_dimensions.len());
+                    reshape_inputs.push(selected);
+                    reshape_inputs.extend(input_dimensions);
+                    transpose_context.bind(
+                        ReshapeOperation::new().with_output_sharding(transpose_target_type.sharding().cloned()),
+                        Vec::new(),
+                        reshape_inputs.as_slice(),
+                    )
+                },
+            )?
+            .remove(0);
+            MaybeZero::Value(tangent)
+        }
+    };
+    Ok(vec![DifferentiationDual::new(primal, tangent)?])
+}
+
+/// Mixed array-program JVP for all-gather. Explicit output extents are retained as ordinary residual values, and an
+/// invariant result uses participant-indexed slicing in its transposed linear region.
+impl<C> MemberDifferentiableOperation<C> for AllGatherOperation
+where
+    C: Context<Type = ArrayProgramType>,
+    C::Operation: From<AllGatherOperation>
+        + From<DimensionFromScalarOperation>
+        + From<DimensionSizeOperation>
+        + From<DynamicShapeSliceOperation>
+        + From<LinearCallOperation<ArrayProgramType>>
+        + From<PSumScatterOperation>
+        + From<ReshapeOperation>
+        + OperationProjection<ArrayType>
+        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
+{
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        if self.output_variance() == AllGatherOutputVariance::Invariant {
+            return jvp_invariant_all_gather(self, context, inputs);
+        }
+        jvp_shape_changing_collective_with_adjoint(
+            self,
+            PSumScatterOperation::new(
+                self.axis_name().to_string(),
+                self.axis_size(),
+                self.concat_axis(),
+                self.options().clone(),
+            ),
+            context,
+            inputs,
+        )
+    }
+}
+
+/// Mixed array-program JVP for sum-scatter. Explicit output extents are retained as ordinary residual values, and
+/// the transposed linear region applies varying all-gather to the output cotangent.
+impl<C> MemberDifferentiableOperation<C> for PSumScatterOperation
+where
+    C: Context<Type = ArrayProgramType>,
+    C::Operation: From<AllGatherOperation>
+        + From<DimensionSizeOperation>
+        + From<LinearCallOperation<ArrayProgramType>>
+        + From<PSumScatterOperation>
+        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+{
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        jvp_shape_changing_collective_with_adjoint(
+            self,
+            AllGatherOperation::new(
+                self.axis_name().to_string(),
+                self.axis_size(),
+                self.scatter_axis(),
+                self.options().clone(),
+                AllGatherOutputVariance::Varying,
+            ),
+            context,
+            inputs,
+        )
+    }
+}
+
+/// Mixed array-program JVP for all-to-all. Explicit output extents are retained as ordinary residual values, and the
+/// transposed linear region swaps the split and concatenation axes.
+impl<C> MemberDifferentiableOperation<C> for AllToAllOperation
+where
+    C: Context<Type = ArrayProgramType>,
+    C::Operation: From<AllToAllOperation>
+        + From<DimensionSizeOperation>
+        + From<LinearCallOperation<ArrayProgramType>>
+        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+{
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        jvp_shape_changing_collective_with_adjoint(
+            self,
+            AllToAllOperation::new(
+                self.axis_name().to_string(),
+                self.axis_size(),
+                self.concat_axis(),
+                self.split_axis(),
+                self.options().clone(),
+            ),
+            context,
+            inputs,
+        )
+    }
+}
+
 /// Batching rule for [`AllGatherOperation`]. A matching `batch` level consumes the mapped batch axis by
 /// materializing the gather: the batch axis is transposed to sit immediately before the per-item `concat_axis` and
 /// merged into it, laying the gathered chunks out item-major (item 0's chunk first), which matches the tiled
@@ -2929,6 +3229,125 @@ where
     }
 }
 
+/// Transposes one mixed array-program collective by delegating its array contribution through the homogeneous
+/// projection and assigning structural-zero cotangents to its explicit output extents.
+fn transpose_explicit_shape_changing_collective<V, O, P>(
+    operation: P,
+    context: &mut TracingContext<V, O>,
+    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>
+where
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayProgramType> + OperationProjection<ArrayType>,
+    P: Operation<Type = ArrayType>,
+    <O as OperationProjection<ArrayType>>::Projected: From<P>
+        + TransposableOperation<
+            <V as ValueProjection<ArrayType>>::Projected,
+            <O as OperationProjection<ArrayType>>::Projected,
+        >,
+{
+    let Some((array_input, output_extents)) = inputs.split_first() else {
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+    };
+    if array_input.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference)
+        || output_extents
+            .iter()
+            .any(|extent| extent.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference))
+    {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "direct '{}' transposition with dynamic extents requires linearization so that the primal geometry \
+                 can be retained as residuals",
+                operation.name(),
+            ),
+        }
+        .into());
+    }
+    let operation = <O as OperationProjection<ArrayType>>::Projected::from(operation);
+    let mut cotangents =
+        transpose_projected_operation(context, &operation, std::slice::from_ref(array_input), outputs)?;
+    cotangents.extend(output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())));
+    Ok(cotangents)
+}
+
+/// Direct mixed transposition for all-gather. Invariant all-gather requires linearization so its pullback can retain
+/// participant-indexed geometry; other variances delegate the array cotangent to the homogeneous collective rule.
+impl<V, O> MemberTransposableOperation<V, O> for AllGatherOperation
+where
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayProgramType> + OperationProjection<ArrayType>,
+    <O as OperationProjection<ArrayType>>::Projected: From<AllGatherOperation>
+        + TransposableOperation<
+            <V as ValueProjection<ArrayType>>::Projected,
+            <O as OperationProjection<ArrayType>>::Projected,
+        >,
+{
+    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TracingContext<V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        if self.output_variance() == AllGatherOutputVariance::Invariant {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "direct invariant 'all_gather' transposition requires linearization so that the current \
+                          participant can select its gathered chunk"
+                    .to_string(),
+            }
+            .into());
+        }
+        transpose_explicit_shape_changing_collective(self.clone(), context, inputs, outputs)
+    }
+}
+
+/// Direct mixed transposition for sum-scatter. The array cotangent delegates to the homogeneous all-gather adjoint,
+/// while explicit output extents receive structural-zero cotangents.
+impl<V, O> MemberTransposableOperation<V, O> for PSumScatterOperation
+where
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayProgramType> + OperationProjection<ArrayType>,
+    <O as OperationProjection<ArrayType>>::Projected: From<PSumScatterOperation>
+        + TransposableOperation<
+            <V as ValueProjection<ArrayType>>::Projected,
+            <O as OperationProjection<ArrayType>>::Projected,
+        >,
+{
+    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TracingContext<V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        transpose_explicit_shape_changing_collective(self.clone(), context, inputs, outputs)
+    }
+}
+
+/// Direct mixed transposition for all-to-all. The array cotangent delegates to the homogeneous axis-swapped adjoint,
+/// while explicit output extents receive structural-zero cotangents.
+impl<V, O> MemberTransposableOperation<V, O> for AllToAllOperation
+where
+    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayProgramType> + OperationProjection<ArrayType>,
+    <O as OperationProjection<ArrayType>>::Projected: From<AllToAllOperation>
+        + TransposableOperation<
+            <V as ValueProjection<ArrayType>>::Projected,
+            <O as OperationProjection<ArrayType>>::Projected,
+        >,
+{
+    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TracingContext<V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        transpose_explicit_shape_changing_collective(self.clone(), context, inputs, outputs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -2941,7 +3360,7 @@ mod tests {
         ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError,
         BatchingTracer, batch,
     };
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::value_and_gradient;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::types::{ArrayProgramType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
@@ -4032,6 +4451,67 @@ mod tests {
         assert!(matches!(transposed_twice.instructions()[0].operation(), ArrayOperation::AllToAll(_)));
         assert_eq!(transposed_twice.input_types(), program.input_types());
         assert_eq!(transposed_twice.output_types(), program.output_types());
+    }
+
+    #[test]
+    fn test_explicit_shape_changing_collective_member_transforms() -> Result<(), ProgramError> {
+        type Context = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+
+        // A live tangent through a dynamically shaped mixed collective stages one residual-aware linear call directly
+        // through the payload's member JVP rule.
+        let variable = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);
+        let dimension_type = DimensionType::new(variable.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let context = Context::new();
+        let primal = context.input(array_type.clone().into());
+        let tangent = context.input(array_type.into());
+        let extent = context.input(dimension_type.into());
+        let extent_tangent_type = extent.r#type().tangent();
+        let outputs = AllGatherOperation::new(
+            "x".to_string(),
+            1,
+            0,
+            CollectiveOptions::tiled(),
+            AllGatherOutputVariance::Varying,
+        )
+        .jvp_in_parent(
+            &context,
+            &crate::EmptyRegionDriver,
+            &[
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent))?,
+                DifferentiationDual::new(extent, MaybeZero::Zero(extent_tangent_type))?,
+            ],
+        )?;
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(_)));
+        assert!(
+            context
+                .builder()
+                .borrow()
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), ArrayProgramOperation::LinearCall(_)))
+        );
+
+        // Direct mixed transposition delegates the array contribution through the homogeneous projection and gives
+        // the explicit extent operand a structural-zero cotangent.
+        let mut context = Context::new();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
+        let output_cotangent = context.input(array_type.clone().into());
+        let extent_type = DimensionValue::constant(3)?.r#type().clone();
+        let cotangents = PSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled())
+            .transpose_in_parent(
+                &mut context,
+                &crate::EmptyRegionDriver,
+                &[PartialValue::Unknown(array_type.into()), PartialValue::Unknown(extent_type.into())],
+                &[MaybeZero::Value(output_cotangent)],
+            )?;
+        assert!(matches!(cotangents.as_slice(), [MaybeZero::Value(_), MaybeZero::Zero(_)]));
+        assert!(matches!(
+            context.builder().borrow().instructions()[0].operation(),
+            ArrayProgramOperation::Array(ArrayOperation::AllGather(_)),
+        ));
+
+        Ok(())
     }
 
     #[test]

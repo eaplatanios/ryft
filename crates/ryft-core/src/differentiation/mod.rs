@@ -78,7 +78,8 @@
 //! context and preserve symbolic zeros where possible. Implement [`MemberDifferentiableOperation`] when a homogeneous
 //! member operation needs values from its projection's parent context while constructing its derivative. Ordinary
 //! homogeneous projected rules should use [`jvp_projected_operation`]. Implement [`TransposableOperation`] for linear
-//! primitives that may occur in a pushforward. Higher-order [`Operation`](crate::Operation) logic belongs with the
+//! primitives that may occur in a homogeneous pushforward and [`MemberTransposableOperation`] when a member payload's
+//! parent instruction has a mixed signature. Higher-order [`Operation`](crate::Operation) logic belongs with the
 //! operation whose instruction attaches to the nested [`Region`](crate::Region). Wrapper operation enums should
 //! provide family dispatch and forward to those payload rules.
 
@@ -118,9 +119,10 @@ pub use jacobian::{
 };
 pub use linear::{LinearCallBatchingPolicy, LinearCallOperation, ResidualZeroProvider};
 pub use reverse::{
-    Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, gradient, gradient_holomorphic,
-    gradient_holomorphic_with_aux, gradient_with_aux, transpose_projected_operation, value_and_gradient,
-    value_and_gradient_holomorphic, value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
+    MemberTransposableOperation, Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver,
+    gradient, gradient_holomorphic, gradient_holomorphic_with_aux, gradient_with_aux, transpose_projected_operation,
+    value_and_gradient, value_and_gradient_holomorphic, value_and_gradient_holomorphic_with_aux,
+    value_and_gradient_with_aux, vjp,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
 

@@ -15,6 +15,8 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - For `Result` success paths, prefer `assert_eq!(operation(), Ok(expected))` when the expected value is stable.
 - For error paths, assert the concrete error variant and `ryft`-owned message text.
 - Await asynchronous transfer, copy, execution, or callback completion before asserting final state or output contents.
+- When replacing a directly tested helper with another helper, retain direct owner-module coverage for the replacement
+  instead of relying only on downstream tests that exercise it incidentally.
 - Reuse shared crate test helpers instead of recreating client, plugin, context, backend, or fixture setup.
 - Keep tests flat and readable; extract helpers only when they encode a repeated semantic testing contract.
 - When testing a later-stage validation error, keep earlier-stage fixtures well-formed unless malformed construction
