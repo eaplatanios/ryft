@@ -8,6 +8,10 @@
 
 use std::fmt::{Debug, Display};
 
+use crate::axes::Axis;
+use crate::backends::array_programs::ArrayProgramValue;
+use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, align_array_batch};
+use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, ProgramBatchingOutputAxesPolicy,
@@ -21,9 +25,10 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperationProvider};
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
+use crate::operations::dimensions::DimensionSizeOperation;
 use crate::operations::manipulation::{
-    LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Reshape, Slice, SliceOperation, Transpose,
-    TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Reshape, Slice,
+    SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -34,11 +39,11 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::{AtomId, MaybeZero};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRef, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
 
@@ -2045,6 +2050,159 @@ pub(crate) fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
         Some(axis) if axis.value() == 0 => BatchAxis::new(0),
         Some(axis) => BatchAxis::new(axis.value() - 1),
         None => BatchAxis::replicated(),
+    }
+}
+
+/// Composite array-program batching rule for [`ScanOperation`].
+///
+/// The rule carries the mapped extent as leading replicated state in the transformed scan. Array carries use the
+/// same monotonic mapped-axis fixed point as homogeneous scans, while first-class dimension carries remain
+/// replicated. Stacked inputs and outputs are necessarily arrays because one shared dimension value cannot represent
+/// a different stacked extent for each batch item.
+impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ScanOperation<ArrayProgramValue<A>>
+where
+    A: Value<Type = ArrayType>,
+    C: Context<
+            Type = ArrayProgramType,
+            Operation: From<BroadcastOperation>
+                           + From<DimensionOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + From<ScanOperation<ArrayProgramValue<A>>>
+                           + OperationProjection<ArrayType>,
+        >,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
+{
+    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayProgramBatching>,
+        driver: &D,
+        inputs: &[ArrayProgramBatch<C::Value>],
+    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        let body = driver.region(0)?;
+        let (scan_inputs, runtime_length) = if self.length().variable().is_some() {
+            let Some((runtime_length, scan_inputs)) = inputs.split_last() else {
+                return Err(
+                    ProgramError::InvalidInputCount { expected: body.input_types().len() + 1, actual: 0 }.into()
+                );
+            };
+            runtime_length.validate_replicated_dimension()?;
+            (scan_inputs, Some(runtime_length))
+        } else {
+            (inputs, None)
+        };
+        check_count!("input", scan_inputs, body.input_types().len(), ProgramError);
+        let carry_count = self.carry_count();
+
+        // Canonicalize mapped array carries to the leading axis. Dimension carries remain replicated.
+        let mut carries = scan_inputs[..carry_count]
+            .iter()
+            .cloned()
+            .map(|input| match input.unbatched_type() {
+                ArrayProgramType::Array(_) if !input.batch_axis().is_replicated() => {
+                    align_array_batch(context, input, Axis::from(0))
+                }
+                ArrayProgramType::Array(_) => Ok(input),
+                ArrayProgramType::Dimension(_) => {
+                    input.validate_replicated_dimension()?;
+                    Ok(input)
+                }
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()?;
+        let stacks = scan_inputs[carry_count..]
+            .iter()
+            .cloned()
+            .map(|input| {
+                <&ArrayType>::try_from(input.unbatched_type())?;
+                if input.batch_axis_position() == Some(0) {
+                    align_array_batch(context, input, Axis::from(1))
+                } else {
+                    Ok(input)
+                }
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()?;
+        let mut carry_axes = carries.iter().map(ArrayProgramBatch::batch_axis).collect::<Vec<_>>();
+        let slice_axes = stacks.iter().map(|stack| scan_iteration_batch_axis(stack.batch_axis())).collect::<Vec<_>>();
+
+        // Iterate carry axes to a fixed point. A first-class dimension cannot widen because composite batching does
+        // not admit mapped dimension values.
+        let mut output_slice_axes = None;
+        for _ in 0..=carry_count {
+            let iteration_axes = carry_axes.iter().chain(slice_axes.iter()).copied().collect::<Vec<_>>();
+            let candidate = driver.batch_program(
+                context,
+                body,
+                iteration_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )?;
+            check_count!("output", candidate.output_axes(), body.output_types().len(), ProgramError);
+            let mut widened = false;
+            for (index, (carry_axis, output_axis)) in
+                carry_axes.iter_mut().zip(candidate.output_axes().iter()).enumerate()
+            {
+                if carry_axis.is_replicated() && !output_axis.is_replicated() {
+                    if matches!(scan_inputs[index].unbatched_type(), ArrayProgramType::Dimension(_)) {
+                        return Err(BatchingError::MappedDimension {
+                            r#type: Box::new(<&DimensionType>::try_from(scan_inputs[index].unbatched_type())?.clone()),
+                            axis: *output_axis,
+                        });
+                    }
+                    *carry_axis = BatchAxis::new(0);
+                    widened = true;
+                }
+            }
+            if !widened {
+                output_slice_axes = Some(candidate.output_axes()[carry_count..].to_vec());
+                break;
+            }
+        }
+        let Some(output_slice_axes) = output_slice_axes else {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "scan batching failed to stabilize the carry batch axes within {carry_count} widening passes",
+                ),
+            });
+        };
+
+        let iteration_axes = carry_axes.iter().chain(slice_axes.iter()).copied().collect::<Vec<_>>();
+        let target_axes = carry_axes.iter().chain(output_slice_axes.iter()).copied().collect::<Vec<_>>();
+        let (batched_body, _) = driver
+            .batch_program(
+                context,
+                body,
+                iteration_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(target_axes),
+            )?
+            .into_parts();
+        for (carry, axis) in carries.iter_mut().zip(carry_axes.iter()) {
+            if !axis.is_replicated() && carry.batch_axis().is_replicated() {
+                *carry = align_array_batch(context, carry.clone(), Axis::from(0))?;
+            }
+        }
+
+        let batched_scan = ScanOperation::<ArrayProgramValue<A>>::new(carry_count + 1, self.length())
+            .with_reverse(self.reverse())
+            .with_unroll(self.unroll())?
+            .with_captures(self.captures().to_vec());
+        let mut packed_inputs = Vec::with_capacity(inputs.len() + 1);
+        packed_inputs.push(context.axis_extent().clone());
+        packed_inputs.extend(carries.iter().map(|carry| carry.value().clone()));
+        packed_inputs.extend(stacks.iter().map(|stack| stack.value().clone()));
+        packed_inputs.extend(runtime_length.map(|runtime_length| runtime_length.value().clone()));
+        let mut outputs = context.parent().bind(batched_scan, vec![batched_body], packed_inputs.as_slice())?;
+        check_count!("output", outputs, 1 + carry_count + output_slice_axes.len(), ProgramError);
+        outputs.remove(0);
+        let mut output_axes = carry_axes;
+        output_axes.extend(output_slice_axes.iter().map(|axis| match axis.axis() {
+            Some(axis) => BatchAxis::new(axis.value() + 1),
+            None => BatchAxis::replicated(),
+        }));
+        outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| ArrayProgramBatch::new(output, axis))
+            .collect()
     }
 }
 

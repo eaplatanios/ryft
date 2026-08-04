@@ -32,7 +32,6 @@ use crate::operations::collectives::{
     infer_explicit_psum_scatter_output_types,
 };
 use crate::operations::constants::{ConstantOperation, OneOperation, Zero, ZeroOperation};
-use crate::operations::control_flow::scan::scan_iteration_batch_axis;
 use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
 use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::dimensions::{
@@ -112,7 +111,7 @@ impl<V: Value<Type = ArrayProgramType>> ArrayProgramBatch<V> {
     }
 
     /// Returns the canonical nonnegative mapped-axis position for an array member, or `None` for a replicated member.
-    fn batch_axis_position(&self) -> Option<usize> {
+    pub(crate) fn batch_axis_position(&self) -> Option<usize> {
         let value_type = self.value.r#type();
         let r#type = <&ArrayType>::try_from(value_type.as_ref()).ok()?;
         self.batch_axis.axis().map(|axis| axis.normalize(r#type.rank()).unwrap())
@@ -1145,143 +1144,6 @@ where
     }
 }
 
-/// Batches a composite scan by carrying the mapped extent as its leading replicated state value.
-fn batch_scan<A, C, D>(
-    operation: &ScanOperation<ArrayProgramValue<A>>,
-    context: &BatchingContext<C, ArrayProgramBatching>,
-    driver: &D,
-    inputs: &[ArrayProgramBatch<C::Value>],
-) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError>
-where
-    A: Value<Type = ArrayType>,
-    C: Context<
-            Type = ArrayProgramType,
-            Operation: From<BroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + From<ScanOperation<ArrayProgramValue<A>>>
-                           + OperationProjection<ArrayType>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
-    D: BatchingDriver<C, ArrayProgramBatching>,
-{
-    let body = driver.region(0)?;
-    let (scan_inputs, runtime_length) = if operation.length().variable().is_some() {
-        let Some((runtime_length, scan_inputs)) = inputs.split_last() else {
-            return Err(ProgramError::InvalidInputCount { expected: body.input_types().len() + 1, actual: 0 }.into());
-        };
-        runtime_length.validate_replicated_dimension()?;
-        (scan_inputs, Some(runtime_length))
-    } else {
-        (inputs, None)
-    };
-    check_count!("input", scan_inputs, body.input_types().len(), ProgramError);
-    let carry_count = operation.carry_count();
-
-    let mut carries = scan_inputs[..carry_count]
-        .iter()
-        .cloned()
-        .map(|input| match input.unbatched_type() {
-            ArrayProgramType::Array(_) if !input.batch_axis().is_replicated() => {
-                align_array_batch(context, input, Axis::from(0))
-            }
-            ArrayProgramType::Array(_) => Ok(input),
-            ArrayProgramType::Dimension(_) => {
-                input.validate_replicated_dimension()?;
-                Ok(input)
-            }
-        })
-        .collect::<Result<Vec<_>, BatchingError>>()?;
-    let stacks = scan_inputs[carry_count..]
-        .iter()
-        .cloned()
-        .map(|input| {
-            <&ArrayType>::try_from(input.unbatched_type())?;
-            if input.batch_axis_position() == Some(0) {
-                align_array_batch(context, input, Axis::from(1))
-            } else {
-                Ok(input)
-            }
-        })
-        .collect::<Result<Vec<_>, BatchingError>>()?;
-    let mut carry_axes = carries.iter().map(ArrayProgramBatch::batch_axis).collect::<Vec<_>>();
-    let slice_axes = stacks.iter().map(|stack| scan_iteration_batch_axis(stack.batch_axis())).collect::<Vec<_>>();
-
-    let mut y_axes = None;
-    for _ in 0..=carry_count {
-        let iteration_axes = carry_axes.iter().chain(slice_axes.iter()).copied().collect::<Vec<_>>();
-        let candidate =
-            driver.batch_program(context, body, iteration_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
-        check_count!("output", candidate.output_axes(), body.output_types().len(), ProgramError);
-        let mut widened = false;
-        for (index, (carry_axis, output_axis)) in carry_axes.iter_mut().zip(candidate.output_axes().iter()).enumerate()
-        {
-            if carry_axis.is_replicated() && !output_axis.is_replicated() {
-                if matches!(scan_inputs[index].unbatched_type(), ArrayProgramType::Dimension(_)) {
-                    return Err(BatchingError::MappedDimension {
-                        r#type: Box::new(<&DimensionType>::try_from(scan_inputs[index].unbatched_type())?.clone()),
-                        axis: *output_axis,
-                    });
-                }
-                *carry_axis = BatchAxis::new(0);
-                widened = true;
-            }
-        }
-        if !widened {
-            y_axes = Some(candidate.output_axes()[carry_count..].to_vec());
-            break;
-        }
-    }
-    let Some(y_axes) = y_axes else {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "scan batching failed to stabilize the carry batch axes within {carry_count} widening passes",
-            ),
-        });
-    };
-
-    let iteration_axes = carry_axes.iter().chain(slice_axes.iter()).copied().collect::<Vec<_>>();
-    let target_axes = carry_axes.iter().chain(y_axes.iter()).copied().collect::<Vec<_>>();
-    let (batched_body, _) = driver
-        .batch_program(
-            context,
-            body,
-            iteration_axes.as_slice(),
-            ProgramBatchingOutputAxesPolicy::AlignEachTo(target_axes),
-        )?
-        .into_parts();
-    for (carry, axis) in carries.iter_mut().zip(carry_axes.iter()) {
-        if !axis.is_replicated() && carry.batch_axis().is_replicated() {
-            *carry = align_array_batch(context, carry.clone(), Axis::from(0))?;
-        }
-    }
-
-    let batched_scan = ScanOperation::<ArrayProgramValue<A>>::new(carry_count + 1, operation.length())
-        .with_reverse(operation.reverse())
-        .with_unroll(operation.unroll())?
-        .with_captures(operation.captures().to_vec());
-    let mut packed_inputs = Vec::with_capacity(inputs.len() + 1);
-    packed_inputs.push(context.axis_extent().clone());
-    packed_inputs.extend(carries.iter().map(|carry| carry.value().clone()));
-    packed_inputs.extend(stacks.iter().map(|stack| stack.value().clone()));
-    packed_inputs.extend(runtime_length.map(|runtime_length| runtime_length.value().clone()));
-    let mut outputs = context.parent().bind(batched_scan, vec![batched_body], packed_inputs.as_slice())?;
-    check_count!("output", outputs, 1 + carry_count + y_axes.len(), ProgramError);
-    outputs.remove(0);
-    let mut output_axes = carry_axes;
-    output_axes.extend(y_axes.iter().map(|axis| match axis.axis() {
-        Some(axis) => BatchAxis::new(axis.value() + 1),
-        None => BatchAxis::replicated(),
-    }));
-    outputs
-        .into_iter()
-        .zip(output_axes)
-        .map(|(output, axis)| ArrayProgramBatch::new(output, axis))
-        .collect()
-}
-
 /// Validates the mixed collective operand structure and returns its array operand and complete logical output extents.
 fn explicit_collective_inputs<V: Value<Type = ArrayProgramType>>(
     inputs: &[ArrayProgramBatch<V>],
@@ -2002,7 +1864,7 @@ where
             }
             Self::Condition(operation) => operation.batch(context, driver, inputs),
             Self::While(operation) => operation.batch(context, driver, inputs),
-            Self::Scan(operation) => batch_scan(operation, context, driver, inputs),
+            Self::Scan(operation) => operation.batch(context, driver, inputs),
             Self::Array(operation) => batch_projected_operation(context, operation, inputs),
             Self::Dimension(operation) => batch_projected_operation(context, operation, inputs),
             Self::Compare(_) => {
