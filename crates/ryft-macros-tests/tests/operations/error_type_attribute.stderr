@@ -1,5 +1,5 @@
-error: invalid '#[ryft(...)]' attribute: 'type'; these are the attributes that are supported here: [Symbol("crate"), Symbol("dispatch")]
-  --> tests/operations/error_type_attribute.rs:10:8
+error: explicit operation-family declarations must specify both 'type' and 'constant'
+  --> tests/operations/error_type_attribute.rs:11:6
    |
-10 | #[ryft(type = "DataType")]
-   |        ^^^^
+11 | enum BadOperation<V: Value<Type = DataType>> {
+   |      ^^^^^^^^^^^^

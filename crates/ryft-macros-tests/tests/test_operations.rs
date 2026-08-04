@@ -3,14 +3,17 @@
 //! These tests define local stand-in traits and types that mirror the shapes the derives emit against. That keeps the
 //! macro tests focused on generated code rather than on the current `ryft-core` implementation details. The fixtures
 //! and tests are grouped and ordered by the traits the derives generate: [`Operation`] together with its
-//! [`InterpretableOperation`] and [`PartiallyEvaluatableOperation`](partial::PartiallyEvaluatableOperation)
-//! companions, then [`BatchableOperation`], [`DifferentiableOperation`], and [`TransposableOperation`].
+//! [`InterpretableOperation`] and [`PartiallyEvaluatableOperation`] companions, then [`BatchableOperation`],
+//! [`DifferentiableOperation`], and [`TransposableOperation`].
 
 #![allow(private_interfaces, dead_code)]
 
 use std::marker::PhantomData;
 
-use self::partial::PartialValue;
+pub(crate) use self::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation,
+};
 
 /// Stand-in for `ryft_core::TypeIdentity`.
 trait TypeIdentity: Clone {}
@@ -41,9 +44,20 @@ trait Type: Clone {
 /// Stand-in for `ryft_core::DifferentiableType`.
 trait DifferentiableType: Type {}
 
-/// Stand-in for `ryft_core::TypeError`.
+/// Stand-in for `ryft_core::TypeError`. The stand-in keeps the diagnostic message so that generated conversion
+/// diagnostics can be asserted exactly.
 #[derive(Debug, PartialEq, Eq)]
-struct TypeError;
+struct TypeError {
+    /// Diagnostic message describing the invalid type contract.
+    message: String,
+}
+
+impl TypeError {
+    /// Stand-in for `ryft_core::TypeError::invalid`.
+    fn invalid<M: Into<String>>(message: M) -> Self {
+        Self { message: message.into() }
+    }
+}
 
 /// Stand-in for `ryft_core::ProgramError`.
 #[derive(Debug, PartialEq, Eq)]
@@ -283,6 +297,16 @@ trait Operation: Clone {
         formatter.write_str(self.name())
     }
 }
+
+/// Stand-in for `ryft_core::OperationProjection`.
+trait OperationProjection<T: Type>: Operation + From<Self::Projected> {
+    type Projected: Operation<Type = T>;
+}
+
+/// Stand-in for the operation-family capability used to construct typed structural zeros.
+trait ZeroOperationProvider<T: Type>: Operation<Type = T> {}
+
+impl<T: Type, O: Operation<Type = T>> ZeroOperationProvider<T> for O {}
 
 /// Infers projected region input types using the same contract as `ryft_core`'s derive support helper.
 fn infer_projected_operation_region_input_types<T: Type, U: Type, O: Operation<Type = T>>(
@@ -577,8 +601,7 @@ where
     }
 }
 
-/// Stand-in for the `ryft_core::partial` module, mirroring the shapes the `Operation` derive emits against for the
-/// generated `PartiallyEvaluatableOperation` implementation.
+/// Stand-ins for partial-evaluation machinery re-exported through the test crate's root facade.
 mod partial {
     use super::{Context, Operation, PhantomData, Program, ProgramError, Value};
 
@@ -629,7 +652,7 @@ mod partial {
 
     /// Stand-in for `ryft_core::partial::PartialEvaluationDriver`.
     pub(crate) trait PartialEvaluationDriver<C: Context> {
-        fn regions(&self) -> Result<Vec<RegionRef<C::Constant, C::Operation>>, ProgramError>;
+        fn regions(&self) -> Vec<RegionRef<C::Constant, C::Operation>>;
     }
 
     /// Stand-in for `ryft_core::partial::PartiallyEvaluatableOperation`.
@@ -647,8 +670,8 @@ mod partial {
 }
 
 impl<C: Context> partial::PartialEvaluationDriver<C> for EmptyRegionDriver {
-    fn regions(&self) -> Result<Vec<partial::RegionRef<C::Constant, C::Operation>>, ProgramError> {
-        Ok(Vec::new())
+    fn regions(&self) -> Vec<partial::RegionRef<C::Constant, C::Operation>> {
+        Vec::new()
     }
 }
 
@@ -734,18 +757,18 @@ impl<const MEMBER: u8> Value for ProjectedMemberValue<MEMBER> {
 
 /// Composite value containing the same two member kinds as [`ProjectedProgramType`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ProjectedProgramValue {
-    First(ProjectedMemberValue<0>),
+enum ProjectedProgramValue<A: Value<Type = ProjectedMemberType<0>> = ProjectedMemberValue<0>> {
+    First(A),
     Third(ProjectedMemberValue<2>),
 }
 
-impl Value for ProjectedProgramValue {
+impl<A: Value<Type = ProjectedMemberType<0>>> Value for ProjectedProgramValue<A> {
     type Type = ProjectedProgramType;
 }
 
 macro_rules! impl_projected_test_member {
     // Generates the type and value projection vocabulary for one test-only composite member.
-    ($member:literal, $variant:ident) => {
+    ($member:literal, $variant:ident, $projected:ty) => {
         impl From<ProjectedMemberType<$member>> for ProjectedProgramType {
             fn from(r#type: ProjectedMemberType<$member>) -> Self {
                 Self::$variant(r#type)
@@ -758,13 +781,15 @@ macro_rules! impl_projected_test_member {
             fn try_from(r#type: &'t ProjectedProgramType) -> Result<Self, Self::Error> {
                 match r#type {
                     ProjectedProgramType::$variant(r#type) => Ok(r#type),
-                    _ => Err(TypeError),
+                    _ => Err(TypeError::invalid("wrong projected member type")),
                 }
             }
         }
 
-        impl ValueProjection<ProjectedMemberType<$member>> for ProjectedProgramValue {
-            type Projected = ProjectedMemberValue<$member>;
+        impl<A: Value<Type = ProjectedMemberType<0>>> ValueProjection<ProjectedMemberType<$member>>
+            for ProjectedProgramValue<A>
+        {
+            type Projected = $projected;
 
             fn from_projected(value: Self::Projected) -> Self {
                 Self::$variant(value)
@@ -773,15 +798,15 @@ macro_rules! impl_projected_test_member {
             fn into_projected(self) -> Result<Self::Projected, TypeError> {
                 match self {
                     Self::$variant(value) => Ok(value),
-                    _ => Err(TypeError),
+                    _ => Err(TypeError::invalid("wrong projected member value")),
                 }
             }
         }
     };
 }
 
-impl_projected_test_member!(0, First);
-impl_projected_test_member!(2, Third);
+impl_projected_test_member!(0, First, A);
+impl_projected_test_member!(2, Third, ProjectedMemberValue<2>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TranspositionFactor(i64);
@@ -1133,34 +1158,43 @@ impl<const MEMBER: u8>
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
-#[ryft(crate = "crate")]
-enum ProjectedProgramOperation<V: Value<Type = ProjectedProgramType>> {
+#[ryft(
+    crate = "crate",
+    type = ProjectedProgramType,
+    constant = ProjectedProgramValue<A>,
+)]
+enum ProjectedProgramOperation<A: Value<Type = ProjectedMemberType<0>>> {
     #[ryft(projected(ProjectedMemberType<0>))]
     First(ProjectedMemberOperation<0>),
 
-    #[ryft(projected(ProjectedMemberType<2>))]
+    #[ryft(projected(ProjectedMemberType<2>, structural))]
     Third(ProjectedMemberOperation<2>),
 
-    Constant(ConstantOperation<ProjectedProgramType, V>),
+    Constant(ConstantOperation<ProjectedProgramType, ProjectedProgramValue<A>>),
 }
 
 #[test]
 fn test_operation_generates_projected_member_dispatch() {
     use partial::PartiallyEvaluatableOperation as _;
 
-    type Operation = ProjectedProgramOperation<ProjectedProgramValue>;
-    type Context = EagerContext<ProjectedProgramValue, Operation>;
+    type Value = ProjectedProgramValue<ProjectedMemberValue<0>>;
+    type Operation = ProjectedProgramOperation<ProjectedMemberValue<0>>;
+    type Context = EagerContext<Value, Operation>;
 
     let first = Operation::from(ProjectedMemberOperation::<0>);
     let third = Operation::from(ProjectedMemberOperation::<2>);
     let first_type = ProjectedProgramType::First(ProjectedMemberType);
     let third_type = ProjectedProgramType::Third(ProjectedMemberType);
 
-    // Base operation metadata and inference project to each declared member type and lift results back.
+    // Base operation metadata and inference project both computational and structural members to their declared type
+    // and lift results back into the composite family.
     assert_eq!(first.name(), "projected");
     assert_eq!(first.to_string(), "projected");
     assert_eq!(first.infer_output_types(std::slice::from_ref(&first_type), &[]), Ok(vec![first_type.clone()]));
-    assert_eq!(first.infer_output_types(std::slice::from_ref(&third_type), &[]), Err(TypeError));
+    assert_eq!(
+        first.infer_output_types(std::slice::from_ref(&third_type), &[]),
+        Err(TypeError::invalid("wrong projected member type")),
+    );
     assert_eq!(
         first.infer_region_input_types(std::slice::from_ref(&first_type), &[RegionInterface::new()]),
         Ok(vec![None]),
@@ -1181,9 +1215,13 @@ fn test_operation_generates_projected_member_dispatch() {
     let partial_context = partial::PartialEvaluationContext::new(Context { marker: PhantomData });
     assert!(third.partially_evaluate(&partial_context, &EmptyRegionDriver, &[]).unwrap().is_empty());
 
-    // Concrete member payload conversions retain their variant identity.
+    // Concrete member payload conversions retain their variant identity, and a wrong-payload projection reports the
+    // canonical conversion diagnostic naming both the stored operation and the expected payload type.
     assert_eq!(<&ProjectedMemberOperation<0>>::try_from(&first), Ok(&ProjectedMemberOperation));
-    assert_eq!(<&ProjectedMemberOperation<2>>::try_from(&first), Err(()));
+    assert_eq!(
+        <&ProjectedMemberOperation<2>>::try_from(&first),
+        Err(TypeError::invalid("cannot project operation 'projected' into a 'ProjectedMemberOperation<2>' payload")),
+    );
 }
 
 impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, F: Clone> TransposableOperation<V, O>
@@ -1297,7 +1335,10 @@ fn test_scalar_operation() {
         <&CustomJvpOperation<DataType, ScalarFactor>>::try_from(&custom_jvp),
         Ok(&CustomJvpOperation { tag: "tag", marker: PhantomData }),
     );
-    assert_eq!(<&AddOperation>::try_from(&zero), Err(()));
+    assert_eq!(
+        <&AddOperation>::try_from(&zero),
+        Err(TypeError::invalid("cannot project operation 'zero' into a 'AddOperation' payload")),
+    );
 }
 
 #[test]
@@ -1346,6 +1387,389 @@ fn test_operation_default_crate_path_is_ryft() {
         DefaultPathLinearOperation::<ryft::Scalar>::from(ryft::ZeroOperation::new(ryft::DataType::F64));
     assert_eq!(ryft::Operation::name(&operation), "zero");
     assert_eq!(ryft::Operation::name(&linear_operation), "zero");
+}
+
+/// Mixed-boundary fixtures for the declared-member machinery. Unlike the rest of this file, this module builds on the
+/// real `ryft` member vocabulary instead of stand-ins, because the mixed contracts the derive emits against
+/// ([`MemberOperation`](ryft::MemberOperation), the member zero constructor selected per output universe, and
+/// [`transpose_mixed_operation`](ryft::transpose_mixed_operation)) are defined over real member universes, and a
+/// stand-in could not pin how the real machinery classifies an interleaved operand list.
+mod mixed_members {
+    use ryft::backends::arrays::Array;
+    use ryft::{
+        ArrayProgramType, ArrayProgramValue, ArrayType, Context, DataType, DifferentiableOperation, DifferentiableType,
+        DifferentiationDriver, DifferentiationDual, Dimension, DimensionBounds, DimensionOperation, DimensionType,
+        DimensionValue, DimensionVariable, EmptyRegionDriver, MaybeZero, MemberDifferentiableOperation,
+        MemberInterpretableOperation, MemberOperation, Operation, PartialValue, ProgramError, RegionInterface, Shape,
+        StagingContext, Tracer, TracingContext, TransposableOperation, TranspositionDriver, TypeError,
+        TypeIdentityRenaming, Typed, Value, ZeroOperation, ZeroOperationProvider,
+    };
+
+    /// Member payload whose parent instruction interleaves its two array data operands with two first-class dimension
+    /// operands. No production payload arranges its operands this way, so this fixture is what pins that the generated
+    /// mixed dispatchers classify operands individually instead of splitting on the first dimension operand.
+    #[derive(Clone, Debug)]
+    struct InterleavedOperation;
+
+    impl Operation for InterleavedOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            "interleaved"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            if input_types.len() != 2 {
+                return Err(TypeError::invalid("interleaved expects two array operands"));
+            }
+            Ok(vec![input_types[0].clone()])
+        }
+    }
+
+    impl MemberOperation<ArrayProgramType> for InterleavedOperation {
+        fn infer_parent_region_input_types(
+            &self,
+            _input_types: &[ArrayProgramType],
+            region_interfaces: &[RegionInterface<ArrayProgramType>],
+        ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
+            Ok(vec![None; region_interfaces.len()])
+        }
+
+        fn infer_parent_output_types(
+            &self,
+            input_types: &[ArrayProgramType],
+            _region_interfaces: &[RegionInterface<ArrayProgramType>],
+        ) -> Result<Vec<ArrayProgramType>, TypeError> {
+            // The parent boundary is `(array, dimension, array, dimension) -> array`, so the payload's own homogeneous
+            // rule sees the two array operands and the dimension operands only select the result geometry.
+            let arrays = input_types
+                .iter()
+                .filter_map(|r#type| <&ArrayType>::try_from(r#type).ok())
+                .cloned()
+                .collect::<Vec<_>>();
+            Ok(self.infer_output_types(arrays.as_slice(), &[])?.into_iter().map(Into::into).collect())
+        }
+
+        fn rename_parent_type_identities(
+            &self,
+            _renaming: &TypeIdentityRenaming<DimensionVariable>,
+        ) -> Result<Self, TypeError> {
+            Ok(self.clone())
+        }
+    }
+
+    impl<C: Context<Type = ArrayProgramType>> MemberInterpretableOperation<C> for InterleavedOperation {
+        fn interpret_in_parent<D: ryft::InterpretationDriver<C>>(
+            &self,
+            _context: &C,
+            _driver: &D,
+            inputs: &[C::Value],
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            Ok(vec![inputs[0].clone()])
+        }
+    }
+
+    impl<C: Context<Type = ArrayProgramType, Operation: From<InterleavedOperation>>> MemberDifferentiableOperation<C>
+        for InterleavedOperation
+    {
+        fn jvp_in_parent<D: DifferentiationDriver<C>>(
+            &self,
+            context: &C,
+            _driver: &D,
+            inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, ryft::DifferentiationError> {
+            // A linear payload pushes its tangents through the same mixed instruction, keeping the geometry operands
+            // as primals.
+            let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let primal = context.bind(self.clone(), Vec::new(), primals.as_slice())?.remove(0);
+            Ok(vec![DifferentiationDual::new(primal, inputs[0].tangent().clone())?])
+        }
+    }
+
+    impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O> for InterleavedOperation {
+        fn transpose<D: TranspositionDriver<V, O>>(
+            &self,
+            _context: &mut TracingContext<V, O>,
+            _driver: &D,
+            inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+            outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ryft::DifferentiationError> {
+            // The homogeneous rule sees exactly the two array data operands and forwards the output cotangent to each
+            // one that is linear in the transposed program.
+            if inputs.len() != 2 || outputs.len() != 1 {
+                return Err(ProgramError::InvalidArgument {
+                    message: "interleaved transposition expects two operands and one output".to_string(),
+                }
+                .into());
+            }
+            Ok(inputs
+                .iter()
+                .map(|input| match input {
+                    PartialValue::Unknown(_) => outputs[0].clone(),
+                    PartialValue::Known(_) => MaybeZero::Zero(input.r#type().cotangent()),
+                })
+                .collect())
+        }
+    }
+
+    /// Structural member payload whose parent instruction produces one array output and one first-class dimension
+    /// output, so its generated forward-mode arm must select a zero tangent universe per output instead of assuming
+    /// that every output belongs to the family's computational member.
+    #[derive(Clone, Debug)]
+    struct MixedUniverseConstructorOperation {
+        /// Array output type of the constructed instruction.
+        r#type: ArrayType,
+
+        /// First-class dimension output type of the constructed instruction.
+        dimension_type: DimensionType,
+    }
+
+    impl Operation for MixedUniverseConstructorOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            "mixed_universe_constructor"
+        }
+
+        fn infer_output_types(
+            &self,
+            _input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            Ok(vec![self.r#type.clone()])
+        }
+    }
+
+    impl MemberOperation<ArrayProgramType> for MixedUniverseConstructorOperation {
+        fn infer_parent_region_input_types(
+            &self,
+            _input_types: &[ArrayProgramType],
+            region_interfaces: &[RegionInterface<ArrayProgramType>],
+        ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
+            Ok(vec![None; region_interfaces.len()])
+        }
+
+        fn infer_parent_output_types(
+            &self,
+            _input_types: &[ArrayProgramType],
+            _region_interfaces: &[RegionInterface<ArrayProgramType>],
+        ) -> Result<Vec<ArrayProgramType>, TypeError> {
+            Ok(vec![self.r#type.clone().into(), self.dimension_type.clone().into()])
+        }
+
+        fn rename_parent_type_identities(
+            &self,
+            _renaming: &TypeIdentityRenaming<DimensionVariable>,
+        ) -> Result<Self, TypeError> {
+            Ok(self.clone())
+        }
+    }
+
+    impl<C: Context<Type = ArrayProgramType>> MemberInterpretableOperation<C> for MixedUniverseConstructorOperation {
+        fn interpret_in_parent<D: ryft::InterpretationDriver<C>>(
+            &self,
+            _context: &C,
+            _driver: &D,
+            _inputs: &[C::Value],
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            Err(ProgramError::UnsupportedOperation {
+                message: "mixed_universe_constructor has no eager semantics".to_string(),
+            })
+        }
+    }
+
+    impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O>
+        for MixedUniverseConstructorOperation
+    {
+        fn transpose<D: TranspositionDriver<V, O>>(
+            &self,
+            _context: &mut TracingContext<V, O>,
+            _driver: &D,
+            inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+            _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ryft::DifferentiationError> {
+            Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect())
+        }
+    }
+
+    /// Homogeneous array member family of [`MixedProgramOperation`], which is the family every projected boundary and
+    /// every delegated mixed transpose rule runs in.
+    #[derive(Clone, Debug, ryft::Operation)]
+    #[ryft(dispatch(transposition))]
+    enum MixedMemberOperation<V: Value<Type = ArrayType>> {
+        /// Member zero constructor, which is also the tangent constructor the family's structural mixed arm stages.
+        Zero(ZeroOperation<ArrayType>),
+
+        /// Member view of the interleaved mixed payload, which owns its homogeneous transpose rule.
+        Interleaved(InterleavedOperation),
+
+        /// Member view of the structural mixed constructor.
+        MixedUniverseConstructor(MixedUniverseConstructorOperation),
+
+        /// Member constant, which is what ties this family to its flowing value type.
+        Constant(ryft::ConstantOperation<V>),
+    }
+
+    /// Operation family with two declared member universes: computational arrays and structural first-class
+    /// dimensions. Its mixed variants take their data universe from that declaration instead of naming it.
+    #[derive(Clone, Debug, ryft::Operation)]
+    #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+    #[ryft(members(ArrayType, structural(DimensionType)))]
+    #[ryft(dispatch(differentiation, transposition))]
+    enum MixedProgramOperation<A: Value<Type = ArrayType>> {
+        /// Computational mixed payload whose parent instruction interleaves array and dimension operands.
+        #[ryft(mixed)]
+        Interleaved(InterleavedOperation),
+
+        /// Structural mixed payload whose parent outputs span both declared member universes.
+        #[ryft(mixed(structural))]
+        MixedUniverseConstructor(MixedUniverseConstructorOperation),
+
+        /// Homogeneous array member family, which is also this family's canonical array projection.
+        #[ryft(projected(ArrayType))]
+        Array(MixedMemberOperation<A>),
+
+        /// Homogeneous first-class-dimension member family.
+        #[ryft(projected(DimensionType, structural))]
+        Dimension(DimensionOperation<DimensionValue>),
+    }
+
+    impl<A, C> MemberDifferentiableOperation<C> for MixedMemberOperation<A>
+    where
+        A: Value<Type = ArrayType>,
+        C: Context<Type = ArrayProgramType, Operation: From<MixedMemberOperation<A>>>,
+    {
+        fn jvp_in_parent<D: DifferentiationDriver<C>>(
+            &self,
+            context: &C,
+            _driver: &D,
+            inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, ryft::DifferentiationError> {
+            // The fixture's member family is only the projection target of this operation family, so its
+            // parent-universe rule stages the member instruction and reports constant outputs.
+            let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            Ok(context
+                .bind(self.clone(), Vec::new(), primals.as_slice())?
+                .into_iter()
+                .map(DifferentiationDual::new_with_zero_tangent)
+                .collect())
+        }
+    }
+
+    impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for MixedProgramOperation<A> {
+        fn from(operation: ZeroOperation<ArrayType>) -> Self {
+            Self::Array(MixedMemberOperation::Zero(operation))
+        }
+    }
+
+    impl<A: Value<Type = ArrayType>> ZeroOperationProvider<ArrayProgramType> for MixedProgramOperation<A> {
+        fn zero_operation(r#type: ArrayProgramType) -> Result<Self, ProgramError> {
+            Ok(Self::from(ZeroOperation::new(<&ArrayType>::try_from(&r#type)?.clone())))
+        }
+    }
+
+    /// Returns the fixture's array member type together with the first-class dimension member type its mixed
+    /// instructions consume and produce. The array type is static because reconstructing a mixed instruction from type
+    /// metadata alone requires that its geometry not live in runtime identity references.
+    fn fixture_types() -> (ArrayType, DimensionType) {
+        let dimension_type =
+            DimensionType::new(DimensionVariable::new("items", DimensionBounds::new(1, Some(8)).unwrap()));
+        (ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])), dimension_type)
+    }
+
+    #[test]
+    fn test_operation_generates_declared_member_mixed_dispatch() {
+        type Operation = MixedProgramOperation<Array>;
+
+        // A bare `mixed` marker declares the same computational data universe the family declares, so base inference
+        // still runs through the payload's parent boundary and accepts the interleaved operand arrangement.
+        let (array_type, dimension_type) = fixture_types();
+        let operation = Operation::from(InterleavedOperation);
+        assert_eq!(operation.name(), "interleaved");
+        assert_eq!(
+            operation.infer_output_types(
+                &[
+                    array_type.clone().into(),
+                    dimension_type.clone().into(),
+                    array_type.clone().into(),
+                    dimension_type.clone().into(),
+                ],
+                &[],
+            ),
+            Ok(vec![array_type.clone().into()]),
+        );
+
+        // Transposing that interleaved instruction delegates the array operands, in operand order, to the payload's
+        // homogeneous rule and gives each interleaved dimension operand a structural zero cotangent.
+        let mut context = TracingContext::<ArrayProgramValue<Array>, Operation>::new();
+        let output_cotangent = context.input(array_type.clone().into());
+        let cotangents = operation
+            .transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &[
+                    PartialValue::Unknown(array_type.clone().into()),
+                    PartialValue::Unknown(dimension_type.clone().into()),
+                    PartialValue::Unknown(array_type.clone().into()),
+                    PartialValue::Unknown(dimension_type.clone().into()),
+                ],
+                &[MaybeZero::Value(output_cotangent.clone())],
+            )
+            .unwrap();
+        let [
+            MaybeZero::Value(first_cotangent),
+            MaybeZero::Zero(second_cotangent_type),
+            MaybeZero::Value(third_cotangent),
+            MaybeZero::Zero(fourth_cotangent_type),
+        ] = cotangents.as_slice()
+        else {
+            panic!("interleaved mixed transposition must classify each operand: {cotangents:?}");
+        };
+        assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
+        assert_eq!(third_cotangent.atom_id(), output_cotangent.atom_id());
+        let dimension_cotangent_type = ArrayProgramType::from(dimension_type).cotangent();
+        assert_eq!(second_cotangent_type, &dimension_cotangent_type);
+        assert_eq!(fourth_cotangent_type, &dimension_cotangent_type);
+    }
+
+    #[test]
+    fn test_operation_generates_structural_mixed_tangents_per_output_universe() {
+        type Operation = MixedProgramOperation<Array>;
+
+        // A structural mixed payload stages its primal and one zero tangent per output. The array output's tangent is
+        // staged in the computational member universe, while the first-class dimension output has a zero differential
+        // space and therefore receives a structural zero tangent with no staged instruction.
+        let (array_type, dimension_type) = fixture_types();
+        let operation = Operation::from(MixedUniverseConstructorOperation {
+            r#type: array_type.clone(),
+            dimension_type: dimension_type.clone(),
+        });
+        let context = TracingContext::<ArrayProgramValue<Array>, Operation>::new();
+        let duals = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
+
+        assert_eq!(duals.len(), 2);
+        assert_eq!(duals[0].primal().r#type().as_ref(), &ArrayProgramType::from(array_type.clone()));
+        assert_eq!(duals[1].primal().r#type().as_ref(), &ArrayProgramType::from(dimension_type.clone()));
+        let MaybeZero::Value(array_tangent) = duals[0].tangent() else {
+            panic!("an array output of a structural mixed payload stages a member zero tangent: {duals:?}");
+        };
+        assert_eq!(array_tangent.r#type().as_ref(), &ArrayProgramType::from(array_type.tangent()));
+        assert!(matches!(duals[1].tangent(), MaybeZero::Zero(_)));
+
+        // The staged program holds the primal instruction plus exactly one staged array zero tangent.
+        let names = context
+            .builder()
+            .borrow()
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["mixed_universe_constructor", "zero"]);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1798,7 +2222,10 @@ fn test_linear_array_operation_shape() {
         ),
         Ok(&CustomVjpCallOperation { marker: PhantomData }),
     );
-    assert_eq!(<&ZeroOperation<ArrayType>>::try_from(&while_operation), Err(()));
+    assert_eq!(
+        <&ZeroOperation<ArrayType>>::try_from(&while_operation),
+        Err(TypeError::invalid("cannot project operation 'while' into a 'ZeroOperation<ArrayType>' payload")),
+    );
 
     // `Backend(Backend)` is a bare generic payload, so its conversion is skipped automatically, while the
     // recompute wrapper and boxed payloads still expose conversions.
@@ -1943,13 +2370,13 @@ impl<V> ArrayBatch<V> {
 
 /// Stand-in for `ryft_core::BatchableOperation`. Every rule receives the active [`BatchingContext`] and its optional
 /// instruction-scoped [`BatchingDriver`] while physical values remain owned by the parent context `C`.
-trait BatchableOperation<C: Context<Type = ArrayType>, P>: Operation<Type = ArrayType> {
+trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<Type = C::Type> {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
         driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>;
+        inputs: &[P::Batch],
+    ) -> Result<Vec<P::Batch>, BatchingError>;
 }
 
 /// Stand-in for `ryft_core::EagerContext`. Mirrors the real context's `Context` membership so that a top-level
@@ -2001,9 +2428,14 @@ impl<C, P> BatchingContext<C, P> {
 }
 
 /// Stand-in for `ryft_core::BatchingDriver`.
-trait BatchingDriver<C: Context<Type = ArrayType>, P> {}
+trait BatchingDriver<C: Context, P: BatchingPolicy<C>> {}
 
-impl<C: Context<Type = ArrayType>, P> BatchingDriver<C, P> for EmptyRegionDriver {}
+impl<C: Context, P: BatchingPolicy<C>> BatchingDriver<C, P> for EmptyRegionDriver {}
+
+/// Stand-in for `ryft_core::BatchingPolicy`.
+trait BatchingPolicy<C: Context> {
+    type Batch;
+}
 
 /// Stand-in for `ryft_core::ArrayBatchingPolicy`.
 trait ArrayBatchingPolicy<C: Context<Type = ArrayType>> {}
@@ -2017,6 +2449,10 @@ impl<C: Context<Type = ArrayType>> ArrayBatchingPolicy<C> for StaticArrayBatchin
 /// Stand-in for `ryft_core::ArrayBatching`.
 #[derive(Copy, Clone, Debug)]
 struct ArrayBatching<M = StaticArrayBatchingPolicy>(PhantomData<fn() -> M>);
+
+impl<C: Context<Type = ArrayType>, M: ArrayBatchingPolicy<C>> BatchingPolicy<C> for ArrayBatching<M> {
+    type Batch = ArrayBatch<C::Value>;
+}
 
 /// Stand-in for `ryft_core::BatchAxis`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -2327,12 +2763,15 @@ fn test_errors() {
     test_cases.compile_fail("tests/operations/error_duplicate_dispatcher.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_variant_class.rs");
     test_cases.compile_fail("tests/operations/error_empty_dispatch.rs");
+    test_cases.compile_fail("tests/operations/error_members_attribute.rs");
     test_cases.compile_fail("tests/operations/error_missing_type.rs");
     test_cases.compile_fail("tests/operations/error_missing_variant_member_type.rs");
     test_cases.compile_fail("tests/operations/error_misplaced_variant_class.rs");
     test_cases.compile_fail("tests/operations/error_mismatched_payload_type.rs");
     test_cases.compile_fail("tests/operations/error_multiple_operation_types.rs");
+    test_cases.compile_fail("tests/operations/error_removed_structural_variant_class.rs");
     test_cases.compile_fail("tests/operations/error_type_attribute.rs");
+    test_cases.compile_fail("tests/operations/error_undeclared_variant_member_type.rs");
     test_cases.compile_fail("tests/operations/error_unknown_dispatcher.rs");
     test_cases.compile_fail("tests/operations/error_unsupported_variant_class.rs");
 }

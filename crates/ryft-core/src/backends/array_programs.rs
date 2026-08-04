@@ -5,21 +5,16 @@ use ryft_macros::Parameter;
 
 use crate::backends::arrays::{Array, ArrayOperation, BroadcastKernel};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
-use crate::contexts::{Context, EagerContext, ProjectedContext};
+use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
 use crate::differentiation::{
-    BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment, LinearCallOperation,
-    ResidualZeroProvider, TransposableOperation, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    LinearCallOperation, ResidualZeroProvider,
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
 #[cfg(test)]
 use crate::operations::collectives::CollectiveOptions;
-use crate::operations::collectives::{
-    ALL_GATHER_OPERATION_NAME, ALL_TO_ALL_OPERATION_NAME, AllGatherOperation, AllToAllOperation, CollectiveMode,
-    PSUM_SCATTER_OPERATION_NAME, PSumScatterOperation, PpermuteOperation, infer_explicit_all_gather_output_types,
-    infer_explicit_all_to_all_output_types, infer_explicit_psum_scatter_output_types,
-};
+use crate::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation, PpermuteOperation};
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::{
     ConstantOperation, Iota, IotaOperation, One, OneOperation, ZERO_OPERATION_NAME, Zero, ZeroLikeOperation,
@@ -32,7 +27,7 @@ use crate::operations::control_flow::scan::{
 use crate::operations::control_flow::{
     ConditionOperation, ScanOperation, SelectOperation, WhileOperation, WhilePredicate,
 };
-use crate::operations::custom_call::{CustomCall, CustomCallOperation};
+use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::dimensions::{
     DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar,
     DimensionToScalarOperation,
@@ -40,27 +35,20 @@ use crate::operations::dimensions::{
 use crate::operations::manipulation::ConvertElementTypeOperation;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation,
-    DynamicShapeSliceOperation, DynamicUpdateSliceOperation, LegacyBroadcastOperation, Pad, PadOperation, Reshape,
-    ReshapeOperation, ReshapeParameters, Slice, Transpose, UpdateSlice,
+    Broadcast, BroadcastOperation, ConcatenateOperation, DynamicShapeSliceOperation, DynamicUpdateSliceOperation,
+    LegacyBroadcastOperation, PadOperation, Reshape, ReshapeOperation, Slice, UpdateSlice,
 };
 use crate::operations::math::{AddOperation, ReduceOperation, ReductionKind};
-use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
+use crate::operations::random::RngBitGeneratorOperation;
 use crate::parameters::Parameter;
-use crate::partial::{
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation,
-};
 use crate::programs::atoms::MaybeZero;
-use crate::programs::effects::Effects;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
-use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::regions::{EmptyRegionDriver, OutputRegionProvenance, RegionInterface, RegionSlot};
+use crate::programs::operations::{MemberOperation, Operation, OperationProjection};
+use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Concretizable, ProjectedValue, Value, ValueProjection};
+use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::programs::{AtomId, ProgramBuilder, ProgramError};
 use crate::sharding::Sharding;
-use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
 
 pub mod batching;
@@ -246,28 +234,36 @@ impl<V: Value<Type = ArrayProgramType>> LinearResiduals<V> {
 /// Operations whose signatures mix arrays and dimensions are represented as explicit variants because no homogeneous
 /// member family can express such a signature. For example, [`DimensionSizeOperation`] consumes an array and produces
 /// a first-class dimension without changing either homogeneous family.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, ryft_macros::Operation)]
+#[ryft(crate = "crate", type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+#[ryft(members(ArrayType, structural(DimensionType)))]
+#[ryft(dispatch(batching, differentiation, transposition))]
 pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     /// Mixed zero constructor whose stored [`ArrayType`] defines the array result and whose dynamic dimensions are
     /// consumed as explicit first-class dimension operands, one per dynamic axis in axis order. This constructor
     /// lives at the composite-family level because its signature crosses member kinds: a homogeneous
     /// [`ArrayOperation`] cannot consume dimension operands, while the stored structural type carries identities and
     /// bounds but not the concrete runtime extents required to materialize the result.
+    #[ryft(mixed(structural), skip_from)]
     Zero(ZeroOperation<ArrayType>),
 
     /// Mixed one constructor whose stored [`ArrayType`] fully defines the output type and whose dynamic dimensions
     /// are consumed as explicit first-class dimension operands, one per dynamic axis in axis order.
+    #[ryft(mixed(structural), skip_from)]
     DynamicOne(OneOperation<ArrayType>),
 
     /// Mixed iota constructor whose stored [`ArrayType`] and iota axis define the complete output, and whose dynamic
     /// dimensions are consumed as explicit first-class dimension operands in axis order.
+    #[ryft(mixed(structural), skip_from)]
     DynamicIota(IotaOperation<ArrayType>),
 
     /// Region-free homogeneous array operation. Member control-flow operations are promoted to their direct
     /// composite carriers when an array program is unprojected.
+    #[ryft(projected(ArrayType), skip_from)]
     Array(ArrayOperation<A>),
 
     /// Homogeneous first-class-dimension operation.
+    #[ryft(projected(DimensionType, structural))]
     Dimension(DimensionOperation<DimensionValue>),
 
     /// Mixed comparison of two first-class dimensions that produces ordinary rank-zero Boolean array data.
@@ -315,12 +311,15 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     RngBitGenerator(RngBitGeneratorOperation<ArrayProgramType>),
 
     /// Mixed all-gather whose trailing dimension operands define every result axis in axis order.
+    #[ryft(mixed)]
     AllGather(AllGatherOperation),
 
     /// Mixed sum-scatter whose trailing dimension operands define every result axis in axis order.
+    #[ryft(mixed)]
     PSumScatter(PSumScatterOperation),
 
     /// Mixed all-to-all whose trailing dimension operands define every result axis in axis order.
+    #[ryft(mixed)]
     AllToAll(AllToAllOperation),
 
     /// Composite condition whose attached branches may carry arrays and first-class dimensions.
@@ -336,12 +335,39 @@ pub enum ArrayProgramOperation<A: Value<Type = ArrayType>> {
     LinearCall(LinearCallOperation<ArrayProgramType>),
 }
 
-impl<A: Value<Type = ArrayType>> Display for ArrayProgramOperation<A> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
+macro_rules! impl_dynamic_constructor_member_operation {
+    // Implements the shared mixed array-program boundary for one canonical homogeneous constructor payload.
+    ($operation:ty) => {
+        impl MemberOperation<ArrayProgramType> for $operation {
+            fn infer_parent_region_input_types(
+                &self,
+                _input_types: &[ArrayProgramType],
+                region_interfaces: &[RegionInterface<ArrayProgramType>],
+            ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
+                Ok(vec![None; region_interfaces.len()])
+            }
+
+            fn infer_parent_output_types(
+                &self,
+                input_types: &[ArrayProgramType],
+                region_interfaces: &[RegionInterface<ArrayProgramType>],
+            ) -> Result<Vec<ArrayProgramType>, TypeError> {
+                infer_dynamic_constructor_output_types(self.name(), self.r#type(), input_types, region_interfaces)
+            }
+
+            fn rename_parent_type_identities(
+                &self,
+                renaming: &TypeIdentityRenaming<DimensionVariable>,
+            ) -> Result<Self, TypeError> {
+                self.rename_type_identities(renaming)
+            }
+        }
+    };
 }
+
+impl_dynamic_constructor_member_operation!(ZeroOperation<ArrayType>);
+impl_dynamic_constructor_member_operation!(OneOperation<ArrayType>);
+impl_dynamic_constructor_member_operation!(IotaOperation<ArrayType>);
 
 impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayProgramOperation<A> {
     #[inline]
@@ -361,87 +387,10 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayProgramOperati
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<DimensionOperation<DimensionValue>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: DimensionOperation<DimensionValue>) -> Self {
-        Self::Dimension(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<ConditionOperation<ArrayProgramValue<A>>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: ConditionOperation<ArrayProgramValue<A>>) -> Self {
-        Self::Condition(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<WhileOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: WhileOperation<ArrayProgramType>) -> Self {
-        Self::While(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<ScanOperation<ArrayProgramValue<A>>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: ScanOperation<ArrayProgramValue<A>>) -> Self {
-        Self::Scan(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<CompareOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: CompareOperation<ArrayProgramType>) -> Self {
-        Self::Compare(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<DimensionSizeOperation> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: DimensionSizeOperation) -> Self {
-        Self::DimensionSize(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<DimensionFromScalarOperation> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: DimensionFromScalarOperation) -> Self {
-        Self::DimensionFromScalar(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<DimensionToScalarOperation> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: DimensionToScalarOperation) -> Self {
-        Self::DimensionToScalar(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<ReshapeOperation> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: ReshapeOperation) -> Self {
-        Self::Reshape(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<BroadcastOperation> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: BroadcastOperation) -> Self {
-        Self::Broadcast(operation)
-    }
-}
-
 impl<A: Value<Type = ArrayType>> From<ConcatenateOperation<ArrayType>> for ArrayProgramOperation<A> {
     #[inline]
     fn from(operation: ConcatenateOperation<ArrayType>) -> Self {
         Self::Concatenate(operation.into())
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<ConcatenateOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: ConcatenateOperation<ArrayProgramType>) -> Self {
-        Self::Concatenate(operation)
     }
 }
 
@@ -452,59 +401,10 @@ impl<A: Value<Type = ArrayType>> From<CustomCallOperation<ArrayType>> for ArrayP
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<CustomCallOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: CustomCallOperation<ArrayProgramType>) -> Self {
-        Self::CustomCall(operation)
-    }
-}
-
 impl<A: Value<Type = ArrayType>> From<PadOperation<ArrayType>> for ArrayProgramOperation<A> {
     #[inline]
     fn from(operation: PadOperation<ArrayType>) -> Self {
         Self::Pad(operation.into())
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<PadOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: PadOperation<ArrayProgramType>) -> Self {
-        Self::Pad(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<DynamicShapeSliceOperation> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: DynamicShapeSliceOperation) -> Self {
-        Self::DynamicShapeSlice(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<RngBitGeneratorOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: RngBitGeneratorOperation<ArrayProgramType>) -> Self {
-        Self::RngBitGenerator(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<AllGatherOperation> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: AllGatherOperation) -> Self {
-        Self::AllGather(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<PSumScatterOperation> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: PSumScatterOperation) -> Self {
-        Self::PSumScatter(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<AllToAllOperation> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: AllToAllOperation) -> Self {
-        Self::AllToAll(operation)
     }
 }
 
@@ -716,424 +616,16 @@ impl<A: Value<Type = ArrayType>> From<PpermuteOperation> for ArrayProgramOperati
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<LinearCallOperation<ArrayProgramType>> for ArrayProgramOperation<A> {
-    #[inline]
-    fn from(operation: LinearCallOperation<ArrayProgramType>) -> Self {
-        Self::LinearCall(operation)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> OperationProjection<ArrayType> for ArrayProgramOperation<A> {
-    type Projected = ArrayOperation<A>;
-}
-
-impl<A: Value<Type = ArrayType>> OperationProjection<DimensionType> for ArrayProgramOperation<A> {
-    type Projected = DimensionOperation<DimensionValue>;
-}
-
-/// Projects the complete inference boundary for one homogeneous inner operation while preserving region effects.
-fn project_operation_boundary<T: Type>(
-    input_types: &[ArrayProgramType],
-    region_interfaces: &[RegionInterface<ArrayProgramType>],
-) -> Result<(Vec<T>, Vec<RegionInterface<T>>), TypeError>
-where
-    for<'t> &'t T: TryFrom<&'t ArrayProgramType, Error = TypeError>,
-{
-    Ok((
-        input_types.iter().map(|r#type| <&T>::try_from(r#type).cloned()).collect::<Result<_, _>>()?,
-        region_interfaces
-            .iter()
-            .map(|interface| {
-                Ok(RegionInterface::new(
-                    interface
-                        .input_types()
-                        .iter()
-                        .map(|r#type| <&T>::try_from(r#type).cloned())
-                        .collect::<Result<_, _>>()?,
-                    interface
-                        .output_types()
-                        .iter()
-                        .map(|r#type| <&T>::try_from(r#type).cloned())
-                        .collect::<Result<_, _>>()?,
-                    interface.effects(),
-                ))
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?,
-    ))
-}
-
-impl<A: Value<Type = ArrayType>> Operation for ArrayProgramOperation<A> {
-    type Type = ArrayProgramType;
-
-    #[inline]
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Zero(operation) => operation.name(),
-            Self::DynamicOne(operation) => operation.name(),
-            Self::DynamicIota(operation) => operation.name(),
-            Self::Array(operation) => operation.name(),
-            Self::Dimension(operation) => operation.name(),
-            Self::Compare(operation) => operation.name(),
-            Self::DimensionSize(operation) => operation.name(),
-            Self::DimensionFromScalar(operation) => operation.name(),
-            Self::DimensionToScalar(operation) => operation.name(),
-            Self::Reshape(operation) => operation.name(),
-            Self::Broadcast(operation) => operation.name(),
-            Self::Concatenate(operation) => operation.name(),
-            Self::CustomCall(operation) => operation.name(),
-            Self::Pad(operation) => operation.name(),
-            Self::DynamicShapeSlice(operation) => operation.name(),
-            Self::RngBitGenerator(operation) => operation.name(),
-            Self::AllGather(operation) => operation.name(),
-            Self::PSumScatter(operation) => operation.name(),
-            Self::AllToAll(operation) => operation.name(),
-            Self::Condition(operation) => operation.name(),
-            Self::While(operation) => operation.name(),
-            Self::Scan(operation) => operation.name(),
-            Self::LinearCall(operation) => operation.name(),
-        }
-    }
-
-    #[inline]
-    fn region_slots(&self) -> &'static [RegionSlot] {
-        match self {
-            Self::Zero(operation) => operation.region_slots(),
-            Self::DynamicOne(operation) => operation.region_slots(),
-            Self::DynamicIota(operation) => operation.region_slots(),
-            Self::Array(operation) => operation.region_slots(),
-            Self::Dimension(operation) => operation.region_slots(),
-            Self::Compare(operation) => operation.region_slots(),
-            Self::DimensionSize(operation) => operation.region_slots(),
-            Self::DimensionFromScalar(operation) => operation.region_slots(),
-            Self::DimensionToScalar(operation) => operation.region_slots(),
-            Self::Reshape(operation) => operation.region_slots(),
-            Self::Broadcast(operation) => operation.region_slots(),
-            Self::Concatenate(operation) => operation.region_slots(),
-            Self::CustomCall(operation) => operation.region_slots(),
-            Self::Pad(operation) => operation.region_slots(),
-            Self::DynamicShapeSlice(operation) => operation.region_slots(),
-            Self::RngBitGenerator(operation) => operation.region_slots(),
-            Self::AllGather(operation) => operation.region_slots(),
-            Self::PSumScatter(operation) => operation.region_slots(),
-            Self::AllToAll(operation) => operation.region_slots(),
-            Self::Condition(operation) => operation.region_slots(),
-            Self::While(operation) => operation.region_slots(),
-            Self::Scan(operation) => operation.region_slots(),
-            Self::LinearCall(operation) => operation.region_slots(),
-        }
-    }
-
-    fn infer_region_input_types(
-        &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
-        match self {
-            Self::Zero(_) | Self::DynamicOne(_) | Self::DynamicIota(_) => Ok(vec![None; region_interfaces.len()]),
-            Self::Array(operation) => {
-                let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
-                Ok(operation
-                    .infer_region_input_types(&input_types, &region_interfaces)?
-                    .into_iter()
-                    .map(|types| types.map(|types| types.into_iter().map(Into::into).collect()))
-                    .collect())
-            }
-            Self::Dimension(operation) => {
-                let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
-                Ok(operation
-                    .infer_region_input_types(&input_types, &region_interfaces)?
-                    .into_iter()
-                    .map(|types| types.map(|types| types.into_iter().map(Into::into).collect()))
-                    .collect())
-            }
-            Self::Compare(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::DimensionSize(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::DimensionFromScalar(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::DimensionToScalar(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::Reshape(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::Broadcast(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::Concatenate(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::CustomCall(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::Pad(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::DynamicShapeSlice(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::RngBitGenerator(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::AllGather(_) | Self::PSumScatter(_) | Self::AllToAll(_) => Ok(vec![None; region_interfaces.len()]),
-            Self::Condition(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::While(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::Scan(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::LinearCall(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-        }
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
-        match self {
-            Self::Zero(operation) => infer_dynamic_constructor_output_types(
-                operation.name(),
-                operation.r#type(),
-                input_types,
-                region_interfaces,
-            ),
-            Self::DynamicOne(operation) => infer_dynamic_constructor_output_types(
-                operation.name(),
-                operation.r#type(),
-                input_types,
-                region_interfaces,
-            ),
-            Self::DynamicIota(operation) => infer_dynamic_constructor_output_types(
-                operation.name(),
-                operation.r#type(),
-                input_types,
-                region_interfaces,
-            ),
-            Self::Array(operation) => {
-                let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
-                Ok(operation
-                    .infer_output_types(&input_types, &region_interfaces)?
-                    .into_iter()
-                    .map(Into::into)
-                    .collect())
-            }
-            Self::Dimension(operation) => {
-                let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
-                Ok(operation
-                    .infer_output_types(&input_types, &region_interfaces)?
-                    .into_iter()
-                    .map(Into::into)
-                    .collect())
-            }
-            Self::Compare(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::DimensionSize(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::DimensionFromScalar(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::DimensionToScalar(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::Reshape(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::Broadcast(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::Concatenate(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::CustomCall(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::Pad(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::DynamicShapeSlice(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::RngBitGenerator(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::AllGather(operation) => {
-                check_count!("region", region_interfaces, 0, TypeError);
-                infer_explicit_all_gather_output_types(operation, input_types)
-            }
-            Self::PSumScatter(operation) => {
-                check_count!("region", region_interfaces, 0, TypeError);
-                infer_explicit_psum_scatter_output_types(operation, input_types)
-            }
-            Self::AllToAll(operation) => {
-                check_count!("region", region_interfaces, 0, TypeError);
-                infer_explicit_all_to_all_output_types(operation, input_types)
-            }
-            Self::Condition(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::While(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::Scan(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::LinearCall(operation) => operation.infer_output_types(input_types, region_interfaces),
-        }
-    }
-
-    #[inline]
-    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-        match self {
-            Self::Zero(operation) => operation.output_region_provenance(output_index),
-            Self::DynamicOne(operation) => operation.output_region_provenance(output_index),
-            Self::DynamicIota(operation) => operation.output_region_provenance(output_index),
-            Self::Array(operation) => operation.output_region_provenance(output_index),
-            Self::Dimension(operation) => operation.output_region_provenance(output_index),
-            Self::Compare(operation) => operation.output_region_provenance(output_index),
-            Self::DimensionSize(operation) => operation.output_region_provenance(output_index),
-            Self::DimensionFromScalar(operation) => operation.output_region_provenance(output_index),
-            Self::DimensionToScalar(operation) => operation.output_region_provenance(output_index),
-            Self::Reshape(operation) => operation.output_region_provenance(output_index),
-            Self::Broadcast(operation) => operation.output_region_provenance(output_index),
-            Self::Concatenate(operation) => operation.output_region_provenance(output_index),
-            Self::CustomCall(operation) => operation.output_region_provenance(output_index),
-            Self::Pad(operation) => operation.output_region_provenance(output_index),
-            Self::DynamicShapeSlice(operation) => operation.output_region_provenance(output_index),
-            Self::RngBitGenerator(operation) => operation.output_region_provenance(output_index),
-            Self::AllGather(operation) => operation.output_region_provenance(output_index),
-            Self::PSumScatter(operation) => operation.output_region_provenance(output_index),
-            Self::AllToAll(operation) => operation.output_region_provenance(output_index),
-            Self::Condition(operation) => operation.output_region_provenance(output_index),
-            Self::While(operation) => operation.output_region_provenance(output_index),
-            Self::Scan(operation) => operation.output_region_provenance(output_index),
-            Self::LinearCall(operation) => operation.output_region_provenance(output_index),
-        }
-    }
-
-    #[inline]
-    fn is_zero(&self, output_index: usize) -> bool {
-        match self {
-            Self::Zero(operation) => operation.is_zero(output_index),
-            Self::DynamicOne(operation) => operation.is_zero(output_index),
-            Self::DynamicIota(operation) => operation.is_zero(output_index),
-            Self::Array(operation) => operation.is_zero(output_index),
-            Self::Dimension(operation) => operation.is_zero(output_index),
-            Self::Compare(operation) => operation.is_zero(output_index),
-            Self::DimensionSize(operation) => operation.is_zero(output_index),
-            Self::DimensionFromScalar(operation) => operation.is_zero(output_index),
-            Self::DimensionToScalar(operation) => operation.is_zero(output_index),
-            Self::Reshape(operation) => operation.is_zero(output_index),
-            Self::Broadcast(operation) => operation.is_zero(output_index),
-            Self::Concatenate(operation) => operation.is_zero(output_index),
-            Self::CustomCall(operation) => operation.is_zero(output_index),
-            Self::Pad(operation) => operation.is_zero(output_index),
-            Self::DynamicShapeSlice(operation) => operation.is_zero(output_index),
-            Self::RngBitGenerator(operation) => operation.is_zero(output_index),
-            Self::AllGather(operation) => operation.is_zero(output_index),
-            Self::PSumScatter(operation) => operation.is_zero(output_index),
-            Self::AllToAll(operation) => operation.is_zero(output_index),
-            Self::Condition(operation) => operation.is_zero(output_index),
-            Self::While(operation) => operation.is_zero(output_index),
-            Self::Scan(operation) => operation.is_zero(output_index),
-            Self::LinearCall(operation) => operation.is_zero(output_index),
-        }
-    }
-
-    #[inline]
-    fn effects(&self) -> Effects {
-        match self {
-            Self::Zero(operation) => operation.effects(),
-            Self::DynamicOne(operation) => operation.effects(),
-            Self::DynamicIota(operation) => operation.effects(),
-            Self::Array(operation) => operation.effects(),
-            Self::Dimension(operation) => operation.effects(),
-            Self::Compare(operation) => operation.effects(),
-            Self::DimensionSize(operation) => operation.effects(),
-            Self::DimensionFromScalar(operation) => operation.effects(),
-            Self::DimensionToScalar(operation) => operation.effects(),
-            Self::Reshape(operation) => operation.effects(),
-            Self::Broadcast(operation) => operation.effects(),
-            Self::Concatenate(operation) => operation.effects(),
-            Self::CustomCall(operation) => operation.effects(),
-            Self::Pad(operation) => operation.effects(),
-            Self::DynamicShapeSlice(operation) => operation.effects(),
-            Self::RngBitGenerator(operation) => operation.effects(),
-            Self::AllGather(operation) => operation.effects(),
-            Self::PSumScatter(operation) => operation.effects(),
-            Self::AllToAll(operation) => operation.effects(),
-            Self::Condition(operation) => operation.effects(),
-            Self::While(operation) => operation.effects(),
-            Self::Scan(operation) => operation.effects(),
-            Self::LinearCall(operation) => operation.effects(),
-        }
-    }
-
-    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
-        match self {
-            Self::Zero(operation) => Ok(Self::Zero(operation.rename_type_identities(renaming)?)),
-            Self::DynamicOne(operation) => Ok(Self::DynamicOne(operation.rename_type_identities(renaming)?)),
-            Self::DynamicIota(operation) => Ok(Self::DynamicIota(operation.rename_type_identities(renaming)?)),
-            Self::Array(operation) => Ok(Self::Array(operation.rename_type_identities(renaming)?)),
-            Self::Dimension(operation) => Ok(Self::Dimension(operation.rename_type_identities(renaming)?)),
-            Self::Compare(operation) => Ok(Self::Compare(operation.rename_type_identities(renaming)?)),
-            Self::DimensionSize(operation) => Ok(Self::DimensionSize(operation.rename_type_identities(renaming)?)),
-            Self::DimensionFromScalar(operation) => {
-                Ok(Self::DimensionFromScalar(operation.rename_type_identities(renaming)?))
-            }
-            Self::DimensionToScalar(operation) => {
-                Ok(Self::DimensionToScalar(operation.rename_type_identities(renaming)?))
-            }
-            Self::Reshape(operation) => Ok(Self::Reshape(operation.rename_type_identities(renaming)?)),
-            Self::Broadcast(operation) => Ok(Self::Broadcast(operation.rename_type_identities(renaming)?)),
-            Self::Concatenate(operation) => Ok(Self::Concatenate(operation.rename_type_identities(renaming)?)),
-            Self::CustomCall(operation) => Ok(Self::CustomCall(operation.rename_type_identities(renaming)?)),
-            Self::Pad(operation) => Ok(Self::Pad(operation.rename_type_identities(renaming)?)),
-            Self::DynamicShapeSlice(operation) => {
-                Ok(Self::DynamicShapeSlice(operation.rename_type_identities(renaming)?))
-            }
-            Self::RngBitGenerator(operation) => Ok(Self::RngBitGenerator(operation.rename_type_identities(renaming)?)),
-            Self::AllGather(operation) => Ok(Self::AllGather(operation.rename_type_identities(renaming)?)),
-            Self::PSumScatter(operation) => Ok(Self::PSumScatter(operation.rename_type_identities(renaming)?)),
-            Self::AllToAll(operation) => Ok(Self::AllToAll(operation.rename_type_identities(renaming)?)),
-            Self::Condition(operation) => Ok(Self::Condition(operation.rename_type_identities(renaming)?)),
-            Self::While(operation) => Ok(Self::While(operation.rename_type_identities(renaming)?)),
-            Self::Scan(operation) => Ok(Self::Scan(operation.rename_type_identities(renaming)?)),
-            Self::LinearCall(operation) => Ok(Self::LinearCall(operation.rename_type_identities(renaming)?)),
-        }
-    }
-
-    #[inline]
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self {
-            Self::Zero(operation) => operation.render(formatter, indentation),
-            Self::DynamicOne(operation) => operation.render(formatter, indentation),
-            Self::DynamicIota(operation) => operation.render(formatter, indentation),
-            Self::Array(operation) => operation.render(formatter, indentation),
-            Self::Dimension(operation) => operation.render(formatter, indentation),
-            Self::Compare(operation) => operation.render(formatter, indentation),
-            Self::DimensionSize(operation) => operation.render(formatter, indentation),
-            Self::DimensionFromScalar(operation) => operation.render(formatter, indentation),
-            Self::DimensionToScalar(operation) => operation.render(formatter, indentation),
-            Self::Reshape(operation) => operation.render(formatter, indentation),
-            Self::Broadcast(operation) => operation.render(formatter, indentation),
-            Self::Concatenate(operation) => operation.render(formatter, indentation),
-            Self::CustomCall(operation) => operation.render(formatter, indentation),
-            Self::Pad(operation) => operation.render(formatter, indentation),
-            Self::DynamicShapeSlice(operation) => operation.render(formatter, indentation),
-            Self::RngBitGenerator(operation) => operation.render(formatter, indentation),
-            Self::AllGather(operation) => operation.render(formatter, indentation),
-            Self::PSumScatter(operation) => operation.render(formatter, indentation),
-            Self::AllToAll(operation) => operation.render(formatter, indentation),
-            Self::Condition(operation) => operation.render(formatter, indentation),
-            Self::While(operation) => operation.render(formatter, indentation),
-            Self::Scan(operation) => operation.render(formatter, indentation),
-            Self::LinearCall(operation) => operation.render(formatter, indentation),
-        }
-    }
-}
-
-/// Interprets one homogeneous operation family using its native eager domain and lifts the results back into the
-/// composite value family. Common operation arities stay on the stack; only wider operations allocate an input vector.
-fn interpret_homogeneous_operation<
-    T: Type,
-    V: Value<Type = T>,
-    O: Operation<Type = T> + InterpretableOperation<EagerContext<V, O>>,
-    A: Value<Type = ArrayType>,
->(
-    operation: &O,
-    inputs: &[ArrayProgramValue<A>],
-) -> Result<Vec<ArrayProgramValue<A>>, ProgramError>
-where
-    ArrayProgramValue<A>: ValueProjection<T, Projected = V>,
-{
-    let context = EagerContext::<V, O>::new();
-    let interpret = |inputs: &[V]| operation.interpret(&context, &EmptyRegionDriver, inputs);
-    let outputs = match inputs {
-        [] => interpret(&[]),
-        [input] => {
-            let inputs = [<ArrayProgramValue<A> as ValueProjection<T>>::into_projected(input.clone())?];
-            interpret(&inputs)
-        }
-        [left, right] => {
-            let inputs = [
-                <ArrayProgramValue<A> as ValueProjection<T>>::into_projected(left.clone())?,
-                <ArrayProgramValue<A> as ValueProjection<T>>::into_projected(right.clone())?,
-            ];
-            interpret(&inputs)
-        }
-        inputs => {
-            let inputs = inputs
-                .iter()
-                .cloned()
-                .map(<ArrayProgramValue<A> as ValueProjection<T>>::into_projected)
-                .collect::<Result<Vec<_>, _>>()?;
-            interpret(&inputs)
-        }
-    }?;
-    Ok(outputs.into_iter().map(<ArrayProgramValue<A> as ValueProjection<T>>::from_projected).collect())
-}
-
 /// Resolves one mixed constructor's explicit dimension operands into the concrete static output type required by an
 /// eager backend.
-fn materialize_dynamic_constructor_type<A: Value<Type = ArrayType>>(
+fn materialize_dynamic_constructor_type<V>(
     name: &str,
     r#type: &ArrayType,
-    inputs: &[ArrayProgramValue<A>],
-) -> Result<ArrayType, ProgramError> {
+    inputs: &[V],
+) -> Result<ArrayType, ProgramError>
+where
+    V: ValueProjection<DimensionType, Projected = DimensionValue>,
+{
     let expected = r#type
         .shape()
         .dimensions()
@@ -1158,8 +650,7 @@ fn materialize_dynamic_constructor_type<A: Value<Type = ArrayType>>(
             Dimension::Dynamic(variable) => {
                 let extent =
                     extents.next().ok_or(ProgramError::InvalidInputCount { expected, actual: inputs.len() })?;
-                let extent: &DimensionValue =
-                    <ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected(extent)?;
+                let extent = <V as ValueProjection<DimensionType>>::into_projected(extent.clone())?;
                 // Eager binds skip inference and intermediate results skip boundary refinement checks, so validate
                 // each runtime extent against the stored output axis's authoritative bounds before allocation.
                 // Identity equality is deliberately not required because interpreted inputs may be alpha-renamed.
@@ -1181,521 +672,71 @@ fn materialize_dynamic_constructor_type<A: Value<Type = ArrayType>>(
     Ok(r#type.clone().with_shape(Shape::new(dimensions)))
 }
 
-/// Resolves and validates one shape-changing collective's complete axis-ordered result extents.
-fn explicit_collective_output_extents<A: Value<Type = ArrayType>>(
-    operation_name: &str,
-    inputs: &[ArrayProgramValue<A>],
-    expected_extents: &[usize],
-) -> Result<Vec<usize>, ProgramError> {
-    let expected_input_count = 1 + expected_extents.len();
-    if inputs.len() != expected_input_count {
-        return Err(ProgramError::InvalidInputCount { expected: expected_input_count, actual: inputs.len() });
-    }
-    let output_extents = inputs[1..]
-        .iter()
-        .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
-        .map(|result| result.map(DimensionValue::extent))
-        .collect::<Result<Vec<_>, _>>()?;
-    for (axis, (&expected, &actual)) in expected_extents.iter().zip(&output_extents).enumerate() {
-        if actual != expected {
-            return Err(ProgramError::InvalidArgument {
-                message: format!(
-                    "'{operation_name}' output axis {axis} extent must equal observed result extent {expected} but got \
-                     {actual}",
-                ),
-            });
-        }
-    }
-    Ok(output_extents)
-}
-
-impl<
-    A: BroadcastKernel
-        + Concatenate
-        + Concretizable<bool>
-        + CustomCall
-        + DimensionFromScalar<DimensionValue>
-        + DimensionSize<usize>
-        + Pad
-        + Reshape
-        + RngBitGenerator
-        + Slice
-        + UpdateSlice
-        + Value<Type = ArrayType>
-        + WhilePredicate,
-> InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>> for ArrayProgramOperation<A>
-where
-    DimensionValue: Compare<A> + DimensionToScalar<A>,
-    EagerContext<A, ArrayOperation<A>>: Iota<A> + One<A> + Zero<A>,
-    ArrayOperation<A>: Operation<Type = ArrayType> + InterpretableOperation<EagerContext<A, ArrayOperation<A>>>,
-    DimensionOperation<DimensionValue>:
-        InterpretableOperation<EagerContext<DimensionValue, DimensionOperation<DimensionValue>>>,
-{
-    fn interpret<D: InterpretationDriver<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>>(
-        &self,
-        context: &EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>,
-        driver: &D,
-        inputs: &[ArrayProgramValue<A>],
-    ) -> Result<Vec<ArrayProgramValue<A>>, ProgramError> {
-        if !matches!(self, Self::Condition(_) | Self::While(_) | Self::Scan(_) | Self::LinearCall(_))
-            && (!self.region_slots().is_empty() || driver.region_count() != 0)
+macro_rules! impl_dynamic_constant_interpretation {
+    // Implements eager materialization for a dynamic nullary array constructor.
+    ($operation:ty, $capability:ident, $method:ident) => {
+        impl<C> MemberInterpretableOperation<C> for $operation
+        where
+            C: Domain<Type = ArrayProgramType>,
+            C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+                + ValueProjection<DimensionType, Projected = DimensionValue>,
+            EagerContext<
+                <C::Value as ValueProjection<ArrayType>>::Projected,
+                ArrayOperation<<C::Value as ValueProjection<ArrayType>>::Projected>,
+            >: $capability<<C::Value as ValueProjection<ArrayType>>::Projected>,
         {
-            return Err(ProgramError::MalformedProgram(format!(
-                "projected operation `{}` cannot carry regions",
-                self.name(),
-            )));
-        }
-        match self {
-            Self::Zero(operation) => {
-                let output_type = materialize_dynamic_constructor_type(operation.name(), operation.r#type(), inputs)?;
-                Ok(vec![ArrayProgramValue::Array(EagerContext::<A, ArrayOperation<A>>::new().zero(&output_type)?)])
-            }
-            Self::DynamicOne(operation) => {
-                let output_type = materialize_dynamic_constructor_type(operation.name(), operation.r#type(), inputs)?;
-                Ok(vec![ArrayProgramValue::Array(EagerContext::<A, ArrayOperation<A>>::new().one(&output_type)?)])
-            }
-            Self::DynamicIota(operation) => {
-                let output_type = materialize_dynamic_constructor_type(operation.name(), operation.r#type(), inputs)?;
-                Ok(vec![ArrayProgramValue::Array(
-                    EagerContext::<A, ArrayOperation<A>>::new().iota(&output_type, operation.dimension())?,
-                )])
-            }
-            Self::Array(operation) => interpret_homogeneous_operation(operation, inputs),
-            Self::Dimension(operation) => interpret_homogeneous_operation(operation, inputs),
-            Self::Compare(operation) => operation.interpret(
-                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
-                &EmptyRegionDriver,
-                inputs,
-            ),
-            Self::DimensionSize(operation) => operation.interpret(
-                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
-                &EmptyRegionDriver,
-                inputs,
-            ),
-            Self::DimensionFromScalar(operation) => operation.interpret(
-                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
-                &EmptyRegionDriver,
-                inputs,
-            ),
-            Self::DimensionToScalar(operation) => operation.interpret(
-                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
-                &EmptyRegionDriver,
-                inputs,
-            ),
-            Self::Reshape(operation) => {
-                let Some((input, output_extents)) = inputs.split_first() else {
-                    return Err(TypeError::invalid("'reshape' expects an array followed by its output extents").into());
-                };
-                let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
-                let output_shape = Shape::new(
-                    output_extents
-                        .iter()
-                        .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
-                        .map(|result| result.map(|extent: &DimensionValue| Dimension::Static(extent.extent())))
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-                let mut parameters = ReshapeParameters::new(output_shape);
-                if let Some(dimensions) = operation.dimensions() {
-                    parameters = parameters.with_dimensions(dimensions.clone());
-                }
-                if let Some(output_sharding) = operation.output_sharding() {
-                    parameters = parameters.with_output_sharding(output_sharding.clone());
-                }
-                Ok(vec![ArrayProgramValue::Array(input.reshape(parameters)?)])
-            }
-            Self::Broadcast(operation) => {
-                let Some((input, output_extents)) = inputs.split_first() else {
+            fn interpret_in_parent<D: InterpretationDriver<C>>(
+                &self,
+                _context: &C,
+                driver: &D,
+                inputs: &[C::Value],
+            ) -> Result<Vec<C::Value>, ProgramError> {
+                if driver.region_count() != 0 {
                     return Err(
-                        TypeError::invalid("'broadcast' expects an array followed by its output extents").into()
+                        TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count(),)).into()
                     );
-                };
-                let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
-                let output_shape = Shape::new(
-                    output_extents
-                        .iter()
-                        .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
-                        .map(|result| result.map(|extent: &DimensionValue| Dimension::Static(extent.extent())))
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-                let output_type =
-                    infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, operation)?;
-                Ok(vec![ArrayProgramValue::Array(input.broadcast_to_type(output_type, operation.output_axes())?)])
+                }
+                let output_type = materialize_dynamic_constructor_type(self.name(), self.r#type(), inputs)?;
+                let output = EagerContext::<
+                    <C::Value as ValueProjection<ArrayType>>::Projected,
+                    ArrayOperation<<C::Value as ValueProjection<ArrayType>>::Projected>,
+                >::new()
+                .$method(&output_type)?;
+                Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(output)])
             }
-            Self::Concatenate(operation) => {
-                let Some((result_extent, inputs)) = inputs.split_last() else {
-                    return Err(TypeError::invalid(format!(
-                        "'{}' expects at least one array followed by its result extent",
-                        CONCATENATE_OPERATION_NAME,
-                    ))
-                    .into());
-                };
-                if inputs.is_empty() {
-                    return match result_extent {
-                        ArrayProgramValue::Array(_) => Err(TypeError::invalid(format!(
-                            "'{}' expects a trailing result-extent dimension",
-                            CONCATENATE_OPERATION_NAME,
-                        ))
-                        .into()),
-                        ArrayProgramValue::Dimension(_) => Err(TypeError::invalid(format!(
-                            "'{}' expects at least one array before its result extent",
-                            CONCATENATE_OPERATION_NAME,
-                        ))
-                        .into()),
-                    };
-                }
-                let result_extent = <ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected(result_extent)?;
-                let inputs = inputs
-                    .iter()
-                    .map(<ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected)
-                    .collect::<Result<Vec<_>, _>>()?;
-                let actual_extent = inputs.iter().try_fold(0usize, |extent, input| {
-                    extent.checked_add(input.dimension_size(operation.axis())?).ok_or_else(|| {
-                        ProgramError::from(TypeError::invalid(format!(
-                            "'{}' result extent overflows usize",
-                            CONCATENATE_OPERATION_NAME,
-                        )))
-                    })
-                })?;
-                if result_extent.extent() != actual_extent {
-                    return Err(ProgramError::InvalidArgument {
-                        message: format!(
-                            "'{}' result extent must equal the sum of input axis {} extents; expected {actual_extent} \
-                             but got {}",
-                            CONCATENATE_OPERATION_NAME,
-                            operation.axis(),
-                            result_extent.extent(),
-                        ),
-                    });
-                }
-                Ok(vec![ArrayProgramValue::Array(A::concatenate(inputs.iter().copied(), operation.axis())?)])
-            }
-            Self::CustomCall(operation) => operation.interpret(
-                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
-                &EmptyRegionDriver,
-                inputs,
-            ),
-            Self::Pad(operation) => operation.interpret(
-                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
-                &EmptyRegionDriver,
-                inputs,
-            ),
-            Self::DynamicShapeSlice(operation) => {
-                let Some((input, bounds)) = inputs.split_first() else {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
-                };
-                let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
-                let rank = input.r#type().rank();
-                check_count!("input", inputs, 1 + 2 * rank, ProgramError);
-                let starts = bounds[..rank]
-                    .iter()
-                    .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
-                    .map(|result| result.map(DimensionValue::extent))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let sizes = bounds[rank..]
-                    .iter()
-                    .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
-                    .map(|result| result.map(DimensionValue::extent))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let limits = starts
-                    .iter()
-                    .zip(&sizes)
-                    .zip(operation.strides())
-                    .enumerate()
-                    .map(|(axis, ((start, size), stride))| {
-                        let span = if *size == 0 {
-                            0
-                        } else {
-                            size.checked_sub(1)
-                                .and_then(|size| size.checked_mul(*stride))
-                                .and_then(|span| span.checked_add(1))
-                                .ok_or_else(|| {
-                                    TypeError::invalid(format!(
-                                        "'dynamic_shape_slice' span overflows usize on axis {axis}",
-                                    ))
-                                })?
-                        };
-                        let limit = start.checked_add(span).ok_or_else(|| {
-                            TypeError::invalid(format!("'dynamic_shape_slice' limit overflows usize on axis {axis}",))
-                        })?;
-                        let input_size = input.dimension_size(axis)?;
-                        if limit > input_size {
-                            return Err(ProgramError::InvalidArgument {
-                                message: format!(
-                                    "'dynamic_shape_slice' limit {limit} exceeds input axis {axis} extent \
-                                     {input_size}",
-                                ),
-                            });
-                        }
-                        Ok(limit)
-                    })
-                    .collect::<Result<Vec<_>, ProgramError>>()?;
-                Ok(vec![ArrayProgramValue::Array(input.slice(&starts, &limits, operation.strides())?)])
-            }
-            Self::RngBitGenerator(operation) => operation.interpret(
-                &EagerContext::<ArrayProgramValue<A>, ArrayProgramOperation<A>>::new(),
-                &EmptyRegionDriver,
-                inputs,
-            ),
-            Self::AllGather(operation) => {
-                let effective_axis_size = operation.effective_axis_size()?;
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                infer_explicit_all_gather_output_types(operation, input_types.as_slice())?;
-                let Some(input) = inputs.first() else {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
-                };
-                let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
-                let mut expected_extents =
-                    (0..input.r#type().rank()).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
-                match operation.options().mode() {
-                    CollectiveMode::Untiled => {
-                        if operation.concat_axis() > expected_extents.len() {
-                            return Err(TypeError::invalid(format!(
-                                "'all_gather' concat axis {} is out of bounds for rank {}",
-                                operation.concat_axis(),
-                                expected_extents.len(),
-                            ))
-                            .into());
-                        }
-                        expected_extents.insert(operation.concat_axis(), effective_axis_size);
-                    }
-                    CollectiveMode::Tiled => {
-                        let rank = expected_extents.len();
-                        let Some(output_extent) = expected_extents.get_mut(operation.concat_axis()) else {
-                            return Err(TypeError::invalid(format!(
-                                "'all_gather' concat axis {} is out of bounds for rank {rank}",
-                                operation.concat_axis(),
-                            ))
-                            .into());
-                        };
-                        *output_extent = output_extent
-                            .checked_mul(effective_axis_size)
-                            .ok_or_else(|| TypeError::invalid("'all_gather' result extent does not fit in usize"))?;
-                    }
-                }
-                let output_extents =
-                    explicit_collective_output_extents(ALL_GATHER_OPERATION_NAME, inputs, &expected_extents)?;
-                if effective_axis_size != 1 {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "cannot interpret 'all_gather' over axis '{}' of size {} without an enclosing binder",
-                            operation.axis_name(),
-                            effective_axis_size,
-                        ),
-                    });
-                }
-                let output = match operation.options().mode() {
-                    CollectiveMode::Tiled => input.clone(),
-                    CollectiveMode::Untiled => {
-                        input.reshape(Shape::new(output_extents.into_iter().map(Dimension::Static).collect()))?
-                    }
-                };
-                Ok(vec![ArrayProgramValue::Array(output)])
-            }
-            Self::PSumScatter(operation) => {
-                let effective_axis_size = operation.effective_axis_size()?;
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                infer_explicit_psum_scatter_output_types(operation, input_types.as_slice())?;
-                let Some(input) = inputs.first() else {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
-                };
-                let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
-                let mut expected_extents =
-                    (0..input.r#type().rank()).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
-                if operation.scatter_axis() >= expected_extents.len() {
-                    return Err(TypeError::invalid(format!(
-                        "'psum_scatter' scatter axis {} is out of bounds for rank {}",
-                        operation.scatter_axis(),
-                        expected_extents.len(),
-                    ))
-                    .into());
-                }
-                match operation.options().mode() {
-                    CollectiveMode::Untiled => {
-                        if expected_extents[operation.scatter_axis()] != effective_axis_size {
-                            return Err(TypeError::invalid(format!(
-                                "'psum_scatter' untiled scatter axis {} size {} must equal group size \
-                                 {effective_axis_size}",
-                                operation.scatter_axis(),
-                                expected_extents[operation.scatter_axis()],
-                            ))
-                            .into());
-                        }
-                        expected_extents.remove(operation.scatter_axis());
-                    }
-                    CollectiveMode::Tiled => {
-                        if expected_extents[operation.scatter_axis()] % effective_axis_size != 0 {
-                            return Err(TypeError::invalid(format!(
-                                "'psum_scatter' scatter axis {} size {} is not divisible by group size \
-                                 {effective_axis_size}",
-                                operation.scatter_axis(),
-                                expected_extents[operation.scatter_axis()],
-                            ))
-                            .into());
-                        }
-                        expected_extents[operation.scatter_axis()] /= effective_axis_size;
-                    }
-                }
-                let output_extents =
-                    explicit_collective_output_extents(PSUM_SCATTER_OPERATION_NAME, inputs, &expected_extents)?;
-                if effective_axis_size != 1 {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "cannot interpret 'psum_scatter' over axis '{}' of size {} without an enclosing binder",
-                            operation.axis_name(),
-                            effective_axis_size,
-                        ),
-                    });
-                }
-                let output = match operation.options().mode() {
-                    CollectiveMode::Tiled => input.clone(),
-                    CollectiveMode::Untiled => {
-                        input.reshape(Shape::new(output_extents.into_iter().map(Dimension::Static).collect()))?
-                    }
-                };
-                Ok(vec![ArrayProgramValue::Array(output)])
-            }
-            Self::AllToAll(operation) => {
-                let effective_axis_size = operation.effective_axis_size()?;
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                infer_explicit_all_to_all_output_types(operation, input_types.as_slice())?;
-                let Some(input) = inputs.first() else {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
-                };
-                let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(input)?;
-                let mut expected_extents =
-                    (0..input.r#type().rank()).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
-                let rank = expected_extents.len();
-                if operation.split_axis() >= rank || operation.concat_axis() >= rank {
-                    return Err(TypeError::invalid(format!(
-                        "'all_to_all' split axis {} or concat axis {} is out of bounds for rank {rank}",
-                        operation.split_axis(),
-                        operation.concat_axis(),
-                    ))
-                    .into());
-                }
-                match operation.options().mode() {
-                    CollectiveMode::Untiled => {
-                        if expected_extents[operation.split_axis()] != effective_axis_size {
-                            return Err(TypeError::invalid(format!(
-                                "'all_to_all' untiled split axis {} size {} must equal group size \
-                                 {effective_axis_size}",
-                                operation.split_axis(),
-                                expected_extents[operation.split_axis()],
-                            ))
-                            .into());
-                        }
-                        expected_extents.remove(operation.split_axis());
-                        expected_extents.insert(operation.concat_axis(), effective_axis_size);
-                    }
-                    CollectiveMode::Tiled if expected_extents[operation.split_axis()] % effective_axis_size != 0 => {
-                        return Err(TypeError::invalid(format!(
-                            "'all_to_all' split axis {} size {} is not divisible by group size {effective_axis_size}",
-                            operation.split_axis(),
-                            expected_extents[operation.split_axis()],
-                        ))
-                        .into());
-                    }
-                    CollectiveMode::Tiled if operation.split_axis() == operation.concat_axis() => {}
-                    CollectiveMode::Tiled => {
-                        expected_extents[operation.split_axis()] /= effective_axis_size;
-                        expected_extents[operation.concat_axis()] =
-                            expected_extents[operation.concat_axis()].checked_mul(effective_axis_size).ok_or_else(
-                                || TypeError::invalid("'all_to_all' concatenation result extent does not fit in usize"),
-                            )?;
-                    }
-                }
-                let output_extents =
-                    explicit_collective_output_extents(ALL_TO_ALL_OPERATION_NAME, inputs, &expected_extents)?;
-                if effective_axis_size != 1 {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "cannot interpret 'all_to_all' over axis '{}' of size {} without an enclosing binder",
-                            operation.axis_name(),
-                            effective_axis_size,
-                        ),
-                    });
-                }
-                let output = match operation.options().mode() {
-                    CollectiveMode::Tiled => input.clone(),
-                    CollectiveMode::Untiled => {
-                        input.reshape(Shape::new(output_extents.into_iter().map(Dimension::Static).collect()))?
-                    }
-                };
-                Ok(vec![ArrayProgramValue::Array(output)])
-            }
-            Self::Condition(operation) => operation.interpret(context, driver, inputs),
-            Self::While(operation) => operation.interpret(context, driver, inputs),
-            Self::Scan(operation) => operation.interpret(context, driver, inputs),
-            Self::LinearCall(operation) => operation.interpret(context, driver, inputs),
         }
-    }
+    };
 }
 
-impl<
-    A: Value<Type = ArrayType>,
-    C: Context<
-            Type = ArrayProgramType,
-            Constant: Concretizable<bool>,
-            Operation: From<ArrayProgramOperation<A>>
-                           + From<ConditionOperation<C::Constant>>
-                           + From<DimensionFromScalarOperation>
-                           + From<DimensionToScalarOperation>
-                           + From<ScanOperation<C::Constant>>
-                           + From<WhileOperation<ArrayProgramType>>
-                           + ZeroOperationProvider<ArrayProgramType>,
-        >,
-> PartiallyEvaluatableOperation<C> for ArrayProgramOperation<A>
+impl_dynamic_constant_interpretation!(ZeroOperation<ArrayType>, Zero, zero);
+impl_dynamic_constant_interpretation!(OneOperation<ArrayType>, One, one);
+
+impl<C> MemberInterpretableOperation<C> for IotaOperation<ArrayType>
 where
-    C::Value: PartialEq,
+    C: Domain<Type = ArrayProgramType>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
+    EagerContext<
+        <C::Value as ValueProjection<ArrayType>>::Projected,
+        ArrayOperation<<C::Value as ValueProjection<ArrayType>>::Projected>,
+    >: Iota<<C::Value as ValueProjection<ArrayType>>::Projected>,
 {
-    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+    fn interpret_in_parent<D: InterpretationDriver<C>>(
         &self,
-        context: &PartialEvaluationContext<C>,
+        _context: &C,
         driver: &D,
-        inputs: &[PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        if matches!(self, Self::Condition(_)) {
-            return ConditionOperation::<C::Constant>::new().partially_evaluate(context, driver, inputs);
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        if driver.region_count() != 0 {
+            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
         }
-        if let Self::Scan(operation) = self {
-            let scan = ScanOperation::<C::Constant>::new(operation.carry_count(), operation.length())
-                .with_reverse(operation.reverse())
-                .with_unroll(operation.unroll())?;
-            return scan.partially_evaluate(context, driver, inputs);
-        }
-        if let Self::While(operation) = self {
-            return operation.partially_evaluate(context, driver, inputs);
-        }
-        if let Self::Reshape(operation) = self
-            && operation.output_sharding().is_none()
-            && driver.region_count() == 0
-            && let Some(input) = inputs.first()
-            && let Ok(input_type) = <&ArrayType>::try_from(input.r#type().as_ref())
-            && input_type.static_shape().is_some()
-            && operation.dimensions().is_none_or(|dimensions| dimensions.iter().copied().eq(0..input_type.rank()))
-            && operation
-                .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?
-                == vec![input.r#type().into_owned()]
-        {
-            // An entirely static identity reshape cannot observe its exact dimension operands. Preserve the input
-            // directly so an unknown array does not leave a redundant reshape in the residual program.
-            return Ok(vec![input.clone()]);
-        }
-        if let Self::Broadcast(operation) = self
-            && operation.output_sharding().is_none()
-            && driver.region_count() == 0
-            && let Some(input) = inputs.first()
-            && let Ok(input_type) = <&ArrayType>::try_from(input.r#type().as_ref())
-            && input_type.static_shape().is_some()
-            && operation.output_axes().iter().copied().eq(0..input_type.rank())
-            && operation
-                .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?
-                == vec![input.r#type().into_owned()]
-        {
-            // An entirely static identity broadcast cannot observe its exact dimension operands.
-            return Ok(vec![input.clone()]);
-        }
-        context.fold_or_residualize(self.clone(), driver.regions().map(|region| region.to_program()).collect(), inputs)
+        let output_type = materialize_dynamic_constructor_type(self.name(), self.r#type(), inputs)?;
+        let output = EagerContext::<
+            <C::Value as ValueProjection<ArrayType>>::Projected,
+            ArrayOperation<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        >::new()
+        .iota(&output_type, self.dimension())?;
+        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(output)])
     }
 }
 
@@ -1794,6 +835,13 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayProgra
         match (on_true, on_false) {
             (Self::Array(on_true), Self::Array(on_false)) => Ok(Self::Array(predicate.mask_select(on_true, on_false)?)),
             (Self::Dimension(on_true), Self::Dimension(on_false)) => {
+                // Selecting between equal dimension carries (e.g., the loop-invariant mapped extent that structural
+                // batching threads through a while loop's state) is the identity for every item, so it needs no
+                // scalar predicate. Distinct dimension carries fall back to the scalar-predicate semantics because
+                // one dimension value cannot represent independently masked per-item extents.
+                if on_true == on_false {
+                    return Ok(Self::Dimension(on_true.clone()));
+                }
                 Ok(Self::Dimension(if predicate.concretize()? { on_true.clone() } else { on_false.clone() }))
             }
             _ => Err(TypeError::invalid(format!(
@@ -2112,7 +1160,10 @@ mod tests {
         JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, try_jit,
     };
     use crate::contexts::{Context, StagingContext};
-    use crate::differentiation::{DifferentiationTracer, ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::differentiation::{
+        DifferentiationTracer, ForwardModeDifferentiate, ReverseModeDifferentiate, TransposableOperation,
+    };
+    use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::collectives::{
         AllGather, AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, PSumScatter, PSumScatterOperation,
@@ -2123,6 +1174,7 @@ mod tests {
     use crate::operations::dimensions::{
         DimensionAddOperation, DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation,
     };
+    use crate::operations::manipulation::concatenation::CONCATENATE_OPERATION_NAME;
     use crate::operations::manipulation::{
         Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, GatherDimensionNumbers,
         GatherOperation, PadOperation, ReshapeOperation, ScatterDimensionNumbers, ScatterOperation,
@@ -2130,11 +1182,12 @@ mod tests {
     };
     use crate::operations::math::{AddOperation, MulOperation};
     use crate::parameters::Placeholder;
-    use crate::partial::PartialTracer;
+    use crate::partial::{PartialTracer, PartialValue};
     use crate::programs::AtomId;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::operations::OperationProjection;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::tracing::{Tracer, TracingContext};
     use crate::types::{DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Memory, Shape, StridedLayout};
@@ -2324,8 +1377,8 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct 'all_gather' transposition with dynamic extents requires linearization so that \
-                    the primal geometry can be retained as residuals",
+                if message == "direct 'all_gather' transposition with runtime-dependent type metadata requires \
+                    linearization so that the relevant primal information can be retained as residuals",
         ));
     }
 
@@ -2402,11 +1455,13 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
+        // The mixed boundary delegates its array contribution to the homogeneous all-gather rule, so the invariant
+        // guard that rule owns is what rejects direct transposition here.
         assert!(matches!(
             program.transpose_with_respect_to(&[0]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct invariant 'all_gather' transposition requires linearization so that the current \
-                    participant can select its gathered chunk",
+                if message == "direct transposition of invariant 'all_gather' cannot represent the participant-indexed \
+                    slice; linearize so that the current participant can select its gathered chunk",
         ));
         let pullback = program.linearize().unwrap().pullback().unwrap().to_string();
         assert!(pullback.contains("axis_index [axis_name=\"x\"]"));
@@ -3022,6 +2077,35 @@ mod tests {
                     .into()
             ]),
         );
+    }
+
+    #[test]
+    fn test_array_program_operation_forwards_payload_effects() {
+        // The mixed concatenate payload is unconditionally effectful today, so forwarding it only pins that the derived
+        // dispatcher reads the payload rather than declaring the composite family pure.
+        let concatenate = ConcatenateOperation::<ArrayProgramType>::from(ConcatenateOperation::new(0, 1).unwrap());
+        let operation = ArrayProgramOperation::<Array>::Concatenate(concatenate.clone());
+        assert_eq!(operation.effects(), concatenate.effects());
+        assert_eq!(operation.effects(), Effects::single(Effect::OrderedAssertion));
+
+        // The structural dimension member carries the only genuinely conditional payload effect: a dimension
+        // requirement is pure when it is provable from operand types and otherwise needs an ordered runtime assertion.
+        // Both states must reach the composite family unchanged, so a dispatcher that hardcoded either one is caught.
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
+        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+
+        // Provable: the same dimension variable is trivially equal to itself.
+        let proven = DimensionRequirementOperation::equal(&left_type, &left_type);
+        let operation = ArrayProgramOperation::<Array>::from(DimensionOperation::Requirement(proven.clone()));
+        assert_eq!(operation.effects(), proven.effects());
+        assert_eq!(operation.effects(), Effects::PURE);
+
+        // Unprovable: two distinct variables whose `[1, 9)` bounds admit both equal and unequal extents.
+        let inconclusive = DimensionRequirementOperation::equal(&left_type, &right_type);
+        let operation = ArrayProgramOperation::<Array>::from(DimensionOperation::Requirement(inconclusive.clone()));
+        assert_eq!(operation.effects(), inconclusive.effects());
+        assert_eq!(operation.effects(), Effects::single(Effect::OrderedAssertion));
     }
 
     #[test]
@@ -5255,6 +4339,35 @@ in (%4)
             &[input, dimension(1)?, dimension(1)?, dimension(2)?, dimension(2)?],
         )?;
         assert_eq!(output, vec![ArrayProgramValue::Array(Array::matrix(2, 2, vec![5.0, 6.0, 9.0, 10.0]))]);
+
+        // The slice geometry is discrete, but the array operand remains linear: JVP applies the same runtime slice to
+        // the primal and tangent instead of treating the complete mixed operation as a constant.
+        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)])).into());
+        let start = builder.add_constant(dimension(1)?);
+        let size = builder.add_constant(dimension(2)?);
+        let output =
+            builder.add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![input, start, size])?[0];
+        let program = builder.build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+            vec![output],
+            vec![Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.jvp().unwrap().interpret(vec![
+                ArrayProgramValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
+                ArrayProgramValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])),
+            ]),
+            Ok(vec![
+                ArrayProgramValue::Array(Array::vector(vec![2.0_f64, 3.0])),
+                ArrayProgramValue::Array(Array::vector(vec![20.0_f64, 30.0])),
+            ]),
+        );
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation 'dynamic_shape_slice' does not yet support reverse-mode differentiation",
+        ));
 
         Ok(())
     }

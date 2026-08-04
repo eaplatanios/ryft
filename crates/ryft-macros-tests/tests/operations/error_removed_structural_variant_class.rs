@@ -1,5 +1,4 @@
 struct DataType;
-struct ArrayType;
 struct DimensionType;
 
 trait Value {
@@ -10,7 +9,7 @@ struct MemberOperation<V>(V);
 
 #[derive(ryft::Operation)]
 enum BadOperation<V: Value<Type = DataType>> {
-    #[ryft(projected(ArrayType), mixed(DimensionType))]
+    #[ryft(structural(DimensionType))]
     Member(MemberOperation<V>),
 }
 

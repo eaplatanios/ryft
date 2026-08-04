@@ -1,0 +1,23 @@
+error: the 'projected' operation variant class declares member type 'ScalarType', which the operation family does not declare in '#[ryft(members(...))]'
+  --> tests/operations/error_undeclared_variant_member_type.rs:15:22
+   |
+15 |     #[ryft(projected(ScalarType))]
+   |                      ^^^^^^^^^^
+
+error: the 'mixed' operation variant class declares member type 'ScalarType', which the operation family does not declare in '#[ryft(members(...))]'
+  --> tests/operations/error_undeclared_variant_member_type.rs:18:18
+   |
+18 |     #[ryft(mixed(ScalarType))]
+   |                  ^^^^^^^^^^
+
+error: the 'mixed' operation variant class cannot default its member type because the operation family declares 2 computational member universes; name the member type as 'mixed(U)'
+  --> tests/operations/error_undeclared_variant_member_type.rs:25:12
+   |
+25 |     #[ryft(mixed)]
+   |            ^^^^^
+
+error: the 'mixed' operation variant class cannot default its member type because the operation family declares 2 computational member universes; name the member type as 'mixed(U)'
+  --> tests/operations/error_undeclared_variant_member_type.rs:28:18
+   |
+28 |     #[ryft(mixed(structural))]
+   |                  ^^^^^^^^^^

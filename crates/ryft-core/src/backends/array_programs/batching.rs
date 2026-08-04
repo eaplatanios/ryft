@@ -11,40 +11,26 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 
 use crate::axes::{Axis, NamedAxes, NamedAxis};
-use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
-use crate::backends::arrays::ArrayOperation;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchAxisSpecification, BatchableOperation,
     BatchableType, BatchedProgram, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
     BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DimensionSource,
     MemberBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
-    batch_axis_sharding, batch_projected_operation, normalized_batch_axis_type,
+    batch_axis_sharding, normalized_batch_axis_type,
 };
 use crate::contexts::{Context, ProjectedContext, StagingContext, ValueResolution};
-use crate::differentiation::LinearCallOperation;
 use crate::macros::{check_builders, check_count};
-use crate::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, CollectiveBatchingPolicy, PSumScatterOperation,
-};
-use crate::operations::compare::CompareOperation;
-use crate::operations::constants::{ConstantOperation, OneOperation};
-use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, WhileOperation};
-use crate::operations::dimensions::{
-    DimensionFromScalarOperation, DimensionRequirement, DimensionRequirementOperation, DimensionSizeOperation,
-    DimensionToScalarOperation,
-};
-use crate::operations::manipulation::{
-    BroadcastOperation, ConcatenateOperation, DynamicShapeSliceOperation, LegacyBroadcast, PadOperation, Reshape,
-    ReshapeOperation, Transpose, TransposeOperation,
-};
-use crate::operations::math::{Div, Mul, Reduce};
-use crate::operations::random::RngBitGeneratorOperation;
+use crate::operations::collectives::CollectiveBatchingPolicy;
+use crate::operations::constants::{ConstantOperation, IotaOperation, OneOperation, ZeroOperation};
+use crate::operations::dimensions::{DimensionRequirement, DimensionRequirementOperation, DimensionSizeOperation};
+use crate::operations::manipulation::{BroadcastOperation, ReshapeOperation, Transpose, TransposeOperation};
+use crate::operations::math::{Div, Mul};
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::regions::{RegionRef, RegionReplayMappings, ReplayRegionDriver};
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{ProjectedValue, ProjectedValueRef, Value, ValueProjection};
+use crate::programs::values::{ProjectedValue, Value, ValueProjection};
 use crate::programs::{Program, ProgramError};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
@@ -534,7 +520,7 @@ where
 {
     type Projected = ProjectedValue<T, Self>;
     type ProjectedRef<'v>
-        = ProjectedValueRef<'v, T, Self>
+        = ProjectedValue<T, &'v Self>
     where
         Self: 'v,
         T: 'v;
@@ -549,7 +535,7 @@ where
     where
         T: 'v,
     {
-        Ok(ProjectedValueRef::new(self, <&T>::try_from(self.batch().unbatched_type())?))
+        Ok(ProjectedValue::new(self, <&T>::try_from(self.batch().unbatched_type())?.clone()))
     }
 
     #[inline]
@@ -1151,53 +1137,21 @@ where
     Ok(outputs.remove(0))
 }
 
-impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ArrayProgramOperation<A>
-where
-    A: Value<Type = ArrayType>,
-    C: Context<
-            Type = ArrayProgramType,
-            Constant: ValueProjection<ArrayType, Projected = A>
-                          + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-        >,
-    C::Value: ValueProjection<ArrayType> + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    <C::Value as ValueProjection<ArrayType>>::Projected:
-        LegacyBroadcast + Reduce + Reshape + Select + Transpose + Value<Type = ArrayType>,
-    <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
-    C::Operation: From<ArrayProgramOperation<A>>
-        + From<AllGatherOperation>
-        + From<AllToAllOperation>
-        + From<CompareOperation<ArrayProgramType>>
-        + From<LinearCallOperation<ArrayProgramType>>
-        + From<BroadcastOperation>
-        + From<ConcatenateOperation<ArrayType>>
-        + From<ConcatenateOperation<ArrayProgramType>>
-        + From<ConditionOperation<ArrayProgramValue<A>>>
-        + From<DimensionFromScalarOperation>
-        + From<DimensionSizeOperation>
-        + From<DimensionToScalarOperation>
-        + From<DynamicShapeSliceOperation>
-        + From<OneOperation<ArrayType>>
-        + From<PadOperation<ArrayType>>
-        + From<PSumScatterOperation>
-        + From<RngBitGeneratorOperation<ArrayProgramType>>
-        + From<ReshapeOperation>
-        + From<ScanOperation<ArrayProgramValue<A>>>
-        + From<ScanOperation<C::Constant>>
-        + From<WhileOperation<ArrayProgramType>>
-        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    ArrayOperation<A>: Operation<Type = ArrayType>
-        + BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
-{
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
-        &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
-        driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
-        match self {
-            Self::Zero(_) | Self::DynamicOne(_) | Self::DynamicIota(_) => {
+macro_rules! impl_dynamic_constructor_member_batching {
+    // Implements the replicated-extent batching rule shared by the three dynamic array constructors. Batching is the
+    // one transform the `#[ryft(mixed(structural))]` role does not generate for these payloads, because a
+    // mixed signature cannot be projected into one member kind the way a projected structural member is.
+    ($operation:ty) => {
+        impl<C> MemberBatchableOperation<C, ArrayProgramBatching> for $operation
+        where
+            C: Context<Type = ArrayProgramType, Operation: From<$operation>>,
+        {
+            fn batch_in_parent<D: BatchingDriver<C, ArrayProgramBatching>>(
+                &self,
+                context: &BatchingContext<C, ArrayProgramBatching>,
+                _driver: &D,
+                inputs: &[ArrayProgramBatch<C::Value>],
+            ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
                 // Output extents are shared shape values. A mapped extent would request a different output shape for
                 // each batch item, which requires a ragged representation that ordinary array batching lacks.
                 for extent in inputs {
@@ -1214,36 +1168,19 @@ where
                     .map(ArrayProgramBatch::replicated)
                     .collect())
             }
-            Self::Condition(operation) => operation.batch(context, driver, inputs),
-            Self::While(operation) => operation.batch(context, driver, inputs),
-            Self::Scan(operation) => operation.batch(context, driver, inputs),
-            Self::Array(operation) => batch_projected_operation(context, operation, inputs),
-            Self::Dimension(operation) => batch_projected_operation(context, operation, inputs),
-            Self::Compare(operation) => operation.batch(context, driver, inputs),
-            Self::DimensionFromScalar(operation) => operation.batch(context, driver, inputs),
-            Self::DimensionToScalar(operation) => operation.batch(context, driver, inputs),
-            Self::DimensionSize(operation) => operation.batch(context, driver, inputs),
-            Self::Concatenate(operation) => operation.batch(context, driver, inputs),
-            Self::CustomCall(operation) => operation.batch(context, driver, inputs),
-            Self::Pad(operation) => operation.batch(context, driver, inputs),
-            Self::DynamicShapeSlice(operation) => operation.batch(context, driver, inputs),
-            Self::RngBitGenerator(operation) => operation.batch(context, driver, inputs),
-            Self::AllGather(operation) => operation.batch_in_parent(context, driver, inputs),
-            Self::PSumScatter(operation) => operation.batch_in_parent(context, driver, inputs),
-            Self::AllToAll(operation) => operation.batch_in_parent(context, driver, inputs),
-            Self::Reshape(operation) => operation.batch(context, driver, inputs),
-            Self::Broadcast(operation) => operation.batch(context, driver, inputs),
-            Self::LinearCall(operation) => operation.batch(context, driver, inputs),
         }
-    }
+    };
 }
+
+impl_dynamic_constructor_member_batching!(ZeroOperation<ArrayType>);
+impl_dynamic_constructor_member_batching!(OneOperation<ArrayType>);
+impl_dynamic_constructor_member_batching!(IotaOperation<ArrayType>);
 
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::Scalar;
     use crate::backends::array_programs::ArrayProgramValue;
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
@@ -1252,16 +1189,18 @@ mod tests {
         RecursiveBatchingPolicy, batch,
     };
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::LinearCallOperation;
     use crate::operations::collectives::{
         AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions, PSumScatterOperation,
     };
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{IotaOperation, OneOperation, ZeroOperation};
-    use crate::operations::control_flow::SelectOperation;
+    use crate::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
     use crate::operations::dimensions::{
         DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionToScalar,
         DimensionToScalarOperation,
     };
+    use crate::operations::manipulation::{ConcatenateOperation, PadOperation};
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use crate::operations::{CollectiveKind, CollectiveOperation};
@@ -1272,6 +1211,7 @@ mod tests {
     use crate::tracing::TracingContext;
     use crate::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::types::{DataType, Dimension, Shape};
+    use crate::{ArrayOperation, ArrayProgramOperation, Scalar};
 
     use super::*;
 
@@ -2137,46 +2077,46 @@ mod tests {
             &ArrayProgramValue::Dimension(DimensionValue::new(dimension_type.clone(), 4)?),
         );
 
-        // Once the predicate varies per item, first-class dimension state would need one independent value per item
-        // and is therefore rejected instead of being silently treated as replicated.
-        let error = context
-            .bind(
-                ArrayProgramOperation::While(WhileOperation::new().with_iteration_bound(1)?),
-                vec![condition.clone(), body.clone()],
-                &[
-                    BatchingTracer::new(
-                        context.clone(),
-                        ArrayProgramBatch::new(
-                            ArrayProgramValue::Array(Array::vector(vec![true, false])),
-                            BatchAxis::new(0),
-                        )?,
-                    ),
-                    BatchingTracer::new(
-                        context.clone(),
-                        ArrayProgramBatch::new(
-                            ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0])),
-                            BatchAxis::new(0),
-                        )?,
-                    ),
-                    BatchingTracer::new(
-                        context.clone(),
-                        ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(DimensionValue::new(
-                            dimension_type.clone(),
-                            4,
-                        )?)),
-                    ),
-                ],
-            )
-            .unwrap_err();
-        assert!(
-            matches!(
-                error.downcast_custom::<BatchingError>(),
-                Some(BatchingError::UnsupportedOperation { message })
-                    if message == "cannot batch a while loop with a batch-varying predicate and first-class dimension \
-                                   state dimension<shared \u{2208} [0, 17)> because one replicated dimension cannot represent \
-                                   per-item loop state",
-            ),
-            "{error:?}"
+        // A batch-varying predicate masks the array carries per item while the replicated dimension carry rides through
+        // the loop as loop-invariant state. The single permitted iteration updates the active item only: item 0 takes
+        // the body's `(false, -1.0)` candidate, while item 1 (whose predicate is already false) keeps its carried
+        // `(false, 2.0)`, and the dimension stays replicated at its incoming extent.
+        let outputs = context.bind(
+            ArrayProgramOperation::While(WhileOperation::new().with_iteration_bound(1)?),
+            vec![condition.clone(), body.clone()],
+            &[
+                BatchingTracer::new(
+                    context.clone(),
+                    ArrayProgramBatch::new(
+                        ArrayProgramValue::Array(Array::vector(vec![true, false])),
+                        BatchAxis::new(0),
+                    )?,
+                ),
+                BatchingTracer::new(
+                    context.clone(),
+                    ArrayProgramBatch::new(
+                        ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+                        BatchAxis::new(0),
+                    )?,
+                ),
+                BatchingTracer::new(
+                    context.clone(),
+                    ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(DimensionValue::new(
+                        dimension_type.clone(),
+                        4,
+                    )?)),
+                ),
+            ],
+        )?;
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].batch().value(), &ArrayProgramValue::Array(Array::vector(vec![false, false])));
+        assert_eq!(outputs[1].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[1].batch().value(), &ArrayProgramValue::Array(Array::vector(vec![-1.0_f32, 2.0])));
+        assert_eq!(outputs[2].batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(
+            outputs[2].batch().value(),
+            &ArrayProgramValue::Dimension(DimensionValue::new(dimension_type.clone(), 4)?),
         );
 
         // Staging retains one direct composite while with explicit threaded extents in both regions. Rendering and

@@ -1,0 +1,5 @@
+error: the 'structural' operation variant class was replaced by the 'projected(U, structural)' role form
+  --> tests/operations/error_removed_structural_variant_class.rs:12:12
+   |
+12 |     #[ryft(structural(DimensionType))]
+   |            ^^^^^^^^^^

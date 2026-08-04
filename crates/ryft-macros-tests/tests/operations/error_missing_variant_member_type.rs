@@ -8,8 +8,11 @@ struct MemberOperation<V>(V);
 
 #[derive(ryft::Operation)]
 enum BadOperation<V: Value<Type = DataType>> {
-    #[ryft(replicated)]
+    #[ryft(projected)]
     Member(MemberOperation<V>),
+
+    #[ryft(mixed)]
+    MixedMember(MemberOperation<V>),
 }
 
 fn main() {}

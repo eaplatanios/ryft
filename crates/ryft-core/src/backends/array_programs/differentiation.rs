@@ -5,11 +5,8 @@
 //! the family as a whole, such as member projection and structural-zero cotangents for non-differentiable dimensions.
 
 use crate::differentiation::forward::{MemberDifferentiableOperation, jvp_projected_operation};
-use crate::differentiation::reverse::MemberTransposableOperation;
-use crate::differentiation::reverse::transpose_projected_operation;
 use crate::operations::control_flow::{
     TemporalResidualOperation, TemporalResidualType, WhileResidualStackOperation, WhileResidualStackType,
-    jvp_array_program_while,
 };
 use crate::operations::dimensions::RUNTIME_DIMENSION_DATA_TYPE;
 use crate::operations::logical::AndOperation;
@@ -59,6 +56,14 @@ impl WhileResidualStackType for ArrayProgramType {
             Self::Dimension(r#type) => {
                 Err(TypeError::invalid(format!("expected an array-backed bounded-while state type but got {}", r#type)))
             }
+        }
+    }
+
+    #[inline]
+    fn maskable_array_type(&self) -> Option<&ArrayType> {
+        match self {
+            Self::Array(r#type) => Some(r#type),
+            Self::Dimension(_) => None,
         }
     }
 }
@@ -120,141 +125,38 @@ where
     }
 }
 
-impl<
-    A: Value<Type = ArrayType>,
-    C: Context<Type = ArrayProgramType, Constant: ValueProjection<ArrayType, Projected = A>> + Zero<C::Value>,
-> DifferentiableOperation<C> for ArrayProgramOperation<A>
+impl<A, C> MemberDifferentiableOperation<C> for ArrayOperation<A>
 where
-    C::Value: Concretizable<bool> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: From<ArrayProgramOperation<A>>
-        + From<AllGatherOperation>
-        + From<AllToAllOperation>
-        + From<BroadcastOperation>
-        + From<CompareOperation<ArrayProgramType>>
-        + From<ConcatenateOperation<ArrayProgramType>>
-        + From<ConditionOperation<C::Constant>>
-        + From<DimensionFromScalarOperation>
-        + From<DimensionSizeOperation>
-        + From<DimensionToScalarOperation>
-        + From<DynamicShapeSliceOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
-        + From<PadOperation<ArrayProgramType>>
-        + From<PSumScatterOperation>
-        + From<ReshapeOperation>
-        + From<RngBitGeneratorOperation<ArrayProgramType>>
-        + From<ScanOperation<C::Constant>>
-        + From<WhileOperation<ArrayProgramType>>
-        + From<ZeroOperation<ArrayType>>
-        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>
-        + ZeroOperationProvider<ArrayProgramType>,
+    A: Value<Type = ArrayType>,
+    C: Context<
+            Type = ArrayProgramType,
+            Constant: ValueProjection<ArrayType, Projected = A>,
+            Operation: From<ArrayProgramOperation<A>>
+                           + From<BroadcastOperation>
+                           + From<DimensionSizeOperation>
+                           + From<DimensionToScalarOperation>
+                           + From<LinearCallOperation<ArrayProgramType>>
+                           + From<ZeroOperation<ArrayType>>
+                           + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+                           + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        > + Zero<C::Value>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if let Self::LinearCall(operation) = self {
-            return operation.jvp(context, driver, inputs);
-        }
-        if let Self::Pad(operation) = self {
-            return operation.jvp(context, driver, inputs);
-        }
-        if let Self::CustomCall(operation) = self {
-            return operation.jvp(context, driver, inputs);
-        }
-        if let Self::Compare(operation) = self {
-            return operation.jvp(context, driver, inputs);
-        }
-        if let Self::RngBitGenerator(operation) = self {
-            return operation.jvp(context, driver, inputs);
-        }
-        if matches!(self, Self::Condition(_)) {
-            return ConditionOperation::<C::Constant>::new().jvp(context, driver, inputs);
-        }
-        if let Self::Scan(operation) = self {
-            let scan = ScanOperation::<C::Constant>::new(operation.carry_count(), operation.length())
-                .with_reverse(operation.reverse())
-                .with_unroll(operation.unroll())?;
-            return scan.jvp(context, driver, inputs);
-        }
-        if let Self::While(operation) = self {
-            return jvp_array_program_while(operation, context, driver, inputs);
-        }
-        if let Self::Array(ArrayOperation::Slice(operation)) = self {
-            return operation.jvp_in_parent(context, driver, inputs);
-        }
-        if let Self::Array(ArrayOperation::DynamicSlice(operation)) = self {
-            return operation.jvp_in_parent(context, driver, inputs);
-        }
-        if let Self::Array(ArrayOperation::DynamicUpdateSlice(operation)) = self {
-            return operation.jvp_in_parent(context, driver, inputs);
-        }
-        if let Self::Array(ArrayOperation::Gather(operation)) = self {
-            return operation.jvp_in_parent(context, driver, inputs);
-        }
-        if let Self::Array(ArrayOperation::Reduce(operation)) = self {
-            return operation.jvp_in_parent(context, driver, inputs);
-        }
-        if let Self::Concatenate(operation) = self {
-            return operation.jvp(context, driver, inputs);
-        }
-        if let Self::Reshape(operation) = self {
-            return operation.jvp(context, driver, inputs);
-        }
-        if let Self::Broadcast(operation) = self {
-            return operation.jvp(context, driver, inputs);
-        }
-        if let Self::AllGather(operation) = self {
-            return operation.jvp_in_parent(context, driver, inputs);
-        }
-        if let Self::PSumScatter(operation) = self {
-            return operation.jvp_in_parent(context, driver, inputs);
-        }
-        if let Self::AllToAll(operation) = self {
-            return operation.jvp_in_parent(context, driver, inputs);
-        }
-        match self {
-            Self::DimensionSize(operation) => return operation.jvp(context, driver, inputs),
-            Self::DimensionFromScalar(operation) => return operation.jvp(context, driver, inputs),
-            Self::DimensionToScalar(operation) => return operation.jvp(context, driver, inputs),
-            _ => {}
-        }
-        let dynamic_constant_type = match self {
-            Self::Zero(operation) => Some(operation.r#type()),
-            Self::DynamicOne(operation) => Some(operation.r#type()),
-            Self::DynamicIota(operation) => Some(operation.r#type()),
-            _ => None,
+        let output_duals = match self {
+            Self::Slice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
+            Self::DynamicSlice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
+            Self::DynamicUpdateSlice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
+            Self::Gather(operation) => operation.jvp_in_parent(context, driver, inputs)?,
+            Self::Reduce(operation) => operation.jvp_in_parent(context, driver, inputs)?,
+            operation => jvp_projected_operation(context, operation, inputs)?,
         };
-        if let Some(output_type) = dynamic_constant_type {
-            // Dynamic zero, one, and iota are constant with respect to their extent operands, but their zero tangents
-            // still need those runtime extents for materialization. Stage dynamic zero while the operands remain
-            // available instead of leaving a type-only structural zero for the generic output boundary.
-            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            let mut primals = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
-            check_count!("output", primals, 1, ProgramError);
-            let primal = primals.remove(0);
-            let tangent_operation = ArrayProgramOperation::<A>::from(ZeroOperation::new(output_type.tangent()));
-            let mut tangents = context.bind(tangent_operation, Vec::new(), primal_inputs.as_slice())?;
-            check_count!("output", tangents, 1, ProgramError);
-            let tangent = tangents.remove(0);
-            return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?]);
-        }
-
-        let Self::Array(operation) = self else {
-            // Replicated structural members and the remaining composite-native discrete operations carry no
-            // differential dependence. Replaying the primal preserves their explicit SSA dependencies while
-            // structural zeros prevent first-class dimensions from entering the tangent program.
-            return Ok(context
-                .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>())?
-                .into_iter()
-                .map(DifferentiationDual::new_with_zero_tangent)
-                .collect());
-        };
-
-        let output_duals = jvp_projected_operation(context, operation, inputs)?;
         output_duals
             .into_iter()
             .map(|output| {
@@ -266,8 +168,7 @@ where
                 }
 
                 // A projected array rule can return a structural zero even when its result has runtime extents. Use
-                // the primal result as the geometry exemplar before lifting the dual back into the composite family.
-                // This keeps the zero source-relative and avoids reconstructing dimension values from its type.
+                // the primal result as its geometry exemplar before lifting the dual into the composite family.
                 let (primal, _) = output.into_parts();
                 let tangent_array_type = <&ArrayType>::try_from(&tangent_type)?;
                 let primal_type = primal.r#type();
@@ -295,109 +196,6 @@ where
                 DifferentiationDual::new(primal, MaybeZero::Value(tangent)).map_err(Into::into)
             })
             .collect()
-    }
-}
-
-impl<
-    A: Value<Type = ArrayType>,
-    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected = A>,
-    O: Operation<Type = ArrayProgramType>
-        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
-        + From<ArrayProgramOperation<A>>
-        + From<ConditionOperation<V>>
-        + From<LinearCallOperation<ArrayProgramType>>
-        + From<ScanOperation<V>>
-        + ZeroOperationProvider<ArrayProgramType>,
-> TransposableOperation<V, O> for ArrayProgramOperation<A>
-where
-    ArrayOperation<A>: Operation<Type = ArrayType> + TransposableOperation<A, ArrayOperation<A>>,
-    ProjectedValue<ArrayType, Tracer<TracingContext<V, O>>>:
-        BroadcastDerivativeAlignment + ElementwiseDerivativeAlignment<ArrayType> + Transpose,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        if let Self::LinearCall(operation) = self {
-            return operation.transpose(context, driver, inputs, outputs);
-        }
-        if let Self::CustomCall(operation) = self {
-            return operation.transpose(context, driver, inputs, outputs);
-        }
-        if let Self::Compare(operation) = self {
-            return operation.transpose(context, driver, inputs, outputs);
-        }
-        if let Self::RngBitGenerator(operation) = self {
-            return operation.transpose(context, driver, inputs, outputs);
-        }
-        if matches!(self, Self::Condition(_)) {
-            return ConditionOperation::<V>::new().transpose(context, driver, inputs, outputs);
-        }
-        if let Self::Scan(operation) = self {
-            let scan = ScanOperation::<V>::new(operation.carry_count(), operation.length())
-                .with_reverse(operation.reverse())
-                .with_unroll(operation.unroll())?
-                .with_captures(
-                    operation
-                        .captures()
-                        .iter()
-                        .map(|capture| match capture {
-                            ArrayProgramValue::Array(value) => V::from_projected(value.clone()),
-                            ArrayProgramValue::Dimension(_) => {
-                                unreachable!("validated scan captures are always arrays")
-                            }
-                        })
-                        .collect(),
-                );
-            return scan.transpose(context, driver, inputs, outputs);
-        }
-        match self {
-            Self::DimensionSize(operation) => return operation.transpose(context, driver, inputs, outputs),
-            Self::DimensionFromScalar(operation) => return operation.transpose(context, driver, inputs, outputs),
-            Self::DimensionToScalar(operation) => return operation.transpose(context, driver, inputs, outputs),
-            _ => {}
-        }
-        if matches!(self, Self::Zero(_) | Self::DynamicOne(_) | Self::DynamicIota(_)) {
-            check_count!("output", outputs, 1, ProgramError);
-            // A shaped constructor depends on its extent operands only as non-differentiable shape inputs. Its array
-            // value is constant with respect to those operands, so every extent receives a structural-zero cotangent
-            // regardless of the array output cotangent.
-            return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
-        }
-        if let Self::AllGather(operation) = self {
-            return operation.transpose_in_parent(context, driver, inputs, outputs);
-        }
-        if let Self::PSumScatter(operation) = self {
-            return operation.transpose_in_parent(context, driver, inputs, outputs);
-        }
-        if let Self::AllToAll(operation) = self {
-            return operation.transpose_in_parent(context, driver, inputs, outputs);
-        }
-        if let Self::Pad(operation) = self {
-            return operation.transpose(context, driver, inputs, outputs);
-        }
-        if let Self::Concatenate(operation) = self {
-            return operation.transpose(context, driver, inputs, outputs);
-        }
-        if let Self::Broadcast(operation) = self {
-            return operation.transpose(context, driver, inputs, outputs);
-        }
-
-        if let Self::Reshape(operation) = self {
-            return operation.transpose(context, driver, inputs, outputs);
-        }
-
-        let Self::Array(operation) = self else {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("operation `{}` is not transposable", self.name()),
-            }
-            .into());
-        };
-
-        transpose_projected_operation(context, operation, inputs, outputs)
     }
 }
 
@@ -948,6 +746,93 @@ mod tests {
             linearization.primal().interpret(vec![array(Array::vector(vec![1.0, 1.0, 1.0]))]).unwrap();
         assert_eq!(primal_outputs[0], array(Array::vector(vec![2.0, 4.0, 8.0])));
         let residuals = primal_outputs.split_off(1);
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]))]),
+        );
+    }
+
+    #[test]
+    fn test_composite_bounded_while_differentiation_supports_batched_predicates_with_dimension_state() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+
+        // Condition: a per-item predicate `state < [2, 4, 8]` that ignores the loop-invariant dimension carry.
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        condition_builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
+        let state = condition_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
+        let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0])));
+        let predicate = condition_builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![state, limits],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Body: the dimension carry is forwarded unchanged and the array carry doubles.
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = body_builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
+        let state = body_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
+        let doubled = body_builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![state, state],
+            )
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![extent, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
+        let state = builder.add_input(ArrayProgramType::Array(vector_type));
+        let regions =
+            vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                regions,
+                vec![extent, state],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // Starting from `[1, 1, 1]`, item `i` doubles `i + 1` times before its own predicate turns false, so the
+        // primal outputs are `[2, 4, 8]` and the per-item tangent scale factors are the matching `[2, 4, 8]`. The
+        // dimension carry has an empty tangent space, so it contributes neither a tangent input nor a tangent output.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_count(), 3);
+        assert_eq!(jvp.output_count(), 3);
+        let outputs = jvp
+            .interpret(vec![
+                dimension(&extent_type, 4),
+                array(Array::vector(vec![1.0, 1.0, 1.0])),
+                array(Array::vector(vec![1.0, 1.0, 1.0])),
+            ])
+            .unwrap();
+        assert_eq!(outputs[0], dimension(&extent_type, 4));
+        assert_eq!(outputs[1], array(Array::vector(vec![2.0, 4.0, 8.0])));
+        assert_eq!(outputs[2], array(Array::vector(vec![2.0, 4.0, 8.0])));
+
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![dimension(&extent_type, 4), array(Array::vector(vec![1.0, 1.0, 1.0]))])
+            .unwrap();
+        assert_eq!(primal_outputs[0], dimension(&extent_type, 4));
+        assert_eq!(primal_outputs[1], array(Array::vector(vec![2.0, 4.0, 8.0])));
+        let residuals = primal_outputs.split_off(2);
         let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]))];
         pullback_inputs.extend(residuals);
         assert_eq!(

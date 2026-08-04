@@ -1,0 +1,29 @@
+error: unexpected end of input, '#[ryft(members(...))]' must declare at least one member universe
+  --> tests/operations/error_members_attribute.rs:12:16
+   |
+12 | #[ryft(members())]
+   |                ^
+
+error: duplicate ryft member universe 'ArrayType'
+  --> tests/operations/error_members_attribute.rs:18:27
+   |
+18 | #[ryft(members(ArrayType, ArrayType))]
+   |                           ^^^^^^^^^
+
+error: invalid ryft member universe role 'replicated'; only 'structural' is supported here
+  --> tests/operations/error_members_attribute.rs:24:27
+   |
+24 | #[ryft(members(ArrayType, replicated(DimensionType)))]
+   |                           ^^^^^^^^^^
+
+error: 'structural(...)' declares exactly one member type
+  --> tests/operations/error_members_attribute.rs:30:36
+   |
+30 | #[ryft(members(structural(ArrayType, DimensionType)))]
+   |                                    ^
+
+error: duplicate ryft attribute 'members(...)'
+  --> tests/operations/error_members_attribute.rs:37:8
+   |
+37 | #[ryft(members(DimensionType))]
+   |        ^^^^^^^

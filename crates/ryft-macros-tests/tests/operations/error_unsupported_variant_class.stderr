@@ -1,11 +1,35 @@
-error: operation member class markers accept exactly one member type
-  --> tests/operations/error_unsupported_variant_class.rs:12:31
+error: invalid operation variant '#[ryft(...)]' attribute: 'composite_member'; only 'projected', 'mixed', and 'skip_from' are supported here
+  --> tests/operations/error_unsupported_variant_class.rs:13:12
    |
-12 |     #[ryft(projected(ArrayType, DataType))]
-   |                               ^
-
-error: invalid operation variant '#[ryft(...)]' attribute: 'composite_member'; only 'projected' and 'replicated' are supported here
-  --> tests/operations/error_unsupported_variant_class.rs:15:12
-   |
-15 |     #[ryft(composite_member(ArrayType))]
+13 |     #[ryft(composite_member(ArrayType))]
    |            ^^^^^^^^^^^^^^^^
+
+error: invalid projected operation variant role 'replicated'; only 'structural' is supported here
+  --> tests/operations/error_unsupported_variant_class.rs:16:33
+   |
+16 |     #[ryft(projected(ArrayType, replicated))]
+   |                                 ^^^^^^^^^^
+
+error: invalid mixed operation variant role 'replicated'; only 'structural' is supported here
+  --> tests/operations/error_unsupported_variant_class.rs:19:29
+   |
+19 |     #[ryft(mixed(ArrayType, replicated))]
+   |                             ^^^^^^^^^^
+
+error: the 'projected' operation variant class accepts one member type and an optional role
+  --> tests/operations/error_unsupported_variant_class.rs:22:43
+   |
+22 |     #[ryft(projected(ArrayType, structural, DimensionType))]
+   |                                           ^
+
+error: the 'mixed' operation variant class accepts one member type and an optional role
+  --> tests/operations/error_unsupported_variant_class.rs:25:39
+   |
+25 |     #[ryft(mixed(ArrayType, structural, DimensionType))]
+   |                                       ^
+
+error: duplicate ryft operation variant attribute 'skip_from'
+  --> tests/operations/error_unsupported_variant_class.rs:28:23
+   |
+28 |     #[ryft(skip_from, skip_from)]
+   |                       ^^^^^^^^^
