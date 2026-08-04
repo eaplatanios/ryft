@@ -47,7 +47,7 @@ use crate::operations::manipulation::{
     DynamicShapeSliceOperation, DynamicUpdateSliceOperation, LegacyBroadcastOperation, Pad, PadOperation, Reshape,
     ReshapeOperation, ReshapeParameters, Slice, Transpose, UpdateSlice,
 };
-use crate::operations::math::{AddOperation, Reduce, ReduceOperation, ReductionKind};
+use crate::operations::math::{AddOperation, ReduceOperation, ReductionKind};
 use crate::operations::random::{RngBitGenerator, RngBitGeneratorOperation};
 use crate::parameters::Parameter;
 use crate::partial::{
@@ -63,7 +63,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, ProjectedValue, Value, ValueProjection};
 use crate::programs::{AtomId, ProgramBuilder, ProgramError};
 use crate::sharding::Sharding;
-use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::{
     ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType,
     DimensionVariable, Shape,
