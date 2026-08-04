@@ -16,13 +16,11 @@ const DISPATCH_ATTRIBUTE: Symbol = Symbol::new("dispatch");
 const BATCHING_ATTRIBUTE: Symbol = Symbol::new("batching");
 const DIFFERENTIATION_ATTRIBUTE: Symbol = Symbol::new("differentiation");
 const TRANSPOSITION_ATTRIBUTE: Symbol = Symbol::new("transposition");
+const PROJECTED_ATTRIBUTE: Symbol = Symbol::new("projected");
+const REPLICATED_ATTRIBUTE: Symbol = Symbol::new("replicated");
 const VALID_CONTAINER_ATTRIBUTES: [Symbol; 2] = [CRATE_ATTRIBUTE, DISPATCH_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
-const NESTED_ATTRIBUTE_ERROR: &str = "\
-  the '#[ryft(...)]' attribute is only supported at the top level for operation enums. It is not supported for \
-  variants or fields";
-
 /// Mutable parser and diagnostic accumulator for `#[derive(Operation)]`.
 struct OperationParser {
     /// Path to the `ryft` crate or facade used by generated code.
@@ -301,11 +299,10 @@ impl OperationParser {
     ///
     /// # Parameters
     ///
-    ///   * `enum_name` - [`syn::Ident`] of the enum being derived, used to detect recursive payloads.
     ///   * `generics` - [`syn::Generics`] of the enum being derived, used to detect bare generic payloads.
     ///   * `variant` - [`syn::Variant`] from which to extract an [`OperationVariant`].
     fn extract_variant(&mut self, generics: &syn::Generics, variant: &syn::Variant) -> Option<OperationVariant> {
-        self.reject_nested_attributes(&variant.attrs);
+        let class = self.extract_variant_class(variant);
         let syn::Fields::Unnamed(fields) = &variant.fields else {
             self.add_error(&variant.ident, "operation enum variants must be tuple variants with one payload field");
             return None;
@@ -315,7 +312,13 @@ impl OperationParser {
             return None;
         }
         let field = fields.unnamed.first().expect("expected one payload field");
-        self.reject_nested_attributes(&field.attrs);
+        field.attrs.iter().filter(|attribute| attribute.path() == &RYFT_ATTRIBUTE).for_each(|attribute| {
+            self.add_error(
+                attribute,
+                "operation field attributes are not supported; put operation member-class attributes on the \
+                     enclosing variant",
+            )
+        });
 
         let payload_type = field.ty.clone();
         let (operation_type, is_boxed) = boxed_inner_type(&payload_type)
@@ -324,6 +327,7 @@ impl OperationParser {
         let is_generic_extension = is_bare_generic_parameter(&payload_type, generics);
 
         Some(OperationVariant {
+            class,
             ident: variant.ident.clone(),
             program_payload_type: operation_type.clone(),
             payload_type: operation_type,
@@ -332,14 +336,59 @@ impl OperationParser {
         })
     }
 
-    /// Rejects nested `#[ryft(...)]` attributes, which are only supported at the top level for operation enums and
-    /// never on variants or payload fields.
-    fn reject_nested_attributes(&mut self, attributes: &[syn::Attribute]) {
-        attributes
-            .iter()
-            .filter(|attr| attr.path() == &RYFT_ATTRIBUTE)
-            .for_each(|attr| self.add_error(attr, NESTED_ATTRIBUTE_ERROR));
+    /// Extracts the semantic class declared for `variant`. Variants without a class marker are composite-native and
+    /// retain their payload's direct outer-family contract. Member variants must name the member
+    /// [`Type`](ryft_core::Type) as the sole argument of either `projected(...)` or `replicated(...)`.
+    fn extract_variant_class(&mut self, variant: &syn::Variant) -> OperationVariantClass {
+        let mut class: Option<OperationVariantClass> = None;
+        for attribute in variant.attrs.iter().filter(|attribute| attribute.path() == &RYFT_ATTRIBUTE) {
+            attribute
+                .parse_nested_meta(|meta| {
+                    let candidate = match &meta.path {
+                        path if path == &PROJECTED_ATTRIBUTE => {
+                            OperationVariantClass::ProjectedMember { member_type: parse_member_type(&meta)? }
+                        }
+                        path if path == &REPLICATED_ATTRIBUTE => {
+                            OperationVariantClass::ReplicatedMember { member_type: parse_member_type(&meta)? }
+                        }
+                        _ => {
+                            return Err(meta.error(format_args!(
+                                "invalid operation variant '#[ryft(...)]' attribute: '{}'; only 'projected' and \
+                                 'replicated' are supported here",
+                                meta.path.to_token_stream().to_string().replace(' ', ""),
+                            )));
+                        }
+                    };
+                    if let Some(class) = &class {
+                        let message = if class.name() == candidate.name() {
+                            format!("duplicate ryft operation variant class '{}'", candidate.name())
+                        } else {
+                            format!(
+                                "contradictory ryft operation variant classes '{}' and '{}'",
+                                class.name(),
+                                candidate.name(),
+                            )
+                        };
+                        return Err(syn::Error::new_spanned(&meta.path, message));
+                    }
+                    class = Some(candidate);
+                    Ok(())
+                })
+                .unwrap_or_else(|error| self.errors.push(error));
+        }
+        class.unwrap_or(OperationVariantClass::CompositeNative)
     }
+}
+
+/// Parses the sole member [`Type`](ryft_core::Type) argument of an operation variant class marker.
+fn parse_member_type(meta: &syn::meta::ParseNestedMeta) -> syn::Result<syn::Type> {
+    let content;
+    syn::parenthesized!(content in meta.input);
+    let member_type = content.parse()?;
+    if !content.is_empty() {
+        return Err(content.error("operation member class markers accept exactly one member type"));
+    }
+    Ok(member_type)
 }
 
 impl OperationEnum {
@@ -1145,6 +1194,9 @@ impl OperationEnum {
 /// Operation enum variant extracted from the derive input, together with the payload metadata that drives the
 /// generated dispatch arms, predicates, and conversions.
 struct OperationVariant {
+    /// Semantic dispatch class of this variant.
+    class: OperationVariantClass,
+
     /// Identifier of the enum variant.
     ident: syn::Ident,
 
@@ -1161,6 +1213,43 @@ struct OperationVariant {
     is_generic_extension: bool,
 }
 
+/// Semantic dispatch class declared for one operation enum variant.
+enum OperationVariantClass {
+    /// Operation whose payload already uses the enclosing operation family's type and semantic contracts.
+    CompositeNative,
+
+    /// Rule-bearing homogeneous member whose inference, execution, and transform rules run in a projected context.
+    ProjectedMember {
+        /// Type of the projected member universe.
+        member_type: syn::Type,
+    },
+
+    /// Structural member that executes in a projected context but remains replicated under transforms.
+    ReplicatedMember {
+        /// Type of the replicated member universe.
+        member_type: syn::Type,
+    },
+}
+
+impl OperationVariantClass {
+    /// Returns the marker name that declares this member class.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::CompositeNative => unreachable!("composite-native variants have no class marker"),
+            Self::ProjectedMember { .. } => "projected",
+            Self::ReplicatedMember { .. } => "replicated",
+        }
+    }
+
+    /// Returns the operation type required of this variant's payload.
+    fn operation_type<'t>(&'t self, primary_type: &'t syn::Type) -> &'t syn::Type {
+        match self {
+            Self::CompositeNative => primary_type,
+            Self::ProjectedMember { member_type } | Self::ReplicatedMember { member_type } => member_type,
+        }
+    }
+}
+
 impl OperationVariant {
     /// Receiver expression to use when delegating to the wrapped operation.
     fn receiver(&self) -> TokenStream {
@@ -1169,11 +1258,11 @@ impl OperationVariant {
 }
 
 /// Builds the generics used by the generated [`Operation`] and [`Display`] implementations: the enum generics
-/// without defaults, plus one `Payload: Operation<Type = T>` predicate per variant payload. For bare generic
-/// payloads the predicate is a real constraint; for concrete payloads it is how the derive rejects a payload whose
-/// associated [`Operation::Type`] disagrees with the family's primary type — the dispatcher bodies type-check under
-/// the equality assumption, so a mismatch surfaces as one associated-type error on the generated implementation
-/// instead of a pile of forwarded-signature mismatches.
+/// without defaults, plus one `Payload: Operation<Type = T>` predicate per distinct payload contract. Composite-native
+/// variants use the enclosing family's primary type; declared member variants use their member type. For bare generic
+/// payloads the predicate is a real constraint. For concrete payloads it makes a mismatched associated
+/// [`Operation::Type`] surface as one error on the generated implementation instead of many forwarded-signature
+/// mismatches.
 fn operation_generics(
     generics: &syn::Generics,
     variants: &[OperationVariant],
@@ -1181,14 +1270,20 @@ fn operation_generics(
     operation_type: &syn::Type,
 ) -> syn::Generics {
     let mut generics = generics.without_defaults();
-    let mut seen_payload_types = std::collections::HashSet::new();
+    let mut seen_payload_contracts = std::collections::HashSet::new();
     let payload_operation_bounds = variants
         .iter()
-        .filter(|variant| seen_payload_types.insert(variant.payload_type.to_token_stream().to_string()))
+        .filter(|variant| {
+            seen_payload_contracts.insert((
+                variant.payload_type.to_token_stream().to_string(),
+                variant.class.operation_type(operation_type).to_token_stream().to_string(),
+            ))
+        })
         .map(|variant| {
             let payload_type = &variant.payload_type;
+            let expected_type = variant.class.operation_type(operation_type);
             let predicate: syn::WherePredicate =
-                syn::parse_quote!(#payload_type: #ryft::Operation<Type = #operation_type>);
+                syn::parse_quote!(#payload_type: #ryft::Operation<Type = #expected_type>);
             predicate
         });
     generics.make_where_clause().predicates.extend(payload_operation_bounds);
@@ -1596,7 +1691,9 @@ mod tests {
         let mut input = syn::parse2(quote! {
             enum Operation<V: Value<Type = DataType>, Extension> {
                 Zero(ZeroOperation<DataType>),
+                #[ryft(projected(ArrayType))]
                 Boxed(Box<CustomJvpOperation<DataType, V>>),
+                #[ryft(replicated(DimensionType))]
                 Recursive(WhileOperation<DataType, V, Self>),
                 Extension(Extension),
             }
@@ -1608,6 +1705,17 @@ mod tests {
         let variants = generator.extract_variants(&input);
         assert!(generator.errors.is_empty());
         assert_eq!(variants.len(), 4);
+        assert!(matches!(variants[0].class, OperationVariantClass::CompositeNative));
+        assert!(matches!(variants[1].class, OperationVariantClass::ProjectedMember { .. }));
+        assert!(matches!(variants[2].class, OperationVariantClass::ReplicatedMember { .. }));
+        assert_eq!(
+            variants[1].class.operation_type(&syn::parse_quote!(DataType)).to_token_stream().to_string(),
+            "ArrayType",
+        );
+        assert_eq!(
+            variants[2].class.operation_type(&syn::parse_quote!(DataType)).to_token_stream().to_string(),
+            "DimensionType",
+        );
         assert!(!variants[0].is_boxed && !variants[0].is_generic_extension);
         assert!(variants[1].is_boxed && !variants[1].is_generic_extension);
         assert!(!variants[2].is_boxed && !variants[2].is_generic_extension);
@@ -1645,7 +1753,49 @@ mod tests {
         .expect("failed to parse derive input");
         assert_eq!(generator.extract_variants(&input).len(), 1);
         assert_eq!(generator.errors.len(), 2);
-        assert!(generator.errors.iter().all(|error| error.to_string() == NESTED_ATTRIBUTE_ERROR));
+        assert!(generator.errors[0].to_string().contains("invalid operation variant '#[ryft(...)]' attribute"));
+        assert_eq!(
+            generator.errors[1].to_string(),
+            "operation field attributes are not supported; put operation member-class attributes on the enclosing \
+             variant",
+        );
+    }
+
+    #[test]
+    fn test_operation_parser_rejects_invalid_variant_classes() {
+        let cases = [
+            (
+                quote!(#[ryft(projected(ArrayType), projected(ArrayType))]),
+                "duplicate ryft operation variant class 'projected'",
+            ),
+            (
+                quote!(#[ryft(projected(ArrayType), replicated(DimensionType))]),
+                "contradictory ryft operation variant classes 'projected' and 'replicated'",
+            ),
+            (
+                quote!(#[ryft(projected(ArrayType, DimensionType))]),
+                "operation member class markers accept exactly one member type",
+            ),
+            (quote!(#[ryft(replicated)]), "expected parentheses"),
+            (
+                quote!(#[ryft(composite_member(ArrayType))]),
+                "invalid operation variant '#[ryft(...)]' attribute: 'composite_member'; only 'projected' and \
+                 'replicated' are supported here",
+            ),
+        ];
+        for (attribute, expected_error) in cases {
+            let mut generator = OperationParser::new();
+            let input = syn::parse2(quote! {
+                enum Operation<V: Value<Type = DataType>> {
+                    #attribute
+                    Member(MemberOperation<V>),
+                }
+            })
+            .expect("failed to parse derive input");
+            assert_eq!(generator.extract_variants(&input).len(), 1);
+            let errors = generator.errors.iter().map(syn::Error::to_string).collect::<Vec<_>>();
+            assert!(errors.iter().any(|error| error.contains(expected_error)), "errors: {errors:?}");
+        }
     }
 
     #[test]

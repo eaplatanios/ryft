@@ -2168,6 +2168,10 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [x] Relocate the P8b4b collective differentiation and transposition rules.
     - [x] Relocate the P8b4c collective batching rules.
     - [x] Relocate the P8b4d remaining mixed structural and batching rules, then close P8b4.
+  - [x] Extend the derive parser with typed `#[ryft(projected(T))]` and `#[ryft(replicated(T))]` class markers and pin
+        all invalid declaration diagnostics.
+  - [ ] Generate and prove the complete projected-member and replicated-member vertical contracts before annotating
+        `ArrayProgramOperation`.
 - [ ] Establish one authoritative declaration of every array-program operation and its class.
 - [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.
 - [ ] Make `#[derive(Operation)]` with `#[ryft(dispatch(batching, differentiation, transposition))]` the mechanical

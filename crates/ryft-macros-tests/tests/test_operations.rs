@@ -2050,12 +2050,17 @@ fn test_errors() {
     let test_cases = trybuild::TestCases::new();
     test_cases.compile_fail("tests/operations/error_ambiguous_type.rs");
     test_cases.compile_fail("tests/operations/error_bad_variant.rs");
+    test_cases.compile_fail("tests/operations/error_conflicting_variant_classes.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatch_attribute.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatcher.rs");
+    test_cases.compile_fail("tests/operations/error_duplicate_variant_class.rs");
     test_cases.compile_fail("tests/operations/error_empty_dispatch.rs");
     test_cases.compile_fail("tests/operations/error_missing_type.rs");
+    test_cases.compile_fail("tests/operations/error_missing_variant_member_type.rs");
+    test_cases.compile_fail("tests/operations/error_misplaced_variant_class.rs");
     test_cases.compile_fail("tests/operations/error_mismatched_payload_type.rs");
     test_cases.compile_fail("tests/operations/error_multiple_operation_types.rs");
     test_cases.compile_fail("tests/operations/error_type_attribute.rs");
     test_cases.compile_fail("tests/operations/error_unknown_dispatcher.rs");
+    test_cases.compile_fail("tests/operations/error_unsupported_variant_class.rs");
 }

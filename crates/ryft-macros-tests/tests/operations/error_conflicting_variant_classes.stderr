@@ -1,0 +1,5 @@
+error: contradictory ryft operation variant classes 'projected' and 'replicated'
+  --> tests/operations/error_conflicting_variant_classes.rs:13:34
+   |
+13 |     #[ryft(projected(ArrayType), replicated(DimensionType))]
+   |                                  ^^^^^^^^^^

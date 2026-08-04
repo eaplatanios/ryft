@@ -1,0 +1,5 @@
+error: unexpected end of input, expected parentheses
+  --> tests/operations/error_missing_variant_member_type.rs:11:22
+   |
+11 |     #[ryft(replicated)]
+   |                      ^

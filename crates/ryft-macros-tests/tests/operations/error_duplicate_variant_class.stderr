@@ -1,0 +1,5 @@
+error: duplicate ryft operation variant class 'projected'
+  --> tests/operations/error_duplicate_variant_class.rs:12:34
+   |
+12 |     #[ryft(projected(ArrayType), projected(ArrayType))]
+   |                                  ^^^^^^^^^

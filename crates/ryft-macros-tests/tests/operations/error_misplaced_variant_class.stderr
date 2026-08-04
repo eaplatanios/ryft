@@ -1,0 +1,5 @@
+error: operation field attributes are not supported; put operation member-class attributes on the enclosing variant
+  --> tests/operations/error_misplaced_variant_class.rs:12:12
+   |
+12 |     Member(#[ryft(projected(ArrayType))] MemberOperation<V>),
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

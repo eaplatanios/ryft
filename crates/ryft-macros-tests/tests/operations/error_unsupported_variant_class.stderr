@@ -1,0 +1,11 @@
+error: operation member class markers accept exactly one member type
+  --> tests/operations/error_unsupported_variant_class.rs:12:31
+   |
+12 |     #[ryft(projected(ArrayType, DataType))]
+   |                               ^
+
+error: invalid operation variant '#[ryft(...)]' attribute: 'composite_member'; only 'projected' and 'replicated' are supported here
+  --> tests/operations/error_unsupported_variant_class.rs:15:12
+   |
+15 |     #[ryft(composite_member(ArrayType))]
+   |            ^^^^^^^^^^^^^^^^
