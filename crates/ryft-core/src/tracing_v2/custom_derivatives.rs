@@ -171,11 +171,20 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 /// wrapper determines which derivative rule later transforms must use, while a rematerialization wrapper preserves the
 /// recomputation boundary. Inlining only the primal region during batching would erase that meaning. Instead, this
 /// function binds the supplied wrapper operation around either the original regions or structurally batched
-/// replacements. Conceptually, for a custom JVP this function performs the following transformation:
+/// replacements. On the mapped-input path, the custom-JVP case can be summarized as:
 ///
 /// ```text
-/// custom_jvp(primal, jvp)(x) -- batch --> custom_jvp(batch(primal), batch(jvp))(align_to_axis_0(x))
+/// xᵢ@0       = match_axis(xᵢ, 0)
+/// batch₀(f)  = structurally batch every input and output of f at axis 0
+///
+/// custom_jvp(primal, jvp)(x₁, …, xₘ) -- batch --> custom_jvp(batch₀(primal), batch₀(jvp))(x₁@0, …, xₘ@0)
 /// ```
+///
+/// Here, each `xᵢ` is an already-packed [`ArrayBatch`], not an individual logical array. `xᵢ@0` denotes the result of
+/// [`ArrayBatchingPolicy::match_axis`]: an existing mapped axis is moved to position `0`, while a replicated input is
+/// broadcast across the mapped extent with its new mapped axis at position `0`. `batch₀(f)` denotes structural program
+/// batching with every region argument declared mapped at axis `0` and every result aligned to axis `0`. The outer
+/// operands and attached regions therefore agree on one physical calling convention.
 ///
 /// The function has two paths:
 ///
