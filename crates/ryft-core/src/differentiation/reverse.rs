@@ -1817,8 +1817,9 @@ where
 /// constructor whose operands are all extents) is a constant linear map, so no member rule runs.
 ///
 /// Delegating reconstructs the member instruction from type metadata alone, so a mixed instruction whose operands carry
-/// runtime (i.e., [`Reference`](TypeIdentityPosition::Reference)-position) identities is rejected as recovering
-/// that geometry requires linearization, which retains it as explicit residuals.
+/// runtime (i.e., [`Reference`](TypeIdentityPosition::Reference)-position) identities is rejected. Recovering that
+/// runtime-dependent type metadata requires linearization, which retains the relevant primal information as explicit
+/// residuals.
 ///
 /// # Parameters
 ///
@@ -1868,10 +1869,9 @@ where
         .any(|input| input.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference))
     {
         return Err(ProgramError::UnsupportedOperation {
-            // TODO(eaplatanios): This error message seems specific to "extents". Shouldn't it be more generic?
             message: format!(
-                "direct '{}' transposition with dynamic extents requires linearization so that the primal geometry \
-                 can be retained as residuals",
+                "direct '{}' transposition with runtime-dependent type metadata requires linearization so that the \
+                 relevant primal information can be retained as residuals",
                 operation.name(),
             ),
         }
@@ -3157,8 +3157,6 @@ mod tests {
 
     #[test]
     fn test_transpose_mixed_operation() {
-        // TODO(eaplatanios): Does this test really need to define new nested types? Can it reuse existing ones that
-        //  we have for other tests.
         /// Test-only linear member operation consuming two member-typed data operands. No production mixed payload
         /// interleaves its data and geometry operands, so this fixture is what pins that mixed transposition classifies
         /// operands one by one instead of splitting the operand list at its first geometry operand.
