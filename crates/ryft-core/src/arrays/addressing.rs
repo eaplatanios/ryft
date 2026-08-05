@@ -144,9 +144,12 @@ impl ArrayAddressing {
     }
 
     /// Returns the number of bytes used by each logical element. Every [`DataType`] occupies a whole number of bytes:
-    /// sub-byte types such as [`DataType::I4`] store one element per byte with the unused high bits set to zero,
-    /// unlike XLA's packed host representation that stores two 4-bit elements per byte, and so sub-byte buffers must
-    /// be repacked wherever they cross a backend buffer boundary.
+    /// sub-byte types such as [`DataType::I4`] store one element per byte, holding the value in the low bits with the
+    /// unused high bits set to zero, matching the checked element types in [`elements`](crate::arrays::elements)
+    /// (e.g., [`i4`](crate::arrays::elements::i4) and [`f4e2m1fn`](crate::arrays::elements::f4e2m1fn)). This unpacked
+    /// representation is the host-side standard established by [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes) and
+    /// shared by NumPy and JAX. XLA packs two 4-bit elements per byte in its literals and device buffers, and so
+    /// sub-byte buffers are repacked once where they cross the backend buffer boundary.
     #[inline]
     pub fn element_byte_width(&self) -> usize {
         Self::element_byte_width_for_data_type(self.r#type.data_type())
