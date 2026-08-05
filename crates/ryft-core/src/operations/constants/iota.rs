@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, ArrayBatching, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{ArrayBatch, ArrayBatching, ArrayIrBatching, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -17,7 +17,7 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::ArrayType;
+use crate::types::{ArrayIrType, ArrayType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -145,6 +145,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for IotaOper
 impl_non_differentiable_operation!(IotaOperation<ArrayType>);
 impl_nullary_transposable_operation!(IotaOperation<ArrayType>);
 impl_nullary_batchable_operation!(@replicated IotaOperation<ArrayType>);
+impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> IotaOperation<ArrayType>);
 
 /// Represents the ability to synthesize a value for a given [`Type`] whose elements increase from `0` along a chosen
 /// dimension in an interpretation context. [`Iota`] is the [`Type`]-driven capability needed by [`IotaOperation`] for

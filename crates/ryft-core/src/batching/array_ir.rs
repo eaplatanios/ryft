@@ -15,17 +15,15 @@ use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::arrays::{batch_axis_sharding, normalized_batch_axis_type};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchAxisSpecification, BatchableOperation,
-    BatchableType, BatchedProgram, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
-    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DimensionSource,
-    MemberBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
+    BatchableType, BatchedProgram, BatchingContext, BatchingEntrypointPolicy, BatchingError, BatchingPolicy,
+    BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DimensionSource,
+    ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
 };
 use crate::contexts::{Context, ProjectedContext, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
-use crate::operations::collectives::CollectiveBatchingPolicy;
-use crate::operations::constants::{ConstantOperation, IotaOperation, OneOperation, ZeroOperation};
-use crate::operations::dimensions::{DimensionRequirement, DimensionRequirementOperation, DimensionSizeOperation};
-use crate::operations::manipulation::{BroadcastOperation, ReshapeOperation, Transpose, TransposeOperation};
-use crate::operations::math::{Div, Mul};
+use crate::operations::constants::ConstantOperation;
+use crate::operations::dimensions::{DimensionRequirementOperation, DimensionSizeOperation};
+use crate::operations::manipulation::{BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::regions::{RegionRef, RegionReplayMappings, ReplayRegionDriver};
@@ -576,7 +574,7 @@ where
 }
 
 /// Binds one mixed dynamic broadcast against explicit first-class output dimensions.
-fn broadcast_array<C>(
+pub(crate) fn broadcast_array<C>(
     context: &C,
     value: C::Value,
     output_dimensions: Vec<C::Value>,
@@ -688,118 +686,6 @@ where
         let value = <C::Value as ValueProjection<ArrayType>>::from_projected(input.value().clone());
         let value = broadcast_array(outer_context, value, output_dimensions, output_axes, r#type.sharding().cloned())?;
         ArrayBatch::new(r#type, <C::Value as ValueProjection<ArrayType>>::into_projected(value)?, batch_axis)
-    }
-}
-
-impl<C> CollectiveBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayBatchingPolicy
-where
-    C: Context<
-            Type = ArrayIrType,
-            Operation: From<BroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + From<ReshapeOperation>
-                           + OperationProjection<ArrayType>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value:
-        ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
-    <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
-{
-    type ShapeExtent = <C::Value as ValueProjection<DimensionType>>::Projected;
-
-    fn collective_axis_extent(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
-        _operation_name: &str,
-        _axis_name: &str,
-        axis_size: usize,
-    ) -> Result<Self::ShapeExtent, BatchingError> {
-        let axis_extent = <C::Value as ValueProjection<DimensionType>>::into_projected(context.axis_extent().clone())?;
-        let axis_size = Self::collective_extent_constant(context, axis_size)?;
-        axis_extent.require_equal(&axis_size)?;
-        Ok(axis_extent)
-    }
-
-    fn collective_extent_constant(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
-        extent: usize,
-    ) -> Result<Self::ShapeExtent, BatchingError> {
-        let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
-        let mut outputs = context.parent().parent().bind(
-            DimensionOperation::Constant(ConstantOperation::new(value)),
-            Vec::new(),
-            &[],
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(outputs.remove(0))?)
-    }
-
-    fn require_divisible_collective_extents(
-        left: &Self::ShapeExtent,
-        right: &Self::ShapeExtent,
-    ) -> Result<(), BatchingError> {
-        left.require_divisible_by(right).map_err(Into::into)
-    }
-
-    fn match_collective_axis(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
-        batch: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
-        input_extents: &[Self::ShapeExtent],
-    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
-        if !batch.batch_axis().is_replicated() {
-            return batch.move_axis(0);
-        }
-
-        let input_type = batch.unbatched_type();
-        let input_extent_dimensions =
-            input_extents.iter().map(|extent| extent.r#type().to_dimension()).collect::<Vec<_>>();
-        let value = if input_type.shape().dimensions() == input_extent_dimensions {
-            batch.value().clone()
-        } else {
-            Self::reshape_collective(context, batch.value().clone(), input_extents, input_type.sharding().cloned())?
-        };
-        let output_axes = (1..=input_type.rank()).collect::<Vec<_>>();
-        let output_sharding = input_type
-            .sharding()
-            .map(|sharding| {
-                sharding
-                    .with_inserted_dimension(0, context.axis_sharding().clone())
-                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
-            })
-            .transpose()?;
-        let mut output_extents = Vec::with_capacity(input_extents.len() + 1);
-        output_extents.push(context.axis_extent().clone());
-        output_extents
-            .extend(input_extents.iter().cloned().map(<C::Value as ValueProjection<DimensionType>>::from_projected));
-        let value = broadcast_array(
-            context.parent().parent(),
-            <C::Value as ValueProjection<ArrayType>>::from_projected(value),
-            output_extents,
-            output_axes,
-            output_sharding,
-        )?;
-        let r#type = <&ArrayType>::try_from(value.r#type().as_ref())?.clone();
-        ArrayBatch::new(
-            r#type,
-            <C::Value as ValueProjection<ArrayType>>::into_projected(value)?,
-            BatchAxis::from_position(0),
-        )
-    }
-
-    fn reshape_collective(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
-        value: <C::Value as ValueProjection<ArrayType>>::Projected,
-        output_extents: &[Self::ShapeExtent],
-        output_sharding: Option<Sharding>,
-    ) -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, BatchingError> {
-        let operation = ReshapeOperation::new().with_output_sharding(output_sharding);
-        let inputs = std::iter::once(<C::Value as ValueProjection<ArrayType>>::from_projected(value))
-            .chain(output_extents.iter().cloned().map(<C::Value as ValueProjection<DimensionType>>::from_projected))
-            .collect::<Vec<_>>();
-        let mut outputs = context.parent().parent().bind(operation, Vec::new(), inputs.as_slice())?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(<C::Value as ValueProjection<ArrayType>>::into_projected(outputs.remove(0))?)
     }
 }
 
@@ -1121,45 +1007,6 @@ where
     }
 }
 
-macro_rules! impl_dynamic_constructor_member_batching {
-    // Implements the replicated-extent batching rule shared by the three dynamic array constructors. Batching is the
-    // one transform the `#[ryft(mixed(structural))]` role does not generate for these payloads, because a
-    // mixed signature cannot be projected into one member kind the way a projected structural member is.
-    ($operation:ty) => {
-        impl<C> MemberBatchableOperation<C, ArrayIrBatching> for $operation
-        where
-            C: Context<Type = ArrayIrType, Operation: From<$operation>>,
-        {
-            fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
-                &self,
-                context: &BatchingContext<C, ArrayIrBatching>,
-                _driver: &D,
-                inputs: &[ArrayIrBatch<C::Value>],
-            ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
-                // Output extents are shared shape values. A mapped extent would request a different output shape for
-                // each batch item, which requires a ragged representation that ordinary array batching lacks.
-                for extent in inputs {
-                    extent.validate_replicated_dimension()?;
-                }
-                Ok(context
-                    .parent()
-                    .bind(
-                        self.clone(),
-                        Vec::new(),
-                        &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
-                    )?
-                    .into_iter()
-                    .map(ArrayIrBatch::replicated)
-                    .collect())
-            }
-        }
-    };
-}
-
-impl_dynamic_constructor_member_batching!(ZeroOperation<ArrayType>);
-impl_dynamic_constructor_member_batching!(OneOperation<ArrayType>);
-impl_dynamic_constructor_member_batching!(IotaOperation<ArrayType>);
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -1184,7 +1031,7 @@ mod tests {
         DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionToScalar,
         DimensionToScalarOperation,
     };
-    use crate::operations::manipulation::{ConcatenateOperation, PadOperation};
+    use crate::operations::manipulation::{ConcatenateOperation, PadOperation, ReshapeOperation};
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use crate::operations::{CollectiveKind, CollectiveOperation};
@@ -2719,18 +2566,20 @@ mod tests {
             batch_axis: BatchAxis::new(0),
             r#type: mapped_type.clone().into(),
         };
+        let mapped_extent_error = BatchingError::UnsupportedOperation {
+            message: "member operand 0 of type dimension<mapped_extent ∈ [1, 5)> must be replicated but is mapped at \
+                      axis 0"
+                .to_string(),
+        };
         assert_eq!(
             dynamic_zero.batch(&context, &EmptyRegionDriver, &[mapped_extent.clone()]),
-            Err(BatchingError::MappedDimension { r#type: Box::new(mapped_type.clone()), axis: BatchAxis::new(0) }),
+            Err(mapped_extent_error.clone()),
         );
         assert_eq!(
             dynamic_one.batch(&context, &EmptyRegionDriver, &[mapped_extent.clone()]),
-            Err(BatchingError::MappedDimension { r#type: Box::new(mapped_type.clone()), axis: BatchAxis::new(0) }),
+            Err(mapped_extent_error.clone()),
         );
-        assert_eq!(
-            dynamic_iota.batch(&context, &EmptyRegionDriver, &[mapped_extent]),
-            Err(BatchingError::MappedDimension { r#type: Box::new(mapped_type), axis: BatchAxis::new(0) }),
-        );
+        assert_eq!(dynamic_iota.batch(&context, &EmptyRegionDriver, &[mapped_extent]), Err(mapped_extent_error),);
 
         // The composite boundary forwards the mapped-axis name into homogeneous array rules, allowing the matching
         // collective to consume the mapped axis instead of incorrectly forwarding an unbound collective.

@@ -17,7 +17,7 @@ use crate::axes::{AxisError, AxisIndexOperation, NamedAxes, NamedAxis};
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::backends::scalars::Scalar;
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, DynamicArrayBatchingPolicy};
+use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, DynamicArrayBatchingPolicy, broadcast_array};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, MemberBatchableOperation, StaticArrayBatchingPolicy,
@@ -1315,6 +1315,118 @@ where
             return Ok(value);
         }
         Ok(value.reshape(ReshapeParameters::new(output_shape).with_output_sharding(output_sharding))?)
+    }
+}
+
+impl<C> CollectiveBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayBatchingPolicy
+where
+    C: Context<
+            Type = ArrayIrType,
+            Operation: From<BroadcastOperation>
+                           + From<DimensionOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + From<ReshapeOperation>
+                           + OperationProjection<ArrayType>,
+        >,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value:
+        ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
+    <C::Value as ValueProjection<DimensionType>>::Projected:
+        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
+{
+    type ShapeExtent = <C::Value as ValueProjection<DimensionType>>::Projected;
+
+    fn collective_axis_extent(
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        _operation_name: &str,
+        _axis_name: &str,
+        axis_size: usize,
+    ) -> Result<Self::ShapeExtent, BatchingError> {
+        let axis_extent = <C::Value as ValueProjection<DimensionType>>::into_projected(context.axis_extent().clone())?;
+        let axis_size = Self::collective_extent_constant(context, axis_size)?;
+        axis_extent.require_equal(&axis_size)?;
+        Ok(axis_extent)
+    }
+
+    fn collective_extent_constant(
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        extent: usize,
+    ) -> Result<Self::ShapeExtent, BatchingError> {
+        let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
+        let mut outputs = context.parent().parent().bind(
+            DimensionOperation::Constant(ConstantOperation::new(value)),
+            Vec::new(),
+            &[],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(outputs.remove(0))?)
+    }
+
+    fn require_divisible_collective_extents(
+        left: &Self::ShapeExtent,
+        right: &Self::ShapeExtent,
+    ) -> Result<(), BatchingError> {
+        left.require_divisible_by(right).map_err(Into::into)
+    }
+
+    fn match_collective_axis(
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        batch: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        input_extents: &[Self::ShapeExtent],
+    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
+        if !batch.batch_axis().is_replicated() {
+            return batch.move_axis(0);
+        }
+
+        let input_type = batch.unbatched_type();
+        let input_extent_dimensions =
+            input_extents.iter().map(|extent| extent.r#type().to_dimension()).collect::<Vec<_>>();
+        let value = if input_type.shape().dimensions() == input_extent_dimensions {
+            batch.value().clone()
+        } else {
+            Self::reshape_collective(context, batch.value().clone(), input_extents, input_type.sharding().cloned())?
+        };
+        let output_axes = (1..=input_type.rank()).collect::<Vec<_>>();
+        let output_sharding = input_type
+            .sharding()
+            .map(|sharding| {
+                sharding
+                    .with_inserted_dimension(0, context.axis_sharding().clone())
+                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
+            })
+            .transpose()?;
+        let mut output_extents = Vec::with_capacity(input_extents.len() + 1);
+        output_extents.push(context.axis_extent().clone());
+        output_extents
+            .extend(input_extents.iter().cloned().map(<C::Value as ValueProjection<DimensionType>>::from_projected));
+        let value = broadcast_array(
+            context.parent().parent(),
+            <C::Value as ValueProjection<ArrayType>>::from_projected(value),
+            output_extents,
+            output_axes,
+            output_sharding,
+        )?;
+        let r#type = <&ArrayType>::try_from(value.r#type().as_ref())?.clone();
+        ArrayBatch::new(
+            r#type,
+            <C::Value as ValueProjection<ArrayType>>::into_projected(value)?,
+            BatchAxis::from_position(0),
+        )
+    }
+
+    fn reshape_collective(
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        value: <C::Value as ValueProjection<ArrayType>>::Projected,
+        output_extents: &[Self::ShapeExtent],
+        output_sharding: Option<Sharding>,
+    ) -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, BatchingError> {
+        let operation = ReshapeOperation::new().with_output_sharding(output_sharding);
+        let inputs = std::iter::once(<C::Value as ValueProjection<ArrayType>>::from_projected(value))
+            .chain(output_extents.iter().cloned().map(<C::Value as ValueProjection<DimensionType>>::from_projected))
+            .collect::<Vec<_>>();
+        let mut outputs = context.parent().parent().bind(operation, Vec::new(), inputs.as_slice())?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(<C::Value as ValueProjection<ArrayType>>::into_projected(outputs.remove(0))?)
     }
 }
 

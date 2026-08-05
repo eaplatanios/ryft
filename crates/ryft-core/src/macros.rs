@@ -2678,22 +2678,97 @@ macro_rules! impl_nullary_transposable_operation {
 }
 
 /// Implements the [`BatchableOperation`](crate::BatchableOperation) trait for a [`Region`](crate::Region)-less
-/// nullary [`Operation`](crate::Operation) according to the selected batching policy. The `@replicated` policy
-/// interprets the operation once through the parent [`Context`](crate::Context) and marks every output as replicated
-/// because the operation is invariant across the mapped axis. Nullary operations whose result depends on that axis,
-/// such as [`AxisIndexOperation`](crate::AxisIndexOperation), require a custom batching rule instead. The optional
-/// leading generic list declares operation-specific type parameters. Behavioral bounds are derived from
-/// [`InterpretableOperation<C>`](crate::InterpretableOperation). An optional `where` clause can provide
-/// bounds required to make the operation type itself well-formed.
+/// nullary [`Operation`](crate::Operation) according to the selected batching policy.
+///
+/// The `@replicated` policy interprets the operation once through the parent [`Context`](crate::Context) and marks
+/// every output as replicated because the operation is invariant across the mapped axis. It is generic over every
+/// [`Context`](crate::Context) whose type matches the operation's native [`Operation::Type`](crate::Operation::Type)
+/// and every [`BatchingPolicy`](crate::BatchingPolicy) for that context.
+///
+/// The `@member<U, P>` policy supports a nullary operation embedded as a member of a parent type universe `U` under
+/// batching policy `P`. Although the member operation is nullary in its native type universe, its parent instruction
+/// may consume representation operands. The generated rule requires every such operand to be replicated, binds the
+/// member operation once in the parent context, and marks every output as replicated. Neither policy assumes a
+/// concrete type, value, batch carrier, or batching implementation. Nullary operations whose result depends on the
+/// mapped axis, such as [`AxisIndexOperation`](crate::AxisIndexOperation), require a custom batching rule instead.
+///
+/// The optional leading generic list declares operation-specific type parameters. Behavioral bounds for `@replicated`
+/// are derived from [`InterpretableOperation<C>`](crate::InterpretableOperation). An optional `where` clause can
+/// provide bounds required to make the operation type itself well-formed.
 ///
 /// # Parameters
 ///
 ///   - `@replicated`: Selects batching that evaluates the operation once and marks every output as replicated.
+///   - `@member<U, P>`: Selects parent-universe member batching under batching policy `P`, requiring all
+///     representation operands to be replicated.
 ///   - `$generic`: Optional operation-specific type parameters used by `$operation`.
 ///   - `$operation`: Regionless nullary operation type for which the implementation is generated.
 ///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
 #[macro_export]
 macro_rules! impl_nullary_batchable_operation {
+    // This branch accepts a generic member operation with additional well-formedness bounds.
+    (@member<$parent:ty, $policy:ty> <$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
+        $crate::impl_nullary_batchable_operation!(
+            @impl_member [$($generic),+] ($parent) ($policy) ($operation) { $($bounds)+ }
+        );
+    };
+
+    // This branch accepts a generic member operation whose type supplies all required bounds.
+    (@member<$parent:ty, $policy:ty> <$($generic:ident),+> $operation:ty $(,)?) => {
+        $crate::impl_nullary_batchable_operation!(
+            @impl_member [$($generic),+] ($parent) ($policy) ($operation) {}
+        );
+    };
+
+    // This branch accepts the common non-generic member operation form.
+    (@member<$parent:ty, $policy:ty> $operation:ty $(,)?) => {
+        $crate::impl_nullary_batchable_operation!(@impl_member [] ($parent) ($policy) ($operation) {});
+    };
+
+    // This internal helper emits the parent-universe member implementation shared by every public invocation form.
+    (@impl_member [$($generic:ident),*] ($parent:ty) ($policy:ty) ($operation:ty) { $($bounds:tt)* }) => {
+        impl<__C: $crate::Context<Type = $parent> $(, $generic)*>
+            $crate::MemberBatchableOperation<__C, $policy>
+            for $operation
+        where
+            $policy: $crate::BatchingPolicy<__C>,
+            __C::Operation: From<$operation>,
+            $($bounds)*
+        {
+            #[inline]
+            fn batch_in_parent<__D: $crate::BatchingDriver<__C, $policy>>(
+                &self,
+                context: &$crate::BatchingContext<__C, $policy>,
+                _driver: &__D,
+                inputs: &[<$policy as $crate::BatchingPolicy<__C>>::Batch],
+            ) -> Result<Vec<<$policy as $crate::BatchingPolicy<__C>>::Batch>, $crate::BatchingError> {
+                for (index, input) in inputs.iter().enumerate() {
+                    let axis = <$policy as $crate::BatchingPolicy<__C>>::batch_axis(input);
+                    if !axis.is_replicated() {
+                        return Err($crate::BatchingError::UnsupportedOperation {
+                            message: format!(
+                                "member operand {} of type {} must be replicated but is mapped at {}",
+                                index,
+                                <$policy as $crate::BatchingPolicy<__C>>::unbatched_type(input),
+                                axis,
+                            ),
+                        });
+                    }
+                }
+                let inputs = inputs
+                    .iter()
+                    .map(|input| <$policy as $crate::BatchingPolicy<__C>>::value(input).clone())
+                    .collect::<Vec<_>>();
+                Ok(context
+                    .parent()
+                    .bind(self.clone(), Vec::new(), inputs.as_slice())?
+                    .into_iter()
+                    .map(<$policy as $crate::BatchingPolicy<__C>>::replicated)
+                    .collect())
+            }
+        }
+    };
+
     // This branch accepts a generic replicated operation with additional well-formedness bounds.
     (@replicated <$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
         $crate::impl_nullary_batchable_operation!(@impl_replicated [$($generic),+] ($operation) { $($bounds)+ });
@@ -2711,24 +2786,20 @@ macro_rules! impl_nullary_batchable_operation {
 
     // This internal helper emits the replicated batching implementation shared by every public invocation form.
     (@impl_replicated [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
-        impl<
-            __C: $crate::Context<Type = $crate::ArrayType>,
-            __P: $crate::ArrayBatchingPolicy<__C>
-            $(, $generic)*
-        >
-            $crate::BatchableOperation<__C, $crate::ArrayBatching<__P>>
+        impl<__C: $crate::Context, __P: $crate::BatchingPolicy<__C> $(, $generic)*>
+            $crate::BatchableOperation<__C, __P>
             for $operation
         where
-            $operation: $crate::InterpretableOperation<__C>,
+            $operation: $crate::Operation<Type = __C::Type> + $crate::InterpretableOperation<__C>,
             $($bounds)*
         {
             #[inline]
-            fn batch<__D: $crate::BatchingDriver<__C, $crate::ArrayBatching<__P>>>(
+            fn batch<__D: $crate::BatchingDriver<__C, __P>>(
                 &self,
-                context: &$crate::BatchingContext<__C, $crate::ArrayBatching<__P>>,
+                context: &$crate::BatchingContext<__C, __P>,
                 _driver: &__D,
-                inputs: &[$crate::ArrayBatch<__C::Value>],
-            ) -> Result<Vec<$crate::ArrayBatch<__C::Value>>, $crate::BatchingError> {
+                inputs: &[__P::Batch],
+            ) -> Result<Vec<__P::Batch>, $crate::BatchingError> {
                 $crate::check_count!("input", inputs, 0, ProgramError);
                 Ok($crate::InterpretableOperation::interpret(
                     self,
@@ -2737,7 +2808,7 @@ macro_rules! impl_nullary_batchable_operation {
                     &[],
                 )?
                 .into_iter()
-                .map($crate::ArrayBatch::replicated)
+                .map(__P::replicated)
                 .collect())
             }
         }

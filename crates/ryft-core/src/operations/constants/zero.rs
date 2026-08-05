@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, ArrayBatching, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{ArrayBatch, ArrayBatching, ArrayIrBatching, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
@@ -18,7 +18,7 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::ArrayType;
+use crate::types::{ArrayIrType, ArrayType};
 
 /// Canonical operation name for [`ZeroOperation`].
 pub const ZERO_OPERATION_NAME: &str = "zero";
@@ -110,6 +110,7 @@ impl<T: Type, C: Context<Type = T, Operation: From<ZeroOperation<T>>>> Partially
 impl_non_differentiable_operation!(<T> ZeroOperation<T> where T: Type);
 impl_nullary_transposable_operation!(<T> ZeroOperation<T> where T: Type);
 impl_nullary_batchable_operation!(@replicated ZeroOperation<ArrayType>);
+impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> ZeroOperation<ArrayType>);
 
 // TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound once the next-generation trait solver
 //  stabilizes. The current solver cannot discharge this projection equality at implementation heads whose context type

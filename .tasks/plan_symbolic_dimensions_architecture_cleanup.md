@@ -2262,14 +2262,14 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       tree. Confirm that the public first-class dimension capabilities cover the intended ergonomics; do not recreate
       wrapper types merely to satisfy the old module-move wording. If a neutral public alias/API is still needed, add
       only the smallest capability-based surface after the operation and transform families settle.
-- [ ] After Phase 8 has moved every operation-specific batching algorithm to its payload owner, replace the historical
+- [x] After Phase 8 has moved every operation-specific batching algorithm to its payload owner, replace the historical
       asymmetric module layout with a symmetric batching hierarchy:
   - [x] Make `BatchedProgram` the universe-neutral carrier contract, rename the reusable exact-source-boundary carrier
         to `BoundaryPreservingBatchedProgram`, require every `BatchingPolicy::BatchedProgram` to implement the contract,
         and consolidate output-axis alignment into one policy-generic `BatchingContext` implementation. Concrete
         carriers continue to validate their own boundary invariants and the generic contract never interprets or drops
         policy-owned bookkeeping values.
-  - [ ] Keep universe-neutral contracts and machinery in the `batching` module root (`BatchingPolicy`,
+  - [x] Keep universe-neutral contracts and machinery in the `batching` module root (`BatchingPolicy`,
         `BatchingPolicyProjection`, `BatchableType`, contexts/tracers/drivers, the `BatchedProgram` trait and
         `BoundaryPreservingBatchedProgram` default carrier, transform entrypoints, and projected-operation helpers).
   - [x] Move the `ArrayType` specialization to `batching::arrays` (`ArrayBatch`, `ArrayBatching`,
@@ -2285,10 +2285,10 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         `ArrayIrBatching`, `ThreadedExtentBatchedProgram`, `DynamicArrayBatchingPolicy`,
         `ReplicatedDimensionBatchingPolicy`, their policy/projection/recursive/entrypoint implementations, and shared
         first-class-extent mechanics).
-  - [ ] Keep operation-specific `BatchableOperation` implementations and operation-owned policy extensions such as
+  - [x] Keep operation-specific `BatchableOperation` implementations and operation-owned policy extensions such as
         `LinearCallBatchingPolicy` beside their operation payloads rather than moving them into either specialization
         module.
-  - [ ] Gate: neither specialization module contains an outer operation dispatcher or operation-specific batching
+  - [x] Gate: neither specialization module contains an outer operation dispatcher or operation-specific batching
         algorithm, and `backends` contains concrete eager values/operation families rather than transform policy types.
         Update every in-repo path directly and decide the intentional `batching` facade during this move without adding
         compatibility re-exports.
@@ -3919,3 +3919,30 @@ A follow-up minimality pass inlined `array_dimensions`, `normalize_array_input`,
 owning policy rules and deleted the three private helpers. The inlined code preserves the same explicit dimension-size
 reads, sharding normalization, constant binding, output-count validation, and error propagation. The full 1,129-test
 core library suite and `cargo check -p ryft-core --tests` pass after the simplification.
+
+### Phase 9 batching hierarchy ownership closure (2026-08-04)
+
+The final two operation-specific algorithms left in `batching::array_ir` now live beside their payload owners. The
+dynamic `CollectiveBatchingPolicy` implementation moved next to the static policy and collective batching kernels in
+`operations::collectives`; it reuses the array-IR specialization's existing first-class broadcast primitive rather
+than duplicating that representation mechanic. The existing `impl_nullary_batchable_operation!` macro now supports
+`@member<ArrayIrType, ArrayIrBatching>` for homogeneous-nullary member constructors whose mixed encoding consumes
+replicated first-class dimension operands. The member expansion depends only on the named parent universe and its
+generic `BatchingPolicy` contract; it does not name array types, values, batches, or policy implementations internally.
+Its `@replicated` branch is likewise generic over every context matching the operation's native type and every batching
+policy for that context. Zero, one, and iota request both forms beside their payload definitions, eliminating the local
+constructor-specific macro without replacing it with an array-IR-specific shared branch. Malformed mapped member
+operands remain rejected through a policy-neutral diagnostic; valid operation behavior and signatures are unchanged.
+
+The closure audit found no outer operation dispatcher or payload-specific batching algorithm in either
+`batching::arrays` or `batching::array_ir`. Their remaining operation bounds and bindings implement generic policy
+mechanics: elementwise delegation, mapped-axis alignment, first-class extent materialization, recursive program
+rewriting, and entrypoint adaptation. Backend modules retain concrete eager values and closed operation families; the
+dimension backend's batching implementation remains beside the backend-owned `DimensionOperation` payload and does not
+define a transform policy. The intended `batching` facade remains direct, and one stale rustdoc link now names that
+canonical facade.
+
+Verification passed `cargo check -p ryft-core --tests`, the focused 12 array-IR batching tests, 35 collective tests,
+10 constant-family tests, all 1,129 core library tests, and all 53 runnable core doctests (16 ignored). Formatting,
+diff hygiene, dispatcher/algorithm ownership searches, transform-policy definition searches, and the stale-path search
+passed.
