@@ -4300,3 +4300,35 @@ logical values and portable bytes. Focused addressing and codec tests pass, all 
 all 53 runnable core doctests pass with 16 intentional ignores, `cargo check -p ryft-core --lib` is warning-free, and
 formatting and diff hygiene pass. The next Phase 9a1 slice converts `Array` from `Vec<Scalar>` to the checked shared byte
 storage that now has a fully pinned ownership boundary.
+
+A second follow-up slice (plan: `plan_sub_byte_and_low_precision_elements.md`, 2026-08-05) added checked element
+newtypes to `arrays/elements.rs` (split out of `encoding.rs`): sub-byte integers `i1`/`i2`/`i4`/`u1`/`u2`/`u4` that
+own the two's-complement-in-the-low-bits storage convention (fixing the trap where `-1i4` read back as `15`), and
+conversion-only low-precision floats `f4e2m1fn` through `f8e8m0fnu` backed by one class-driven `FloatFormat` engine
+with exact decodes and round-to-nearest-even encodes following ml_dtypes/XLA semantics (quiet canonical NaNs;
+overflow to ±infinity for IEEE-style formats, canonical NaN for `fn`/`fnuz`/`fnu`, saturation for the NaN-less MX
+formats; fallible only for NaN into MX formats and zero into `f8e8m0fnu`). Encodes were cross-validated bitwise
+against an independent exact-rational model over every valid pattern and every adjacent midpoint. `Scalar`'s private
+low-precision engine intentionally diverges (saturating overflow, signaling canonical NaN bits, an unguarded
+huge-input nearest scan, and a `fnuz` negative-underflow NaN) and dies with the byte-storage migration; the
+partially overlapping checklist item below still owes the `Array` construction/validation wiring. All 1,150 core
+tests pass.
+
+A review follow-up hardened three findings. `ArrayAddressing::new` now propagates static element counts that overflow
+`usize` as construction errors instead of panicking through the element-count accessor, with an exact regression test.
+A crate-private `ArrayAddressing::is_dense_row_major` predicate (missing layout, dense-equivalent strides, or a
+descending tile-free minor-to-major permutation) gives `range` an O(1) bulk byte range and gives every codec
+entrypoint a bulk chunked path instead of per-element addressing, with dense-equivalent strided and tiled layouts
+added to the exact-byte round-trip fixtures. The one-byte-per-element storage of sub-byte data types (zero high bits,
+unlike XLA's packed two-per-byte host representation) is now documented on `element_byte_width`; the Phase 9a3
+lowering-boundary packing item already covers the required repack. The follow-up also renamed the private
+`ArrayIndexRanges::range` to `element_range` and clarified the tiled-addressing helper and codec-entrypoint
+docstrings. All 1,137 core library tests pass.
+
+A subsequent API review replaced `ArrayIndexRanges`' three parallel start, size, and optional-stride slices with one
+borrowed `[ArraySliceAxis]`, eliminating mismatched metadata lengths from the representation. `ArraySliceAxis` stores
+one axis's start, selected-coordinate count, and stride, exposes those values through accessors, and converts from
+`Range<usize>` for concise unit-stride call sites such as `(0..8).into()`. Reference slicing and block-update kernels
+now construct the same descriptor consumed by addressing instead of passing parallel metadata through another layer.
+All 90 focused array, addressing, codec, and reference-backend tests pass, and `cargo check -p ryft-core --lib`
+succeeds; its eight warnings are confined to the concurrently developed, not-yet-consumed codec entrypoints.
