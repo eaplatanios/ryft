@@ -23,7 +23,7 @@ use ryft_macros::Operation;
 
 // TODO(eaplatanios): Review from here onwards.
 
-use crate::arrays::addressing::ArrayAddressing;
+use crate::arrays::{ArrayAddressing, ArraySliceAxis};
 use crate::axes::{Axis, AxisIndexOperation};
 use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
@@ -1429,11 +1429,11 @@ impl LegacyBroadcast for Array {
 }
 
 impl Array {
-    /// Copies the row-major block of shape `sizes` out of this array's payload, reading the element at index
-    /// `start_indices + block_index * strides` along each axis. The caller guarantees that the block lies in bounds.
-    fn copy_block(&self, start_indices: &[usize], strides: &[usize], sizes: &[usize]) -> Vec<Scalar> {
+    /// Copies the row-major block selected by `axes` out of this array's payload. The caller guarantees that the block
+    /// lies in bounds.
+    fn copy_block(&self, axes: &[ArraySliceAxis]) -> Vec<Scalar> {
         let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
-        let ranges = addressing.ranges(start_indices, sizes, Some(strides)).unwrap();
+        let ranges = addressing.ranges(axes).unwrap();
         let mut values = Vec::with_capacity(ranges.element_count());
         for range in ranges {
             values.extend_from_slice(&self.values[range.elements()]);
@@ -1446,7 +1446,12 @@ impl Array {
     fn replace_block(mut self, update: &Array, start_indices: &[usize]) -> Self {
         let update_shape = update.r#type.static_shape().unwrap();
         let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
-        let ranges = addressing.ranges(start_indices, update_shape.as_slice(), None).unwrap();
+        let axes = start_indices
+            .iter()
+            .zip(update_shape.dimensions())
+            .map(|(start, size)| ArraySliceAxis::new(*start, *size, 1))
+            .collect::<Vec<_>>();
+        let ranges = addressing.ranges(&axes).unwrap();
         let mut written = 0usize;
         for range in ranges {
             let elements = range.elements();
@@ -1784,13 +1789,13 @@ fn combine_scatter(kind: ScatterReductionKind, current: Scalar, update: Scalar) 
 impl Slice for Array {
     fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
         let output_type = self.r#type.slice(start_indices, limit_indices, strides)?;
-        let sizes: Vec<usize> = start_indices
+        let axes = start_indices
             .iter()
             .zip(limit_indices.iter())
             .zip(strides.iter())
-            .map(|((start, limit), stride)| (limit - start).div_ceil(*stride))
-            .collect();
-        let values = self.copy_block(start_indices, strides, sizes.as_slice());
+            .map(|((start, limit), stride)| ArraySliceAxis::new(*start, (limit - start).div_ceil(*stride), *stride))
+            .collect::<Vec<_>>();
+        let values = self.copy_block(&axes);
         Ok(Self { r#type: output_type, values })
     }
 }
@@ -1808,8 +1813,12 @@ impl DynamicSlice for Array {
         let output_type = self.r#type.dynamic_slice(&index_types, sizes)?;
         let input_shape = self.r#type.static_shape().unwrap();
         let starts = Self::clamped_start_indices(start_indices, &input_shape, sizes);
-        let unit_strides = vec![1; sizes.len()];
-        let values = self.copy_block(starts.as_slice(), unit_strides.as_slice(), sizes);
+        let axes = starts
+            .iter()
+            .zip(sizes)
+            .map(|(start, size)| ArraySliceAxis::new(*start, *size, 1))
+            .collect::<Vec<_>>();
+        let values = self.copy_block(&axes);
         Ok(Self { r#type: output_type, values })
     }
 }
