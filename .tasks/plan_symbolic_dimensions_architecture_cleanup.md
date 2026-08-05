@@ -2299,9 +2299,35 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         compatibility layer.
   - [ ] Move the current `backends::arrays` reference backend to `ryft_core::arrays`, and place the current dimension
         backend and heterogeneous array IR beneath the same hierarchy (expected submodules: `arrays::dimensions` and
-        `arrays::ir`). Keep generic operation semantics in `operations`, generic types in `types`, and transform policy
-        machinery in its transform modules; this hierarchy owns concrete reference values and their closed operation
-        families only.
+        `arrays::ir`). Keep generic operation semantics in `operations`, generic program machinery in `programs`, and
+        transform policy machinery in its transform modules; this hierarchy owns the complete array-language type
+        vocabulary, concrete reference values, and their closed operation families.
+  - [ ] Move every array-language-specific type out of the top-level `types` hierarchy and give it one canonical home
+        under `ryft_core::arrays`:
+    - [ ] Move `DataType`/`DataTypeError` under `arrays::data`; after the scalar backend is deleted, these describe array
+          element data rather than an independent scalar execution universe.
+    - [ ] Move `ArrayType`/`ArrayTypeRefinements` into the array hierarchy and expose them canonically as
+          `ryft_core::arrays::ArrayType` and `ryft_core::arrays::ArrayTypeRefinements`.
+    - [ ] Move `Dimension`, `DimensionBounds`, `DimensionType`, `DimensionVariable`, `Shape`, `StaticShape`, their
+          errors/constants, and the concrete `DimensionValue`/`DimensionOperation` backend into
+          `arrays::dimensions`, with the commonly used type vocabulary re-exported from `arrays`.
+    - [ ] Move `ArrayIrType`/`ArrayIrTypeRefinements` beside `ArrayIrValue`/`ArrayIrOperation` in `arrays::ir`, while
+          re-exporting the four canonical IR names from `arrays` for concise public signatures.
+    - [ ] Move `Layout`, `StridedLayout`, `Tile`, `TileDimension`, `TiledLayout`, and `LayoutError` under
+          `arrays::layouts`, and move `Memory` under `arrays::memories`; both are metadata of `ArrayType`, not generic
+          program-type machinery.
+    - [ ] Delete the top-level `types` module after its array-specific contents have moved. Do **not** move those
+          concrete types into `programs::types`: that module already owns the correct backend-neutral layer
+          (`Type`, `Typed`, `TypeError`, `TypeRefinements`, and signature traversal), which must remain independent of
+          arrays and of any future value universe.
+  - [ ] Move the current top-level `sharding` hierarchy to `arrays::sharding` (including meshes, shardings,
+        visualizations, and `ShardingError`) after auditing that no non-array value universe uses it independently.
+        Update all paths directly without a `ryft_core::sharding` compatibility module; named-axis transform machinery
+        remains outside this hierarchy where it is genuinely universe-neutral.
+  - [ ] Define and document the final public hierarchy before moving files. The expected canonical layout is
+        `arrays::{data, dimensions, ir, layouts, memories, sharding}` with common array types re-exported from
+        `arrays`; remove ambiguous glob exports and duplicate canonical paths rather than preserving the former
+        `backends`, `types`, and `sharding` facades.
   - [ ] Replace the reference `Array`'s element-wise `Vec<Scalar>` payload with an immutable contiguous byte buffer
         whose element type and shape determine and validate its exact storage. Specify canonical encoding for every
         supported data type, including Boolean, sub-byte integers, low-precision floats, complex values, and tokens;
@@ -3828,3 +3854,19 @@ core doctests (16 ignored), all 57 macro unit tests, both macro integration suit
 and all 436 runnable XLA library tests (one ignored). `cargo check -p ryft-core --tests`, formatting, diff hygiene, and
 repository-wide residual searches for the four retired public identifiers and their corresponding lowering/inference
 helper names passed.
+
+### Phase 9 planned array hierarchy refinement (2026-08-04)
+
+The eventual top-level `ryft_core::arrays` hierarchy now owns not only the reference `Array`, dimension backend, and
+array IR, but also their complete domain-specific type vocabulary: element data types, array and dimension types,
+shapes, layouts, memories, and sharding. `ArrayIrType` moves beside `ArrayIrValue` and `ArrayIrOperation` in
+`arrays::ir`; commonly used names are re-exported through `arrays` so public signatures do not require deep module
+paths. The existing top-level `types` and `sharding` facades are deleted without compatibility modules once all
+consumers have moved.
+
+The generic type layer does not absorb these concrete types. `programs::types` already contains the correct
+backend-neutral abstractions (`Type`, `Typed`, `TypeError`, `TypeRefinements`, and signature traversal), whereas moving
+`DataType`, `ArrayType`, `DimensionType`, layouts, or memories there would couple core program machinery to one value
+universe. Consequently, `types/mod.rs` disappears after its contents move under `arrays`; its contents are not copied
+into `programs/types.rs`. The plan uses the intended name `arrays::sharding`—not `arrays::sharing`—and retains
+universe-neutral named-axis and transform machinery outside that array-specific hierarchy.

@@ -1,4 +1,4 @@
-//! Differentiation and transposition rules for composite array-program operations.
+//! Differentiation and transposition rules for composite array IR operations.
 //!
 //! Homogeneous and mixed-operation rules remain with their owning operation payloads. This module implements the
 //! composite operation-family boundary: it delegates operation-owned rules and retains only behavior that belongs to
@@ -13,7 +13,7 @@ use crate::operations::logical::AndOperation;
 
 use super::*;
 
-impl TemporalResidualType for ArrayProgramType {
+impl TemporalResidualType for ArrayIrType {
     #[inline]
     fn temporal_storage_type(&self) -> Result<Self, TypeError> {
         Ok(match self {
@@ -23,28 +23,28 @@ impl TemporalResidualType for ArrayProgramType {
     }
 }
 
-impl<O> TemporalResidualOperation<ArrayProgramType> for O
+impl<O> TemporalResidualOperation<ArrayIrType> for O
 where
-    O: Operation<Type = ArrayProgramType> + From<DimensionFromScalarOperation> + From<DimensionToScalarOperation>,
+    O: Operation<Type = ArrayIrType> + From<DimensionFromScalarOperation> + From<DimensionToScalarOperation>,
 {
-    fn residual_to_storage(residual_type: &ArrayProgramType) -> Result<Option<Self>, TypeError> {
+    fn residual_to_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
         Ok(match residual_type {
-            ArrayProgramType::Array(_) => None,
-            ArrayProgramType::Dimension(_) => Some(Self::from(DimensionToScalarOperation)),
+            ArrayIrType::Array(_) => None,
+            ArrayIrType::Dimension(_) => Some(Self::from(DimensionToScalarOperation)),
         })
     }
 
-    fn residual_from_storage(residual_type: &ArrayProgramType) -> Result<Option<Self>, TypeError> {
+    fn residual_from_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
         Ok(match residual_type {
-            ArrayProgramType::Array(_) => None,
-            ArrayProgramType::Dimension(r#type) => {
+            ArrayIrType::Array(_) => None,
+            ArrayIrType::Dimension(r#type) => {
                 Some(Self::from(DimensionFromScalarOperation::new(r#type.variable().clone())))
             }
         })
     }
 }
 
-impl WhileResidualStackType for ArrayProgramType {
+impl WhileResidualStackType for ArrayIrType {
     #[inline]
     fn from_array_type(r#type: ArrayType) -> Self {
         Self::Array(r#type)
@@ -68,29 +68,23 @@ impl WhileResidualStackType for ArrayProgramType {
     }
 }
 
-impl<A: Value<Type = ArrayType>, O> WhileResidualStackOperation<ArrayProgramType, A> for O
+impl<A: Value<Type = ArrayType>, O> WhileResidualStackOperation<ArrayIrType, A> for O
 where
-    O: Operation<Type = ArrayProgramType>
-        + From<ArrayProgramOperation<A>>
-        + TemporalResidualOperation<ArrayProgramType>,
+    O: Operation<Type = ArrayIrType> + From<ArrayIrOperation<A>> + TemporalResidualOperation<ArrayIrType>,
 {
-    fn residual_stack_zero(r#type: ArrayProgramType) -> Self {
-        let ArrayProgramType::Array(r#type) = r#type else {
-            unreachable!("bounded-while stack zeros are always arrays")
-        };
-        Self::from(ArrayProgramOperation::<A>::from(ZeroOperation::new(r#type)))
+    fn residual_stack_zero(r#type: ArrayIrType) -> Self {
+        let ArrayIrType::Array(r#type) = r#type else { unreachable!("bounded-while stack zeros are always arrays") };
+        Self::from(ArrayIrOperation::<A>::from(ZeroOperation::new(r#type)))
     }
 
-    fn residual_stack_one(r#type: ArrayProgramType) -> Self {
-        let ArrayProgramType::Array(r#type) = r#type else {
-            unreachable!("bounded-while stack ones are always arrays")
-        };
-        Self::from(ArrayProgramOperation::<A>::from(OneOperation::new(r#type)))
+    fn residual_stack_one(r#type: ArrayIrType) -> Self {
+        let ArrayIrType::Array(r#type) = r#type else { unreachable!("bounded-while stack ones are always arrays") };
+        Self::from(ArrayIrOperation::<A>::from(OneOperation::new(r#type)))
     }
 
     #[inline]
     fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
-        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::Broadcast(LegacyBroadcastOperation::new(
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::Broadcast(LegacyBroadcastOperation::new(
             output_type,
             output_axes,
         ))))
@@ -98,30 +92,27 @@ where
 
     #[inline]
     fn residual_stack_update() -> Self {
-        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation)))
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation)))
     }
 
     #[inline]
     fn residual_stack_add() -> Self {
-        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::Add(AddOperation::new())))
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::Add(AddOperation::new())))
     }
 
     #[inline]
     fn residual_stack_select() -> Self {
-        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::Select(SelectOperation::new())))
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::Select(SelectOperation::new())))
     }
 
     #[inline]
     fn mask_reduce_any(axes: Vec<usize>) -> Self {
-        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::Reduce(ReduceOperation::new(
-            axes,
-            ReductionKind::Any,
-        ))))
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::Reduce(ReduceOperation::new(axes, ReductionKind::Any))))
     }
 
     #[inline]
     fn mask_and() -> Self {
-        Self::from(ArrayProgramOperation::<A>::Array(ArrayOperation::And(AndOperation::new())))
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::And(AndOperation::new())))
     }
 }
 
@@ -129,13 +120,13 @@ impl<A, C> MemberDifferentiableOperation<C> for ArrayOperation<A>
 where
     A: Value<Type = ArrayType>,
     C: Context<
-            Type = ArrayProgramType,
+            Type = ArrayIrType,
             Constant: ValueProjection<ArrayType, Projected = A>,
-            Operation: From<ArrayProgramOperation<A>>
+            Operation: From<ArrayIrOperation<A>>
                            + From<BroadcastOperation>
                            + From<DimensionSizeOperation>
                            + From<DimensionToScalarOperation>
-                           + From<LinearCallOperation<ArrayProgramType>>
+                           + From<LinearCallOperation<ArrayIrType>>
                            + From<ZeroOperation<ArrayType>>
                            + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
                            + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
@@ -178,7 +169,7 @@ where
                 } else {
                     context
                         .bind(
-                            ArrayProgramOperation::<A>::Array(ArrayOperation::ConvertElementType(
+                            ArrayIrOperation::<A>::Array(ArrayOperation::ConvertElementType(
                                 ConvertElementTypeOperation::new(tangent_array_type.data_type()),
                             )),
                             Vec::new(),
@@ -188,7 +179,7 @@ where
                 };
                 let tangent = context
                     .bind(
-                        ArrayProgramOperation::<A>::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new())),
+                        ArrayIrOperation::<A>::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new())),
                         Vec::new(),
                         &[exemplar],
                     )?
@@ -203,7 +194,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::contexts::{Context, EagerContext, StagingContext};
@@ -220,11 +211,11 @@ mod tests {
     use crate::programs::{Program, ProgramBuilder};
     use crate::tracing::TracingContext;
     use crate::types::{
-        ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
     };
 
-    type TestValue = ArrayProgramValue<Array>;
-    type TestOperation = ArrayProgramOperation<Array>;
+    type TestValue = ArrayIrValue<Array>;
+    type TestOperation = ArrayIrOperation<Array>;
 
     fn array(value: Array) -> TestValue {
         TestValue::Array(value)
@@ -239,8 +230,8 @@ mod tests {
         factor: f64,
     ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let extent = builder.add_input(ArrayProgramType::Dimension(dimension_type));
-        let operand = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let extent = builder.add_input(ArrayIrType::Dimension(dimension_type));
+        let operand = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let factor = builder.add_constant(array(Array::scalar(factor)));
         let output = builder
             .add_instruction(
@@ -257,9 +248,9 @@ mod tests {
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let predicate = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::Boolean)));
-        let extent = builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
-        let operand = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let operand = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let true_branch = scale_branch(extent_type.clone(), 2.0);
         let false_branch = scale_branch(extent_type.clone(), 3.0);
         let regions = vec![
@@ -396,7 +387,7 @@ mod tests {
             .unwrap();
         assert!(matches!(evaluation.outputs.as_slice(), [PartialEvaluationOutput::Unknown(0)]));
         assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayProgramOperation::Condition(_),));
+        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayIrOperation::Condition(_),));
 
         // Direct transform dispatch must make the same decision before it has a staged instruction whose result type
         // it can inspect. The condition rule retains the selected branch's extent and constructs the tangent there.
@@ -415,7 +406,7 @@ mod tests {
                 vec![predicate_tangent, extent_tangent],
             )
             .unwrap();
-        assert_eq!(tangent.r#type().as_ref(), &ArrayProgramType::Array(output_type.clone()));
+        assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(output_type.clone()));
 
         // Reusable linearization follows the same ordinary region rule and closes over the dynamic result geometry;
         // applying its null linear map therefore reconstructs the shaped tangent without a type-only zero.
@@ -448,7 +439,7 @@ mod tests {
         // The compact pullback has no result slot for the key's zero differential space. Rebuilding the public result
         // must use the key extent captured at linearization time rather than attempt a nullary dynamic zero.
         let cotangents = pullback.apply(cotangent).unwrap();
-        assert_eq!(cotangents[0].r#type().as_ref(), &ArrayProgramType::Array(key_type.tangent()));
+        assert_eq!(cotangents[0].r#type().as_ref(), &ArrayIrType::Array(key_type.tangent()));
         assert_eq!(cotangents[1].r#type().as_ref(), &ArrayType::scalar(DataType::F64).into());
     }
 
@@ -468,16 +459,16 @@ mod tests {
         // The compact pushforward has no output slot for the key's zero differential space. Rebuilding its public
         // result must consume the key extent captured at linearization time.
         let tangent = pushforward.apply(vec![extent_tangent, key_tangent]).unwrap();
-        assert_eq!(tangent.r#type().as_ref(), &ArrayProgramType::Array(key_type.tangent()));
+        assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(key_type.tangent()));
     }
 
     fn product_scan_body(
         extent_type: DimensionType,
     ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let extent = builder.add_input(ArrayProgramType::Dimension(extent_type));
-        let carry = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
-        let item = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type));
+        let carry = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let item = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let product = builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(MulOperation::new())),
@@ -496,11 +487,11 @@ mod tests {
         let length_type = DimensionType::new(length_variable.clone());
         let length = Dimension::Dynamic(length_variable);
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let extent = builder.add_input(ArrayProgramType::Dimension(carry_extent_type.clone()));
-        let carry = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let extent = builder.add_input(ArrayIrType::Dimension(carry_extent_type.clone()));
+        let carry = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let values =
-            builder.add_input(ArrayProgramType::Array(ArrayType::new(DataType::F64, Shape::new(vec![length.clone()]))));
-        let runtime_length = builder.add_input(ArrayProgramType::Dimension(length_type.clone()));
+            builder.add_input(ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![length.clone()]))));
+        let runtime_length = builder.add_input(ArrayIrType::Dimension(length_type.clone()));
         let body = product_scan_body(carry_extent_type.clone());
         let region = builder.import_region(body.entry_region_ref());
         let outputs = builder
@@ -557,8 +548,8 @@ mod tests {
         let scalar_u64 = ArrayType::scalar(DataType::U64);
 
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let state = body_builder.add_input(ArrayProgramType::Array(scalar_f64.clone()));
-        let counter = body_builder.add_input(ArrayProgramType::Array(scalar_u64.clone()));
+        let state = body_builder.add_input(ArrayIrType::Array(scalar_f64.clone()));
+        let counter = body_builder.add_input(ArrayIrType::Array(scalar_u64.clone()));
         let iteration = body_builder
             .add_instruction(
                 TestOperation::from(DimensionFromScalarOperation::new(iteration_variable)),
@@ -597,8 +588,8 @@ mod tests {
             .unwrap();
 
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let state = builder.add_input(ArrayProgramType::Array(scalar_f64));
-        let counter = builder.add_input(ArrayProgramType::Array(scalar_u64));
+        let state = builder.add_input(ArrayIrType::Array(scalar_f64));
+        let counter = builder.add_input(ArrayIrType::Array(scalar_u64));
         let region = builder.import_region(body.entry_region_ref());
         let outputs = builder
             .add_instruction(TestOperation::Scan(ScanOperation::new(2, 2)), vec![region], vec![state, counter])
@@ -628,8 +619,8 @@ mod tests {
         extent_type: DimensionType,
     ) -> Vec<Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>> {
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        condition_builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
-        let state = condition_builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        condition_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let state = condition_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let limit = condition_builder.add_constant(array(Array::scalar(8.0)));
         let predicate = condition_builder
             .add_instruction(
@@ -641,8 +632,8 @@ mod tests {
         let condition = condition_builder.build(vec![predicate], vec![Placeholder; 2], vec![Placeholder]).unwrap();
 
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let extent = body_builder.add_input(ArrayProgramType::Dimension(extent_type));
-        let state = body_builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let extent = body_builder.add_input(ArrayIrType::Dimension(extent_type));
+        let state = body_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let doubled = body_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
@@ -659,8 +650,8 @@ mod tests {
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let extent = builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
-        let state = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::F64)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let state = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let regions = doubling_while_regions(extent_type.clone());
         let regions = regions.iter().map(|region| builder.import_region(region.entry_region_ref())).collect();
         let outputs = builder
@@ -699,7 +690,7 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
 
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let state = condition_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
+        let state = condition_builder.add_input(ArrayIrType::Array(vector_type.clone()));
         let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0])));
         let predicate = condition_builder
             .add_instruction(
@@ -713,7 +704,7 @@ mod tests {
             .unwrap();
 
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let state = body_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
+        let state = body_builder.add_input(ArrayIrType::Array(vector_type.clone()));
         let doubled = body_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
@@ -726,7 +717,7 @@ mod tests {
             .unwrap();
 
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let state = builder.add_input(ArrayProgramType::Array(vector_type));
+        let state = builder.add_input(ArrayIrType::Array(vector_type));
         let regions =
             vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
         let outputs = builder
@@ -762,8 +753,8 @@ mod tests {
 
         // Condition: a per-item predicate `state < [2, 4, 8]` that ignores the loop-invariant dimension carry.
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        condition_builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
-        let state = condition_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
+        condition_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let state = condition_builder.add_input(ArrayIrType::Array(vector_type.clone()));
         let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0])));
         let predicate = condition_builder
             .add_instruction(
@@ -778,8 +769,8 @@ mod tests {
 
         // Body: the dimension carry is forwarded unchanged and the array carry doubles.
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let extent = body_builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
-        let state = body_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
+        let extent = body_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let state = body_builder.add_input(ArrayIrType::Array(vector_type.clone()));
         let doubled = body_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
@@ -792,8 +783,8 @@ mod tests {
             .unwrap();
 
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let extent = builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
-        let state = builder.add_input(ArrayProgramType::Array(vector_type));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let state = builder.add_input(ArrayIrType::Array(vector_type));
         let regions =
             vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
         let outputs = builder
@@ -848,9 +839,9 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_variable)]));
 
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        condition_builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
-        condition_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
-        let counter = condition_builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::I64)));
+        condition_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        condition_builder.add_input(ArrayIrType::Array(vector_type.clone()));
+        let counter = condition_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
         let limit = condition_builder.add_constant(array(Array::scalar(2_i64)));
         let predicate = condition_builder
             .add_instruction(
@@ -864,9 +855,9 @@ mod tests {
             .unwrap();
 
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let extent = body_builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
-        let vector = body_builder.add_input(ArrayProgramType::Array(vector_type.clone()));
-        let counter = body_builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::I64)));
+        let extent = body_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let vector = body_builder.add_input(ArrayIrType::Array(vector_type.clone()));
+        let counter = body_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
         let reshaped = body_builder
             .add_instruction(TestOperation::from(ReshapeOperation::new()), Vec::new(), vec![vector, extent])
             .unwrap()[0];
@@ -887,9 +878,9 @@ mod tests {
             .unwrap();
 
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let extent = builder.add_input(ArrayProgramType::Dimension(extent_type.clone()));
-        let vector = builder.add_input(ArrayProgramType::Array(vector_type));
-        let counter = builder.add_input(ArrayProgramType::Array(ArrayType::scalar(DataType::I64)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let vector = builder.add_input(ArrayIrType::Array(vector_type));
+        let counter = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
         let regions =
             vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
         let outputs = builder
@@ -934,8 +925,8 @@ mod tests {
         let scalar_u64 = ArrayType::scalar(DataType::U64);
 
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        condition_builder.add_input(ArrayProgramType::Array(scalar_f64.clone()));
-        let counter = condition_builder.add_input(ArrayProgramType::Array(scalar_u64.clone()));
+        condition_builder.add_input(ArrayIrType::Array(scalar_f64.clone()));
+        let counter = condition_builder.add_input(ArrayIrType::Array(scalar_u64.clone()));
         let limit = condition_builder.add_constant(array(Array::scalar(3_u64)));
         let predicate = condition_builder
             .add_instruction(
@@ -949,8 +940,8 @@ mod tests {
             .unwrap();
 
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let state = body_builder.add_input(ArrayProgramType::Array(scalar_f64.clone()));
-        let counter = body_builder.add_input(ArrayProgramType::Array(scalar_u64.clone()));
+        let state = body_builder.add_input(ArrayIrType::Array(scalar_f64.clone()));
+        let counter = body_builder.add_input(ArrayIrType::Array(scalar_u64.clone()));
         let iteration = body_builder
             .add_instruction(
                 TestOperation::from(DimensionFromScalarOperation::new(iteration_variable)),
@@ -989,8 +980,8 @@ mod tests {
             .unwrap();
 
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let state = builder.add_input(ArrayProgramType::Array(scalar_f64));
-        let counter = builder.add_input(ArrayProgramType::Array(scalar_u64));
+        let state = builder.add_input(ArrayIrType::Array(scalar_f64));
+        let counter = builder.add_input(ArrayIrType::Array(scalar_u64));
         let regions =
             vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
         let outputs = builder

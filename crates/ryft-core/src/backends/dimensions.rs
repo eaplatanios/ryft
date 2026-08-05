@@ -22,7 +22,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::tracing::TracingContext;
 use crate::types::{
-    ArrayProgramType, DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
+    ArrayIrType, DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
 };
 
 /// Closed [`Operation`] type for staged [`DimensionValue`] [`Program`](crate::Program)s.
@@ -44,7 +44,7 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
 /// Composite batching executes homogeneous dimension operations only over replicated projected values. A mapped
 /// dimension is rejected by [`ReplicatedDimensionBatchingPolicy`] before this rule is called because representing one
 /// extent per batch item would require a ragged value model.
-impl<C: Context<Type = ArrayProgramType>>
+impl<C: Context<Type = ArrayIrType>>
     BatchableOperation<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>
     for DimensionOperation<DimensionValue>
 where

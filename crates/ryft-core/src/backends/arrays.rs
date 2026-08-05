@@ -3,7 +3,7 @@
 //! programs whose values are dense multidimensional arrays typed by [`ArrayType`]. It is meant primarily for exercising
 //! the Ryft tracing, transformation, and interpretation machinery without depending on an optimized backend such as
 //! `ryft-xla`: unit tests, documentation tests, and downstream crates can stage, transform, and interpret complete
-//! array programs eagerly. [`Array`] stores a flat row-major [`Scalar`] payload, so that every per-element concern
+//! programs over arrays eagerly. [`Array`] stores a flat row-major [`Scalar`] payload, so that every per-element concern
 //! (e.g., the exact `f4`/`f8` bit encodings, complex arithmetic, integer wrapping semantics, and fallible arithmetic)
 //! delegates to the scalar reference backend and [`Array`] adds only the shape logic.
 //!
@@ -99,7 +99,7 @@ pub trait BroadcastKernel: Sized {
     fn broadcast_to_type(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError>;
 }
 
-/// Reusable [`Operation`] enum for ordinary staged array programs.
+/// Reusable [`Operation`] enum for ordinary staged programs over arrays.
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`] the
 /// same way [`ScalarOperation`](crate::backends::scalars::ScalarOperation) pairs with [`Scalar`]. Most variants are
