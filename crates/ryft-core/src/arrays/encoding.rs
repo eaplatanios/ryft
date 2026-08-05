@@ -45,8 +45,6 @@ pub trait ArrayElement: private::Codec {}
 
 impl<T: private::Codec> ArrayElement for T {}
 
-// TODO(eaplatanios): Review from here onwards.
-
 mod private {
     use crate::types::DataType;
 
@@ -82,7 +80,7 @@ impl private::Codec for bool {
 }
 
 // Implements the sealed codec for integer primitives using their exact little-endian two's-complement bit patterns.
-macro_rules! impl_integer_array_element {
+macro_rules! impl_codec_for_integer_type {
     ($type:ty, $data_type:ident) => {
         impl private::Codec for $type {
             const DATA_TYPE: DataType = DataType::$data_type;
@@ -101,17 +99,17 @@ macro_rules! impl_integer_array_element {
     };
 }
 
-impl_integer_array_element!(i8, I8);
-impl_integer_array_element!(i16, I16);
-impl_integer_array_element!(i32, I32);
-impl_integer_array_element!(i64, I64);
-impl_integer_array_element!(u8, U8);
-impl_integer_array_element!(u16, U16);
-impl_integer_array_element!(u32, U32);
-impl_integer_array_element!(u64, U64);
+impl_codec_for_integer_type!(i8, I8);
+impl_codec_for_integer_type!(i16, I16);
+impl_codec_for_integer_type!(i32, I32);
+impl_codec_for_integer_type!(i64, I64);
+impl_codec_for_integer_type!(u8, U8);
+impl_codec_for_integer_type!(u16, U16);
+impl_codec_for_integer_type!(u32, U32);
+impl_codec_for_integer_type!(u64, U64);
 
 // Implements the sealed codec for real floating-point primitives while preserving their exact payload bits.
-macro_rules! impl_float_array_element {
+macro_rules! impl_codec_for_floating_point_type {
     ($type:ty, $bits:ty, $data_type:ident) => {
         impl private::Codec for $type {
             const DATA_TYPE: DataType = DataType::$data_type;
@@ -130,10 +128,10 @@ macro_rules! impl_float_array_element {
     };
 }
 
-impl_float_array_element!(bf16, u16, BF16);
-impl_float_array_element!(f16, u16, F16);
-impl_float_array_element!(f32, u32, F32);
-impl_float_array_element!(f64, u64, F64);
+impl_codec_for_floating_point_type!(bf16, u16, BF16);
+impl_codec_for_floating_point_type!(f16, u16, F16);
+impl_codec_for_floating_point_type!(f32, u32, F32);
+impl_codec_for_floating_point_type!(f64, u64, F64);
 
 impl private::Codec for Complex<f32> {
     const DATA_TYPE: DataType = DataType::C64;
@@ -166,6 +164,8 @@ impl private::Codec for Complex<f64> {
         Self::new(<f64 as private::Codec>::decode(&bytes[..8]), <f64 as private::Codec>::decode(&bytes[8..]))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Checked signed 1-bit integer array element representing [`DataType::I1`] values in the range `-1..=0`.
 ///
