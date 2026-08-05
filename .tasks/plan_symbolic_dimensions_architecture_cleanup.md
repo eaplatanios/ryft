@@ -2295,13 +2295,13 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
 - [ ] After the batching hierarchy and operation ownership have settled, consolidate the reference array stack under
       one top-level `ryft_core::arrays` hierarchy as a separate, measured API and representation change:
   - [ ] Execute the Phase 9a representation and scalar-retirement sequence specified below. Storage must migrate
-        before scalar deletion because the current `Array` uses `Vec<Scalar>` in production; keep module paths fixed
-        throughout this sequence so storage, literal lowering, and scalar retirement remain separate from the later
-        hierarchy move.
+        before scalar deletion because the current `Array` uses `Vec<Scalar>` in production; keep existing public
+        backend and type paths fixed throughout this sequence, apart from the private `arrays::addressing` module, so
+        storage, literal lowering, and scalar retirement remain separate from the later hierarchy move.
     - [ ] Replace the reference `Array`'s element-wise `Vec<Scalar>` payload with validated immutable contiguous bytes,
           with payload-copy-free cloning and checked exact encodings for every `DataType`.
-    - [ ] Route exact array literals and XLA constant lowering through the canonical byte representation without an
-          `f64` round trip, including the sub-byte integer families.
+    - [ ] Route exact array literals and XLA constant lowering through logical traversal of the layout-aware byte
+          representation without an `f64` round trip, including the sub-byte integer families.
     - [ ] Prove that the remaining standalone scalar program universe has no unique production role. Move useful
           `DataType`-universe tests to rank-zero arrays or narrowly scoped test fixtures, then delete `Scalar`,
           `ScalarOperation`, `ScalarTracingContext`, `backends::scalars`, and their public exports without a
@@ -2376,29 +2376,33 @@ Current-tree facts and dependency order:
   transform coverage must move to rank-zero arrays or narrowly scoped test fixtures before that universe is deleted.
 - XLA literal lowering expands each `Array` into typed vectors by matching stored `Scalar` variants, adding avoidable
   per-element enum dispatch and leaving the sub-byte integer families unsupported.
-- Keep the current module paths fixed through Phase 9a. Storage, literal lowering, scalar retirement, and the later
-  public hierarchy move are separate review units.
+- Keep the current public backend and type paths fixed through Phase 9a. The private `arrays::addressing` module is the
+  deliberate first piece of the eventual array hierarchy because both reference storage and future physical-layout
+  consumers share it; storage, literal lowering, scalar retirement, and the later public hierarchy move remain
+  separate review units.
 
 Target representation and API:
 
-- Store `Array { type: ArrayType, bytes: Arc<Vec<u8>> }`. The type and static element count determine the only valid
-  byte length. The privately owned `Vec` is immutable after construction, avoids the extra allocation and payload copy
-  required to convert a built `Vec<u8>` into `Arc<[u8]>`, and remains contiguous. Clones share its immutable element
-  storage; cloning the by-value `ArrayType` is intentionally permitted.
-- Store bytes in canonical logical row-major order independently of `ArrayType::layout()`. The reference `Array`
-  remains a dense semantic value rather than a physical strided/tiled buffer: explicit layout is carried metadata for
-  type rules, backend placement, and lowering. Physically applying it here would require base offsets for negative
-  strides, holes, tile padding, and storage lengths larger than `element_count * element_width`, contradicting the
-  canonical literal representation and the reference backend's existing no-view contract.
+- Store `Array { type: ArrayType, bytes: Arc<Vec<u8>> }`. The type's static shape and physical layout determine the
+  required storage span and byte length. The privately owned `Vec` is immutable after construction, avoids the extra
+  allocation and payload copy required to convert a built `Vec<u8>` into `Arc<[u8]>`, and remains one contiguous
+  physical allocation even when a layout introduces holes or tile padding. Clones share its immutable element storage;
+  cloning the by-value `ArrayType` is intentionally permitted.
+- Physically honor `ArrayType::layout()` in the reference `Array`, and therefore in the array member of the reference
+  `ArrayIrValue<Array>` instantiation. A type without an explicit layout uses dense logical row-major storage. A
+  strided layout determines byte strides and the base offset required by negative strides; a tiled layout determines
+  physical ordering and padding. Portable literal construction is a conversion over logical coordinates through
+  `ArrayAddressing`, not a second layout-independent storage representation retained inside `Array`.
 - Use a documented portable little-endian encoding. `Token` and `Zero` carry no payload bytes. Boolean, sub-byte
   integers, and 4/6/8-bit floats occupy one validated byte per logical element; this favors constant-time reference
   indexing, and lowering packs Boolean and sub-byte integer elements only where the target literal format requires it.
   Wider integers and floats use exact bit patterns, and complex values interleave real and imaginary component
   encodings.
-- Add checked raw construction and immutable byte access. Validate byte length, Boolean encodings, sub-byte ranges,
-  unused float bits, and payload-free types. Provide concise typed construction/decoding through one sealed
-  array-element codec for Rust primitives, `half`, and `num_complex`; ambiguous low-precision and sub-byte families
-  use the checked raw-bits path.
+- Add checked physical-storage construction and immutable byte access. Validate the layout-derived storage span,
+  Boolean encodings, sub-byte ranges, unused float bits, holes/padding, and payload-free types. Provide concise typed
+  logical construction/decoding through one sealed array-element codec for Rust primitives, `half`, and `num_complex`;
+  ambiguous low-precision and sub-byte families use the checked raw-bits path and are placed through layout-aware
+  addressing.
 - Remove `Array::new(ArrayType, Vec<Scalar>)` and `values() -> &[Scalar]` instead of retaining overloads. Preserve the
   `scalar`, `vector`, `matrix`, `from_f64s`, and `to_f64s` conveniences with byte-backed implementations, while exact
   literals use typed or raw-bit construction rather than `f64` conversion.
@@ -2410,8 +2414,9 @@ Guardrails:
 
 - No compatibility module, deprecated alias, dual storage representation, `Vec<Scalar>` fallback, per-element box, or
   unsafe typed-slice cast from byte storage.
-- No public indexing capability, general array-view abstraction, or layout-specific reference storage. Add only the
-  private dense-buffer addressing and traversal machinery required by current reference operations.
+- No public indexing capability, general array-view abstraction, or parallel canonical payload beside physical
+  layout-aware storage. Add only the private addressing and traversal machinery required by reference operations and
+  literal conversion.
 - No silent lossy conversion through `f64`, especially for integers, signed zeros, NaN payloads, low-precision floats,
   and complex values.
 - Do not materialize a complete secondary element vector in reference kernels. Build one output byte buffer with known
@@ -2436,22 +2441,29 @@ Phase 9a0 — baseline and vertical prototype:
       may allocate. The prototype adds no unsafe cast, second stored representation, or more production code than its
       equivalent current F32 path.
 
-Phase 9a1 — canonical byte storage and construction:
+Phase 9a1 — layout-aware byte storage and construction:
 
-- [ ] Before converting `Array`, add one private checked dense-buffer addressing contract derived from a static
-      `ArrayType`: element byte width, logical element count, total byte length, row-major element strides, flat and
-      multi-index element offsets, and byte ranges for one element or a contiguous flat element range. Validate rank,
-      bounds, multiplication/addition overflow, zero-rank arrays, empty arrays, and zero-byte `Token`/`Zero` elements
-      when constructing the descriptor or validating each externally supplied index.
-- [ ] Add one allocation-free rectangular/strided logical-index range iterator for traversal patterns appearing in
+- [x] Before converting `Array`, add one private checked dense-buffer addressing contract derived from a static
+      `ArrayType`: element byte width, logical element count, logical byte length, physical storage byte length,
+      row-major element strides, flat and multi-index element offsets, and byte ranges for one element or a contiguous
+      flat element range. Validate rank, bounds, multiplication/addition overflow, zero-rank arrays, empty arrays, and
+      zero-byte `Token`/`Zero` elements when constructing the descriptor or validating each externally supplied index.
+- [x] Add one allocation-free rectangular/strided logical-index range iterator for traversal patterns appearing in
       slice/update, transpose, broadcast, pad, concatenate, gather/scatter, reduce, and dot. Validate the complete
       start/size/stride specification once, then yield maximal contiguous flat element ranges (or single-element ranges
       when a traversal is non-contiguous) without per-element allocation or repeated bounds checks. Do not add a general
       view/slice type: specialized kernels may keep their own coordinate logic when the shared iterator would make them
       less clear.
-- [ ] Pin the storage/layout separation: types with no layout, strided metadata (including negative strides), or tiled
-      metadata encode the same logical values into identical canonical bytes. Physical layout remains a lowering or
-      device-buffer concern and must not change reference-array buffer indexing.
+- [ ] Generalize `ArrayAddressing` to support every physical `ArrayType` layout used by reference arrays. A missing
+      layout defaults to dense row-major addressing; explicit layouts must determine actual reference-array storage.
+      Cover positive and negative byte strides, derived base offsets, holes, alias rejection, tiled layouts and padding,
+      checked storage-span calculation, and physical-contiguity-aware range coalescing. Keep `ArrayType` as the sole
+      stored source of truth and add exact logical-index-to-storage-range tests for every layout family before routing
+      physical-buffer consumers through the abstraction.
+- [ ] Pin layout-aware reference storage: construct equal logical values under layout-free, positive/negative strided,
+      permuted tiled, and padded tiled types; assert each type's expected physical bytes and storage span; and decode
+      each back to the same logical values through `ArrayAddressing`. Portable literal conversion must traverse logical
+      coordinates and produce the target format independently of the reference array's physical byte ordering.
 - [ ] Add byte-length/range validation and the sealed typed codec at the array/data ownership boundary.
 - [ ] Convert `Array` storage and migrate constructors, accessors, `Parameter`, equality, approximation, formatting,
       and the test-only malformed-type constructor in one complete slice.
@@ -2480,8 +2492,9 @@ Phase 9a2 — byte-backed reference kernels:
 
 Phase 9a3 — exact XLA literals:
 
-- [ ] Replace per-element `Scalar` matching and typed-vector reconstruction with canonical bytes. Decode only when an
-      MLIR typed helper requires it; otherwise pass validated raw bytes directly.
+- [ ] Replace per-element `Scalar` matching and typed-vector reconstruction with logical traversal of layout-aware
+      `Array` storage. Decode only when an MLIR typed helper requires it; pass raw physical bytes directly only when
+      their layout already matches the literal API's required ordering.
 - [ ] Pack Boolean and sub-byte integers at the lowering boundary and cover I1/I2/I4/U1/U2/U4 constants.
 - [ ] Add exact-bit StableHLO and execution tests for low-precision floats, signed zero, preserved NaN payloads, wide
       integers, complex values, empty tensors, and sub-byte integers.
@@ -4177,7 +4190,7 @@ constructors, replaces `new` with checked typed/raw-byte construction, and repla
 borrowed bytes or typed single-element decoding. `from_f64s`/`to_f64s` remain explicitly lossy test conveniences and
 must not become the exact literal route.
 
-The complete canonical little-endian byte matrix is:
+The complete portable little-endian element-encoding matrix is:
 
 | Bytes per logical element | `DataType`s | Validation |
 | ---: | --- | --- |
@@ -4193,13 +4206,15 @@ The complete canonical little-endian byte matrix is:
 | 8 | `C64` | Interleaved real then imaginary F32 little-endian bits. |
 | 16 | `C128` | Interleaved real then imaginary F64 little-endian bits. |
 
-Every constructor checks `element_count * byte_width` for overflow and requires exactly that length. The current
-`Scalar` family covers all `DataType`s except `I1`, `I2`, `I4`, `U1`, `U2`, and `U4`; byte storage closes precisely
-those six gaps. Lowering currently reconstructs typed vectors for Boolean, ordinary integers, BF16/F16/F32/F64;
-reconstructs raw temporary vectors for low-precision floats and complex values; has a separate scalar-splat path; and
-rejects token, zero, and all six sub-byte integer types. Phase 9a3 replaces those routes with validated canonical bytes,
-packing Boolean and narrow integers only at the MLIR boundary. A big-endian host must normalize before calling MLIR's
-raw-buffer API rather than forwarding the little-endian storage unchanged.
+Logical constructors check `element_count * byte_width` for overflow and accept exactly that many encoded logical
+elements before placing them through `ArrayAddressing`; physical-storage constructors require the layout-derived span,
+including any holes or tile padding. The current `Scalar` family covers all `DataType`s except `I1`, `I2`, `I4`, `U1`,
+`U2`, and `U4`; byte storage closes precisely those six gaps. Lowering currently reconstructs typed vectors for
+Boolean, ordinary integers, BF16/F16/F32/F64; reconstructs raw temporary vectors for low-precision floats and complex
+values; has a separate scalar-splat path; and rejects token, zero, and all six sub-byte integer types. Phase 9a3
+replaces those routes with layout-aware logical traversal, packing Boolean and narrow integers only at the MLIR
+boundary. A big-endian host must normalize before calling MLIR's raw-buffer API rather than forwarding little-endian
+element encodings unchanged.
 
 The temporary vertical prototype covered checked F32 construction/decoding, unary negation, scalar broadcasting add,
 numeric equality, signed-zero rendering, payload-sharing clone measurement, and exact raw MLIR construction including
@@ -4219,14 +4234,39 @@ isolated implementation unit.
 ### Phase 9a1 dense-buffer addressing refinement (2026-08-04)
 
 The pre-implementation audit found repeated row-major stride, odometer, flat-index, block-copy, and block-replacement
-logic across the current reference kernels. Phase 9a1 now introduces one private checked descriptor for mapping logical
-indices and contiguous logical element ranges to canonical byte ranges, plus one prevalidated allocation-free iterator
-over maximal contiguous runs in rectangular/strided selections. Phase 9a2 reuses these mechanics where they remove
+logic across the current reference kernels. Phase 9a1 introduces one private checked descriptor for mapping logical
+indices and logical element ranges to physical byte ranges, plus one prevalidated allocation-free iterator over maximal
+physically contiguous runs in rectangular/strided selections. Phase 9a2 reuses these mechanics where they remove
 duplication, while keeping operation-specific coordinate semantics in the operation kernels and prohibiting a public
 view/indexing abstraction.
 
-The plan also makes the layout boundary explicit. Reference `Array` bytes remain canonical logical row-major storage;
-`ArrayType::layout()` remains physical backend metadata. Applying strided or tiled layouts to the host literal buffer
-would require negative-stride base offsets, holes, padding, and noncanonical lengths, conflicting with both the existing
-reference-backend contract and direct StableHLO literal lowering. Tests will pin identical bytes for identical logical
-values whose types differ only in layout metadata.
+The plan makes physical layout part of reference-value semantics. `ArrayType::layout()` determines the byte placement
+inside `Array`, including derived bases for negative strides, holes, and tile padding; a missing layout defaults to
+dense row-major storage. StableHLO or other portable literals remain logical values: their conversion traverses logical
+coordinates through `ArrayAddressing` and emits the ordering required by the destination format rather than imposing a
+second layout-independent storage representation on reference arrays.
+
+### Phase 9a1 dense-buffer addressing implementation (2026-08-04)
+
+The first Phase 9a1 implementation slice added `ArrayAddressing`, `ArrayIndexRange`, and `ArrayIndexRanges` in the new
+private `arrays::addressing` module. Addressing is the deliberate term because the contract maps logical indices to both
+element offsets and byte ranges. `ArrayAddressing` stores only its validated `ArrayType`, keeping the type as the sole
+source of truth instead of duplicating its shape, counts, or strides. Its first implementation covers the interim dense
+row-major `Vec<Scalar>` backend: it validates static materializability, the portable byte width for all 34 `DataType`s,
+logical element and byte lengths, physical storage byte length, overflow, multi-index bounds, and flat element ranges,
+while representing rank-zero, empty, and zero-byte `Token`/`Zero` values without alternate storage rules. Arbitrary
+physical-layout addressing remains the next required extension before byte-backed reference arrays are constructed.
+
+The range iterator validates complete start/size/stride selections once, borrows all selection metadata, and stores
+only scalar traversal state. It derives row-major strides during the same reverse pass that decodes each mixed-radix
+ordinal, so neither the descriptor nor the iterator allocates a coordinate or stride vector. It emits maximal
+contiguous runs: complete selections become one range, contiguous inner windows become one range per outer coordinate,
+and genuinely strided inner selections become single-element ranges. Existing block-copy and block-replacement kernels
+now consume those ranges, deleting their duplicated stride calculation, coordinate odometers, and element-by-element
+writes while preserving their caller-validated contracts. Arbitrary-layout addressing, layout-aware byte storage, and
+exact physical-byte/logical-round-trip tests remain the next Phase 9a1 slices.
+
+Verification passed the three focused addressing/range tests, all 35 reference-array tests, all 1,132 core library
+tests, `cargo check -p ryft-core --lib` without warnings, formatting, and diff hygiene. A normal Clippy pass reports no
+diagnostics in the changed implementation; the repository-wide `-D warnings` gate remains blocked by 131 pre-existing
+diagnostics elsewhere in `ryft-core`, beginning with `operations/math/dot.rs` and `backends/scalars.rs`.

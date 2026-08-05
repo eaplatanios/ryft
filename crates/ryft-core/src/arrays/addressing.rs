@@ -108,7 +108,7 @@ impl ArrayAddressing {
         let element_count = self.element_count();
         if elements.start > elements.end || elements.end > element_count {
             return Err(TypeError::invalid(format!(
-                "dense array element range {}..{} is out of bounds for {} elements",
+                "array element range {}..{} is out of bounds for {} elements",
                 elements.start, elements.end, element_count,
             ))
             .into());
@@ -188,42 +188,47 @@ impl ArrayIndexRange {
     }
 }
 
-/// Allocation-free [`Iterator`] over contiguous [`ArrayIndexRange`]s in one logical array selection. The iterator
-/// borrows its selection metadata and represents its current position as one mixed-radix ordinal. It therefore
-/// allocates no coordinate or stride vectors and performs no fallible validation while iterating.
+/// Allocation-free [`Iterator`] over the contiguous [`ArrayIndexRange`]s that make up one logical array selection.
+/// Construction splits the selected axes into two groups: a maximal *run* of trailing axes whose selected elements
+/// are contiguous in row-major storage, and the remaining leading *prefix* axes. The iterator then emits one
+/// [`ArrayIndexRange`] covering the complete run for each combination of prefix coordinates, so a fully contiguous
+/// selection yields a single range and a maximally scattered one yields a range per element. Ranges are emitted in
+/// ascending storage order and never overlap, and concatenating them reproduces the selection in row-major order
+/// Consumers that copy range-by-range into a dense buffer rely on this contract.
+///
+/// The iterator borrows its selection metadata and tracks its position as a single ordinal that it decodes into
+/// prefix coordinates on demand, so iteration allocates nothing and cannot fail. Every fallible check happens during
+/// construction.
 #[derive(Clone, Debug)]
 pub struct ArrayIndexRanges<'a> {
-    /// Addressing used to map each emitted logical range to physical storage.
+    /// [`ArrayAddressing`] used to map each emitted logical range to physical storage.
     addressing: &'a ArrayAddressing,
 
     /// Number of selected coordinates along each logical axis.
     sizes: &'a [usize],
 
-    /// Distance between selected coordinates, or [`None`] when every stride is one.
+    /// Distance between selected coordinates along each logical axis, or [`None`] when every stride is one.
     strides: Option<&'a [usize]>,
 
-    /// First axis included in each emitted contiguous range.
-    run_axis: usize,
+    /// First axis of the contiguous run, with the prefix axes being all axes before it.
+    run_start_axis: usize,
 
-    /// Number of logical elements in each emitted contiguous range.
+    /// Number of logical elements covered by each emitted range (i.e., by one complete run).
     run_length: usize,
 
-    /// Row-major element stride of the innermost prefix axis.
+    /// Row-major element stride of the innermost prefix axis (i.e., the product of the run axes' dimension sizes).
     prefix_element_stride: usize,
 
     /// Flat row-major index of the selection's first element.
     base_element: usize,
 
-    /// Ordinal of the next outer-prefix coordinate to emit.
-    next_prefix: usize,
-
-    /// Total number of outer-prefix coordinates, and therefore emitted ranges.
-    prefix_count: usize,
+    /// Ordinals of the prefix-coordinate combinations that remain to be emitted, one per range.
+    prefix_ordinals: Range<usize>,
 }
 
 impl<'a> ArrayIndexRanges<'a> {
-    /// Validates and constructs a logical range iterator.
-    fn new(
+    /// Creates a new [`ArrayIndexRanges`] [`Iterator`].
+    pub fn new(
         addressing: &'a ArrayAddressing,
         starts: &'a [usize],
         sizes: &'a [usize],
@@ -233,7 +238,9 @@ impl<'a> ArrayIndexRanges<'a> {
         let stride_count = strides.map_or(rank, <[usize]>::len);
         if starts.len() != rank || sizes.len() != rank || stride_count != rank {
             return Err(TypeError::invalid(format!(
-                "dense array selection for rank {rank} requires {rank} starts, sizes, and strides but got {}, {}, and {}",
+                "array selection for rank {} requires {} starts, sizes, and strides but got {}, {}, and {}",
+                rank,
+                rank,
                 starts.len(),
                 sizes.len(),
                 stride_count,
@@ -241,23 +248,22 @@ impl<'a> ArrayIndexRanges<'a> {
             .into());
         }
 
-        let stride = |axis| strides.map_or(1, |strides| strides[axis]);
+        let stride = |axis| strides.map_or(1, |strides: &[usize]| strides[axis]);
         let mut empty = false;
         for axis in 0..rank {
             let axis_stride = stride(axis);
             if axis_stride == 0 {
-                return Err(TypeError::invalid(format!(
-                    "dense array selection stride must be positive on axis {axis}"
-                ))
-                .into());
+                return Err(
+                    TypeError::invalid(format!("array selection stride must be positive on axis {axis}")).into()
+                );
             }
             let dimension = addressing.dimension(axis);
             if sizes[axis] == 0 {
                 empty = true;
                 if starts[axis] > dimension {
                     return Err(TypeError::invalid(format!(
-                        "empty dense array selection starts at {} on axis {axis}, past dimension size {dimension}",
-                        starts[axis],
+                        "empty array selection starts at {} on axis {}, past dimension size {}",
+                        starts[axis], axis, dimension,
                     ))
                     .into());
                 }
@@ -267,11 +273,11 @@ impl<'a> ArrayIndexRanges<'a> {
                 .checked_mul(axis_stride)
                 .and_then(|offset| starts[axis].checked_add(offset))
                 .ok_or_else(|| {
-                TypeError::invalid(format!("dense array selection index calculation overflowed on axis {axis}"))
+                TypeError::invalid(format!("array selection index calculation overflowed on axis {axis}"))
             })?;
             if last >= dimension {
                 return Err(TypeError::invalid(format!(
-                    "dense array selection reaches index {last} on axis {axis}, past dimension size {dimension}",
+                    "array selection reaches index {last} on axis {axis}, past dimension size {dimension}",
                 ))
                 .into());
             }
@@ -282,70 +288,56 @@ impl<'a> ArrayIndexRanges<'a> {
                 addressing,
                 sizes,
                 strides,
-                run_axis: rank,
+                run_start_axis: rank,
                 run_length: 0,
                 prefix_element_stride: 0,
                 base_element: 0,
-                next_prefix: 0,
-                prefix_count: 0,
+                prefix_ordinals: 0..0,
             });
         }
 
+        // Grow the contiguous run from the innermost axis outward. An axis joins the run only when its selected
+        // elements are contiguous (i.e., stride one, or at most one selected element), and the run may extend past
+        // an axis into its outer neighbor only when that axis is selected in full.
         let base_element = addressing.index(starts)?;
-        // Grow the inner contiguous run across each selected suffix axis. We may include one partially selected axis,
-        // but can continue into its outer neighbor only when the current axis is selected in full.
-        let mut run_axis = rank;
+        let mut run_start_axis = rank;
         let mut run_length = 1usize;
         for axis in (0..rank).rev() {
             if sizes[axis] > 1 && stride(axis) != 1 {
                 break;
             }
-            run_axis = axis;
+            run_start_axis = axis;
             run_length = run_length.checked_mul(sizes[axis]).unwrap();
             let covers_axis = starts[axis] == 0 && sizes[axis] == addressing.dimension(axis);
             if !covers_axis {
                 break;
             }
         }
-        let prefix_count = sizes[..run_axis].iter().try_fold(1usize, |count, size| count.checked_mul(*size)).unwrap();
-        let prefix_element_stride = (run_axis..rank)
+
+        // The selection was validated to lie within the array, so both products are bounded by the array's element
+        // count, which `ArrayAddressing::new` must have already proven to be representable.
+        let prefix_count =
+            sizes[..run_start_axis].iter().try_fold(1usize, |count, size| count.checked_mul(*size)).unwrap();
+        let prefix_element_stride = (run_start_axis..rank)
             .try_fold(1usize, |stride, axis| stride.checked_mul(addressing.dimension(axis)))
             .unwrap();
+
         Ok(Self {
             addressing,
             sizes,
             strides,
-            run_axis,
+            run_start_axis,
             run_length,
             prefix_element_stride,
             base_element,
-            next_prefix: 0,
-            prefix_count,
+            prefix_ordinals: 0..prefix_count,
         })
     }
 
-    /// Returns the [`ArrayAddressing`] used to map the emitted logical ranges to physical storage.
-    #[inline]
-    pub fn addressing(&self) -> &ArrayAddressing {
-        self.addressing
-    }
-
-    /// Returns the number of selected coordinates along each logical axis.
-    #[inline]
-    pub fn sizes(&self) -> &[usize] {
-        self.sizes
-    }
-
-    /// Returns the distance between selected coordinates, or [`None`] when every stride is one.
-    #[inline]
-    pub fn strides(&self) -> Option<&[usize]> {
-        self.strides
-    }
-
-    /// Returns the total number of selected logical elements.
+    /// Returns the total number of selected logical elements across all emitted ranges.
     #[inline]
     pub fn element_count(&self) -> usize {
-        self.prefix_count * self.run_length
+        self.prefix_ordinals.end * self.run_length
     }
 }
 
@@ -353,28 +345,25 @@ impl Iterator for ArrayIndexRanges<'_> {
     type Item = ArrayIndexRange;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_prefix == self.prefix_count {
-            return None;
-        }
-        let mut ordinal = self.next_prefix;
-        self.next_prefix += 1;
+        // Decode the ordinal into one coordinate per prefix axis, innermost axis varying fastest, and accumulate each
+        // coordinate's flat element offset. Construction validated the complete selection and its total element count,
+        // so the products and sums below are bounded by the represented array's element count.
+        let mut ordinal = self.prefix_ordinals.next()?;
         let mut element = self.base_element;
         let mut element_stride = self.prefix_element_stride;
-        for axis in (0..self.run_axis).rev() {
+        for axis in (0..self.run_start_axis).rev() {
             let position = ordinal % self.sizes[axis];
             ordinal /= self.sizes[axis];
             let stride = self.strides.map_or(1, |strides| strides[axis]);
-            // Construction validated the complete selection and its total element count, so these products and sums
-            // are bounded by the represented array's element count.
             element += position * stride * element_stride;
             element_stride *= self.addressing.dimension(axis);
         }
         Some(self.addressing.range(element..element + self.run_length).unwrap())
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.prefix_count - self.next_prefix;
-        (remaining, Some(remaining))
+        self.prefix_ordinals.size_hint()
     }
 }
 
@@ -392,14 +381,9 @@ mod tests {
 
     use super::*;
 
-    /// Creates a static [`ArrayType`] with the provided element data type and dimension sizes.
-    fn array_type(data_type: DataType, dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(data_type, Shape::new(dimensions.iter().map(|size| Dimension::Static(*size)).collect()))
-    }
-
     #[test]
     fn test_array_addressing() {
-        let r#type = array_type(DataType::F32, &[2, 3]);
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let addressing = ArrayAddressing::new(r#type.clone()).unwrap();
         assert_eq!(addressing.r#type, r#type);
         assert_eq!(addressing.element_byte_width(), 4);
@@ -419,7 +403,11 @@ mod tests {
         assert_eq!(scalar.logical_byte_len(), 16);
         assert_eq!(scalar.storage_byte_len(), 16);
         assert_eq!(scalar.index(&[]), Ok(0));
-        let empty = ArrayAddressing::new(array_type(DataType::C128, &[0, usize::MAX, usize::MAX])).unwrap();
+        let empty = ArrayAddressing::new(ArrayType::new(
+            DataType::C128,
+            Shape::new(vec![Dimension::Static(0), Dimension::Static(usize::MAX), Dimension::Static(usize::MAX)]),
+        ))
+        .unwrap();
         assert_eq!(empty.element_count(), 0);
         assert_eq!(empty.logical_byte_len(), 0);
         assert_eq!(empty.storage_byte_len(), 0);
@@ -447,12 +435,12 @@ mod tests {
         assert!(matches!(
             addressing.range(4..3),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "dense array element range 4..3 is out of bounds for 6 elements",
+                if message == "array element range 4..3 is out of bounds for 6 elements",
         ));
         assert!(matches!(
             addressing.range(5..7),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "dense array element range 5..7 is out of bounds for 6 elements",
+                if message == "array element range 5..7 is out of bounds for 6 elements",
         ));
         let dynamic = ArrayType::new(
             DataType::F32,
@@ -463,7 +451,7 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot materialize a value of dynamically sized type f32[dynamic]",
         ));
-        let oversized = array_type(DataType::C128, &[usize::MAX]);
+        let oversized = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(usize::MAX)]));
         assert!(matches!(
             ArrayAddressing::new(oversized),
             Err(ProgramError::Type(TypeError::Invalid { message }))
@@ -510,7 +498,8 @@ mod tests {
             (DataType::C128, 16),
         ];
         for (data_type, byte_width) in cases {
-            let addressing = ArrayAddressing::new(array_type(data_type, &[2])).unwrap();
+            let addressing =
+                ArrayAddressing::new(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)]))).unwrap();
             assert_eq!(addressing.element_byte_width(), byte_width);
             assert_eq!(addressing.logical_byte_len(), 2 * byte_width);
             assert_eq!(addressing.storage_byte_len(), 2 * byte_width);
@@ -519,14 +508,16 @@ mod tests {
 
     #[test]
     fn test_array_index_ranges() {
-        let addressing = ArrayAddressing::new(array_type(DataType::F32, &[3, 4])).unwrap();
+        let addressing = ArrayAddressing::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Static(3), Dimension::Static(4)]),
+        ))
+        .unwrap();
 
         // A complete selection coalesces into one range, while a partial innermost dimension emits one range per row.
         let ranges = addressing.ranges(&[0, 0], &[3, 4], Some(&[1, 1])).unwrap();
-        assert!(std::ptr::eq(ranges.addressing(), &addressing));
-        assert_eq!(ranges.sizes(), &[3, 4]);
-        assert_eq!(ranges.strides(), Some([1, 1].as_slice()));
         assert_eq!(ranges.element_count(), 12);
+        assert_eq!(ranges.len(), 1);
         assert_eq!(ranges.collect::<Vec<_>>(), vec![ArrayIndexRange { elements: 0..12, bytes: 0..48 }],);
         assert_eq!(
             addressing.ranges(&[0, 1], &[3, 2], Some(&[1, 1])).unwrap().collect::<Vec<_>>(),
@@ -567,23 +558,25 @@ mod tests {
         assert!(matches!(
             addressing.ranges(&[0], &[1, 1], Some(&[1, 1])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "dense array selection for rank 2 requires 2 starts, sizes, and strides but got 1, 2, and 2",
+                if message == "array selection for rank 2 requires 2 starts, sizes, and strides but got 1, 2, and 2",
         ));
         assert!(matches!(
             addressing.ranges(&[0, 0], &[1, 1], Some(&[1, 0])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "dense array selection stride must be positive on axis 1",
+                if message == "array selection stride must be positive on axis 1",
         ));
         assert!(matches!(
             addressing.ranges(&[0, 3], &[1, 2], Some(&[1, 1])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "dense array selection reaches index 4 on axis 1, past dimension size 4",
+                if message == "array selection reaches index 4 on axis 1, past dimension size 4",
         ));
-        let zero_width = ArrayAddressing::new(array_type(DataType::Zero, &[usize::MAX])).unwrap();
+        let zero_width =
+            ArrayAddressing::new(ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(usize::MAX)])))
+                .unwrap();
         assert!(matches!(
             zero_width.ranges(&[0], &[usize::MAX], Some(&[2])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "dense array selection index calculation overflowed on axis 0",
+                if message == "array selection index calculation overflowed on axis 0",
         ));
     }
 }

@@ -2,6 +2,7 @@
 // lets those same generated paths resolve when those macros are used inside `ryft-core` itself.
 extern crate self as ryft;
 
+pub mod arrays;
 pub mod axes;
 pub mod backends;
 pub mod batching;

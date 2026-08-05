@@ -23,6 +23,7 @@ use ryft_macros::Operation;
 
 // TODO(eaplatanios): Review from here onwards.
 
+use crate::arrays::addressing::ArrayAddressing;
 use crate::axes::{Axis, AxisIndexOperation};
 use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
@@ -1431,25 +1432,11 @@ impl Array {
     /// Copies the row-major block of shape `sizes` out of this array's payload, reading the element at index
     /// `start_indices + block_index * strides` along each axis. The caller guarantees that the block lies in bounds.
     fn copy_block(&self, start_indices: &[usize], strides: &[usize], sizes: &[usize]) -> Vec<Scalar> {
-        let input_shape = self.r#type.static_shape().unwrap();
-        let input_strides = input_shape.row_major_strides();
-        let rank = input_shape.rank();
-        let output_count: usize = sizes.iter().product();
-        let mut values = Vec::with_capacity(output_count);
-        let mut block_index = vec![0usize; rank];
-        while values.len() < output_count {
-            let mut input_flat = 0usize;
-            for axis in 0..rank {
-                input_flat += (start_indices[axis] + block_index[axis] * strides[axis]) * input_strides[axis];
-            }
-            values.push(self.values[input_flat]);
-            for position in (0..rank).rev() {
-                block_index[position] += 1;
-                if block_index[position] < sizes[position] {
-                    break;
-                }
-                block_index[position] = 0;
-            }
+        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
+        let ranges = addressing.ranges(start_indices, sizes, Some(strides)).unwrap();
+        let mut values = Vec::with_capacity(ranges.element_count());
+        for range in ranges {
+            values.extend_from_slice(&self.values[range.elements()]);
         }
         values
     }
@@ -1457,28 +1444,17 @@ impl Array {
     /// Overwrites the row-major block of `update`'s shape starting at `start_indices` in this array's payload with
     /// `update`'s payload. The caller guarantees that the block lies in bounds.
     fn replace_block(mut self, update: &Array, start_indices: &[usize]) -> Self {
-        let input_shape = self.r#type.static_shape().unwrap();
         let update_shape = update.r#type.static_shape().unwrap();
-        let input_strides = input_shape.row_major_strides();
-        let rank = input_shape.rank();
-        let update_count: usize = update_shape.dimensions().iter().product();
-        let mut block_index = vec![0usize; rank];
+        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
+        let ranges = addressing.ranges(start_indices, update_shape.as_slice(), None).unwrap();
         let mut written = 0usize;
-        while written < update_count {
-            let mut input_flat = 0usize;
-            for axis in 0..rank {
-                input_flat += (start_indices[axis] + block_index[axis]) * input_strides[axis];
-            }
-            self.values[input_flat] = update.values[written];
-            written += 1;
-            for position in (0..rank).rev() {
-                block_index[position] += 1;
-                if block_index[position] < update_shape[position] {
-                    break;
-                }
-                block_index[position] = 0;
-            }
+        for range in ranges {
+            let elements = range.elements();
+            let length = elements.len();
+            self.values[elements].copy_from_slice(&update.values[written..written + length]);
+            written += length;
         }
+        debug_assert_eq!(written, update.values.len());
         self
     }
 
