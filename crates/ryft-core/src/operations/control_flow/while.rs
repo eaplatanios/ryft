@@ -54,7 +54,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::programs::{MaybeZero, Program, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, DataType, DimensionType};
+use crate::types::{ArrayIrType, ArrayType, DataType, DimensionType};
 
 // TODO(eaplatanios): Review this.
 
@@ -101,7 +101,7 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 ///
 /// The `T` parameter fixes the loop's type universe in the payload itself. Consequently, one concrete
 /// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<Type = T>`](Operation) contract even though the shared
-/// implementation supports scalar, array, and composite array-program loops.
+/// implementation supports scalar, array, and composite array IR loops.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhileOperation<T: Type> {
     /// Optional semantic iteration bound: when present, the loop runs at most this many iterations by definition,
@@ -174,12 +174,12 @@ impl<T: WhileTypeSemantics> Display for WhileOperation<T> {
 /// along its leading axes. This mirrors JAX's batched `while_p` contract, where the batching transform emits a loop
 /// whose condition returns a batched predicate and the loop's consumers implement the masked semantics.
 ///
-/// [`DataType`] conditions must produce a scalar Boolean data type. [`ArrayProgramType`] conditions must produce a
+/// [`DataType`] conditions must produce a scalar Boolean data type. [`ArrayIrType`] conditions must produce a
 /// Boolean array member and may carry mixed array/dimension state. Under a batched predicate the prefix requirement
 /// applies to the array members only, since a first-class dimension carries no shape, and such a dimension carry must
 /// additionally be *loop-invariant*: one dimension value cannot represent independently masked per-item extents, but
 /// masking a carry that the body forwards unchanged is the identity. Eager interpretation enforces that invariance
-/// dynamically through [`ArrayProgramValue`](crate::backends::array_programs::ArrayProgramValue)'s
+/// dynamically through [`ArrayIrValue`](crate::backends::array_programs::ArrayIrValue)'s
 /// [`mask_select`](WhilePredicate::mask_select), which returns equal dimension carries unchanged and falls back to
 /// scalar-predicate concretization — an error under a batched predicate — for distinct ones. Structural composite
 /// batching relies on this relaxation to thread its loop-invariant mapped extent through batch-varying loops.
@@ -247,7 +247,7 @@ impl WhileTypeSemantics for DataType {
     }
 }
 
-impl WhileTypeSemantics for ArrayProgramType {
+impl WhileTypeSemantics for ArrayIrType {
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
         let Self::Array(condition_output) = condition_output else {
             return Err(TypeError::invalid(format!(
@@ -682,12 +682,12 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayProgramType>> WhilePartialEvaluation<C> for ArrayProgramType
+impl<C: Context<Type = ArrayIrType>> WhilePartialEvaluation<C> for ArrayIrType
 where
-    C::Operation: From<WhileOperation<ArrayProgramType>>,
+    C::Operation: From<WhileOperation<ArrayIrType>>,
 {
     fn partially_evaluate_while<D: PartialEvaluationDriver<C>>(
-        operation: &WhileOperation<ArrayProgramType>,
+        operation: &WhileOperation<ArrayIrType>,
         context: &PartialEvaluationContext<C>,
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
@@ -1120,7 +1120,7 @@ where
     }
 }
 
-/// Composite array-program batching rule for [`WhileOperation`].
+/// Composite array IR batching rule for [`WhileOperation`].
 ///
 /// Array carries use the same monotonic mapped-axis fixed point as homogeneous array loops. First-class dimensions
 /// remain replicated loop state, and the transformed condition and body explicitly thread the mapped extent through
@@ -1128,14 +1128,14 @@ where
 /// loop-invariant state that per-item masking never touches (the relaxed [`WhileTypeSemantics`] contract documents that
 /// invariance requirement), while *mapped* dimension inputs and dimension outputs that would widen into per-item
 /// extents remain rejected.
-impl<C> BatchableOperation<C, ArrayProgramBatching> for WhileOperation<ArrayProgramType>
+impl<C> BatchableOperation<C, ArrayProgramBatching> for WhileOperation<ArrayIrType>
 where
     C: Context<
-            Type = ArrayProgramType,
+            Type = ArrayIrType,
             Operation: From<BroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + From<WhileOperation<ArrayProgramType>>
+                           + From<WhileOperation<ArrayIrType>>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1157,11 +1157,11 @@ where
             .iter()
             .cloned()
             .map(|input| match input.unbatched_type() {
-                ArrayProgramType::Array(_) if !input.batch_axis().is_replicated() => {
+                ArrayIrType::Array(_) if !input.batch_axis().is_replicated() => {
                     align_array_batch(context, input, Axis::from(0))
                 }
-                ArrayProgramType::Array(_) => Ok(input),
-                ArrayProgramType::Dimension(_) => {
+                ArrayIrType::Array(_) => Ok(input),
+                ArrayIrType::Dimension(_) => {
                     input.validate_replicated_dimension()?;
                     Ok(input)
                 }
@@ -1185,7 +1185,7 @@ where
                 state_axes.iter_mut().zip(candidate.output_axes().iter()).enumerate()
             {
                 if state_axis.is_replicated() && !body_axis.is_replicated() {
-                    if matches!(inputs[index].unbatched_type(), ArrayProgramType::Dimension(_)) {
+                    if matches!(inputs[index].unbatched_type(), ArrayIrType::Dimension(_)) {
                         return Err(BatchingError::MappedDimension {
                             r#type: Box::new(<&DimensionType>::try_from(inputs[index].unbatched_type())?.clone()),
                             axis: *body_axis,
@@ -1236,8 +1236,8 @@ where
                 .iter()
                 .zip(inputs.iter())
                 .map(|(axis, input)| match input.unbatched_type() {
-                    ArrayProgramType::Array(_) => BatchAxis::new(0),
-                    ArrayProgramType::Dimension(_) => *axis,
+                    ArrayIrType::Array(_) => BatchAxis::new(0),
+                    ArrayIrType::Dimension(_) => *axis,
                 })
                 .collect::<Vec<_>>();
             if masked_state_axes != state_axes || batched_condition.output_axes()[0] != BatchAxis::new(0) {
@@ -1362,7 +1362,7 @@ where
 /// Array-backed storage semantics used by bounded `while` differentiation.
 ///
 /// A bounded loop stores each per-iteration residual in an ordinary leading-axis array stack. Homogeneous array
-/// programs use their residual type directly. Composite array programs additionally map first-class dimension
+/// programs use their residual type directly. Array IR programs additionally map first-class dimension
 /// residuals to checked scalar-array storage and restore them at the tangent-body boundary. Keeping this contract at
 /// the type-family boundary lets both operation families share the bounded-loop algorithm without making the generic
 /// control-flow rule inspect composite variants.
@@ -1919,18 +1919,18 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayProgramType> + Zero<C::Value>> WhileJvp<C> for ArrayProgramType
+impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> WhileJvp<C> for ArrayIrType
 where
     C::Constant: ValueProjection<ArrayType>,
     C::Value: Concretizable<bool>,
-    C::Operation: ZeroOperationProvider<ArrayProgramType>
+    C::Operation: ZeroOperationProvider<ArrayIrType>
         + From<ConditionOperation<C::Constant>>
-        + From<WhileOperation<ArrayProgramType>>
+        + From<WhileOperation<ArrayIrType>>
         + From<ScanOperation<C::Constant>>
-        + WhileResidualStackOperation<ArrayProgramType, <C::Constant as ValueProjection<ArrayType>>::Projected>,
+        + WhileResidualStackOperation<ArrayIrType, <C::Constant as ValueProjection<ArrayType>>::Projected>,
 {
     fn jvp_while<D: DifferentiationDriver<C>>(
-        operation: &WhileOperation<ArrayProgramType>,
+        operation: &WhileOperation<ArrayIrType>,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         context: &C,
@@ -2494,7 +2494,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::batching::batch;
@@ -2543,15 +2543,13 @@ mod tests {
     #[test]
     fn test_while_composite_type_contract() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let dimension_type = ArrayProgramType::Dimension(DimensionType::new(extent.clone()));
-        let array_type = ArrayProgramType::Array(ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(extent.clone())]),
-        ));
+        let dimension_type = ArrayIrType::Dimension(DimensionType::new(extent.clone()));
+        let array_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())])));
         let state_types = vec![dimension_type.clone(), array_type.clone()];
         let condition_interface = RegionInterface::new(
             state_types.clone(),
-            vec![ArrayProgramType::Array(ArrayType::scalar(DataType::Boolean))],
+            vec![ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))],
             Effects::PURE,
         );
         let body_interface = RegionInterface::new(state_types.clone(), state_types.clone(), Effects::PURE);
@@ -2567,10 +2565,7 @@ mod tests {
         // carry is enforced dynamically during interpretation rather than by this contract.
         let batched_condition_interface = RegionInterface::new(
             state_types.clone(),
-            vec![ArrayProgramType::Array(ArrayType::new(
-                DataType::Boolean,
-                Shape::new(vec![Dimension::Dynamic(extent)]),
-            ))],
+            vec![ArrayIrType::Array(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Dynamic(extent)])))],
             Effects::PURE,
         );
         assert_eq!(
@@ -2582,7 +2577,7 @@ mod tests {
         // The prefix requirement still holds for every array member under a batched predicate.
         let mismatched_condition_interface = RegionInterface::new(
             state_types.clone(),
-            vec![ArrayProgramType::Array(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])))],
+            vec![ArrayIrType::Array(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])))],
             Effects::PURE,
         );
         assert_eq!(
@@ -4061,30 +4056,26 @@ mod tests {
         assert_eq!(program.interpret(Array::vector(vec![3.0, 1.0, 2.0])).unwrap().to_f64s(), vec![0.0, 0.0, 0.0]);
     }
 
-    /// Composite array-program region program over the reference [`Array`] backend.
-    type CompositeRegionProgram = Program<
-        ArrayProgramValue<Array>,
-        ArrayProgramOperation<Array>,
-        Vec<ArrayProgramValue<Array>>,
-        Vec<ArrayProgramValue<Array>>,
-    >;
+    /// Composite array IR region program over the reference [`Array`] backend.
+    type CompositeRegionProgram =
+        Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>;
 
     /// Builds the composite per-item countdown loop `while (x > 0) { x = x - 1 }` over one scalar `f64` array state
     /// element, returning its condition and body programs in `while` region order.
     fn composite_countdown_while_regions() -> Vec<CompositeRegionProgram> {
-        let scalar_f64 = ArrayProgramType::Array(ArrayType::scalar(DataType::F64));
-        let mut condition_builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let scalar_f64 = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let mut condition_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let zero = condition_builder
             .add_instruction(
-                ArrayProgramOperation::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new())),
+                ArrayIrOperation::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new())),
                 Vec::new(),
                 vec![condition_state],
             )
             .unwrap()[0];
         let predicate = condition_builder
             .add_instruction(
-                ArrayProgramOperation::Array(ArrayOperation::Compare(CompareOperation::new(
+                ArrayIrOperation::Array(ArrayOperation::Compare(CompareOperation::new(
                     ComparisonDirection::GreaterThan,
                 ))),
                 Vec::new(),
@@ -4092,30 +4083,30 @@ mod tests {
             )
             .unwrap()[0];
         let condition = condition_builder
-            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![predicate],
                 vec![Placeholder],
                 vec![Placeholder],
             )
             .unwrap();
-        let mut body_builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let mut body_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let body_state = body_builder.add_input(scalar_f64);
         let one = body_builder
             .add_instruction(
-                ArrayProgramOperation::Array(ArrayOperation::OneLike(OneLikeOperation::new())),
+                ArrayIrOperation::Array(ArrayOperation::OneLike(OneLikeOperation::new())),
                 Vec::new(),
                 vec![body_state],
             )
             .unwrap()[0];
         let next = body_builder
             .add_instruction(
-                ArrayProgramOperation::Array(ArrayOperation::Sub(SubOperation::new())),
+                ArrayIrOperation::Array(ArrayOperation::Sub(SubOperation::new())),
                 Vec::new(),
                 vec![body_state, one],
             )
             .unwrap()[0];
         let body = body_builder
-            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![next],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -4131,7 +4122,7 @@ mod tests {
     /// pass per region.
     #[test]
     fn test_composite_while_batching_reuses_naturally_aligned_batch_varying_programs() {
-        type EagerParent = EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        type EagerParent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let countdown_regions = composite_countdown_while_regions();
 
@@ -4140,19 +4131,18 @@ mod tests {
         // semantics: every batch item counts down to 0 even though the items terminate after different trip counts.
         let context = BatchingContext::<_, ArrayProgramBatching>::new(
             EagerParent::new(),
-            ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()),
+            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         );
         let inputs = vec![
-            ArrayProgramBatch::new(ArrayProgramValue::Array(Array::vector(vec![3.0, 1.0, 2.0])), BatchAxis::new(0))
-                .unwrap(),
+            ArrayProgramBatch::new(ArrayIrValue::Array(Array::vector(vec![3.0, 1.0, 2.0])), BatchAxis::new(0)).unwrap(),
         ];
         let driver = CountingBatchingDriver::new(&countdown_regions);
-        let countdown_operation = WhileOperation::<ArrayProgramType>::new();
+        let countdown_operation = WhileOperation::<ArrayIrType>::new();
         let outputs = countdown_operation.batch(&context, &driver, inputs.as_slice()).unwrap();
         assert_eq!(driver.batch_program_calls(), 2);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value(), &ArrayProgramValue::Array(Array::vector(vec![0.0, 0.0, 0.0])));
+        assert_eq!(outputs[0].value(), &ArrayIrValue::Array(Array::vector(vec![0.0, 0.0, 0.0])));
 
         // The skipped alignment rebuilds are byte-identical to the discovery programs the rule kept: replaying each
         // region with `AlignEachTo` at the already-aligned axes (each region returns one output — the predicate or
@@ -4186,7 +4176,7 @@ mod tests {
     /// the staged loop exercises the masked eager path over that carry.
     #[test]
     fn test_composite_while_batching_stages_batched_predicate_loops_under_tracing() {
-        type TraceContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
         let batch_type = DimensionType::new(batch.clone());
@@ -4198,7 +4188,7 @@ mod tests {
         let context = BatchingContext::<_, ArrayProgramBatching>::new(trace.clone(), batch_extent);
         let outputs = context
             .bind(
-                ArrayProgramOperation::While(WhileOperation::new()),
+                ArrayIrOperation::While(WhileOperation::new()),
                 composite_countdown_while_regions(),
                 &[BatchingTracer::new(context.clone(), ArrayProgramBatch::new(state, BatchAxis::new(0)).unwrap())],
             )
@@ -4213,7 +4203,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![outputs[0].batch().value().atom_id().unwrap()],
                 vec![Placeholder; 2],
                 vec![Placeholder],
@@ -4222,7 +4212,7 @@ mod tests {
         let [r#while] = program.entry_region().instructions() else {
             panic!("composite while batching should stage exactly one instruction");
         };
-        assert!(matches!(r#while.operation(), ArrayProgramOperation::While(_)));
+        assert!(matches!(r#while.operation(), ArrayIrOperation::While(_)));
         assert_eq!(r#while.inputs(), &[input_ids[0], input_ids[1]]);
         let rendered = program.to_string();
         assert!(rendered.contains("bool[batch]"), "{rendered}");
@@ -4232,12 +4222,12 @@ mod tests {
         // semantics while the loop-invariant extent carry rides through unchanged.
         let outputs = program
             .interpret(vec![
-                ArrayProgramValue::Dimension(DimensionValue::new(batch_type, 3).unwrap()),
-                ArrayProgramValue::Array(Array::vector(vec![3.0, 1.0, 2.0])),
+                ArrayIrValue::Dimension(DimensionValue::new(batch_type, 3).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![3.0, 1.0, 2.0])),
             ])
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0], ArrayProgramValue::Array(Array::vector(vec![0.0, 0.0, 0.0])));
+        assert_eq!(outputs[0], ArrayIrValue::Array(Array::vector(vec![0.0, 0.0, 0.0])));
     }
 
     /// Builds the `while (counter > 0) { (counter, value) = (counter - 1, value + value) }` loop whose predicate

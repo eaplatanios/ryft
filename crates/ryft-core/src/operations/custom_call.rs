@@ -1,7 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -15,7 +15,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
-use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, DimensionVariable};
+use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, DimensionVariable};
 
 // TODO(eaplatanios): Review this module.
 
@@ -129,7 +129,7 @@ impl Display for CustomCallInputOutputAlias {
 /// its output types are declared up front instead of inferred, and typed [`CustomCallAttribute`]s are forwarded
 /// verbatim to the kernel as its configuration.
 ///
-/// In an array program, each dynamic axis occurrence in the declared outputs requires one trailing first-class
+/// In the array IR, each dynamic axis occurrence in the declared outputs requires one trailing first-class
 /// dimension operand, ordered first by output and then by axis. Type inference verifies that each operand defines the
 /// exact variable referenced by its corresponding output axis. These logical result extents do not enter the foreign
 /// kernel ABI: only the leading array operands are passed to the kernel. Eager execution and backend lowering use the
@@ -138,8 +138,8 @@ impl Display for CustomCallInputOutputAlias {
 /// The type parameter selects that operand contract without introducing a second semantic operation:
 ///
 ///   - `CustomCallOperation<ArrayType>` accepts only the foreign kernel's array operands and is suitable for
-///     homogeneous array programs whose result extents are fully described by their array types.
-///   - `CustomCallOperation<ArrayProgramType>` additionally accepts the trailing first-class dimension operands
+///     programs over homogeneous arrays whose result extents are fully described by their array types.
+///   - `CustomCallOperation<ArrayIrType>` additionally accepts the trailing first-class dimension operands
 ///     described above and is suitable for mixed array/dimension programs.
 ///
 /// Both forms carry the same target, output declarations, attributes, effects, rendering, and backend-kernel
@@ -315,7 +315,7 @@ impl<T: Type> CustomCallOperation<T> {
     }
 }
 
-impl From<CustomCallOperation<ArrayType>> for CustomCallOperation<ArrayProgramType> {
+impl From<CustomCallOperation<ArrayType>> for CustomCallOperation<ArrayIrType> {
     fn from(operation: CustomCallOperation<ArrayType>) -> Self {
         Self {
             target_name: operation.target_name,
@@ -328,8 +328,8 @@ impl From<CustomCallOperation<ArrayType>> for CustomCallOperation<ArrayProgramTy
     }
 }
 
-impl From<CustomCallOperation<ArrayProgramType>> for CustomCallOperation<ArrayType> {
-    fn from(operation: CustomCallOperation<ArrayProgramType>) -> Self {
+impl From<CustomCallOperation<ArrayIrType>> for CustomCallOperation<ArrayType> {
+    fn from(operation: CustomCallOperation<ArrayIrType>) -> Self {
         Self {
             target_name: operation.target_name,
             output_types: operation.output_types,
@@ -414,8 +414,8 @@ impl Operation for CustomCallOperation<ArrayType> {
     }
 }
 
-impl Operation for CustomCallOperation<ArrayProgramType> {
-    type Type = ArrayProgramType;
+impl Operation for CustomCallOperation<ArrayIrType> {
+    type Type = ArrayIrType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -424,9 +424,9 @@ impl Operation for CustomCallOperation<ArrayProgramType> {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         let dynamic_output_dimensions = self
             .output_types
@@ -485,15 +485,14 @@ impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> f
 }
 
 impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>
-    for CustomCallOperation<ArrayProgramType>
+    InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>> for CustomCallOperation<ArrayIrType>
 {
-    fn interpret<D: InterpretationDriver<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>>(
+    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
         &self,
-        _context: &EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>,
+        _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
         driver: &D,
-        inputs: &[ArrayProgramValue<A>],
-    ) -> Result<Vec<ArrayProgramValue<A>>, ProgramError> {
+        inputs: &[ArrayIrValue<A>],
+    ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
         if driver.region_count() != 0 {
             return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
         }
@@ -507,11 +506,11 @@ impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
         let array_input_count = inputs.len() - dynamic_output_dimension_count;
         let array_inputs = inputs[..array_input_count]
             .iter()
-            .map(<ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected)
+            .map(<ArrayIrValue<A> as ValueProjection<ArrayType>>::projected)
             .collect::<Result<Vec<_>, _>>()?;
         let output_extents = inputs[array_input_count..]
             .iter()
-            .map(<ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected)
+            .map(<ArrayIrValue<A> as ValueProjection<DimensionType>>::projected)
             .collect::<Result<Vec<_>, _>>()?;
         let kernel_operation = CustomCallOperation::<ArrayType>::from(self.clone());
         let outputs = A::custom_call(&kernel_operation, array_inputs.iter().copied())?;
@@ -533,7 +532,7 @@ impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
                 }
             }
         }
-        Ok(outputs.into_iter().map(ArrayProgramValue::Array).collect())
+        Ok(outputs.into_iter().map(ArrayIrValue::Array).collect())
     }
 }
 
@@ -710,7 +709,7 @@ mod tests {
         assert_eq!(pure.effects(), Effects::PURE);
         assert_eq!(pure.to_string(), "custom_call [target=ryft.test.add_one]");
         let roundtrip =
-            CustomCallOperation::<ArrayType>::from(CustomCallOperation::<ArrayProgramType>::from(operation.clone()));
+            CustomCallOperation::<ArrayType>::from(CustomCallOperation::<ArrayIrType>::from(operation.clone()));
         assert_eq!(roundtrip.input_output_aliases(), operation.input_output_aliases());
         assert!(matches!(
             operation.clone().with_input_output_alias(0, 1),
@@ -760,7 +759,7 @@ mod tests {
                 Dimension::Dynamic(columns.clone()),
             ]),
         );
-        let dynamic_operation = CustomCallOperation::<ArrayProgramType>::from(CustomCallOperation::new(
+        let dynamic_operation = CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new(
             "ryft.test.dynamic",
             vec![dynamic_output_type.clone()],
         ));
@@ -769,7 +768,7 @@ mod tests {
             DimensionType::new(rows.clone()).into(),
             DimensionType::new(columns.clone()).into(),
         ];
-        let aliased_dynamic_operation = CustomCallOperation::<ArrayProgramType>::from(
+        let aliased_dynamic_operation = CustomCallOperation::<ArrayIrType>::from(
             CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_output_type.clone()])
                 .with_input_output_alias(0, 0)
                 .unwrap(),
@@ -868,16 +867,16 @@ mod tests {
     }
 
     #[test]
-    fn test_array_program_custom_call_rejects_transforms() {
-        let operation = CustomCallOperation::<ArrayProgramType>::from(CustomCallOperation::new(
+    fn test_array_ir_custom_call_rejects_transforms() {
+        let operation = CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new(
             "ryft.test.add_one",
             vec![vector_type()],
         ));
-        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(vector_type().into());
         let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -892,8 +891,8 @@ mod tests {
         ));
 
         let batching_context = BatchingContext::<_, ArrayProgramBatching>::new(
-            EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new(),
-            ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()),
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
         assert!(matches!(
             operation.batch(&batching_context, &EmptyRegionDriver, &[]),
@@ -903,7 +902,7 @@ mod tests {
                         batch axis instead",
         ));
 
-        let mut transposition_context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let mut transposition_context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert!(matches!(
             operation.transpose(&mut transposition_context, &EmptyRegionDriver, &[], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))

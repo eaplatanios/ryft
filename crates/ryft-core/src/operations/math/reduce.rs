@@ -31,7 +31,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value, ValueProjection};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, Shape, StaticShape};
+use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape, StaticShape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -528,13 +528,13 @@ where
 /// normalized extremum mask, while mean computes its divisor from the retained reduced-axis extents.
 impl<C> MemberDifferentiableOperation<C> for ReduceOperation
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<BroadcastOperation>
         + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
+        + From<LinearCallOperation<ArrayIrType>>
         + OperationProjection<ArrayType>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>

@@ -27,7 +27,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, Dimension, Shape};
+use crate::types::{ArrayIrType, ArrayType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -382,15 +382,15 @@ where
     }
 }
 
-/// Projected array-program JVP rule for [`GatherOperation`]. A dynamically shaped operand retains its exact extents
+/// Projected array IR JVP rule for [`GatherOperation`]. A dynamically shaped operand retains its exact extents
 /// and indices as ordinary residual values; a static operand delegates to the homogeneous projected rule.
 impl<C> MemberDifferentiableOperation<C> for GatherOperation
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation:
-        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayIrType>> + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
         + From<GatherOperation>
         + From<ScatterOperation>

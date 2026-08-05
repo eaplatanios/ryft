@@ -17,7 +17,7 @@ pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 use crate::programs::identities::TypeIdentityPosition;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
-use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType};
+use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType};
 
 /// Rejects a nullary constructor output [`Type`] that carries an ungrounded [`TypeIdentity`](crate::TypeIdentity)
 /// reference. A reference-position identity in a constructed-from-nothing type names a runtime quantity that no operand
@@ -36,7 +36,7 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
     }
 }
 
-/// Infers the output type of one mixed [`ArrayProgramType`] constructor whose stored [`ArrayType`] is the
+/// Infers the output type of one mixed [`ArrayIrType`] constructor whose stored [`ArrayType`] is the
 /// complete output type. The constructor consumes one first-class dimension operand per *dynamic* dimension
 /// of its stored shape, in axis order, and each operand's [`DimensionType`] must define exactly the
 /// [`DimensionVariable`](crate::DimensionVariable) named by the corresponding output axis. Static axes remain ordinary
@@ -48,9 +48,9 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 pub(crate) fn infer_dynamic_constructor_output_types(
     name: &str,
     r#type: &ArrayType,
-    input_types: &[ArrayProgramType],
-    region_interfaces: &[RegionInterface<ArrayProgramType>],
-) -> Result<Vec<ArrayProgramType>, TypeError> {
+    input_types: &[ArrayIrType],
+    region_interfaces: &[RegionInterface<ArrayIrType>],
+) -> Result<Vec<ArrayIrType>, TypeError> {
     if !region_interfaces.is_empty() {
         return Err(TypeError::invalid(format!("'{}' expects no regions but got {}", name, region_interfaces.len())));
     }
@@ -81,7 +81,7 @@ pub(crate) fn infer_dynamic_constructor_output_types(
             )));
         }
     }
-    Ok(vec![ArrayProgramType::Array(r#type.clone())])
+    Ok(vec![ArrayIrType::Array(r#type.clone())])
 }
 
 #[cfg(test)]
@@ -104,10 +104,10 @@ mod tests {
             infer_dynamic_constructor_output_types(
                 "zero",
                 &dynamic_type,
-                &[ArrayProgramType::Dimension(DimensionType::new(rows.clone()))],
+                &[ArrayIrType::Dimension(DimensionType::new(rows.clone()))],
                 &[],
             ),
-            Ok(vec![ArrayProgramType::Array(dynamic_type.clone())]),
+            Ok(vec![ArrayIrType::Array(dynamic_type.clone())]),
         );
         assert_eq!(
             infer_dynamic_constructor_output_types("zero", &dynamic_type, &[], &[]),
@@ -120,7 +120,7 @@ mod tests {
             infer_dynamic_constructor_output_types(
                 "zero",
                 &dynamic_type,
-                &[ArrayProgramType::Dimension(DimensionType::new(other))],
+                &[ArrayIrType::Dimension(DimensionType::new(other))],
                 &[],
             ),
             Err(TypeError::invalid(
@@ -132,7 +132,7 @@ mod tests {
             infer_dynamic_constructor_output_types(
                 "zero",
                 &dynamic_type,
-                &[ArrayProgramType::Array(ArrayType::scalar(DataType::I64))],
+                &[ArrayIrType::Array(ArrayType::scalar(DataType::I64))],
                 &[],
             ),
             Err(TypeError::invalid("'zero' operand 0 must be a dimension but has type i64[]")),

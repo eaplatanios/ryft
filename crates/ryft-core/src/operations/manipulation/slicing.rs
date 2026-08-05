@@ -30,7 +30,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, Memory, Shape};
+use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Memory, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -149,7 +149,7 @@ impl Display for DynamicShapeSliceOperation {
 }
 
 impl Operation for DynamicShapeSliceOperation {
-    type Type = ArrayProgramType;
+    type Type = ArrayIrType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -158,9 +158,9 @@ impl Operation for DynamicShapeSliceOperation {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         let Some(input_type) = input_types.first() else {
             return Err(TypeError::invalid("'dynamic_shape_slice' expects an array operand"));
@@ -203,7 +203,7 @@ impl Operation for DynamicShapeSliceOperation {
 /// directly and therefore do not call this rule.
 impl<C> InterpretableOperation<C> for DynamicShapeSliceOperation
 where
-    C: Domain<Type = ArrayProgramType>,
+    C: Domain<Type = ArrayIrType>,
     C::Value: ValueProjection<ArrayType> + ValueProjection<DimensionType, Projected = DimensionValue>,
     <C::Value as ValueProjection<ArrayType>>::Projected: DimensionSize<usize> + Slice,
 {
@@ -271,7 +271,7 @@ where
 
 /// Partial evaluation defers to the default fold-or-residualize behavior of
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context<Type = ArrayProgramType>> PartiallyEvaluatableOperation<C> for DynamicShapeSliceOperation where
+impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for DynamicShapeSliceOperation where
     C::Operation: From<DynamicShapeSliceOperation>
 {
 }
@@ -280,7 +280,7 @@ impl<C: Context<Type = ArrayProgramType>> PartiallyEvaluatableOperation<C> for D
 /// sizes are discrete shape metadata, so the primal and materialized array tangent are sliced with the same geometry.
 impl<C> DifferentiableOperation<C> for DynamicShapeSliceOperation
 where
-    C: Context<Type = ArrayProgramType> + Zero<C::Value>,
+    C: Context<Type = ArrayIrType> + Zero<C::Value>,
     C::Operation: From<DynamicShapeSliceOperation>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -312,7 +312,7 @@ where
 /// possibly strided dynamic-size cotangent into an input whose own runtime extents may need to be retained as linear
 /// residuals; returning an explicit error preserves that requirement instead of silently producing an incorrect
 /// cotangent.
-impl<V: Value<Type = ArrayProgramType>, O: Operation<Type = ArrayProgramType>> TransposableOperation<V, O>
+impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> TransposableOperation<V, O>
     for DynamicShapeSliceOperation
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -335,7 +335,7 @@ impl<V: Value<Type = ArrayProgramType>, O: Operation<Type = ArrayProgramType>> T
 impl<C> BatchableOperation<C, ArrayProgramBatching> for DynamicShapeSliceOperation
 where
     C: Context<
-            Type = ArrayProgramType,
+            Type = ArrayIrType,
             Operation: From<DynamicShapeSliceOperation> + From<DimensionOperation<DimensionValue>>,
         >,
 {
@@ -525,15 +525,15 @@ where
     }
 }
 
-/// Projected array-program JVP rule for [`SliceOperation`]. A dynamically shaped operand retains its exact extents as
+/// Projected array IR JVP rule for [`SliceOperation`]. A dynamically shaped operand retains its exact extents as
 /// ordinary residual values; a static operand delegates to the homogeneous projected rule.
 impl<C> MemberDifferentiableOperation<C> for SliceOperation
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation:
-        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayIrType>> + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
         + From<PadOperation<ArrayType>>
         + From<SliceOperation>
@@ -1410,16 +1410,16 @@ where
     }
 }
 
-/// Projected array-program JVP rule for [`DynamicSliceOperation`]. A dynamically shaped operand retains its exact
+/// Projected array IR JVP rule for [`DynamicSliceOperation`]. A dynamically shaped operand retains its exact
 /// extents and scalar start indices as ordinary residual values; a static operand delegates to the homogeneous
 /// projected rule.
 impl<C> MemberDifferentiableOperation<C> for DynamicSliceOperation
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation:
-        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayIrType>> + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
         + From<DynamicSliceOperation>
         + From<DynamicUpdateSliceOperation>
@@ -1785,16 +1785,16 @@ where
     }
 }
 
-/// Projected array-program JVP rule for [`DynamicUpdateSliceOperation`]. Dynamically shaped operands retain their
+/// Projected array IR JVP rule for [`DynamicUpdateSliceOperation`]. Dynamically shaped operands retain their
 /// exact extents and scalar start indices as ordinary residual values; fully static operands delegate to the
 /// homogeneous projected rule.
 impl<C> MemberDifferentiableOperation<C> for DynamicUpdateSliceOperation
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation:
-        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayProgramType>> + OperationProjection<ArrayType>,
+        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayIrType>> + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
         + From<DynamicSliceOperation>
         + From<DynamicUpdateSliceOperation>
@@ -2487,7 +2487,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::batching::{BatchAxis, BatchingContext, batch};
@@ -2538,16 +2538,16 @@ mod tests {
     #[test]
     fn test_dynamic_shape_slice_batching_inserts_the_mapped_axis_geometry() {
         let context = BatchingContext::<_, ArrayProgramBatching>::new(
-            EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new(),
-            ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()),
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
         let input = ArrayProgramBatch::new(
-            ArrayProgramValue::Array(Array::matrix(2, 4, vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
+            ArrayIrValue::Array(Array::matrix(2, 4, vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
             BatchAxis::new(0),
         )
         .unwrap();
-        let start = ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(DimensionValue::constant(1).unwrap()));
-        let size = ArrayProgramBatch::replicated(ArrayProgramValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let start = ArrayProgramBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()));
+        let size = ArrayProgramBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
 
         let outputs = DynamicShapeSliceOperation::new(1)
             .batch(&context, &EmptyRegionDriver, &[input, start, size])
@@ -2555,7 +2555,7 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value(), &ArrayProgramValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 5.0, 6.0])),);
+        assert_eq!(outputs[0].value(), &ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 5.0, 6.0])),);
     }
 
     #[test]

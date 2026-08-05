@@ -259,7 +259,7 @@ impl<A: Into<Axis>> From<A> for BatchAxis {
 /// an optional axis name that can be referenced by operations that support named axes. The extent is normally
 /// inferred from the inputs that are being batched. An explicit extent can be provided to either pin it or to drive
 /// a broadcasted batching transform whose extent would otherwise be unobservable. Its representation is selected by
-/// the active [`BatchingPolicy`] (e.g., homogeneous arrays use a host `usize`, while composite array programs use a
+/// the active [`BatchingPolicy`] (e.g., homogeneous arrays use a host `usize`, while array IR programs use a
 /// first-class dimension value). The axis name makes the batch axis addressable by name from collective operations
 /// inside the batched function body. The default `usize` form converts from `None`, `Some(extent)`, and `extent`
 /// directly. For example:
@@ -528,7 +528,7 @@ impl BatchableType for ArrayType {
 ///     composite universe may carry an ordinary parent-owned first-class dimension value so that a dynamic batch extent
 ///     remains a Single Static Assignment (SSA) value flowing through operand edges rather than being treated as static
 ///     transform metadata.
-///   - **The Structurally Batched Program (i.e., [`Self::BatchedProgram`]):** Homogeneous array programs preserve the
+///   - **The Structurally Batched Program (i.e., [`Self::BatchedProgram`]):** Programs over homogeneous arrays preserve
 ///     source region's boundary exactly and produce [`BoundaryPreservingBatchedProgram`]s, while a composite universe
 ///     may thread bookkeeping values such as its first-class mapped extent through standalone nested programs. Every
 ///     selected carrier implements [`BatchedProgram`], while [`Self::boundary_operands`] and

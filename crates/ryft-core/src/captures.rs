@@ -509,7 +509,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{EagerContext, StagingContext};
@@ -524,7 +524,7 @@ mod tests {
     use crate::tests::TestRegionOperation;
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
     use crate::types::{
-        ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
     };
 
     use super::*;
@@ -552,33 +552,28 @@ mod tests {
     #[test]
     fn test_capture_reference_projection_preserves_capture_index() {
         let array_type = ArrayType::scalar(DataType::F32);
-        let capture = CaptureReference::new(3, ArrayProgramType::Array(array_type.clone()));
-        let projected =
-            <CaptureReference<ArrayProgramType> as ValueProjection<ArrayType>>::projected(&capture).unwrap();
+        let capture = CaptureReference::new(3, ArrayIrType::Array(array_type.clone()));
+        let projected = <CaptureReference<ArrayIrType> as ValueProjection<ArrayType>>::projected(&capture).unwrap();
         assert_eq!(projected.value().index(), 3);
         assert_eq!(projected.r#type().as_ref(), &array_type);
 
-        let projected =
-            <CaptureReference<ArrayProgramType> as ValueProjection<ArrayType>>::into_projected(capture).unwrap();
+        let projected = <CaptureReference<ArrayIrType> as ValueProjection<ArrayType>>::into_projected(capture).unwrap();
         assert_eq!(projected.index(), 3);
         assert_eq!(projected.r#type().as_ref(), &array_type);
-        let lifted = <CaptureReference<ArrayProgramType> as ValueProjection<ArrayType>>::from_projected(projected);
+        let lifted = <CaptureReference<ArrayIrType> as ValueProjection<ArrayType>>::from_projected(projected);
         assert_eq!(lifted.index(), 3);
-        assert_eq!(lifted.r#type().as_ref(), &ArrayProgramType::Array(array_type));
+        assert_eq!(lifted.r#type().as_ref(), &ArrayIrType::Array(array_type));
 
         assert_eq!(
-            <CaptureReference<ArrayProgramType> as ValueProjection<DimensionType>>::projected(&lifted),
+            <CaptureReference<ArrayIrType> as ValueProjection<DimensionType>>::projected(&lifted),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
     }
 
     #[test]
     fn test_projected_context_capture_delegates_to_parent_capture_table() {
-        let parent = TracingContext::<
-            CaptureReference<ArrayProgramType>,
-            ArrayProgramOperation<Array>,
-            ArrayProgramValue<Array>,
-        >::new();
+        let parent =
+            TracingContext::<CaptureReference<ArrayIrType>, ArrayIrOperation<Array>, ArrayIrValue<Array>>::new();
         let array_context = ProjectedContext::<_, ArrayType>::new(parent.clone());
         let array = Array::scalar(3.0_f32);
         let array_reference = array_context.capture(array.clone()).unwrap();
@@ -591,7 +586,7 @@ mod tests {
         assert_eq!(dimension_reference.r#type().as_ref(), dimension.r#type());
         assert_eq!(
             parent.captures().borrow().as_slice(),
-            &[ArrayProgramValue::Array(array), ArrayProgramValue::Dimension(dimension),],
+            &[ArrayIrValue::Array(array), ArrayIrValue::Dimension(dimension),],
         );
     }
 

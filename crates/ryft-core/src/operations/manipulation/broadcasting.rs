@@ -38,7 +38,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, Shape};
+use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -95,7 +95,7 @@ impl Display for BroadcastOperation {
 }
 
 impl Operation for BroadcastOperation {
-    type Type = ArrayProgramType;
+    type Type = ArrayIrType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -104,9 +104,9 @@ impl Operation for BroadcastOperation {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         let Some((input_type, output_extent_types)) = input_types.split_first() else {
             return Err(TypeError::invalid("'broadcast' expects an array followed by its output extents"));
@@ -135,7 +135,7 @@ impl Operation for BroadcastOperation {
 
 impl<C> InterpretableOperation<C> for BroadcastOperation
 where
-    C: Domain<Type = ArrayProgramType>,
+    C: Domain<Type = ArrayIrType>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + BroadcastKernel>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
 {
@@ -167,7 +167,7 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayProgramType, Operation: From<BroadcastOperation>>> PartiallyEvaluatableOperation<C>
+impl<C: Context<Type = ArrayIrType, Operation: From<BroadcastOperation>>> PartiallyEvaluatableOperation<C>
     for BroadcastOperation
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
@@ -199,7 +199,7 @@ impl<C: Context<Type = ArrayProgramType, Operation: From<BroadcastOperation>>> P
 /// input-to-output axis mapping.
 impl<C> BatchableOperation<C, ArrayProgramBatching> for BroadcastOperation
 where
-    C: Context<Type = ArrayProgramType, Operation: From<BroadcastOperation>>,
+    C: Context<Type = ArrayIrType, Operation: From<BroadcastOperation>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
@@ -418,12 +418,12 @@ impl_differentiable_operation! {
 /// linear transpose can reduce, reorder, and rebind the input cotangent using first-class dimension residuals.
 impl<C> DifferentiableOperation<C> for BroadcastOperation
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<BroadcastOperation>
         + From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
+        + From<LinearCallOperation<ArrayIrType>>
         + From<ReshapeOperation>
         + From<ZeroOperation<ArrayType>>
         + OperationProjection<ArrayType, Projected: From<ReduceOperation> + From<TransposeOperation>>
@@ -584,8 +584,8 @@ where
 /// linearization so [`DifferentiableOperation::jvp`] can retain its exact extents as residuals.
 impl<V, O> TransposableOperation<V, O> for BroadcastOperation
 where
-    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayProgramType> + OperationProjection<ArrayType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
     <O as OperationProjection<ArrayType>>::Projected: From<LegacyBroadcastOperation>
         + TransposableOperation<
             <V as ValueProjection<ArrayType>>::Projected,
@@ -906,13 +906,13 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 ///
 /// ```rust
 /// use ryft_core::operations::manipulation::Broadcast;
-/// use ryft_core::{Array, ArrayProgramValue};
+/// use ryft_core::{Array, ArrayIrValue};
 ///
-/// let input = ArrayProgramValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
+/// let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
 /// let output = input.broadcast_to_sizes(&[2, 3]).unwrap();
 /// assert_eq!(
 ///     output,
-///     ArrayProgramValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0])),
+///     ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0])),
 /// );
 /// ```
 ///
@@ -921,23 +921,23 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 /// ```rust
 /// use ryft_core::operations::manipulation::Broadcast;
 /// use ryft_core::{
-///     Array, ArrayProgramOperation, ArrayProgramType, ArrayProgramValue, ArrayType, DataType,
+///     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType,
 ///     DimensionBounds, DimensionType, DimensionVariable, TracingContext, Typed,
 ///     StagingContext,
 /// };
 ///
-/// type C = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+/// type C = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 ///
 /// let context = C::new();
-/// let scalar = context.input(ArrayProgramType::Array(ArrayType::scalar(DataType::F32)));
-/// let extent = context.input(ArrayProgramType::Dimension(DimensionType::new(DimensionVariable::new(
+/// let scalar = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+/// let extent = context.input(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
 ///     "extent",
 ///     DimensionBounds::new(1, Some(9)).unwrap(),
 /// ))));
 /// let output = scalar.broadcast_to(&[extent]).unwrap();
 /// assert_eq!(output.r#type().to_string(), "f32[extent]");
 /// ```
-pub trait Broadcast: Value<Type = ArrayProgramType> + DimensionSize + Sized {
+pub trait Broadcast: Value<Type = ArrayIrType> + DimensionSize + Sized {
     /// Broadcasts `self` using an explicit input-to-output axis mapping and one first-class value per output extent.
     ///
     /// # Parameters
@@ -974,7 +974,7 @@ pub trait Broadcast: Value<Type = ArrayProgramType> + DimensionSize + Sized {
     /// Broadcasts `self` by prepending the supplied first-class leading dimensions.
     fn broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
-        Self::DispatchDomain: Context<Type = ArrayProgramType>,
+        Self::DispatchDomain: Context<Type = ArrayIrType>,
         <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     {
         let r#type = self.r#type();
@@ -994,7 +994,7 @@ pub trait Broadcast: Value<Type = ArrayProgramType> + DimensionSize + Sized {
     /// Broadcasts `self` to an exact static shape.
     fn broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self::DispatchDomain: Context<Type = ArrayProgramType>,
+        Self::DispatchDomain: Context<Type = ArrayIrType>,
         <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     {
         let output_dimensions = output_sizes
@@ -1007,7 +1007,7 @@ pub trait Broadcast: Value<Type = ArrayProgramType> + DimensionSize + Sized {
     /// Broadcasts `self` by prepending exact static leading dimensions.
     fn broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self::DispatchDomain: Context<Type = ArrayProgramType>,
+        Self::DispatchDomain: Context<Type = ArrayIrType>,
         <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     {
         let context = self.dispatch_domain();
@@ -1021,9 +1021,9 @@ pub trait Broadcast: Value<Type = ArrayProgramType> + DimensionSize + Sized {
 
 impl<
     V: Value<
-            Type = ArrayProgramType,
+            Type = ArrayIrType,
             DispatchDomain: Context<
-                Type = ArrayProgramType,
+                Type = ArrayIrType,
                 Operation: From<BroadcastOperation> + From<DimensionSizeOperation>,
             >,
         >,

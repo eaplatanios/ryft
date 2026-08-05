@@ -26,7 +26,7 @@ use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionSl
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType};
+use crate::types::{ArrayIrType, ArrayType};
 
 /// Differentiation-owned protocol through which an operation family materializes zeros whose runtime geometry must
 /// be supplied by explicitly captured _residual_ values, because it is not derivable from the zero's [`Type`] alone.
@@ -1110,7 +1110,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>, P: ArrayBat
 
 impl<
     C: Context<
-            Type = ArrayProgramType,
+            Type = ArrayIrType,
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Operation: OperationProjection<ArrayType, Projected: From<ReduceOperation>>,
         >,
@@ -1139,7 +1139,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::tests::{
@@ -1160,7 +1160,7 @@ mod tests {
     use crate::programs::regions::{RegionDriver, RegionRef, RegionSlot};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -1250,7 +1250,7 @@ mod tests {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let key_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)]));
         let accumulator_type = ArrayType::scalar(DataType::F64);
-        let context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let key = context.input(key_type.clone().into());
         let accumulator = context.input(accumulator_type.clone().into());
         let primal_values = vec![key, accumulator.clone()];
@@ -1266,7 +1266,7 @@ mod tests {
         )
         .unwrap();
         let outputs = reconstruction.rebuild(&context, [accumulator.clone()]).unwrap();
-        let key_tangent_type = ArrayProgramType::Array(key_type.tangent());
+        let key_tangent_type = ArrayIrType::Array(key_type.tangent());
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].r#type().as_ref(), &key_tangent_type);
         assert_eq!(outputs[1].atom_id(), accumulator.atom_id());
@@ -1275,8 +1275,8 @@ mod tests {
         // stored residual range—not a type-only zero—is used during reconstruction.
         let builder = context.builder().borrow();
         assert_eq!(builder.instructions().len(), 2);
-        assert!(matches!(builder.instructions()[0].operation(), ArrayProgramOperation::DimensionSize(_)));
-        assert!(matches!(builder.instructions()[1].operation(), ArrayProgramOperation::Zero(_)));
+        assert!(matches!(builder.instructions()[0].operation(), ArrayIrOperation::DimensionSize(_)));
+        assert!(matches!(builder.instructions()[1].operation(), ArrayIrOperation::Zero(_)));
         assert_eq!(builder.instructions()[1].inputs(), builder.instructions()[0].outputs());
     }
 

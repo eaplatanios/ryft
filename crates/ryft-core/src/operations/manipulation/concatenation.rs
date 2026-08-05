@@ -35,7 +35,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, Shape};
+use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -48,13 +48,13 @@ pub const CONCATENATE_OPERATION_NAME: &str = "concatenate";
 /// The type parameter selects the operand contract without introducing a separate concatenation operation:
 ///
 ///   - `ConcatenateOperation<ArrayType>` accepts only the arrays being concatenated.
-///   - `ConcatenateOperation<ArrayProgramType>` additionally accepts one trailing first-class result extent.
+///   - `ConcatenateOperation<ArrayIrType>` additionally accepts one trailing first-class result extent.
 ///
 /// Both forms carry the same normalized axis and share all concatenation semantics. The mixed form also records
 /// whether its operand types prove that the explicit result extent equals the sum of the input extents. This derived
 /// bit lets pure, statically proven concatenations avoid an ordered runtime assertion without retaining a duplicate
 /// copy of their complete input signature. Construct mixed operations with
-/// [`ConcatenateOperation::<ArrayProgramType>::from_input_types`] whenever the complete signature is available. The
+/// [`ConcatenateOperation::<ArrayIrType>::from_input_types`] whenever the complete signature is available. The
 /// homogeneous-to-mixed [`From`] conversion remains a generic projection fallback and conservatively retains the
 /// assertion because a conversion of the axis-only payload cannot prove anything about its eventual operands. The
 /// proof bit intentionally participates in equality and hashing: otherwise operation-keyed deduplication could merge
@@ -66,7 +66,7 @@ pub struct ConcatenateOperation<T: Type> {
     axis: usize,
 
     /// Whether validating the explicit result extent can fail for the mixed operand signature used at construction.
-    /// This field is meaningful only when `T` is [`ArrayProgramType`] and is always `false` for [`ArrayType`].
+    /// This field is meaningful only when `T` is [`ArrayIrType`] and is always `false` for [`ArrayType`].
     requires_runtime_assertion: bool,
 
     /// Type universe that determines the operation's operand contract.
@@ -89,7 +89,7 @@ impl ConcatenateOperation<ArrayType> {
     }
 }
 
-impl ConcatenateOperation<ArrayProgramType> {
+impl ConcatenateOperation<ArrayIrType> {
     /// Creates a mixed [`ConcatenateOperation`] for the provided complete operand signature. `input_types` contains
     /// one or more leading arrays followed by the explicit result-extent dimension. The operation is pure exactly
     /// when those types prove the extent equality; otherwise it carries an ordered runtime assertion.
@@ -98,8 +98,8 @@ impl ConcatenateOperation<ArrayProgramType> {
     ///
     ///   - `axis`: Axis along which the leading array operands are joined.
     ///   - `input_types`: Complete mixed input signature, including the trailing result-extent dimension.
-    pub fn from_input_types<A: Into<Axis>>(axis: A, input_types: &[ArrayProgramType]) -> Result<Self, TypeError> {
-        let (axis, _, requires_runtime_assertion) = infer_array_program_concatenation(input_types, axis.into())?;
+    pub fn from_input_types<A: Into<Axis>>(axis: A, input_types: &[ArrayIrType]) -> Result<Self, TypeError> {
+        let (axis, _, requires_runtime_assertion) = infer_array_ir_concatenation(input_types, axis.into())?;
         Ok(Self { axis, requires_runtime_assertion, marker: PhantomData })
     }
 }
@@ -118,16 +118,16 @@ impl<T: Type> ConcatenateOperation<T> {
     }
 }
 
-impl From<ConcatenateOperation<ArrayType>> for ConcatenateOperation<ArrayProgramType> {
+impl From<ConcatenateOperation<ArrayType>> for ConcatenateOperation<ArrayIrType> {
     #[inline]
     fn from(operation: ConcatenateOperation<ArrayType>) -> Self {
         Self { axis: operation.axis, requires_runtime_assertion: true, marker: PhantomData }
     }
 }
 
-impl From<ConcatenateOperation<ArrayProgramType>> for ConcatenateOperation<ArrayType> {
+impl From<ConcatenateOperation<ArrayIrType>> for ConcatenateOperation<ArrayType> {
     #[inline]
-    fn from(operation: ConcatenateOperation<ArrayProgramType>) -> Self {
+    fn from(operation: ConcatenateOperation<ArrayIrType>) -> Self {
         Self { axis: operation.axis, requires_runtime_assertion: false, marker: PhantomData }
     }
 }
@@ -139,8 +139,8 @@ impl<T: Type> Display for ConcatenateOperation<T> {
     }
 }
 
-impl Operation for ConcatenateOperation<ArrayProgramType> {
-    type Type = ArrayProgramType;
+impl Operation for ConcatenateOperation<ArrayIrType> {
+    type Type = ArrayIrType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -149,12 +149,12 @@ impl Operation for ConcatenateOperation<ArrayProgramType> {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         let (_, output_type, requires_runtime_assertion) =
-            infer_array_program_concatenation(input_types, Axis::from(self.axis))?;
+            infer_array_ir_concatenation(input_types, Axis::from(self.axis))?;
         if !self.requires_runtime_assertion && requires_runtime_assertion {
             return Err(TypeError::invalid(format!(
                 "'{}' was constructed for an operand signature that proves its result extent, but the provided input \
@@ -215,9 +215,9 @@ impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> 
     }
 }
 
-impl<C> InterpretableOperation<C> for ConcatenateOperation<ArrayProgramType>
+impl<C> InterpretableOperation<C> for ConcatenateOperation<ArrayIrType>
 where
-    C: Domain<Type = ArrayProgramType>,
+    C: Domain<Type = ArrayIrType>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
 {
@@ -372,18 +372,18 @@ impl_differentiable_operation! {
     },
 }
 
-/// Forward-mode rule for mixed array-program concatenation. The trailing result-extent operand is an ordinary
+/// Forward-mode rule for mixed array IR concatenation. The trailing result-extent operand is an ordinary
 /// non-differentiated shape value. Static input cotangent shapes replay the mixed concatenate directly; dynamic input
 /// shapes are retained as explicit residuals so the transpose can slice the output cotangent at runtime offsets.
-impl<C> DifferentiableOperation<C> for ConcatenateOperation<ArrayProgramType>
+impl<C> DifferentiableOperation<C> for ConcatenateOperation<ArrayIrType>
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: From<ConcatenateOperation<ArrayProgramType>>
+    C::Operation: From<ConcatenateOperation<ArrayIrType>>
         + From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
+        + From<LinearCallOperation<ArrayIrType>>
         + OperationProjection<ArrayType, Projected: From<ZeroOperation<ArrayType>>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
@@ -402,11 +402,11 @@ where
         };
         if array_inputs.is_empty() {
             return match result_extent.primal().r#type().as_ref() {
-                ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
+                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
                     "'{CONCATENATE_OPERATION_NAME}' differentiation expects a trailing result-extent dimension",
                 ))
                 .into()),
-                ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
+                ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
                     "'{CONCATENATE_OPERATION_NAME}' differentiation expects at least one array before its result \
                      extent",
                 ))
@@ -521,13 +521,13 @@ where
     }
 }
 
-/// Direct transposition rule for mixed array-program concatenation. Static concatenated axes delegate to the
+/// Direct transposition rule for mixed array IR concatenation. Static concatenated axes delegate to the
 /// homogeneous array pullback, while the explicit result extent receives a structural-zero cotangent. Dynamic input
 /// extents require linearization so they can be retained as residuals by [`DifferentiableOperation::jvp`].
-impl<V, O> TransposableOperation<V, O> for ConcatenateOperation<ArrayProgramType>
+impl<V, O> TransposableOperation<V, O> for ConcatenateOperation<ArrayIrType>
 where
-    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayProgramType> + OperationProjection<ArrayType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
     <O as OperationProjection<ArrayType>>::Projected: From<ConcatenateOperation<ArrayType>>
         + TransposableOperation<
             <V as ValueProjection<ArrayType>>::Projected,
@@ -549,11 +549,11 @@ where
         };
         if array_inputs.is_empty() {
             return match result_extent.r#type().as_ref() {
-                ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
+                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
                     "'{CONCATENATE_OPERATION_NAME}' transpose expects a trailing result-extent dimension",
                 ))
                 .into()),
-                ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
+                ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
                     "'{CONCATENATE_OPERATION_NAME}' transpose expects at least one array before its result extent",
                 ))
                 .into()),
@@ -619,14 +619,13 @@ where
     }
 }
 
-/// Batching rule for mixed [`ConcatenateOperation<ArrayProgramType>`] instructions. The trailing result extent stays
+/// Batching rule for mixed [`ConcatenateOperation<ArrayIrType>`] instructions. The trailing result extent stays
 /// replicated, while array operands are aligned on one physical mapped axis before concatenation.
-impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching>
-    for ConcatenateOperation<ArrayProgramType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayProgramBatching> for ConcatenateOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
-    C::Operation: From<ConcatenateOperation<ArrayProgramType>>
+    C::Operation: From<ConcatenateOperation<ArrayIrType>>
         + From<BroadcastOperation>
         + From<DimensionOperation<DimensionValue>>
         + From<DimensionSizeOperation>
@@ -646,11 +645,11 @@ where
         };
         if inputs.is_empty() {
             return match result_extent.unbatched_type() {
-                ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
+                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
                     "'{CONCATENATE_OPERATION_NAME}' expects a trailing result-extent dimension",
                 ))
                 .into()),
-                ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
+                ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
                     "'{CONCATENATE_OPERATION_NAME}' expects at least one array before its result extent",
                 ))
                 .into()),
@@ -688,7 +687,7 @@ where
         let mut lifted_inputs = aligned_inputs.into_iter().map(ArrayProgramBatch::into_value).collect::<Vec<_>>();
         lifted_inputs.push(result_extent.value().clone());
         let input_types = lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(lifted_axis, &input_types)?;
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(lifted_axis, &input_types)?;
         context
             .parent()
             .bind(operation, Vec::new(), lifted_inputs.as_slice())?
@@ -828,8 +827,8 @@ where
 }
 
 /// Infers a mixed concatenation's normalized axis, output type, and runtime-assertion requirement.
-fn infer_array_program_concatenation(
-    input_types: &[ArrayProgramType],
+fn infer_array_ir_concatenation(
+    input_types: &[ArrayIrType],
     axis: Axis,
 ) -> Result<(usize, ArrayType, bool), TypeError> {
     let Some((result_extent, inputs)) = input_types.split_last() else {
@@ -840,11 +839,11 @@ fn infer_array_program_concatenation(
     };
     if inputs.is_empty() {
         return match result_extent {
-            ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
+            ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
                 "'{}' expects a trailing result-extent dimension",
                 CONCATENATE_OPERATION_NAME,
             ))),
-            ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
+            ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
                 "'{}' expects at least one array before its result extent",
                 CONCATENATE_OPERATION_NAME,
             ))),
@@ -1058,24 +1057,23 @@ mod tests {
     #[test]
     fn test_explicit_concatenate_operation() {
         let operation = ConcatenateOperation::new(-2, 2).unwrap();
-        let mixed_operation = ConcatenateOperation::<ArrayProgramType>::from(operation.clone());
+        let mixed_operation = ConcatenateOperation::<ArrayIrType>::from(operation.clone());
         assert_eq!(operation.axis(), 0);
         assert_eq!(mixed_operation.name(), CONCATENATE_OPERATION_NAME);
         assert_eq!(operation.to_string(), "concatenate [axis=0]");
         assert_eq!(mixed_operation.effects(), Effects::single(Effect::OrderedAssertion));
         assert_eq!(operation.effects(), Effects::PURE);
-        let infer = |input_types: &[ArrayProgramType]| mixed_operation.infer_output_types(input_types, &[]);
+        let infer = |input_types: &[ArrayIrType]| mixed_operation.infer_output_types(input_types, &[]);
 
         let first_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         let second_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let four = DimensionValue::constant(4).unwrap().r#type().clone();
         let static_input_types = [first_type.clone().into(), second_type.clone().into(), four.clone().into()];
-        let proven_operation =
-            ConcatenateOperation::<ArrayProgramType>::from_input_types(-2, &static_input_types).unwrap();
+        let proven_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(-2, &static_input_types).unwrap();
         assert_eq!(proven_operation.axis(), 0);
         assert_eq!(proven_operation.effects(), Effects::PURE);
         assert_ne!(proven_operation, mixed_operation);
-        let round_tripped = ConcatenateOperation::<ArrayProgramType>::from(ConcatenateOperation::<ArrayType>::from(
+        let round_tripped = ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::<ArrayType>::from(
             proven_operation.clone(),
         ));
         assert_eq!(round_tripped.effects(), Effects::single(Effect::OrderedAssertion));
@@ -1111,8 +1109,7 @@ mod tests {
         );
         let dynamic_input_types =
             [dynamic_left.clone().into(), dynamic_right.clone().into(), DimensionType::new(result.clone()).into()];
-        let dynamic_operation =
-            ConcatenateOperation::<ArrayProgramType>::from_input_types(0, &dynamic_input_types).unwrap();
+        let dynamic_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(0, &dynamic_input_types).unwrap();
         assert_eq!(dynamic_operation.effects(), Effects::single(Effect::OrderedAssertion));
         assert_eq!(
             dynamic_operation.infer_output_types(&dynamic_input_types, &[]),
@@ -1195,7 +1192,7 @@ mod tests {
             ))),
         );
         assert_eq!(
-            ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            ConcatenateOperation::<ArrayIrType>::from_input_types(
                 0,
                 &[
                     first_type.clone().into(),
@@ -1209,14 +1206,13 @@ mod tests {
             ))),
         );
         assert_eq!(
-            ConcatenateOperation::<ArrayProgramType>::from(ConcatenateOperation::new(1, 2).unwrap())
-                .infer_output_types(
-                    &[
-                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
-                        DimensionValue::constant(1).unwrap().r#type().clone().into(),
-                    ],
-                    &[],
-                ),
+            ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(1, 2).unwrap()).infer_output_types(
+                &[
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
+                    DimensionValue::constant(1).unwrap().r#type().clone().into(),
+                ],
+                &[],
+            ),
             Err(TypeError::invalid(format!(
                 "'{}' axis 1 is out of bounds for operands of rank 1",
                 CONCATENATE_OPERATION_NAME,

@@ -7,7 +7,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::backends::array_programs::ArrayProgramValue;
+use crate::backends::array_programs::ArrayIrValue;
 use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, require_equal_dimensions};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
@@ -40,7 +40,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, DataType, DimensionType};
+use crate::types::{ArrayIrType, ArrayType, DataType, DimensionType};
 
 // TODO(eaplatanios): Review this.
 
@@ -100,9 +100,9 @@ impl<F: Value<Type: ConditionTypeSemantics>> Display for ConditionOperation<F> {
 
 /// Type-family predicate semantics for [`ConditionOperation`].
 ///
-/// Conditions always branch on ordinary Boolean data. Scalar data and array programs therefore accept
+/// Conditions always branch on ordinary Boolean data. Programs over scalar data and arrays therefore accept
 /// [`DataType::Boolean`] and rank-zero Boolean [`ArrayType`] predicates respectively, while a composite
-/// [`ArrayProgramType`] accepts only its rank-zero Boolean array member. A first-class dimension describes an array
+/// [`ArrayIrType`] accepts only its rank-zero Boolean array member. A first-class dimension describes an array
 /// extent rather than Boolean data, even when its runtime representation is scalar.
 pub trait ConditionTypeSemantics: Type {
     /// Returns whether this type is a valid condition predicate.
@@ -123,7 +123,7 @@ impl ConditionTypeSemantics for DataType {
     }
 }
 
-impl ConditionTypeSemantics for ArrayProgramType {
+impl ConditionTypeSemantics for ArrayIrType {
     #[inline]
     fn is_condition_predicate(&self) -> bool {
         matches!(self, Self::Array(r#type) if r#type.is_condition_predicate())
@@ -996,19 +996,19 @@ where
         .collect()
 }
 
-/// Composite array-program batching rule for [`ConditionOperation`].
+/// Composite array IR batching rule for [`ConditionOperation`].
 ///
 /// A replicated predicate preserves one structural condition whose transformed branches explicitly thread the
 /// mapped extent. A mapped predicate replays both pure branches and selects their array outputs per item. First-class
 /// dimension outputs remain replicated, so the mapped-predicate path requires both branches to produce the same
 /// dimension value.
-impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ConditionOperation<ArrayProgramValue<A>>
+impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ConditionOperation<ArrayIrValue<A>>
 where
     A: Value<Type = ArrayType>,
     C: Context<
-            Type = ArrayProgramType,
+            Type = ArrayIrType,
             Operation: From<BroadcastOperation>
-                           + From<ConditionOperation<ArrayProgramValue<A>>>
+                           + From<ConditionOperation<ArrayIrValue<A>>>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>
@@ -1108,7 +1108,7 @@ where
             .into_iter()
             .zip(false_outputs)
             .map(|(true_output, false_output)| match true_output.unbatched_type() {
-                ArrayProgramType::Array(_) => {
+                ArrayIrType::Array(_) => {
                     <&ArrayType>::try_from(false_output.unbatched_type())?;
                     let mut selected = batch_projected_operation(
                         context,
@@ -1118,7 +1118,7 @@ where
                     check_count!("output", selected, 1, ProgramError);
                     Ok(selected.remove(0))
                 }
-                ArrayProgramType::Dimension(_) => {
+                ArrayIrType::Dimension(_) => {
                     true_output.validate_replicated_dimension()?;
                     false_output.validate_replicated_dimension()?;
                     require_equal_dimensions(context.parent(), true_output.value(), false_output.value())?;
@@ -1483,14 +1483,14 @@ mod tests {
     #[test]
     fn test_condition_composite_type_contract() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let dimension_type = ArrayProgramType::Dimension(DimensionType::new(extent.clone()));
+        let dimension_type = ArrayIrType::Dimension(DimensionType::new(extent.clone()));
         let array_type =
-            ArrayProgramType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])));
+            ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])));
         let branch_inputs = vec![dimension_type.clone(), array_type.clone()];
         let branch_outputs = vec![array_type.clone(), dimension_type.clone()];
         let branch_interface = RegionInterface::new(branch_inputs.clone(), branch_outputs.clone(), Effects::PURE);
-        let operation = ConditionOperation::<CaptureReference<ArrayProgramType>>::new();
-        let mut input_types = vec![ArrayProgramType::Array(ArrayType::scalar(DataType::Boolean))];
+        let operation = ConditionOperation::<CaptureReference<ArrayIrType>>::new();
+        let mut input_types = vec![ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))];
         input_types.extend(branch_inputs);
 
         assert_eq!(

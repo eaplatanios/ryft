@@ -15,7 +15,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::{ProjectedValue, Value};
-use crate::types::{ArrayProgramType, ArrayType, DataType, DimensionType};
+use crate::types::{ArrayIrType, ArrayType, DataType, DimensionType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -48,7 +48,7 @@ impl Display for ComparisonDirection {
 }
 
 /// [`Operation`] that performs pairwise comparisons in the `T` type universe. [`DataType`] and [`ArrayType`]
-/// instantiations provide homogeneous elementwise comparison, while [`ArrayProgramType`] provides the mixed
+/// instantiations provide homogeneous elementwise comparison, while [`ArrayIrType`] provides the mixed
 /// first-class-dimension comparison whose Boolean predicate is ordinary array data. Refer to [`Compare`] for the
 /// corresponding value-level semantics.
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -131,8 +131,8 @@ impl<T: Broadcastable + ElementType> Operation for CompareOperation<T> {
 
 /// Composite comparison contract: both operands are first-class dimensions and the predicate is ordinary rank-zero
 /// Boolean array data rather than another dimension value.
-impl Operation for CompareOperation<ArrayProgramType> {
-    type Type = ArrayProgramType;
+impl Operation for CompareOperation<ArrayIrType> {
+    type Type = ArrayIrType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -141,9 +141,9 @@ impl Operation for CompareOperation<ArrayProgramType> {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         input_types.iter().try_for_each(|r#type| <&DimensionType>::try_from(r#type).map(|_| ()))?;
@@ -197,10 +197,9 @@ crate::impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
 
 /// Batching rule for first-class dimension comparison. Dimension operands describe one shared array shape and must
 /// therefore remain replicated; their Boolean array result is replicated ordinary data.
-impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching>
-    for CompareOperation<ArrayProgramType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayProgramBatching> for CompareOperation<ArrayIrType>
 where
-    C::Operation: From<CompareOperation<ArrayProgramType>>,
+    C::Operation: From<CompareOperation<ArrayIrType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
         &self,
@@ -232,12 +231,12 @@ where
 /// keeps the predicate available to selection and control-flow operations without making the result a dimension:
 ///
 /// ```rust
-/// # use ryft_core::{ArrayProgramValue, Compare, DimensionValue, ProgramError};
+/// # use ryft_core::{ArrayIrValue, Compare, DimensionValue, ProgramError};
 /// # use ryft_core::backends::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
-/// let left = ArrayProgramValue::<Array>::Dimension(DimensionValue::constant(3)?);
-/// let right = ArrayProgramValue::<Array>::Dimension(DimensionValue::constant(5)?);
-/// let ArrayProgramValue::Array(result) = left.less_than(&right)? else {
+/// let left = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3)?);
+/// let right = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(5)?);
+/// let ArrayIrValue::Array(result) = left.less_than(&right)? else {
 ///     unreachable!("comparing dimensions always returns an array member");
 /// };
 /// assert_eq!(result, Array::scalar(true));
@@ -300,9 +299,9 @@ impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation<V::Type>>
     }
 }
 
-impl<V: Value<Type = ArrayProgramType>> Compare<V> for ProjectedValue<DimensionType, V>
+impl<V: Value<Type = ArrayIrType>> Compare<V> for ProjectedValue<DimensionType, V>
 where
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<CompareOperation<V::Type>>,
 {
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<V, ProgramError> {
@@ -318,7 +317,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::backends::scalars::Scalar;
@@ -338,8 +337,8 @@ mod tests {
     use crate::programs::values::ValueProjection;
     use crate::tracing::{Tracer, TracingContext};
     use crate::types::{
-        ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Layout,
-        Memory, Shape, StridedLayout,
+        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Layout, Memory,
+        Shape, StridedLayout,
     };
 
     use super::*;
@@ -374,9 +373,9 @@ mod tests {
         assert_eq!(left.greater_than(&right), Ok(Array::scalar(false)));
         assert_eq!(left.greater_than_or_equal(&right), Ok(Array::scalar(false)));
 
-        let left = ArrayProgramValue::<Array>::Dimension(left);
-        let right = ArrayProgramValue::<Array>::Dimension(right);
-        assert_eq!(left.less_than(&right), Ok(ArrayProgramValue::Array(Array::scalar(true))));
+        let left = ArrayIrValue::<Array>::Dimension(left);
+        let right = ArrayIrValue::<Array>::Dimension(right);
+        assert_eq!(left.less_than(&right), Ok(ArrayIrValue::Array(Array::scalar(true))));
     }
 
     #[test]
@@ -423,7 +422,7 @@ mod tests {
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
         let left = DimensionType::new(DimensionVariable::new("left", bounds));
         let right = DimensionType::new(DimensionVariable::new("right", bounds));
-        let operation = CompareOperation::<ArrayProgramType>::new(ComparisonDirection::LessThan);
+        let operation = CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThan);
         assert_eq!(
             operation.infer_output_types(&[left.clone().into(), right.clone().into()], &[]),
             Ok(vec![ArrayType::scalar(DataType::Boolean).into()]),
@@ -495,40 +494,40 @@ mod tests {
         let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
         let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
         check_operation_partial_evaluation!(
-            backend = (ArrayProgramValue<Array>, ArrayProgramOperation<Array>),
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
             operation = CompareOperation::new(ComparisonDirection::LessThan),
             cases = [
                 {
                     inputs = [
-                        (@known, ArrayProgramValue::Dimension(
+                        (@known, ArrayIrValue::Dimension(
                             DimensionValue::new(left_type.clone(), 3).unwrap()
                         )),
-                        (@known, ArrayProgramValue::Dimension(
+                        (@known, ArrayIrValue::Dimension(
                             DimensionValue::new(right_type.clone(), 5).unwrap()
                         )),
                     ],
                     outputs = [
-                        (@known, ArrayProgramValue::Array(Array::scalar(true))),
+                        (@known, ArrayIrValue::Array(Array::scalar(true))),
                     ],
                     residual_instructions = 0,
                 },
                 {
                     inputs = [
                         (@unknown(
-                            type = ArrayProgramType::Dimension(left_type.clone()),
-                            replay = ArrayProgramValue::Dimension(
+                            type = ArrayIrType::Dimension(left_type.clone()),
+                            replay = ArrayIrValue::Dimension(
                                 DimensionValue::new(left_type.clone(), 3).unwrap()
                             )
                         )),
                         (@unknown(
-                            type = ArrayProgramType::Dimension(right_type.clone()),
-                            replay = ArrayProgramValue::Dimension(
+                            type = ArrayIrType::Dimension(right_type.clone()),
+                            replay = ArrayIrValue::Dimension(
                                 DimensionValue::new(right_type.clone(), 5).unwrap()
                             )
                         )),
                     ],
                     outputs = [
-                        (@residual, ArrayProgramValue::Array(Array::scalar(true))),
+                        (@residual, ArrayIrValue::Array(Array::scalar(true))),
                     ],
                     residual_instructions = 1,
                 },
@@ -537,8 +536,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_array_program() {
-        type TestContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+    fn test_compare_array_ir() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
         let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
@@ -552,7 +551,7 @@ mod tests {
         let right = <Tracer<TestContext> as ValueProjection<DimensionType>>::into_projected(right).unwrap();
         let output = left.less_than(&right).unwrap();
         let output_id = output.atom_id().unwrap();
-        assert_eq!(output.r#type().as_ref(), &ArrayProgramType::Array(ArrayType::scalar(DataType::Boolean)));
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
 
         let builder = context.builder().borrow();
         let [instruction] = builder.instructions() else {
@@ -561,10 +560,10 @@ mod tests {
         assert_eq!(instruction.inputs(), &[left_id, right_id]);
         assert_eq!(instruction.outputs(), &[output_id]);
         assert!(instruction.regions().is_empty());
-        assert!(matches!(instruction.operation(), ArrayProgramOperation::Compare(_)));
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Compare(_)));
         let program = builder
             .clone()
-            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output_id],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -574,13 +573,13 @@ mod tests {
 
         assert_eq!(
             program.interpret(vec![
-                ArrayProgramValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap()),
-                ArrayProgramValue::Dimension(DimensionValue::new(right_type.clone(), 5).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 5).unwrap()),
             ]),
-            Ok(vec![ArrayProgramValue::Array(Array::scalar(true))]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(true))]),
         );
 
-        let mut relocated_builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let mut relocated_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let relocated_left =
             relocated_builder.add_input(DimensionType::new(DimensionVariable::new("relocated_left", bounds)).into());
         let relocated_right =
@@ -591,18 +590,18 @@ mod tests {
         };
         assert_eq!(relocated_instruction.inputs(), &[relocated_left, relocated_right]);
         assert_eq!(relocated_instruction.outputs(), relocated_outputs.as_slice());
-        assert!(matches!(relocated_instruction.operation(), ArrayProgramOperation::Compare(_)));
+        assert!(matches!(relocated_instruction.operation(), ArrayIrOperation::Compare(_)));
 
         let jvp = program.jvp().unwrap();
         assert_eq!(jvp.input_ids().len(), 2);
         assert_eq!(jvp.output_ids().len(), 1);
 
-        let operation = ArrayProgramOperation::<Array>::from(CompareOperation::new(ComparisonDirection::LessThan));
+        let operation = ArrayIrOperation::<Array>::from(CompareOperation::new(ComparisonDirection::LessThan));
         let mut transposition_context = TestContext::new();
         assert!(matches!(
-            <ArrayProgramOperation<Array> as TransposableOperation<
-                ArrayProgramValue<Array>,
-                ArrayProgramOperation<Array>,
+            <ArrayIrOperation<Array> as TransposableOperation<
+                ArrayIrValue<Array>,
+                ArrayIrOperation<Array>,
             >>::transpose(
                 &operation,
                 &mut transposition_context,

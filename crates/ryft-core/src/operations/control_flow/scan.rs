@@ -9,7 +9,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::axes::Axis;
-use crate::backends::array_programs::ArrayProgramValue;
+use crate::backends::array_programs::ArrayIrValue;
 use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, align_array_batch};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
@@ -45,7 +45,7 @@ use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRe
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
+use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -74,7 +74,7 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 ///
 /// The `length` is stored explicitly so that scans without stacked inputs (pure carry loops with stacked outputs)
 /// remain well-defined. Homogeneous [`ArrayType`] and [`DataType`] scans require a static length. Composite
-/// [`ArrayProgramType`] scans may instead use one dynamic dimension identity and then
+/// [`ArrayIrType`] scans may instead use one dynamic dimension identity and then
 /// consume its matching first-class dimension value as a trailing runtime operand; this is the scalar-SSA trip-count
 /// contract used by structurally batched scans.
 ///
@@ -333,7 +333,7 @@ pub(crate) fn scalar_scan_output_types(
 ///
 /// [`ArrayType`] can represent scanned values by prepending a static leading axis to each per-iteration value type,
 /// while [`DataType`] currently has no stack metadata and therefore supports only carry-only scalar scans. Both
-/// homogeneous families require a static trip count. [`ArrayProgramType`] permits arrays and first-class dimensions
+/// homogeneous families require a static trip count. [`ArrayIrType`] permits arrays and first-class dimensions
 /// in carry positions and a dynamic trip count backed by one trailing dimension operand, but requires every stacked
 /// input, output, and capture to be an array because the composite domain has no ragged or stacked dimension value.
 /// This trait keeps those type rules local to the scan operation so the operation dispatcher itself can be generic
@@ -563,10 +563,10 @@ impl<O: Operation<Type = DataType>> TemporalResidualOperation<DataType> for O {
 /// trailing array entry along the scan's shape-determined leading axis.
 fn composite_scan_boundary_types(
     role: &str,
-    body_types: &[ArrayProgramType],
+    body_types: &[ArrayIrType],
     carry_count: usize,
     length: &Dimension,
-) -> Result<Vec<ArrayProgramType>, TypeError> {
+) -> Result<Vec<ArrayIrType>, TypeError> {
     if carry_count > body_types.len() {
         return Err(TypeError::invalid(format!(
             "scan carry count {} exceeds the body {} count {}",
@@ -577,7 +577,7 @@ fn composite_scan_boundary_types(
     }
     let mut boundary_types = body_types[..carry_count].to_vec();
     for (index, r#type) in body_types[carry_count..].iter().enumerate() {
-        let ArrayProgramType::Array(r#type) = r#type else {
+        let ArrayIrType::Array(r#type) = r#type else {
             return Err(TypeError::invalid(format!(
                 "scan stacked body {} {} must be an array but got {}",
                 role,
@@ -585,12 +585,12 @@ fn composite_scan_boundary_types(
                 r#type,
             )));
         };
-        boundary_types.push(ArrayProgramType::Array(stacked_scan_type(r#type, length)));
+        boundary_types.push(ArrayIrType::Array(stacked_scan_type(r#type, length)));
     }
     Ok(boundary_types)
 }
 
-impl ScanTypeSemantics for ArrayProgramType {
+impl ScanTypeSemantics for ArrayIrType {
     fn rename_scan_length(length: &Dimension, renaming: &TypeIdentityRenaming<Self::Identity>) -> Dimension {
         length.rename_type_identities(renaming)
     }
@@ -727,7 +727,7 @@ impl ScanTypeSemantics for ArrayProgramType {
 /// Validates the scan contract over the single attached body region interface (the `["body"]` slot) and returns
 /// it: the body's first `carry_count` input and output types must agree, every body type must satisfy the type
 /// family's scan rules (fully static for [`ArrayType`], carry-only for [`DataType`], and mixed carries with array-only
-/// stacks for [`ArrayProgramType`]), and the interface is what the scan's boundary types derive from.
+/// stacks for [`ArrayIrType`]), and the interface is what the scan's boundary types derive from.
 fn validated_scan_interface<'i, T: ScanTypeSemantics>(
     region_interfaces: &'i [RegionInterface<T>],
     carry_count: usize,
@@ -2058,21 +2058,21 @@ pub(crate) fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
     }
 }
 
-/// Composite array-program batching rule for [`ScanOperation`].
+/// Composite array IR batching rule for [`ScanOperation`].
 ///
 /// The rule carries the mapped extent as leading replicated state in the transformed scan. Array carries use the
 /// same monotonic mapped-axis fixed point as homogeneous scans, while first-class dimension carries remain
 /// replicated. Stacked inputs and outputs are necessarily arrays because one shared dimension value cannot represent
 /// a different stacked extent for each batch item.
-impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ScanOperation<ArrayProgramValue<A>>
+impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ScanOperation<ArrayIrValue<A>>
 where
     A: Value<Type = ArrayType>,
     C: Context<
-            Type = ArrayProgramType,
+            Type = ArrayIrType,
             Operation: From<BroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + From<ScanOperation<ArrayProgramValue<A>>>
+                           + From<ScanOperation<ArrayIrValue<A>>>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -2105,11 +2105,11 @@ where
             .iter()
             .cloned()
             .map(|input| match input.unbatched_type() {
-                ArrayProgramType::Array(_) if !input.batch_axis().is_replicated() => {
+                ArrayIrType::Array(_) if !input.batch_axis().is_replicated() => {
                     align_array_batch(context, input, Axis::from(0))
                 }
-                ArrayProgramType::Array(_) => Ok(input),
-                ArrayProgramType::Dimension(_) => {
+                ArrayIrType::Array(_) => Ok(input),
+                ArrayIrType::Dimension(_) => {
                     input.validate_replicated_dimension()?;
                     Ok(input)
                 }
@@ -2147,7 +2147,7 @@ where
                 carry_axes.iter_mut().zip(candidate.output_axes().iter()).enumerate()
             {
                 if carry_axis.is_replicated() && !output_axis.is_replicated() {
-                    if matches!(scan_inputs[index].unbatched_type(), ArrayProgramType::Dimension(_)) {
+                    if matches!(scan_inputs[index].unbatched_type(), ArrayIrType::Dimension(_)) {
                         return Err(BatchingError::MappedDimension {
                             r#type: Box::new(<&DimensionType>::try_from(scan_inputs[index].unbatched_type())?.clone()),
                             axis: *output_axis,
@@ -2188,7 +2188,7 @@ where
             }
         }
 
-        let batched_scan = ScanOperation::<ArrayProgramValue<A>>::new(carry_count + 1, self.length())
+        let batched_scan = ScanOperation::<ArrayIrValue<A>>::new(carry_count + 1, self.length())
             .with_reverse(self.reverse())
             .with_unroll(self.unroll())?
             .with_captures(self.captures().to_vec());
@@ -2512,11 +2512,11 @@ where
     }
 }
 
-impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayProgramType
+impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayIrType
 where
-    V: Value<Type = ArrayProgramType>,
-    F: Value<Type = ArrayProgramType>,
-    Target: Operation<Type = ArrayProgramType> + ZeroOperationProvider<ArrayProgramType> + From<ScanOperation<F>>,
+    V: Value<Type = ArrayIrType>,
+    F: Value<Type = ArrayIrType>,
+    Target: Operation<Type = ArrayIrType> + ZeroOperationProvider<ArrayIrType> + From<ScanOperation<F>>,
 {
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
@@ -2905,7 +2905,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::CaptureReference;
@@ -2977,19 +2977,17 @@ mod tests {
     #[test]
     fn test_scan_composite_type_contract() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let dimension_type = ArrayProgramType::Dimension(DimensionType::new(extent.clone()));
-        let slice_type = ArrayProgramType::Array(ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(extent.clone())]),
-        ));
-        let stacked_type = ArrayProgramType::Array(ArrayType::new(
+        let dimension_type = ArrayIrType::Dimension(DimensionType::new(extent.clone()));
+        let slice_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())])));
+        let stacked_type = ArrayIrType::Array(ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(extent)]),
         ));
         let body_input_types = vec![dimension_type.clone(), slice_type.clone()];
         let body_output_types = vec![dimension_type.clone(), slice_type];
         let body_interface = RegionInterface::new(body_input_types, body_output_types, Effects::PURE);
-        let operation = ScanOperation::<CaptureReference<ArrayProgramType>>::new(1, 3);
+        let operation = ScanOperation::<CaptureReference<ArrayIrType>>::new(1, 3);
         let input_types = vec![dimension_type.clone(), stacked_type.clone()];
 
         assert_eq!(
@@ -3001,7 +2999,7 @@ mod tests {
             Ok(vec![dimension_type.clone(), stacked_type]),
         );
 
-        let captured_dimension = ScanOperation::<CaptureReference<ArrayProgramType>>::new(1, 3)
+        let captured_dimension = ScanOperation::<CaptureReference<ArrayIrType>>::new(1, 3)
             .with_captures(vec![CaptureReference::new(0, dimension_type.clone())]);
         assert_eq!(
             captured_dimension.infer_output_types(input_types.as_slice(), std::slice::from_ref(&body_interface)),
@@ -3016,7 +3014,7 @@ mod tests {
             Effects::PURE,
         );
         assert_eq!(
-            ScanOperation::<CaptureReference<ArrayProgramType>>::new(1, 3)
+            ScanOperation::<CaptureReference<ArrayIrType>>::new(1, 3)
                 .infer_output_types(&[dimension_type.clone(), dimension_type.clone()], &[invalid_body_interface]),
             Err(TypeError::invalid(
                 "scan stacked body input 1 must be an array but got dimension<extent ∈ [1, 8)>".to_string(),
@@ -3990,13 +3988,12 @@ mod tests {
 
     #[test]
     fn test_scan_thread_known_carries_projects_out_dynamic_zero_space_inputs() {
-        type CompositeValue = ArrayProgramValue<Array>;
-        type CompositeOperation = ArrayProgramOperation<Array>;
+        type CompositeValue = ArrayIrValue<Array>;
+        type CompositeOperation = ArrayIrOperation<Array>;
 
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let key_type =
-            ArrayProgramType::Array(ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)])));
-        let accumulator_type = ArrayProgramType::Array(ArrayType::scalar(DataType::F64));
+        let key_type = ArrayIrType::Array(ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)])));
+        let accumulator_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let mut builder = ProgramBuilder::<CompositeValue, CompositeOperation>::new();
         let _key_cotangent = builder.add_input(key_type.cotangent());
         let accumulator_cotangent = builder.add_input(accumulator_type.cotangent());

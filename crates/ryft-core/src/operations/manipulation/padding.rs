@@ -5,7 +5,7 @@ use crate::axes::Axis;
 use crate::backends::array_programs::batching::{
     ArrayProgramBatch, ArrayProgramBatching, align_array_batch, array_dimension,
 };
-use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue, LinearResiduals};
+use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue, LinearResiduals};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -37,7 +37,7 @@ use crate::programs::values::{Value, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, Shape};
+use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -51,9 +51,10 @@ pub const PAD_OPERATION_NAME: &str = "pad";
 ///
 /// The type parameter selects the operand contract without introducing a separate dynamic-padding operation:
 ///
-///   - `PadOperation<ArrayType>` accepts the input and padding-value arrays. It is used in homogeneous array programs
+///   - `PadOperation<ArrayType>` accepts the input and padding-value arrays. It is used in programs over homogeneous
+///     arrays
 ///     whose output extents are fully described by the inferred array type.
-///   - `PadOperation<ArrayProgramType>` additionally accepts one first-class dimension operand for each dynamic output
+///   - `PadOperation<ArrayIrType>` additionally accepts one first-class dimension operand for each dynamic output
 ///     axis. It is used in mixed array/dimension programs that must carry those logical result extents explicitly.
 ///
 /// The padding amounts remain static configuration in both forms. This distinction is therefore unrelated to
@@ -126,7 +127,7 @@ impl<T: Type> PadOperation<T> {
     }
 }
 
-impl From<PadOperation<ArrayType>> for PadOperation<ArrayProgramType> {
+impl From<PadOperation<ArrayType>> for PadOperation<ArrayIrType> {
     fn from(operation: PadOperation<ArrayType>) -> Self {
         Self {
             edge_padding_low: operation.edge_padding_low,
@@ -137,8 +138,8 @@ impl From<PadOperation<ArrayType>> for PadOperation<ArrayProgramType> {
     }
 }
 
-impl From<PadOperation<ArrayProgramType>> for PadOperation<ArrayType> {
-    fn from(operation: PadOperation<ArrayProgramType>) -> Self {
+impl From<PadOperation<ArrayIrType>> for PadOperation<ArrayType> {
+    fn from(operation: PadOperation<ArrayIrType>) -> Self {
         Self {
             edge_padding_low: operation.edge_padding_low,
             edge_padding_high: operation.edge_padding_high,
@@ -185,8 +186,8 @@ impl Operation for PadOperation<ArrayType> {
     }
 }
 
-impl Operation for PadOperation<ArrayProgramType> {
-    type Type = ArrayProgramType;
+impl Operation for PadOperation<ArrayIrType> {
+    type Type = ArrayIrType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -195,9 +196,9 @@ impl Operation for PadOperation<ArrayProgramType> {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         if input_types.len() < 2 {
             return Err(TypeError::invalid(format!("expected at least 2 inputs but got {}", input_types.len())));
@@ -366,26 +367,25 @@ impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadO
 }
 
 impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>
-    for PadOperation<ArrayProgramType>
+    InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>> for PadOperation<ArrayIrType>
 {
-    fn interpret<D: InterpretationDriver<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>>(
+    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
         &self,
-        _context: &EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>,
+        _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
         driver: &D,
-        inputs: &[ArrayProgramValue<A>],
-    ) -> Result<Vec<ArrayProgramValue<A>>, ProgramError> {
+        inputs: &[ArrayIrValue<A>],
+    ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
         if driver.region_count() != 0 {
             return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
         }
         let expected_input_count = 2 + self.edge_padding_low.len();
         check_count!("input", inputs, expected_input_count, ProgramError);
-        let input = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
-        let padding_value = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(&inputs[1])?;
+        let input = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
+        let padding_value = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[1])?;
         let output =
             input.pad(padding_value, self.edge_padding_low(), self.edge_padding_high(), self.interior_padding())?;
         for (axis, extent) in inputs[2..].iter().enumerate() {
-            let expected_extent = <ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected(extent)?.extent();
+            let expected_extent = <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(extent)?.extent();
             let actual_extent = output.dimension_size(axis)?;
             if actual_extent != expected_extent {
                 return Err(ProgramError::InvalidArgument {
@@ -396,7 +396,7 @@ impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
                 });
             }
         }
-        Ok(vec![ArrayProgramValue::Array(output)])
+        Ok(vec![ArrayIrValue::Array(output)])
     }
 }
 
@@ -590,15 +590,15 @@ where
 /// Forward-mode rule for mixed pad. The explicit output extents are ordinary non-differentiated shape values. Exact
 /// operand geometry replays the mixed pad directly; dynamic geometry retains the exact operand shape and output
 /// extents so the linear transpose can reconstruct both the operand and padding-value cotangents.
-impl<C> DifferentiableOperation<C> for PadOperation<ArrayProgramType>
+impl<C> DifferentiableOperation<C> for PadOperation<ArrayIrType>
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
-        + From<PadOperation<ArrayProgramType>>
+        + From<LinearCallOperation<ArrayIrType>>
+        + From<PadOperation<ArrayIrType>>
         + From<ZeroOperation<ArrayType>>
         + OperationProjection<
             ArrayType,
@@ -771,7 +771,7 @@ where
                             .remove(0);
                         let mut inverse_inputs = vec![output_cotangent.clone(), zero];
                         inverse_inputs.extend(dilated_extents);
-                        let inverse_operation = PadOperation::<ArrayProgramType>::from(PadOperation::<ArrayType>::new(
+                        let inverse_operation = PadOperation::<ArrayIrType>::from(PadOperation::<ArrayType>::new(
                             inverse_low,
                             inverse_high,
                             vec![0; transpose_operand_type.rank()],
@@ -891,10 +891,10 @@ where
 /// Direct transposition rule for mixed pad. Static operand and output geometry delegate to the homogeneous array
 /// pullback, while every explicit output extent receives a structural-zero cotangent. Dynamic geometry requires
 /// linearization so [`DifferentiableOperation::jvp`] can retain the exact primal extents as residuals.
-impl<V, O> TransposableOperation<V, O> for PadOperation<ArrayProgramType>
+impl<V, O> TransposableOperation<V, O> for PadOperation<ArrayIrType>
 where
-    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayProgramType> + OperationProjection<ArrayType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
     <O as OperationProjection<ArrayType>>::Projected: From<PadOperation<ArrayType>>
         + TransposableOperation<
             <V as ValueProjection<ArrayType>>::Projected,
@@ -1004,10 +1004,10 @@ where
     }
 }
 
-/// Batching rule for mixed [`PadOperation<ArrayProgramType>`] instructions. Explicit result extents remain
+/// Batching rule for mixed [`PadOperation<ArrayIrType>`] instructions. Explicit result extents remain
 /// replicated. When the scalar padding value varies across the batch, the rule pads with zero and uses a padded mask
 /// to select the broadcast per-item padding value without changing `pad`'s scalar operand contract.
-impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching> for PadOperation<ArrayProgramType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayProgramBatching> for PadOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
@@ -1520,7 +1520,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::batching::{BatchAxis, BatchingContext};
@@ -1536,7 +1536,7 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::{
-        ArrayProgramType, DataType, DimensionBounds, DimensionType, DimensionVariable, Layout, Memory, StridedLayout,
+        ArrayIrType, DataType, DimensionBounds, DimensionType, DimensionVariable, Layout, Memory, StridedLayout,
     };
 
     use super::*;
@@ -1608,7 +1608,7 @@ mod tests {
         );
         assert_eq!(input_type.pad(&padding_value_type, &[1], &[2], &[1]), Ok(output_type.clone()));
         let output_extent = DimensionValue::constant(8).unwrap();
-        let composite_operation = PadOperation::<ArrayProgramType>::from(operation.clone());
+        let composite_operation = PadOperation::<ArrayIrType>::from(operation.clone());
         assert_eq!(
             composite_operation.infer_output_types(
                 &[input_type.clone().into(), padding_value_type.clone().into(), output_extent.r#type().clone().into(),],
@@ -1653,7 +1653,7 @@ mod tests {
         let dynamic_output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(output_variable.clone())]));
         let dynamic_operation =
-            PadOperation::<ArrayProgramType>::from(PadOperation::new(vec![1], vec![1], vec![0]).unwrap());
+            PadOperation::<ArrayIrType>::from(PadOperation::new(vec![1], vec![1], vec![0]).unwrap());
         assert_eq!(
             dynamic_operation.infer_output_types(
                 &[
@@ -1688,7 +1688,7 @@ mod tests {
             ))]),
         );
         assert_eq!(
-            PadOperation::<ArrayProgramType>::from(PadOperation::new(vec![-1], vec![0], vec![0]).unwrap())
+            PadOperation::<ArrayIrType>::from(PadOperation::new(vec![-1], vec![0], vec![0]).unwrap())
                 .infer_output_types(
                     &[
                         zero_bounded_input.into(),
@@ -1771,22 +1771,18 @@ mod tests {
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].to_f64s(), vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]);
-        let output =
-            InterpretableOperation::<EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>>::interpret(
-                &composite_operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[
-                    ArrayProgramValue::Array(Array::vector(vec![1.0, 2.0, 3.0])),
-                    ArrayProgramValue::Array(Array::scalar(9.0)),
-                    ArrayProgramValue::Dimension(output_extent),
-                ],
-            )
-            .unwrap();
-        assert_eq!(
-            output,
-            vec![ArrayProgramValue::Array(Array::vector(vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0,]))],
-        );
+        let output = InterpretableOperation::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::interpret(
+            &composite_operation,
+            &EagerContext::new(),
+            &EmptyRegionDriver,
+            &[
+                ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0])),
+                ArrayIrValue::Array(Array::scalar(9.0)),
+                ArrayIrValue::Dimension(output_extent),
+            ],
+        )
+        .unwrap();
+        assert_eq!(output, vec![ArrayIrValue::Array(Array::vector(vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0,]))],);
 
         // Empty input axes hold only the edge padding (the `d == 0` case skips interior padding entirely) and
         // rank-0 inputs pass through unchanged.
@@ -2048,7 +2044,7 @@ mod tests {
         );
 
         // The homogeneous contract cannot manufacture a fresh result identity for a bounded-dynamic operand. The
-        // canonical array-program contract supplies that result extent explicitly; keep this rejection to prevent
+        // canonical array IR contract supplies that result extent explicitly; keep this rejection to prevent
         // callers from falling back to implicit identity recovery.
         let dynamic_input_type = ArrayType::new(
             DataType::F64,

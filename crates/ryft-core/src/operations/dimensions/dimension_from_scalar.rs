@@ -21,7 +21,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValue, Value};
-use crate::types::{ArrayProgramType, ArrayType, DimensionType, DimensionVariable};
+use crate::types::{ArrayIrType, ArrayType, DimensionType, DimensionVariable};
 
 /// Canonical operation name for [`DimensionFromScalarOperation`].
 pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
@@ -40,15 +40,15 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 ///
 /// ```rust
 /// # use ryft_core::{
-/// #     ArrayProgramValue, DimensionBounds, DimensionFromScalar, DimensionValue, DimensionVariable, Mul,
+/// #     ArrayIrValue, DimensionBounds, DimensionFromScalar, DimensionValue, DimensionVariable, Mul,
 /// #     ProgramError,
 /// # };
 /// # use ryft_core::backends::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
-/// let scalar = ArrayProgramValue::Array(Array::scalar(5_i32));
+/// let scalar = ArrayIrValue::Array(Array::scalar(5_i32));
 /// let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
 /// let dimension = scalar.to_dimension(batch)?;
-/// let ArrayProgramValue::Dimension(dimension) = dimension else {
+/// let ArrayIrValue::Dimension(dimension) = dimension else {
 ///     unreachable!("dimension_from_scalar always returns a dimension member");
 /// };
 /// assert_eq!(dimension.extent(), 5);
@@ -82,9 +82,9 @@ pub trait DimensionFromScalar<Output = Self>: Typed + Sized {
     fn to_dimension(&self, result: DimensionVariable) -> Result<Output, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayProgramType>> DimensionFromScalar<V> for V
+impl<V: Value<Type = ArrayIrType>> DimensionFromScalar<V> for V
 where
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<DimensionFromScalarOperation>,
 {
     fn to_dimension(&self, result: DimensionVariable) -> Result<V, ProgramError> {
@@ -95,9 +95,9 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayProgramType>> DimensionFromScalar<V> for ProjectedValue<ArrayType, V>
+impl<V: Value<Type = ArrayIrType>> DimensionFromScalar<V> for ProjectedValue<ArrayType, V>
 where
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<DimensionFromScalarOperation>,
 {
     fn to_dimension(&self, result: DimensionVariable) -> Result<V, ProgramError> {
@@ -151,7 +151,7 @@ impl Display for DimensionFromScalarOperation {
 }
 
 impl Operation for DimensionFromScalarOperation {
-    type Type = ArrayProgramType;
+    type Type = ArrayIrType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -160,9 +160,9 @@ impl Operation for DimensionFromScalarOperation {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let input_type = <&ArrayType>::try_from(&input_types[0])?;
@@ -186,7 +186,7 @@ impl Operation for DimensionFromScalarOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayProgramType, Value: DimensionFromScalar<C::Value>>> InterpretableOperation<C>
+impl<C: Domain<Type = ArrayIrType, Value: DimensionFromScalar<C::Value>>> InterpretableOperation<C>
     for DimensionFromScalarOperation
 {
     fn interpret<D: InterpretationDriver<C>>(
@@ -205,14 +205,14 @@ impl<C: Domain<Type = ArrayProgramType, Value: DimensionFromScalar<C::Value>>> I
     }
 }
 
-impl<C: Context<Type = ArrayProgramType, Operation: From<DimensionFromScalarOperation>>>
-    PartiallyEvaluatableOperation<C> for DimensionFromScalarOperation
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>> PartiallyEvaluatableOperation<C>
+    for DimensionFromScalarOperation
 {
 }
 
 /// Batching rejects mapped scalar inputs because converting one scalar per batch item would produce a ragged
 /// collection of first-class dimensions. A replicated scalar is converted once and remains replicated.
-impl<C: Context<Type = ArrayProgramType, Operation: From<DimensionFromScalarOperation>>>
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>>
     BatchableOperation<C, ArrayProgramBatching> for DimensionFromScalarOperation
 {
     fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
@@ -247,7 +247,7 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
     use crate::contexts::{Context, EagerContext, StagingContext};
@@ -268,7 +268,7 @@ mod tests {
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
         let variable = DimensionVariable::new("extent", bounds);
         let operation = DimensionFromScalarOperation::new(variable.clone());
-        let scalar_type = ArrayProgramType::Array(ArrayType::scalar(DataType::I32));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
 
         assert_eq!(operation.name(), DIMENSION_FROM_SCALAR_OPERATION_NAME);
         assert_eq!(operation.result_type(), &DimensionType::new(variable.clone()));
@@ -373,29 +373,29 @@ mod tests {
             );
         }
 
-        let context = EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(
-            context.bind(operation.clone(), Vec::new(), &[ArrayProgramValue::Array(Array::scalar(7_i32))],),
-            Ok(vec![ArrayProgramValue::Dimension(DimensionValue::new(operation.result_type().clone(), 7).unwrap(),)]),
+            context.bind(operation.clone(), Vec::new(), &[ArrayIrValue::Array(Array::scalar(7_i32))],),
+            Ok(vec![ArrayIrValue::Dimension(DimensionValue::new(operation.result_type().clone(), 7).unwrap(),)]),
         );
         assert_eq!(
             context.bind(
                 operation.clone(),
                 Vec::new(),
-                &[ArrayProgramValue::Dimension(DimensionValue::new(operation.result_type().clone(), 7).unwrap(),)],
+                &[ArrayIrValue::Dimension(DimensionValue::new(operation.result_type().clone(), 7).unwrap(),)],
             ),
             Err(TypeError::invalid("expected array type but got dimension type").into()),
         );
         check_operation_partial_evaluation!(
-            backend = (ArrayProgramValue<Array>, ArrayProgramOperation<Array>),
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
             operation = operation.clone(),
             cases = [
                 {
                     inputs = [
-                        (@known, ArrayProgramValue::Array(Array::scalar(7_i32))),
+                        (@known, ArrayIrValue::Array(Array::scalar(7_i32))),
                     ],
                     outputs = [
-                        (@known, ArrayProgramValue::Dimension(
+                        (@known, ArrayIrValue::Dimension(
                             DimensionValue::new(operation.result_type().clone(), 7).unwrap()
                         )),
                     ],
@@ -405,11 +405,11 @@ mod tests {
                     inputs = [
                         (@unknown(
                             type = scalar_type.clone(),
-                            replay = ArrayProgramValue::Array(Array::scalar(7_i32))
+                            replay = ArrayIrValue::Array(Array::scalar(7_i32))
                         )),
                     ],
                     outputs = [
-                        (@residual, ArrayProgramValue::Dimension(
+                        (@residual, ArrayIrValue::Dimension(
                             DimensionValue::new(operation.result_type().clone(), 7).unwrap()
                         )),
                     ],
@@ -418,7 +418,7 @@ mod tests {
             ],
         );
 
-        type TestContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let context = TestContext::new();
         let input = context.input(scalar_type);
         let input_id = input.atom_id().unwrap();
@@ -431,12 +431,12 @@ mod tests {
         assert_eq!(instruction.inputs(), &[input_id]);
         assert_eq!(instruction.outputs(), &[output_id]);
         assert!(instruction.regions().is_empty());
-        assert!(matches!(instruction.operation(), ArrayProgramOperation::DimensionFromScalar(_)));
-        assert_eq!(output.r#type().as_ref(), &ArrayProgramType::Dimension(DimensionType::new(variable.clone())));
+        assert!(matches!(instruction.operation(), ArrayIrOperation::DimensionFromScalar(_)));
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Dimension(DimensionType::new(variable.clone())));
 
         let program = builder
             .clone()
-            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output_id],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -445,7 +445,7 @@ mod tests {
         drop(builder);
         assert_eq!(program.type_identity_signature().internal_identities(), std::slice::from_ref(&variable));
 
-        let mut relocated_builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let mut relocated_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let relocated_input = relocated_builder.add_input(ArrayType::scalar(DataType::I32).into());
         let relocated_outputs = relocated_builder.splice_program(&program, &[relocated_input]).unwrap();
         let [relocated_instruction] = relocated_builder.instructions() else {
@@ -453,7 +453,7 @@ mod tests {
         };
         assert_eq!(relocated_instruction.inputs(), &[relocated_input]);
         assert_eq!(relocated_instruction.outputs(), relocated_outputs.as_slice());
-        let ArrayProgramOperation::DimensionFromScalar(relocated_operation) = relocated_instruction.operation() else {
+        let ArrayIrOperation::DimensionFromScalar(relocated_operation) = relocated_instruction.operation() else {
             panic!("expected a relocated dimension-from-scalar operation");
         };
         assert_ne!(relocated_operation.result_type().variable(), &variable);
@@ -466,13 +466,10 @@ mod tests {
             <crate::Tracer<TestContext> as crate::ValueProjection<ArrayType>>::into_projected(projected_input).unwrap();
         let projected_variable = DimensionVariable::new("projected", bounds);
         let projected_output = projected_input.to_dimension(projected_variable.clone()).unwrap();
-        assert_eq!(
-            projected_output.r#type().as_ref(),
-            &ArrayProgramType::Dimension(DimensionType::new(projected_variable)),
-        );
+        assert_eq!(projected_output.r#type().as_ref(), &ArrayIrType::Dimension(DimensionType::new(projected_variable)),);
         assert!(matches!(
             projected_context.builder().borrow().instructions(),
-            [instruction] if matches!(instruction.operation(), ArrayProgramOperation::DimensionFromScalar(_)),
+            [instruction] if matches!(instruction.operation(), ArrayIrOperation::DimensionFromScalar(_)),
         ));
 
         let jvp = program.jvp().unwrap();
@@ -482,8 +479,8 @@ mod tests {
         let mut transposition_context = TestContext::new();
         assert!(matches!(
             <DimensionFromScalarOperation as TransposableOperation<
-                ArrayProgramValue<Array>,
-                ArrayProgramOperation<Array>,
+                ArrayIrValue<Array>,
+                ArrayIrOperation<Array>,
             >>::transpose(
                 &operation,
                 &mut transposition_context,

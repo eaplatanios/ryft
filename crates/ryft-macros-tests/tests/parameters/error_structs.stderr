@@ -47,9 +47,9 @@ error[E0283]: type annotations needed
    = note: cannot satisfy `_: ryft::Parameter`
    = help: the following types implement trait `ryft::Parameter`:
              ArrayBatch<V>
-             ArrayProgramBatch<V>
              ArrayIrType
              ArrayIrValue<A>
+             ArrayProgramBatch<V>
              ArrayType
              Atom<V>
              AtomId

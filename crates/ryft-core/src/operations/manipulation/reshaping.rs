@@ -32,7 +32,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, Dimension, DimensionType, Shape};
+use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -104,7 +104,7 @@ impl Display for ReshapeOperation {
 }
 
 impl Operation for ReshapeOperation {
-    type Type = ArrayProgramType;
+    type Type = ArrayIrType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -113,9 +113,9 @@ impl Operation for ReshapeOperation {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         let Some((input_type, output_extent_types)) = input_types.split_first() else {
             return Err(TypeError::invalid("'reshape' expects an array followed by its output extents"));
@@ -149,7 +149,7 @@ impl Operation for ReshapeOperation {
 
 impl<C> InterpretableOperation<C> for ReshapeOperation
 where
-    C: Domain<Type = ArrayProgramType>,
+    C: Domain<Type = ArrayIrType>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Reshape>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
 {
@@ -185,7 +185,7 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayProgramType, Operation: From<ReshapeOperation>>> PartiallyEvaluatableOperation<C>
+impl<C: Context<Type = ArrayIrType, Operation: From<ReshapeOperation>>> PartiallyEvaluatableOperation<C>
     for ReshapeOperation
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
@@ -217,7 +217,7 @@ impl<C: Context<Type = ArrayProgramType, Operation: From<ReshapeOperation>>> Par
 /// sharding before the mixed operation is replayed.
 impl<C> BatchableOperation<C, ArrayProgramBatching> for ReshapeOperation
 where
-    C: Context<Type = ArrayProgramType, Operation: From<ReshapeOperation>>,
+    C: Context<Type = ArrayIrType, Operation: From<ReshapeOperation>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
@@ -855,9 +855,9 @@ impl_differentiable_operation! {
 /// so the linear transpose can reconstruct the inverse reshape from first-class dimension residuals.
 impl<C> DifferentiableOperation<C> for ReshapeOperation
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Operation: From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
+        + From<LinearCallOperation<ArrayIrType>>
         + From<ReshapeOperation>
         + OperationProjection<ArrayType, Projected: From<TransposeOperation>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
@@ -986,8 +986,8 @@ where
 /// linearization so [`DifferentiableOperation::jvp`] can retain its exact extents as residuals.
 impl<V, O> TransposableOperation<V, O> for ReshapeOperation
 where
-    V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayProgramType> + OperationProjection<ArrayType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
     <O as OperationProjection<ArrayType>>::Projected: From<LegacyReshapeOperation>
         + From<TransposeOperation>
         + TransposableOperation<

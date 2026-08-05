@@ -49,7 +49,7 @@ use crate::programs::values::{ProjectedValue, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
+use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -815,11 +815,11 @@ fn all_gather_output_type(
 /// axis.
 fn infer_explicit_shape_changing_collective_output_type(
     operation_name: &'static str,
-    input_types: &[ArrayProgramType],
+    input_types: &[ArrayIrType],
     base_output_type: ArrayType,
     unchanged_input_axes: &[Option<usize>],
     validate_exact_extents: impl FnOnce(&ArrayType, &[Dimension]) -> Result<(), TypeError>,
-) -> Result<Vec<ArrayProgramType>, TypeError> {
+) -> Result<Vec<ArrayIrType>, TypeError> {
     let expected = 1 + base_output_type.rank();
     check_count!("input", input_types, expected, TypeError);
     let input_type = <&ArrayType>::try_from(&input_types[0])?;
@@ -860,8 +860,8 @@ fn infer_explicit_shape_changing_collective_output_type(
 /// Infers the composite all-gather contract.
 pub(crate) fn infer_explicit_all_gather_output_types(
     operation: &AllGatherOperation,
-    input_types: &[ArrayProgramType],
-) -> Result<Vec<ArrayProgramType>, TypeError> {
+    input_types: &[ArrayIrType],
+) -> Result<Vec<ArrayIrType>, TypeError> {
     let effective_axis_size = operation.effective_axis_size()?;
     let Some(input_type) = input_types.first() else {
         return Err(TypeError::invalid("'all_gather' expects an array followed by its output extents"));
@@ -946,8 +946,8 @@ pub(crate) fn infer_explicit_all_gather_output_types(
 /// Infers the composite sum-scatter contract.
 pub(crate) fn infer_explicit_psum_scatter_output_types(
     operation: &PSumScatterOperation,
-    input_types: &[ArrayProgramType],
-) -> Result<Vec<ArrayProgramType>, TypeError> {
+    input_types: &[ArrayIrType],
+) -> Result<Vec<ArrayIrType>, TypeError> {
     let effective_axis_size = operation.effective_axis_size()?;
     let Some(input_type) = input_types.first() else {
         return Err(TypeError::invalid("'psum_scatter' expects an array followed by its output extents"));
@@ -1042,8 +1042,8 @@ pub(crate) fn infer_explicit_psum_scatter_output_types(
 /// Infers the composite all-to-all contract.
 pub(crate) fn infer_explicit_all_to_all_output_types(
     operation: &AllToAllOperation,
-    input_types: &[ArrayProgramType],
-) -> Result<Vec<ArrayProgramType>, TypeError> {
+    input_types: &[ArrayIrType],
+) -> Result<Vec<ArrayIrType>, TypeError> {
     let effective_axis_size = operation.effective_axis_size()?;
     let Some(input_type) = input_types.first() else {
         return Err(TypeError::invalid("'all_to_all' expects an array followed by its output extents"));
@@ -2064,22 +2064,22 @@ impl AllToAllOperation {
 }
 
 macro_rules! impl_shape_changing_collective_member_operation {
-    // Implements the explicit array-program boundary shared by the three shape-changing collective payloads.
+    // Implements the explicit array IR boundary shared by the three shape-changing collective payloads.
     ($operation:ty, $infer_output_types:ident) => {
-        impl MemberOperation<ArrayProgramType> for $operation {
+        impl MemberOperation<ArrayIrType> for $operation {
             fn infer_parent_region_input_types(
                 &self,
-                _input_types: &[ArrayProgramType],
-                region_interfaces: &[RegionInterface<ArrayProgramType>],
-            ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
+                _input_types: &[ArrayIrType],
+                region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
                 Ok(vec![None; region_interfaces.len()])
             }
 
             fn infer_parent_output_types(
                 &self,
-                input_types: &[ArrayProgramType],
-                region_interfaces: &[RegionInterface<ArrayProgramType>],
-            ) -> Result<Vec<ArrayProgramType>, TypeError> {
+                input_types: &[ArrayIrType],
+                region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
                 check_count!("region", region_interfaces, 0, TypeError);
                 $infer_output_types(self, input_types)
             }
@@ -2094,7 +2094,7 @@ macro_rules! impl_shape_changing_collective_member_operation {
 
         impl<C> MemberInterpretableOperation<C> for $operation
         where
-            C: Domain<Type = ArrayProgramType>,
+            C: Domain<Type = ArrayIrType>,
             C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape>
                 + ValueProjection<DimensionType, Projected = DimensionValue>,
         {
@@ -2170,8 +2170,8 @@ impl_shape_changing_collective_member_operation!(AllToAllOperation, infer_explic
 /// Returns an exact first-class collective extent constant.
 fn collective_extent_constant<V>(context: &V::DispatchDomain, extent: usize) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayProgramType>,
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V: Value<Type = ArrayIrType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
 {
     context.lift(DimensionValue::constant(extent)?.into())
@@ -2181,8 +2181,8 @@ where
 /// [`DimensionSize`] gateways for dynamic axes.
 fn collective_input_extents<V>(context: &V::DispatchDomain, value: &V) -> Result<Vec<V>, ProgramError>
 where
-    V: Value<Type = ArrayProgramType> + DimensionSize<V>,
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V: Value<Type = ArrayIrType> + DimensionSize<V>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
 {
     let r#type = value.r#type();
@@ -2206,8 +2206,8 @@ fn multiplied_collective_extent<V>(
     effective_axis_size: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayProgramType> + ValueProjection<DimensionType>,
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V as ValueProjection<DimensionType>>::Projected: Mul,
 {
@@ -2225,8 +2225,8 @@ fn divided_collective_extent<V>(
     effective_axis_size: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayProgramType> + ValueProjection<DimensionType>,
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div,
 {
@@ -2244,8 +2244,8 @@ fn require_collective_axis_extent<V>(
     effective_axis_size: usize,
 ) -> Result<(), ProgramError>
 where
-    V: Value<Type = ArrayProgramType> + ValueProjection<DimensionType>,
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement,
 {
@@ -2262,8 +2262,8 @@ fn require_collective_axis_divisible<V>(
     effective_axis_size: usize,
 ) -> Result<(), ProgramError>
 where
-    V: Value<Type = ArrayProgramType> + ValueProjection<DimensionType>,
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement,
 {
@@ -2310,8 +2310,8 @@ pub trait AllGather: Sized {
 
 impl<V> AllGather for V
 where
-    V: Value<Type = ArrayProgramType> + DimensionSize<V> + ValueProjection<DimensionType>,
-    V::DispatchDomain: Context<Type = ArrayProgramType> + NamedAxes,
+    V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V::DispatchDomain as Domain>::Operation: From<AllGatherOperation>,
     <V as ValueProjection<DimensionType>>::Projected: Mul,
@@ -2406,8 +2406,8 @@ pub trait PSumScatter: Sized {
 
 impl<V> PSumScatter for V
 where
-    V: Value<Type = ArrayProgramType> + DimensionSize<V> + ValueProjection<DimensionType>,
-    V::DispatchDomain: Context<Type = ArrayProgramType> + NamedAxes,
+    V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V::DispatchDomain as Domain>::Operation: From<PSumScatterOperation>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div,
@@ -2488,8 +2488,8 @@ pub trait AllToAll: Sized {
 
 impl<V> AllToAll for V
 where
-    V: Value<Type = ArrayProgramType> + DimensionSize<V> + ValueProjection<DimensionType>,
-    V::DispatchDomain: Context<Type = ArrayProgramType> + NamedAxes,
+    V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     <V::DispatchDomain as Domain>::Operation: From<AllToAllOperation>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div + Mul,
@@ -2563,8 +2563,8 @@ pub trait Pshuffle: Sized {
 
 impl<V> Pshuffle for V
 where
-    V: Value<Type = ArrayProgramType>,
-    V::DispatchDomain: Context<Type = ArrayProgramType> + NamedAxes,
+    V: Value<Type = ArrayIrType>,
+    V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     <V::DispatchDomain as Domain>::Operation: From<PpermuteOperation>,
 {
     fn pshuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError> {
@@ -2634,7 +2634,7 @@ pub trait PSwapAxes: AllToAll {
 
 impl<V: AllToAll> PSwapAxes for V {}
 
-/// Applies the mixed array-program JVP shared by shape-changing collectives whose transpose is another collective.
+/// Applies the mixed array IR JVP shared by shape-changing collectives whose transpose is another collective.
 /// Explicit output extents and the exact input shape become ordinary residuals of one linear call.
 fn jvp_shape_changing_collective_with_adjoint<C, Forward, Adjoint>(
     operation: &Forward,
@@ -2643,11 +2643,11 @@ fn jvp_shape_changing_collective_with_adjoint<C, Forward, Adjoint>(
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Operation: From<Forward>
         + From<Adjoint>
         + From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
+        + From<LinearCallOperation<ArrayIrType>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     Forward: Clone + Operation<Type = ArrayType>,
     Adjoint: Operation<Type = ArrayType>,
@@ -2691,7 +2691,7 @@ where
     Ok(vec![DifferentiationDual::new(primal, tangent)?])
 }
 
-/// Applies the mixed array-program JVP for invariant all-gather. Its transpose selects the current participant's
+/// Applies the mixed array IR JVP for invariant all-gather. Its transpose selects the current participant's
 /// gathered chunk using the retained input geometry and reshapes an untiled size-one participant axis away.
 fn jvp_invariant_all_gather<C>(
     operation: &AllGatherOperation,
@@ -2699,12 +2699,12 @@ fn jvp_invariant_all_gather<C>(
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Operation: From<AllGatherOperation>
         + From<DimensionFromScalarOperation>
         + From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
+        + From<LinearCallOperation<ArrayIrType>>
         + From<ReshapeOperation>
         + OperationProjection<ArrayType>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
@@ -2824,16 +2824,16 @@ where
     Ok(vec![DifferentiationDual::new(primal, tangent)?])
 }
 
-/// Mixed array-program JVP for all-gather. Explicit output extents are retained as ordinary residual values, and an
+/// Mixed array IR JVP for all-gather. Explicit output extents are retained as ordinary residual values, and an
 /// invariant result uses participant-indexed slicing in its transposed linear region.
 impl<C> MemberDifferentiableOperation<C> for AllGatherOperation
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Operation: From<AllGatherOperation>
         + From<DimensionFromScalarOperation>
         + From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
+        + From<LinearCallOperation<ArrayIrType>>
         + From<PSumScatterOperation>
         + From<ReshapeOperation>
         + OperationProjection<ArrayType>
@@ -2863,14 +2863,14 @@ where
     }
 }
 
-/// Mixed array-program JVP for sum-scatter. Explicit output extents are retained as ordinary residual values, and
+/// Mixed array IR JVP for sum-scatter. Explicit output extents are retained as ordinary residual values, and
 /// the transposed linear region applies varying all-gather to the output cotangent.
 impl<C> MemberDifferentiableOperation<C> for PSumScatterOperation
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Operation: From<AllGatherOperation>
         + From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
+        + From<LinearCallOperation<ArrayIrType>>
         + From<PSumScatterOperation>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
@@ -2895,14 +2895,14 @@ where
     }
 }
 
-/// Mixed array-program JVP for all-to-all. Explicit output extents are retained as ordinary residual values, and the
+/// Mixed array IR JVP for all-to-all. Explicit output extents are retained as ordinary residual values, and the
 /// transposed linear region swaps the split and concatenation axes.
 impl<C> MemberDifferentiableOperation<C> for AllToAllOperation
 where
-    C: Context<Type = ArrayProgramType>,
+    C: Context<Type = ArrayIrType>,
     C::Operation: From<AllToAllOperation>
         + From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayProgramType>>
+        + From<LinearCallOperation<ArrayIrType>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>>(
@@ -3188,7 +3188,7 @@ where
 }
 
 /// Validates a mixed collective's array operand and replicated result extents.
-fn explicit_collective_inputs<V: Value<Type = ArrayProgramType>>(
+fn explicit_collective_inputs<V: Value<Type = ArrayIrType>>(
     inputs: &[ArrayProgramBatch<V>],
 ) -> Result<(&ArrayProgramBatch<V>, &[ArrayProgramBatch<V>]), BatchingError> {
     let Some((array, output_extents)) = inputs.split_first() else {
@@ -3211,7 +3211,7 @@ fn forward_explicit_collective<C, O>(
     output_batch_axis: Option<usize>,
 ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError>
 where
-    C: Context<Type = ArrayProgramType, Operation: From<O>>,
+    C: Context<Type = ArrayIrType, Operation: From<O>>,
 {
     let mut physical_output_extents = output_extents.iter().map(|extent| extent.value().clone()).collect::<Vec<_>>();
     if let Some(output_batch_axis) = output_batch_axis {
@@ -3234,7 +3234,7 @@ where
 impl<C> MemberBatchableOperation<C, ArrayProgramBatching> for AllGatherOperation
 where
     C: Context<
-            Type = ArrayProgramType,
+            Type = ArrayIrType,
             Operation: From<AllGatherOperation>
                            + From<BroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
@@ -3311,7 +3311,7 @@ where
 impl<C> MemberBatchableOperation<C, ArrayProgramBatching> for PSumScatterOperation
 where
     C: Context<
-            Type = ArrayProgramType,
+            Type = ArrayIrType,
             Operation: From<PSumScatterOperation>
                            + From<BroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
@@ -3390,7 +3390,7 @@ where
 impl<C> MemberBatchableOperation<C, ArrayProgramBatching> for AllToAllOperation
 where
     C: Context<
-            Type = ArrayProgramType,
+            Type = ArrayIrType,
             Operation: From<AllToAllOperation>
                            + From<BroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
@@ -3620,7 +3620,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::batching::{
@@ -3630,7 +3630,7 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{transpose_mixed_operation, value_and_gradient};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use crate::types::{ArrayProgramType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
+    use crate::types::{ArrayIrType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
 
     use super::*;
 
@@ -3905,20 +3905,20 @@ mod tests {
 
     #[test]
     fn test_pshuffle_composes_ppermute_in_the_composite_domain() {
-        type Parent = EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let context = BatchingContext::<_, ArrayProgramBatching>::new(
             Parent::new(),
-            ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()),
+            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         )
         .with_axis_name("x".to_string());
-        let input = ArrayProgramValue::Array(Array::matrix(3, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let input = ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
         let input = ArrayProgramBatch::new(input, BatchAxis::new(0)).unwrap();
         let input = BatchingTracer::new(context, input);
         let output = input.pshuffle("x", &[2, 0, 1]).unwrap().into_batch();
 
         assert_eq!(output.batch_axis(), BatchAxis::new(0));
-        let ArrayProgramValue::Array(output) = output.into_value() else {
+        let ArrayIrValue::Array(output) = output.into_value() else {
             panic!("pshuffle must preserve the array member kind");
         };
         assert_eq!(output.to_f64s(), vec![5.0, 6.0, 1.0, 2.0, 3.0, 4.0]);
@@ -3926,18 +3926,18 @@ mod tests {
 
     #[test]
     fn test_pswapaxes_composes_untiled_all_to_all_in_the_composite_domain() {
-        type TestContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let (_, program) = TestContext::trace_with_named_axes(
             |input| input.pswapaxes("x", 0),
-            ArrayProgramType::Array(input_type),
+            ArrayIrType::Array(input_type),
             vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2 })],
         )
         .unwrap();
 
         let all_to_all = program.instructions().last().unwrap();
-        let ArrayProgramOperation::AllToAll(operation) = all_to_all.operation() else {
+        let ArrayIrOperation::AllToAll(operation) = all_to_all.operation() else {
             panic!("pswapaxes must compose the canonical all-to-all operation");
         };
         assert_eq!(operation.split_axis(), 0);
@@ -4046,7 +4046,7 @@ mod tests {
             infer_explicit_all_gather_output_types(
                 &AllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::default(), output_variance),
                 &[
-                    ArrayProgramType::Array(input.clone()),
+                    ArrayIrType::Array(input.clone()),
                     DimensionValue::constant(2).unwrap().r#type().clone().into(),
                     DimensionValue::constant(3).unwrap().r#type().clone().into(),
                 ],
@@ -4100,7 +4100,7 @@ mod tests {
                 ),
                 &[
                     input_type.clone().into(),
-                    ArrayProgramType::Dimension(DimensionType::new(concat_result.clone())),
+                    ArrayIrType::Dimension(DimensionType::new(concat_result.clone())),
                     DimensionValue::constant(3).unwrap().r#type().clone().into(),
                 ],
             ),
@@ -4117,7 +4117,7 @@ mod tests {
                 &PSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
                 &[
                     input_type.clone().into(),
-                    ArrayProgramType::Dimension(DimensionType::new(split_result.clone())),
+                    ArrayIrType::Dimension(DimensionType::new(split_result.clone())),
                     DimensionValue::constant(3).unwrap().r#type().clone().into(),
                 ],
             ),
@@ -4134,8 +4134,8 @@ mod tests {
                 &AllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
                 &[
                     input_type.clone().into(),
-                    ArrayProgramType::Dimension(DimensionType::new(split_result.clone())),
-                    ArrayProgramType::Dimension(DimensionType::new(concat_result.clone())),
+                    ArrayIrType::Dimension(DimensionType::new(split_result.clone())),
+                    ArrayIrType::Dimension(DimensionType::new(concat_result.clone())),
                 ],
             ),
             Ok(vec![
@@ -4150,8 +4150,8 @@ mod tests {
             infer_explicit_all_to_all_output_types(
                 &AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
                 &[
-                    ArrayProgramType::Array(input_type.clone()),
-                    ArrayProgramType::Dimension(DimensionType::new(input_axis)),
+                    ArrayIrType::Array(input_type.clone()),
+                    ArrayIrType::Dimension(DimensionType::new(input_axis)),
                     DimensionValue::constant(3).unwrap().r#type().clone().into(),
                 ],
             ),
@@ -4722,7 +4722,7 @@ mod tests {
 
     #[test]
     fn test_explicit_shape_changing_collective_member_transforms() -> Result<(), ProgramError> {
-        type Context = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        type Context = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         // A live tangent through a dynamically shaped mixed collective stages one residual-aware linear call directly
         // through the payload's member JVP rule.
@@ -4756,7 +4756,7 @@ mod tests {
                 .borrow()
                 .instructions()
                 .iter()
-                .any(|instruction| matches!(instruction.operation(), ArrayProgramOperation::LinearCall(_)))
+                .any(|instruction| matches!(instruction.operation(), ArrayIrOperation::LinearCall(_)))
         );
 
         // Direct mixed transposition delegates the array contribution through the homogeneous projection and gives
@@ -4774,7 +4774,7 @@ mod tests {
         assert!(matches!(cotangents.as_slice(), [MaybeZero::Value(_), MaybeZero::Zero(_)]));
         assert!(matches!(
             context.builder().borrow().instructions()[0].operation(),
-            ArrayProgramOperation::Array(ArrayOperation::AllGather(_)),
+            ArrayIrOperation::Array(ArrayOperation::AllGather(_)),
         ));
 
         Ok(())

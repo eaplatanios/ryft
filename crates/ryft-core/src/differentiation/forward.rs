@@ -813,10 +813,10 @@ pub trait DifferentiableOperation<C: Context>: Operation {
 ///
 /// This distinction matters for rules such as dynamically shaped slicing. The primal operation remains an ordinary
 /// [`ArrayType`](crate::ArrayType) operation, but its linearization must retain first-class dimension values in an
-/// [`ArrayProgramType`](crate::ArrayProgramType) program. Implementing [`DifferentiableOperation<C>`] directly cannot
-/// express that relationship because its [`jvp`](DifferentiableOperation::jvp) method deliberately requires
-/// `Self::Type = C::Type`. This trait preserves that same-universe invariant while making member differentiation in
-/// the parent universe explicit.
+/// [`ArrayIrType`](crate::ArrayIrType) program. Implementing [`DifferentiableOperation<C>`] directly cannot express
+/// that relationship because its [`jvp`](DifferentiableOperation::jvp) method deliberately requires `Self::Type =
+/// C::Type`. This trait preserves that same-universe invariant while making member differentiation in the parent
+/// universe explicit.
 ///
 /// Implementations bound the parent context by the projection vocabulary they actually use (typically
 /// [`ValueProjection<T>`](ValueProjection) for values and constants, [`OperationProjection<T>`](OperationProjection)

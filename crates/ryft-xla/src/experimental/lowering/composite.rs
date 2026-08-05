@@ -24,7 +24,7 @@ use super::{
 };
 
 /// Lowers a composite array IR type to its physical StableHLO tensor type.
-pub(super) fn lower_array_program_type<'c, 't, L: Location<'c, 't>>(
+pub(super) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
     r#type: &ArrayIrType,
     context: &'c MlirContext<'t>,
     location: L,
@@ -240,7 +240,7 @@ fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Lowers one array IR instruction.
-pub(super) fn lower_array_program_operation<'b, 'c: 'b, 't: 'c, A>(
+pub(super) fn lower_array_ir_operation<'b, 'c: 'b, 't: 'c, A>(
     operation: &ArrayIrOperation<A>,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayIrType],

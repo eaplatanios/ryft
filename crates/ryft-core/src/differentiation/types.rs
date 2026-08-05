@@ -13,7 +13,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::TracingContext;
-use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, Shape};
+use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, Shape};
 
 /// A [`Type`] whose forward perturbations and reverse adjoints carry well-defined differential representations.
 /// Differential values need not use the primal representation. A compact primal storage format may require a wider
@@ -126,7 +126,7 @@ impl DifferentiableType for ArrayType {
     }
 }
 
-impl DifferentiableType for ArrayProgramType {
+impl DifferentiableType for ArrayIrType {
     #[inline]
     fn is_zero_space(&self) -> bool {
         match self {

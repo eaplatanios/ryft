@@ -5540,9 +5540,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
     }
     let mut lowered_state_types = full_state_types
         .iter()
-        .map(|r#type| {
-            composite::lower_array_program_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref())
-        })
+        .map(|r#type| composite::lower_array_ir_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     for _ in 0..threaded_effect_count {
         lowered_state_types.push(context.stable_hlo_token_type()?.as_ref());
@@ -5993,9 +5991,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     let token_start_index = state_types.len();
     let mut lowered_state_types = state_types
         .iter()
-        .map(|r#type| {
-            composite::lower_array_program_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref())
-        })
+        .map(|r#type| composite::lower_array_ir_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     for effect in ordered_effects(threaded_effects) {
         lowered_state_types.push(context.stable_hlo_token_type()?.as_ref());
@@ -6492,12 +6488,12 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
     let argument_tensor_types = function
         .input_types
         .iter()
-        .map(|r#type| composite::lower_array_program_type(r#type, context, location))
+        .map(|r#type| composite::lower_array_ir_type(r#type, context, location))
         .collect::<Result<Vec<_>, _>>()?;
     let result_tensor_types = function
         .output_types
         .iter()
-        .map(|r#type| composite::lower_array_program_type(r#type, context, location))
+        .map(|r#type| composite::lower_array_ir_type(r#type, context, location))
         .collect::<Result<Vec<_>, _>>()?;
 
     let function_block = context.block(
@@ -6577,7 +6573,7 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c>(
                 let result_tensor_types = function
                     .output_types
                     .iter()
-                    .map(|r#type| composite::lower_array_program_type(r#type, context, location))
+                    .map(|r#type| composite::lower_array_ir_type(r#type, context, location))
                     .collect::<Result<Vec<_>, _>>()?;
                 let operation = block.append_operation(func::call(
                     function.symbol.as_str(),
@@ -7119,7 +7115,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
     lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if let Some(operation) = operation.to_core_operation() {
-        return composite::lower_array_program_operation(
+        return composite::lower_array_ir_operation(
             &operation,
             input_values,
             lowerer.input_types.as_slice(),

@@ -22,7 +22,7 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValue, Value};
 use crate::types::{
-    ArrayProgramType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
+    ArrayIrType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -48,12 +48,12 @@ pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
 /// # Example
 ///
 /// ```rust
-/// # use ryft_core::{ArrayProgramValue, DimensionSize, ProgramError};
+/// # use ryft_core::{ArrayIrValue, DimensionSize, ProgramError};
 /// # use ryft_core::backends::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
-/// let array = ArrayProgramValue::Array(Array::matrix(2, 3, vec![0.0; 6]));
+/// let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0; 6]));
 /// let columns = array.dimension_size(-1)?;
-/// let ArrayProgramValue::Dimension(columns) = columns else {
+/// let ArrayIrValue::Dimension(columns) = columns else {
 ///     unreachable!("dimension_size always returns a dimension member");
 /// };
 /// assert_eq!(columns.extent(), 3);
@@ -65,9 +65,9 @@ pub trait DimensionSize<Output = Self>: Typed + Sized {
     fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<Output, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayProgramType>> DimensionSize<V> for V
+impl<V: Value<Type = ArrayIrType>> DimensionSize<V> for V
 where
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation>,
 {
     fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<V, ProgramError> {
@@ -78,9 +78,9 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayProgramType>> DimensionSize<V> for ProjectedValue<ArrayType, V>
+impl<V: Value<Type = ArrayIrType>> DimensionSize<V> for ProjectedValue<ArrayType, V>
 where
-    V::DispatchDomain: Context<Type = ArrayProgramType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation>,
 {
     fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<V, ProgramError> {
@@ -153,7 +153,7 @@ impl DimensionSizeOperation {
     }
 
     /// Validates one complete composite input type against this operation's selected declared axis.
-    fn validate_input_type(&self, input_type: &ArrayProgramType) -> Result<(), TypeError> {
+    fn validate_input_type(&self, input_type: &ArrayIrType) -> Result<(), TypeError> {
         let input_type = <&ArrayType>::try_from(input_type)?;
         let actual_dimension = input_type.shape().dimensions().get(self.axis).ok_or_else(|| {
             TypeError::invalid(format!(
@@ -199,7 +199,7 @@ impl Display for DimensionSizeOperation {
 }
 
 impl Operation for DimensionSizeOperation {
-    type Type = ArrayProgramType;
+    type Type = ArrayIrType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -208,9 +208,9 @@ impl Operation for DimensionSizeOperation {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         self.validate_input_type(&input_types[0])?;
@@ -232,7 +232,7 @@ impl Operation for DimensionSizeOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayProgramType, Value: DimensionSize<C::Value>>> InterpretableOperation<C>
+impl<C: Domain<Type = ArrayIrType, Value: DimensionSize<C::Value>>> InterpretableOperation<C>
     for DimensionSizeOperation
 {
     fn interpret<D: InterpretationDriver<C>>(
@@ -252,14 +252,14 @@ impl<C: Domain<Type = ArrayProgramType, Value: DimensionSize<C::Value>>> Interpr
     }
 }
 
-impl<C: Context<Type = ArrayProgramType, Operation: From<DimensionSizeOperation>>> PartiallyEvaluatableOperation<C>
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> PartiallyEvaluatableOperation<C>
     for DimensionSizeOperation
 {
 }
 
 /// Batching reads the same logical array axis after accounting for an inserted packed batch axis. The resulting
 /// first-class dimension is shared shape metadata and therefore remains replicated.
-impl<C: Context<Type = ArrayProgramType, Operation: From<DimensionSizeOperation>>>
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
     BatchableOperation<C, ArrayProgramBatching> for DimensionSizeOperation
 {
     fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
@@ -297,7 +297,7 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::Array;
     use crate::contexts::{Context, EagerContext};
     use crate::parameters::Placeholder;
@@ -438,36 +438,35 @@ mod tests {
         // Eager execution reads shape metadata without consuming or copying the array payload.
         let reference_array = Array::matrix(2, 3, vec![0.0f32; 6]);
         assert_eq!(reference_array.dimension_size(-1), Ok(3));
-        let array = ArrayProgramValue::Array(Array::matrix(2, 3, vec![0.0f32; 6]));
-        let payload = <ArrayProgramValue<Array> as crate::ValueProjection<ArrayType>>::projected(&array)
+        let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0f32; 6]));
+        let payload = <ArrayIrValue<Array> as crate::ValueProjection<ArrayType>>::projected(&array)
             .unwrap()
             .values()
             .as_ptr();
         let result = array.dimension_size(-1).unwrap();
-        let ArrayProgramValue::Dimension(result) = result else {
+        let ArrayIrValue::Dimension(result) = result else {
             panic!("expected one dimension result");
         };
         assert_eq!(result.extent(), 3);
         assert_eq!(
-            <ArrayProgramValue<Array> as crate::ValueProjection<ArrayType>>::projected(&array)
+            <ArrayIrValue<Array> as crate::ValueProjection<ArrayType>>::projected(&array)
                 .unwrap()
                 .values()
                 .as_ptr(),
             payload,
         );
 
-        let dimension = ArrayProgramValue::<Array>::Dimension(crate::DimensionValue::new(dimension_type, 3).unwrap());
+        let dimension = ArrayIrValue::<Array>::Dimension(crate::DimensionValue::new(dimension_type, 3).unwrap());
         assert_eq!(
             dimension.dimension_size(0),
             Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
 
         // A dynamic staged declaration executes against its compatible concrete static refinement.
-        let context = EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
-        let result = context
-            .bind(operation, Vec::new(), &[ArrayProgramValue::Array(Array::vector(vec![0.0f32; 5]))])
-            .unwrap();
-        let [ArrayProgramValue::Dimension(result)] = result.as_slice() else {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let result =
+            context.bind(operation, Vec::new(), &[ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]))]).unwrap();
+        let [ArrayIrValue::Dimension(result)] = result.as_slice() else {
             panic!("expected one dimension result");
         };
         assert_eq!(result.extent(), 5);
@@ -475,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_dimension_size_program() {
-        type TestContext = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let bounds = DimensionBounds::new(2, Some(8)).unwrap();
         let variable = DimensionVariable::new("extent", bounds);
@@ -486,10 +485,10 @@ mod tests {
                     <crate::Tracer<TestContext> as crate::ValueProjection<ArrayType>>::into_projected(array.clone())?;
                 Ok((array.dimension_size(0)?, projected.dimension_size(0)?))
             },
-            ArrayProgramType::from(input_type.clone()),
+            ArrayIrType::from(input_type.clone()),
         )
         .unwrap();
-        let (ArrayProgramType::Dimension(first), ArrayProgramType::Dimension(second)) = output_types else {
+        let (ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)) = output_types else {
             panic!("expected two dimension result types");
         };
         assert_eq!(first.variable(), &variable);
@@ -503,23 +502,23 @@ mod tests {
         assert_eq!(second_instruction.inputs(), program.input_ids());
         assert!(first_instruction.regions().is_empty());
         assert!(second_instruction.regions().is_empty());
-        assert!(matches!(first_instruction.operation(), ArrayProgramOperation::DimensionSize(_),));
-        assert!(matches!(second_instruction.operation(), ArrayProgramOperation::DimensionSize(_),));
+        assert!(matches!(first_instruction.operation(), ArrayIrOperation::DimensionSize(_),));
+        assert!(matches!(second_instruction.operation(), ArrayIrOperation::DimensionSize(_),));
 
-        let concrete = ArrayProgramValue::Array(Array::vector(vec![0.0f32; 5]));
+        let concrete = ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]));
         let (first, second) = program.interpret(concrete.clone()).unwrap();
-        let (ArrayProgramValue::Dimension(first), ArrayProgramValue::Dimension(second)) = (first, second) else {
+        let (ArrayIrValue::Dimension(first), ArrayIrValue::Dimension(second)) = (first, second) else {
             panic!("expected two concrete dimension results");
         };
         assert_eq!(first.extent(), 5);
         assert_eq!(second.extent(), 5);
 
         // Relocation preserves both explicit reader edges and their shared forwarded identity.
-        let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.into());
         let outputs = builder.splice_program(&program, &[input]).unwrap();
         let imported = builder
-            .build::<ArrayProgramValue<Array>, (ArrayProgramValue<Array>, ArrayProgramValue<Array>)>(
+            .build::<ArrayIrValue<Array>, (ArrayIrValue<Array>, ArrayIrValue<Array>)>(
                 outputs,
                 Placeholder,
                 (Placeholder, Placeholder),
@@ -527,7 +526,7 @@ mod tests {
             .unwrap();
         assert!(imported.type_identity_signature().internal_identities().is_empty());
         let output_types = imported.output_types();
-        let [ArrayProgramType::Dimension(first), ArrayProgramType::Dimension(second)] = output_types.as_slice() else {
+        let [ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)] = output_types.as_slice() else {
             panic!("expected two imported dimension result types");
         };
         assert_eq!(first.variable(), &variable);
@@ -537,19 +536,19 @@ mod tests {
 
     #[test]
     fn test_dimension_size_partial_evaluation() {
-        type TestContext = TracingContext<ArrayProgramValue<Array>, DimensionSizeOperation>;
+        type TestContext = TracingContext<ArrayIrValue<Array>, DimensionSizeOperation>;
 
         let variable = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
         let (_, program) =
-            TestContext::trace(|array| array.dimension_size(0), ArrayProgramType::from(input_type.clone())).unwrap();
+            TestContext::trace(|array| array.dimension_size(0), ArrayIrType::from(input_type.clone())).unwrap();
         let program = program.to_flat_program();
 
         let known = program
-            .partially_evaluate(&[PartialValue::Known(ArrayProgramValue::Array(Array::vector(vec![0.0f32; 5])))])
+            .partially_evaluate(&[PartialValue::Known(ArrayIrValue::Array(Array::vector(vec![0.0f32; 5])))])
             .unwrap();
         assert!(known.program().instructions().is_empty());
-        let [PartialEvaluationOutput::Known(ArrayProgramValue::Dimension(result))] = known.outputs() else {
+        let [PartialEvaluationOutput::Known(ArrayIrValue::Dimension(result))] = known.outputs() else {
             panic!("expected one known dimension result");
         };
         assert_eq!(result.extent(), 5);

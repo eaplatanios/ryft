@@ -650,7 +650,7 @@ pub fn interpret_projected_operation<
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{EagerContext, StagingContext};
@@ -968,15 +968,13 @@ mod tests {
 
     #[test]
     fn test_interpret_projected_operation() {
-        let context = EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let operation = ArrayOperation::Add(AddOperation::new());
-        let inputs = [
-            ArrayProgramValue::Array(Array::vector(vec![1.0, 2.0])),
-            ArrayProgramValue::Array(Array::vector(vec![3.0, 4.0])),
-        ];
+        let inputs =
+            [ArrayIrValue::Array(Array::vector(vec![1.0, 2.0])), ArrayIrValue::Array(Array::vector(vec![3.0, 4.0]))];
         assert_eq!(
             interpret_projected_operation(&context, &operation, &EmptyRegionDriver, &inputs),
-            Ok(vec![ArrayProgramValue::Array(Array::vector(vec![4.0, 6.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0, 6.0]))]),
         );
     }
 }
