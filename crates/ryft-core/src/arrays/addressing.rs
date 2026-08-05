@@ -178,8 +178,6 @@ impl ArrayAddressing {
     pub fn storage_byte_len(&self) -> usize {
         self.storage_byte_len_checked().unwrap()
     }
-    
-    // TODO(eaplatanios): Review from here onwards.
 
     /// Maps the provided logical multi-index to its flat row-major element index.
     pub fn index(&self, index: &[usize]) -> Result<usize, ProgramError> {
@@ -193,10 +191,9 @@ impl ArrayAddressing {
         Ok(self.byte_range_unchecked(|axis| index[axis]))
     }
 
-    /// Maps a contiguous flat logical element index range to its corresponding physical byte range.
-    ///
-    /// This operation returns an error when the logical elements are not stored contiguously in ascending physical
-    /// address order. Use [`Self::ranges`] when the layout may split a logical selection across storage ranges.
+    /// Maps a contiguous flat logical element index range to its corresponding physical byte range. This operation
+    /// returns an error when the logical elements are not stored contiguously in ascending physical address order.
+    /// Use [`Self::ranges`] when the [`Layout`] may split a logical selection across storage ranges.
     pub fn range(&self, elements: Range<usize>) -> Result<ArrayIndexRange, ProgramError> {
         let element_count = self.element_count();
         if elements.start > elements.end || elements.end > element_count {
@@ -246,76 +243,12 @@ impl ArrayAddressing {
         ArrayIndexRanges::new(self, starts, sizes, strides)
     }
 
-    /// Returns the logical row-major index produced by `coordinate` without validating its coordinates.
-    fn logical_index_unchecked(&self, coordinate: impl Fn(usize) -> usize) -> usize {
-        let mut index = 0usize;
-        for axis in 0..self.r#type.rank() {
-            index = index * self.dimension(axis) + coordinate(axis);
-        }
-        index
-    }
-
-    /// Returns the physical byte range produced by `coordinate` without validating its coordinates.
-    fn byte_range_unchecked<F: Copy + Fn(usize) -> usize>(&self, coordinate: F) -> Range<usize> {
-        let start = self.byte_offset_unchecked(coordinate);
-        start..start + self.element_byte_width()
-    }
-
-    /// Returns the physical byte offset produced by `coordinate` without validating its coordinates.
-    fn byte_offset_unchecked<F: Copy + Fn(usize) -> usize>(&self, coordinate: F) -> usize {
-        let element_byte_width = self.element_byte_width();
-        if element_byte_width == 0 {
-            return 0;
-        }
-        match self.r#type.layout() {
-            None => self.logical_index_unchecked(coordinate) * element_byte_width,
-            Some(Layout::Strided(layout)) => {
-                let mut offset = layout.strides().iter().enumerate().fold(0usize, |offset, (axis, stride)| {
-                    if *stride < 0 { offset + (self.dimension(axis) - 1) * stride.unsigned_abs() } else { offset }
-                });
-                for (axis, stride) in layout.strides().iter().enumerate() {
-                    let delta = coordinate(axis) * stride.unsigned_abs();
-                    if *stride < 0 {
-                        offset -= delta;
-                    } else {
-                        offset += delta;
-                    }
-                }
-                offset
-            }
-            Some(Layout::Tiled(layout)) => {
-                let level = layout.tiles().len();
-                let dimension_count = self.tiled_dimension_count(layout, level);
-                let mut element = 0usize;
-                for position in 0..dimension_count {
-                    let (component, bound) = self.tiled_component(layout, level, position, coordinate).unwrap();
-                    element = element.checked_mul(bound).and_then(|element| element.checked_add(component)).unwrap();
-                }
-                element * element_byte_width
-            }
-        }
-    }
-
-    /// Maps a flat logical row-major index to its physical byte offset.
-    fn byte_offset_for_flat_index(&self, index: usize) -> usize {
-        self.byte_offset_unchecked(|axis| {
-            let inner = (axis + 1..self.r#type.rank()).fold(1usize, |stride, axis| stride * self.dimension(axis));
-            (index / inner) % self.dimension(axis)
-        })
-    }
-
-    /// Maps a prevalidated flat logical row-major index to its physical byte range.
-    pub(crate) fn byte_range_for_flat_index(&self, index: usize) -> Range<usize> {
-        let start = self.byte_offset_for_flat_index(index);
-        start..start + self.element_byte_width()
-    }
-
-    /// Returns `true` when flat logical row-major element order coincides with dense, gap-free physical storage.
-    /// This holds for arrays without an explicit [`Layout`], for strided layouts whose strides equal the dense
-    /// row-major byte strides, for tiled layouts with a descending minor-to-major permutation and no tiles, and
-    /// trivially for arrays without payload bytes. Callers use this to replace per-element addressing with bulk
-    /// byte ranges and copies.
-    pub(crate) fn is_dense_row_major(&self) -> bool {
+    /// Returns `true` when the flat logical row-major element order coincides with dense, gap-free physical storage for
+    /// this [`ArrayAddressing`] instance. This holds for arrays without an explicit [`Layout`], for [`Layout::Strided`]
+    /// layouts whose strides equal the dense row-major byte strides, for [`Layout::Tiled`] layouts with a descending
+    /// minor-to-major permutation and no tiles, and trivially for arrays without payload bytes. Callers can use this
+    /// function to replace per-element addressing with bulk byte ranges and copies.
+    pub fn is_dense_row_major(&self) -> bool {
         if self.element_count() == 0 || self.element_byte_width() == 0 {
             return true;
         }
@@ -340,97 +273,18 @@ impl ArrayAddressing {
         }
     }
 
-    /// Validates one externally supplied logical multi-index.
-    fn validate_index(&self, index: &[usize]) -> Result<(), ProgramError> {
-        let rank = self.r#type.rank();
-        if index.len() != rank {
-            return Err(TypeError::invalid(format!(
-                "array index rank {} does not match array rank {}",
-                index.len(),
-                rank,
-            ))
-            .into());
-        }
-        for (axis, coordinate) in index.iter().enumerate() {
-            let dimension = self.dimension(axis);
-            if *coordinate >= dimension {
-                return Err(TypeError::invalid(format!(
-                    "array index {coordinate} on axis {axis} is out of bounds for dimension size {dimension}",
-                ))
-                .into());
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns the number of physical dimensions after applying the first `level` nested tiles. Every applied tile
-    /// removes its input dimensions and adds one tile-count and one within-tile dimension per sized tile dimension.
-    fn tiled_dimension_count(&self, layout: &TiledLayout, level: usize) -> usize {
-        layout.tiles()[..level].iter().fold(self.r#type.rank(), |count, tile| {
-            count - tile.dimensions().len()
-                + 2 * tile.dimensions().iter().filter(|dimension| dimension.is_sized()).count()
+    /// Maps a flat logical row-major index to its physical byte offset.
+    fn byte_offset_for_flat_index(&self, index: usize) -> usize {
+        self.byte_offset_unchecked(|axis| {
+            let inner = (axis + 1..self.r#type.rank()).fold(1usize, |stride, axis| stride * self.dimension(axis));
+            (index / inner) % self.dimension(axis)
         })
     }
 
-    /// Evaluates the physical coordinate and dimension bound at `position` after applying the first `level` nested
-    /// tiles, with positions ordering physical dimensions from most major to most minor. At level zero, positions map
-    /// logical dimensions through the layout's minor-to-major permutation. Each tile level then passes its untiled
-    /// prefix dimensions through unchanged and replaces the tiled suffix with the tile-count coordinates of all sized
-    /// tile dimensions followed by their within-tile coordinates, where each sized tile dimension first absorbs the
-    /// run of [`TileDimension::Combined`] dimensions immediately preceding it. Returns [`None`] when an intermediate
-    /// coordinate or bound does not fit in [`usize`].
-    fn tiled_component<F: Copy + Fn(usize) -> usize>(
-        &self,
-        layout: &TiledLayout,
-        level: usize,
-        position: usize,
-        coordinate: F,
-    ) -> Option<(usize, usize)> {
-        if level == 0 {
-            let axis = layout.minor_to_major()[self.r#type.rank() - 1 - position];
-            return Some((coordinate(axis), self.dimension(axis)));
-        }
-        let tile = &layout.tiles()[level - 1];
-        let prior_count = self.tiled_dimension_count(layout, level - 1);
-        let prefix_count = prior_count - tile.dimensions().len();
-        if position < prefix_count {
-            return self.tiled_component(layout, level - 1, position, coordinate);
-        }
-        let sized_count = tile.dimensions().iter().filter(|dimension| dimension.is_sized()).count();
-        let tiled_position = position - prefix_count;
-        let group = tiled_position % sized_count;
-        let within_tile = tiled_position >= sized_count;
-        let (start, end, tile_size) = Self::tile_group(tile, group);
-        let mut combined_coordinate = 0usize;
-        let mut combined_bound = 1usize;
-        for prior_position in prefix_count + start..prefix_count + end {
-            let (component, bound) = self.tiled_component(layout, level - 1, prior_position, coordinate)?;
-            combined_coordinate = combined_coordinate.checked_mul(bound)?.checked_add(component)?;
-            combined_bound = combined_bound.checked_mul(bound)?;
-        }
-        if within_tile {
-            Some((combined_coordinate % tile_size, tile_size))
-        } else {
-            Some((combined_coordinate / tile_size, combined_bound.div_ceil(tile_size)))
-        }
-    }
-
-    /// Returns the tiled-dimension positions absorbed by the `group`-th sized dimension of `tile` as a
-    /// `(start, end, tile_size)` tuple, where `start..end` spans the combined dimensions preceding the sized
-    /// dimension together with the sized dimension itself.
-    fn tile_group(tile: &Tile, group: usize) -> (usize, usize, usize) {
-        let mut start = 0usize;
-        let mut current_group = 0usize;
-        for (position, dimension) in tile.dimensions().iter().enumerate() {
-            if let TileDimension::Sized(size) = dimension {
-                if current_group == group {
-                    return (start, position + 1, *size);
-                }
-                current_group += 1;
-                start = position + 1;
-            }
-        }
-        unreachable!()
+    /// Maps a prevalidated flat logical row-major index to its physical byte range.
+    pub(crate) fn byte_range_for_flat_index(&self, index: usize) -> Range<usize> {
+        let start = self.byte_offset_for_flat_index(index);
+        start..start + self.element_byte_width()
     }
 
     /// Returns the checked logical payload byte length, rejecting static element counts or byte lengths
@@ -479,7 +333,7 @@ impl ArrayAddressing {
                 let level = layout.tiles().len();
                 let dimension_count = self.tiled_dimension_count(layout, level);
                 let padded_element_count = (0..dimension_count).try_fold(1usize, |count, position| {
-                    count.checked_mul(self.tiled_component(layout, level, position, |_| 0)?.1)
+                    count.checked_mul(self.tiled_component(layout, level, position, &|_| 0)?.1)
                 });
                 padded_element_count.and_then(|count| count.checked_mul(element_byte_width)).ok_or_else(|| {
                     TypeError::invalid(format!(
@@ -490,6 +344,158 @@ impl ArrayAddressing {
                 })
             }
         }
+    }
+
+    /// Validates the provided logical multi-index is within bounds for the underlying array.
+    fn validate_index(&self, index: &[usize]) -> Result<(), ProgramError> {
+        let rank = self.r#type.rank();
+        if index.len() != rank {
+            return Err(TypeError::invalid(format!(
+                "array index rank {} does not match array rank {}",
+                index.len(),
+                rank,
+            ))
+            .into());
+        }
+        for (axis, coordinate) in index.iter().enumerate() {
+            let dimension = self.dimension(axis);
+            if *coordinate >= dimension {
+                return Err(TypeError::invalid(format!(
+                    "array index {coordinate} on axis {axis} is out of bounds for dimension size {dimension}",
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a flat row-major index without validating its coordinates. `coordinate_fn` is called with each logical
+    /// axis and must return the selected coordinate along that axis.
+    fn logical_index_unchecked<CoordinateFn: Fn(usize) -> usize>(&self, coordinate_fn: CoordinateFn) -> usize {
+        let mut index = 0usize;
+        for axis in 0..self.r#type.rank() {
+            index = index * self.dimension(axis) + coordinate_fn(axis);
+        }
+        index
+    }
+
+    /// Returns a physical byte range without validating its coordinates. `coordinate_fn` is called with each logical
+    /// axis and must return the selected coordinate along that axis.
+    fn byte_range_unchecked<CoordinateFn: Fn(usize) -> usize>(&self, coordinate_fn: CoordinateFn) -> Range<usize> {
+        let start = self.byte_offset_unchecked(coordinate_fn);
+        start..start + self.element_byte_width()
+    }
+
+    /// Returns a physical byte offset without validating its coordinates. `coordinate_fn` is called with each logical
+    /// axis and must return the selected coordinate along that axis.
+    fn byte_offset_unchecked<CoordinateFn: Fn(usize) -> usize>(&self, coordinate_fn: CoordinateFn) -> usize {
+        let element_byte_width = self.element_byte_width();
+        if element_byte_width == 0 {
+            return 0;
+        }
+        match self.r#type.layout() {
+            None => self.logical_index_unchecked(coordinate_fn) * element_byte_width,
+            Some(Layout::Strided(layout)) => {
+                let mut offset = layout.strides().iter().enumerate().fold(0usize, |offset, (axis, stride)| {
+                    if *stride < 0 { offset + (self.dimension(axis) - 1) * stride.unsigned_abs() } else { offset }
+                });
+                for (axis, stride) in layout.strides().iter().enumerate() {
+                    let delta = coordinate_fn(axis) * stride.unsigned_abs();
+                    if *stride < 0 {
+                        offset -= delta;
+                    } else {
+                        offset += delta;
+                    }
+                }
+                offset
+            }
+            Some(Layout::Tiled(layout)) => {
+                let level = layout.tiles().len();
+                let dimension_count = self.tiled_dimension_count(layout, level);
+                let mut element = 0usize;
+                for position in 0..dimension_count {
+                    let (component, bound) = self.tiled_component(layout, level, position, &coordinate_fn).unwrap();
+                    element = element.checked_mul(bound).and_then(|element| element.checked_add(component)).unwrap();
+                }
+                element * element_byte_width
+            }
+        }
+    }
+
+    // TODO(eaplatanios): Should this be moved to `TiledLayout`?
+    /// Returns the number of physical dimensions after applying the first `level` nested tiles. Every applied tile
+    /// removes its input dimensions and adds one tile-count and one within-tile dimension per sized tile dimension.
+    fn tiled_dimension_count(&self, layout: &TiledLayout, level: usize) -> usize {
+        layout.tiles()[..level].iter().fold(self.r#type.rank(), |count, tile| {
+            count - tile.dimensions().len()
+                + 2 * tile.dimensions().iter().filter(|dimension| dimension.is_sized()).count()
+        })
+    }
+
+    // TODO(eaplatanios): Should this be moved to `TiledLayout`?
+    /// Evaluates the physical coordinate and dimension bound at `position` after applying the first `level` nested
+    /// tiles, with positions ordering physical dimensions from most major to most minor. At level zero, positions map
+    /// logical dimensions through the layout's minor-to-major permutation. Each tile level then passes its untiled
+    /// prefix dimensions through unchanged and replaces the tiled suffix with the tile-count coordinates of all sized
+    /// tile dimensions followed by their within-tile coordinates, where each sized tile dimension first absorbs the
+    /// run of [`TileDimension::Combined`] dimensions immediately preceding it. Returns [`None`] when an intermediate
+    /// coordinate or bound does not fit in [`usize`]. `coordinate_fn` is called with a logical axis and must return
+    /// the selected coordinate along that axis.
+    fn tiled_component<CoordinateFn: Fn(usize) -> usize>(
+        &self,
+        layout: &TiledLayout,
+        level: usize,
+        position: usize,
+        coordinate_fn: &CoordinateFn,
+    ) -> Option<(usize, usize)> {
+        if level == 0 {
+            let axis = layout.minor_to_major()[self.r#type.rank() - 1 - position];
+            return Some((coordinate_fn(axis), self.dimension(axis)));
+        }
+        let tile = &layout.tiles()[level - 1];
+        let prior_count = self.tiled_dimension_count(layout, level - 1);
+        let prefix_count = prior_count - tile.dimensions().len();
+        if position < prefix_count {
+            return self.tiled_component(layout, level - 1, position, coordinate_fn);
+        }
+        let sized_count = tile.dimensions().iter().filter(|dimension| dimension.is_sized()).count();
+        let tiled_position = position - prefix_count;
+        let group = tiled_position % sized_count;
+        let within_tile = tiled_position >= sized_count;
+        let (start, end, tile_size) = Self::tile_group(tile, group);
+        let mut combined_coordinate = 0usize;
+        let mut combined_bound = 1usize;
+        for prior_position in prefix_count + start..prefix_count + end {
+            let (component, bound) = self.tiled_component(layout, level - 1, prior_position, coordinate_fn)?;
+            combined_coordinate = combined_coordinate.checked_mul(bound)?.checked_add(component)?;
+            combined_bound = combined_bound.checked_mul(bound)?;
+        }
+        if within_tile {
+            Some((combined_coordinate % tile_size, tile_size))
+        } else {
+            Some((combined_coordinate / tile_size, combined_bound.div_ceil(tile_size)))
+        }
+    }
+
+    /// Returns the tiled-dimension positions absorbed by the `group`-th sized dimension of `tile` as a `(start, end,
+    /// size)` tuple, where `start..end` spans the combined dimensions preceding the sized dimension together with the
+    /// sized dimension itself.
+    fn tile_group(tile: &Tile, group: usize) -> (usize, usize, usize) {
+        let mut start = 0usize;
+        let mut current_group = 0usize;
+        for (position, dimension) in tile.dimensions().iter().enumerate() {
+            if let TileDimension::Sized(size) = dimension {
+                if current_group == group {
+                    return (start, position + 1, *size);
+                }
+                current_group += 1;
+                start = position + 1;
+            }
+        }
+
+        // Layout validation ensures that every tile ends in a sized dimension, while callers compute `group` modulo
+        // the number of sized dimensions. The loop must therefore return upon visiting the requested sized dimension.
+        unreachable!()
     }
 
     /// Returns the byte width of one element of `data_type`.
