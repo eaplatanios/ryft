@@ -2371,7 +2371,7 @@ mod tests {
         assert!(dispatchers.transposition);
 
         let generator = extract_attributes(quote! {
-            #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+            #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
             #[ryft(members(ArrayType, structural(DimensionType)))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(projected(ArrayType))]
@@ -2379,10 +2379,10 @@ mod tests {
             }
         });
         assert!(generator.errors.is_empty());
-        assert_eq!(generator.operation_type.as_ref().unwrap().to_token_stream().to_string(), "ArrayProgramType");
+        assert_eq!(generator.operation_type.as_ref().unwrap().to_token_stream().to_string(), "ArrayIrType");
         assert_eq!(
             generator.program_constant_type.as_ref().unwrap().to_token_stream().to_string(),
-            "ArrayProgramValue < A >",
+            "ArrayIrValue < A >",
         );
         // Member universes are recorded in declaration order together with their transform roles.
         let members = generator
@@ -2437,11 +2437,11 @@ mod tests {
                 "duplicate ryft attribute 'dispatch(...)'",
             ),
             (
-                quote!(#[ryft(type = ArrayProgramType)]),
+                quote!(#[ryft(type = ArrayIrType)]),
                 "explicit operation-family declarations must specify both 'type' and 'constant'",
             ),
             (
-                quote!(#[ryft(constant = ArrayProgramValue<V>)]),
+                quote!(#[ryft(constant = ArrayIrValue<V>)]),
                 "explicit operation-family declarations must specify both 'type' and 'constant'",
             ),
             (
@@ -2647,7 +2647,7 @@ mod tests {
         // With one declared computational member universe, both abbreviated mixed forms take their data universe from
         // the declaration while the explicit forms keep naming it.
         let (parser, variants) = extract_variants(quote! {
-            #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+            #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
             #[ryft(members(ArrayType, structural(DimensionType)))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed)]
@@ -2690,7 +2690,7 @@ mod tests {
         // A member marker naming a type the family does not declare is a declaration mismatch rather than a silent
         // second member universe.
         let (parser, _) = extract_variants(quote! {
-            #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+            #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
             #[ryft(members(ArrayType))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed(DimensionType))]
@@ -2709,7 +2709,7 @@ mod tests {
         // Several computational member universes leave the data universe ambiguous, so the abbreviated forms are
         // rejected in favor of the explicit one.
         let (parser, _) = extract_variants(quote! {
-            #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+            #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
             #[ryft(members(ArrayType, DimensionType))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed)]
@@ -2767,11 +2767,11 @@ mod tests {
         assert!(operation.variants[1].is_generic_extension);
 
         let mut input: syn::DeriveInput = syn::parse_quote! {
-            #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+            #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
             enum CompositeOperation<A: Value<Type = ArrayType>> {
                 #[ryft(projected(ArrayType))]
                 Array(ArrayOperation<A>),
-                Mixed(MixedOperation<ArrayProgramType>),
+                Mixed(MixedOperation<ArrayIrType>),
             }
         };
         replace_self_type(&mut input);
@@ -2780,8 +2780,8 @@ mod tests {
         parser.extract_attributes(&input);
         let operation = parser.normalize_input(&input).expect("failed to normalize composite operation enum");
 
-        assert_eq!(operation.operation_type.to_token_stream().to_string(), "ArrayProgramType");
-        assert_eq!(operation.program_constant_type.to_token_stream().to_string(), "ArrayProgramValue < A >");
+        assert_eq!(operation.operation_type.to_token_stream().to_string(), "ArrayIrType");
+        assert_eq!(operation.program_constant_type.to_token_stream().to_string(), "ArrayIrValue < A >");
         assert!(operation.program_constant_parameter.is_none());
         assert!(operation.has_separate_runtime_value_type);
         assert_eq!(operation.program_self_type.to_token_stream().to_string(), "CompositeOperation < A >");
@@ -2809,7 +2809,7 @@ mod tests {
     #[test]
     fn test_operation_generates_composite_member_dispatchers() {
         let mut input: syn::DeriveInput = syn::parse_quote! {
-            #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+            #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
             #[ryft(dispatch(batching, differentiation, transposition))]
             enum CompositeOperation<A: Value<Type = ArrayType>> {
                 #[ryft(projected(ArrayType))]
@@ -2820,7 +2820,7 @@ mod tests {
                 Collective(AllGatherOperation),
                 #[ryft(mixed(ArrayType, structural))]
                 DynamicZero(ZeroOperation<ArrayType>),
-                Native(NativeOperation<ArrayProgramType>),
+                Native(NativeOperation<ArrayIrType>),
             }
         };
         replace_self_type(&mut input);
@@ -2843,12 +2843,12 @@ mod tests {
         assert!(generated.contains("MaybeZero::Zero(input.r#type().cotangent())"));
 
         // Mixed payloads use their parent-universe contracts, while native payloads continue to delegate directly.
-        assert!(generated.contains("MemberOperation<ArrayProgramType>>::infer_parent_output_types"));
+        assert!(generated.contains("MemberOperation<ArrayIrType>>::infer_parent_output_types"));
         assert!(generated.contains("MemberInterpretableOperation<__Context>>::interpret_in_parent"));
         assert!(generated.contains("MemberBatchableOperation<__ParentContext,__BatchingPolicy,>>::batch_in_parent"));
         assert!(generated.contains("MemberDifferentiableOperation<__DifferentiationContext>>::jvp_in_parent"));
         assert!(generated.contains("transpose_mixed_operation(context,operation,inputs,outputs)"));
-        assert!(generated.contains("NativeOperation<ArrayProgramType>asryft::Operation>::infer_output_types"));
+        assert!(generated.contains("NativeOperation<ArrayIrType>asryft::Operation>::infer_output_types"));
 
         // The structural mixed role keeps the shared mixed base, interpretation, batching, and transposition dispatch
         // while replacing only the forward-mode arm with a generated primal plus member zero tangent over the same
@@ -2885,7 +2885,7 @@ mod tests {
         // the data universe on every marker, so declaring members is a pure notation change for a family with one
         // computational member universe.
         let explicit = generate(quote! {
-            #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+            #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
             #[ryft(dispatch(batching, differentiation, transposition))]
             enum CompositeOperation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed(ArrayType))]
@@ -2899,7 +2899,7 @@ mod tests {
             }
         });
         let declared = generate(quote! {
-            #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+            #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
             #[ryft(members(ArrayType, structural(DimensionType)))]
             #[ryft(dispatch(batching, differentiation, transposition))]
             enum CompositeOperation<A: Value<Type = ArrayType>> {

@@ -10,15 +10,15 @@ use ryft_core::compilation::{
 };
 use ryft_core::operations::math::Sin;
 use ryft_core::{
-    ArrayProgramType, ArrayProgramValue, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis,
-    MeshAxisType, Shape, Sharding, ValueProjection,
+    ArrayIrType, ArrayIrValue, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType,
+    Shape, Sharding, ValueProjection,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, jitted};
 use serde_json::{Value, json};
 
-type BenchmarkStagedFunction<'c> = StagedFunction<XlaDomain<'c>, ArrayProgramType, ArrayProgramType>;
-type BenchmarkCompiledFunction<'c> = CompiledFunction<XlaDomain<'c>, ArrayProgramType, ArrayProgramType>;
+type BenchmarkStagedFunction<'c> = StagedFunction<XlaDomain<'c>, ArrayIrType, ArrayIrType>;
+type BenchmarkCompiledFunction<'c> = CompiledFunction<XlaDomain<'c>, ArrayIrType, ArrayIrType>;
 
 #[derive(Debug)]
 struct Arguments {
@@ -183,7 +183,7 @@ fn stage_workload<'c>(
             let input = ValueProjection::<ArrayType>::into_projected(input).unwrap();
             (input.clone() * input.clone() + input).sin().unwrap().into_value()
         },
-        ArrayProgramType::Array(r#type),
+        ArrayIrType::Array(r#type),
         XlaOptions::new(mesh.clone()),
     )?)
 }
@@ -193,10 +193,9 @@ fn call_workload<'c>(
     compiled: &BenchmarkCompiledFunction<'c>,
     input: Array<'c>,
 ) -> Result<Array<'c>, Box<dyn std::error::Error>> {
-    match ryft_core::compilation::call_function(domain, compiled.executable_program(), ArrayProgramValue::Array(input))?
-    {
-        ArrayProgramValue::Array(output) => Ok(output),
-        ArrayProgramValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
+    match ryft_core::compilation::call_function(domain, compiled.executable_program(), ArrayIrValue::Array(input))? {
+        ArrayIrValue::Array(output) => Ok(output),
+        ArrayIrValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
     }
 }
 

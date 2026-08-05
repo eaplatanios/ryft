@@ -4430,7 +4430,7 @@ mod tests {
     use indoc::indoc;
     use num_complex::Complex;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::backends::scalars::{Scalar, ScalarOperation};
@@ -6286,12 +6286,12 @@ mod tests {
         assert_eq!(builder.instructions()[0].inputs(), &[input_id]);
         drop(builder);
 
-        let context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = context.input(ArrayType::scalar(DataType::F32).into());
         let input = <Tracer<_> as ValueProjection<ArrayType>>::into_projected(input).unwrap();
         let output = input.apply_unary();
         let builder = context.builder().borrow();
-        assert!(matches!(builder.instructions()[0].operation(), ArrayProgramOperation::Array(ArrayOperation::Neg(_))));
+        assert!(matches!(builder.instructions()[0].operation(), ArrayIrOperation::Array(ArrayOperation::Neg(_))));
         assert_eq!(output.value().atom_id(), Ok(builder.instructions()[0].outputs()[0]));
         drop(builder);
 
@@ -6328,14 +6328,14 @@ mod tests {
         assert_eq!(builder.instructions()[0].inputs(), &input_ids);
         drop(builder);
 
-        let context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let left = context.input(ArrayType::scalar(DataType::F32).into());
         let right = context.input(ArrayType::scalar(DataType::F32).into());
         let left = <Tracer<_> as ValueProjection<ArrayType>>::into_projected(left).unwrap();
         let right = <Tracer<_> as ValueProjection<ArrayType>>::into_projected(right).unwrap();
         let output = left.apply_binary(right);
         let builder = context.builder().borrow();
-        assert!(matches!(builder.instructions()[0].operation(), ArrayProgramOperation::Array(ArrayOperation::Add(_))));
+        assert!(matches!(builder.instructions()[0].operation(), ArrayIrOperation::Array(ArrayOperation::Add(_))));
         assert_eq!(output.value().atom_id(), Ok(builder.instructions()[0].outputs()[0]));
         drop(builder);
 
@@ -6379,14 +6379,14 @@ mod tests {
         assert_eq!(builder.instructions()[0].inputs(), &input_ids);
         drop(builder);
 
-        let context = TracingContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let left = context.input(ArrayType::scalar(DataType::F32).into());
         let right = context.input(ArrayType::scalar(DataType::F32).into());
         let left = <Tracer<_> as ValueProjection<ArrayType>>::into_projected(left).unwrap();
         let right = <Tracer<_> as ValueProjection<ArrayType>>::into_projected(right).unwrap();
         let output = left.apply_provided_binary(right);
         let builder = context.builder().borrow();
-        assert!(matches!(builder.instructions()[0].operation(), ArrayProgramOperation::Array(ArrayOperation::Add(_))));
+        assert!(matches!(builder.instructions()[0].operation(), ArrayIrOperation::Array(ArrayOperation::Add(_))));
         assert_eq!(output.value().atom_id(), Ok(builder.instructions()[0].outputs()[0]));
         drop(builder);
 

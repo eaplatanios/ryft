@@ -375,11 +375,15 @@ impl ArrayType {
         self.data_type == other.data_type && layout_is_refined && sharding_is_refined && self.memory == other.memory
     }
 
-    /// Extends a complete-signature [`TypeIdentityRenaming`] and its [`ArrayTypeRefinements`] with one declared/actual
-    /// [`ArrayType`] pair. This is the per-pair fold step behind [`Type::derive_identity_renaming`] for array types:
-    /// signature-level drivers (including the array arms of [`ArrayProgramType`]) call it once per member so that
-    /// a repeated declared [`DimensionVariable`] is checked consistently across the whole signature rather than
-    /// pair-by-pair.
+    /// Checks that `actual` can instantiate `declared` and records what that instantiation implies for the declared
+    /// [`DimensionVariable`]s (variable renamings in `renaming` and static extent bindings in `refinements`) for
+    /// one declared/actual [`ArrayType`] pair.
+    ///
+    /// This is the single-pair step used by the [`Type::derive_identity_renaming`] implementations that fold over an
+    /// entire declared/actual signature like [`ArrayType`]'s own, and [`ArrayIrType`]'s, which encounters array types
+    /// as individual elements of a mixed signature. It is a separate function so that those callers can thread the same
+    /// two accumulators through every pair of the signature, which is what makes a declared [`DimensionVariable`]
+    /// that appears in several signature positions get checked consistently rather than pair-by-pair.
     ///
     /// The `actual` type must have the `declared` type's element [`DataType`] and [`Memory`] placement, refine its
     /// optional [`Layout`] and [`Sharding`], and have the same rank. Each pair of corresponding dimensions then
@@ -393,10 +397,10 @@ impl ArrayType {
     ///
     /// Every other combination (e.g., mismatched static extents, a static declared dimension instantiated by a dynamic
     /// one, or actual bounds the declared variable's bounds do not contain) fails with a [`TypeError`]. A conflict
-    /// *between* the two accumulators, where one member renames a variable that another member binds to a static
-    /// extent, is deliberately left to the drivers, which call [`ArrayTypeRefinements::require_disjoint_from`] once
-    /// after folding over the complete signature, so that detection does not depend on the order in which the two
-    /// conflicting observations arrive.
+    /// *between* the two accumulators, where one signature position renames a variable that another position binds to
+    /// a static extent, is deliberately left to the signature-folding callers, which call
+    /// [`ArrayTypeRefinements::require_disjoint_from`] once after folding over the complete signature,
+    /// so that detection does not depend on the order in which the two conflicting observations arrive.
     ///
     /// # Example
     ///
@@ -406,7 +410,7 @@ impl ArrayType {
     ///   - `(f32[m, 2], f32[m])`: Records the renaming `n -> m` and accepts its consistent repetition.
     ///   - `(f32[3, 2], f32[4])`: Fails because `n` is bound to static extent `3` and then observed as `4`.
     ///   - `(f32[m, 2], f32[3])`: The extension itself succeeds, recording the renaming `n -> m` and the static binding
-    ///     `n = 3`; the driver's subsequent [`ArrayTypeRefinements::require_disjoint_from`] check then rejects the
+    ///     `n = 3`. The caller's subsequent [`ArrayTypeRefinements::require_disjoint_from`] check then rejects the
     ///     signature.
     fn extend_identity_renaming(
         declared: &Self,
@@ -707,16 +711,16 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
     }
 }
 
-/// [`Type`] of values stored in [`Program`](crate::Program)s that mix ordinary arrays with first-class runtime
-/// dimensions. It is the type-level counterpart of
-/// [`ArrayProgramValue`](crate::backends::array_programs::ArrayProgramValue), with one member per value kind.
+/// [`Type`] vocabulary of Ryft's array Intermediate Representation (IR), whose values may be ordinary arrays or
+/// first-class runtime dimensions. It is the type-level counterpart of [`ArrayIrValue`](crate::ArrayIrValue), with
+/// one member per value kind.
 ///
 /// The sum is a storage boundary rather than the contract ordinary primitives are written against: array-only
 /// [`Operation`](crate::Operation)s and transform rules keep consuming [`ArrayType`], dimension-only operations keep
-/// consuming [`DimensionType`], and only genuinely mixed operations — shape-carrying operations whose dynamic output
-/// extents are explicit dimension operands — consume this type directly. [`From`] lifts each member type into the
-/// sum, and the borrowing [`TryFrom`] implementations project it back out with a checked kind diagnostic. The same
-/// bridge backs the value-level [`ValueProjection`](crate::programs::ValueProjection) implementations.
+/// consuming [`DimensionType`], and only genuinely mixed operations (i.e., shape-carrying operations whose dynamic
+/// output extents are explicit dimension operands) consume this type directly. [`From`] lifts each member type into
+/// the sum, and the borrowing [`TryFrom`] implementations project it back out with a checked kind diagnostic.
+/// The same bridge backs the value-level [`ValueProjection`](crate::programs::ValueProjection) implementations.
 ///
 /// Both members carry [`DimensionVariable`] identities, so one renaming and refinement vocabulary spans a complete
 /// signature: an [`ArrayType`] member *references* the variables named by its dynamic axes, while a [`DimensionType`]
@@ -726,7 +730,7 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
 /// Refer to the documentation of [`DimensionType`] for why runtime dimensions can be first-class typed values in the
 /// first place, the input-derived provenance restriction they encode, and how it enables shape-polymorphic programs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub enum ArrayProgramType {
+pub enum ArrayIrType {
     /// An ordinary array type.
     Array(ArrayType),
 
@@ -734,7 +738,7 @@ pub enum ArrayProgramType {
     Dimension(DimensionType),
 }
 
-impl Display for ArrayProgramType {
+impl Display for ArrayIrType {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -744,47 +748,47 @@ impl Display for ArrayProgramType {
     }
 }
 
-impl From<ArrayType> for ArrayProgramType {
+impl From<ArrayType> for ArrayIrType {
     #[inline]
     fn from(r#type: ArrayType) -> Self {
         Self::Array(r#type)
     }
 }
 
-impl From<DimensionType> for ArrayProgramType {
+impl From<DimensionType> for ArrayIrType {
     #[inline]
     fn from(r#type: DimensionType) -> Self {
         Self::Dimension(r#type)
     }
 }
 
-impl<'t> TryFrom<&'t ArrayProgramType> for &'t ArrayType {
+impl<'t> TryFrom<&'t ArrayIrType> for &'t ArrayType {
     type Error = TypeError;
 
     #[inline]
-    fn try_from(r#type: &'t ArrayProgramType) -> Result<Self, Self::Error> {
+    fn try_from(r#type: &'t ArrayIrType) -> Result<Self, Self::Error> {
         match r#type {
-            ArrayProgramType::Array(r#type) => Ok(r#type),
-            ArrayProgramType::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
+            ArrayIrType::Array(r#type) => Ok(r#type),
+            ArrayIrType::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
         }
     }
 }
 
-impl<'t> TryFrom<&'t ArrayProgramType> for &'t DimensionType {
+impl<'t> TryFrom<&'t ArrayIrType> for &'t DimensionType {
     type Error = TypeError;
 
     #[inline]
-    fn try_from(r#type: &'t ArrayProgramType) -> Result<Self, Self::Error> {
+    fn try_from(r#type: &'t ArrayIrType) -> Result<Self, Self::Error> {
         match r#type {
-            ArrayProgramType::Array(_) => Err(TypeError::invalid("expected dimension type but got array type")),
-            ArrayProgramType::Dimension(r#type) => Ok(r#type),
+            ArrayIrType::Array(_) => Err(TypeError::invalid("expected dimension type but got array type")),
+            ArrayIrType::Dimension(r#type) => Ok(r#type),
         }
     }
 }
 
-impl Type for ArrayProgramType {
+impl Type for ArrayIrType {
     type Identity = DimensionVariable;
-    type Refinements = ArrayProgramTypeRefinements;
+    type Refinements = ArrayIrTypeRefinements;
 
     fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
         let array = match self {
@@ -868,7 +872,7 @@ impl Type for ArrayProgramType {
     }
 }
 
-/// [`TypeRefinements`] established while refining one complete [`ArrayProgramType`] signature. A declared dynamic array
+/// [`TypeRefinements`] established while refining one complete [`ArrayIrType`] signature. A declared dynamic array
 /// axis met by a static extent contributes a dynamic-to-static binding following the [`ArrayTypeRefinements`] rules
 /// unchanged. A dimension member contributes no concrete fact, because a [`DimensionType`] is strictly identity plus
 /// bounds: its variable belongs to the boundary's closed identity set (see
@@ -876,47 +880,45 @@ impl Type for ArrayProgramType {
 /// on first observation (e.g., relating an eagerly materialized static array output back to the dimension input that
 /// supplied its shape) while still rejecting inconsistent repeated observations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ArrayProgramTypeRefinements {
+pub struct ArrayIrTypeRefinements {
     /// [`ArrayTypeRefinements`] shared by all array members of the signature.
     arrays: ArrayTypeRefinements,
 }
 
-impl ArrayProgramTypeRefinements {
-    /// Validates a pair of [`ArrayProgramType`]s and visits any concrete identity refinement it contributes.
+impl ArrayIrTypeRefinements {
+    /// Validates a pair of [`ArrayIrType`]s and visits any concrete identity refinement it contributes.
     fn visit_pair(
-        declared: &ArrayProgramType,
-        actual: &ArrayProgramType,
+        declared: &ArrayIrType,
+        actual: &ArrayIrType,
         visit: impl FnMut(&DimensionVariable, usize) -> Result<(), TypeError>,
     ) -> Result<(), TypeError> {
         match (declared, actual) {
-            (ArrayProgramType::Array(declared), ArrayProgramType::Array(actual)) => {
+            (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) => {
                 ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared, actual, visit)
             }
-            (ArrayProgramType::Dimension(declared), ArrayProgramType::Dimension(actual))
-                if declared.is_refined_by(actual) =>
-            {
+            (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) if declared.is_refined_by(actual) => {
                 Ok(())
             }
-            (ArrayProgramType::Dimension(declared), ArrayProgramType::Dimension(actual)) => {
+            (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) => {
                 Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")))
             }
-            (ArrayProgramType::Array(_), ArrayProgramType::Dimension(_)) => {
+            (ArrayIrType::Array(_), ArrayIrType::Dimension(_)) => {
                 Err(TypeError::invalid("expected array type but got dimension type"))
             }
-            (ArrayProgramType::Dimension(_), ArrayProgramType::Array(_)) => {
+            (ArrayIrType::Dimension(_), ArrayIrType::Array(_)) => {
                 Err(TypeError::invalid("expected dimension type but got array type"))
             }
         }
     }
 }
 
-impl TypeRefinements<ArrayProgramType> for ArrayProgramTypeRefinements {
+impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
     fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
     where
         D::IntoIter: ExactSizeIterator,
         A::IntoIter: ExactSizeIterator,
-        D::Item: Borrow<ArrayProgramType>,
-        A::Item: Borrow<ArrayProgramType>,
+        D::Item: Borrow<ArrayIrType>,
+        A::Item: Borrow<ArrayIrType>,
     {
         let mut refinements = Self::default();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
@@ -934,8 +936,8 @@ impl TypeRefinements<ArrayProgramType> for ArrayProgramTypeRefinements {
     where
         D::IntoIter: ExactSizeIterator,
         A::IntoIter: ExactSizeIterator,
-        D::Item: Borrow<ArrayProgramType>,
-        A::Item: Borrow<ArrayProgramType>,
+        D::Item: Borrow<ArrayIrType>,
+        A::Item: Borrow<ArrayIrType>,
     {
         let mut refinements = self.clone();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
@@ -1373,16 +1375,16 @@ mod tests {
             Err(error.clone()),
         );
 
-        // The conflict is also detected across array and dimension members of one array-program signature.
+        // The conflict is also detected across array and dimension members of one array IR signature.
         assert_eq!(
-            ArrayProgramType::derive_identity_renaming(
+            ArrayIrType::derive_identity_renaming(
                 &[
-                    ArrayProgramType::Array(declared.clone()),
-                    ArrayProgramType::Dimension(DimensionType::new(declared_variable.clone())),
+                    ArrayIrType::Array(declared.clone()),
+                    ArrayIrType::Dimension(DimensionType::new(declared_variable.clone())),
                 ],
                 &[
-                    ArrayProgramType::Array(static_actual),
-                    ArrayProgramType::Dimension(DimensionType::new(actual_variable.clone())),
+                    ArrayIrType::Array(static_actual),
+                    ArrayIrType::Dimension(DimensionType::new(actual_variable.clone())),
                 ],
             ),
             Err(error),
@@ -1437,24 +1439,21 @@ mod tests {
     }
 
     #[test]
-    fn test_array_program_type() {
+    fn test_array_ir_type() {
         let declared_variable = DimensionVariable::new("declared", DimensionBounds::non_negative(Some(8)).unwrap());
         let actual_variable = DimensionVariable::new("actual", DimensionBounds::non_negative(Some(4)).unwrap());
         let declared = [
-            ArrayProgramType::Dimension(DimensionType::new(declared_variable.clone())),
-            ArrayProgramType::Array(ArrayType::new(
-                F32,
-                Shape::new(vec![Dimension::Dynamic(declared_variable.clone())]),
-            )),
+            ArrayIrType::Dimension(DimensionType::new(declared_variable.clone())),
+            ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(declared_variable.clone())]))),
         ];
         let actual = [
-            ArrayProgramType::Dimension(DimensionType::new(actual_variable.clone())),
-            ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(actual_variable.clone())]))),
+            ArrayIrType::Dimension(DimensionType::new(actual_variable.clone())),
+            ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(actual_variable.clone())]))),
         ];
         assert_eq!(
             declared
                 .iter()
-                .flat_map(ArrayProgramType::identities)
+                .flat_map(ArrayIrType::identities)
                 .map(|(position, identity)| (position, identity.clone()))
                 .collect::<Vec<_>>(),
             vec![
@@ -1463,34 +1462,31 @@ mod tests {
             ],
         );
 
-        let renaming = ArrayProgramType::derive_identity_renaming(&declared, &actual).unwrap();
+        let renaming = ArrayIrType::derive_identity_renaming(&declared, &actual).unwrap();
         assert_eq!(renaming.rename(&declared_variable), actual_variable);
         assert_eq!(
-            ArrayProgramType::derive_identity_renaming(&declared, &actual[..1]),
+            ArrayIrType::derive_identity_renaming(&declared, &actual[..1]),
             Err(TypeError::invalid("declared type count 2 does not match actual type count 1")),
         );
         assert_eq!(
-            ArrayProgramType::derive_identity_renaming(
-                &declared[..1],
-                &[ArrayProgramType::Array(ArrayType::scalar(F32))],
-            ),
+            ArrayIrType::derive_identity_renaming(&declared[..1], &[ArrayIrType::Array(ArrayType::scalar(F32))],),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
 
         let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap());
         let declared_array =
-            ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(batch.clone())])));
-        let actual_two = ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])));
-        let actual_three = ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)])));
-        let refinements = ArrayProgramTypeRefinements::establish(
+            ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(batch.clone())])));
+        let actual_two = ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])));
+        let actual_three = ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)])));
+        let refinements = ArrayIrTypeRefinements::establish(
             [declared_array.clone(), declared_array.clone()],
             [actual_two.clone(), actual_two.clone()],
         )
         .unwrap();
         assert_eq!(refinements.validate([declared_array.clone()], [actual_two], &[],), Ok(()),);
-        let error = ArrayProgramTypeRefinements::establish(
+        let error = ArrayIrTypeRefinements::establish(
             [declared_array.clone(), declared_array.clone()],
-            [ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))), actual_three],
+            [ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))), actual_three],
         )
         .unwrap_err();
         assert_eq!(
@@ -1502,8 +1498,8 @@ mod tests {
         // instead belongs to the boundary's closed identity signature, so output validation may establish the concrete
         // extent for it on first observation and must reject an inconsistent repeated observation within the same
         // validated signature.
-        let declared_dimension = ArrayProgramType::Dimension(DimensionType::new(batch.clone()));
-        let refinements = ArrayProgramTypeRefinements::establish(
+        let declared_dimension = ArrayIrType::Dimension(DimensionType::new(batch.clone()));
+        let refinements = ArrayIrTypeRefinements::establish(
             std::slice::from_ref(&declared_dimension),
             std::slice::from_ref(&declared_dimension),
         )
@@ -1513,8 +1509,8 @@ mod tests {
             refinements.validate(
                 [declared_array.clone(), declared_array.clone()],
                 [
-                    ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
-                    ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
+                    ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
+                    ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
                 ],
                 &closed_identities,
             ),
@@ -1524,8 +1520,8 @@ mod tests {
             .validate(
                 [declared_array.clone(), declared_array.clone()],
                 [
-                    ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
-                    ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]))),
+                    ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
+                    ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]))),
                 ],
                 &closed_identities,
             )
@@ -1539,11 +1535,11 @@ mod tests {
         // establish its first fact exactly like an input-signature identity.
         let unrelated = DimensionVariable::new("unrelated", DimensionBounds::non_negative(Some(8)).unwrap());
         let unrelated_array =
-            ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(unrelated.clone())])));
+            ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(unrelated.clone())])));
         assert_eq!(
             refinements.validate(
                 std::slice::from_ref(&unrelated_array),
-                [ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])))],
+                [ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])))],
                 &closed_identities,
             ),
             Err(TypeError::invalid("dimension identity unrelated does not belong to the validated boundary signature")),
@@ -1551,7 +1547,7 @@ mod tests {
         assert_eq!(
             refinements.validate(
                 std::slice::from_ref(&unrelated_array),
-                [ArrayProgramType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])))],
+                [ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])))],
                 std::slice::from_ref(&unrelated),
             ),
             Ok(()),

@@ -10,7 +10,7 @@
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
 
 use ryft_core::Typed;
-use ryft_core::backends::array_programs::ArrayProgramValue;
+use ryft_core::backends::array_programs::ArrayIrValue;
 use ryft_core::captures::{CapturingContext, ClosedProgram};
 use ryft_core::compilation::{
     CompilationDomain, CompilationStagingRequest, CompiledFunction, ExecutableProgram, JitCacheStatistics,
@@ -24,7 +24,7 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::programs::{ProgramError, ProjectedValue, Value, ValueProjection};
 use ryft_core::sharding::DeviceMesh;
 use ryft_core::tracing::{DomainTracingContext, Tracer};
-use ryft_core::types::{ArrayProgramType, ArrayType};
+use ryft_core::types::{ArrayIrType, ArrayType};
 use ryft_pjrt::Execution;
 
 use crate::Array;
@@ -33,22 +33,22 @@ use crate::experimental::ops::{XlaConstant, XlaOperation};
 use crate::profile_guided::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction};
 
 /// Composite tracer retained by the production XLA program.
-type XlaProgramTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, ArrayProgramValue<Array<'c>>>>;
+type XlaProgramTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, ArrayIrValue<Array<'c>>>>;
 
 /// Tracer leaf exposed by the public array-only XLA compilation facade.
 pub type XlaCompileTracer<'c> = ProjectedValue<ArrayType, XlaProgramTracer<'c>>;
 
 /// Internal reparameterization of one public array parameter tree into the production composite type family.
-type XlaProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayProgramType>;
+type XlaProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayIrType>;
 
 /// Internal value tree corresponding to one public array parameter tree.
-type XlaProgramParameterValues<P, V> = <XlaProgramParameters<P> as Parameterized<ArrayProgramType>>::To<V>;
+type XlaProgramParameterValues<P, V> = <XlaProgramParameters<P> as Parameterized<ArrayIrType>>::To<V>;
 
 /// Captured-constant tree corresponding to one public array parameter tree.
 type XlaProgramConstants<P> = XlaProgramParameterValues<P, XlaConstant>;
 
 /// Concrete runtime value retained by the production composite domain.
-type XlaProgramValue<'c> = ArrayProgramValue<Array<'c>>;
+type XlaProgramValue<'c> = ArrayIrValue<Array<'c>>;
 
 /// Projects one internal composite tracer tree to the public array-only tracer tree.
 fn project_tracers<'c, P>(
@@ -58,7 +58,7 @@ where
     P: Parameterized<ArrayType>,
     P::Family: ParameterizedFamily<XlaProgramTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<ArrayProgramType>,
+        + ParameterizedFamily<ArrayIrType>,
 {
     let structure = values.parameter_structure();
     let parameters = values
@@ -76,7 +76,7 @@ fn lift_tracers<'c, P>(
 ) -> Result<XlaProgramParameterValues<P, XlaProgramTracer<'c>>, XlaDomainError>
 where
     P: Parameterized<ArrayType>,
-    P::Family: ParameterizedFamily<ArrayProgramType>
+    P::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
 {
@@ -93,12 +93,11 @@ fn lift_arrays<'c, P>(
 ) -> Result<XlaProgramParameterValues<P, XlaProgramValue<'c>>, XlaDomainError>
 where
     P: Parameterized<ArrayType>,
-    P::Family: ParameterizedFamily<ArrayProgramType>
-        + ParameterizedFamily<Array<'c>>
-        + ParameterizedFamily<XlaProgramValue<'c>>,
+    P::Family:
+        ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaProgramValue<'c>>,
 {
     let structure = values.parameter_structure();
-    let parameters = values.into_parameters().map(ArrayProgramValue::Array);
+    let parameters = values.into_parameters().map(ArrayIrValue::Array);
     XlaProgramParameterValues::<P, XlaProgramValue<'c>>::from_parameters(structure, parameters)
         .map_err(ProgramError::from)
         .map_err(Into::into)
@@ -110,9 +109,8 @@ fn project_arrays<'c, P>(
 ) -> Result<P::To<Array<'c>>, XlaDomainError>
 where
     P: Parameterized<ArrayType>,
-    P::Family: ParameterizedFamily<ArrayProgramType>
-        + ParameterizedFamily<XlaProgramValue<'c>>
-        + ParameterizedFamily<Array<'c>>,
+    P::Family:
+        ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaProgramValue<'c>> + ParameterizedFamily<Array<'c>>,
 {
     let structure = values.parameter_structure();
     let parameters = values
@@ -131,8 +129,8 @@ where
 /// should be low-cardinality configuration such as axes, shapes, or Boolean branch choices; arrays remain dynamic.
 pub struct JittedXlaFunction<'c, F, Static: Specialization, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     /// Composite-domain dispatcher hidden behind the public array projection boundary.
     function: CoreJittedFunction<XlaDomain<'c>, F, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
@@ -142,9 +140,9 @@ impl<'c, F, Static, In, Out> Clone for JittedXlaFunction<'c, F, Static, In, Out>
 where
     Static: Specialization,
     In: Parameterized<ArrayType>,
-    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     CoreJittedFunction<XlaDomain<'c>, F, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>>: Clone,
 {
     #[inline]
@@ -157,13 +155,13 @@ impl<'c, F, Static, In, Out> JittedXlaFunction<'c, F, Static, In, Out>
 where
     Static: Specialization,
     In: Parameterized<ArrayType>,
-    In::Family: ParameterizedFamily<ArrayProgramType>
+    In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<Array<'c>>
         + ParameterizedFamily<XlaProgramValue<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayProgramType>
+    Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<Array<'c>>
         + ParameterizedFamily<XlaProgramValue<'c>>
@@ -181,13 +179,13 @@ where
             Static,
             XlaProgramParameterValues<In, XlaProgramTracer<'c>>,
         ) -> Result<XlaProgramParameterValues<Out, XlaProgramTracer<'c>>, XlaDomainError>,
-        XlaProgramParameters<In>: Parameterized<ArrayProgramType, To<ArrayProgramType> = XlaProgramParameters<In>>,
-        XlaProgramParameters<Out>: Parameterized<ArrayProgramType, To<ArrayProgramType> = XlaProgramParameters<Out>>,
+        XlaProgramParameters<In>: Parameterized<ArrayIrType, To<ArrayIrType> = XlaProgramParameters<In>>,
+        XlaProgramParameters<Out>: Parameterized<ArrayIrType, To<ArrayIrType> = XlaProgramParameters<Out>>,
         XlaProgramParameterValues<In, XlaProgramValue<'c>>:
-            Parameterized<XlaProgramValue<'c>, To<ArrayProgramType> = XlaProgramParameters<In>>,
+            Parameterized<XlaProgramValue<'c>, To<ArrayIrType> = XlaProgramParameters<In>>,
         XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
                 XlaProgramTracer<'c>,
-                To<ArrayProgramType> = XlaProgramParameters<Out>,
+                To<ArrayIrType> = XlaProgramParameters<Out>,
                 To<XlaConstant> = XlaProgramConstants<Out>,
             >,
     {
@@ -221,12 +219,12 @@ where
     F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
     Static: Specialization,
     In: Parameterized<ArrayType>,
-    In::Family: ParameterizedFamily<ArrayProgramType>
+    In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayProgramType>
+    Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
@@ -257,12 +255,12 @@ where
     F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     Static: Specialization,
     In: Parameterized<ArrayType>,
-    In::Family: ParameterizedFamily<ArrayProgramType>
+    In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayProgramType>
+    Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
@@ -290,12 +288,12 @@ where
     F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     Static: Specialization,
     In: Parameterized<ArrayType>,
-    In::Family: ParameterizedFamily<ArrayProgramType>
+    In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayProgramType>
+    Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
@@ -317,10 +315,8 @@ type XlaSourceProgramOutput<Out> = XlaProgramConstants<Out>;
 /// even when they were produced at different Rust call sites.
 pub struct StagedXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     /// Backend-neutral staged function carrying the source program, captures, structures, and retained options.
     function: StagedFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
@@ -328,10 +324,8 @@ where
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for StagedXlaFunction<'c, In, Out>
 where
-    In::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     fn clone(&self) -> Self {
         Self { function: self.function.clone() }
@@ -340,10 +334,8 @@ where
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> StagedXlaFunction<'c, In, Out>
 where
-    In::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     /// Returns the staged source [`Program`](ryft_core::Program) together with its captured runtime values. Useful for
     /// outer transforms (`grad` / `jvp` / `vjp` / `batch`), staged `jit_call` payloads, and diagnostics (printing the
@@ -369,8 +361,8 @@ where
         inputs: In::To<ProjectedValue<ArrayType, V>>,
     ) -> Result<Out::To<ProjectedValue<ArrayType, V>>, ProgramError>
     where
-        V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-        V::DispatchDomain: Context<Type = ArrayProgramType, Constant = XlaConstant, Operation = XlaOperation>
+        V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+        V::DispatchDomain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>
             + CapturingContext<Capture = XlaProgramValue<'c>>
             + Constant<V, XlaConstant>,
         In::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
@@ -403,10 +395,8 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
     From<StagedFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>>
     for StagedXlaFunction<'c, In, Out>
 where
-    In::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     #[inline]
     fn from(function: StagedFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>) -> Self {
@@ -421,16 +411,16 @@ where
 /// backend state; no unsafe blanket implementation is used.
 pub struct ExecutableXlaProgram<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     function: ExecutableProgram<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
 }
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for ExecutableXlaProgram<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -440,8 +430,8 @@ where
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> ExecutableXlaProgram<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     /// Returns the flat output [`ArrayType`]s in executor order.
     #[inline]
@@ -465,10 +455,10 @@ impl<'c> XlaDomain<'c> {
     where
         In: Parameterized<ArrayType>,
         In::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
         Out: Parameterized<ArrayType>,
         Out::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     {
         let lowered = self.lower(staged.function)?;
         let function = self.compile(lowered)?;
@@ -485,14 +475,14 @@ impl<'c> XlaDomain<'c> {
     where
         In: Parameterized<
                 ArrayType,
-                Family: ParameterizedFamily<ArrayProgramType>
+                Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
                             + ParameterizedFamily<Array<'c>>
                             + ParameterizedFamily<XlaProgramValue<'c>>,
             >,
         Out: Parameterized<
                 ArrayType,
-                Family: ParameterizedFamily<ArrayProgramType>
+                Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
                             + ParameterizedFamily<Array<'c>>
                             + ParameterizedFamily<XlaProgramValue<'c>>,
@@ -513,14 +503,14 @@ impl<'c> XlaDomain<'c> {
     where
         In: Parameterized<
                 ArrayType,
-                Family: ParameterizedFamily<ArrayProgramType>
+                Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
                             + ParameterizedFamily<Array<'c>>
                             + ParameterizedFamily<XlaProgramValue<'c>>,
             >,
         Out: Parameterized<
                 ArrayType,
-                Family: ParameterizedFamily<ArrayProgramType>
+                Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
                             + ParameterizedFamily<Array<'c>>
                             + ParameterizedFamily<XlaProgramValue<'c>>,
@@ -552,7 +542,7 @@ impl<'c> XlaDomain<'c> {
         )?;
         let outputs = executable
             .function
-            .reconstruct_outputs(flat_outputs.into_iter().map(ArrayProgramValue::Array).collect())
+            .reconstruct_outputs(flat_outputs.into_iter().map(ArrayIrValue::Array).collect())
             .map_err(XlaDomainError::from)?;
         Ok(Execution::new(project_arrays::<Out>(outputs)?, fence))
     }
@@ -565,9 +555,9 @@ impl<'c> XlaDomain<'c> {
     ) -> Result<ExecutableXlaProgram<'c, In, Out>, XlaDomainError>
     where
         In: Parameterized<ArrayType>,
-        In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+        In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
         Out: Parameterized<ArrayType>,
-        Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+        Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     {
         self.validate_xla_replacement(executable.function.compiled_program(), &program)?;
         Ok(ExecutableXlaProgram {
@@ -591,10 +581,10 @@ impl<'c> XlaDomain<'c> {
     where
         In: Parameterized<ArrayType>,
         In::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
         Out: Parameterized<ArrayType>,
         Out::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     {
         AdaptiveProfileGuidedXlaFunction::new(
             self.clone(),
@@ -619,10 +609,8 @@ impl<'c> XlaDomain<'c> {
 /// emits a `jit_call` boundary carrying the source program into the active outer trace context.
 pub struct CompiledXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     /// Backend-neutral compiled function backed by an XLA executable. Retains the staged source function,
     /// captured runtime buffers, output structure, and compilation options through its lowered metadata.
@@ -631,10 +619,8 @@ where
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for CompiledXlaFunction<'c, In, Out>
 where
-    In::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     fn clone(&self) -> Self {
         Self { function: self.function.clone() }
@@ -643,10 +629,8 @@ where
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> CompiledXlaFunction<'c, In, Out>
 where
-    In::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     /// Returns the flat output [`ArrayType`]s in the order the executor produces them.
     #[inline]
@@ -698,8 +682,8 @@ where
         inputs: In::To<ProjectedValue<ArrayType, V>>,
     ) -> Result<Out::To<ProjectedValue<ArrayType, V>>, ProgramError>
     where
-        V: Value<Type = ArrayProgramType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-        V::DispatchDomain: Context<Type = ArrayProgramType, Constant = XlaConstant, Operation = XlaOperation>
+        V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+        V::DispatchDomain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>
             + CapturingContext<Capture = XlaProgramValue<'c>>
             + Constant<V, XlaConstant>,
         In::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
@@ -715,7 +699,7 @@ where
 impl<'c, In: Parameterized<ArrayType, To<ArrayType> = In>> CompiledXlaFunction<'c, In, ArrayType>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
     In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
@@ -743,7 +727,7 @@ where
             >,
         XlaProgramParameterValues<In, XlaProgramTracer<'c>>: Parameterized<
                 XlaProgramTracer<'c>,
-                To<ArrayProgramType> = XlaProgramParameters<In>,
+                To<ArrayIrType> = XlaProgramParameters<In>,
                 To<XlaConstant> = XlaProgramConstants<In>,
             >,
     {
@@ -809,12 +793,12 @@ impl<'c, In: Clone + Parameterized<ArrayType, To<ArrayType> = In>, Out: Paramete
     CompiledXlaFunction<'c, In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
     In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
 {
@@ -845,7 +829,7 @@ where
             >,
         XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
                 XlaProgramTracer<'c>,
-                To<ArrayProgramType> = XlaProgramParameters<Out>,
+                To<ArrayIrType> = XlaProgramParameters<Out>,
                 To<XlaConstant> = XlaProgramConstants<Out>,
             >,
     {
@@ -957,13 +941,13 @@ pub fn compile<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Param
 where
     F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
     In::ParameterStructure: std::hash::Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
@@ -971,7 +955,7 @@ where
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
     XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
             XlaProgramTracer<'c>,
-            To<ArrayProgramType> = XlaProgramParameters<Out>,
+            To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
 {
@@ -994,13 +978,13 @@ pub fn compile_with_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayTyp
 where
     F: FnOnce(Vec<XlaCompileTracer<'c>>, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
     In::ParameterStructure: std::hash::Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
@@ -1008,7 +992,7 @@ where
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
     XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
             XlaProgramTracer<'c>,
-            To<ArrayProgramType> = XlaProgramParameters<Out>,
+            To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
 {
@@ -1033,13 +1017,13 @@ pub fn compile_with_options<'domain, 'c: 'domain, F, In: Parameterized<ArrayType
 where
     F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
     In::ParameterStructure: std::hash::Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
@@ -1047,7 +1031,7 @@ where
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
     XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
             XlaProgramTracer<'c>,
-            To<ArrayProgramType> = XlaProgramParameters<Out>,
+            To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
 {
@@ -1069,13 +1053,13 @@ where
         In::To<XlaCompileTracer<'c>>,
     ) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
     In::ParameterStructure: std::hash::Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
@@ -1083,7 +1067,7 @@ where
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
     XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
             XlaProgramTracer<'c>,
-            To<ArrayProgramType> = XlaProgramParameters<Out>,
+            To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
 {
@@ -1108,13 +1092,13 @@ pub fn stage<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Paramet
 where
     F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
     In::ParameterStructure: std::hash::Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
@@ -1122,7 +1106,7 @@ where
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
     XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
             XlaProgramTracer<'c>,
-            To<ArrayProgramType> = XlaProgramParameters<Out>,
+            To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
 {
@@ -1145,13 +1129,13 @@ pub fn stage_with_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>
 where
     F: FnOnce(Vec<XlaCompileTracer<'c>>, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
     In::ParameterStructure: std::hash::Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
@@ -1159,7 +1143,7 @@ where
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
     XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
             XlaProgramTracer<'c>,
-            To<ArrayProgramType> = XlaProgramParameters<Out>,
+            To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
 {
@@ -1187,13 +1171,13 @@ where
         In::To<XlaCompileTracer<'c>>,
     ) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
     In::ParameterStructure: std::hash::Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
@@ -1201,15 +1185,15 @@ where
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
     XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
             XlaProgramTracer<'c>,
-            To<ArrayProgramType> = XlaProgramParameters<Out>,
+            To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
 {
-    let captures = captures.into_iter().map(ArrayProgramValue::Array).collect();
+    let captures = captures.into_iter().map(ArrayIrValue::Array).collect();
     let input_structure = input_types.parameter_structure();
     let input_types = XlaProgramParameters::<In>::from_parameters(
         input_structure,
-        input_types.into_parameters().map(ArrayProgramType::from),
+        input_types.into_parameters().map(ArrayIrType::from),
     )
     .map_err(ProgramError::from)?;
     let function = move |capture_references,
@@ -1237,12 +1221,12 @@ pub fn infer_output_types<F, In: Parameterized<ArrayType>, Out: Parameterized<Ar
 where
     F: FnOnce(In::To<XlaCompileTracer<'static>>) -> Out::To<XlaCompileTracer<'static>>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'static>>
         + ParameterizedFamily<XlaProgramTracer<'static>>,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'static>>
         + ParameterizedFamily<XlaProgramTracer<'static>>,
@@ -1251,7 +1235,7 @@ where
     let input_structure = input_types.parameter_structure();
     let input_types = XlaProgramParameters::<In>::from_parameters(
         input_structure,
-        input_types.into_parameters().map(ArrayProgramType::from),
+        input_types.into_parameters().map(ArrayIrType::from),
     )?;
     let output_types = DomainTracingContext::<XlaDomain<'static>, XlaProgramValue<'static>>::infer_output_type(
         |tracers| {
@@ -1281,7 +1265,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::backends::array_programs::ArrayProgramValue;
+    use ryft_core::backends::array_programs::ArrayIrValue;
     use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
     use ryft_core::backends::scalars::Scalar;
     use ryft_core::contexts::{Context, EagerContext};
@@ -1305,7 +1289,7 @@ mod tests {
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::DomainTracingContext;
     use ryft_core::types::data::DataType;
-    use ryft_core::types::{ArrayProgramType, ArrayType, Dimension, Shape};
+    use ryft_core::types::{ArrayIrType, ArrayType, Dimension, Shape};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
@@ -3157,7 +3141,7 @@ mod tests {
         let options = XlaOptions::new(mesh).with_in_shardings(vec![sharding]);
         let staged: StagedXlaFunction<'_, ArrayType, ArrayType> =
             stage(|x| x.sin().unwrap(), input_type, &engine, options).unwrap();
-        let ArrayProgramType::Array(staged_input_type) = &staged.source_program().program().input_types()[0] else {
+        let ArrayIrType::Array(staged_input_type) = &staged.source_program().program().input_types()[0] else {
             panic!("public staged input should remain an array");
         };
         assert!(staged_input_type.sharding().is_some());
@@ -3205,7 +3189,7 @@ mod tests {
     /// Tracing context that stages the decode-loop demo's `While` condition and body region programs in the XLA
     /// domain universe: its tracers are exactly [`XlaCompileTracer`]s, so the shared [`decode_step`] model runs
     /// unchanged inside the staged regions and in the eager reference loop.
-    type DecodeTraceContext<'c> = DomainTracingContext<XlaDomain<'c>, ArrayProgramValue<Array<'c>>>;
+    type DecodeTraceContext<'c> = DomainTracingContext<XlaDomain<'c>, ArrayIrValue<Array<'c>>>;
 
     /// Shape and sampling hyperparameters of the tiny decode-loop demo model.
     #[derive(Copy, Clone)]
@@ -3407,8 +3391,7 @@ mod tests {
         attention: DecodeAttention,
     ) -> Vec<XlaCompileTracer<'c>> {
         let context = inputs[0].value().context().clone();
-        let carry_types =
-            inputs.iter().map(|input| input.value().r#type().into_owned()).collect::<Vec<ArrayProgramType>>();
+        let carry_types = inputs.iter().map(|input| input.value().r#type().into_owned()).collect::<Vec<ArrayIrType>>();
         let steps = configuration.steps;
         let (_, condition) = <DecodeTraceContext<'c>>::trace(
             |state: Vec<XlaProgramTracer<'c>>| {

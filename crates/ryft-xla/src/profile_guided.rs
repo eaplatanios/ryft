@@ -8,10 +8,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use ryft_core::backends::array_programs::ArrayProgramValue;
+use ryft_core::backends::array_programs::ArrayIrValue;
 use ryft_core::compilation::CompilationCacheDomain;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
-use ryft_core::types::{ArrayProgramType, ArrayType};
+use ryft_core::types::{ArrayIrType, ArrayType};
 use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile;
 use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 
@@ -366,16 +366,16 @@ fn adaptive_profile_sidecar_key<'c>(
 /// or records a permanent failure while continuing to serve the baseline.
 pub struct AdaptiveProfileGuidedXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     inner: Arc<AdaptiveProfileGuidedXlaFunctionInner<'c, In, Out>>,
 }
 
 struct AdaptiveProfileGuidedXlaFunctionInner<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     domain: XlaDomain<'c>,
     baseline: ExecutableXlaProgram<'c, In, Out>,
@@ -390,8 +390,8 @@ where
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone
     for AdaptiveProfileGuidedXlaFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -401,8 +401,8 @@ where
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptiveProfileGuidedXlaFunction<'c, In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
-    Out::Family: ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     pub(crate) fn new(
         domain: XlaDomain<'c>,
@@ -471,8 +471,8 @@ where
     /// Executes with the active executable and advances adaptive profiling when this call wins ownership.
     pub fn interpret(&self, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
-        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayProgramValue<Array<'c>>>,
-        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayProgramValue<Array<'c>>>,
+        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayIrValue<Array<'c>>>,
+        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayIrValue<Array<'c>>>,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
@@ -507,8 +507,8 @@ where
         inputs: In::To<Array<'c>>,
     ) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
-        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayProgramValue<Array<'c>>>,
-        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayProgramValue<Array<'c>>>,
+        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayIrValue<Array<'c>>>,
+        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayIrValue<Array<'c>>>,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {

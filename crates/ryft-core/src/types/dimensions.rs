@@ -360,19 +360,23 @@ impl DimensionType {
         (bounds.lower().checked_add(1) == bounds.upper()).then_some(bounds.lower())
     }
 
-    /// Returns the most precise [`Dimension`] described by this [`DimensionType`]. Exact singleton bounds become a
-    /// static dimension. All other cases retain this type's [`DimensionVariable`] as a dynamic dimension.
+    /// Returns the most precise [`Dimension`] described by this [`DimensionType`]. Exact singleton bounds become
+    /// a static dimension. All other cases retain this type's [`DimensionVariable`] as a dynamic dimension.
     #[inline]
     pub fn to_dimension(&self) -> Dimension {
         self.extent().map_or_else(|| Dimension::Dynamic(self.variable.clone()), Dimension::Static)
     }
 
-    /// Extends a complete-signature [`TypeIdentityRenaming`] with one declared/actual dimension-type pair. This is
-    /// the per-pair fold step behind [`Type::derive_identity_renaming`] for dimension types: signature-level drivers
-    /// (including the dimension arms of [`ArrayProgramType`](crate::types::ArrayProgramType)) call it once per member
-    /// so that a repeated declared [`DimensionVariable`] renames consistently across the whole signature. The `actual`
-    /// [`DimensionType`]'s bounds must be contained in the `declared` [`DimensionType`]'s bounds, and the declared
-    /// [`DimensionVariable`] must not already be renamed to a different target by another member of the same signature.
+    /// Checks that `actual` refines `declared` (i.e., that the actual bounds are contained in the declared bounds)
+    /// and records the renaming of `declared`'s [`DimensionVariable`] to `actual`'s in `renaming`, failing when that
+    /// variable is already renamed to a different target.
+    ///
+    /// This is the single-pair step used by the [`Type::derive_identity_renaming`] implementations that fold over an
+    /// entire declared/actual signature like [`DimensionType`]'s own, and [`ArrayIrType`](crate::ArrayIrType)'s, which
+    /// encounters dimension types as individual elements of a mixed signature. It is a separate function so that
+    /// those callers can thread one shared [`TypeIdentityRenaming`] through every pair of the signature. Sharing the
+    /// accumulator is what makes a declared [`DimensionVariable`] that appears in several signature positions rename
+    /// consistently, and what rejects signatures that would rename it to two different targets.
     ///
     /// # Example
     ///

@@ -23,7 +23,7 @@ use ryft_core::programs::types::Typed;
 use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError, ProjectedValue, Value, ValueProjection};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::DomainTracingContext;
-use ryft_core::types::{ArrayProgramType, ArrayType, Dimension, Shape};
+use ryft_core::types::{ArrayIrType, ArrayType, Dimension, Shape};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::operations::ShardMapOperation;
@@ -466,9 +466,9 @@ pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayTy
 
 pub(crate) type ShardMapLocalTraceOutput<Output> = <Output as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
-type ShardMapProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayProgramType>;
+type ShardMapProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayIrType>;
 
-type ShardMapProgramValues<P, V> = <ShardMapProgramParameters<P> as Parameterized<ArrayProgramType>>::To<V>;
+type ShardMapProgramValues<P, V> = <ShardMapProgramParameters<P> as Parameterized<ArrayIrType>>::To<V>;
 
 type ShardMapCapturedInput<Input> = ShardMapProgramValues<Input, XlaConstant>;
 
@@ -481,13 +481,13 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
     type Return<Input: Parameterized<Self>, Output: Parameterized<ArrayType>>
     where
         Input::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ArrayProgramType>
+            + ParameterizedFamily<ArrayIrType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ArrayProgramType>
+            + ParameterizedFamily<ArrayIrType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Self>,
@@ -509,13 +509,13 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
         Input::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ArrayProgramType>
+            + ParameterizedFamily<ArrayIrType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ArrayProgramType>
+            + ParameterizedFamily<ArrayIrType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Self>,
@@ -543,11 +543,11 @@ pub fn trace<
 ) -> Result<TracedXlaProgram<Input, Output>, ShardMapTraceError>
 where
     Input::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
@@ -700,13 +700,13 @@ pub fn shard_map<
 ) -> Result<<Leaf as ShardMapInvocationLeaf>::Return<Input, Output>, ShardMapTraceError>
 where
     Input::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Sharding>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
         + ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>
         + ParameterizedFamily<Leaf>,
@@ -749,13 +749,13 @@ pub fn shard_map_with_options<
 ) -> Result<<Leaf as ShardMapInvocationLeaf>::Return<Input, Output>, ShardMapTraceError>
 where
     Input::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Sharding>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
         + ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>
         + ParameterizedFamily<Leaf>,
@@ -772,10 +772,9 @@ where
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedShardMap<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Output::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
 {
@@ -802,10 +801,9 @@ where
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedXlaProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Output::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
 {
@@ -1035,11 +1033,11 @@ impl ShardMap {
     ) -> Result<TracedShardMap<Input, Output>, ShardMapTraceError>
     where
         Input::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ArrayProgramType>
+            + ParameterizedFamily<ArrayIrType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ArrayProgramType>
+            + ParameterizedFamily<ArrayIrType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
@@ -1064,10 +1062,9 @@ impl ShardMap {
 #[allow(private_bounds, private_interfaces)]
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedShardMap<Input, Output>
 where
-    Input::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Output::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
 {
@@ -1114,10 +1111,9 @@ where
 #[allow(private_bounds, private_interfaces)]
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedXlaProgram<Input, Output>
 where
-    Input::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Output::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
 {
@@ -1276,9 +1272,9 @@ impl FlatTracedShardMap {
     ) -> Self
     where
         Input::Family:
-            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+            ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
         Output::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ArrayProgramType>
+            + ParameterizedFamily<ArrayIrType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>,
     {
@@ -1521,17 +1517,17 @@ fn trace_xla_function<
 ) -> Result<(Output, XlaProgram<ShardMapCapturedInput<Input>, ShardMapCapturedOutput<Output>>), ShardMapTraceError>
 where
     Input::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
     let input_structure = input_types.parameter_structure();
-    let flat_input_types = input_types.parameters().cloned().map(ArrayProgramType::from).collect::<Vec<_>>();
+    let flat_input_types = input_types.parameters().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
     let output_structure = RefCell::new(None);
     let (flat_output_types, program) = DomainTracingContext::<XlaDomain<'static>>::trace_with_named_axes(
         |input: Vec<XlaTracer<'static>>| {
@@ -3727,7 +3723,7 @@ mod tests {
                             let local_type = local_x.r#type().into_owned();
                             let psum_branch = {
                                 let mut builder = XlaProgramBuilder::new();
-                                let input = builder.add_input(ArrayProgramType::Array(local_type.clone()));
+                                let input = builder.add_input(ArrayIrType::Array(local_type.clone()));
                                 let output = builder
                                     .add_instruction(
                                         CollectiveOperation::new("x".to_string(), CollectiveKind::PSum),
@@ -3739,7 +3735,7 @@ mod tests {
                             };
                             let identity_branch = {
                                 let mut builder = XlaProgramBuilder::new();
-                                let input = builder.add_input(ArrayProgramType::Array(local_type));
+                                let input = builder.add_input(ArrayIrType::Array(local_type));
                                 builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
                             };
                             let predicate = local_x

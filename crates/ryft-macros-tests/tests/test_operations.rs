@@ -1397,7 +1397,7 @@ fn test_operation_default_crate_path_is_ryft() {
 mod mixed_members {
     use ryft::backends::arrays::Array;
     use ryft::{
-        ArrayProgramType, ArrayProgramValue, ArrayType, Context, DataType, DifferentiableOperation, DifferentiableType,
+        ArrayIrType, ArrayIrValue, ArrayType, Context, DataType, DifferentiableOperation, DifferentiableType,
         DifferentiationDriver, DifferentiationDual, Dimension, DimensionBounds, DimensionOperation, DimensionType,
         DimensionValue, DimensionVariable, EmptyRegionDriver, MaybeZero, MemberDifferentiableOperation,
         MemberInterpretableOperation, MemberOperation, Operation, PartialValue, ProgramError, RegionInterface, Shape,
@@ -1430,20 +1430,20 @@ mod mixed_members {
         }
     }
 
-    impl MemberOperation<ArrayProgramType> for InterleavedOperation {
+    impl MemberOperation<ArrayIrType> for InterleavedOperation {
         fn infer_parent_region_input_types(
             &self,
-            _input_types: &[ArrayProgramType],
-            region_interfaces: &[RegionInterface<ArrayProgramType>],
-        ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
+            _input_types: &[ArrayIrType],
+            region_interfaces: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
             Ok(vec![None; region_interfaces.len()])
         }
 
         fn infer_parent_output_types(
             &self,
-            input_types: &[ArrayProgramType],
-            _region_interfaces: &[RegionInterface<ArrayProgramType>],
-        ) -> Result<Vec<ArrayProgramType>, TypeError> {
+            input_types: &[ArrayIrType],
+            _region_interfaces: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
             // The parent boundary is `(array, dimension, array, dimension) -> array`, so the payload's own homogeneous
             // rule sees the two array operands and the dimension operands only select the result geometry.
             let arrays = input_types
@@ -1462,7 +1462,7 @@ mod mixed_members {
         }
     }
 
-    impl<C: Context<Type = ArrayProgramType>> MemberInterpretableOperation<C> for InterleavedOperation {
+    impl<C: Context<Type = ArrayIrType>> MemberInterpretableOperation<C> for InterleavedOperation {
         fn interpret_in_parent<D: ryft::InterpretationDriver<C>>(
             &self,
             _context: &C,
@@ -1473,7 +1473,7 @@ mod mixed_members {
         }
     }
 
-    impl<C: Context<Type = ArrayProgramType, Operation: From<InterleavedOperation>>> MemberDifferentiableOperation<C>
+    impl<C: Context<Type = ArrayIrType, Operation: From<InterleavedOperation>>> MemberDifferentiableOperation<C>
         for InterleavedOperation
     {
         fn jvp_in_parent<D: DifferentiationDriver<C>>(
@@ -1544,20 +1544,20 @@ mod mixed_members {
         }
     }
 
-    impl MemberOperation<ArrayProgramType> for MixedUniverseConstructorOperation {
+    impl MemberOperation<ArrayIrType> for MixedUniverseConstructorOperation {
         fn infer_parent_region_input_types(
             &self,
-            _input_types: &[ArrayProgramType],
-            region_interfaces: &[RegionInterface<ArrayProgramType>],
-        ) -> Result<Vec<Option<Vec<ArrayProgramType>>>, TypeError> {
+            _input_types: &[ArrayIrType],
+            region_interfaces: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
             Ok(vec![None; region_interfaces.len()])
         }
 
         fn infer_parent_output_types(
             &self,
-            _input_types: &[ArrayProgramType],
-            _region_interfaces: &[RegionInterface<ArrayProgramType>],
-        ) -> Result<Vec<ArrayProgramType>, TypeError> {
+            _input_types: &[ArrayIrType],
+            _region_interfaces: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
             Ok(vec![self.r#type.clone().into(), self.dimension_type.clone().into()])
         }
 
@@ -1569,7 +1569,7 @@ mod mixed_members {
         }
     }
 
-    impl<C: Context<Type = ArrayProgramType>> MemberInterpretableOperation<C> for MixedUniverseConstructorOperation {
+    impl<C: Context<Type = ArrayIrType>> MemberInterpretableOperation<C> for MixedUniverseConstructorOperation {
         fn interpret_in_parent<D: ryft::InterpretationDriver<C>>(
             &self,
             _context: &C,
@@ -1617,7 +1617,7 @@ mod mixed_members {
     /// Operation family with two declared member universes: computational arrays and structural first-class
     /// dimensions. Its mixed variants take their data universe from that declaration instead of naming it.
     #[derive(Clone, Debug, ryft::Operation)]
-    #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+    #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
     #[ryft(members(ArrayType, structural(DimensionType)))]
     #[ryft(dispatch(differentiation, transposition))]
     enum MixedProgramOperation<A: Value<Type = ArrayType>> {
@@ -1641,7 +1641,7 @@ mod mixed_members {
     impl<A, C> MemberDifferentiableOperation<C> for MixedMemberOperation<A>
     where
         A: Value<Type = ArrayType>,
-        C: Context<Type = ArrayProgramType, Operation: From<MixedMemberOperation<A>>>,
+        C: Context<Type = ArrayIrType, Operation: From<MixedMemberOperation<A>>>,
     {
         fn jvp_in_parent<D: DifferentiationDriver<C>>(
             &self,
@@ -1666,8 +1666,8 @@ mod mixed_members {
         }
     }
 
-    impl<A: Value<Type = ArrayType>> ZeroOperationProvider<ArrayProgramType> for MixedProgramOperation<A> {
-        fn zero_operation(r#type: ArrayProgramType) -> Result<Self, ProgramError> {
+    impl<A: Value<Type = ArrayType>> ZeroOperationProvider<ArrayIrType> for MixedProgramOperation<A> {
+        fn zero_operation(r#type: ArrayIrType) -> Result<Self, ProgramError> {
             Ok(Self::from(ZeroOperation::new(<&ArrayType>::try_from(&r#type)?.clone())))
         }
     }
@@ -1705,7 +1705,7 @@ mod mixed_members {
 
         // Transposing that interleaved instruction delegates the array operands, in operand order, to the payload's
         // homogeneous rule and gives each interleaved dimension operand a structural zero cotangent.
-        let mut context = TracingContext::<ArrayProgramValue<Array>, Operation>::new();
+        let mut context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
         let output_cotangent = context.input(array_type.clone().into());
         let cotangents = operation
             .transpose(
@@ -1731,7 +1731,7 @@ mod mixed_members {
         };
         assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
         assert_eq!(third_cotangent.atom_id(), output_cotangent.atom_id());
-        let dimension_cotangent_type = ArrayProgramType::from(dimension_type).cotangent();
+        let dimension_cotangent_type = ArrayIrType::from(dimension_type).cotangent();
         assert_eq!(second_cotangent_type, &dimension_cotangent_type);
         assert_eq!(fourth_cotangent_type, &dimension_cotangent_type);
     }
@@ -1748,16 +1748,16 @@ mod mixed_members {
             r#type: array_type.clone(),
             dimension_type: dimension_type.clone(),
         });
-        let context = TracingContext::<ArrayProgramValue<Array>, Operation>::new();
+        let context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
         let duals = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
 
         assert_eq!(duals.len(), 2);
-        assert_eq!(duals[0].primal().r#type().as_ref(), &ArrayProgramType::from(array_type.clone()));
-        assert_eq!(duals[1].primal().r#type().as_ref(), &ArrayProgramType::from(dimension_type.clone()));
+        assert_eq!(duals[0].primal().r#type().as_ref(), &ArrayIrType::from(array_type.clone()));
+        assert_eq!(duals[1].primal().r#type().as_ref(), &ArrayIrType::from(dimension_type.clone()));
         let MaybeZero::Value(array_tangent) = duals[0].tangent() else {
             panic!("an array output of a structural mixed payload stages a member zero tangent: {duals:?}");
         };
-        assert_eq!(array_tangent.r#type().as_ref(), &ArrayProgramType::from(array_type.tangent()));
+        assert_eq!(array_tangent.r#type().as_ref(), &ArrayIrType::from(array_type.tangent()));
         assert!(matches!(duals[1].tangent(), MaybeZero::Zero(_)));
 
         // The staged program holds the primal instruction plus exactly one staged array zero tangent.

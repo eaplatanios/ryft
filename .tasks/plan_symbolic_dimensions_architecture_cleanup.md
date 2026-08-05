@@ -29,7 +29,7 @@ preserves that plan's user-visible capabilities and its decision to represent ru
 values, but supersedes the following implementation compromises:
 
 - one operation payload implementing materially different `Operation<ArrayType>` and
-  `Operation<ArrayProgramType>` contracts;
+  `Operation<ArrayIrType>` contracts;
 - a complete homogeneous `ArrayOperation` graph used as an implicit-shape transform staging language;
 - `ArrayContextView` side channels that recover dimension operands from ambient dimensions or source arrays;
 - replay-time conversion of implicit shape dependencies back into explicit dimension SSA operands;
@@ -108,7 +108,7 @@ post-Phase-7 inventory at `7da7d7f25`, recorded in `.tasks/plan_p8a_operation_co
 2026-07-28 count:
 
 - `ConcatenateOperation`, `CustomCallOperation`, `PadOperation`, and `RngBitGeneratorOperation` directly implement
-  both `Operation<ArrayType>` and `Operation<ArrayProgramType>`;
+  both `Operation<ArrayType>` and `Operation<ArrayIrType>`;
 - `CompareOperation` has a generic homogeneous `Operation<T>` implementation plus its distinct composite dimension
   comparison contract;
 - `ShardMapOperation<V>` implements both array and composite contracts;
@@ -133,7 +133,7 @@ case:
 
 The current branch has removed those four archived array-program-specific implementations. `One`, fill, and `Iota`
 appear only in the homogeneous array family. One temporary exception remains:
-`ArrayProgramOperation::Zero(ZeroOperation<ArrayProgramType>)`, which lets generic differentiation machinery
+`ArrayIrOperation::Zero(ZeroOperation<ArrayIrType>)`, which lets generic differentiation machinery
 materialize a composite array zero without explicit geometry. The final constructor design cannot be resolved merely
 by retaining that generic escape hatch. The canonical destination is:
 
@@ -141,8 +141,8 @@ by retaining that generic escape hatch. The canonical destination is:
 - a homogeneous nullary constructor for zero, one, and iota only when its stored output type is identity-free,
   enforced by the blanket `Operation<T>` inference;
 - a typed rank-zero `ConstantOperation` literal, followed by ordinary broadcast for every rank-positive fill; and
-- for identity-bearing zero, one, and iota output types, a mixed `Operation<ArrayProgramType>` contract owned by the
-  corresponding flat `ArrayProgramOperation` variant arm. The stored `ArrayType` is the complete output authority and
+- for identity-bearing zero, one, and iota output types, a mixed `Operation<ArrayIrType>` contract owned by the
+  corresponding flat `ArrayIrOperation` variant arm. The stored `ArrayType` is the complete output authority and
   the variant consumes one explicit dimension operand per dynamic axis in identity-validated axis order.
 
 Fill intentionally has no mixed constructor variant. JAX implements scalar `lax.full` as dtype conversion plus
@@ -151,7 +151,7 @@ directly. A rank-zero literal fill or caller-provided array SSA value feeds the 
 broadcast operation, whose explicit dimension operands own dynamic output geometry.
 
 No wrapper type exists and no payload carries two trait implementations: the mixed contract is owned by the
-`ArrayProgramOperation::DynamicZero` variant arm, which delegates rendering, identity renaming, and structural flags
+`ArrayIrOperation::DynamicZero` variant arm, which delegates rendering, identity renaming, and structural flags
 to the payload's single `Operation<ArrayType>` implementation and calls the shared dynamic-constructor inference
 helper directly. The `From<ZeroOperation<ArrayType>>` conversion routes canonically: reference-bearing dynamic output
 types become `DynamicZero`, identity-free types become the homogeneous member family's zero, and the helper rejects
@@ -244,7 +244,7 @@ expression language while solving only the algebraic subset of residual needs.
 
 ### Contained heterogeneity
 
-- `ArrayProgramType` and `ArrayProgramValue<A>` remain the single storage sum for an array program.
+- `ArrayIrType` and `ArrayIrValue<A>` remain the single storage sum for an array program.
 - Array-only payload inference and semantic rules receive `ArrayType` and typed array values.
 - Dimension-only payload inference and semantic rules receive `DimensionType` and typed dimension values.
 - Mixed payloads receive the storage sum only because their signatures genuinely cross kinds.
@@ -298,7 +298,7 @@ pub trait Operation: Clone {
 Programs then require `O: Operation<Type = V::Type>`. Generic payloads such as `ZeroOperation<T>` remain generic and
 set `type Type = T`; the operation payload still has one contract for each concrete instantiation. Homogeneous wrapper
 enums require every payload to use the same associated type. The heterogeneous outer dispatcher is a distinct
-operation type whose associated type is `ArrayProgramType`; it adapts inner array and dimension operation families.
+operation type whose associated type is `ArrayIrType`; it adapts inner array and dimension operation families.
 
 This change is recommended because it makes the most important invariant compiler-enforced. It is not permission for
 an unbounded mechanical sweep. Phase 8 prototypes the trait only after the semantic architecture is stable, covering
@@ -325,7 +325,7 @@ experiment boundary); the live adoption deleted 242 (all crates at the adoption 
 trait-disambiguation turbofishes, distinct from payload-constructor marker spellings such as `AddOperation::<X>::new()`,
 which remain and belong to the open projected-helper item (full census in the P8a plan's post-adoption note: 474
 lines, ~250 currently necessary, ~212 removable today — dominated by 132 redundant
-`ArrayProgramOperation::<A>::from(...)` spellings). An earlier prototype's two
+`ArrayIrOperation::<A>::from(...)` spellings). An earlier prototype's two
 failure classes were diagnosed as (1) E0283 from per-instantiation `Operation` impls — eliminated by the blanket-impl
 discipline (one `impl<T: Universe> Operation for FooOperation<T>` per payload family) — and (2) E0284 from
 supertraits projecting `Self`'s operation type through a context built from `Self` — an independent current-solver
@@ -362,7 +362,7 @@ pub trait ValueProjection<T: Type>: Value {
 }
 ```
 
-The exact borrowed-view bounds are a prototype decision, but returning an owned `A` from `&ArrayProgramValue<A>` is
+The exact borrowed-view bounds are a prototype decision, but returning an owned `A` from `&ArrayIrValue<A>` is
 not allowed. The current reference `Array` stores `values: Vec<Scalar>`, so its `Clone` deep-copies the complete
 payload. A projection API that calls `.cloned()` would copy every eager operand on every bind and contradict the
 allocation gate.
@@ -384,7 +384,7 @@ retaining vector capacity has a measured benefit.
 
 Required projection behavior is fixed:
 
-- eager `ArrayProgramValue<A>` borrows `A`/`DimensionValue` for read-only projection and transfers ownership without
+- eager `ArrayIrValue<A>` borrows `A`/`DimensionValue` for read-only projection and transfers ownership without
   copying when consumed;
 - captures and tracers project to a checked typed view preserving the original SSA identity;
 - partial tracers preserve known/unknown state without cloning concrete values unnecessarily;
@@ -445,14 +445,14 @@ The final production families are:
 ```text
 ArrayPrimitiveOperation<A> Operation<Type = ArrayType>
 DimensionOperation        Operation<Type = DimensionType>
-ArrayProgramOperation<A>  Operation<Type = ArrayProgramType>
+ArrayIrOperation<A>  Operation<Type = ArrayIrType>
 ```
 
 The names may be simplified after the migration, but the roles are fixed.
 
 - `ArrayPrimitiveOperation` contains operations whose complete signature is array-only.
 - `DimensionOperation` contains dimension-only operations.
-- `ArrayProgramOperation` is the sole stored dispatcher and public array-program operation family. It projects the two
+- `ArrayIrOperation` is the sole stored dispatcher and public array-program operation family. It projects the two
   homogeneous member families and stores cross-kind and higher-order operations as direct flat variants.
 
 Do not introduce a separate mixed-operation family solely to reduce forwarding match arms. Such a family describes
@@ -603,7 +603,7 @@ wrap `TypeError` in `ProgramError` only at outward program boundaries.
 
 - `DimensionVariable` as identity and bounds authority;
 - leaf-only `Dimension`, `DimensionType`, and `ArrayType` shape metadata;
-- `ArrayProgramType` and `ArrayProgramValue<A>` as the storage sum;
+- `ArrayIrType` and `ArrayIrValue<A>` as the storage sum;
 - first-class dimension arithmetic and requirement operations;
 - interval, congruence, order, equality, and constant abstract interpretation;
 - `Effect::OrderedAssertion`;
@@ -1049,7 +1049,7 @@ semantics; the P0 release build is its regression gate.
 - [x] Capture the code-size, occurrence-count, operation-family, trait-implementation, compile-time, memory, generated
       code, graph-size, allocation, runtime, and diagnostics baselines listed above.
 - [x] Separate production lines from unit/integration tests and generated code.
-- [x] Inventory every `Operation<ArrayType>` and `Operation<ArrayProgramType>` implementation and classify it as
+- [x] Inventory every `Operation<ArrayType>` and `Operation<ArrayIrType>` implementation and classify it as
       array-only, dimension-only, mixed, region-polymorphic, or erroneous dual contract.
 - [x] Separately inventory blanket generic constructor implementations that overlap array-program-specific
       instantiations: zero, one, fill, and iota. Assign each static, dynamic, public-API, transform, and lowering use to
@@ -1213,7 +1213,7 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
       explicit SSA through eager execution, partial evaluation, replicated-only batching, JVP/import, and direct
       signed StableHLO comparison lowering. P2a and P2b already provide ordinary dimension SSA, constants, arithmetic,
       and requirements.
-- [x] P3g Delivery A: retain cross-member primitives as flat `ArrayProgramOperation` variants and specify one explicit
+- [x] P3g Delivery A: retain cross-member primitives as flat `ArrayIrOperation` variants and specify one explicit
       dimension operand per reshape/broadcast output axis. Exact constants represent static axes and inference derives
       the output shape from operand types. The rejected `DimensionOperandSchema`, nested-family prototype, and
       projection-aware-derive analysis are recorded in the P3g plan; none remains in production.
@@ -1265,7 +1265,7 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
       `known_extent` leak is gone; genuine cross-program instantiation, pairwise-distinct XLA operand/axis execution,
       retained specialization, macro integration, and the complete zero verification gate pass.
 - [x] P3j boundary-refinement correction: remove `DimensionType::known_extent`,
-      `DimensionType::with_known_extent`, all observed-extent logic from `ArrayProgramValue::r#type`, and the
+      `DimensionType::with_known_extent`, all observed-extent logic from `ArrayIrValue::r#type`, and the
       corresponding equality/hash/display/renaming and `DimensionValue` checks. Do not replace them with a new
       `Value`, `Typed`, `Type`, or array-program-specific boundary-evidence abstraction.
 - [x] Let a concrete output establish the first refinement for any identity already established by the formal input
@@ -1364,7 +1364,7 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
 - [x] Add a residual search proving no concrete payload in the completed Phase 3 inventory implements materially
       different operation type contracts. P3k's final residual audit records the zero-result search.
 - [x] Generic constructors have no overlapping array-program-specific payload implementation. `DynamicZero` is a
-      composite variant-arm contract, while the temporary `ZeroOperation<ArrayProgramType>` is a different generic
+      composite variant-arm contract, while the temporary `ZeroOperation<ArrayIrType>` is a different generic
       instantiation restricted to identity-free member types until Phase 6 deletes it.
 - [x] No operation consumer independently calls an ad hoc
       `runtime_dimension_variables` contract.
@@ -1376,8 +1376,8 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
 Execute the XLA portion as one dependency-ordered migration, not as a second body representation:
 
 1. Change the existing flat `XlaOperation` family, its program constants, and `XlaDomain` values to the composite
-   `ArrayProgramType`/`ArrayProgramValue` contract. Keep the backend enum flat; adapt homogeneous array payloads
-   through the canonical typed projection machinery rather than wrapping a stored `ArrayProgramOperation`.
+   `ArrayIrType`/`ArrayIrValue` contract. Keep the backend enum flat; adapt homogeneous array payloads
+   through the canonical typed projection machinery rather than wrapping a stored `ArrayIrOperation`.
 2. Retype `ShardMapOperation` and every attached higher-order region to that same composite family while keeping the
    public shard-map boundary array-only. Boundary projection must reject a dimension-valued argument or result with
    the canonical wrong-member diagnostic.
@@ -1386,7 +1386,7 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 4. Route the attached body through the existing composite lowerer with the entered `CollectiveLoweringState`; then
    delete the homogeneous body replay and the transitional `Legacy*` collective capabilities from production tests.
 5. Migrate eager compilation/execution and transform entry points by projecting array-valued public inputs/outputs at
-   the boundary. No public XLA array API should expose `ArrayProgramValue`; the storage sum is an internal program
+   the boundary. No public XLA array API should expose `ArrayIrValue`; the storage sum is an internal program
    representation.
 6. Only after all region and transform tests pass, delete duplicated homogeneous lowering dispatch and narrow or
    remove the old full `ArrayOperation` family according to the remaining consumer ledger.
@@ -1401,7 +1401,7 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       payloads behind their canonical projected member families, keep mixed and XLA-owned higher-order operations as
       direct backend variants, and switch the existing program/domain/region/lowering cycle in place. Preserve
       array-only public APIs through projection; do not add a projection-aware derive mode, a stored
-      `ArrayProgramOperation`, a replay bridge, or a parallel production lowerer.
+      `ArrayIrOperation`, a replay bridge, or a parallel production lowerer.
 - [x] P4b1 projected-region foundation: add and verify lossless `Program` member-program unprojection specified by the
       P4b plan. This is a behavior-preserving, core-only prerequisite for importing public array-only regions into the
       production composite graph without instruction replay.
@@ -1430,12 +1430,12 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       `ShardMapOperation` a composite operation contract that preserves its array-only public boundary with canonical
       member projection.
 - [x] P4b6 projected compilation facade prototype: retain public `In`/`Out: Parameterized<ArrayType>`, make internal
-      compilation artifacts own `In::To<ArrayProgramType>`/`Out::To<ArrayProgramType>`, and trace directly into the
+      compilation artifacts own `In::To<ArrayIrType>`/`Out::To<ArrayIrType>`, and trace directly into the
       composite domain through checked array-member views. The static and declared-dynamic compile/execute probe
       passed without a new core hook, second domain, replay bridge, or temporary homogeneous top-level program.
 - [x] P4b7 mixed control-flow prerequisite: add direct composite condition, while, and scan contracts before the
       production domain flip. Keep predicates Boolean arrays, define variant-aware state/carry/output rules, and do
-      not make `ArrayProgramType` an `ElementType` solely to route mixed regions through homogeneous contracts.
+      not make `ArrayIrType` an `ElementType` solely to route mixed regions through homogeneous contracts.
 - [x] P4b8 eager gateway prerequisite and final cutover audit: give concrete XLA arrays checked host
       `dimension_size` and `dimension_from_scalar` capabilities, derive global extents from complete shard metadata,
       and record the domain-owned eager dispatch split required by the atomic cutover. Keep array members on cached
@@ -1552,7 +1552,7 @@ rename only part of the problem while introducing another carrier.
       composite explicit extents as different collective contracts; the follow-up audit found that this criterion was
       too weak because both implementations repeat the same axis choreography. P5e supersedes that part of this gate.
 - [x] P5e — execute `.tasks/plan_p5e_extent_polymorphic_collective_batching.md` immediately after P5d and before
-      Phase 6. Preserve both `ArrayOperation` and `ArrayProgramOperation`, but make each collective's batching
+      Phase 6. Preserve both `ArrayOperation` and `ArrayIrOperation`, but make each collective's batching
       semantics one extent-polymorphic algorithm reached through thin implicit-extent and explicit-extent adapters.
       Do not introduce a whole-program promotion pass, a parallel batching context/tracer, or another operation
       family.
@@ -1571,7 +1571,7 @@ rename only part of the problem while introducing another carrier.
       reshape/broadcast/alignment with explicit extents, and staging requirements that cannot use the existing
       `DimensionRequirement` capability directly. First test whether `BatchingPolicy::Extent` can serve as the
       arithmetic extent unchanged; introduce at most one associated projected extent type only if the composite
-      value's `ArrayProgramType` wrapper makes that impossible. Do not put collective formulas or per-operation axis
+      value's `ArrayIrType` wrapper makes that impossible. Do not put collective formulas or per-operation axis
       decisions on the policy.
 - [x] Prototype all-gather end to end before touching the other collective rules. Its one shared matching-axis kernel
       must be generic over the policy's fallible extent operations and materialization hooks. The homogeneous adapter
@@ -1698,7 +1698,7 @@ searches. The complete source ledger and verification record are in
       unit. Make generic outer dispatch project/lift array-only JVP and transpose rules, let VJP reuse their existing
       composition, and exercise the shared toy composite fixture for member-kind-agnostic dispatch tests.
 - [x] P6d — execute `.tasks/plan_p6d_composite_region_differentiation.md` as three review-sized vertical slices:
-      condition, scan, and while. Reuse the existing control-flow algorithms over `ArrayProgramType` regions, preserve
+      condition, scan, and while. Reuse the existing control-flow algorithms over `ArrayIrType` regions, preserve
       dimensions as primal/residual SSA without differential slots, compact only time-varying dimension residuals
       through the checked scalar gateway when iteration storage requires it, and reach full JAX parity plus Ryft's
       bounded-dynamic extensions before beginning composite-zero deletion.
@@ -1719,23 +1719,23 @@ searches. The complete source ledger and verification record are in
       value-level and builder-level spending; project unused zero-space scan inputs out instead of constructing them;
       and retain condition partial evaluation's conservative whole-condition fallback for identity-bearing branch
       edges.
-- [x] Inventory every production construction of `ZeroOperation<ArrayProgramType>` and every composite
-      `Zero<ArrayProgramValue<_>>` materialization path, including the retained-linearization residual-zero sites in
+- [x] Inventory every production construction of `ZeroOperation<ArrayIrType>` and every composite
+      `Zero<ArrayIrValue<_>>` materialization path, including the retained-linearization residual-zero sites in
       `differentiation/forward.rs`. Classify each as a structural zero that should remain unmaterialized, an
       operand-relative `zero_like`, an identity-free homogeneous array zero, or a genuinely dynamic zero whose
       explicit dimension SSA operands must already be available.
 - [x] Migrate those callers so generic differentiation and transposition never request a zero from
-      `ArrayProgramType` alone. Preserve [`MaybeZero`] structurally for as long as possible; use `zero_like` when an
+      `ArrayIrType` alone. Preserve [`MaybeZero`] structurally for as long as possible; use `zero_like` when an
       array value supplies runtime geometry; stage `Array(ArrayOperation::Zero(ZeroOperation<ArrayType>))` only for
       identity-free array types; and stage the mixed constructor with explicit dimension operands when a dynamic array
       zero truly must be materialized. A dimension-member zero must be unrepresentable rather than constructed and
       rejected later by inference.
-- [x] Delete `ArrayProgramOperation::Zero(ZeroOperation<ArrayProgramType>)`,
-      `From<ZeroOperation<ArrayProgramType>>`, and every dedicated inference, eager, batching, differentiation,
+- [x] Delete `ArrayIrOperation::Zero(ZeroOperation<ArrayIrType>)`,
+      `From<ZeroOperation<ArrayIrType>>`, and every dedicated inference, eager, batching, differentiation,
       rendering, identity-renaming, and lowering arm once the generic callers are gone. Do not replace them with
       another type-only composite constructor or a hidden extent-recovery path.
-- [x] Rename `ArrayProgramOperation::DynamicZero(ZeroOperation<ArrayType>)` to
-      `ArrayProgramOperation::Zero(ZeroOperation<ArrayType>)` after deleting the conflicting generic variant. Expand
+- [x] Rename `ArrayIrOperation::DynamicZero(ZeroOperation<ArrayType>)` to
+      `ArrayIrOperation::Zero(ZeroOperation<ArrayType>)` after deleting the conflicting generic variant. Expand
       its rustdoc to explain that this top-level variant owns the mixed `(Dimension...) -> Array` signature because
       homogeneous `Array(...)` projection cannot accept dimension operands and structural types do not contain
       concrete runtime extents. Update all tests, diagnostics, rendering expectations, and documentation directly
@@ -1744,7 +1744,7 @@ searches. The complete source ledger and verification record are in
       `Array(ArrayOperation::Zero(ZeroOperation<ArrayType>))`, identity-bearing zeros use the renamed top-level
       `Zero(ZeroOperation<ArrayType>)` with one explicit operand per dynamic axis, and no operation can encode a
       dimension-member zero. Add residual searches requiring zero source occurrences of
-      `ZeroOperation<ArrayProgramType>` and `DynamicZero`.
+      `ZeroOperation<ArrayIrType>` and `DynamicZero`.
 - [x] Preserve proven/disproven/residual requirement behavior and `OrderedAssertion` effects.
 - [x] Verify nested JVP/VJP, linearization, transpose, rematerialization, custom derivatives, condition, while, and
       scan.
@@ -1831,7 +1831,7 @@ doctests, formatting, source closure, and JAX extent/collective parity gates pas
 remains afterward.
 
 P6d is complete as one combined condition/scan/while review unit. All three operations now reuse their shared
-partial-evaluation, JVP, and transpose algorithms for `ArrayProgramType`, and the final abstraction pass removed the
+partial-evaluation, JVP, and transpose algorithms for `ArrayIrType`, and the final abstraction pass removed the
 duplicated homogeneous/composite bounded-while dispatcher. Dimensions remain primal-only boundary leaves; invariant
 dimension residuals thread directly as scan carries, while only time-varying residuals use the visible checked scalar
 gateway pair. Dynamic scan lengths, batched-predicate bounded loops, early exit, structural zeros, identity closure,
@@ -1856,7 +1856,7 @@ next isolated Phase 6 deletion unit exactly as listed below. Full evidence and t
 `.tasks/plan_p6d_composite_region_differentiation.md`.
 
 P6e is complete against frozen boundary `f2bc0dfa5`. The type-only composite
-`ZeroOperation<ArrayProgramType>` representation is gone, and the sole top-level zero variant is now the explicit
+`ZeroOperation<ArrayIrType>` representation is gone, and the sole top-level zero variant is now the explicit
 mixed `Zero(ZeroOperation<ArrayType>)` constructor whose dimension operands provide runtime geometry. Identity-free
 array zeros remain canonical homogeneous `Array(ArrayOperation::Zero(...))` operations, while dimension-member zeros
 are unrepresentable. Promotion, inference, eager interpretation, rendering, identity renaming, transforms, and XLA
@@ -1974,7 +1974,7 @@ generic inference, interpretation, PE, batching, JVP, transposition, region, and
 single shared rules. The array-to-composite while lift reconstructs only the payload's validated iteration-bound
 metadata; attached regions continue to live on the instruction. JIT calls retain two intentional instantiations:
 `JitCallOperation<ArrayType>` owns the reusable homogeneous batching contract, and
-`JitCallOperation<ArrayProgramType>` owns the executable composite call contract. No aliases, default type arguments,
+`JitCallOperation<ArrayIrType>` owns the executable composite call contract. No aliases, default type arguments,
 compatibility implementations, duplicated semantic rules, or new projection layers were introduced. The genuinely
 mixed/homogeneous dual payloads and compile-fail gate remain separate review units. Verification passed the complete
 `ryft-core` suite (1,107 tests), the complete `ryft-xla` library suite (433 passed, 1 intentional benchmark ignore),
@@ -1983,14 +1983,14 @@ and trybuild suites.
 
 The fourth P8a prerequisite slice resolves the most diagnostic genuinely mixed payload.
 `CompareOperation<DataType>` and `CompareOperation<ArrayType>` now share the homogeneous comparison contract, while
-`CompareOperation<ArrayProgramType>` alone owns the mixed dimension-to-Boolean-array contract. The payload's type
+`CompareOperation<ArrayIrType>` alone owns the mixed dimension-to-Boolean-array contract. The payload's type
 parameter is inferred at ordinary bind and operation-family conversion sites; there is no alias, default type
 argument, projection adapter, or duplicated inference algorithm. Focused core and XLA compare tests and both complete
 test-target checks pass. The remaining random-bit-generator, custom-call, concatenate, pad, and shard-map payloads are
 still pending as separate review units.
 
 The fifth P8a prerequisite slice parameterizes `RngBitGeneratorOperation<T>`. Its homogeneous `ArrayType` instance
-owns the static-shape kernel contract and scan-based array batching, while its `ArrayProgramType` instance owns the
+owns the static-shape kernel contract and scan-based array batching, while its `ArrayIrType` instance owns the
 mixed explicit-output-extent contract and composite batching rule. Shared payload validation, identity renaming,
 rendering, reference execution, and XLA lowering remain single implementations, and ordinary constructors infer the
 type universe from the receiving context. Focused random, composite batching, and XLA eager/lowering tests pass, as do
@@ -1998,7 +1998,7 @@ all 1,112 core tests and all 433 passing XLA tests (with one intentional benchma
 concatenate, pad, and shard-map payloads remain pending.
 
 The sixth P8a prerequisite slice parameterizes `CustomCallOperation<T>` and `PadOperation<T>`. Their `ArrayType`
-instantiations own the homogeneous contracts, while their `ArrayProgramType` instantiations own the mixed contracts
+instantiations own the homogeneous contracts, while their `ArrayIrType` instantiations own the mixed contracts
 with explicit result extents. Each remains one public, type-indexed operation family rather than acquiring a nominal
 `Dynamic*` adapter. Shared configuration, rendering, validation, and lowering remain single implementations;
 conversion at a family boundary moves the existing owned metadata without allocating or copying it. Composite eager
@@ -2007,7 +2007,7 @@ Verification passed the focused core and XLA custom-call/padding tests, both tes
 and all 433 passing XLA tests plus its one intentional benchmark ignore. Concatenate and shard-map remain pending.
 
 The seventh P8a prerequisite slice parameterizes `ConcatenateOperation<T>` and removes shard map's obsolete
-homogeneous contract. Concatenate's `ArrayType` and `ArrayProgramType` instantiations now own the homogeneous and mixed
+homogeneous contract. Concatenate's `ArrayType` and `ArrayIrType` instantiations now own the homogeneous and mixed
 explicit-result-extent signatures, respectively, while sharing the same normalized axis and semantic implementations.
 The later authoritative-declaration step still owns concatenate's conditional assertion-effect metadata, avoiding
 premature duplication of operand-derived extent metadata in this prerequisite. `ShardMapOperation<V>` now retains only
@@ -2173,16 +2173,16 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
   - [x] Prove projected-member base dispatch through type inference, eager interpretation, PE, rendering, conversions,
         and a second projected member type without array-program-specific generated code.
   - [x] Add the minimal outer-family declaration needed by production-shaped composite enums: deriving
-        `ArrayProgramOperation<A>` must select `ArrayProgramType` and `ArrayProgramValue<A>` even though its stored
+        `ArrayIrOperation<A>` must select `ArrayIrType` and `ArrayIrValue<A>` even though its stored
         generic `A` belongs to the projected `ArrayType` member. Do not add a phantom composite-value parameter or
         redesign the enum's public generic merely to satisfy derive inference.
   - [x] Generate and prove the complete projected-member and replicated-member vertical contracts before annotating
-        `ArrayProgramOperation`.
+        `ArrayIrOperation`.
 - [x] Establish one authoritative declaration of every array-program operation and its class.
 - [x] Use the declared outer variants to generate inner lifts, direct `From` conversions, borrowed projections, and
       mechanical dispatch.
 - [x] Make `#[derive(Operation)]` with `#[ryft(dispatch(batching, differentiation, transposition))]` the mechanical
-      dispatch surface for `ArrayProgramOperation`, matching the homogeneous families instead of introducing a second
+      dispatch surface for `ArrayIrOperation`, matching the homogeneous families instead of introducing a second
       generator syntax. Before migration, move every semantic rule off the enum match and into its colocated payload
       implementation, and ensure each dual-contract variant carries a dedicated typed payload instantiation (or a
       semantic mixed payload when its stored metadata differs) so one concrete payload never carries two semantic
@@ -2194,13 +2194,13 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       `ArrayBatching<P>`. The class markers and typed mixed payloads are irreducible declaration content, not ceremony:
       which universe and transform contract a variant's payload speaks must be declared exactly once on the enum.
       Design decisions settled in review (2026-08-03):
-      - The projected-member arm is **family-level**, not per-primitive: because `ArrayProgramOperation` embeds the
+      - The projected-member arm is **family-level**, not per-primitive: because `ArrayIrOperation` embeds the
         entire `ArrayOperation` family as one member variant, the derive generates one project-delegate-lift adapter
         at the family boundary and every current and future `ArrayOperation` batching rule flows through it. A new
         composite universe provides its projection vocabulary once (`ValueProjection`, `OperationProjection<ArrayType>`
         plus operation lifts, `BatchingPolicyProjection<C, ArrayType>` with a projected policy compatible with the
         outer extent representation, and its `BatchableType` entrypoint policy) and inherits the adapters.
-      - `LinearCallOperation<ArrayProgramType>` is classified **composite-native**, not a projected member: its
+      - `LinearCallOperation<ArrayIrType>` is classified **composite-native**, not a projected member: its
         regions carry composite boundaries with dimension residuals and batching threads the first-class mapped
         extent through them, so no member marker can generate its semantics. The shared semantic algorithm stays in
         `LinearCallOperation::batch_regions`, and one generic `BatchableOperation` implementation uses the narrow
@@ -2245,6 +2245,11 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
 
 ### Phase 9: module and public API cleanup
 
+- [x] Standardize the composite array/dimension vocabulary on `ArrayIrType`, `ArrayIrValue`, and `ArrayIrOperation`,
+      including the directly owned `ArrayIrTypeRefinements` companion and projection-allocation fixture. Keep the
+      existing `types::arrays` and `backends::array_programs` module placement for this review unit, update every
+      in-repo consumer without compatibility aliases, and reserve the shorter “array IR” terminology for this
+      heterogeneous SSA representation rather than ordinary homogeneous programs over `ArrayType`.
 - [x] Confirm the `S4` typed `Custom`/`DimensionError` recovery behavior and canonical invalid projection diagnostics
       remain intact;
       do not mix another error-representation migration into the module move.
@@ -2275,7 +2280,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [ ] Move `ArrayBatching`, `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, and their policy, recursive, and
           entrypoint implementations after the carrier slice is reviewed.
     - [ ] Move the array-specialization tests beside their owner and close the specialization-module checkbox.
-  - [ ] Move the `ArrayProgramType` specialization to `batching::array_programs` (`ArrayProgramBatch`,
+  - [ ] Move the `ArrayIrType` specialization to `batching::array_programs` (`ArrayProgramBatch`,
         `ArrayProgramBatching`, `ThreadedExtentBatchedProgram`, `DynamicArrayBatchingPolicy`,
         `ReplicatedDimensionBatchingPolicy`, their policy/projection/recursive/entrypoint implementations, and shared
         first-class-extent mechanics).
@@ -2286,8 +2291,31 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         algorithm, and `backends` contains concrete eager values/operation families rather than transform policy types.
         Update every in-repo path directly and decide the intentional `batching` facade during this move without adding
         compatibility re-exports.
+- [ ] After the batching hierarchy and operation ownership have settled, consolidate the reference array stack under
+      one top-level `ryft_core::arrays` hierarchy as a separate, measured API and representation change:
+  - [ ] Prove that the `Scalar` reference backend and `backends::scalars` module have no unique production role. Move
+        any still-useful `DataType`-universe tests to rank-zero arrays or narrowly scoped test fixtures, then delete
+        `Scalar`, `ScalarOperation`, `ScalarTracingContext`, the backend module, and their public exports without a
+        compatibility layer.
+  - [ ] Move the current `backends::arrays` reference backend to `ryft_core::arrays`, and place the current dimension
+        backend and heterogeneous array IR beneath the same hierarchy (expected submodules: `arrays::dimensions` and
+        `arrays::ir`). Keep generic operation semantics in `operations`, generic types in `types`, and transform policy
+        machinery in its transform modules; this hierarchy owns concrete reference values and their closed operation
+        families only.
+  - [ ] Replace the reference `Array`'s element-wise `Vec<Scalar>` payload with an immutable contiguous byte buffer
+        whose element type and shape determine and validate its exact storage. Specify canonical encoding for every
+        supported data type, including Boolean, sub-byte integers, low-precision floats, complex values, and tokens;
+        make cloning and read-only projection allocation-free (prefer shared immutable storage unless measurements
+        justify owned copies), and expose checked typed construction/access APIs without restoring `Scalar` storage.
+  - [ ] Route exact array literals and XLA constant lowering through the canonical byte representation so literal
+        construction does not round-trip through `f64` or per-element enum values. Preserve element bits, shapes,
+        layouts, shardings, and memory placement, and measure construction cost, clone cost, allocation count, and XLA
+        compile/runtime behavior before and after the migration.
+  - [ ] Gate: the top-level hierarchy has one obvious public path for reference arrays, dimensions, and array IR; no
+        scalar backend or per-element `Scalar` payload remains; all reference-backend semantics, transformations,
+        exact-literal tests, core/XLA execution suites, and allocation/performance thresholds pass.
 - [ ] Audit names after responsibilities settle; rename only where the final name is materially clearer.
-- [ ] Known residual from the P4b audit: `ryft-xla/src/profile_guided.rs` names `ArrayProgramValue<Array>` in the
+- [ ] Known residual from the P4b audit: `ryft-xla/src/profile_guided.rs` names `ArrayIrValue<Array>` in the
       `where` clauses of two public functions (`interpret` and `profile_baseline`). Bounds only — no public value
       positions — but it is public-signature/rustdoc surface; tighten or accept explicitly during this cleanup.
 - [ ] Update every in-repo use site directly without compatibility re-exports.
@@ -2372,7 +2400,7 @@ ambient environments, and the graph remains the complete source of data dependen
 - [ ] Confirm the Phase 8 authoritative operation declaration covers the gateway so it acquires generated dispatch,
       conversions, and classification like every other dimension operation.
 - [ ] Update the `DimensionType` motivation rustdoc in `types/dimensions.rs` so the provenance story describes the
-      tiers and names the gateway as the single data-to-dimension boundary, and update the `ArrayProgramType`
+      tiers and names the gateway as the single data-to-dimension boundary, and update the `ArrayIrType`
       cross-reference if its wording changes.
 - [ ] Add JAX comparison fixtures for eager and staged `n = count(mask); take(x, n)`-shaped programs that JAX rejects
       (`ConcretizationTypeError`) and Ryft accepts eagerly and stages symbolically. Compiled execution may reject with
@@ -2577,7 +2605,7 @@ The current unstaged P3j prototype was reviewed path by path:
   direct upper-bound allocation plus `stablehlo.set_dimension_size`; the mixed static/dynamic axis pairing fix; and
   their focused tests.
 - **Delete rather than generalize:** `DimensionType::known_extent`, `with_known_extent`, observed extents injected by
-  `ArrayProgramValue::r#type`, `ArrayProgramTypeRefinements`' dependence on those type payloads, the extra
+  `ArrayIrValue::r#type`, `ArrayIrTypeRefinements`' dependence on those type payloads, the extra
   `DimensionValue` validation, and all equality/hash/display/renaming tests for this field. These make one runtime
   value part of the structural type and would specialize caches per extent.
 - **Re-evaluate before retaining:** the global fused-JVP “reuse a zero primal as its tangent” rule and the Jacobian
@@ -2621,7 +2649,7 @@ blocker is resolved:
 
 - `known_extent` and `with_known_extent` have zero source occurrences;
 - `DimensionType` is again exactly identity plus bounds, with exact extents derived only from singleton bounds;
-- `ArrayProgramValue::r#type` no longer incorporates runtime observations;
+- `ArrayIrValue::r#type` no longer incorporates runtime observations;
 - `TypeIdentitySignature` stores one ordered identity vector with an input/internal split, so the complete authority
   set is available without concatenating or cloning vectors during interpretation;
 - output refinement admits both input-owned and internally defined closed identities and rejects inconsistent repeated
@@ -2764,8 +2792,8 @@ constructor rule.
 
 A second review pass corrected the first implementation of this design:
 
-- the mixed contract moved from a second `impl Operation<ArrayProgramType>` on `ZeroOperation<ArrayType>` to the
-  `ArrayProgramOperation::DynamicZero` variant arm, restoring one trait implementation per payload and Phase 8
+- the mixed contract moved from a second `impl Operation<ArrayIrType>` on `ZeroOperation<ArrayType>` to the
+  `ArrayIrOperation::DynamicZero` variant arm, restoring one trait implementation per payload and Phase 8
   compatibility;
 - the nullary guard became position-aware: it rejects only ungrounded identity *references* (dynamic array axes) and
   allows definition-position identities such as a `DimensionType`'s own variable;
@@ -3231,7 +3259,7 @@ warnings remain assigned to P9.
 
 P2c introduces only the heterogeneous storage and projection seam:
 
-- `ArrayProgramType` and `ArrayProgramValue<A>` are the sole array/dimension storage sums;
+- `ArrayIrType` and `ArrayIrValue<A>` are the sole array/dimension storage sums;
 - standard `From`/borrowed `TryFrom` type conversions and the `ValueProjection<T>` contract provide lifting and
   distinct borrowed and consuming projection paths;
 - eager array and dimension projection returns direct references or transfers the stored payload, with no clone,
@@ -3273,7 +3301,7 @@ shape operation:
   carriers; and
 - the context-size assertion pins that the type marker adds no runtime storage beyond the parent context.
 
-Production `ArrayProgramOperation`, mixed operand contracts, shape operations, higher-order region projection, batching,
+Production `ArrayIrOperation`, mixed operand contracts, shape operations, higher-order region projection, batching,
 and differentiation policies remain assigned to P3–P6. The existing reference-array allocation tests continue to prove
 that borrowed and consuming eager value projection neither allocates nor copies payloads. Projected-context binding
 temporarily reconstructs parent values from borrowed inputs because the generic `Context::bind` contract accepts a
@@ -3285,7 +3313,7 @@ Verification and residual-audit results are recorded in the P2d cleanup-ledger e
 
 ### Execution: P3a production array-program dispatcher
 
-P3a introduced `ArrayProgramOperation<A>` as the sole stored dispatcher for heterogeneous array/dimension programs.
+P3a introduced `ArrayIrOperation<A>` as the sole stored dispatcher for heterogeneous array/dimension programs.
 Homogeneous array and dimension operations retain their native type contracts and pass through generic projection and
 lifting. Genuinely mixed signatures receive explicit outer-family variants rather than a generic mixed bucket.
 P3a added no mixed operation; verification and residual-audit results are recorded in the P3a cleanup-ledger entry.
@@ -3360,7 +3388,7 @@ consolidation and residual evidence is in `.tasks/plan_broadcast_api_consolidati
 ### Execution: P3h Delivery A explicit concatenate result extent
 
 P3h Delivery A extended the existing axis-only `ConcatenateOperation` with
-`Operation<ArrayProgramType>` rather than creating a redundant legacy payload. Its canonical mixed signature is
+`Operation<ArrayIrType>` rather than creating a redundant legacy payload. Its canonical mixed signature is
 `(Array..., Dimension) -> Array`: inference derives the concatenated result axis exclusively from the final
 dimension operand, rejects contradictory exact sums, and preserves dynamic result identities. Eager execution
 validates the supplied extent against the checked observed input sum before calling the existing array kernel.
@@ -3410,7 +3438,7 @@ record of the superseded increment only.
 
 
 P3j Delivery A introduced the sole generic `ShapedConstructorOperation<C>` adapter and proved its zero specialization
-as a flat `ArrayProgramOperation::ShapedZero` variant. The operation consumes one explicit first-class dimension
+as a flat `ArrayIrOperation::ShapedZero` variant. The operation consumes one explicit first-class dimension
 operand per output axis, including exact constants, and derives its complete result shape from those operand types.
 The wrapped homogeneous zero contributes only element type, expected rank, and placement metadata; no identity,
 bounds, extent ordering, witness, or packed shape data is duplicated in the payload.
@@ -3425,7 +3453,7 @@ invented.
 Bounded XLA lowering materializes the upper-bound zero buffer and attaches each dynamic logical size with
 `stablehlo.set_dimension_size` using the explicit SSA operand. Its test emits no `get_dimension_size` and compiles and
 executes through CPU PJRT. Generic linearization and disconnected-input pullback still need transform-owned dimension
-residuals, so deletion of the temporary `Zero(ZeroOperation<ArrayProgramType>)` escape hatch remains P3j Delivery D
+residuals, so deletion of the temporary `Zero(ZeroOperation<ArrayIrType>)` escape hatch remains P3j Delivery D
 and may move to the first Phase 6 residual delivery rather than adding type-to-value recovery. Exact inventory,
 measurements, verification, and residual evidence are recorded in `.tasks/plan_p3j_shaped_constructors.md`.
 
@@ -3465,7 +3493,7 @@ implementation and review records are in `.tasks/plan_p3j_dynamic_fill.md` and
 
 P3k moves the complete result geometry of all-gather, psum-scatter, and all-to-all into ordinary dimension SSA without
 duplicating their semantic operation payloads. The payloads remain homogeneous `Operation<ArrayType>`
-implementations; the flat `ArrayProgramOperation` variant arms own the mixed positional contracts. Every result axis
+implementations; the flat `ArrayIrOperation` variant arms own the mixed positional contracts. Every result axis
 has one trailing extent operand in axis order. Unchanged axes preserve their input identities, changed axes carry
 ordinary arithmetic SSA, and exact extents are checked against participant-count multiplication or division during
 inference and eager execution.
@@ -3565,7 +3593,7 @@ timing-sensitive benchmark; `cargo check -p ryft-xla --lib`, formatting, and dif
 P4b5 generalized the jitted-call region contract over its enclosing program type and gave shard-map a direct
 composite contract with an array-only public boundary. P4b6 then proved in an isolated compile/execute prototype that
 the public XLA facade can retain `In`/`Out: Parameterized<ArrayType>` while its internal compilation artifacts use the
-canonical `In::To<ArrayProgramType>`/`Out::To<ArrayProgramType>` families. The trace enters the composite domain
+canonical `In::To<ArrayIrType>`/`Out::To<ArrayIrType>` families. The trace enters the composite domain
 directly and uses checked array-member views at the user closure; no second domain, top-level member-program replay, or
 new core compilation hook is required.
 
@@ -3593,11 +3621,11 @@ explicit host readback. The focused CPU gateway regression, XLA library check, f
 ### Execution: P4b atomic production composite XLA cutover
 
 The XLA backend now has one stored graph and one production lowering path. `XlaDomain` uses
-`ArrayProgramType`, `ArrayProgramValue<Array>`, the composite `XlaConstant`, and the flat composite `XlaOperation`;
+`ArrayIrType`, `ArrayIrValue<Array>`, the composite `XlaConstant`, and the flat composite `XlaOperation`;
 all public array APIs preserve their existing `ArrayType`/`Array` contracts through checked projection. Complete
 owned member regions are lifted structurally once, while replay and callee regions remain natively composite and
 retain their identity-sharing semantics. No projection-aware derive mode, second production domain, replay bridge, or
-stored `ArrayProgramOperation` was introduced.
+stored `ArrayIrOperation` was introduced.
 
 Eager execution separates host-owned dimension work from cached array kernels, and mixed eager operations specialize
 their concrete dimension operands into internal scalar SSA constants. Production StableHLO lowering consumes
@@ -3617,7 +3645,7 @@ Verification passed all 1,019 core library tests, all 396 runnable XLA library t
 the benchmark-feature all-target compile gate, focused benchmark-feature tests, the compilation benchmark smoke run,
 XLA doctests, formatting, and diff hygiene. The residual scan found one composite `XlaProgram` alias, no standalone
 composite lowerer, no retired dynamic-broadcast path, no disabled `cfg(any())` fixtures, and no public array API
-exposing `ArrayProgramValue`. The complete implementation ledger and exact evidence are recorded in
+exposing `ArrayIrValue`. The complete implementation ledger and exact evidence are recorded in
 `.tasks/plan_p4b_production_composite_xla.md`.
 
 ### Execution: P4c composite region and identity verification
@@ -3708,7 +3736,7 @@ library tests (one timing-sensitive benchmark ignored), formatting, and diff hyg
 
 Completed the remaining operation-derive work as one review unit. The derive now owns the mechanical contract for
 projected, replicated, mixed, and composite-native variants, including inference, eager interpretation, PE, batching,
-JVP, transposition, conversions, and operation-family projections. `ArrayProgramOperation<A>` is the production proof:
+JVP, transposition, conversions, and operation-family projections. `ArrayIrOperation<A>` is the production proof:
 its enum declaration is now the sole variant/class ledger and its previous outer dispatcher implementations have been
 deleted. Semantic rules remain handwritten beside their payloads, while shared member contracts contain only the
 repeated parent-boundary projection and delegation vocabulary.
@@ -3778,3 +3806,25 @@ ignored), all 57 macro unit tests, both macro integration suites including all c
 runnable XLA library tests (one ignored). Formatting, diff hygiene, unique-owner searches, and the old-path residual
 search passed. The following review slice moves the array policy family; the array-specialization tests move last so
 each extraction remains within the review budget.
+
+### Phase 9 array IR vocabulary rename (2026-08-04)
+
+The heterogeneous array/dimension SSA vocabulary is now named `ArrayIrType`, `ArrayIrValue`, and `ArrayIrOperation`;
+its signature refinement state is `ArrayIrTypeRefinements`. The existing `types::arrays` and
+`backends::array_programs` module placement remains unchanged, no compatibility aliases were added, and the public
+crate-root exports use only the new names. Directly corresponding helper, lowering, test, and allocation-fixture names
+now use “array IR” as well, while ordinary homogeneous programs over `ArrayType` remain described as programs over
+arrays. The obsolete TODO proposing that the heterogeneous dispatcher become `ArrayOperation` was deleted because the
+new name makes its distinct mixed-universe role explicit.
+
+The Phase 9 checklist now also records the subsequent, separately reviewable reference-backend consolidation: retire
+the scalar backend after proving its remaining tests have suitable replacements; move concrete arrays, dimensions, and
+the array IR under one top-level `ryft_core::arrays` hierarchy; replace `Array`'s `Vec<Scalar>` payload with validated
+immutable contiguous bytes; and route exact XLA literals through that canonical representation. The future slice has
+explicit encoding, allocation, exact-bit, CPU/XLA execution, and performance gates and does not alter this rename.
+
+Verification passed the renamed two-test projection-allocation fixture, all 1,129 core library tests, all 53 runnable
+core doctests (16 ignored), all 57 macro unit tests, both macro integration suites including every compile-fail fixture,
+and all 436 runnable XLA library tests (one ignored). `cargo check -p ryft-core --tests`, formatting, diff hygiene, and
+repository-wide residual searches for the four retired public identifiers and their corresponding lowering/inference
+helper names passed.

@@ -47,7 +47,7 @@ use ryft_core::programs::types::{Type as RyftType, Typed};
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::types::{
-    ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Layout, MAX_DIMENSION_EXTENT, Memory, Shape,
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Layout, MAX_DIMENSION_EXTENT, Memory, Shape,
 };
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
@@ -4398,7 +4398,7 @@ pub(crate) struct ShardMapMlirLowerer<'b, 'c: 'b, 't: 'c> {
     location: LocationRef<'c, 't>,
 
     /// Declared input types of the instruction currently being lowered, in operand order.
-    input_types: Vec<ArrayProgramType>,
+    input_types: Vec<ArrayIrType>,
 
     /// Shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call` lowering sites.
     /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
@@ -4436,7 +4436,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Attaches the declared input types of the instruction currently being lowered.
-    pub(crate) fn with_input_types(mut self, input_types: Vec<ArrayProgramType>) -> Self {
+    pub(crate) fn with_input_types(mut self, input_types: Vec<ArrayIrType>) -> Self {
         self.input_types = input_types;
         self
     }
@@ -4487,7 +4487,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested while operation inside this lowering context.
     pub(crate) fn lower_while(
         &mut self,
-        while_op: &WhileOperation<ArrayProgramType>,
+        while_op: &WhileOperation<ArrayIrType>,
         loop_regions: &[FlatXlaProgram],
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
@@ -5473,7 +5473,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
 }
 
 fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
-    while_op: &WhileOperation<ArrayProgramType>,
+    while_op: &WhileOperation<ArrayIrType>,
     loop_regions: &[FlatXlaProgram],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -5716,7 +5716,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
                     // documented on `WhileTypeSemantics`), so masking it is the identity and the body's candidate
                     // result is threaded on directly. This matches eager interpretation, whose `mask_select` returns
                     // equal dimension carries unchanged.
-                    if matches!(state_type, ArrayProgramType::Dimension(_)) {
+                    if matches!(state_type, ArrayIrType::Dimension(_)) {
                         return Ok(candidate);
                     }
                     let state_type = <&ArrayType>::try_from(state_type).map_err(ProgramError::from)?;
@@ -6244,11 +6244,11 @@ struct JitCallProgramKey {
     rendered: String,
 
     /// Flat input types, which together with the rendering pin the full callee signature.
-    input_types: Vec<ArrayProgramType>,
+    input_types: Vec<ArrayIrType>,
 
     /// Flat output types, completing the callee signature when output-only placement metadata is not visible
     /// in the rendered body.
-    output_types: Vec<ArrayProgramType>,
+    output_types: Vec<ArrayIrType>,
 }
 
 /// Returns whether `program` may be deduplicated by structural identity.
@@ -6341,10 +6341,10 @@ struct JitCallFunction {
     program: FlatXlaProgram,
 
     /// Flat input types of the callee, also the emitted function's argument types.
-    input_types: Vec<ArrayProgramType>,
+    input_types: Vec<ArrayIrType>,
 
     /// Flat output types of the callee, also the emitted function's result types.
-    output_types: Vec<ArrayProgramType>,
+    output_types: Vec<ArrayIrType>,
 }
 
 /// Shared private functions emitted for `jit_call` callees that occur more than once in a module.
@@ -7115,7 +7115,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
     captured_values: &[ValueRef<'b, 'c, 't>],
     input_values: &[ValueRef<'b, 'c, 't>],
     regions: &[FlatXlaProgram],
-    output_types: &[ArrayProgramType],
+    output_types: &[ArrayIrType],
     lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if let Some(operation) = operation.to_core_operation() {
@@ -8625,7 +8625,7 @@ mod tests {
 
         /// Adds an array input while lifting its descriptor into the composite type universe.
         fn add_input(&mut self, r#type: ArrayType) -> AtomId {
-            self.0.add_input(ArrayProgramType::Array(r#type))
+            self.0.add_input(ArrayIrType::Array(r#type))
         }
 
         /// Finalizes the composite program.
@@ -9988,8 +9988,8 @@ mod tests {
         };
         let operation = LinearCallOperation::transpose_only(
             1,
-            vec![ArrayProgramType::Array(vector_type.clone())],
-            vec![ArrayProgramType::Array(vector_type.clone())],
+            vec![ArrayIrType::Array(vector_type.clone())],
+            vec![ArrayIrType::Array(vector_type.clone())],
         );
         let mut builder = CompositeXlaProgramBuilder::new();
         let backward_region = builder.import_region(backward.entry_region_ref());
@@ -10709,8 +10709,8 @@ mod tests {
             .output_types()
             .iter()
             .map(|r#type| match r#type {
-                ArrayProgramType::Array(r#type) => r#type.clone(),
-                ArrayProgramType::Dimension(_) => panic!("this fixture has only array residuals"),
+                ArrayIrType::Array(r#type) => r#type.clone(),
+                ArrayIrType::Dimension(_) => panic!("this fixture has only array residuals"),
             })
             .collect::<Vec<_>>();
         let primal_stablehlo =
@@ -10723,8 +10723,8 @@ mod tests {
             .input_types()
             .iter()
             .map(|r#type| match r#type {
-                ArrayProgramType::Array(r#type) => r#type.clone(),
-                ArrayProgramType::Dimension(_) => panic!("this fixture has only array residuals"),
+                ArrayIrType::Array(r#type) => r#type.clone(),
+                ArrayIrType::Dimension(_) => panic!("this fixture has only array residuals"),
             })
             .collect::<Vec<_>>();
         let pullback_outputs = vec![scalar_f32, vector_f32];
@@ -13768,7 +13768,7 @@ mod tests {
         let first_type = test_matrix_type(1, 2);
         let second_type = test_matrix_type(3, 2);
         let result_extent = DimensionValue::constant(4).unwrap();
-        let operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
             0,
             &[first_type.clone().into(), second_type.clone().into(), result_extent.r#type().clone().into()],
         )
@@ -13820,7 +13820,7 @@ mod tests {
                 .unwrap();
         let result_extent_type =
             DimensionType::new(DimensionVariable::new(add_operation.result_name(), add_operation.result_bounds()));
-        let concatenate_operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+        let concatenate_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
             0,
             &[first_type.clone().into(), second_type.clone().into(), result_extent_type.into()],
         )

@@ -48,8 +48,8 @@ error[E0283]: type annotations needed
    = help: the following types implement trait `ryft::Parameter`:
              ArrayBatch<V>
              ArrayProgramBatch<V>
-             ArrayProgramType
-             ArrayProgramValue<A>
+             ArrayIrType
+             ArrayIrValue<A>
              ArrayType
              Atom<V>
              AtomId

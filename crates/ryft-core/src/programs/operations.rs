@@ -366,14 +366,14 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// ```rust
 /// # use ryft_core as ryft;
-/// # use ryft_core::{ArrayProgramType, ArrayType, DataType, Dimension, Operation, Shape, Value, ZeroOperation};
-/// # use ryft_core::backends::{Array, ArrayOperation, ArrayProgramValue, DimensionOperation, DimensionValue};
+/// # use ryft_core::{ArrayIrType, ArrayType, DataType, Dimension, Operation, Shape, Value, ZeroOperation};
+/// # use ryft_core::backends::{Array, ArrayOperation, ArrayIrValue, DimensionOperation, DimensionValue};
 /// # use ryft_core::operations::dimensions::DimensionSizeOperation;
 /// # use ryft_core::types::DimensionType;
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
-/// #[ryft(type = ArrayProgramType, constant = ArrayProgramValue<A>)]
+/// #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
 /// #[ryft(members(ArrayType, structural(DimensionType)))]
 /// enum CompositeOperation<A: Value<Type = ArrayType>> {
 ///     /// Mixed structural constructor whose operands are the stored type's dynamic extents, its data universe
@@ -611,11 +611,11 @@ impl<O: Operation> Operation for Box<O> {
 /// corresponding [`From`] implementation lifts. For example:
 ///
 /// ```rust,ignore
-/// impl<A: Value<Type = ArrayType>> OperationProjection<ArrayType> for ArrayProgramOperation<A> {
+/// impl<A: Value<Type = ArrayType>> OperationProjection<ArrayType> for ArrayIrOperation<A> {
 ///     type Projected = ArrayOperation<A>;
 /// }
 ///
-/// impl<A: Value<Type = ArrayType>> OperationProjection<DimensionType> for ArrayProgramOperation<A> {
+/// impl<A: Value<Type = ArrayType>> OperationProjection<DimensionType> for ArrayIrOperation<A> {
 ///     type Projected = DimensionOperation<DimensionValue>;
 /// }
 /// ```
@@ -825,7 +825,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::Effect;
-    use crate::types::{ArrayProgramType, ArrayType, DataType};
+    use crate::types::{ArrayIrType, ArrayType, DataType};
 
     use super::*;
 
@@ -1009,19 +1009,19 @@ mod tests {
         let operation = ForwardingOperation::<ArrayType> { renamed: false, marker: PhantomData };
         let input_type = ArrayType::scalar(DataType::F32);
         let region_output_type = ArrayType::scalar(DataType::F64);
-        let input_types = [ArrayProgramType::from(input_type.clone())];
+        let input_types = [ArrayIrType::from(input_type.clone())];
         let region_interfaces = [RegionInterface::new(
-            vec![ArrayProgramType::from(input_type.clone())],
-            vec![ArrayProgramType::from(region_output_type.clone())],
+            vec![ArrayIrType::from(input_type.clone())],
+            vec![ArrayIrType::from(region_output_type.clone())],
             Effects::single(Effect::OrderedIo),
         )];
         assert_eq!(
             infer_projected_operation_region_input_types(&operation, &input_types, &region_interfaces),
-            Ok(vec![Some(vec![ArrayProgramType::from(input_type.clone())])]),
+            Ok(vec![Some(vec![ArrayIrType::from(input_type.clone())])]),
         );
         assert_eq!(
             infer_projected_operation_output_types(&operation, &input_types, &region_interfaces),
-            Ok(vec![ArrayProgramType::from(input_type), ArrayProgramType::from(region_output_type)]),
+            Ok(vec![ArrayIrType::from(input_type), ArrayIrType::from(region_output_type)]),
         );
     }
 }

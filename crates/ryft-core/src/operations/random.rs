@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use crate::axes::Axis;
 use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, align_array_batch};
-use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::backends::scalars::Scalar;
 use crate::batching::{
@@ -33,7 +33,7 @@ use crate::programs::values::{Value, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError};
 use crate::sharding::ShardingDimension;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
+use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -87,7 +87,7 @@ impl Display for RandomAlgorithm {
 /// floating-point values are compositions on top of the raw bits (see [`uniform`](RngBitGenerator::uniform)).
 /// The declared output must not be sharded (each shard would otherwise see the same bits; derive per-shard states
 /// inside `shard_map` instead). The homogeneous array contract requires a static output shape. In an
-/// [`ArrayProgramType`] graph, a bounded dynamic bits axis instead has one trailing first-class dimension operand;
+/// [`ArrayIrType`] graph, a bounded dynamic bits axis instead has one trailing first-class dimension operand;
 /// eager execution resolves those operands before generating bits. XLA lowering rejects dynamic bits outputs:
 /// generating the physical upper-bound buffer would advance the functional generator state by the physical rather
 /// than logical element count, which is observably incorrect.
@@ -95,7 +95,7 @@ impl Display for RandomAlgorithm {
 /// Both outputs are discrete, so differentiation assigns structural-zero tangents and transposition is rejected.
 /// Homogeneous array batching of a *mapped* state (one state per batch item, e.g. derived with [`split_key`]) stages
 /// one carry-free [`ScanOperation`] over the per-item states, so each batch item draws its own bits from its own state.
-/// Composite array-program batching remains unsupported because the scan must retain first-class extent operands across
+/// Composite array IR batching remains unsupported because the scan must retain first-class extent operands across
 /// its region boundary. Batching a *replicated* state is rejected in either contract because every batch item would see
 /// the same state and draw identical bits. The reference array backend implements both
 /// [`ThreeFry`](RandomAlgorithm::ThreeFry) and [`Philox`](RandomAlgorithm::Philox)
@@ -222,8 +222,8 @@ impl Operation for RngBitGeneratorOperation<ArrayType> {
 
 /// Composite bit-generation contract: the generator state is followed by one explicit first-class extent operand per
 /// dynamic bits axis, each of which must define the dimension variable that the declared bits axis refers to.
-impl Operation for RngBitGeneratorOperation<ArrayProgramType> {
-    type Type = ArrayProgramType;
+impl Operation for RngBitGeneratorOperation<ArrayIrType> {
+    type Type = ArrayIrType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -232,9 +232,9 @@ impl Operation for RngBitGeneratorOperation<ArrayProgramType> {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayProgramType],
-        region_interfaces: &[RegionInterface<ArrayProgramType>],
-    ) -> Result<Vec<ArrayProgramType>, TypeError> {
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         let dynamic_output_dimensions =
             self.output_type.shape().dimensions().iter().filter_map(Dimension::variable).collect::<Vec<_>>();
@@ -280,20 +280,20 @@ impl<C: Domain<Type = ArrayType, Value: RngBitGenerator>> InterpretableOperation
 }
 
 impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>
-    for RngBitGeneratorOperation<ArrayProgramType>
+    InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>
+    for RngBitGeneratorOperation<ArrayIrType>
 {
-    fn interpret<D: InterpretationDriver<EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>>>(
+    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
         &self,
-        _context: &EagerContext<ArrayProgramValue<A>, ArrayProgramOperation<A>>,
+        _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
         driver: &D,
-        inputs: &[ArrayProgramValue<A>],
-    ) -> Result<Vec<ArrayProgramValue<A>>, ProgramError> {
+        inputs: &[ArrayIrValue<A>],
+    ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
         if driver.region_count() != 0 {
             return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
         }
         self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-        let state = <ArrayProgramValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
+        let state = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
         let mut output_extents = inputs[1..].iter();
         let concrete_output_dimensions = self
             .output_type
@@ -305,7 +305,7 @@ impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
                 Dimension::Dynamic(_) => {
                     let extent = output_extents.next().unwrap();
                     Ok(Dimension::Static(
-                        <ArrayProgramValue<A> as ValueProjection<DimensionType>>::projected(extent)?.extent(),
+                        <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(extent)?.extent(),
                     ))
                 }
             })
@@ -327,7 +327,7 @@ impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
                 }
             }
         }
-        Ok(vec![ArrayProgramValue::Array(advanced_state), ArrayProgramValue::Array(bits)])
+        Ok(vec![ArrayIrValue::Array(advanced_state), ArrayIrValue::Array(bits)])
     }
 }
 
@@ -423,15 +423,15 @@ where
 /// Composite batching rule for [`RngBitGeneratorOperation`]. Replicated first-class output extents become invariant
 /// scan carries, while one mapped state row is consumed per iteration. This preserves one independently advanced state
 /// and one dynamically shaped bits value per batch item without duplicating the generator state.
-impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatching>
-    for RngBitGeneratorOperation<ArrayProgramType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayProgramBatching>
+    for RngBitGeneratorOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Operation: From<BroadcastOperation>
         + From<DimensionOperation<DimensionValue>>
         + From<DimensionSizeOperation>
-        + From<RngBitGeneratorOperation<ArrayProgramType>>
+        + From<RngBitGeneratorOperation<ArrayIrType>>
         + From<ScanOperation<C::Constant>>
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
@@ -463,7 +463,7 @@ where
             .iter()
             .map(|extent| builder.add_input(extent.unbatched_type().clone()))
             .collect::<Vec<_>>();
-        let state_input = builder.add_input(ArrayProgramType::Array(self.algorithm().state_type()));
+        let state_input = builder.add_input(ArrayIrType::Array(self.algorithm().state_type()));
         let operation_inputs = std::iter::once(state_input).chain(extent_inputs.iter().copied()).collect::<Vec<_>>();
         let random_outputs = builder.add_instruction(self.clone(), Vec::new(), operation_inputs)?.to_vec();
         let body_outputs = extent_inputs.iter().copied().chain(random_outputs).collect::<Vec<_>>();
@@ -814,7 +814,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::batching::{
@@ -986,18 +986,18 @@ mod tests {
             Ok(vec![RandomAlgorithm::ThreeFry.state_type().into(), dynamic_bits_type.into()]),
         );
         let dynamic_outputs =
-            InterpretableOperation::<EagerContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>>::interpret(
+            InterpretableOperation::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::interpret(
                 &dynamic_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[
-                    ArrayProgramValue::Array(state),
-                    ArrayProgramValue::Dimension(DimensionValue::new(DimensionType::new(extent_variable), 5).unwrap()),
+                    ArrayIrValue::Array(state),
+                    ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(extent_variable), 5).unwrap()),
                 ],
             )
             .unwrap();
-        assert_eq!(dynamic_outputs[0], ArrayProgramValue::Array(outputs[0].clone()));
-        assert_eq!(dynamic_outputs[1], ArrayProgramValue::Array(outputs[1].clone()));
+        assert_eq!(dynamic_outputs[0], ArrayIrValue::Array(outputs[0].clone()));
+        assert_eq!(dynamic_outputs[1], ArrayIrValue::Array(outputs[1].clone()));
 
         // Staging through a program builder produces one instruction with both outputs.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -1224,7 +1224,7 @@ mod tests {
 
     #[test]
     fn test_mapped_rng_batching_stages_one_dynamic_composite_scan() -> Result<(), ProgramError> {
-        type Context = TracingContext<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>;
+        type Context = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(7))?);
@@ -1241,7 +1241,7 @@ mod tests {
             .map(|input| input.atom_id().unwrap());
         let context = BatchingContext::<_, ArrayProgramBatching>::new(trace.clone(), batch_extent);
         let outputs = context.bind(
-            ArrayProgramOperation::RngBitGenerator(RngBitGeneratorOperation::new(
+            ArrayIrOperation::RngBitGenerator(RngBitGeneratorOperation::new(
                 RandomAlgorithm::ThreeFry,
                 ArrayType::new(
                     DataType::U32,
@@ -1260,26 +1260,22 @@ mod tests {
         assert_eq!(outputs[1].batch().batch_axis(), BatchAxis::new(0));
         assert_eq!(
             outputs[1].batch().unbatched_type(),
-            &ArrayProgramType::Array(ArrayType::new(
+            &ArrayIrType::Array(ArrayType::new(
                 DataType::U32,
                 Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Dynamic(columns.clone())]),
             )),
         );
 
         let output_ids = outputs.iter().map(|output| output.batch().value().atom_id().unwrap()).collect::<Vec<_>>();
-        let program = trace
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
-                output_ids,
-                vec![Placeholder; 4],
-                vec![Placeholder; 2],
-            )?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            output_ids,
+            vec![Placeholder; 4],
+            vec![Placeholder; 2],
+        )?;
         let [scan] = program.entry_region().instructions() else {
             panic!("mapped RNG batching should stage exactly one scan instruction");
         };
-        let ArrayProgramOperation::Scan(scan_operation) = scan.operation() else {
+        let ArrayIrOperation::Scan(scan_operation) = scan.operation() else {
             panic!("mapped RNG batching should stage the direct composite scan carrier");
         };
         assert_eq!(scan_operation.carry_count(), 2);
@@ -1288,7 +1284,7 @@ mod tests {
         assert_eq!(scan.regions().len(), 1);
         assert!(matches!(
             program.region(scan.regions()[0])?.instructions()[0].operation(),
-            ArrayProgramOperation::RngBitGenerator(_),
+            ArrayIrOperation::RngBitGenerator(_),
         ));
         let rendered = program.to_string();
         let mut imported_builder = ProgramBuilder::new();
@@ -1313,11 +1309,11 @@ mod tests {
             nested
                 .instructions()
                 .iter()
-                .filter(|instruction| matches!(instruction.operation(), ArrayProgramOperation::Scan(_)))
+                .filter(|instruction| matches!(instruction.operation(), ArrayIrOperation::Scan(_)))
                 .count(),
             1,
         );
-        assert_eq!(nested.input_types()[0], ArrayProgramType::Dimension(DimensionType::new(outer)));
+        assert_eq!(nested.input_types()[0], ArrayIrType::Dimension(DimensionType::new(outer)));
 
         Ok(())
     }

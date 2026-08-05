@@ -9,7 +9,7 @@ use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, Shardin
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, Shape};
+use ryft_core::types::{ArrayIrType, ArrayType, DataType, Dimension, Shape};
 
 use crate::experimental::lowering::{to_mlir_module_for_plain_program, to_mlir_module_for_program};
 use crate::experimental::ops::{XlaConstant, XlaProgram};
@@ -111,9 +111,9 @@ fn traced_xla_records<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
 ) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError>
 where
     <Input as Parameterized<ArrayType>>::Family:
-        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayProgramType> + ParameterizedFamily<XlaConstant>,
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     <Output as Parameterized<ArrayType>>::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayProgramType>
+        + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
 {

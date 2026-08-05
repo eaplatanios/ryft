@@ -1,12 +1,12 @@
 //! StableHLO lowering for programs that mix arrays with first-class dimensions.
 
-use ryft_core::backends::array_programs::ArrayProgramOperation;
+use ryft_core::backends::array_programs::ArrayIrOperation;
 use ryft_core::backends::dimensions::DimensionOperation;
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::dimensions::DimensionRequirementOperation;
 use ryft_core::programs::effects::Effect;
 use ryft_core::programs::{Operation, ProgramError};
-use ryft_core::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionType, Shape};
+use ryft_core::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape};
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
     Block, Context as MlirContext, Location, Operation as MlirOperation, Size as MlirSize, Type as MlirType,
@@ -23,15 +23,15 @@ use super::{
     reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 
-/// Lowers a composite array-program type to its physical StableHLO tensor type.
+/// Lowers a composite array IR type to its physical StableHLO tensor type.
 pub(super) fn lower_array_program_type<'c, 't, L: Location<'c, 't>>(
-    r#type: &ArrayProgramType,
+    r#type: &ArrayIrType,
     context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, LoweringError> {
     match r#type {
-        ArrayProgramType::Array(r#type) => lower_tensor_type(r#type, context, location),
-        ArrayProgramType::Dimension(_) => lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location),
+        ArrayIrType::Array(r#type) => lower_tensor_type(r#type, context, location),
+        ArrayIrType::Dimension(_) => lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location),
     }
 }
 
@@ -114,7 +114,7 @@ fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
 fn dynamic_constructor_types(
     name: &str,
     input_count: usize,
-    output_types: &[ArrayProgramType],
+    output_types: &[ArrayIrType],
 ) -> Result<(ArrayType, ArrayType), LoweringError> {
     let [output_type] = output_types else {
         return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
@@ -228,7 +228,7 @@ fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
     name: &str,
     integer_value: i64,
     input_values: &[ValueRef<'b, 'c, 't>],
-    output_types: &[ArrayProgramType],
+    output_types: &[ArrayIrType],
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
@@ -239,12 +239,12 @@ fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
     refine_dynamic_constructor_result(result, input_values, &output_type, physical_type, block, context, location)
 }
 
-/// Lowers one array-program instruction.
+/// Lowers one array IR instruction.
 pub(super) fn lower_array_program_operation<'b, 'c: 'b, 't: 'c, A>(
-    operation: &ArrayProgramOperation<A>,
+    operation: &ArrayIrOperation<A>,
     input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayProgramType],
-    output_types: &[ArrayProgramType],
+    input_types: &[ArrayIrType],
+    output_types: &[ArrayIrType],
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
@@ -255,13 +255,13 @@ where
     A: MlirLowerableValue,
 {
     match operation {
-        ArrayProgramOperation::Zero(operation) => {
+        ArrayIrOperation::Zero(operation) => {
             lower_dynamic_constructor(operation.name(), 0, input_values, output_types, block, context, location)
         }
-        ArrayProgramOperation::DynamicOne(operation) => {
+        ArrayIrOperation::DynamicOne(operation) => {
             lower_dynamic_constructor(operation.name(), 1, input_values, output_types, block, context, location)
         }
-        ArrayProgramOperation::DynamicIota(operation) => {
+        ArrayIrOperation::DynamicIota(operation) => {
             let (output_type, physical_type) =
                 dynamic_constructor_types(operation.name(), input_values.len(), output_types)?;
             let tensor_type = lower_tensor_type(&physical_type, context, location)?;
@@ -277,7 +277,7 @@ where
                 location,
             )
         }
-        ArrayProgramOperation::Array(operation) => {
+        ArrayIrOperation::Array(operation) => {
             let input_types = input_types
                 .iter()
                 .map(|r#type| {
@@ -303,7 +303,7 @@ where
             *effect_tokens = lowerer.effect_tokens;
             Ok(outputs)
         }
-        ArrayProgramOperation::Dimension(operation) => {
+        ArrayIrOperation::Dimension(operation) => {
             match operation {
                 DimensionOperation::Constant(operation) => {
                     if !input_values.is_empty() {
@@ -444,7 +444,7 @@ where
                 }
             }
         }
-        ArrayProgramOperation::Compare(operation) => {
+        ArrayIrOperation::Compare(operation) => {
             let [left, right] = input_values else {
                 return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() }.into());
             };
@@ -452,7 +452,7 @@ where
             // consume them directly without a data gateway or host-side shape reconstruction.
             Ok(vec![lower_compare_to_mlir(operation.direction(), *left, *right, block, location)?])
         }
-        ArrayProgramOperation::DimensionSize(operation) => {
+        ArrayIrOperation::DimensionSize(operation) => {
             let [input] = input_values else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
             };
@@ -481,7 +481,7 @@ where
                 }
             }
         }
-        ArrayProgramOperation::DimensionFromScalar(operation) => {
+        ArrayIrOperation::DimensionFromScalar(operation) => {
             let [input] = input_values else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
             };
@@ -501,13 +501,13 @@ where
             )?;
             Ok(vec![converted])
         }
-        ArrayProgramOperation::DimensionToScalar(_) => {
+        ArrayIrOperation::DimensionToScalar(_) => {
             let [input] = input_values else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
             };
             Ok(vec![*input])
         }
-        ArrayProgramOperation::Reshape(operation) => {
+        ArrayIrOperation::Reshape(operation) => {
             let Some((input, output_extents)) = input_values.split_first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -563,7 +563,7 @@ where
                 Ok(vec![result])
             }
         }
-        ArrayProgramOperation::Broadcast(operation) => {
+        ArrayIrOperation::Broadcast(operation) => {
             let Some((input, output_extents)) = input_values.split_first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -643,7 +643,7 @@ where
                 Ok(vec![result])
             }
         }
-        ArrayProgramOperation::Concatenate(operation) => {
+        ArrayIrOperation::Concatenate(operation) => {
             let Some((result_extent, array_inputs)) = input_values.split_last() else {
                 return Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }.into());
             };
@@ -700,7 +700,7 @@ where
             let result = block.append_operation(stable_hlo::concatenate(array_inputs, operation.axis(), location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
         }
-        ArrayProgramOperation::CustomCall(operation) => {
+        ArrayIrOperation::CustomCall(operation) => {
             let dynamic_output_dimension_count = operation
                 .output_types()
                 .iter()
@@ -790,7 +790,7 @@ where
             }
             Ok(results)
         }
-        ArrayProgramOperation::Pad(operation) => {
+        ArrayIrOperation::Pad(operation) => {
             let [output_type] = output_types else {
                 return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
             };
@@ -838,7 +838,7 @@ where
             }
             Ok(results)
         }
-        ArrayProgramOperation::DynamicShapeSlice(operation) => {
+        ArrayIrOperation::DynamicShapeSlice(operation) => {
             let Some((input, bounds)) = input_values.split_first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -909,7 +909,7 @@ where
             )?)?;
             Ok(vec![operation.result(0).expect("stablehlo.real_dynamic_slice should return one result").as_ref()])
         }
-        ArrayProgramOperation::RngBitGenerator(operation) => {
+        ArrayIrOperation::RngBitGenerator(operation) => {
             let has_dynamic_output = operation
                 .output_type()
                 .shape()
@@ -934,7 +934,7 @@ where
             }
             lower_rng_bit_generator_to_mlir(operation, input_values, block, context, location)
         }
-        ArrayProgramOperation::AllGather(operation) => {
+        ArrayIrOperation::AllGather(operation) => {
             let Some(input) = input_values.first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -948,7 +948,7 @@ where
                     .remove(0);
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
-        ArrayProgramOperation::PSumScatter(operation) => {
+        ArrayIrOperation::PSumScatter(operation) => {
             let Some(input) = input_values.first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -962,7 +962,7 @@ where
                     .remove(0);
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
-        ArrayProgramOperation::AllToAll(operation) => {
+        ArrayIrOperation::AllToAll(operation) => {
             let Some(input) = input_values.first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -989,10 +989,10 @@ where
             .remove(0);
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
-        ArrayProgramOperation::Condition(_)
-        | ArrayProgramOperation::While(_)
-        | ArrayProgramOperation::Scan(_)
-        | ArrayProgramOperation::LinearCall(_) => Err(LoweringError::UnsupportedOp {
+        ArrayIrOperation::Condition(_)
+        | ArrayIrOperation::While(_)
+        | ArrayIrOperation::Scan(_)
+        | ArrayIrOperation::LinearCall(_) => Err(LoweringError::UnsupportedOp {
             op: format!(
                 "core composite higher-order operation `{}` must be promoted to the XLA operation family before \
                      lowering",

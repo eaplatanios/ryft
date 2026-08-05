@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use ryft_core::InterpretationDriver;
-use ryft_core::backends::array_programs::ArrayProgramValue;
+use ryft_core::backends::array_programs::ArrayIrValue;
 #[cfg(test)]
 use ryft_core::backends::arrays::Array as ReferenceArray;
 use ryft_core::backends::dimensions::{DimensionOperation, DimensionValue};
@@ -49,7 +49,7 @@ use ryft_core::tracing::DomainTracer;
 use ryft_core::types::DimensionType;
 use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
 use ryft_core::types::{
-    ArrayProgramType, ArrayType, DataType, Dimension, Layout, Memory, Shape, StaticShape, StridedLayout, Tile,
+    ArrayIrType, ArrayType, DataType, Dimension, Layout, Memory, Shape, StaticShape, StridedLayout, Tile,
     TileDimension, TiledLayout,
 };
 
@@ -365,8 +365,8 @@ impl<'c> XlaDomain<'c> {
 }
 
 impl<'c> Domain for XlaDomain<'c> {
-    type Type = ArrayProgramType;
-    type Value = ArrayProgramValue<Array<'c>>;
+    type Type = ArrayIrType;
+    type Value = ArrayIrValue<Array<'c>>;
     type Constant = XlaConstant;
     type Operation = XlaOperation;
 }
@@ -375,7 +375,7 @@ impl<'c> Context for XlaDomain<'c> {
     /// [`XlaConstant`] is a [`CaptureReference`](ryft_core::captures::CaptureReference) — a symbolic index into a
     /// compiled function's capture table carrying only a type and no data — so there is nothing to materialize
     /// without the surrounding capture table and lifting is always rejected.
-    fn lift(&self, constant: XlaConstant) -> Result<ArrayProgramValue<Array<'c>>, ProgramError> {
+    fn lift(&self, constant: XlaConstant) -> Result<ArrayIrValue<Array<'c>>, ProgramError> {
         Err(TypeError::invalid(format!("xla captured constant {constant} requires a captured program capture table"))
             .into())
     }
@@ -404,7 +404,7 @@ impl<'c> Context for XlaDomain<'c> {
             if self.mesh.is_some() {
                 let kind = if name == ZERO_OPERATION_NAME { ConstantKind::Zero } else { ConstantKind::One };
                 let value = self.constant(&array_type, kind).map_err(|error| TypeError::invalid(error.to_string()))?;
-                return Ok(vec![ArrayProgramValue::Array(value)]);
+                return Ok(vec![ArrayIrValue::Array(value)]);
             }
         }
         self.eager_bind(operation, driver, inputs)
@@ -428,8 +428,8 @@ impl<'c> Context for XlaDomain<'c> {
 /// The binds below take the constant-materialization fast path on domains constructed with a concrete mesh and the
 /// compiled eager dispatch path (over a derived default mesh) otherwise. Dynamic array zeros are intentionally not
 /// available through this type-only capability because they require explicit first-class extent operands.
-impl<'c> Zero<ArrayProgramValue<Array<'c>>> for XlaDomain<'c> {
-    fn zero(&self, r#type: &ArrayProgramType) -> Result<ArrayProgramValue<Array<'c>>, ProgramError> {
+impl<'c> Zero<ArrayIrValue<Array<'c>>> for XlaDomain<'c> {
+    fn zero(&self, r#type: &ArrayIrType) -> Result<ArrayIrValue<Array<'c>>, ProgramError> {
         let mut outputs = self.bind(XlaOperation::zero_operation(r#type.clone())?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -441,8 +441,8 @@ impl<'c> Zero<ArrayProgramValue<Array<'c>>> for XlaDomain<'c> {
 /// rejected outside a surrounding capture table. The implementation exists because interpretation- and
 /// batching-capable operation families require a [`Constant`] leaf on their contexts; programs whose constants were
 /// compiled into capture tables never take this path.
-impl<'c> Constant<ArrayProgramValue<Array<'c>>, XlaConstant> for XlaDomain<'c> {
-    fn constant(&self, value: XlaConstant) -> Result<ArrayProgramValue<Array<'c>>, ProgramError> {
+impl<'c> Constant<ArrayIrValue<Array<'c>>, XlaConstant> for XlaDomain<'c> {
+    fn constant(&self, value: XlaConstant) -> Result<ArrayIrValue<Array<'c>>, ProgramError> {
         self.lift(value)
     }
 }
@@ -455,13 +455,13 @@ impl<'c> Constant<ArrayProgramValue<Array<'c>>, XlaConstant> for XlaDomain<'c> {
 /// executable. This rule covers the remaining path — a `jit_call` nested inside another region being interpreted —
 /// by re-entering the active interpreter on the callee region, which dispatches the callee's operations one by one
 /// through this same domain.
-impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation<ArrayProgramType> {
+impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation<ArrayIrType> {
     fn interpret<D: InterpretationDriver<XlaDomain<'c>>>(
         &self,
         context: &XlaDomain<'c>,
         driver: &D,
-        inputs: &[ArrayProgramValue<Array<'c>>],
-    ) -> Result<Vec<ArrayProgramValue<Array<'c>>>, ProgramError> {
+        inputs: &[ArrayIrValue<Array<'c>>],
+    ) -> Result<Vec<ArrayIrValue<Array<'c>>>, ProgramError> {
         driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
@@ -481,8 +481,8 @@ impl<'c> InterpretableOperation<XlaDomain<'c>> for ShardMapOperation<XlaConstant
         &self,
         _context: &XlaDomain<'c>,
         _driver: &D,
-        _inputs: &[ArrayProgramValue<Array<'c>>],
-    ) -> Result<Vec<ArrayProgramValue<Array<'c>>>, ProgramError> {
+        _inputs: &[ArrayIrValue<Array<'c>>],
+    ) -> Result<Vec<ArrayIrValue<Array<'c>>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: "eager shard_map replay must bind through a client-backed domain context".to_string(),
         })
@@ -492,7 +492,7 @@ impl<'c> InterpretableOperation<XlaDomain<'c>> for ShardMapOperation<XlaConstant
 /// Returns the single [`ArrayType`] produced by a nullary additive/multiplicative identity operation
 /// ([`ZERO_OPERATION_NAME`] / [`ONE_OPERATION_NAME`]). The identity fast path in [`Context::bind`] materializes these
 /// constants directly through the runtime client instead of compiling a program.
-fn eager_identity_output_type<O: Operation<Type = ArrayProgramType>>(operation: &O) -> Result<ArrayType, ProgramError> {
+fn eager_identity_output_type<O: Operation<Type = ArrayIrType>>(operation: &O) -> Result<ArrayType, ProgramError> {
     let mut output_types = operation.infer_output_types(&[], &[])?;
     if output_types.len() != 1 {
         return Err(TypeError::invalid(format!(
@@ -537,8 +537,8 @@ impl<'c> XlaDomain<'c> {
         &self,
         operation: XlaOperation,
         driver: D,
-        inputs: &[ArrayProgramValue<Array<'c>>],
-    ) -> Result<Vec<ArrayProgramValue<Array<'c>>>, ProgramError> {
+        inputs: &[ArrayIrValue<Array<'c>>],
+    ) -> Result<Vec<ArrayIrValue<Array<'c>>>, ProgramError> {
         if let XlaOperation::Dimension(operation) = &operation {
             if driver.regions().count() != 0 {
                 return Err(TypeError::invalid("dimension operations do not accept attached regions").into());
@@ -546,10 +546,8 @@ impl<'c> XlaDomain<'c> {
             let inputs = inputs
                 .iter()
                 .map(|input| {
-                    <ArrayProgramValue<Array<'c>> as ryft_core::ValueProjection<ryft_core::DimensionType>>::projected(
-                        input,
-                    )
-                    .cloned()
+                    <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<ryft_core::DimensionType>>::projected(input)
+                        .cloned()
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let outputs = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().bind(
@@ -557,7 +555,7 @@ impl<'c> XlaDomain<'c> {
                 Vec::new(),
                 inputs.as_slice(),
             )?;
-            return Ok(outputs.into_iter().map(ArrayProgramValue::Dimension).collect());
+            return Ok(outputs.into_iter().map(ArrayIrValue::Dimension).collect());
         }
         if let XlaOperation::DimensionSize(operation) = &operation {
             if driver.regions().count() != 0 {
@@ -565,12 +563,9 @@ impl<'c> XlaDomain<'c> {
             }
             check_count!("input", inputs, 1, ProgramError);
             operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-            let array = <ArrayProgramValue<Array<'c>> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
+            let array = <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
             let extent = array.dimension_size(operation.axis())?;
-            return Ok(vec![ArrayProgramValue::Dimension(DimensionValue::new(
-                operation.result_type().clone(),
-                extent,
-            )?)]);
+            return Ok(vec![ArrayIrValue::Dimension(DimensionValue::new(operation.result_type().clone(), extent)?)]);
         }
         if let XlaOperation::DimensionFromScalar(operation) = &operation {
             if driver.regions().count() != 0 {
@@ -578,10 +573,8 @@ impl<'c> XlaDomain<'c> {
             }
             check_count!("input", inputs, 1, ProgramError);
             operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-            let array = <ArrayProgramValue<Array<'c>> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
-            return Ok(vec![ArrayProgramValue::Dimension(
-                array.to_dimension(operation.result_type().variable().clone())?,
-            )]);
+            let array = <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
+            return Ok(vec![ArrayIrValue::Dimension(array.to_dimension(operation.result_type().variable().clone())?)]);
         }
 
         let Some(client) = self.client else {
@@ -598,7 +591,7 @@ impl<'c> XlaDomain<'c> {
             }
             check_count!("input", inputs, 1, ProgramError);
             let dimension =
-                <ArrayProgramValue<Array<'c>> as ryft_core::ValueProjection<ryft_core::DimensionType>>::projected(
+                <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<ryft_core::DimensionType>>::projected(
                     &inputs[0],
                 )?;
             let extent = i64::try_from(dimension.extent()).unwrap();
@@ -610,7 +603,7 @@ impl<'c> XlaDomain<'c> {
             let output = Array::from_host_buffer(client, output_type, mesh, extent.to_ne_bytes().as_slice())
                 .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
                 .with_compilation_cache(Arc::clone(&self.cache));
-            return Ok(vec![ArrayProgramValue::Array(output)]);
+            return Ok(vec![ArrayIrValue::Array(output)]);
         }
 
         let mut array_inputs = Vec::new();
@@ -625,11 +618,11 @@ impl<'c> XlaDomain<'c> {
             let input_atoms = inputs
                 .iter()
                 .map(|input| match input {
-                    ArrayProgramValue::Array(array) => {
+                    ArrayIrValue::Array(array) => {
                         array_inputs.push(array.clone());
-                        Ok(builder.add_input(ArrayProgramType::Array(array.r#type().into_owned())))
+                        Ok(builder.add_input(ArrayIrType::Array(array.r#type().into_owned())))
                     }
-                    ArrayProgramValue::Dimension(dimension) => {
+                    ArrayIrValue::Dimension(dimension) => {
                         let operation = DimensionOperation::Constant(ConstantOperation::new(dimension.clone()));
                         Ok(builder.add_instruction(XlaOperation::Dimension(operation), Vec::new(), Vec::new())?[0])
                     }
@@ -673,7 +666,7 @@ impl<'c> XlaDomain<'c> {
         // executing on the same client and keeps hitting the same compile cache.
         Ok(outputs
             .into_iter()
-            .map(|output| ArrayProgramValue::Array(output.with_compilation_cache(Arc::clone(&self.cache))))
+            .map(|output| ArrayIrValue::Array(output.with_compilation_cache(Arc::clone(&self.cache))))
             .collect())
     }
 
@@ -2259,7 +2252,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             .map_err(ProgramError::from)?;
         let outputs = self.execute_xla_program(executable.compiled_program(), arguments)?;
         validate_runtime_outputs(&output_types, &outputs)?;
-        Request::reconstruct(&executable, outputs.into_iter().map(ArrayProgramValue::Array).collect())
+        Request::reconstruct(&executable, outputs.into_iter().map(ArrayIrValue::Array).collect())
     }
 }
 
@@ -2657,7 +2650,7 @@ impl<'c> CompilationCacheDomain for XlaDomain<'c> {
 impl<'c> AnalyzableCompilationDomain for XlaDomain<'c> {
     type Analysis = XlaCompilationAnalysis;
 
-    fn analyze<Input: Parameterized<ArrayProgramType>, Output: Parameterized<ArrayProgramType>>(
+    fn analyze<Input: Parameterized<ArrayIrType>, Output: Parameterized<ArrayIrType>>(
         &self,
         executable_program: &ryft_core::compilation::ExecutableProgram<Self, Input, Output>,
     ) -> Result<Self::Analysis, Self::Error> {
@@ -2709,7 +2702,7 @@ pub(crate) fn validate_xla_input_type(declared: &ArrayType, actual: &ArrayType) 
     }
 }
 
-fn validate_output_types(declared: &[ArrayProgramType], actual: &[ArrayType]) -> Result<(), XlaDomainError> {
+fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Result<(), XlaDomainError> {
     if declared.len() != actual.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: actual.len() }.into());
     }
@@ -2825,10 +2818,10 @@ fn optional_pjrt_analysis<T>(result: Result<T, ryft_pjrt::Error>) -> Result<Opti
 /// Applies an optional per-leaf sharding override to a public composite signature. Every boundary leaf must be an
 /// array; first-class dimensions are internal SSA values and cannot cross the PJRT ABI.
 fn apply_signature_shardings(
-    mut types: Vec<ArrayProgramType>,
+    mut types: Vec<ArrayIrType>,
     shardings: Option<&[Sharding]>,
     kind: &'static str,
-) -> Result<Vec<ArrayProgramType>, XlaDomainError> {
+) -> Result<Vec<ArrayIrType>, XlaDomainError> {
     let Some(shardings) = shardings else {
         return Ok(types);
     };
@@ -3575,9 +3568,9 @@ mod tests {
         ProjectedContext::new(XlaDomain::new(client))
     }
 
-    fn program_array<'a, 'c>(value: &'a ArrayProgramValue<Array<'c>>) -> &'a Array<'c> {
-        let ArrayProgramValue::Array(array) = value else {
-            panic!("expected an array program value");
+    fn program_array<'a, 'c>(value: &'a ArrayIrValue<Array<'c>>) -> &'a Array<'c> {
+        let ArrayIrValue::Array(array) = value else {
+            panic!("expected an array IR value");
         };
         array
     }
@@ -3865,21 +3858,21 @@ mod tests {
             .bind(
                 XlaOperation::Dimension(DimensionOperation::Add(add)),
                 Vec::new(),
-                &[ArrayProgramValue::Dimension(left), ArrayProgramValue::Dimension(right)],
+                &[ArrayIrValue::Dimension(left), ArrayIrValue::Dimension(right)],
             )
             .unwrap()
             .remove(0);
-        let ArrayProgramValue::Dimension(output) = output else {
+        let ArrayIrValue::Dimension(output) = output else {
             panic!("dimension arithmetic must produce a dimension value");
         };
         assert_eq!(output.extent(), 5);
         assert_eq!(domain.cache_size(), 0);
 
         let scalar = domain
-            .bind(DimensionToScalarOperation, Vec::new(), &[ArrayProgramValue::Dimension(output.clone())])
+            .bind(DimensionToScalarOperation, Vec::new(), &[ArrayIrValue::Dimension(output.clone())])
             .unwrap()
             .remove(0);
-        let ArrayProgramValue::Array(scalar) = scalar else {
+        let ArrayIrValue::Array(scalar) = scalar else {
             panic!("dimension_to_scalar must produce an array");
         };
         assert_eq!(read_i64s(&client, &scalar), vec![5]);
@@ -3889,11 +3882,11 @@ mod tests {
             .bind(
                 ryft_core::DimensionFromScalarOperation::new(output.r#type().variable().clone()),
                 Vec::new(),
-                &[ArrayProgramValue::Array(scalar)],
+                &[ArrayIrValue::Array(scalar)],
             )
             .unwrap()
             .remove(0);
-        let ArrayProgramValue::Dimension(from_scalar) = from_scalar else {
+        let ArrayIrValue::Dimension(from_scalar) = from_scalar else {
             panic!("dimension_from_scalar must produce a dimension value");
         };
         assert_eq!(from_scalar.extent(), 5);
@@ -4247,11 +4240,11 @@ mod tests {
             .bind(
                 DimensionSizeOperation::new(input.r#type().as_ref(), 0).unwrap(),
                 Vec::new(),
-                &[ArrayProgramValue::Array(input.clone())],
+                &[ArrayIrValue::Array(input.clone())],
             )
             .unwrap()
             .remove(0);
-        let ArrayProgramValue::Dimension(extent) = extent else {
+        let ArrayIrValue::Dimension(extent) = extent else {
             panic!("dimension_size must produce a dimension value");
         };
         assert_eq!(extent.extent(), 6);
@@ -4263,32 +4256,25 @@ mod tests {
             .bind(
                 XlaOperation::Dimension(DimensionOperation::DivFloor(division)),
                 Vec::new(),
-                &[ArrayProgramValue::Dimension(extent), ArrayProgramValue::Dimension(two.clone())],
+                &[ArrayIrValue::Dimension(extent), ArrayIrValue::Dimension(two.clone())],
             )
             .unwrap()
             .remove(0);
-        let ArrayProgramValue::Dimension(three) = three else {
+        let ArrayIrValue::Dimension(three) = three else {
             panic!("dimension division must produce a dimension value");
         };
         assert_eq!(three.extent(), 3);
         assert_eq!(domain.cache_size(), 0);
 
-        let reshape_inputs = [
-            ArrayProgramValue::Array(input),
-            ArrayProgramValue::Dimension(two.clone()),
-            ArrayProgramValue::Dimension(three.clone()),
-        ];
+        let reshape_inputs =
+            [ArrayIrValue::Array(input), ArrayIrValue::Dimension(two.clone()), ArrayIrValue::Dimension(three.clone())];
         let reshaped = domain.bind(ReshapeOperation::new(), Vec::new(), &reshape_inputs).unwrap().remove(0);
         assert_eq!(program_array(&reshaped).shape().as_slice(), &[2, 3]);
         assert_eq!(domain.cache_size(), 1);
 
         let four = DimensionValue::constant(4).unwrap();
-        let broadcast_inputs = [
-            reshaped,
-            ArrayProgramValue::Dimension(four),
-            ArrayProgramValue::Dimension(two),
-            ArrayProgramValue::Dimension(three),
-        ];
+        let broadcast_inputs =
+            [reshaped, ArrayIrValue::Dimension(four), ArrayIrValue::Dimension(two), ArrayIrValue::Dimension(three)];
         let broadcast =
             domain.bind(BroadcastOperation::new(vec![1, 2]), Vec::new(), &broadcast_inputs).unwrap().remove(0);
         assert_eq!(program_array(&broadcast).shape().as_slice(), &[4, 2, 3]);
@@ -4400,7 +4386,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> =
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             domain.compile(domain.lower(staged).unwrap()).unwrap();
         assert_eq!(domain.cache_size(), 1);
 
@@ -4420,10 +4406,10 @@ mod tests {
                 let output = ryft_core::compilation::call_function(
                     &domain,
                     compiled.executable_program(),
-                    ArrayProgramValue::Array(input.clone()),
+                    ArrayIrValue::Array(input.clone()),
                 )
                 .unwrap();
-                let ArrayProgramValue::Array(output) = output else {
+                let ArrayIrValue::Array(output) = output else {
                     panic!("array-only compiled function returned a first-class dimension");
                 };
                 output.block_until_ready().unwrap();
@@ -4503,7 +4489,7 @@ mod tests {
             crate::jit::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), &engine, options)
                 .unwrap()
                 .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> =
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             engine.compile(engine.lower(staged).unwrap()).unwrap();
 
         // Round-trip a small input through the new CompilationDomain-driven pipeline.
@@ -4515,13 +4501,10 @@ mod tests {
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
-        let array = ryft_core::compilation::call_function(
-            &engine,
-            compiled.executable_program(),
-            ArrayProgramValue::Array(source),
-        )
-        .unwrap();
-        let ArrayProgramValue::Array(array) = array else {
+        let array =
+            ryft_core::compilation::call_function(&engine, compiled.executable_program(), ArrayIrValue::Array(source))
+                .unwrap();
+        let ArrayIrValue::Array(array) = array else {
             panic!("array-only compiled function returned a first-class dimension");
         };
         array.block_until_ready().unwrap();
@@ -4552,7 +4535,7 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-            let _: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> =
+            let _: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
                 engine.compile(engine.lower(staged).unwrap()).unwrap();
         }
         assert_eq!(
@@ -4579,11 +4562,11 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> =
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             domain.compile(domain.lower(staged).unwrap()).unwrap();
         assert_eq!(compiled.compiled_program().output_types(), std::slice::from_ref(&input_type));
 
-        let donated_staged: StagedFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> =
+        let donated_staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             crate::jit::stage::<_, ArrayType, ArrayType>(
                 |input| input,
                 input_type.clone(),
@@ -4602,7 +4585,7 @@ mod tests {
         // Boolean values retain physical `i1` arguments/results while the zero-space identity has an empty physical
         // signature. Their retained logical metadata also keeps their compilation identities distinct.
         let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
-        let boolean_staged: StagedFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> =
+        let boolean_staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             crate::jit::stage::<_, ArrayType, ArrayType>(
                 |input| input,
                 boolean_type,
@@ -4618,13 +4601,10 @@ mod tests {
         );
 
         let input = Array::from_host_buffer(&client, input_type, mesh, []).unwrap();
-        let output = ryft_core::compilation::call_function(
-            &domain,
-            compiled.executable_program(),
-            ArrayProgramValue::Array(input),
-        )
-        .unwrap();
-        let ArrayProgramValue::Array(output) = output else {
+        let output =
+            ryft_core::compilation::call_function(&domain, compiled.executable_program(), ArrayIrValue::Array(input))
+                .unwrap();
+        let ArrayIrValue::Array(output) = output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
         assert_eq!(output.data_type(), DataType::Zero);
@@ -4657,8 +4637,8 @@ mod tests {
         assert!(lowered.lowered_program().stable_hlo().contains("func.func @main(%arg0: tensor<3xf32>"));
         let compiled: ryft_core::compilation::CompiledFunction<
             XlaDomain<'_>,
-            (ArrayProgramType, ArrayProgramType),
-            (ArrayProgramType, ArrayProgramType),
+            (ArrayIrType, ArrayIrType),
+            (ArrayIrType, ArrayIrType),
         > = domain.compile(lowered).unwrap();
         let value = Array::from_host_buffer(
             &client,
@@ -4672,13 +4652,13 @@ mod tests {
         let (zero_output, value_output) = ryft_core::compilation::call_function(
             &domain,
             compiled.executable_program(),
-            (ArrayProgramValue::Array(value), ArrayProgramValue::Array(zero)),
+            (ArrayIrValue::Array(value), ArrayIrValue::Array(zero)),
         )
         .unwrap();
-        let ArrayProgramValue::Array(zero_output) = zero_output else {
+        let ArrayIrValue::Array(zero_output) = zero_output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
-        let ArrayProgramValue::Array(value_output) = value_output else {
+        let ArrayIrValue::Array(value_output) = value_output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
 
@@ -5168,7 +5148,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> =
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             domain.compile(domain.lower(staged).unwrap()).unwrap();
         let key = domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
         let clientless_domain = XlaDomain::clientless();
@@ -5214,18 +5194,15 @@ mod tests {
             let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
             Ok(ValueProjection::<ArrayType>::from_projected(capture + input))
         }
-        let staged: StagedFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> = domain
-            .stage(ryft_core::compilation::CompilationStagingRequest::<
-                XlaDomain<'_>,
-                _,
-                ArrayProgramType,
-                ArrayProgramType,
-            >::new(
-                add_capture,
-                vec![ArrayProgramValue::Array(capture.clone())],
-                ArrayProgramType::Array(input_type.clone()),
-                XlaOptions::new(mesh.clone()).with_donate(true),
-            ))
+        let staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> = domain
+            .stage(
+                ryft_core::compilation::CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+                    add_capture,
+                    vec![ArrayIrValue::Array(capture.clone())],
+                    ArrayIrType::Array(input_type.clone()),
+                    XlaOptions::new(mesh.clone()).with_donate(true),
+                ),
+            )
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let compiled_analysis = domain.analyze(compiled.executable_program()).unwrap();
@@ -5310,7 +5287,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let first: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> =
+        let first: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             first_domain.compile(first_domain.lower(staged).unwrap()).unwrap();
         assert_eq!(first_domain.cache.statistics().compilations, 1);
         drop(first);
@@ -5328,7 +5305,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let _restored: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayProgramType, ArrayProgramType> =
+        let _restored: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             second_domain.compile(second_domain.lower(staged).unwrap()).unwrap();
         let statistics = second_domain.cache.statistics();
         assert_eq!(statistics.persistent_hits, 1);
@@ -5572,10 +5549,7 @@ mod tests {
             .bind(
                 operation.clone(),
                 [doubled.clone(), squared.clone()],
-                &[
-                    ArrayProgramValue::Array(boolean_scalar(&client, &mesh, true)),
-                    ArrayProgramValue::Array(input.clone()),
-                ],
+                &[ArrayIrValue::Array(boolean_scalar(&client, &mesh, true)), ArrayIrValue::Array(input.clone())],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&true_outputs[0])), vec![2.0, 4.0, 6.0, 8.0]);
@@ -5584,7 +5558,7 @@ mod tests {
             .bind(
                 operation,
                 [doubled, squared],
-                &[ArrayProgramValue::Array(boolean_scalar(&client, &mesh, false)), ArrayProgramValue::Array(input)],
+                &[ArrayIrValue::Array(boolean_scalar(&client, &mesh, false)), ArrayIrValue::Array(input)],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&false_outputs[0])), vec![1.0, 4.0, 9.0, 16.0]);
@@ -5628,9 +5602,9 @@ mod tests {
                 operation.clone(),
                 [branch(false), branch(true)],
                 &[
-                    ArrayProgramValue::Array(boolean_scalar(&client, &mesh, true)),
-                    ArrayProgramValue::Dimension(extent.clone()),
-                    ArrayProgramValue::Array(scalar.clone()),
+                    ArrayIrValue::Array(boolean_scalar(&client, &mesh, true)),
+                    ArrayIrValue::Dimension(extent.clone()),
+                    ArrayIrValue::Array(scalar.clone()),
                 ],
             )
             .unwrap();
@@ -5642,9 +5616,9 @@ mod tests {
                 operation,
                 [branch(false), branch(true)],
                 &[
-                    ArrayProgramValue::Array(boolean_scalar(&client, &mesh, false)),
-                    ArrayProgramValue::Dimension(extent),
-                    ArrayProgramValue::Array(scalar),
+                    ArrayIrValue::Array(boolean_scalar(&client, &mesh, false)),
+                    ArrayIrValue::Dimension(extent),
+                    ArrayIrValue::Array(scalar),
                 ],
             )
             .unwrap();
@@ -5693,7 +5667,7 @@ mod tests {
         let operation = XlaOperation::While(WhileOperation::new());
 
         let outputs = domain
-            .bind(operation, vec![condition, body], &[ArrayProgramValue::Array(f32_scalar(&client, &mesh, 0.0))])
+            .bind(operation, vec![condition, body], &[ArrayIrValue::Array(f32_scalar(&client, &mesh, 0.0))])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![3.0]);
@@ -5765,7 +5739,7 @@ mod tests {
         let scan = ScanOperation::<XlaConstant>::new(1, 4);
 
         let outputs = domain
-            .bind(XlaOperation::Scan(scan), [body], &[ArrayProgramValue::Array(f32_scalar(&client, &mesh, 0.0))])
+            .bind(XlaOperation::Scan(scan), [body], &[ArrayIrValue::Array(f32_scalar(&client, &mesh, 0.0))])
             .unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![4.0]);
@@ -5802,7 +5776,7 @@ mod tests {
             .bind(
                 XlaOperation::Scan(scan),
                 [body],
-                &[ArrayProgramValue::Array(f32_scalar(&client, &mesh, 0.0)), ArrayProgramValue::Dimension(length)],
+                &[ArrayIrValue::Array(f32_scalar(&client, &mesh, 0.0)), ArrayIrValue::Dimension(length)],
             )
             .unwrap();
 
@@ -5838,11 +5812,7 @@ mod tests {
         let carry = f32_scalar(&client, &mesh, 0.0);
         let xs = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let outputs = domain
-            .bind(
-                XlaOperation::Scan(scan),
-                vec![body],
-                &[ArrayProgramValue::Array(carry), ArrayProgramValue::Array(xs)],
-            )
+            .bind(XlaOperation::Scan(scan), vec![body], &[ArrayIrValue::Array(carry), ArrayIrValue::Array(xs)])
             .unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![10.0]);
@@ -5887,11 +5857,7 @@ mod tests {
         .unwrap();
         let carry = f32_scalar(&client, &mesh, 0.0);
         let outputs = domain
-            .bind(
-                XlaOperation::Scan(scan),
-                vec![body],
-                &[ArrayProgramValue::Array(carry), ArrayProgramValue::Array(xs)],
-            )
+            .bind(XlaOperation::Scan(scan), vec![body], &[ArrayIrValue::Array(carry), ArrayIrValue::Array(xs)])
             .unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![10.0]);
@@ -5925,20 +5891,14 @@ mod tests {
 
         let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let first = domain
-            .bind(
-                operation.clone(),
-                CalleeRegionDriver::new(&[callee.clone()]),
-                &[ArrayProgramValue::Array(input.clone())],
-            )
+            .bind(operation.clone(), CalleeRegionDriver::new(&[callee.clone()]), &[ArrayIrValue::Array(input.clone())])
             .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(read_f32s(&client, program_array(&first[0])), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1);
 
         // A repeated eager `jit_call` at the same input signature is a dispatch-cache hit.
-        let second = domain
-            .bind(operation, CalleeRegionDriver::new(&[callee]), &[ArrayProgramValue::Array(input)])
-            .unwrap();
+        let second = domain.bind(operation, CalleeRegionDriver::new(&[callee]), &[ArrayIrValue::Array(input)]).unwrap();
         assert_eq!(read_f32s(&client, program_array(&second[0])), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1, "a repeated eager jit_call must be a compile-cache hit");
     }
@@ -5999,7 +5959,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.bind(operation, vec![body_region], &[ArrayProgramValue::Array(input)]).unwrap();
+        let outputs = domain.bind(operation, vec![body_region], &[ArrayIrValue::Array(input)]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         let output = program_array(&outputs[0]);

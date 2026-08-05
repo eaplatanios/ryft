@@ -1608,7 +1608,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::backends::array_programs::{ArrayProgramOperation, ArrayProgramValue};
+    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::macros::check_count;
@@ -1623,7 +1623,7 @@ mod tests {
     use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
     use crate::tests::TestRegionOperation;
-    use crate::types::{ArrayProgramType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -2218,20 +2218,17 @@ mod tests {
             .collect::<Vec<_>>();
 
         let composite: Program<
-            ArrayProgramValue<Array>,
-            ArrayProgramOperation<Array>,
-            (ArrayProgramValue<Array>, ArrayProgramValue<Array>),
-            ArrayProgramValue<Array>,
+            ArrayIrValue<Array>,
+            ArrayIrOperation<Array>,
+            (ArrayIrValue<Array>, ArrayIrValue<Array>),
+            ArrayIrValue<Array>,
         > = source.into_unprojected().unwrap();
 
         assert_eq!(
             composite.input_types(),
-            vec![
-                ArrayProgramType::Array(ArrayType::scalar(DataType::Boolean)),
-                ArrayProgramType::Array(array_type.clone()),
-            ],
+            vec![ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)), ArrayIrType::Array(array_type.clone()),],
         );
-        assert_eq!(composite.output_types(), vec![ArrayProgramType::Array(array_type)]);
+        assert_eq!(composite.output_types(), vec![ArrayIrType::Array(array_type)]);
         assert_eq!(composite.input_structure(), &(Placeholder, Placeholder));
         assert_eq!(composite.output_structure(), &Placeholder);
         assert_eq!(composite.effects(), source_effects);
@@ -2256,34 +2253,34 @@ mod tests {
         assert_eq!(entry.instructions().len(), 1);
         let branch_region = entry.instructions()[0].regions()[0];
         assert_eq!(entry.instructions()[0].regions(), &[branch_region, branch_region]);
-        assert!(matches!(entry.instructions()[0].operation(), ArrayProgramOperation::Condition(_),));
+        assert!(matches!(entry.instructions()[0].operation(), ArrayIrOperation::Condition(_),));
         assert!(matches!(
             &entry.atoms()[constant.index()],
-            Atom::Constant(ArrayProgramValue::Array(value)) if value == &Array::scalar(2.0_f64),
+            Atom::Constant(ArrayIrValue::Array(value)) if value == &Array::scalar(2.0_f64),
         ));
         let branch = composite.region(branch_region).unwrap();
-        assert!(matches!(branch.instructions()[0].operation(), ArrayProgramOperation::Array(ArrayOperation::Neg(_))));
+        assert!(matches!(branch.instructions()[0].operation(), ArrayIrOperation::Array(ArrayOperation::Neg(_))));
         let scan_instruction = branch
             .instructions()
             .iter()
-            .find(|instruction| matches!(instruction.operation(), ArrayProgramOperation::Scan(_)))
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::Scan(_)))
             .unwrap();
-        let ArrayProgramOperation::Scan(scan) = scan_instruction.operation() else {
+        let ArrayIrOperation::Scan(scan) = scan_instruction.operation() else {
             unreachable!();
         };
         assert_eq!(scan.carry_count(), 1);
         assert_eq!(scan.length(), &Dimension::Static(2));
         assert!(scan.reverse());
         assert_eq!(scan.unroll(), 2);
-        assert_eq!(scan.captures(), &[ArrayProgramValue::Array(scan_capture)]);
+        assert_eq!(scan.captures(), &[ArrayIrValue::Array(scan_capture)]);
         let scan_body = composite.region(scan_instruction.regions()[0]).unwrap();
         let while_instruction = scan_body
             .instructions()
             .iter()
-            .find(|instruction| matches!(instruction.operation(), ArrayProgramOperation::While(_)))
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::While(_)))
             .unwrap();
         assert_eq!(while_instruction.regions().len(), 2);
-        assert!(matches!(while_instruction.operation(), ArrayProgramOperation::While(_)));
+        assert!(matches!(while_instruction.operation(), ArrayIrOperation::While(_)));
     }
 
     #[test]

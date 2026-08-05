@@ -12,7 +12,7 @@ use ryft_core::operations::manipulation::conversion::ElementType;
 use ryft_core::operations::math::{Add, Div, Mul, Neg, Sub};
 use ryft_core::programs::types::Typed;
 use ryft_core::programs::{Concretizable, Operation, ProgramError, Value};
-use ryft_core::types::{ArrayProgramType, DataType, DimensionType, DimensionVariable};
+use ryft_core::types::{ArrayIrType, DataType, DimensionType, DimensionVariable};
 
 use crate::experimental::ops::XlaArrayConstant;
 use crate::{Array, ArrayShard};
@@ -100,8 +100,7 @@ impl DimensionFromScalar<DimensionValue> for Array<'_> {
     /// Copies this rank-zero integer array to the host and grants its checked value first-class dimension authority.
     fn to_dimension(&self, result: DimensionVariable) -> Result<DimensionValue, ProgramError> {
         let operation = DimensionFromScalarOperation::new(result);
-        let mut output_types =
-            operation.infer_output_types(&[ArrayProgramType::Array(self.r#type().into_owned())], &[])?;
+        let mut output_types = operation.infer_output_types(&[ArrayIrType::Array(self.r#type().into_owned())], &[])?;
         let output_type = <&DimensionType>::try_from(&output_types.remove(0))?.clone();
         let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
             message: format!(
