@@ -4,8 +4,8 @@ use std::marker::PhantomData;
 
 use crate::axes::Axis;
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
+use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,

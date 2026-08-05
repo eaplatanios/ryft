@@ -8,8 +8,8 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::backends::array_programs::ArrayIrValue;
-use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, require_equal_dimensions};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
+use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, require_equal_dimensions};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
     BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy, batch_projected_operation,

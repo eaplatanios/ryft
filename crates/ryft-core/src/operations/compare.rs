@@ -1,7 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
+use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};

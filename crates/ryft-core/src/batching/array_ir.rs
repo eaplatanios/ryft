@@ -36,6 +36,8 @@ use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType};
 
+// TODO(eaplatanios): Review this module.
+
 /// Kind-aware batched view of one array IR value.
 #[derive(Clone, Debug, Parameter)]
 pub struct ArrayIrBatch<V: Value<Type = ArrayIrType>> {
@@ -573,14 +575,6 @@ where
     Ok(())
 }
 
-/// Returns one first-class dimension operand for every packed array axis.
-fn array_dimensions<C>(context: &C, value: &C::Value, rank: usize) -> Result<Vec<C::Value>, BatchingError>
-where
-    C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>,
-{
-    (0..rank).map(|axis| array_dimension(context, value, axis)).collect()
-}
-
 /// Binds one mixed dynamic broadcast against explicit first-class output dimensions.
 fn broadcast_array<C>(
     context: &C,
@@ -633,7 +627,9 @@ where
             .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis })?;
         let outer_context = context.parent().parent();
         let value = <C::Value as ValueProjection<ArrayType>>::from_projected(batch.value().clone());
-        let mut output_dimensions = array_dimensions(outer_context, &value, array_type.rank())?;
+        let mut output_dimensions = (0..array_type.rank())
+            .map(|axis| array_dimension(outer_context, &value, axis))
+            .collect::<Result<Vec<_>, _>>()?;
         output_dimensions.insert(position, context.axis_extent().clone());
         let output_axes = (0..array_type.rank())
             .map(|input_axis| if input_axis < position { input_axis } else { input_axis + 1 })
@@ -729,10 +725,14 @@ where
         context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
         extent: usize,
     ) -> Result<Self::ShapeExtent, BatchingError> {
-        Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(dimension_constant(
-            context.parent().parent(),
-            extent,
-        )?)?)
+        let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
+        let mut outputs = context.parent().parent().bind(
+            DimensionOperation::Constant(ConstantOperation::new(value)),
+            Vec::new(),
+            &[],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(outputs.remove(0))?)
     }
 
     fn require_divisible_collective_extents(
@@ -847,37 +847,6 @@ where
     ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
 }
 
-/// Normalizes one mapped composite array input to the batching context's common packed sharding placement.
-fn normalize_array_input<C>(
-    context: &BatchingContext<C, ArrayIrBatching>,
-    batch: ArrayIrBatch<C::Value>,
-) -> Result<ArrayIrBatch<C::Value>, BatchingError>
-where
-    C: Context<Type = ArrayIrType, Operation: From<BroadcastOperation> + From<DimensionSizeOperation>>,
-{
-    let Some(position) = batch.batch_axis_position() else {
-        return Ok(batch);
-    };
-    let value_type = batch.value.r#type();
-    let array_type = <&ArrayType>::try_from(value_type.as_ref())?;
-    let Some(normalized_type) = normalized_batch_axis_type(array_type, position, context.axis_sharding())? else {
-        return Ok(batch);
-    };
-
-    let mut output_dimensions = array_dimensions(context.parent(), &batch.value, array_type.rank())?;
-    output_dimensions[position] = context.axis_extent().clone();
-    let output_axes = (0..array_type.rank()).collect::<Vec<_>>();
-    let batch_axis = batch.batch_axis;
-    let value = broadcast_array(
-        context.parent(),
-        batch.value,
-        output_dimensions,
-        output_axes,
-        normalized_type.sharding().cloned(),
-    )?;
-    ArrayIrBatch::new(value, batch_axis)
-}
-
 impl<C> BatchingEntrypointPolicy<C> for ArrayIrBatching
 where
     C: Context<
@@ -942,7 +911,33 @@ where
             .with_axis_sharding(axis_sharding);
         let batches = batches
             .into_iter()
-            .map(|batch| normalize_array_input(&batching_context, batch))
+            .map(|batch| -> Result<_, BatchingError> {
+                let Some(position) = batch.batch_axis_position() else {
+                    return Ok(batch);
+                };
+                let value_type = batch.value.r#type();
+                let array_type = <&ArrayType>::try_from(value_type.as_ref())?;
+                let Some(normalized_type) =
+                    normalized_batch_axis_type(array_type, position, batching_context.axis_sharding())?
+                else {
+                    return Ok(batch);
+                };
+
+                let mut output_dimensions = (0..array_type.rank())
+                    .map(|axis| array_dimension(batching_context.parent(), &batch.value, axis))
+                    .collect::<Result<Vec<_>, _>>()?;
+                output_dimensions[position] = batching_context.axis_extent().clone();
+                let output_axes = (0..array_type.rank()).collect::<Vec<_>>();
+                let batch_axis = batch.batch_axis;
+                let value = broadcast_array(
+                    batching_context.parent(),
+                    batch.value,
+                    output_dimensions,
+                    output_axes,
+                    normalized_type.sharding().cloned(),
+                )?;
+                ArrayIrBatch::new(value, batch_axis)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((batching_context, batches))
     }
@@ -1124,17 +1119,6 @@ where
             self.parent().named_axis(name)
         }
     }
-}
-
-/// Materializes one exact first-class dimension in a composite context.
-fn dimension_constant<C>(context: &C, extent: usize) -> Result<C::Value, BatchingError>
-where
-    C: Context<Type = ArrayIrType, Operation: From<DimensionOperation<DimensionValue>>>,
-{
-    let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
-    let mut outputs = context.bind(DimensionOperation::Constant(ConstantOperation::new(value)), Vec::new(), &[])?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
 }
 
 macro_rules! impl_dynamic_constructor_member_batching {

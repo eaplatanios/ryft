@@ -15,9 +15,9 @@ use std::ops::Mul as StdMul;
 
 use crate::axes::{AxisError, AxisIndexOperation, NamedAxes, NamedAxis};
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, DynamicArrayBatchingPolicy};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::backends::scalars::Scalar;
+use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, DynamicArrayBatchingPolicy};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, MemberBatchableOperation, StaticArrayBatchingPolicy,
@@ -3613,10 +3613,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
+    use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
     use crate::batching::{
         ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError,
         BatchingTracer, batch,

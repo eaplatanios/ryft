@@ -2,8 +2,8 @@ use std::fmt::Display;
 
 use crate::axes::Axis;
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
+use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
@@ -2486,10 +2486,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
+    use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::jacobian::jacobian_forward;

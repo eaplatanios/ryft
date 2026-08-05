@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
+use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};

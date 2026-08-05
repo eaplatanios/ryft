@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
+use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,

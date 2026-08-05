@@ -51,7 +51,6 @@ use crate::programs::{AtomId, ProgramBuilder, ProgramError};
 use crate::sharding::Sharding;
 use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
 
-pub mod batching;
 mod differentiation;
 
 /// One axis of an exact runtime shape retained by a linearization rule.
@@ -1149,9 +1148,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::axes::NamedAxis;
-    use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
+    use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::compilation::{
         CallRequest, CompilationDomain, CompilationTracer, CompileRequest, CompiledFunction, FlatCompilationProgram,

@@ -2272,7 +2272,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
   - [ ] Keep universe-neutral contracts and machinery in the `batching` module root (`BatchingPolicy`,
         `BatchingPolicyProjection`, `BatchableType`, contexts/tracers/drivers, the `BatchedProgram` trait and
         `BoundaryPreservingBatchedProgram` default carrier, transform entrypoints, and projected-operation helpers).
-  - [ ] Move the `ArrayType` specialization to `batching::arrays` (`ArrayBatch`, `ArrayBatching`,
+  - [x] Move the `ArrayType` specialization to `batching::arrays` (`ArrayBatch`, `ArrayBatching`,
         `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, their policy/recursive/entrypoint implementations, and
         shared array-axis mechanics).
     - [x] Move `ArrayBatch`, batching-specific `ArrayType` normalization/unbatching, and shared mapped-axis sharding
@@ -2280,8 +2280,8 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
           handwritten paths through it.
     - [x] Move `ArrayBatching`, `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, and their policy, recursive, and
           entrypoint implementations after the carrier slice is reviewed.
-    - [ ] Move the array-specialization tests beside their owner and close the specialization-module checkbox.
-  - [ ] Move the `ArrayIrType` specialization to `batching::array_ir` (`ArrayIrBatch`,
+    - [x] Move the array-specialization tests beside their owner and close the specialization-module checkbox.
+  - [x] Move the `ArrayIrType` specialization to `batching::array_ir` (`ArrayIrBatch`,
         `ArrayIrBatching`, `ThreadedExtentBatchedProgram`, `DynamicArrayBatchingPolicy`,
         `ReplicatedDimensionBatchingPolicy`, their policy/projection/recursive/entrypoint implementations, and shared
         first-class-extent mechanics).
@@ -3891,3 +3891,26 @@ array-specialization tests remain in the parent module for the next isolated rev
 macro unit tests, both macro integration suites including every compile-fail fixture, and all 436 runnable XLA library
 tests (one ignored). Formatting, diff hygiene, and definition-owner searches passed; the moved implementations occur
 only in `batching::arrays`, while the parent module contains only their intentional public re-exports.
+
+### Phase 9 batching specialization closure (2026-08-04)
+
+The array-specialization tests now live at the end of `batching::arrays`, ordered after the implementation surface
+they exercise. Generic batching errors, axes, boundary carriers, contexts, and projected-operation tests remain in the
+parent module. The extraction also corrected declaration order: `ArrayBatching` is declared with all of its policy,
+entrypoint, and recursive implementations before `impl BatchableType for ArrayType`, followed by the shared
+elementwise rule, homogeneous region/program helpers, and tests.
+
+The complete heterogeneous specialization moved from `backends::array_programs::batching` to
+`batching::array_ir`: `ArrayIrBatch`, `ArrayIrBatching`, `ThreadedExtentBatchedProgram`, the dynamic-array and
+replicated-dimension projected policies, projection/value adapters, first-class extent helpers, entrypoint and
+recursive policies, named-axis support, and their tests moved together. `backends::array_programs` now owns only the
+eager array-IR value and operation family plus its differentiation capability module. All in-repo consumers use the
+new canonical specialization path directly; `batching` and the crate root retain the intentional flat public facade,
+and no compatibility module or old-path re-export remains.
+
+The array-IR file is byte-for-byte identical at its new path, while the array test move changes only test ownership and
+imports. Verification passed `cargo check -p ryft-core --tests`, all 1,129 core library tests, all 53 runnable core
+doctests (16 ignored), all 57 macro unit tests, both macro integration suites including every compile-fail fixture, and
+all 436 runnable XLA library tests (one ignored). Formatting and diff hygiene passed, the old module declaration and
+all Rust paths to `backends::array_programs::batching` are absent, and the implementation definitions occur only in
+`batching::{arrays, array_ir}`.

@@ -2,9 +2,9 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::axes::Axis;
-use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, align_array_batch, array_dimension};
 use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue, LinearResiduals};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
+use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch, array_dimension};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,

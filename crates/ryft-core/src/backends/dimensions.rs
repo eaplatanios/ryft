@@ -3,7 +3,7 @@ use std::fmt::Display;
 
 use ryft_macros::{Operation, Parameter};
 
-use crate::backends::array_programs::batching::ReplicatedDimensionBatchingPolicy;
+use crate::batching::array_ir::ReplicatedDimensionBatchingPolicy;
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, EagerContext, ProjectedContext};
 use crate::operations::constants::ConstantOperation;

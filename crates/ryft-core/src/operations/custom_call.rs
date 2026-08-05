@@ -639,9 +639,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::batching::ArrayIrBatching;
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
+    use crate::batching::array_ir::ArrayIrBatching;
     use crate::batching::{BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
     use crate::differentiation::DifferentiationError;
