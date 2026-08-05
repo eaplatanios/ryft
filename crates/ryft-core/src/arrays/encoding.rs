@@ -16,14 +16,14 @@ use crate::types::{ArrayType, DataType};
 /// bytes deterministically on every platform:
 ///
 ///   - Booleans encode as one byte holding `0` or `1`.
-///   - Integers encode as their little-endian two's-complement bytes.
 ///   - Sub-byte integers (i.e., [`i1`], [`i2`], [`i4`], [`u1`], [`u2`], and [`u4`]) encode as two's complement in the
 ///     low bits of one byte, with all higher bits set to zero.
-///   - Floating-point values (i.e., [`bf16`], [`f16`](struct@f16), [`f32`], and [`f64`]) encode as their little-endian
-///     IEEE bit patterns, preserving signed zeros and NaN payload bits exactly.
+///   - Integers encode as their little-endian two's-complement bytes.
 ///   - Low-precision floating-point values (e.g., [`f8e4m3fn`] and [`f4e2m1fn`]) encode as their one-byte sign,
 ///     exponent, and mantissa bit patterns, which occupy only the low bits of that byte for the four- and six-bit
 ///     formats, with all higher bits set to zero.
+///   - Floating-point values (i.e., [`bf16`], [`f16`](struct@f16), [`f32`], and [`f64`]) encode as their little-endian
+///     IEEE bit patterns, preserving signed zeros and NaN payload bits exactly.
 ///   - [`Complex`] values encode their real component immediately followed by their imaginary component.
 ///
 /// For example, `-2i32` always encodes as `[254, 255, 255, 255]` and `Complex::new(1.5f32, -2.0)` always encodes as
@@ -80,92 +80,6 @@ impl private::Codec for bool {
     }
 }
 
-// Implements the sealed codec for integer primitives using their exact little-endian two's-complement bit patterns.
-macro_rules! impl_codec_for_integer_type {
-    ($type:ty, $data_type:ident) => {
-        impl private::Codec for $type {
-            const DATA_TYPE: DataType = DataType::$data_type;
-            const BYTE_COUNT: usize = size_of::<Self>();
-
-            #[inline]
-            fn encode(self, bytes: &mut [u8]) {
-                bytes.copy_from_slice(&self.to_le_bytes());
-            }
-
-            #[inline]
-            fn decode(bytes: &[u8]) -> Self {
-                Self::from_le_bytes(bytes.try_into().unwrap())
-            }
-        }
-    };
-}
-
-impl_codec_for_integer_type!(i8, I8);
-impl_codec_for_integer_type!(i16, I16);
-impl_codec_for_integer_type!(i32, I32);
-impl_codec_for_integer_type!(i64, I64);
-impl_codec_for_integer_type!(u8, U8);
-impl_codec_for_integer_type!(u16, U16);
-impl_codec_for_integer_type!(u32, U32);
-impl_codec_for_integer_type!(u64, U64);
-
-// Implements the sealed codec for real floating-point primitives while preserving their exact payload bits.
-macro_rules! impl_codec_for_floating_point_type {
-    ($type:ty, $bits:ty, $data_type:ident) => {
-        impl private::Codec for $type {
-            const DATA_TYPE: DataType = DataType::$data_type;
-            const BYTE_COUNT: usize = size_of::<$bits>();
-
-            #[inline]
-            fn encode(self, bytes: &mut [u8]) {
-                bytes.copy_from_slice(&self.to_bits().to_le_bytes());
-            }
-
-            #[inline]
-            fn decode(bytes: &[u8]) -> Self {
-                Self::from_bits(<$bits>::from_le_bytes(bytes.try_into().unwrap()))
-            }
-        }
-    };
-}
-
-impl_codec_for_floating_point_type!(bf16, u16, BF16);
-impl_codec_for_floating_point_type!(f16, u16, F16);
-impl_codec_for_floating_point_type!(f32, u32, F32);
-impl_codec_for_floating_point_type!(f64, u64, F64);
-
-impl private::Codec for Complex<f32> {
-    const DATA_TYPE: DataType = DataType::C64;
-    const BYTE_COUNT: usize = 8;
-
-    #[inline]
-    fn encode(self, bytes: &mut [u8]) {
-        self.re.encode(&mut bytes[..4]);
-        self.im.encode(&mut bytes[4..]);
-    }
-
-    #[inline]
-    fn decode(bytes: &[u8]) -> Self {
-        Self::new(<f32 as private::Codec>::decode(&bytes[..4]), <f32 as private::Codec>::decode(&bytes[4..]))
-    }
-}
-
-impl private::Codec for Complex<f64> {
-    const DATA_TYPE: DataType = DataType::C128;
-    const BYTE_COUNT: usize = 16;
-
-    #[inline]
-    fn encode(self, bytes: &mut [u8]) {
-        self.re.encode(&mut bytes[..8]);
-        self.im.encode(&mut bytes[8..]);
-    }
-
-    #[inline]
-    fn decode(bytes: &[u8]) -> Self {
-        Self::new(<f64 as private::Codec>::decode(&bytes[..8]), <f64 as private::Codec>::decode(&bytes[8..]))
-    }
-}
-
 /// Checked signed 1-bit integer array element representing [`DataType::I1`] values in the range `-1..=0`. The value is
 /// stored as two's complement in the low bit of one storage byte, with all higher bits set to zero, so `-1` is stored
 /// as the byte `0x01`. The wrapped native value stays sign-extended, so [`i1::value`] returns `-1` rather than `1` for
@@ -193,33 +107,9 @@ pub struct i2(i8);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct i4(i8);
 
-/// Checked unsigned 1-bit integer array element representing [`DataType::U1`] values in the range `0..=1`. The value
-/// is stored in the low bit of one storage byte, with all higher bits set to zero. This unpacked one-element-per-byte
-/// representation is the padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
-/// which NumPy and JAX also use.
-#[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct u1(u8);
-
-/// Checked unsigned 2-bit integer array element representing [`DataType::U2`] values in the range `0..=3`. The value is
-/// stored in the low two bits of one storage byte, with all higher bits set to zero. This unpacked one-element-per-byte
-/// representation is the padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
-/// which NumPy and JAX also use.
-#[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct u2(u8);
-
-/// Checked unsigned 4-bit integer array element representing [`DataType::U4`] values in the range `0..=15`.
-/// The value is stored in the low four bits of one storage byte, with all higher bits set to zero. This unpacked
-/// one-element-per-byte representation is the padded sub-byte layout of
-/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also use.
-#[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct u4(u8);
-
 // Implements the checked element API and the sealed codec for a signed sub-byte integer newtype that wraps its
 // sign-extended native `i8` value and stores it as two's complement in the low `$bit_count` bits of one storage byte.
-macro_rules! impl_signed_sub_byte_array_element {
+macro_rules! impl_codec_for_signed_sub_byte_integer_type {
     ($type:ident, $data_type:ident, $bit_count:literal) => {
         impl $type {
             /// Smallest representable value.
@@ -297,6 +187,59 @@ macro_rules! impl_signed_sub_byte_array_element {
     };
 }
 
+impl_codec_for_signed_sub_byte_integer_type!(i1, I1, 1);
+impl_codec_for_signed_sub_byte_integer_type!(i2, I2, 2);
+impl_codec_for_signed_sub_byte_integer_type!(i4, I4, 4);
+
+// Implements the sealed codec for integer primitives using their exact little-endian two's-complement bit patterns.
+macro_rules! impl_codec_for_integer_type {
+    ($type:ty, $data_type:ident) => {
+        impl private::Codec for $type {
+            const DATA_TYPE: DataType = DataType::$data_type;
+            const BYTE_COUNT: usize = size_of::<Self>();
+
+            #[inline]
+            fn encode(self, bytes: &mut [u8]) {
+                bytes.copy_from_slice(&self.to_le_bytes());
+            }
+
+            #[inline]
+            fn decode(bytes: &[u8]) -> Self {
+                Self::from_le_bytes(bytes.try_into().unwrap())
+            }
+        }
+    };
+}
+
+impl_codec_for_integer_type!(i8, I8);
+impl_codec_for_integer_type!(i16, I16);
+impl_codec_for_integer_type!(i32, I32);
+impl_codec_for_integer_type!(i64, I64);
+
+/// Checked unsigned 1-bit integer array element representing [`DataType::U1`] values in the range `0..=1`. The value
+/// is stored in the low bit of one storage byte, with all higher bits set to zero. This unpacked one-element-per-byte
+/// representation is the padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// which NumPy and JAX also use.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct u1(u8);
+
+/// Checked unsigned 2-bit integer array element representing [`DataType::U2`] values in the range `0..=3`. The value is
+/// stored in the low two bits of one storage byte, with all higher bits set to zero. This unpacked one-element-per-byte
+/// representation is the padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// which NumPy and JAX also use.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct u2(u8);
+
+/// Checked unsigned 4-bit integer array element representing [`DataType::U4`] values in the range `0..=15`.
+/// The value is stored in the low four bits of one storage byte, with all higher bits set to zero. This unpacked
+/// one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also use.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct u4(u8);
+
 // Implements the checked element API and the sealed codec for an unsigned sub-byte integer newtype that wraps its
 // native `u8` value and stores it in the low `$bit_count` bits of one storage byte.
 macro_rules! impl_unsigned_sub_byte_array_element {
@@ -373,12 +316,14 @@ macro_rules! impl_unsigned_sub_byte_array_element {
     };
 }
 
-impl_signed_sub_byte_array_element!(i1, I1, 1);
-impl_signed_sub_byte_array_element!(i2, I2, 2);
-impl_signed_sub_byte_array_element!(i4, I4, 4);
 impl_unsigned_sub_byte_array_element!(u1, U1, 1);
 impl_unsigned_sub_byte_array_element!(u2, U2, 2);
 impl_unsigned_sub_byte_array_element!(u4, U4, 4);
+
+impl_codec_for_integer_type!(u8, U8);
+impl_codec_for_integer_type!(u16, U16);
+impl_codec_for_integer_type!(u32, U32);
+impl_codec_for_integer_type!(u64, U64);
 
 /// Special-value policy of a low-precision floating-point format. The class fixes which bit patterns a format reserves
 /// for infinities and NaNs, whether it has a negative zero, and how a conversion whose rounded result falls beyond the
@@ -548,12 +493,12 @@ impl LowPrecisionFloatingPointFormat {
         if magnitude > self.decode_magnitude(max_finite_magnitude + 1) {
             return self.overflow_bits(negative);
         }
-        
+
         let mut nearest = 0;
         let mut nearest_distance = f64::INFINITY;
         for candidate in 0..=max_finite_magnitude + 1 {
             let distance = (self.decode_magnitude(candidate) - magnitude).abs();
-            
+
             // Candidate values increase strictly with their encoding, so at most two candidates can be equidistant
             // from the input and exactly one of those two has an even encoding, which is the one to round to.
             if distance < nearest_distance || (distance == nearest_distance && candidate % 2 == 0) {
@@ -561,11 +506,11 @@ impl LowPrecisionFloatingPointFormat {
                 nearest_distance = distance;
             }
         }
-        
+
         if nearest > max_finite_magnitude {
             return self.overflow_bits(negative);
         }
-        
+
         // A nonzero input can still round down onto the zero encoding, which the `fnuz` formats leave unsigned.
         self.signed_bits(nearest as u8, negative)
     }
@@ -767,11 +712,9 @@ pub struct f8e5m2fnuz(u8);
 #[derive(Copy, Clone, Debug)]
 pub struct f8e8m0fnu(u8);
 
-// TODO(eaplatanios): Review from here onwards.
-
 // Implements the shared conversion API and the numeric comparison semantics of a low-precision floating-point newtype
 // that wraps its storage byte, driving every conversion through the shared `FloatFormat` engine.
-macro_rules! impl_low_precision_float {
+macro_rules! impl_low_precision_floating_point_type {
     ($type:ident, $data_type:ident, $class:ident, $exponent_bits:literal, $mantissa_bits:literal, $bias:literal) => {
         impl $type {
             /// Format descriptor driving every conversion of this element type.
@@ -796,46 +739,51 @@ macro_rules! impl_low_precision_float {
             }
 
             /// Rounds `value` to the nearest representable value, breaking exact ties toward the even encoding.
-            ///
-            /// Returns an error only when this format has no encoding for the input at all, namely a NaN input to a
-            /// microscaling format or a zero input to [`f8e8m0fnu`].
+            /// Returns an error only when this format has no encoding for the input at all, namely a NaN input
+            /// to a microscaling format or a zero input to [`f8e8m0fnu`].
+            #[inline]
             pub fn from_f32(value: f32) -> Result<Self, TypeError> {
                 // Widening to `f64` is exact, so the `f64` conversion performs the only rounding step.
                 Self::from_f64(f64::from(value))
             }
 
             /// Rounds `value` to the nearest representable value, breaking exact ties toward the even encoding.
-            ///
             /// Returns an error only when this format has no encoding for the input at all, namely a NaN input to a
             /// microscaling format or a zero input to [`f8e8m0fnu`].
+            #[inline]
             pub fn from_f64(value: f64) -> Result<Self, TypeError> {
                 Self::FORMAT.encode(value).map(Self)
             }
 
-            /// Returns this element's exact value, which every value of this format has in [`f32`] as well.
+            /// Returns this element's exact value as an [`f32`] value.
+            #[inline]
             pub fn to_f32(self) -> f32 {
                 self.to_f64() as f32
             }
 
-            /// Returns this element's exact value.
+            /// Returns this element's exact value as an [`f64`] value.
+            #[inline]
             pub fn to_f64(self) -> f64 {
                 Self::FORMAT.decode(self.0)
             }
         }
 
         impl Display for $type {
+            #[inline]
             fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
                 write!(formatter, "{}", self.to_f64())
             }
         }
 
         impl PartialEq for $type {
+            #[inline]
             fn eq(&self, other: &Self) -> bool {
                 self.to_f64() == other.to_f64()
             }
         }
 
         impl PartialOrd for $type {
+            #[inline]
             fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
                 self.to_f64().partial_cmp(&other.to_f64())
             }
@@ -843,9 +791,42 @@ macro_rules! impl_low_precision_float {
     };
 }
 
+// Implements the NaN vocabulary of a low-precision floating-point newtype whose format reserves a NaN encoding.
+macro_rules! impl_nan_for_low_precision_floating_point_type {
+    ($type:ident) => {
+        impl $type {
+            /// Canonical NaN value of this format.
+            pub const NAN: Self = Self(match Self::FORMAT.nan_bits(false) {
+                Some(bits) => bits,
+                // This constant is only generated for formats that reserve a NaN encoding.
+                None => unreachable!(),
+            });
+
+            /// Returns whether this element is NaN.
+            #[inline]
+            pub fn is_nan(self) -> bool {
+                self.to_f64().is_nan()
+            }
+        }
+    };
+}
+
+// Implements the infinity vocabulary of an IEEE-style low-precision floating-point newtype.
+macro_rules! impl_infinities_for_low_precision_floating_point_type {
+    ($type:ident) => {
+        impl $type {
+            /// Positive infinity value of this format.
+            pub const INFINITY: Self = Self(Self::FORMAT.infinity_bits(false));
+
+            /// Negative infinity value of this format.
+            pub const NEG_INFINITY: Self = Self(Self::FORMAT.infinity_bits(true));
+        }
+    };
+}
+
 // Implements the storage-byte constructor and the sealed codec for a low-precision floating-point newtype whose
 // encoding fills a whole storage byte, so that every byte is a valid encoding.
-macro_rules! impl_low_precision_float_bytes {
+macro_rules! impl_codec_for_byte_low_precision_floating_point_type {
     ($type:ident) => {
         impl $type {
             /// Creates a new element from its storage byte. Every byte encodes a value of this format.
@@ -874,11 +855,11 @@ macro_rules! impl_low_precision_float_bytes {
 
 // Implements the checked storage-byte constructor and the sealed codec for a low-precision floating-point newtype
 // whose encoding occupies only the low bits of a storage byte, requiring all higher bits to be zero.
-macro_rules! impl_low_precision_float_checked_bytes {
+macro_rules! impl_codec_for_sub_byte_low_precision_floating_point_type {
     ($type:ident) => {
         impl $type {
-            /// Creates a new element from one storage byte whose low bits hold its encoding. All higher bits must be
-            /// zero.
+            /// Creates a new element from one storage byte whose low bits hold its encoding.
+            /// All higher bits must be zero.
             pub fn from_bits(bits: u8) -> Result<Self, TypeError> {
                 if bits & !Self::FORMAT.bit_mask() != 0 {
                     return Err(TypeError::invalid(format!(
@@ -908,82 +889,108 @@ macro_rules! impl_low_precision_float_checked_bytes {
     };
 }
 
-// Implements the NaN vocabulary of a low-precision floating-point newtype whose format reserves a NaN encoding.
-macro_rules! impl_low_precision_float_nan {
-    ($type:ident) => {
-        impl $type {
-            /// Canonical NaN value of this format.
-            pub const NAN: Self = Self(match Self::FORMAT.nan_bits(false) {
-                Some(bits) => bits,
-                // This constant is only generated for formats that reserve a NaN encoding.
-                None => unreachable!(),
-            });
+impl_low_precision_floating_point_type!(f4e2m1fn, F4E2M1FN, NoNan, 2, 1, 1);
+impl_codec_for_sub_byte_low_precision_floating_point_type!(f4e2m1fn);
 
-            /// Returns whether this element is NaN.
+impl_low_precision_floating_point_type!(f6e2m3fn, F6E2M3FN, NoNan, 2, 3, 1);
+impl_codec_for_sub_byte_low_precision_floating_point_type!(f6e2m3fn);
+
+impl_low_precision_floating_point_type!(f6e3m2fn, F6E3M2FN, NoNan, 3, 2, 3);
+impl_codec_for_sub_byte_low_precision_floating_point_type!(f6e3m2fn);
+
+impl_low_precision_floating_point_type!(f8e3m4, F8E3M4, Ieee, 3, 4, 3);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e3m4);
+impl_nan_for_low_precision_floating_point_type!(f8e3m4);
+impl_infinities_for_low_precision_floating_point_type!(f8e3m4);
+
+impl_low_precision_floating_point_type!(f8e4m3, F8E4M3, Ieee, 4, 3, 7);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e4m3);
+impl_nan_for_low_precision_floating_point_type!(f8e4m3);
+impl_infinities_for_low_precision_floating_point_type!(f8e4m3);
+
+impl_low_precision_floating_point_type!(f8e4m3fn, F8E4M3FN, SignedNan, 4, 3, 7);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e4m3fn);
+impl_nan_for_low_precision_floating_point_type!(f8e4m3fn);
+
+impl_low_precision_floating_point_type!(f8e4m3fnuz, F8E4M3FNUZ, UnsignedNan, 4, 3, 8);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e4m3fnuz);
+impl_nan_for_low_precision_floating_point_type!(f8e4m3fnuz);
+
+impl_low_precision_floating_point_type!(f8e4m3b11fnuz, F8E4M3B11FNUZ, UnsignedNan, 4, 3, 11);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e4m3b11fnuz);
+impl_nan_for_low_precision_floating_point_type!(f8e4m3b11fnuz);
+
+impl_low_precision_floating_point_type!(f8e5m2, F8E5M2, Ieee, 5, 2, 15);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e5m2);
+impl_nan_for_low_precision_floating_point_type!(f8e5m2);
+impl_infinities_for_low_precision_floating_point_type!(f8e5m2);
+
+impl_low_precision_floating_point_type!(f8e5m2fnuz, F8E5M2FNUZ, UnsignedNan, 5, 2, 16);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e5m2fnuz);
+impl_nan_for_low_precision_floating_point_type!(f8e5m2fnuz);
+
+impl_low_precision_floating_point_type!(f8e8m0fnu, F8E8M0FNU, ExponentOnly, 8, 0, 127);
+impl_codec_for_byte_low_precision_floating_point_type!(f8e8m0fnu);
+impl_nan_for_low_precision_floating_point_type!(f8e8m0fnu);
+
+// Implements the sealed codec for real floating-point primitives while preserving their exact payload bits.
+macro_rules! impl_codec_for_floating_point_type {
+    ($type:ty, $bits:ty, $data_type:ident) => {
+        impl private::Codec for $type {
+            const DATA_TYPE: DataType = DataType::$data_type;
+            const BYTE_COUNT: usize = size_of::<$bits>();
+
             #[inline]
-            pub fn is_nan(self) -> bool {
-                self.to_f64().is_nan()
+            fn encode(self, bytes: &mut [u8]) {
+                bytes.copy_from_slice(&self.to_bits().to_le_bytes());
+            }
+
+            #[inline]
+            fn decode(bytes: &[u8]) -> Self {
+                Self::from_bits(<$bits>::from_le_bytes(bytes.try_into().unwrap()))
             }
         }
     };
 }
 
-// Implements the infinity vocabulary of an IEEE-style low-precision floating-point newtype.
-macro_rules! impl_low_precision_float_infinities {
-    ($type:ident) => {
-        impl $type {
-            /// Positive infinity value of this format.
-            pub const INFINITY: Self = Self(Self::FORMAT.infinity_bits(false));
+impl_codec_for_floating_point_type!(bf16, u16, BF16);
+impl_codec_for_floating_point_type!(f16, u16, F16);
+impl_codec_for_floating_point_type!(f32, u32, F32);
+impl_codec_for_floating_point_type!(f64, u64, F64);
 
-            /// Negative infinity value of this format.
-            pub const NEG_INFINITY: Self = Self(Self::FORMAT.infinity_bits(true));
-        }
-    };
+impl private::Codec for Complex<f32> {
+    const DATA_TYPE: DataType = DataType::C64;
+    const BYTE_COUNT: usize = 8;
+
+    #[inline]
+    fn encode(self, bytes: &mut [u8]) {
+        self.re.encode(&mut bytes[..4]);
+        self.im.encode(&mut bytes[4..]);
+    }
+
+    #[inline]
+    fn decode(bytes: &[u8]) -> Self {
+        Self::new(<f32 as private::Codec>::decode(&bytes[..4]), <f32 as private::Codec>::decode(&bytes[4..]))
+    }
 }
 
-impl_low_precision_float!(f4e2m1fn, F4E2M1FN, NoNan, 2, 1, 1);
-impl_low_precision_float_checked_bytes!(f4e2m1fn);
+impl private::Codec for Complex<f64> {
+    const DATA_TYPE: DataType = DataType::C128;
+    const BYTE_COUNT: usize = 16;
 
-impl_low_precision_float!(f6e2m3fn, F6E2M3FN, NoNan, 2, 3, 1);
-impl_low_precision_float_checked_bytes!(f6e2m3fn);
+    #[inline]
+    fn encode(self, bytes: &mut [u8]) {
+        self.re.encode(&mut bytes[..8]);
+        self.im.encode(&mut bytes[8..]);
+    }
 
-impl_low_precision_float!(f6e3m2fn, F6E3M2FN, NoNan, 3, 2, 3);
-impl_low_precision_float_checked_bytes!(f6e3m2fn);
+    #[inline]
+    fn decode(bytes: &[u8]) -> Self {
+        Self::new(<f64 as private::Codec>::decode(&bytes[..8]), <f64 as private::Codec>::decode(&bytes[8..]))
+    }
+}
 
-impl_low_precision_float!(f8e3m4, F8E3M4, Ieee, 3, 4, 3);
-impl_low_precision_float_bytes!(f8e3m4);
-impl_low_precision_float_nan!(f8e3m4);
-impl_low_precision_float_infinities!(f8e3m4);
-
-impl_low_precision_float!(f8e4m3, F8E4M3, Ieee, 4, 3, 7);
-impl_low_precision_float_bytes!(f8e4m3);
-impl_low_precision_float_nan!(f8e4m3);
-impl_low_precision_float_infinities!(f8e4m3);
-
-impl_low_precision_float!(f8e4m3fn, F8E4M3FN, SignedNan, 4, 3, 7);
-impl_low_precision_float_bytes!(f8e4m3fn);
-impl_low_precision_float_nan!(f8e4m3fn);
-
-impl_low_precision_float!(f8e4m3fnuz, F8E4M3FNUZ, UnsignedNan, 4, 3, 8);
-impl_low_precision_float_bytes!(f8e4m3fnuz);
-impl_low_precision_float_nan!(f8e4m3fnuz);
-
-impl_low_precision_float!(f8e4m3b11fnuz, F8E4M3B11FNUZ, UnsignedNan, 4, 3, 11);
-impl_low_precision_float_bytes!(f8e4m3b11fnuz);
-impl_low_precision_float_nan!(f8e4m3b11fnuz);
-
-impl_low_precision_float!(f8e5m2, F8E5M2, Ieee, 5, 2, 15);
-impl_low_precision_float_bytes!(f8e5m2);
-impl_low_precision_float_nan!(f8e5m2);
-impl_low_precision_float_infinities!(f8e5m2);
-
-impl_low_precision_float!(f8e5m2fnuz, F8E5M2FNUZ, UnsignedNan, 5, 2, 16);
-impl_low_precision_float_bytes!(f8e5m2fnuz);
-impl_low_precision_float_nan!(f8e5m2fnuz);
-
-impl_low_precision_float!(f8e8m0fnu, F8E8M0FNU, ExponentOnly, 8, 0, 127);
-impl_low_precision_float_bytes!(f8e8m0fnu);
-impl_low_precision_float_nan!(f8e8m0fnu);
+// TODO(eaplatanios): Review from here onwards.
 
 /// Encodes typed logical row-major elements into the physical storage declared by `type`. Storage bytes that no
 /// logical element occupies, namely layout holes and tile padding, are set to zero.
@@ -1466,69 +1473,6 @@ mod tests {
     }
 
     #[test]
-    fn test_low_precision_float_rounding() {
-        // Rounding ties choose the even encoding, which at the overflow boundary can be either the largest finite
-        // value or the virtual candidate one step past it.
-        assert_eq!(f8e4m3fn::from_f64(464.0).map(f8e4m3fn::to_bits), Ok(0x7e));
-        assert_eq!(f8e4m3fn::from_f64(465.0).map(f8e4m3fn::to_bits), Ok(0x7f));
-        assert_eq!(f8e4m3fn::from_f64(-465.0).map(f8e4m3fn::to_bits), Ok(0xff));
-        // 21 lies halfway between the neighboring values 20 and 22, so the even mantissa wins.
-        assert_eq!(f8e4m3fn::from_f64(20.0).map(f8e4m3fn::to_bits), Ok(0x5a));
-        assert_eq!(f8e4m3fn::from_f64(22.0).map(f8e4m3fn::to_bits), Ok(0x5b));
-        assert_eq!(f8e4m3fn::from_f64(21.0).map(f8e4m3fn::to_bits), Ok(0x5a));
-        assert_eq!(f8e4m3fn::from_f64(20.9).map(f8e4m3fn::to_f64), Ok(20.0));
-        assert_eq!(f8e4m3fn::from_f64(21.1).map(f8e4m3fn::to_f64), Ok(22.0));
-
-        assert_eq!(f8e5m2::from_f64(61439.0).map(f8e5m2::to_bits), Ok(0x7b));
-        assert_eq!(f8e5m2::from_f64(61440.0).map(f8e5m2::to_bits), Ok(0x7c));
-        assert_eq!(f8e5m2::from_f64(f64::MAX).map(f8e5m2::to_bits), Ok(0x7c));
-        assert_eq!(f8e5m2::from_f64(-61440.0).map(f8e5m2::to_bits), Ok(0xfc));
-        assert_eq!(f8e5m2::from_f64(f64::INFINITY).map(f8e5m2::to_bits), Ok(0x7c));
-
-        assert_eq!(f8e4m3::from_f64(247.0).map(f8e4m3::to_bits), Ok(0x77));
-        assert_eq!(f8e4m3::from_f64(248.0).map(f8e4m3::to_bits), Ok(0x78));
-
-        assert_eq!(f8e3m4::from_f64(15.7).map(f8e3m4::to_f64), Ok(15.5));
-        assert_eq!(f8e3m4::from_f64(15.75).map(f8e3m4::to_bits), Ok(0x70));
-
-        assert_eq!(f8e4m3fnuz::from_f64(247.0).map(f8e4m3fnuz::to_bits), Ok(0x7f));
-        assert_eq!(f8e4m3fnuz::from_f64(248.0).map(f8e4m3fnuz::to_bits), Ok(0x80));
-        assert_eq!(f8e4m3fnuz::from_f64(-0.0).map(f8e4m3fnuz::to_bits), Ok(0x00));
-        assert_eq!(f8e4m3fnuz::from_f64(f64::NEG_INFINITY).map(f8e4m3fnuz::to_bits), Ok(0x80));
-
-        assert_eq!(f8e4m3b11fnuz::from_f64(30.9).map(f8e4m3b11fnuz::to_bits), Ok(0x7f));
-        assert_eq!(f8e4m3b11fnuz::from_f64(31.0).map(f8e4m3b11fnuz::to_bits), Ok(0x80));
-
-        assert_eq!(f8e5m2fnuz::from_f64(61439.0).map(f8e5m2fnuz::to_bits), Ok(0x7f));
-        assert_eq!(f8e5m2fnuz::from_f64(61440.0).map(f8e5m2fnuz::to_bits), Ok(0x80));
-        assert_eq!(f8e5m2fnuz::from_f64(-0.0).map(f8e5m2fnuz::to_bits), Ok(0x00));
-
-        // An input that underflows keeps its sign, except in the `fnuz` formats, whose sign-bit-only encoding is NaN
-        // rather than a negative zero.
-        assert_eq!(f8e4m3fn::from_f64(-1e-30).map(f8e4m3fn::to_bits), Ok(0x80));
-        assert_eq!(f8e4m3fn::from_f64(1e-30).map(f8e4m3fn::to_bits), Ok(0x00));
-        assert_eq!(f8e5m2::from_f64(-1e-30).map(f8e5m2::to_bits), Ok(0x80));
-        assert_eq!(f8e4m3fnuz::from_f64(-1e-30).map(f8e4m3fnuz::to_bits), Ok(0x00));
-        assert_eq!(f8e4m3b11fnuz::from_f64(-1e-30).map(f8e4m3b11fnuz::to_bits), Ok(0x00));
-        assert_eq!(f8e5m2fnuz::from_f64(-1e-30).map(f8e5m2fnuz::to_bits), Ok(0x00));
-
-        // Inputs far above a format's range overflow just like inputs just past its rounding boundary.
-        assert_eq!(f8e4m3fn::from_f64(f64::MAX).map(f8e4m3fn::to_bits), Ok(0x7f));
-        assert_eq!(f8e4m3fn::from_f64(f64::MIN).map(f8e4m3fn::to_bits), Ok(0xff));
-        assert_eq!(f8e4m3::from_f64(f64::MAX).map(f8e4m3::to_bits), Ok(0x78));
-        assert_eq!(f8e3m4::from_f64(f64::MAX).map(f8e3m4::to_bits), Ok(0x70));
-        assert_eq!(f8e4m3fnuz::from_f64(f64::MAX).map(f8e4m3fnuz::to_bits), Ok(0x80));
-        assert_eq!(f8e4m3b11fnuz::from_f64(f64::MAX).map(f8e4m3b11fnuz::to_bits), Ok(0x80));
-        assert_eq!(f8e5m2fnuz::from_f64(f64::MAX).map(f8e5m2fnuz::to_bits), Ok(0x80));
-
-        // Widening an `f32` input to `f64` is exact, so both conversions round identically.
-        assert_eq!(f8e4m3fn::from_f32(21.0).map(f8e4m3fn::to_bits), f8e4m3fn::from_f64(21.0).map(f8e4m3fn::to_bits));
-        assert_eq!(f8e5m2::from_f32(61439.0).map(f8e5m2::to_bits), f8e5m2::from_f64(61439.0).map(f8e5m2::to_bits));
-        assert_eq!(f8e5m2::from_f32(61439.0).map(f8e5m2::to_bits), Ok(0x7b));
-        assert_eq!(f8e3m4::from_f32(15.75).map(f8e3m4::to_bits), Ok(0x70));
-    }
-
-    #[test]
     fn test_microscaling_float_rounding() {
         // The microscaling formats have no infinity and no NaN, so overflowing inputs saturate and NaN is rejected.
         assert_eq!(f4e2m1fn::from_f64(7.0).map(f4e2m1fn::to_f64), Ok(6.0));
@@ -1568,6 +1512,69 @@ mod tests {
             f6e3m2fn::from_f64(f64::NAN),
             Err(TypeError::Invalid { message }) if message == "data type f6e3m2fn cannot represent NaN",
         ));
+    }
+
+    #[test]
+    fn test_low_precision_float_rounding() {
+        // Rounding ties choose the even encoding, which at the overflow boundary can be either the largest finite
+        // value or the virtual candidate one step past it.
+        assert_eq!(f8e3m4::from_f64(15.7).map(f8e3m4::to_f64), Ok(15.5));
+        assert_eq!(f8e3m4::from_f64(15.75).map(f8e3m4::to_bits), Ok(0x70));
+
+        assert_eq!(f8e4m3::from_f64(247.0).map(f8e4m3::to_bits), Ok(0x77));
+        assert_eq!(f8e4m3::from_f64(248.0).map(f8e4m3::to_bits), Ok(0x78));
+
+        assert_eq!(f8e4m3fn::from_f64(464.0).map(f8e4m3fn::to_bits), Ok(0x7e));
+        assert_eq!(f8e4m3fn::from_f64(465.0).map(f8e4m3fn::to_bits), Ok(0x7f));
+        assert_eq!(f8e4m3fn::from_f64(-465.0).map(f8e4m3fn::to_bits), Ok(0xff));
+        // 21 lies halfway between the neighboring values 20 and 22, so the even mantissa wins.
+        assert_eq!(f8e4m3fn::from_f64(20.0).map(f8e4m3fn::to_bits), Ok(0x5a));
+        assert_eq!(f8e4m3fn::from_f64(22.0).map(f8e4m3fn::to_bits), Ok(0x5b));
+        assert_eq!(f8e4m3fn::from_f64(21.0).map(f8e4m3fn::to_bits), Ok(0x5a));
+        assert_eq!(f8e4m3fn::from_f64(20.9).map(f8e4m3fn::to_f64), Ok(20.0));
+        assert_eq!(f8e4m3fn::from_f64(21.1).map(f8e4m3fn::to_f64), Ok(22.0));
+
+        assert_eq!(f8e4m3fnuz::from_f64(247.0).map(f8e4m3fnuz::to_bits), Ok(0x7f));
+        assert_eq!(f8e4m3fnuz::from_f64(248.0).map(f8e4m3fnuz::to_bits), Ok(0x80));
+        assert_eq!(f8e4m3fnuz::from_f64(-0.0).map(f8e4m3fnuz::to_bits), Ok(0x00));
+        assert_eq!(f8e4m3fnuz::from_f64(f64::NEG_INFINITY).map(f8e4m3fnuz::to_bits), Ok(0x80));
+
+        assert_eq!(f8e4m3b11fnuz::from_f64(30.9).map(f8e4m3b11fnuz::to_bits), Ok(0x7f));
+        assert_eq!(f8e4m3b11fnuz::from_f64(31.0).map(f8e4m3b11fnuz::to_bits), Ok(0x80));
+
+        assert_eq!(f8e5m2::from_f64(61439.0).map(f8e5m2::to_bits), Ok(0x7b));
+        assert_eq!(f8e5m2::from_f64(61440.0).map(f8e5m2::to_bits), Ok(0x7c));
+        assert_eq!(f8e5m2::from_f64(f64::MAX).map(f8e5m2::to_bits), Ok(0x7c));
+        assert_eq!(f8e5m2::from_f64(-61440.0).map(f8e5m2::to_bits), Ok(0xfc));
+        assert_eq!(f8e5m2::from_f64(f64::INFINITY).map(f8e5m2::to_bits), Ok(0x7c));
+
+        assert_eq!(f8e5m2fnuz::from_f64(61439.0).map(f8e5m2fnuz::to_bits), Ok(0x7f));
+        assert_eq!(f8e5m2fnuz::from_f64(61440.0).map(f8e5m2fnuz::to_bits), Ok(0x80));
+        assert_eq!(f8e5m2fnuz::from_f64(-0.0).map(f8e5m2fnuz::to_bits), Ok(0x00));
+
+        // An input that underflows keeps its sign, except in the `fnuz` formats, whose sign-bit-only encoding is NaN
+        // rather than a negative zero.
+        assert_eq!(f8e4m3fn::from_f64(-1e-30).map(f8e4m3fn::to_bits), Ok(0x80));
+        assert_eq!(f8e4m3fn::from_f64(1e-30).map(f8e4m3fn::to_bits), Ok(0x00));
+        assert_eq!(f8e5m2::from_f64(-1e-30).map(f8e5m2::to_bits), Ok(0x80));
+        assert_eq!(f8e4m3fnuz::from_f64(-1e-30).map(f8e4m3fnuz::to_bits), Ok(0x00));
+        assert_eq!(f8e4m3b11fnuz::from_f64(-1e-30).map(f8e4m3b11fnuz::to_bits), Ok(0x00));
+        assert_eq!(f8e5m2fnuz::from_f64(-1e-30).map(f8e5m2fnuz::to_bits), Ok(0x00));
+
+        // Inputs far above a format's range overflow just like inputs just past its rounding boundary.
+        assert_eq!(f8e4m3fn::from_f64(f64::MAX).map(f8e4m3fn::to_bits), Ok(0x7f));
+        assert_eq!(f8e4m3fn::from_f64(f64::MIN).map(f8e4m3fn::to_bits), Ok(0xff));
+        assert_eq!(f8e4m3::from_f64(f64::MAX).map(f8e4m3::to_bits), Ok(0x78));
+        assert_eq!(f8e3m4::from_f64(f64::MAX).map(f8e3m4::to_bits), Ok(0x70));
+        assert_eq!(f8e4m3fnuz::from_f64(f64::MAX).map(f8e4m3fnuz::to_bits), Ok(0x80));
+        assert_eq!(f8e4m3b11fnuz::from_f64(f64::MAX).map(f8e4m3b11fnuz::to_bits), Ok(0x80));
+        assert_eq!(f8e5m2fnuz::from_f64(f64::MAX).map(f8e5m2fnuz::to_bits), Ok(0x80));
+
+        // Widening an `f32` input to `f64` is exact, so both conversions round identically.
+        assert_eq!(f8e4m3fn::from_f32(21.0).map(f8e4m3fn::to_bits), f8e4m3fn::from_f64(21.0).map(f8e4m3fn::to_bits));
+        assert_eq!(f8e5m2::from_f32(61439.0).map(f8e5m2::to_bits), f8e5m2::from_f64(61439.0).map(f8e5m2::to_bits));
+        assert_eq!(f8e5m2::from_f32(61439.0).map(f8e5m2::to_bits), Ok(0x7b));
+        assert_eq!(f8e3m4::from_f32(15.75).map(f8e3m4::to_bits), Ok(0x70));
     }
 
     #[test]
