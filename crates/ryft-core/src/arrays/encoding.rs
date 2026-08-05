@@ -1221,8 +1221,6 @@ fn validate_element_bytes(data_type: DataType, element: usize, bytes: &[u8]) -> 
     Ok(())
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1232,38 +1230,6 @@ mod tests {
     use crate::types::{Dimension, Layout, Shape, StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
-
-    // Asserts that every valid encoding of a low-precision floating-point format round-trips through `to_f64` and
-    // `from_f64`, that its NaN encodings collapse onto the canonical positive and negative NaN encodings passed as
-    // `$nan_bits`, and that decoded values increase strictly across the format's finite magnitude encodings, which run
-    // from zero through `$max_finite_magnitude`.
-    macro_rules! assert_low_precision_float_encodings {
-        ($type:ident, $from_bits:expr, $bit_count:literal, $max_finite_magnitude:literal, $nan_bits:expr $(,)?) => {{
-            let from_bits: fn(u8) -> $type = $from_bits;
-            let nan_bits: Option<(u8, u8)> = $nan_bits;
-            for bits in 0..(1u16 << $bit_count) {
-                let bits = bits as u8;
-                let value = from_bits(bits).to_f64();
-                let expected = match nan_bits {
-                    Some((positive, negative)) if value.is_nan() => {
-                        if value.is_sign_negative() {
-                            negative
-                        } else {
-                            positive
-                        }
-                    }
-                    _ => bits,
-                };
-                assert_eq!($type::from_f64(value).map($type::to_bits), Ok(expected), "encoding {bits:#04x}");
-            }
-            let mut previous = f64::NEG_INFINITY;
-            for magnitude in 0..=$max_finite_magnitude {
-                let value = from_bits(magnitude).to_f64();
-                assert!(value > previous, "encoding {magnitude:#04x} decodes to {value}");
-                previous = value;
-            }
-        }};
-    }
 
     #[test]
     fn test_sub_byte_integer_construction() {
@@ -1279,7 +1245,6 @@ mod tests {
         assert_eq!(u2::new(3).map(u2::value), Ok(3));
         assert_eq!(u4::new(0).map(u4::value), Ok(0));
         assert_eq!(u4::new(15).map(u4::value), Ok(15));
-
         assert!(matches!(
             i1::new(1),
             Err(TypeError::Invalid { message }) if message == "value 1 is out of range for i1 array elements",
@@ -1400,9 +1365,9 @@ mod tests {
     }
 
     #[test]
-    fn test_low_precision_float_decoding() {
-        // Golden decodes pin each format's extremes (largest finite, smallest normal, smallest subnormal) and its
-        // reserved special-value encodings.
+    fn test_low_precision_floating_point_number_decoding() {
+        // Golden decodes pin each format's extremes (i.e., largest finite, smallest normal, and smallest subnormal)
+        // and its reserved special-value encodings.
         assert_eq!(f4e2m1fn::from_bits(0x07).map(f4e2m1fn::to_f64), Ok(6.0));
         assert_eq!(f4e2m1fn::from_bits(0x0f).map(f4e2m1fn::to_f64), Ok(-6.0));
         assert_eq!(f4e2m1fn::from_bits(0x02).map(f4e2m1fn::to_f64), Ok(1.0));
@@ -1490,37 +1455,73 @@ mod tests {
         assert_eq!((f8e8m0fnu::MAX.to_bits(), f8e8m0fnu::MIN.to_bits()), (0xfe, 0x00));
 
         // Every format with a sign bit decodes its two zero encodings to the two signed zeros.
-        for negative_zero in [f4e2m1fn::from_bits(0x08).unwrap().to_f64(), f6e2m3fn::from_bits(0x20).unwrap().to_f64()]
-        {
-            assert_eq!(negative_zero, 0.0);
-            assert!(negative_zero.is_sign_negative());
-        }
+        assert_eq!(f4e2m1fn::from_bits(0x08).unwrap().to_f64(), 0.0);
+        assert!(f4e2m1fn::from_bits(0x08).unwrap().to_f64().is_sign_negative());
+        assert_eq!(f6e2m3fn::from_bits(0x20).unwrap().to_f64(), 0.0);
+        assert!(f6e2m3fn::from_bits(0x20).unwrap().to_f64().is_sign_negative());
         assert_eq!(f8e4m3fn::from_bits(0x00).to_f64(), 0.0);
         assert!(f8e4m3fn::from_bits(0x00).to_f64().is_sign_positive());
         assert!(f8e4m3fn::from_bits(0x80).to_f64().is_sign_negative());
     }
 
     #[test]
-    fn test_low_precision_float_bit_round_trips() {
-        assert_low_precision_float_encodings!(f4e2m1fn, |bits| f4e2m1fn::from_bits(bits).unwrap(), 4, 0x07, None);
-        assert_low_precision_float_encodings!(f6e2m3fn, |bits| f6e2m3fn::from_bits(bits).unwrap(), 6, 0x1f, None);
-        assert_low_precision_float_encodings!(f6e3m2fn, |bits| f6e3m2fn::from_bits(bits).unwrap(), 6, 0x1f, None);
-        assert_low_precision_float_encodings!(f8e3m4, f8e3m4::from_bits, 8, 0x6f, Some((0x78, 0xf8)));
-        assert_low_precision_float_encodings!(f8e4m3, f8e4m3::from_bits, 8, 0x77, Some((0x7c, 0xfc)));
-        assert_low_precision_float_encodings!(f8e4m3fn, f8e4m3fn::from_bits, 8, 0x7e, Some((0x7f, 0xff)));
-        assert_low_precision_float_encodings!(f8e4m3fnuz, f8e4m3fnuz::from_bits, 8, 0x7f, Some((0x80, 0x80)));
-        assert_low_precision_float_encodings!(f8e4m3b11fnuz, f8e4m3b11fnuz::from_bits, 8, 0x7f, Some((0x80, 0x80)));
-        assert_low_precision_float_encodings!(f8e5m2, f8e5m2::from_bits, 8, 0x7b, Some((0x7e, 0xfe)));
-        assert_low_precision_float_encodings!(f8e5m2fnuz, f8e5m2fnuz::from_bits, 8, 0x7f, Some((0x80, 0x80)));
-        assert_low_precision_float_encodings!(f8e8m0fnu, f8e8m0fnu::from_bits, 8, 0xfe, Some((0xff, 0xff)));
+    fn test_low_precision_floating_point_number_encoding_round_trips() {
+        // Asserts that every valid encoding of a low-precision floating-point format round-trips through `to_f64` and
+        // `from_f64`, that its NaN encodings collapse onto the canonical positive and negative NaN encodings passed as
+        // `$nan_bits`, and that decoded values increase strictly across the format's finite magnitude encodings, which
+        // run  from zero through `$max_finite_magnitude`.
+        macro_rules! assert_roundtrips {
+            (
+                $type:ident,
+                $from_bits:expr,
+                $bit_count:literal,
+                $max_finite_magnitude:literal,
+                $nan_bits:expr $(,)?
+            ) => {{
+                let from_bits: fn(u8) -> $type = $from_bits;
+                let nan_bits: Option<(u8, u8)> = $nan_bits;
+                for bits in 0..(1u16 << $bit_count) {
+                    let bits = bits as u8;
+                    let value = from_bits(bits).to_f64();
+                    let expected = match nan_bits {
+                        Some((positive, negative)) if value.is_nan() => {
+                            if value.is_sign_negative() {
+                                negative
+                            } else {
+                                positive
+                            }
+                        }
+                        _ => bits,
+                    };
+                    assert_eq!($type::from_f64(value).map($type::to_bits), Ok(expected), "encoding {bits:#04x}");
+                }
+                let mut previous = f64::NEG_INFINITY;
+                for magnitude in 0..=$max_finite_magnitude {
+                    let value = from_bits(magnitude).to_f64();
+                    assert!(value > previous, "encoding {magnitude:#04x} decodes to {value}");
+                    previous = value;
+                }
+            }};
+        }
+
+        assert_roundtrips!(f4e2m1fn, |bits| f4e2m1fn::from_bits(bits).unwrap(), 4, 0x07, None);
+        assert_roundtrips!(f6e2m3fn, |bits| f6e2m3fn::from_bits(bits).unwrap(), 6, 0x1f, None);
+        assert_roundtrips!(f6e3m2fn, |bits| f6e3m2fn::from_bits(bits).unwrap(), 6, 0x1f, None);
+        assert_roundtrips!(f8e3m4, f8e3m4::from_bits, 8, 0x6f, Some((0x78, 0xf8)));
+        assert_roundtrips!(f8e4m3, f8e4m3::from_bits, 8, 0x77, Some((0x7c, 0xfc)));
+        assert_roundtrips!(f8e4m3fn, f8e4m3fn::from_bits, 8, 0x7e, Some((0x7f, 0xff)));
+        assert_roundtrips!(f8e4m3fnuz, f8e4m3fnuz::from_bits, 8, 0x7f, Some((0x80, 0x80)));
+        assert_roundtrips!(f8e4m3b11fnuz, f8e4m3b11fnuz::from_bits, 8, 0x7f, Some((0x80, 0x80)));
+        assert_roundtrips!(f8e5m2, f8e5m2::from_bits, 8, 0x7b, Some((0x7e, 0xfe)));
+        assert_roundtrips!(f8e5m2fnuz, f8e5m2fnuz::from_bits, 8, 0x7f, Some((0x80, 0x80)));
+        assert_roundtrips!(f8e8m0fnu, f8e8m0fnu::from_bits, 8, 0xfe, Some((0xff, 0xff)));
     }
 
     #[test]
-    fn test_low_precision_float_checked_bit_encodings() {
+    fn test_low_precision_floating_point_number_checked_bit_encodings() {
         assert_eq!(f4e2m1fn::from_bits(0x0f).map(f4e2m1fn::to_bits), Ok(0x0f));
         assert_eq!(f6e2m3fn::from_bits(0x3f).map(f6e2m3fn::to_bits), Ok(0x3f));
         assert_eq!(f6e3m2fn::from_bits(0x3f).map(f6e3m2fn::to_bits), Ok(0x3f));
-
         assert!(matches!(
             f4e2m1fn::from_bits(0x10),
             Err(TypeError::Invalid { message })
@@ -1539,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_microscaling_float_rounding() {
+    fn test_low_precision_floating_point_number_rounding() {
         // The microscaling formats have no infinity and no NaN, so overflowing inputs saturate and NaN is rejected.
         assert_eq!(f4e2m1fn::from_f64(7.0).map(f4e2m1fn::to_f64), Ok(6.0));
         assert_eq!(f4e2m1fn::from_f64(1e10).map(f4e2m1fn::to_f64), Ok(6.0));
@@ -1558,7 +1559,6 @@ mod tests {
             f4e2m1fn::from_f64(f64::NAN),
             Err(TypeError::Invalid { message }) if message == "data type f4e2m1fn cannot represent NaN",
         ));
-
         assert_eq!(f6e2m3fn::from_f64(100.0).map(f6e2m3fn::to_f64), Ok(7.5));
         assert_eq!(f6e2m3fn::from_f64(7.75).map(f6e2m3fn::to_bits), Ok(0x1f));
         assert_eq!(f6e2m3fn::from_f64(-7.75).map(f6e2m3fn::to_bits), Ok(0x3f));
@@ -1568,7 +1568,6 @@ mod tests {
             f6e2m3fn::from_f32(f32::NAN),
             Err(TypeError::Invalid { message }) if message == "data type f6e2m3fn cannot represent NaN",
         ));
-
         assert_eq!(f6e3m2fn::from_f64(100.0).map(f6e3m2fn::to_f64), Ok(28.0));
         assert_eq!(f6e3m2fn::from_f64(30.0).map(f6e3m2fn::to_bits), Ok(0x1f));
         assert_eq!(f6e3m2fn::from_f64(-30.0).map(f6e3m2fn::to_bits), Ok(0x3f));
@@ -1578,10 +1577,7 @@ mod tests {
             f6e3m2fn::from_f64(f64::NAN),
             Err(TypeError::Invalid { message }) if message == "data type f6e3m2fn cannot represent NaN",
         ));
-    }
 
-    #[test]
-    fn test_low_precision_float_rounding() {
         // Rounding ties choose the even encoding, which at the overflow boundary can be either the largest finite
         // value or the virtual candidate one step past it.
         assert_eq!(f8e3m4::from_f64(15.7).map(f8e3m4::to_f64), Ok(15.5));
@@ -1641,10 +1637,7 @@ mod tests {
         assert_eq!(f8e5m2::from_f32(61439.0).map(f8e5m2::to_bits), f8e5m2::from_f64(61439.0).map(f8e5m2::to_bits));
         assert_eq!(f8e5m2::from_f32(61439.0).map(f8e5m2::to_bits), Ok(0x7b));
         assert_eq!(f8e3m4::from_f32(15.75).map(f8e3m4::to_bits), Ok(0x70));
-    }
 
-    #[test]
-    fn test_exponent_only_float_rounding() {
         assert_eq!(f8e8m0fnu::from_f64(1.0).map(f8e8m0fnu::to_bits), Ok(0x7f));
         assert_eq!(f8e8m0fnu::from_f64(2.0).map(f8e8m0fnu::to_bits), Ok(0x80));
         // Consecutive powers of two are the only representable values, so ties round to the even exponent encoding.
@@ -1654,14 +1647,12 @@ mod tests {
         assert_eq!(f8e8m0fnu::from_f64(6.0).map(f8e8m0fnu::to_f64), Ok(8.0));
         assert_eq!(f8e8m0fnu::from_f64(2f64.powi(-127)).map(f8e8m0fnu::to_bits), Ok(0x00));
         assert_eq!(f8e8m0fnu::from_f32(1.5).map(f8e8m0fnu::to_bits), Ok(0x80));
-
         // Negative, infinite, and overflowing inputs have no encoding other than the single NaN.
         assert_eq!(f8e8m0fnu::from_f64(-1.0).map(f8e8m0fnu::to_bits), Ok(0xff));
         assert_eq!(f8e8m0fnu::from_f64(f64::MAX).map(f8e8m0fnu::to_bits), Ok(0xff));
         assert_eq!(f8e8m0fnu::from_f64(f64::INFINITY).map(f8e8m0fnu::to_bits), Ok(0xff));
         assert_eq!(f8e8m0fnu::from_f64(f64::NEG_INFINITY).map(f8e8m0fnu::to_bits), Ok(0xff));
         assert_eq!(f8e8m0fnu::from_f64(f64::NAN).map(f8e8m0fnu::to_bits), Ok(0xff));
-
         assert!(matches!(
             f8e8m0fnu::from_f64(0.0),
             Err(TypeError::Invalid { message }) if message == "data type f8e8m0fnu cannot represent zero",
@@ -1673,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn test_low_precision_float_special_values() {
+    fn test_low_precision_floating_point_number_special_values() {
         assert_eq!(f8e3m4::NAN.to_bits(), 0x78);
         assert_eq!(f8e4m3::NAN.to_bits(), 0x7c);
         assert_eq!(f8e4m3fn::NAN.to_bits(), 0x7f);
@@ -1724,11 +1715,20 @@ mod tests {
     }
 
     #[test]
-    fn test_array_element_encoding() {
+    fn test_encode_and_decode_elements() {
         let booleans = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]));
         let boolean_bytes = encode_elements(&booleans, &[false, true]).unwrap();
         assert_eq!(boolean_bytes, [0, 1]);
         assert_eq!(decode_elements::<bool>(&booleans, &boolean_bytes), Ok(vec![false, true]));
+
+        let r#type = ArrayType::new(DataType::I4, Shape::new(vec![Dimension::Static(4)]));
+        let elements = [-8, -1, 0, 7].map(|value| i4::new(value).unwrap());
+        let bytes = encode_elements(&r#type, &elements).unwrap();
+        assert_eq!(bytes, [0x08, 0x0f, 0x00, 0x07]);
+        assert_eq!(validate_storage_bytes(&r#type, &bytes), Ok(()));
+        let decoded = decode_elements::<i4>(&r#type, &bytes).unwrap();
+        assert_eq!(decoded, elements.to_vec());
+        assert_eq!(decoded.into_iter().map(i4::value).collect::<Vec<_>>(), [-8, -1, 0, 7]);
 
         let integers = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)]));
         let integer_bytes = encode_elements(&integers, &[1i32, -2]).unwrap();
@@ -1747,22 +1747,7 @@ mod tests {
         let complex_bytes = encode_elements(&complex, &[Complex::new(1.5f32, -2.0)]).unwrap();
         assert_eq!(complex_bytes, [0, 0, 192, 63, 0, 0, 0, 192]);
         assert_eq!(decode_elements::<Complex<f32>>(&complex, &complex_bytes), Ok(vec![Complex::new(1.5, -2.0)]));
-    }
 
-    #[test]
-    fn test_sub_byte_integer_array_encoding() {
-        let r#type = ArrayType::new(DataType::I4, Shape::new(vec![Dimension::Static(4)]));
-        let elements = [-8, -1, 0, 7].map(|value| i4::new(value).unwrap());
-        let bytes = encode_elements(&r#type, &elements).unwrap();
-        assert_eq!(bytes, [0x08, 0x0f, 0x00, 0x07]);
-        assert_eq!(validate_storage_bytes(&r#type, &bytes), Ok(()));
-        let decoded = decode_elements::<i4>(&r#type, &bytes).unwrap();
-        assert_eq!(decoded, elements.to_vec());
-        assert_eq!(decoded.into_iter().map(i4::value).collect::<Vec<_>>(), [-8, -1, 0, 7]);
-    }
-
-    #[test]
-    fn test_low_precision_float_array_encoding() {
         let r#type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(4)]));
         let elements = [-448.0, -0.5, 0.0, 448.0].map(|value| f8e4m3fn::from_f64(value).unwrap());
         let bytes = encode_elements(&r#type, &elements).unwrap();
@@ -1782,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_aware_array_encoding() {
+    fn test_encode_and_decode_elements_with_layouts() {
         let shape = Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]);
         let values = [1u8, 2, 3, 4, 5, 6];
         let cases = [
@@ -1832,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_byte_validation() {
+    fn test_validate_storage_bytes() {
         let booleans = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]));
         assert_eq!(encode_logical_bytes(&booleans, &[0, 1]), Ok(vec![0, 1]));
         assert!(matches!(
