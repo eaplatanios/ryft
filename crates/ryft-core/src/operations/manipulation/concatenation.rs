@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use crate::axes::Axis;
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, align_array_batch};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -621,7 +621,7 @@ where
 
 /// Batching rule for mixed [`ConcatenateOperation<ArrayIrType>`] instructions. The trailing result extent stays
 /// replicated, while array operands are aligned on one physical mapped axis before concatenation.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayProgramBatching> for ConcatenateOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for ConcatenateOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
@@ -631,12 +631,12 @@ where
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let Some((result_extent, inputs)) = inputs.split_last() else {
             return Err(TypeError::invalid(format!(
                 "'{CONCATENATE_OPERATION_NAME}' expects at least one array followed by its result extent",
@@ -659,7 +659,7 @@ where
         // representation. Concatenate therefore accepts only one replicated result extent.
         result_extent.validate_replicated_dimension()?;
 
-        let Some(batch_axis) = inputs.iter().find_map(ArrayProgramBatch::batch_axis_position) else {
+        let Some(batch_axis) = inputs.iter().find_map(ArrayIrBatch::batch_axis_position) else {
             return Ok(context
                 .parent()
                 .bind(
@@ -672,7 +672,7 @@ where
                         .collect::<Vec<_>>(),
                 )?
                 .into_iter()
-                .map(ArrayProgramBatch::replicated)
+                .map(ArrayIrBatch::replicated)
                 .collect());
         };
 
@@ -684,7 +684,7 @@ where
             .map(|input| align_array_batch(context, input, Axis::from(batch_axis)))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
-        let mut lifted_inputs = aligned_inputs.into_iter().map(ArrayProgramBatch::into_value).collect::<Vec<_>>();
+        let mut lifted_inputs = aligned_inputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>();
         lifted_inputs.push(result_extent.value().clone());
         let input_types = lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(lifted_axis, &input_types)?;
@@ -692,7 +692,7 @@ where
             .parent()
             .bind(operation, Vec::new(), lifted_inputs.as_slice())?
             .into_iter()
-            .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(batch_axis)))
+            .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
             .collect()
     }
 }

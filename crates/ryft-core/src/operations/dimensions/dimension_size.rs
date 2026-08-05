@@ -8,7 +8,7 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::axes::Axis;
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -259,15 +259,15 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Pa
 
 /// Batching reads the same logical array axis after accounting for an inserted packed batch axis. The resulting
 /// first-class dimension is shared shape metadata and therefore remains replicated.
-impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
-    BatchableOperation<C, ArrayProgramBatching> for DimensionSizeOperation
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> BatchableOperation<C, ArrayIrBatching>
+    for DimensionSizeOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
@@ -285,7 +285,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
             .parent()
             .bind(operation, Vec::new(), std::slice::from_ref(input.value()))?
             .into_iter()
-            .map(ArrayProgramBatch::replicated)
+            .map(ArrayIrBatch::replicated)
             .collect())
     }
 }

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -215,17 +215,17 @@ impl<C: Context<Type = ArrayIrType, Operation: From<ReshapeOperation>>> Partiall
 /// Batching rule for [`ReshapeOperation`]. Explicit output extents remain replicated shape values. A mapped input is
 /// canonicalized to a leading batch axis, and that axis is inserted into both the reshape geometry and output
 /// sharding before the mixed operation is replayed.
-impl<C> BatchableOperation<C, ArrayProgramBatching> for ReshapeOperation
+impl<C> BatchableOperation<C, ArrayIrBatching> for ReshapeOperation
 where
     C: Context<Type = ArrayIrType, Operation: From<ReshapeOperation>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -239,7 +239,7 @@ where
                 .parent()
                 .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>())?
                 .into_iter()
-                .map(ArrayProgramBatch::replicated)
+                .map(ArrayIrBatch::replicated)
                 .collect());
         }
 
@@ -274,7 +274,7 @@ where
             .parent()
             .bind(operation, Vec::new(), lifted_inputs.as_slice())?
             .into_iter()
-            .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(0)))
+            .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(0)))
             .collect()
     }
 }

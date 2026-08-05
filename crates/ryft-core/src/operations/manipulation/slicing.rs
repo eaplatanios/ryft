@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::axes::Axis;
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -332,19 +332,19 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transposabl
 /// Batching rule for [`DynamicShapeSliceOperation`]. First-class starts and sizes must remain replicated because
 /// per-item slice geometry requires a ragged representation. A mapped array axis is inserted into the slice geometry
 /// with start zero, the transform's exact extent, and unit stride.
-impl<C> BatchableOperation<C, ArrayProgramBatching> for DynamicShapeSliceOperation
+impl<C> BatchableOperation<C, ArrayIrBatching> for DynamicShapeSliceOperation
 where
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicShapeSliceOperation> + From<DimensionOperation<DimensionValue>>,
         >,
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let Some((input, bounds)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -358,7 +358,7 @@ where
                 .parent()
                 .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>())?
                 .into_iter()
-                .map(ArrayProgramBatch::replicated)
+                .map(ArrayIrBatch::replicated)
                 .collect());
         }
 
@@ -383,7 +383,7 @@ where
             .parent()
             .bind(operation, Vec::new(), packed_inputs.as_slice())?
             .into_iter()
-            .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(batch_axis)))
+            .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
             .collect()
     }
 }
@@ -2486,7 +2486,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+    use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
@@ -2537,17 +2537,17 @@ mod tests {
 
     #[test]
     fn test_dynamic_shape_slice_batching_inserts_the_mapped_axis_geometry() {
-        let context = BatchingContext::<_, ArrayProgramBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
-        let input = ArrayProgramBatch::new(
+        let input = ArrayIrBatch::new(
             ArrayIrValue::Array(Array::matrix(2, 4, vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
             BatchAxis::new(0),
         )
         .unwrap();
-        let start = ArrayProgramBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()));
-        let size = ArrayProgramBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let start = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()));
+        let size = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
 
         let outputs = DynamicShapeSliceOperation::new(1)
             .batch(&context, &EmptyRegionDriver, &[input, start, size])

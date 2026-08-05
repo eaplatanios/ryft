@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::axes::Axis;
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, align_array_batch};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::backends::scalars::Scalar;
@@ -423,8 +423,7 @@ where
 /// Composite batching rule for [`RngBitGeneratorOperation`]. Replicated first-class output extents become invariant
 /// scan carries, while one mapped state row is consumed per iteration. This preserves one independently advanced state
 /// and one dynamically shaped bits value per batch item without duplicating the generator state.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayProgramBatching>
-    for RngBitGeneratorOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for RngBitGeneratorOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
@@ -436,12 +435,12 @@ where
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let Some((state, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -486,10 +485,7 @@ where
         outputs.drain(..output_extents.len());
         let bits = outputs.remove(1);
         let advanced_states = outputs.remove(0);
-        Ok(vec![
-            ArrayProgramBatch::new(advanced_states, BatchAxis::new(0))?,
-            ArrayProgramBatch::new(bits, BatchAxis::new(0))?,
-        ])
+        Ok(vec![ArrayIrBatch::new(advanced_states, BatchAxis::new(0))?, ArrayIrBatch::new(bits, BatchAxis::new(0))?])
     }
 }
 
@@ -1239,7 +1235,7 @@ mod tests {
         let column_extent = trace.input(DimensionType::new(columns.clone()).into());
         let input_ids = [batch_extent.clone(), states.clone(), row_extent.clone(), column_extent.clone()]
             .map(|input| input.atom_id().unwrap());
-        let context = BatchingContext::<_, ArrayProgramBatching>::new(trace.clone(), batch_extent);
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), batch_extent);
         let outputs = context.bind(
             ArrayIrOperation::RngBitGenerator(RngBitGeneratorOperation::new(
                 RandomAlgorithm::ThreeFry,
@@ -1250,9 +1246,9 @@ mod tests {
             )),
             Vec::new(),
             &[
-                BatchingTracer::new(context.clone(), ArrayProgramBatch::new(states, BatchAxis::new(0))?),
-                BatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(row_extent)),
-                BatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(column_extent)),
+                BatchingTracer::new(context.clone(), ArrayIrBatch::new(states, BatchAxis::new(0))?),
+                BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(row_extent)),
+                BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(column_extent)),
             ],
         )?;
         assert_eq!(outputs.len(), 2);
@@ -1296,8 +1292,8 @@ mod tests {
         let nested_trace = Context::new();
         let outer = DimensionVariable::new("outer", DimensionBounds::new(1, Some(5))?);
         let outer_extent = nested_trace.input(DimensionType::new(outer.clone()).into());
-        let nested_context = BatchingContext::<_, ArrayProgramBatching>::new(nested_trace, outer_extent);
-        let nested = <ArrayProgramBatching as RecursiveBatchingPolicy<Context>>::batch_program(
+        let nested_context = BatchingContext::<_, ArrayIrBatching>::new(nested_trace, outer_extent);
+        let nested = <ArrayIrBatching as RecursiveBatchingPolicy<Context>>::batch_program(
             &nested_context,
             program.entry_region_ref(),
             &[BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::replicated()],

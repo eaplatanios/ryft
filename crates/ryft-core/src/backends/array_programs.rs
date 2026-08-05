@@ -1149,7 +1149,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::axes::NamedAxis;
-    use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+    use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
@@ -4851,7 +4851,7 @@ in (%4)
         );
 
         type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let batching_context = BatchingContext::<_, ArrayProgramBatching>::new(
+        let batching_context = BatchingContext::<_, ArrayIrBatching>::new(
             Parent::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         )
@@ -4863,7 +4863,7 @@ in (%4)
                 vec![
                     BatchingTracer::new(
                         batching_context.clone(),
-                        ArrayProgramBatch::new(
+                        ArrayIrBatch::new(
                             ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 4.0, 5.0])),
                             BatchAxis::new(0),
                         )
@@ -4871,7 +4871,7 @@ in (%4)
                     ),
                     BatchingTracer::new(
                         batching_context.clone(),
-                        ArrayProgramBatch::new(
+                        ArrayIrBatch::new(
                             ArrayIrValue::Array(Array::matrix(2, 1, vec![3.0_f32, 6.0])),
                             BatchAxis::new(0),
                         )
@@ -5120,20 +5120,20 @@ in (%4)
         );
 
         // Batching inserts one physical leading axis while the extent remains a replicated shape value.
-        let batching_context = BatchingContext::<_, ArrayProgramBatching>::new(
+        let batching_context = BatchingContext::<_, ArrayIrBatching>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
         let batched_input = BatchingTracer::new(
             batching_context.clone(),
-            ArrayProgramBatch::new(
+            ArrayIrBatch::new(
                 ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])),
                 BatchAxis::new(0),
             )
             .unwrap(),
         );
         let batched_extent =
-            BatchingTracer::new(batching_context.clone(), ArrayProgramBatch::replicated(extent_value.clone()));
+            BatchingTracer::new(batching_context.clone(), ArrayIrBatch::replicated(extent_value.clone()));
         let batched_output = program
             .interpret_in_context(&batching_context, vec![batched_input, batched_extent])
             .unwrap()

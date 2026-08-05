@@ -10,7 +10,7 @@ use std::fmt::{Debug, Display};
 
 use crate::axes::Axis;
 use crate::backends::array_programs::ArrayIrValue;
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, align_array_batch};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
@@ -2064,7 +2064,7 @@ pub(crate) fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
 /// same monotonic mapped-axis fixed point as homogeneous scans, while first-class dimension carries remain
 /// replicated. Stacked inputs and outputs are necessarily arrays because one shared dimension value cannot represent
 /// a different stacked extent for each batch item.
-impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ScanOperation<ArrayIrValue<A>>
+impl<A, C> BatchableOperation<C, ArrayIrBatching> for ScanOperation<ArrayIrValue<A>>
 where
     A: Value<Type = ArrayType>,
     C: Context<
@@ -2079,12 +2079,12 @@ where
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let body = driver.region(0)?;
         let (scan_inputs, runtime_length) = if self.length().variable().is_some() {
             let Some((runtime_length, scan_inputs)) = inputs.split_last() else {
@@ -2127,7 +2127,7 @@ where
                 }
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
-        let mut carry_axes = carries.iter().map(ArrayProgramBatch::batch_axis).collect::<Vec<_>>();
+        let mut carry_axes = carries.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
         let slice_axes = stacks.iter().map(|stack| scan_iteration_batch_axis(stack.batch_axis())).collect::<Vec<_>>();
 
         // Iterate carry axes to a fixed point. A first-class dimension cannot widen because composite batching does
@@ -2205,11 +2205,7 @@ where
             Some(axis) => BatchAxis::new(axis.value() + 1),
             None => BatchAxis::replicated(),
         }));
-        outputs
-            .into_iter()
-            .zip(output_axes)
-            .map(|(output, axis)| ArrayProgramBatch::new(output, axis))
-            .collect()
+        outputs.into_iter().zip(output_axes).map(|(output, axis)| ArrayIrBatch::new(output, axis)).collect()
     }
 }
 

@@ -2,9 +2,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::axes::Axis;
-use crate::backends::array_programs::batching::{
-    ArrayProgramBatch, ArrayProgramBatching, align_array_batch, array_dimension,
-};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, align_array_batch, array_dimension};
 use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue, LinearResiduals};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
@@ -1007,7 +1005,7 @@ where
 /// Batching rule for mixed [`PadOperation<ArrayIrType>`] instructions. Explicit result extents remain
 /// replicated. When the scalar padding value varies across the batch, the rule pads with zero and uses a padded mask
 /// to select the broadcast per-item padding value without changing `pad`'s scalar operand contract.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayProgramBatching> for PadOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for PadOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
@@ -1019,12 +1017,12 @@ where
         + From<PadOperation<ArrayType>>
         + OperationProjection<ArrayType, Projected: From<SelectOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
@@ -1061,7 +1059,7 @@ where
                     &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
                 )?
                 .into_iter()
-                .map(ArrayProgramBatch::replicated)
+                .map(ArrayIrBatch::replicated)
                 .collect());
         };
 
@@ -1092,7 +1090,7 @@ where
                 .parent()
                 .bind(operation, Vec::new(), lifted_inputs.as_slice())?
                 .into_iter()
-                .map(|output| ArrayProgramBatch::new(output, BatchAxis::from_position(batch_axis)))
+                .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
                 .collect();
         }
 
@@ -1167,7 +1165,7 @@ where
         let mut output =
             array_context.bind(SelectOperation::new(), Vec::new(), &[mask, padded, broadcasted_padding])?;
         check_count!("output", output, 1, ProgramError);
-        Ok(vec![ArrayProgramBatch::new(
+        Ok(vec![ArrayIrBatch::new(
             <C::Value as ValueProjection<ArrayType>>::from_projected(output.remove(0)),
             BatchAxis::from_position(batch_axis),
         )?])

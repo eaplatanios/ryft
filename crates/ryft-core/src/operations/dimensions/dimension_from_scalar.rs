@@ -7,7 +7,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -213,14 +213,14 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation
 /// Batching rejects mapped scalar inputs because converting one scalar per batch item would produce a ragged
 /// collection of first-class dimensions. A replicated scalar is converted once and remains replicated.
 impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>>
-    BatchableOperation<C, ArrayProgramBatching> for DimensionFromScalarOperation
+    BatchableOperation<C, ArrayIrBatching> for DimensionFromScalarOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
@@ -235,7 +235,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation
             .parent()
             .bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?
             .into_iter()
-            .map(ArrayProgramBatch::replicated)
+            .map(ArrayIrBatch::replicated)
             .collect())
     }
 }

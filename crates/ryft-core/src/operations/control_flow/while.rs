@@ -13,7 +13,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::axes::Axis;
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, align_array_batch};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
@@ -1128,7 +1128,7 @@ where
 /// loop-invariant state that per-item masking never touches (the relaxed [`WhileTypeSemantics`] contract documents that
 /// invariance requirement), while *mapped* dimension inputs and dimension outputs that would widen into per-item
 /// extents remain rejected.
-impl<C> BatchableOperation<C, ArrayProgramBatching> for WhileOperation<ArrayIrType>
+impl<C> BatchableOperation<C, ArrayIrBatching> for WhileOperation<ArrayIrType>
 where
     C: Context<
             Type = ArrayIrType,
@@ -1142,12 +1142,12 @@ where
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let condition_region = driver.region(0)?;
         let body_region = driver.region(1)?;
         let state_count = inputs.len();
@@ -1167,7 +1167,7 @@ where
                 }
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
-        let mut state_axes = state.iter().map(ArrayProgramBatch::batch_axis).collect::<Vec<_>>();
+        let mut state_axes = state.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
 
         // Iterate array carry axes to the same monotonic fixed point as the homogeneous rule. A dimension output can
         // never widen because structural composite batching rejects mapped dimensions at its boundary.
@@ -1296,11 +1296,7 @@ where
             context.parent().bind(*self, vec![batched_condition, batched_body], packed_inputs.as_slice())?;
         check_count!("output", outputs, state_count + 1, ProgramError);
         outputs.remove(0);
-        outputs
-            .into_iter()
-            .zip(state_axes)
-            .map(|(output, axis)| ArrayProgramBatch::new(output, axis))
-            .collect()
+        outputs.into_iter().zip(state_axes).map(|(output, axis)| ArrayIrBatch::new(output, axis)).collect()
     }
 }
 
@@ -4129,12 +4125,12 @@ mod tests {
         // Batching batch items [3, 1, 2] under an eager parent performs exactly one structural pass per region (the
         // fixed-point discovery body and the natural condition) and interprets the loop with its masked per-item
         // semantics: every batch item counts down to 0 even though the items terminate after different trip counts.
-        let context = BatchingContext::<_, ArrayProgramBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
             EagerParent::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         );
         let inputs = vec![
-            ArrayProgramBatch::new(ArrayIrValue::Array(Array::vector(vec![3.0, 1.0, 2.0])), BatchAxis::new(0)).unwrap(),
+            ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![3.0, 1.0, 2.0])), BatchAxis::new(0)).unwrap(),
         ];
         let driver = CountingBatchingDriver::new(&countdown_regions);
         let countdown_operation = WhileOperation::<ArrayIrType>::new();
@@ -4185,12 +4181,12 @@ mod tests {
         let state =
             trace.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone())])).into());
         let input_ids = [batch_extent.clone(), state.clone()].map(|input| input.atom_id().unwrap());
-        let context = BatchingContext::<_, ArrayProgramBatching>::new(trace.clone(), batch_extent);
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), batch_extent);
         let outputs = context
             .bind(
                 ArrayIrOperation::While(WhileOperation::new()),
                 composite_countdown_while_regions(),
-                &[BatchingTracer::new(context.clone(), ArrayProgramBatch::new(state, BatchAxis::new(0)).unwrap())],
+                &[BatchingTracer::new(context.clone(), ArrayIrBatch::new(state, BatchAxis::new(0)).unwrap())],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);

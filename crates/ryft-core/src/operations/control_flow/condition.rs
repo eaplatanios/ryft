@@ -8,7 +8,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::backends::array_programs::ArrayIrValue;
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, require_equal_dimensions};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, require_equal_dimensions};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
@@ -1002,7 +1002,7 @@ where
 /// mapped extent. A mapped predicate replays both pure branches and selects their array outputs per item. First-class
 /// dimension outputs remain replicated, so the mapped-predicate path requires both branches to produce the same
 /// dimension value.
-impl<A, C> BatchableOperation<C, ArrayProgramBatching> for ConditionOperation<ArrayIrValue<A>>
+impl<A, C> BatchableOperation<C, ArrayIrBatching> for ConditionOperation<ArrayIrValue<A>>
 where
     A: Value<Type = ArrayType>,
     C: Context<
@@ -1022,12 +1022,12 @@ where
         From<LegacyBroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
     <C::Operation as OperationProjection<DimensionType>>::Projected: From<DimensionRequirementOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let Some((predicate, operands)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
                 message: "cannot batch a condition operation with no predicate input".to_string(),
@@ -1036,7 +1036,7 @@ where
         <&ArrayType>::try_from(predicate.unbatched_type())?;
 
         if predicate.batch_axis().is_replicated() {
-            let operand_axes = operands.iter().map(ArrayProgramBatch::batch_axis).collect::<Vec<_>>();
+            let operand_axes = operands.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
             let true_region = driver.region(0)?;
             let false_region = driver.region(1)?;
             let true_program = driver.batch_program(
@@ -1088,7 +1088,7 @@ where
             return outputs
                 .into_iter()
                 .zip(output_axes)
-                .map(|(output, axis)| ArrayProgramBatch::new(output, axis))
+                .map(|(output, axis)| ArrayIrBatch::new(output, axis))
                 .collect();
         }
 

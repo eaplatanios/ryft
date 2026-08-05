@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -146,15 +146,15 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
 /// Batching converts one replicated first-class dimension into one replicated scalar array. Mapped dimension inputs
 /// are rejected by the composite batch carrier before conversion because ordinary array batching has no ragged shape
 /// representation.
-impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>>
-    BatchableOperation<C, ArrayProgramBatching> for DimensionToScalarOperation
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>> BatchableOperation<C, ArrayIrBatching>
+    for DimensionToScalarOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
@@ -163,7 +163,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
             .parent()
             .bind(*self, Vec::new(), std::slice::from_ref(input.value()))?
             .into_iter()
-            .map(ArrayProgramBatch::replicated)
+            .map(ArrayIrBatch::replicated)
             .collect())
     }
 }

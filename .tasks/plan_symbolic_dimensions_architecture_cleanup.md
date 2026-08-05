@@ -176,7 +176,7 @@ captured:
 
 - tracked and untracked production/test line counts relative to `HEAD`;
 - non-test line counts for `backends/array_programs/{mod,batching,differentiation}.rs`;
-- occurrences and files containing `ArrayProgramProjection`, `ArrayContextView`, `DimensionContextView`,
+- occurrences and files containing `ArrayIrProjection`, `ArrayContextView`, `DimensionContextView`,
   `with_dimensions`, `with_source_array`, `bind_replayed`, `runtime_dimension_variables`, and
   `OutputIdentityRole`;
 - operation-family variant counts and duplicate operation-contract implementations;
@@ -1471,7 +1471,7 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 P3c advances the smallest composite batching implementation needed to make the
 `dimension_size -> dimension_to_scalar` vertical slice reachable. Treat the semantics it establishes as durable
 (arrays may be mapped or replicated, while first-class dimensions are replicated-only), but do not assume that its
-parallel `ArrayProgramBatchingContext`, `ArrayProgramBatchingTracer`, or exact `ArrayProgramBatch` representation is
+parallel `ArrayIrBatchingContext`, `ArrayIrBatchingTracer`, or exact `ArrayIrBatch` representation is
 the final architecture. A projected-array wrapper alone cannot represent dimension members, mixed operations,
 region recursion, or a first-class dynamic batching extent, and so merely adding a public `ProjectedArrayBatch` would
 rename only part of the problem while introducing another carrier.
@@ -1498,12 +1498,12 @@ rename only part of the problem while introducing another carrier.
       reduce it to the smallest value-kind policy layer rather than forcing the abstraction.
 - [x] Generalize the operation batching contract alongside the carrier, context, and driver so that one
       `BatchableOperation` can serve homogeneous and composite batching, then delete
-      `ArrayProgramBatchableOperation`. Do not generalize the operation trait in isolation: its inputs, outputs,
+      `ArrayIrBatchableOperation`. Do not generalize the operation trait in isolation: its inputs, outputs,
       active context, and recursive driver must all come from the same transform-owned batching policy. If the
       prototype gate rejects the generic policy because it adds more ceremony than it removes, retain the localized
       composite trait and record that evidence explicitly.
 - [x] Gate: the final design has one canonical representation for each necessary batching concept, no wrapper that
-      merely renames `ArrayProgramBatch`, and no parallel context/tracer tower unless the rejected-policy evidence
+      merely renames `ArrayIrBatch`, and no parallel context/tracer tower unless the rejected-policy evidence
       demonstrates that the localized duplication is the simpler implementation.
 - [x] Promote the toy composite projection fixtures from the `contexts.rs` unit tests (`ProjectedMemberType`,
       `ProjectedMemberValue`, `ProjectedProgramType`, `ProjectedProgramValue`, `ProjectedProgramOperation`, and the
@@ -1608,7 +1608,7 @@ rename only part of the problem while introducing another carrier.
 
 P5a adopted the transform-owned policy design and completed the shared-frame migration. `BatchingContext`,
 `BatchingTracer`, `BatchingDriver`, and `BatchableOperation` are now policy-generic; the three parallel
-`ArrayProgramBatching*` context/tracer/trait concepts are deleted; and composite extents are parent-owned dimension SSA
+`ArrayIrBatching*` context/tracer/trait concepts are deleted; and composite extents are parent-owned dimension SSA
 values. The promoted three-member fixture, ordinary array and dimension rules, mixed gateways, dynamic reshape edge,
 mapped-dimension diagnostic, recursive replay, rendering/import, macro integration, full `ryft-core`, and full
 `ryft-xla` suites all pass. Clean repeated `ryft-core` check time remained effectively neutral (`12.17-12.26s`
@@ -2246,10 +2246,11 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
 ### Phase 9: module and public API cleanup
 
 - [x] Standardize the composite array/dimension vocabulary on `ArrayIrType`, `ArrayIrValue`, and `ArrayIrOperation`,
-      including the directly owned `ArrayIrTypeRefinements` companion and projection-allocation fixture. Keep the
-      existing `types::arrays` and `backends::array_programs` module placement for this review unit, update every
-      in-repo consumer without compatibility aliases, and reserve the shorter “array IR” terminology for this
-      heterogeneous SSA representation rather than ordinary homogeneous programs over `ArrayType`.
+      including the directly owned `ArrayIrTypeRefinements` companion, `ArrayIrBatch` carrier, `ArrayIrBatching`
+      policy, and projection-allocation fixture. Keep the existing `types::arrays` and `backends::array_programs`
+      module placement for this review unit, update every in-repo consumer without compatibility aliases, and reserve
+      the shorter “array IR” terminology for this heterogeneous SSA representation rather than ordinary homogeneous
+      programs over `ArrayType`.
 - [x] Confirm the `S4` typed `Custom`/`DimensionError` recovery behavior and canonical invalid projection diagnostics
       remain intact;
       do not mix another error-representation migration into the module move.
@@ -2280,8 +2281,8 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [ ] Move `ArrayBatching`, `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, and their policy, recursive, and
           entrypoint implementations after the carrier slice is reviewed.
     - [ ] Move the array-specialization tests beside their owner and close the specialization-module checkbox.
-  - [ ] Move the `ArrayIrType` specialization to `batching::array_programs` (`ArrayProgramBatch`,
-        `ArrayProgramBatching`, `ThreadedExtentBatchedProgram`, `DynamicArrayBatchingPolicy`,
+  - [ ] Move the `ArrayIrType` specialization to `batching::array_ir` (`ArrayIrBatch`,
+        `ArrayIrBatching`, `ThreadedExtentBatchedProgram`, `DynamicArrayBatchingPolicy`,
         `ReplicatedDimensionBatchingPolicy`, their policy/projection/recursive/entrypoint implementations, and shared
         first-class-extent mechanics).
   - [ ] Keep operation-specific `BatchableOperation` implementations and operation-owned policy extensions such as
@@ -2618,8 +2619,8 @@ The committed architecture has completed Phases 0–2 and P3a–P3i. Repository 
 identifier is only reshape permutation configuration. Phase 4 is nevertheless not complete:
 `ReshapeDimensionExpression` has 80 occurrences, `LegacyReshapeOperation` 68,
 `LegacyBroadcastOperation` 81, `DynamicBroadcastOperation` 51, and the complete homogeneous `ArrayOperation` family
-remains a production transform/backend language. Phase 5's separate `ArrayProgramBatchingContext`,
-`ArrayProgramBatchingTracer`, and `ArrayProgramBatchableOperation` also remain, as do the composite differentiation
+remains a production transform/backend language. Phase 5's separate `ArrayIrBatchingContext`,
+`ArrayIrBatchingTracer`, and `ArrayIrBatchableOperation` also remain, as do the composite differentiation
 dispatcher and the five transitional dual-contract payloads listed in the diagnosis. `Operation` is still generic as
 `Operation<T>`; Phases 8–11 have not begun.
 
@@ -3836,12 +3837,13 @@ each extraction remains within the review budget.
 ### Phase 9 array IR vocabulary rename (2026-08-04)
 
 The heterogeneous array/dimension SSA vocabulary is now named `ArrayIrType`, `ArrayIrValue`, and `ArrayIrOperation`;
-its signature refinement state is `ArrayIrTypeRefinements`. The existing `types::arrays` and
-`backends::array_programs` module placement remains unchanged, no compatibility aliases were added, and the public
-crate-root exports use only the new names. Directly corresponding helper, lowering, test, and allocation-fixture names
-now use “array IR” as well, while ordinary homogeneous programs over `ArrayType` remain described as programs over
-arrays. The obsolete TODO proposing that the heterogeneous dispatcher become `ArrayOperation` was deleted because the
-new name makes its distinct mixed-universe role explicit.
+its signature refinement state is `ArrayIrTypeRefinements`, its batching carrier is `ArrayIrBatch`, and its batching
+policy is `ArrayIrBatching`. The existing `types::arrays` and `backends::array_programs` module placement remains
+unchanged, no compatibility aliases were added, and the public crate-root exports use only the new names. Directly
+corresponding helper, lowering, test, and allocation-fixture names now use “array IR” as well, while ordinary
+homogeneous programs over `ArrayType` remain described as programs over arrays. The obsolete TODO proposing that the
+heterogeneous dispatcher become `ArrayOperation` was deleted because the new name makes its distinct mixed-universe
+role explicit.
 
 The Phase 9 checklist now also records the subsequent, separately reviewable reference-backend consolidation: retire
 the scalar backend after proving its remaining tests have suitable replacements; move concrete arrays, dimensions, and
@@ -3852,8 +3854,10 @@ explicit encoding, allocation, exact-bit, CPU/XLA execution, and performance gat
 Verification passed the renamed two-test projection-allocation fixture, all 1,129 core library tests, all 53 runnable
 core doctests (16 ignored), all 57 macro unit tests, both macro integration suites including every compile-fail fixture,
 and all 436 runnable XLA library tests (one ignored). `cargo check -p ryft-core --tests`, formatting, diff hygiene, and
-repository-wide residual searches for the four retired public identifiers and their corresponding lowering/inference
-helper names passed.
+repository-wide residual searches for the six retired public identifiers and their corresponding lowering/inference
+helper names passed. The follow-up batching rename additionally confirmed that the rejected historical
+`ArrayIrBatchingContext`, `ArrayIrBatchingTracer`, `ArrayIrBatchableOperation`, and `ArrayIrProjection` concepts have no
+live code definitions; they remain plan-history names only.
 
 ### Phase 9 planned array hierarchy refinement (2026-08-04)
 

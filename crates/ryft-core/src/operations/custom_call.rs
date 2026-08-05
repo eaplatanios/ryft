@@ -639,7 +639,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::batching::ArrayProgramBatching;
+    use crate::backends::array_programs::batching::ArrayIrBatching;
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::batching::{BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy};
@@ -890,7 +890,7 @@ mod tests {
                         `custom_vjp` to provide one",
         ));
 
-        let batching_context = BatchingContext::<_, ArrayProgramBatching>::new(
+        let batching_context = BatchingContext::<_, ArrayIrBatching>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );

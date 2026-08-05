@@ -15,7 +15,7 @@ use std::ops::Mul as StdMul;
 
 use crate::axes::{AxisError, AxisIndexOperation, NamedAxes, NamedAxis};
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching, DynamicArrayBatchingPolicy};
+use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching, DynamicArrayBatchingPolicy};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::backends::scalars::Scalar;
 use crate::batching::{
@@ -3189,8 +3189,8 @@ where
 
 /// Validates a mixed collective's array operand and replicated result extents.
 fn explicit_collective_inputs<V: Value<Type = ArrayIrType>>(
-    inputs: &[ArrayProgramBatch<V>],
-) -> Result<(&ArrayProgramBatch<V>, &[ArrayProgramBatch<V>]), BatchingError> {
+    inputs: &[ArrayIrBatch<V>],
+) -> Result<(&ArrayIrBatch<V>, &[ArrayIrBatch<V>]), BatchingError> {
     let Some((array, output_extents)) = inputs.split_first() else {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     };
@@ -3205,11 +3205,11 @@ fn explicit_collective_inputs<V: Value<Type = ArrayIrType>>(
 /// extents. Replicated arrays require no lifting and remain replicated.
 fn forward_explicit_collective<C, O>(
     operation: O,
-    context: &BatchingContext<C, ArrayProgramBatching>,
-    array: &ArrayProgramBatch<C::Value>,
-    output_extents: &[ArrayProgramBatch<C::Value>],
+    context: &BatchingContext<C, ArrayIrBatching>,
+    array: &ArrayIrBatch<C::Value>,
+    output_extents: &[ArrayIrBatch<C::Value>],
     output_batch_axis: Option<usize>,
-) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError>
+) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayIrType, Operation: From<O>>,
 {
@@ -3223,15 +3223,15 @@ where
         .bind(operation, Vec::new(), physical_inputs.as_slice())?
         .into_iter()
         .map(|output| match output_batch_axis {
-            Some(output_batch_axis) => ArrayProgramBatch::new(output, BatchAxis::from_position(output_batch_axis)),
-            None => Ok(ArrayProgramBatch::replicated(output)),
+            Some(output_batch_axis) => ArrayIrBatch::new(output, BatchAxis::from_position(output_batch_axis)),
+            None => Ok(ArrayIrBatch::replicated(output)),
         })
         .collect()
 }
 
 /// Batching rule for explicit-extent [`AllGatherOperation`]. The logical result extents remain ordinary replicated
 /// dimension SSA operands; matching-axis batching delegates its array mechanics to the homogeneous collective kernel.
-impl<C> MemberBatchableOperation<C, ArrayProgramBatching> for AllGatherOperation
+impl<C> MemberBatchableOperation<C, ArrayIrBatching> for AllGatherOperation
 where
     C: Context<
             Type = ArrayIrType,
@@ -3248,12 +3248,12 @@ where
     <C::Value as ValueProjection<DimensionType>>::Projected:
         DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
 {
-    fn batch_in_parent<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let (array, output_extents) = explicit_collective_inputs(inputs)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_all_gather_output_types(self, logical_input_types.as_slice())?;
@@ -3300,7 +3300,7 @@ where
             output_extents,
             logical_output_type.sharding().cloned(),
         )?;
-        Ok(vec![ArrayProgramBatch::replicated(<C::Value as ValueProjection<ArrayType>>::from_projected(
+        Ok(vec![ArrayIrBatch::replicated(<C::Value as ValueProjection<ArrayType>>::from_projected(
             output.into_value(),
         ))])
     }
@@ -3308,7 +3308,7 @@ where
 
 /// Batching rule for explicit-extent [`PSumScatterOperation`]. The explicit result extents remain the only source for
 /// dynamic reshape geometry while matching-axis array mechanics reuse the homogeneous collective kernel.
-impl<C> MemberBatchableOperation<C, ArrayProgramBatching> for PSumScatterOperation
+impl<C> MemberBatchableOperation<C, ArrayIrBatching> for PSumScatterOperation
 where
     C: Context<
             Type = ArrayIrType,
@@ -3325,12 +3325,12 @@ where
     <C::Value as ValueProjection<DimensionType>>::Projected:
         DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
 {
-    fn batch_in_parent<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let (array, output_extents) = explicit_collective_inputs(inputs)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_psum_scatter_output_types(self, logical_input_types.as_slice())?;
@@ -3377,17 +3377,14 @@ where
             logical_output_type.sharding().cloned(),
         )?;
         let batch_axis = output.batch_axis();
-        ArrayProgramBatch::new(
-            <C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()),
-            batch_axis,
-        )
-        .map(|output| vec![output])
+        ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
+            .map(|output| vec![output])
     }
 }
 
 /// Batching rule for explicit-extent [`AllToAllOperation`]. Dimension SSA supplies its temporary split and merge
 /// shapes directly, while matching-axis array mechanics reuse the homogeneous collective kernel.
-impl<C> MemberBatchableOperation<C, ArrayProgramBatching> for AllToAllOperation
+impl<C> MemberBatchableOperation<C, ArrayIrBatching> for AllToAllOperation
 where
     C: Context<
             Type = ArrayIrType,
@@ -3404,12 +3401,12 @@ where
     <C::Value as ValueProjection<DimensionType>>::Projected:
         DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
 {
-    fn batch_in_parent<D: BatchingDriver<C, ArrayProgramBatching>>(
+    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
-        context: &BatchingContext<C, ArrayProgramBatching>,
+        context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
-        inputs: &[ArrayProgramBatch<C::Value>],
-    ) -> Result<Vec<ArrayProgramBatch<C::Value>>, BatchingError> {
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
         let (array, output_extents) = explicit_collective_inputs(inputs)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_all_to_all_output_types(self, logical_input_types.as_slice())?;
@@ -3461,11 +3458,8 @@ where
             logical_output_type.sharding().cloned(),
         )?;
         let batch_axis = output.batch_axis();
-        ArrayProgramBatch::new(
-            <C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()),
-            batch_axis,
-        )
-        .map(|output| vec![output])
+        ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
+            .map(|output| vec![output])
     }
 }
 
@@ -3619,7 +3613,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::array_programs::batching::{ArrayProgramBatch, ArrayProgramBatching};
+    use crate::backends::array_programs::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
@@ -3907,13 +3901,13 @@ mod tests {
     fn test_pshuffle_composes_ppermute_in_the_composite_domain() {
         type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        let context = BatchingContext::<_, ArrayProgramBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
             Parent::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         )
         .with_axis_name("x".to_string());
         let input = ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
-        let input = ArrayProgramBatch::new(input, BatchAxis::new(0)).unwrap();
+        let input = ArrayIrBatch::new(input, BatchAxis::new(0)).unwrap();
         let input = BatchingTracer::new(context, input);
         let output = input.pshuffle("x", &[2, 0, 1]).unwrap().into_batch();
 

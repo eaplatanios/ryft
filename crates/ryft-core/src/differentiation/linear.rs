@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::ops::Range;
 
 use crate::axes::Axis;
-use crate::backends::array_programs::batching::ArrayProgramBatching;
+use crate::backends::array_programs::batching::ArrayIrBatching;
 use crate::batching::{
     ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver,
     BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
@@ -1114,7 +1114,7 @@ impl<
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Operation: OperationProjection<ArrayType, Projected: From<ReduceOperation>>,
         >,
-> LinearCallBatchingPolicy<C> for ArrayProgramBatching
+> LinearCallBatchingPolicy<C> for ArrayIrBatching
 {
     fn sum_mapped_cotangents(
         _context: &TracingContext<C::Constant, C::Operation>,

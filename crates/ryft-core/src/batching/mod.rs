@@ -578,9 +578,9 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     ///
     ///   - Homogeneous array policies return no values (the default), because their mapped-axis extent is static
     ///     transform metadata and their batched programs carry exactly the source boundary.
-    ///   - [`ArrayProgramBatching`](crate::backends::ArrayProgramBatching) returns its first-class mapped-extent
-    ///     dimension value, because every dynamic batch dimension inserted into one of its batched programs references
-    ///     the [`DimensionVariable`](crate::DimensionVariable) defined by that program's leading extent input.
+    ///   - [`ArrayIrBatching`](crate::backends::ArrayIrBatching) returns its first-class mapped-extent dimension
+    ///     value, because every dynamic batch dimension inserted into one of its batched programs references the
+    ///     [`DimensionVariable`](crate::DimensionVariable) defined by that program's leading extent input.
     ///
     /// Refer to the documentation of [`Self::adapt_batched_program`] for the output-side counterpart of this contract,
     /// along with a complete boundary example.
