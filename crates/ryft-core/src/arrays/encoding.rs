@@ -496,14 +496,12 @@ impl LowPrecisionFloatingPointFormat {
         exponent | if negative { self.sign_mask() } else { 0 }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Canonical quiet-NaN encoding of this format, or `None` for the microscaling formats, which have no NaN
     /// encoding. The sign is honored only by the classes whose NaN encodings carry a sign bit.
     const fn nan_bits(self, negative: bool) -> Option<u8> {
         match self.class {
-            // A canonical quiet NaN sets the most significant mantissa bit under an all-ones exponent field.
             LowPrecisionFloatingPointFormatClass::Ieee => {
+                // A canonical quiet NaN sets the most significant mantissa bit under an all-ones exponent field.
                 Some(self.infinity_bits(negative) | 1 << (self.mantissa_bits - 1))
             }
             LowPrecisionFloatingPointFormatClass::SignedNan => {
@@ -528,15 +526,18 @@ impl LowPrecisionFloatingPointFormat {
         match self.class {
             LowPrecisionFloatingPointFormatClass::Ieee => self.infinity_bits(negative),
             LowPrecisionFloatingPointFormatClass::NoNan => self.signed_bits(self.max_finite_magnitude(), negative),
-            // The remaining classes have no infinity encoding, so an overflow lands on their canonical NaN, which
-            // every one of them has.
-            _ => self.nan_bits(negative).unwrap(),
+            _ => {
+                // The remaining classes have no infinity encoding, so an overflow lands on their canonical NaN,
+                // which every one of them has.
+                self.nan_bits(negative).unwrap()
+            }
         }
     }
 
-    /// Exact value denoted by one magnitude encoding, evaluated purely from this format's exponent and mantissa
-    /// formula. Reserved special-value patterns are not recognized, so passing one magnitude past
-    /// [`LowPrecisionFloatingPointFormat::max_finite_magnitude`] yields the virtual overflow candidate used while rounding.
+    /// Exact value denoted by one magnitude encoding, evaluated purely from this format's exponent and
+    /// mantissa formula. Reserved special-value patterns are not recognized, so passing one magnitude past
+    /// [`LowPrecisionFloatingPointFormat::max_finite_magnitude`] yields the virtual overflow candidate
+    /// used while rounding.
     fn decode_magnitude(self, magnitude: u16) -> f64 {
         let mantissa_scale = f64::from(1u32 << self.mantissa_bits);
         let mantissa = f64::from(u32::from(magnitude) & ((1u32 << self.mantissa_bits) - 1));
@@ -548,55 +549,22 @@ impl LowPrecisionFloatingPointFormat {
         2f64.powi(exponent - self.bias) * (1.0 + mantissa / mantissa_scale)
     }
 
-    /// Exact value denoted by one storage byte. Bits outside this format's encoding are ignored.
-    fn decode(self, bits: u8) -> f64 {
-        let bits = bits & self.bit_mask();
-        let negative = bits & self.sign_mask() != 0;
-        let magnitude = bits & self.magnitude_mask();
-        let mantissa = magnitude & ((1u8 << self.mantissa_bits) - 1);
-        let exponent = u16::from(magnitude >> self.mantissa_bits);
-        let is_special = match self.class {
-            LowPrecisionFloatingPointFormatClass::Ieee => exponent == (1u16 << self.exponent_bits) - 1,
-            LowPrecisionFloatingPointFormatClass::SignedNan => magnitude == self.magnitude_mask(),
-            LowPrecisionFloatingPointFormatClass::UnsignedNan => negative && magnitude == 0,
-            LowPrecisionFloatingPointFormatClass::NoNan => false,
-            LowPrecisionFloatingPointFormatClass::ExponentOnly => bits == u8::MAX,
-        };
-        if is_special {
-            return match self.class {
-                LowPrecisionFloatingPointFormatClass::Ieee if mantissa == 0 => {
-                    if negative {
-                        f64::NEG_INFINITY
-                    } else {
-                        f64::INFINITY
-                    }
-                }
-                // Only the classes whose NaN encodings carry a sign bit have a negative NaN to decode.
-                LowPrecisionFloatingPointFormatClass::Ieee | LowPrecisionFloatingPointFormatClass::SignedNan
-                    if negative =>
-                {
-                    -f64::NAN
-                }
-                _ => f64::NAN,
-            };
-        }
-        let value = self.decode_magnitude(u16::from(magnitude));
-        if negative { -value } else { value }
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
-    /// Encoding of the value nearest to `value`, breaking exact ties toward the even encoding.
-    ///
-    /// Rounding scans every finite magnitude encoding of this format plus the virtual overflow candidate one step past
-    /// its largest finite magnitude, which reproduces round-to-nearest-even exactly, including at the overflow
-    /// boundary. NaN, infinite, and zero inputs, along with results that round onto the virtual candidate, follow the
-    /// policies of this format's [`LowPrecisionFloatingPointFormatClass`].
+    /// Encodes the value nearest to `value` in this [`LowPrecisionFloatingPointFormat`], breaking exact ties toward the
+    /// even encoding. Rounding scans every finite magnitude encoding of this format plus the virtual overflow candidate
+    /// one step past its largest finite magnitude, which reproduces round-to-nearest-even exactly, including at the
+    /// overflow boundary. NaN, infinite, and zero inputs, along with results that round onto the virtual candidate,
+    /// follow the policies of this format's [`LowPrecisionFloatingPointFormatClass`].
     fn encode(self, value: f64) -> Result<u8, TypeError> {
         let negative = value.is_sign_negative();
+        
         if value.is_nan() {
             return self
                 .nan_bits(negative)
                 .ok_or_else(|| TypeError::invalid(format!("data type {} cannot represent NaN", self.data_type)));
         }
+        
         if matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly) {
             if value == 0.0 {
                 return Err(TypeError::invalid(format!("data type {} cannot represent zero", self.data_type)));
@@ -608,9 +576,11 @@ impl LowPrecisionFloatingPointFormat {
         } else if value == 0.0 {
             return Ok(self.signed_bits(0, negative));
         }
+        
         if value.is_infinite() {
             return Ok(self.overflow_bits(negative));
         }
+        
         let magnitude = value.abs();
         let max_finite_magnitude = u16::from(self.max_finite_magnitude());
         // An input above the virtual overflow candidate is unambiguously an overflow. Resolving it before the scan also
@@ -635,6 +605,38 @@ impl LowPrecisionFloatingPointFormat {
         }
         // A nonzero input can still round down onto the zero encoding, which the `fnuz` formats leave unsigned.
         Ok(self.signed_bits(nearest as u8, negative))
+    }
+
+    /// Decodes the exact value denoted by one storage byte in this [`LowPrecisionFloatingPointFormat`].
+    /// Bits outside this format's encoding are ignored.
+    fn decode(self, bits: u8) -> f64 {
+        let bits = bits & self.bit_mask();
+        let negative = bits & self.sign_mask() != 0;
+        let magnitude = bits & self.magnitude_mask();
+        let mantissa = magnitude & ((1u8 << self.mantissa_bits) - 1);
+        let exponent = u16::from(magnitude >> self.mantissa_bits);
+        let is_special = match self.class {
+            LowPrecisionFloatingPointFormatClass::Ieee => exponent == (1u16 << self.exponent_bits) - 1,
+            LowPrecisionFloatingPointFormatClass::SignedNan => magnitude == self.magnitude_mask(),
+            LowPrecisionFloatingPointFormatClass::UnsignedNan => negative && magnitude == 0,
+            LowPrecisionFloatingPointFormatClass::NoNan => false,
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => bits == u8::MAX,
+        };
+        if is_special {
+            return match self.class {
+                LowPrecisionFloatingPointFormatClass::Ieee if mantissa == 0 && negative => f64::NEG_INFINITY,
+                LowPrecisionFloatingPointFormatClass::Ieee if mantissa == 0 && !negative => f64::INFINITY,
+                LowPrecisionFloatingPointFormatClass::Ieee | LowPrecisionFloatingPointFormatClass::SignedNan
+                    if negative =>
+                {
+                    // Only the classes whose NaN encodings carry a sign bit have a negative NaN to decode.
+                    -f64::NAN
+                }
+                _ => f64::NAN,
+            };
+        }
+        let value = self.decode_magnitude(u16::from(magnitude));
+        if negative { -value } else { value }
     }
 }
 
