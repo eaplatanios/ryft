@@ -47,21 +47,26 @@ impl ArrayAddressing {
         self.r#type.element_count().unwrap().unwrap()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-    
-    /// Returns the number of bytes in the complete addressed array.
+    /// Returns the number of bytes occupied by the encoded logical elements, excluding layout holes and padding.
     #[inline]
-    pub fn byte_length(&self) -> usize {
+    pub fn logical_byte_len(&self) -> usize {
         self.element_count() * self.element_byte_width()
     }
 
-    /// Maps a logical multi-index to its flat row-major element index.
-    pub(crate) fn flat_index(&self, index: &[usize]) -> Result<usize, ProgramError> {
+    /// Returns the number of bytes required by the physical storage of the addressed array.
+    #[inline]
+    pub fn storage_byte_len(&self) -> usize {
+        self.logical_byte_len()
+    }
+
+    /// Maps the provided logical multi-index to its flat row-major element index.
+    pub fn index(&self, index: &[usize]) -> Result<usize, ProgramError> {
         let rank = self.r#type.rank();
         if index.len() != rank {
             return Err(TypeError::invalid(format!(
-                "dense array index rank {} does not match array rank {rank}",
+                "array index rank {} does not match array rank {}",
                 index.len(),
+                rank,
             ))
             .into());
         }
@@ -72,40 +77,41 @@ impl ArrayAddressing {
             let dimension = self.dimension(axis);
             if coordinate >= dimension {
                 return Err(TypeError::invalid(format!(
-                    "dense array index {coordinate} on axis {axis} is out of bounds for dimension size {dimension}",
+                    "array index {coordinate} on axis {axis} is out of bounds for dimension size {dimension}",
                 ))
                 .into());
             }
-            flat_index = flat_index
-                .checked_add(coordinate.checked_mul(element_stride).ok_or_else(|| {
-                    TypeError::invalid(format!("dense array index calculation overflowed on axis {axis}"))
-                })?)
-                .ok_or_else(|| {
-                    TypeError::invalid(format!("dense array index calculation overflowed on axis {axis}"))
-                })?;
-            element_stride = element_stride.checked_mul(dimension).ok_or_else(|| {
-                TypeError::invalid(format!("dense array index calculation overflowed on axis {axis}"))
-            })?;
+            flat_index =
+                flat_index
+                    .checked_add(coordinate.checked_mul(element_stride).ok_or_else(|| {
+                        TypeError::invalid(format!("array index calculation overflowed on axis {axis}"))
+                    })?)
+                    .ok_or_else(|| TypeError::invalid(format!("array index calculation overflowed on axis {axis}")))?;
+            element_stride = element_stride
+                .checked_mul(dimension)
+                .ok_or_else(|| TypeError::invalid(format!("array index calculation overflowed on axis {axis}")))?;
         }
         Ok(flat_index)
     }
 
-    /// Maps a contiguous flat logical element range to its corresponding element and byte ranges.
-    pub(crate) fn range(&self, elements: Range<usize>) -> Result<ArrayIndexRange, ProgramError> {
+    /// Maps a contiguous flat logical element index range to its corresponding element and byte ranges.
+    pub fn range(&self, elements: Range<usize>) -> Result<ArrayIndexRange, ProgramError> {
         let element_count = self.element_count();
         if elements.start > elements.end || elements.end > element_count {
             return Err(TypeError::invalid(format!(
-                "dense array element range {}..{} is out of bounds for {element_count} elements",
-                elements.start, elements.end,
+                "dense array element range {}..{} is out of bounds for {} elements",
+                elements.start, elements.end, element_count,
             ))
             .into());
         }
         let element_byte_width = self.element_byte_width();
         let bytes = elements.start * element_byte_width..elements.end * element_byte_width;
-        debug_assert!(bytes.end <= self.byte_length());
+        debug_assert!(bytes.end <= self.storage_byte_len());
         Ok(ArrayIndexRange { elements, bytes })
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+    
     /// Constructs a prevalidated iterator over a rectangular, potentially strided logical selection.
     pub(crate) fn ranges<'a>(
         &'a self,
@@ -168,7 +174,7 @@ impl ArrayAddressing {
 
 /// One contiguous logical element range and its corresponding physical byte range.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ArrayIndexRange {
+pub struct ArrayIndexRange {
     /// Contiguous flat logical element range.
     pub(crate) elements: Range<usize>,
 
@@ -181,7 +187,7 @@ pub(crate) struct ArrayIndexRange {
 /// The iterator borrows its selection metadata and represents its current position as one mixed-radix ordinal. It
 /// therefore allocates no coordinate or stride vectors and performs no fallible validation while iterating.
 #[derive(Clone, Debug)]
-pub(crate) struct ArrayIndexRanges<'a> {
+pub struct ArrayIndexRanges<'a> {
     /// Addressing used to map each emitted logical range to physical storage.
     addressing: &'a ArrayAddressing,
 
@@ -280,7 +286,7 @@ impl<'a> ArrayIndexRanges<'a> {
             });
         }
 
-        let base_element = addressing.flat_index(starts)?;
+        let base_element = addressing.index(starts)?;
         // Grow the inner contiguous run across each selected suffix axis. We may include one partially selected axis,
         // but can continue into its outer neighbor only when the current axis is selected in full.
         let mut run_axis = rank;
@@ -374,38 +380,41 @@ mod tests {
         assert_eq!(addressing.r#type, r#type);
         assert_eq!(addressing.element_byte_width(), 4);
         assert_eq!(addressing.element_count(), 6);
-        assert_eq!(addressing.byte_length(), 24);
-        assert_eq!(addressing.flat_index(&[0, 0]), Ok(0));
-        assert_eq!(addressing.flat_index(&[1, 2]), Ok(5));
+        assert_eq!(addressing.logical_byte_len(), 24);
+        assert_eq!(addressing.storage_byte_len(), 24);
+        assert_eq!(addressing.index(&[0, 0]), Ok(0));
+        assert_eq!(addressing.index(&[1, 2]), Ok(5));
         assert_eq!(addressing.range(1..4), Ok(ArrayIndexRange { elements: 1..4, bytes: 4..16 }),);
 
         // Scalar and empty shapes have well-defined addressing, including empty shapes whose irrelevant suffix
         // products would overflow an ordinary row-major-stride calculation.
         let scalar = ArrayAddressing::new(ArrayType::scalar(DataType::C128)).unwrap();
         assert_eq!(scalar.element_count(), 1);
-        assert_eq!(scalar.byte_length(), 16);
-        assert_eq!(scalar.flat_index(&[]), Ok(0));
+        assert_eq!(scalar.logical_byte_len(), 16);
+        assert_eq!(scalar.storage_byte_len(), 16);
+        assert_eq!(scalar.index(&[]), Ok(0));
         let empty = ArrayAddressing::new(array_type(DataType::C128, &[0, usize::MAX, usize::MAX])).unwrap();
         assert_eq!(empty.element_count(), 0);
-        assert_eq!(empty.byte_length(), 0);
+        assert_eq!(empty.logical_byte_len(), 0);
+        assert_eq!(empty.storage_byte_len(), 0);
 
-        // Explicit physical-layout metadata does not alter the canonical logical addresses.
+        // Until arbitrary-layout support lands, explicit layouts leave the interim dense addresses unchanged.
         let strided_type = r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![-12, 4])));
         let tiled_type = r#type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
         for layout_type in [strided_type, tiled_type] {
             let layout_addressing = ArrayAddressing::new(layout_type).unwrap();
-            assert_eq!(layout_addressing.flat_index(&[1, 2]), addressing.flat_index(&[1, 2]));
+            assert_eq!(layout_addressing.index(&[1, 2]), addressing.index(&[1, 2]));
             assert_eq!(layout_addressing.range(1..4), addressing.range(1..4));
         }
 
         // Malformed external indices and unmaterializable types fail before payload access.
         assert!(matches!(
-            addressing.flat_index(&[0]),
+            addressing.index(&[0]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "dense array index rank 1 does not match array rank 2",
         ));
         assert!(matches!(
-            addressing.flat_index(&[2, 0]),
+            addressing.index(&[2, 0]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "dense array index 2 on axis 0 is out of bounds for dimension size 2",
         ));
@@ -477,7 +486,8 @@ mod tests {
         for (data_type, byte_width) in cases {
             let addressing = ArrayAddressing::new(array_type(data_type, &[2])).unwrap();
             assert_eq!(addressing.element_byte_width(), byte_width);
-            assert_eq!(addressing.byte_length(), 2 * byte_width);
+            assert_eq!(addressing.logical_byte_len(), 2 * byte_width);
+            assert_eq!(addressing.storage_byte_len(), 2 * byte_width);
         }
     }
 
