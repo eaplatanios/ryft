@@ -2141,7 +2141,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
 - [x] Replace `BatchingPolicy::Projected` with `BatchingPolicyProjection<C, T>`, add the replicated dimension-member
       policy, and route both homogeneous array and replicated dimension member operations through the common projected
       batching helper without changing their distinct mapped-axis semantics.
-- [ ] Execute `.tasks/plan_p8b_array_program_operation_declaration.md` as the next bounded Phase 8 sequence: first
+- [x] Execute `.tasks/plan_p8b_array_program_operation_declaration.md` as the next bounded Phase 8 sequence: first
       restore type-indexed batching-policy projection and move semantic rules to their payload owners, then extend the
       existing derive vertically, and only then migrate the production enum.
   - [x] Freeze the variant/conversion migration ledger and pre-migration source, expansion-size, and macro-test build
@@ -2172,24 +2172,21 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         all invalid declaration diagnostics.
   - [x] Prove projected-member base dispatch through type inference, eager interpretation, PE, rendering, conversions,
         and a second projected member type without array-program-specific generated code.
-  - [ ] Add the minimal outer-family declaration needed by production-shaped composite enums: deriving
+  - [x] Add the minimal outer-family declaration needed by production-shaped composite enums: deriving
         `ArrayProgramOperation<A>` must select `ArrayProgramType` and `ArrayProgramValue<A>` even though its stored
         generic `A` belongs to the projected `ArrayType` member. Do not add a phantom composite-value parameter or
         redesign the enum's public generic merely to satisfy derive inference.
-  - [ ] Generate and prove the complete projected-member and replicated-member vertical contracts before annotating
+  - [x] Generate and prove the complete projected-member and replicated-member vertical contracts before annotating
         `ArrayProgramOperation`.
-- [ ] Establish one authoritative declaration of every array-program operation and its class.
-- [ ] Generate the outer variants, inner lifts, `From` conversions, and mechanical dispatch from that declaration.
-- [ ] Make `#[derive(Operation)]` with `#[ryft(dispatch(batching, differentiation, transposition))]` the mechanical
+- [x] Establish one authoritative declaration of every array-program operation and its class.
+- [x] Use the declared outer variants to generate inner lifts, direct `From` conversions, borrowed projections, and
+      mechanical dispatch.
+- [x] Make `#[derive(Operation)]` with `#[ryft(dispatch(batching, differentiation, transposition))]` the mechanical
       dispatch surface for `ArrayProgramOperation`, matching the homogeneous families instead of introducing a second
       generator syntax. Before migration, move every semantic rule off the enum match and into its colocated payload
       implementation, and ensure each dual-contract variant carries a dedicated typed payload instantiation (or a
       semantic mixed payload when its stored metadata differs) so one concrete payload never carries two semantic
-      contracts. The mixed concatenate representation additionally owns its extent signature the way dimension
-      arithmetic payloads do, making its `OrderedAssertion` effect conditional on the same bounds-proof predicate so
-      bounds-proven concatenates stop being permanently effectful (today's shared `{ axis }` payload cannot express
-      that without duplicating operand-derived shape metadata; the over-approximation is documented at the payload's
-      `effects`). Extend the derive with variant-level class markers that distinguish rule-bearing projected members
+      contracts. Extend the derive with variant-level class markers that distinguish rule-bearing projected members
       from replicated structural members and emit the corresponding project-delegate-lift or structural arm by calling
       shared helpers rather than inlining boundary logic. Select a projected batching policy through the type-indexed
       `BatchingPolicyProjection<C, T>` relation instead of assuming one projected policy per outer policy, and select each
@@ -2219,20 +2216,23 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         "delegatable" audit finding predates that mixed contract). All genuinely mixed contracts (reshape, broadcast,
         concatenate, pad, custom call, RNG, collectives, gateways, and region operations) keep explicit wrappers
         where their signatures or region boundaries differ.
-- [ ] Make each mixed operation's inference contract the authoritative source for dimension operand positions,
+- [x] Make each mixed operation's inference contract the authoritative source for dimension operand positions,
       member kinds, ordering, and result metadata.
-- [ ] Extend the typed mixed projection vocabulary only for repeated fixed/optional/segmented patterns found in the
+- [x] Extend the typed mixed projection vocabulary only for repeated fixed/optional/segmented patterns found in the
       Phase 0 inventory.
-- [ ] Centralize only structural projection needed to ensure eager interpretation, transforms, and lowering preserve
+- [x] Centralize only structural projection needed to ensure eager interpretation, transforms, and lowering preserve
       the operand order declared by inference.
-- [ ] Delete redundant local variant lists, conversion macros, manual wrong-kind matches, and projection boilerplate.
-- [ ] Delete independent `runtime_dimension_variables` methods after their operations consume explicit operands.
-- [ ] Keep semantically meaningful operation rules handwritten and colocated with their payload.
-- [ ] Add compile-fail coverage for invalid generated operation declarations and runtime goldens for canonical
+- [x] Delete redundant local variant lists, conversion macros, manual wrong-kind matches, and projection boilerplate.
+- [x] Delete independent `runtime_dimension_variables` methods after their operations consume explicit operands.
+- [x] Keep semantically meaningful operation rules handwritten and colocated with their payload.
+- [x] Add compile-fail coverage for invalid generated operation declarations and runtime goldens for canonical
       projection diagnostics.
-- [ ] Run macro unit and integration tests and compare generated token counts/compile time with the baseline.
-- [ ] Gate: one new array-only primitive requires one family declaration and its semantic/backend rules; one new mixed
+- [x] Run macro unit and integration tests and compare generated token counts/compile time with the baseline.
+- [x] Gate: one new array-only primitive requires one family declaration and its semantic/backend rules; one new mixed
       operation declares its signature once and does not add projection ceremony to transforms.
+- [ ] Replace concatenation's conservative unconditional `OrderedAssertion` effect with a typed mixed payload that can
+      own the operand-derived extent proof needed to classify the effect conditionally. This is a semantic effect-
+      precision follow-up, not part of the derive's mechanical dispatch contract.
 
 ### Phase 9: module and public API cleanup
 
@@ -3688,3 +3688,19 @@ policies. The remaining Phase 9 module relocation is intentionally still pending
 Verification passed `cargo check -p ryft-core --tests`, all 1,123 core library tests, all 52 runnable core doctests (16
 examples ignored), both 17-test macro integration suites including their compile-fail fixtures, all 434 runnable XLA
 library tests (one timing-sensitive benchmark ignored), formatting, and diff hygiene.
+
+### Phase 8 complete operation-derive migration (2026-08-03)
+
+Completed the remaining operation-derive work as one review unit. The derive now owns the mechanical contract for
+projected, replicated, mixed, and composite-native variants, including inference, eager interpretation, PE, batching,
+JVP, transposition, conversions, and operation-family projections. `ArrayProgramOperation<A>` is the production proof:
+its enum declaration is now the sole variant/class ledger and its previous outer dispatcher implementations have been
+deleted. Semantic rules remain handwritten beside their payloads, while shared member contracts contain only the
+repeated parent-boundary projection and delegation vocabulary.
+
+This closes the Phase 8 derive gate with a net reduction in the review diff and a 4,083-line reduction in the three
+production dispatcher surfaces. The larger macro fixture expansion is intentional test coverage for the complete
+multi-universe contract; fresh compile time did not regress. The detailed carries-over/deletes ledger, metrics, and
+verification evidence are recorded in `.tasks/plan_p8b_array_program_operation_declaration.md`. Conditional
+concatenation-effect precision remains a separate unchecked semantic follow-up because its axis-only payload lacks the
+operand-derived extent proof; it is no longer conflated with the completed derive migration.

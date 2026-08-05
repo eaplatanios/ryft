@@ -107,27 +107,30 @@ impl AttributeValue for syn::LitStr {
 impl AttributeValue for syn::Ident {
     fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
         let string = syn::LitStr::from_meta(name, meta)?;
-        string.parse().map_err(|_| {
-            syn::Error::new_spanned(&string, format!("failed to parse identifier: '{:?}'", string.value()))
-        })
+        string.parse().map_err(|error| syn::Error::new_spanned(&string, error))
     }
 }
 
 impl AttributeValue for syn::Path {
     fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
         let string = syn::LitStr::from_meta(name, meta)?;
-        string
-            .parse()
-            .map_err(|_| syn::Error::new_spanned(&string, format!("failed to parse path: '{:?}'", string.value())))
+        string.parse().map_err(|error| syn::Error::new_spanned(&string, error))
+    }
+}
+
+impl AttributeValue for syn::Type {
+    fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
+        if &meta.path != name {
+            return Err(meta.error("cannot parse attribute value from a 'ParseNestedMeta' with a different path"));
+        }
+        meta.value()?.parse()
     }
 }
 
 impl AttributeValue for syn::ExprPath {
     fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
         let string = syn::LitStr::from_meta(name, meta)?;
-        string.parse().map_err(|_| {
-            syn::Error::new_spanned(&string, format!("failed to parse expression path: '{:?}'", string.value()))
-        })
+        string.parse().map_err(|error| syn::Error::new_spanned(&string, error))
     }
 }
 
@@ -138,15 +141,6 @@ impl AttributeValue for Vec<syn::WherePredicate> {
             .parse_with(syn::punctuated::Punctuated::<syn::WherePredicate, syn::Token![,]>::parse_terminated)
             .map(Vec::from_iter)
             .map_err(|error| syn::Error::new_spanned(&string, error))
-    }
-}
-
-impl AttributeValue for syn::Type {
-    fn from_meta(name: &Symbol, meta: &syn::meta::ParseNestedMeta) -> syn::Result<Self> {
-        let string = syn::LitStr::from_meta(name, meta)?;
-        string
-            .parse()
-            .map_err(|_| syn::Error::new_spanned(&string, format!("failed to parse type: '{:?}'", string.value())))
     }
 }
 
@@ -293,11 +287,35 @@ mod tests {
             ty = Some(syn::Type::from_meta(&Symbol::new("crate"), &meta)?);
             Ok(())
         })
-        .parse2(quote!(crate = "Vec<ryft::Placeholder>"))
+        .parse2(quote!(crate = Vec<ryft::Placeholder>))
         .unwrap();
         assert_eq!(
             ty.expect("expected type to be parsed").to_token_stream().to_string().replace(' ', ""),
             "Vec<ryft::Placeholder>",
         );
+
+        let error = syn::meta::parser(|meta| {
+            let _ = syn::Ident::from_meta(&Symbol::new("crate"), &meta)?;
+            Ok(())
+        })
+        .parse2(quote!(crate = ""))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unexpected end of input, expected identifier");
+
+        let error = syn::meta::parser(|meta| {
+            let _ = syn::Path::from_meta(&Symbol::new("crate"), &meta)?;
+            Ok(())
+        })
+        .parse2(quote!(crate = ""))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unexpected end of input, expected identifier");
+
+        let error = syn::meta::parser(|meta| {
+            let _ = syn::ExprPath::from_meta(&Symbol::new("crate"), &meta)?;
+            Ok(())
+        })
+        .parse2(quote!(crate = ""))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unexpected end of input, expected identifier");
     }
 }
