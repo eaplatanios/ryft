@@ -2269,6 +2269,12 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
   - [ ] Move the `ArrayType` specialization to `batching::arrays` (`ArrayBatch`, `ArrayBatching`,
         `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, their policy/recursive/entrypoint implementations, and
         shared array-axis mechanics).
+    - [x] Move `ArrayBatch`, batching-specific `ArrayType` normalization/unbatching, and shared mapped-axis sharding
+          mechanics; keep `batching::ArrayBatch` as the intentional public batching facade and route generated and
+          handwritten paths through it.
+    - [ ] Move `ArrayBatching`, `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, and their policy, recursive, and
+          entrypoint implementations after the carrier slice is reviewed.
+    - [ ] Move the array-specialization tests beside their owner and close the specialization-module checkbox.
   - [ ] Move the `ArrayProgramType` specialization to `batching::array_programs` (`ArrayProgramBatch`,
         `ArrayProgramBatching`, `ThreadedExtentBatchedProgram`, `DynamicArrayBatchingPolicy`,
         `ReplicatedDimensionBatchingPolicy`, their policy/projection/recursive/entrypoint implementations, and shared
@@ -3755,3 +3761,20 @@ slice, constructors, collectives, and transforms consume those same values. Rank
 ordinary Rust parameter structure and array types, so a second shape wrapper would add neither authority nor safety;
 it would only duplicate storage-sum projection and operation APIs. Focused typed-error, type/value-projection, and
 public dimension-capability tests passed.
+
+### Phase 9 array-specialization slice 1: carrier and axis mechanics (2026-08-04)
+
+The `ArrayBatch` carrier, batching-specific `ArrayType` normalization and unbatching methods, and the shared mapped-axis
+sharding join/normalization functions now live in `batching::arrays`. The batching root moved from `batching.rs` to
+`batching/mod.rs`, placing it beside the specialization module while preserving `crate::batching` as the canonical
+facade. Universe-neutral contracts and transform machinery remain in that root, while the array policies stay there
+only until the next isolated review slice. The intentional `batching::ArrayBatch` re-export keeps callers on the
+batching facade; only private shared mechanics name `batching::arrays` directly. The crate-root `ArrayBatch` export
+remains the flat public facade. The moved implementation is otherwise unchanged, and root policy code now uses the
+carrier's public accessors instead of relying on former same-module field visibility.
+
+Verification passed `cargo check -p ryft-core --tests`, all 1,129 core library tests, all 53 runnable core doctests (16
+ignored), all 57 macro unit tests, both macro integration suites including all compile-fail fixtures, and all 436
+runnable XLA library tests (one ignored). Formatting, diff hygiene, unique-owner searches, and the old-path residual
+search passed. The following review slice moves the array policy family; the array-specialization tests move last so
+each extraction remains within the review budget.

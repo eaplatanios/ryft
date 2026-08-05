@@ -12,12 +12,12 @@ use ryft_macros::Parameter;
 
 use crate::axes::{Axis, NamedAxes, NamedAxis};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
+use crate::batching::arrays::{batch_axis_sharding, normalized_batch_axis_type};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchAxisSpecification, BatchableOperation,
     BatchableType, BatchedProgram, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
     BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DimensionSource,
     MemberBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
-    batch_axis_sharding, normalized_batch_axis_type,
 };
 use crate::contexts::{Context, ProjectedContext, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
