@@ -655,40 +655,48 @@ where
             }
             <&DimensionType>::try_from(result_extent_type).map_err(|error| LoweringError::Tracing(error.into()))?;
 
-            // The callback receives every concrete logical input extent and computes their checked sum on the host.
-            // This avoids both overflow in a speculative StableHLO sum and false rejection from conservative declared
-            // maxima while preserving the explicit result-extent contract as an ordered assertion.
-            let i64_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
-            let mut input_extents = Vec::with_capacity(array_inputs.len());
-            for (input, r#type) in array_inputs.iter().zip(array_input_types) {
-                let r#type = <&ArrayType>::try_from(r#type).map_err(|error| LoweringError::Tracing(error.into()))?;
-                let extent = match r#type.shape().dimensions()[operation.axis()] {
-                    Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
-                    Dimension::Dynamic(_) => {
-                        let extent = block.append_operation(stable_hlo::get_dimension_size(
-                            *input,
-                            operation.axis(),
-                            location,
-                        )?)?;
-                        let extent =
-                            extent.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
-                        let extent = block.append_operation(stable_hlo::convert(extent, i64_type, location)?)?;
-                        extent.result(0).expect("stablehlo.convert should return one result").as_ref()
-                    }
-                };
-                input_extents.push(extent);
+            if operation.effects().contains(Effect::OrderedAssertion) {
+                // The callback receives every concrete logical input extent and computes their checked sum on the
+                // host. This avoids both overflow in a speculative StableHLO sum and false rejection from conservative
+                // declared maxima. A type-derived proof omits this entire assertion path for static signatures.
+                let i64_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
+                let mut input_extents = Vec::with_capacity(array_inputs.len());
+                for (input, r#type) in array_inputs.iter().zip(array_input_types) {
+                    let r#type =
+                        <&ArrayType>::try_from(r#type).map_err(|error| LoweringError::Tracing(error.into()))?;
+                    let extent = match r#type.shape().dimensions()[operation.axis()] {
+                        Dimension::Static(extent) => {
+                            lower_static_index_constants(&[extent], block, context, location)?[0]
+                        }
+                        Dimension::Dynamic(_) => {
+                            let extent = block.append_operation(stable_hlo::get_dimension_size(
+                                *input,
+                                operation.axis(),
+                                location,
+                            )?)?;
+                            let extent = extent
+                                .result(0)
+                                .expect("stablehlo.get_dimension_size should return one result")
+                                .as_ref();
+                            let extent = block.append_operation(stable_hlo::convert(extent, i64_type, location)?)?;
+                            extent.result(0).expect("stablehlo.convert should return one result").as_ref()
+                        }
+                    };
+                    input_extents.push(extent);
+                }
+                lower_concatenate_extent_assertion(
+                    operation.axis(),
+                    *result_extent,
+                    input_extents.as_slice(),
+                    effect_tokens,
+                    block,
+                    context,
+                    location,
+                )?;
             }
-            lower_concatenate_extent_assertion(
-                operation.axis(),
-                *result_extent,
-                input_extents.as_slice(),
-                effect_tokens,
-                block,
-                context,
-                location,
-            )?;
 
-            // StableHLO receives only the physical arrays; the trailing scalar is consumed by the ordered assertion.
+            // StableHLO receives only the physical arrays. The trailing scalar is consumed by the optional assertion
+            // or is redundant with the type-level proof.
             let result = block.append_operation(stable_hlo::concatenate(array_inputs, operation.axis(), location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
         }

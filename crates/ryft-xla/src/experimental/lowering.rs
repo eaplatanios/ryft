@@ -13763,6 +13763,46 @@ mod tests {
             ))),
         );
 
+        // A mixed concatenate whose static operand types prove its explicit result extent is pure and lowers without
+        // assertion callback or dimension-size machinery.
+        let first_type = test_matrix_type(1, 2);
+        let second_type = test_matrix_type(3, 2);
+        let result_extent = DimensionValue::constant(4).unwrap();
+        let operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            0,
+            &[first_type.clone().into(), second_type.clone().into(), result_extent.r#type().clone().into()],
+        )
+        .unwrap();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let first = builder.add_input(first_type.clone());
+        let second = builder.add_input(second_type.clone());
+        let result_extent = builder
+            .add_instruction(DimensionOperation::from(ConstantOperation::new(result_extent)), Vec::new(), Vec::new())
+            .unwrap()[0];
+        let joined = builder.add_instruction(operation, Vec::new(), vec![first, second, result_extent]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![joined],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.effects(), Effects::PURE);
+        let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![first_type, second_type],
+            &vec![output_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stablehlo.matches("@ryft.assert").count(), 0, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.get_dimension_size").count(), 0, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.concatenate").count(), 1, "{stablehlo}");
+
         // Once that extent is explicit, lowering reads the concrete logical input sizes, checks their sum on the
         // ordered-assertion chain, and passes only the arrays to StableHLO's concatenate operation.
         let first_variable =
@@ -13778,6 +13818,13 @@ mod tests {
         let add_operation =
             DimensionAddOperation::new(first_size_operation.result_type(), second_size_operation.result_type())
                 .unwrap();
+        let result_extent_type =
+            DimensionType::new(DimensionVariable::new(add_operation.result_name(), add_operation.result_bounds()));
+        let concatenate_operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            0,
+            &[first_type.clone().into(), second_type.clone().into(), result_extent_type.into()],
+        )
+        .unwrap();
         let mut builder = CompositeXlaProgramBuilder::new();
         let first = builder.add_input(first_type.clone());
         let second = builder.add_input(second_type.clone());
@@ -13787,7 +13834,7 @@ mod tests {
             .add_instruction(DimensionOperation::Add(add_operation), Vec::new(), vec![first_size, second_size])
             .unwrap()[0];
         let joined = builder
-            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![first, second, result_extent])
+            .add_instruction(concatenate_operation, Vec::new(), vec![first, second, result_extent])
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(

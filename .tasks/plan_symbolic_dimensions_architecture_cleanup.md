@@ -2230,9 +2230,18 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
 - [x] Run macro unit and integration tests and compare generated token counts/compile time with the baseline.
 - [x] Gate: one new array-only primitive requires one family declaration and its semantic/backend rules; one new mixed
       operation declares its signature once and does not add projection ceremony to transforms.
-- [ ] Replace concatenation's conservative unconditional `OrderedAssertion` effect with a typed mixed payload that can
+- [x] Replace concatenation's conservative unconditional `OrderedAssertion` effect with a typed mixed payload that can
       own the operand-derived extent proof needed to classify the effect conditionally. This is a semantic effect-
       precision follow-up, not part of the derive's mechanical dispatch contract.
+  - [x] Add a type-derived mixed-concatenation constructor and retain only the proof bit needed by `effects`; do not
+        clone complete operand signatures into the payload or widen the generic `Operation` contract.
+  - [x] Make inference validate that a payload classified as pure is still bound to a signature that proves the
+        explicit result extent, while allowing an assertion-bearing payload to remain conservatively effectful after
+        type refinement.
+  - [x] Make eager execution retain its defensive extent check and make XLA lowering omit the assertion callback,
+        assertion token, and extent-size IR exactly when the payload is proven pure.
+  - [x] Update all mixed construction sites, add pure/effectful core and lowering regressions, run the core and XLA
+        gates, and record the completed review unit below.
 
 ### Phase 9: module and public API cleanup
 
@@ -3702,5 +3711,30 @@ This closes the Phase 8 derive gate with a net reduction in the review diff and 
 production dispatcher surfaces. The larger macro fixture expansion is intentional test coverage for the complete
 multi-universe contract; fresh compile time did not regress. The detailed carries-over/deletes ledger, metrics, and
 verification evidence are recorded in `.tasks/plan_p8b_array_program_operation_declaration.md`. Conditional
-concatenation-effect precision remains a separate unchecked semantic follow-up because its axis-only payload lacks the
-operand-derived extent proof; it is no longer conflated with the completed derive migration.
+concatenation-effect precision remained a separate semantic follow-up because the axis-only payload lacked the
+operand-derived extent proof; the following review unit records its completion without conflating it with the derive
+migration.
+
+### Phase 8 concatenation effect-precision closure (2026-08-04)
+
+Mixed concatenation now retains one operand-derived Boolean stating whether its complete construction signature proves
+the explicit result extent. `from_input_types` validates that signature and is the canonical mixed constructor when
+types are available. The generic homogeneous-to-mixed conversion remains necessary for operation projection and is
+therefore deliberately conservative: without operand types it creates an assertion-bearing payload. Inference rejects
+only the unsafe stale case in which a payload classified as pure is rebound to a signature that needs a runtime check;
+an assertion-bearing payload may remain conservatively effectful after refinement.
+
+Eager execution continues to compare the observed input-axis sum with the supplied extent defensively. XLA lowering
+now omits the assertion callback, ordered token, and input-extent extraction for proven-static signatures, while
+dynamic signatures retain the checked host callback. Batching reconstructs the mixed payload from its transformed
+operand types so the effect classification remains precise. Core and lowering regressions pin both classifications and
+the absence of assertion and dimension-size IR in the pure case. The review also corrected one pre-existing stale
+all-gather expected diagnostic to the current canonical wording; collective behavior was unchanged.
+
+Verification passed all 1,129 `ryft-core` library tests, all 53 runnable core doctests (16 ignored), and all 436
+runnable `ryft-xla` library tests (one ignored). The first incremental core invocation encountered a Rust compiler
+fingerprint ICE; rerunning with `CARGO_INCREMENTAL=0` passed without cleaning the workspace. Formatting and diff
+hygiene passed. A follow-up audit documented and pinned that the proof bit intentionally participates in equality and
+hashing, that the homogeneous instantiation always stores `false`, and that mixed-to-homogeneous-to-mixed conversion
+soundly loses provenness. The only production mixed-to-homogeneous conversion is the terminal delegation into the
+static homogeneous transposition rule; it never round-trips into a mixed program.

@@ -2426,10 +2426,11 @@ mod tests {
             BatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(replicated)),
             BatchingTracer::new(context.clone(), ArrayProgramBatch::replicated(result_extent)),
         ];
-        let [output] = context
-            .bind(ArrayProgramOperation::from(ConcatenateOperation::new(0, 1)?), Vec::new(), &inputs)?
-            .try_into()
-            .unwrap();
+        let operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            0,
+            &inputs.iter().map(|input| input.batch().unbatched_type().clone()).collect::<Vec<_>>(),
+        )?;
+        let [output] = context.bind(ArrayProgramOperation::from(operation), Vec::new(), &inputs)?.try_into().unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
         let builder = trace.builder().borrow();
         let broadcast = builder
@@ -3252,8 +3253,18 @@ mod tests {
 
         // Concatenate aligns mapped array operands before shifting the per-item concatenation axis around the common
         // packed batch axis. Its trailing extent remains a replicated shape value.
-        let concatenate = ArrayProgramOperation::<Array>::from(ConcatenateOperation::new(0, 1).unwrap());
         let concatenate_extent = ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap());
+        let concatenate = ArrayProgramOperation::<Array>::from(
+            ConcatenateOperation::<ArrayProgramType>::from_input_types(
+                0,
+                &[
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into(),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
+                    concatenate_extent.r#type().into_owned(),
+                ],
+            )
+            .unwrap(),
+        );
         let concatenate_output = concatenate
             .batch(
                 &context,

@@ -50,12 +50,24 @@ pub const CONCATENATE_OPERATION_NAME: &str = "concatenate";
 ///   - `ConcatenateOperation<ArrayType>` accepts only the arrays being concatenated.
 ///   - `ConcatenateOperation<ArrayProgramType>` additionally accepts one trailing first-class result extent.
 ///
-/// Both forms carry the same normalized axis and share all concatenation semantics. Converting between them only
-/// reparameterizes the operation family.
+/// Both forms carry the same normalized axis and share all concatenation semantics. The mixed form also records
+/// whether its operand types prove that the explicit result extent equals the sum of the input extents. This derived
+/// bit lets pure, statically proven concatenations avoid an ordered runtime assertion without retaining a duplicate
+/// copy of their complete input signature. Construct mixed operations with
+/// [`ConcatenateOperation::<ArrayProgramType>::from_input_types`] whenever the complete signature is available. The
+/// homogeneous-to-mixed [`From`] conversion remains a generic projection fallback and conservatively retains the
+/// assertion because a conversion of the axis-only payload cannot prove anything about its eventual operands. The
+/// proof bit intentionally participates in equality and hashing: otherwise operation-keyed deduplication could merge
+/// payloads with different effects and scheduling constraints. Consequently, converting a proven mixed operation to
+/// the homogeneous form and back is a sound one-way loss of provenness and produces the conservative mixed form.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ConcatenateOperation<T: Type> {
     /// Axis along which the operands are joined.
     axis: usize,
+
+    /// Whether validating the explicit result extent can fail for the mixed operand signature used at construction.
+    /// This field is meaningful only when `T` is [`ArrayProgramType`] and is always `false` for [`ArrayType`].
+    requires_runtime_assertion: bool,
 
     /// Type universe that determines the operation's operand contract.
     marker: PhantomData<fn() -> T>,
@@ -66,12 +78,29 @@ impl ConcatenateOperation<ArrayType> {
     #[inline]
     pub fn new<A: Into<Axis>>(axis: A, rank: usize) -> Result<Self, TypeError> {
         let axis = axis.into();
-        axis.normalize(rank).map(|axis| Self { axis, marker: PhantomData }).map_err(|_| {
-            TypeError::invalid(format!(
-                "'{}' axis {axis} is out of bounds for operands of rank {rank}",
-                CONCATENATE_OPERATION_NAME,
-            ))
-        })
+        axis.normalize(rank)
+            .map(|axis| Self { axis, requires_runtime_assertion: false, marker: PhantomData })
+            .map_err(|_| {
+                TypeError::invalid(format!(
+                    "'{}' axis {axis} is out of bounds for operands of rank {rank}",
+                    CONCATENATE_OPERATION_NAME,
+                ))
+            })
+    }
+}
+
+impl ConcatenateOperation<ArrayProgramType> {
+    /// Creates a mixed [`ConcatenateOperation`] for the provided complete operand signature. `input_types` contains
+    /// one or more leading arrays followed by the explicit result-extent dimension. The operation is pure exactly
+    /// when those types prove the extent equality; otherwise it carries an ordered runtime assertion.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Axis along which the leading array operands are joined.
+    ///   - `input_types`: Complete mixed input signature, including the trailing result-extent dimension.
+    pub fn from_input_types<A: Into<Axis>>(axis: A, input_types: &[ArrayProgramType]) -> Result<Self, TypeError> {
+        let (axis, _, requires_runtime_assertion) = infer_array_program_concatenation(input_types, axis.into())?;
+        Ok(Self { axis, requires_runtime_assertion, marker: PhantomData })
     }
 }
 
@@ -92,14 +121,14 @@ impl<T: Type> ConcatenateOperation<T> {
 impl From<ConcatenateOperation<ArrayType>> for ConcatenateOperation<ArrayProgramType> {
     #[inline]
     fn from(operation: ConcatenateOperation<ArrayType>) -> Self {
-        Self { axis: operation.axis, marker: PhantomData }
+        Self { axis: operation.axis, requires_runtime_assertion: true, marker: PhantomData }
     }
 }
 
 impl From<ConcatenateOperation<ArrayProgramType>> for ConcatenateOperation<ArrayType> {
     #[inline]
     fn from(operation: ConcatenateOperation<ArrayProgramType>) -> Self {
-        Self { axis: operation.axis, marker: PhantomData }
+        Self { axis: operation.axis, requires_runtime_assertion: false, marker: PhantomData }
     }
 }
 
@@ -124,60 +153,21 @@ impl Operation for ConcatenateOperation<ArrayProgramType> {
         region_interfaces: &[RegionInterface<ArrayProgramType>],
     ) -> Result<Vec<ArrayProgramType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
-        let Some((result_extent, inputs)) = input_types.split_last() else {
+        let (_, output_type, requires_runtime_assertion) =
+            infer_array_program_concatenation(input_types, Axis::from(self.axis))?;
+        if !self.requires_runtime_assertion && requires_runtime_assertion {
             return Err(TypeError::invalid(format!(
-                "'{}' expects at least one array followed by its result extent",
+                "'{}' was constructed for an operand signature that proves its result extent, but the provided input \
+                 types require a runtime extent check",
                 CONCATENATE_OPERATION_NAME,
             )));
-        };
-        if inputs.is_empty() {
-            return match result_extent {
-                ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
-                    "'{}' expects a trailing result-extent dimension",
-                    CONCATENATE_OPERATION_NAME,
-                ))),
-                ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
-                    "'{}' expects at least one array before its result extent",
-                    CONCATENATE_OPERATION_NAME,
-                ))),
-            };
         }
-        let inputs = inputs.iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
-        let result_extent = <&DimensionType>::try_from(result_extent)?;
-        let static_sum = validate_concatenation_inputs(&inputs, self.axis)?;
-        let result_dimension = result_extent.to_dimension();
-        if let Some(static_sum) = static_sum
-            && result_dimension != Dimension::Static(static_sum)
-        {
-            return Err(TypeError::invalid(format!(
-                "'{}' result extent is {} but the static input extent sum is {static_sum}",
-                CONCATENATE_OPERATION_NAME, result_dimension,
-            )));
-        }
-
-        let first = inputs[0];
-        let mut dimensions = first.shape().dimensions().to_vec();
-        dimensions[self.axis] = result_dimension;
-        let output_shape = Shape::new(dimensions);
-        if inputs.len() == 1 && first.shape() == &output_shape {
-            return Ok(vec![first.clone().into()]);
-        }
-        let output_type = ArrayType::new(first.data_type(), output_shape)
-            .with_memory(first.memory())
-            .with_sharding(infer_concatenation_sharding(&inputs)?)
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
         Ok(vec![output_type.into()])
     }
 
     #[inline]
     fn effects(&self) -> Effects {
-        // TODO(eaplatanios): Replace the axis-only mixed payload with one that can classify this effect precisely.
-        // This is a deliberate over-approximation. A mixed concatenate whose input extents are all static and whose
-        // result extent is a provably equal exact constant needs no runtime check (inference above already rejects
-        // static mismatches), but `effects` sees only this axis-only payload and cannot derive the operand extent
-        // signature. A later effect-precision slice can add the irreducible mixed extent metadata and make this effect
-        // conditional on the same bounds-proof predicate used by inference.
-        Effects::single(Effect::OrderedAssertion)
+        if self.requires_runtime_assertion { Effects::single(Effect::OrderedAssertion) } else { Effects::PURE }
     }
 
     #[inline]
@@ -636,8 +626,7 @@ impl<C: Context<Type = ArrayProgramType>> BatchableOperation<C, ArrayProgramBatc
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
-    C::Operation: From<ConcatenateOperation<ArrayType>>
-        + From<ConcatenateOperation<ArrayProgramType>>
+    C::Operation: From<ConcatenateOperation<ArrayProgramType>>
         + From<BroadcastOperation>
         + From<DimensionOperation<DimensionValue>>
         + From<DimensionSizeOperation>
@@ -696,11 +685,10 @@ where
             .map(|input| align_array_batch(context, input, Axis::from(batch_axis)))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
-        let first_type = aligned_inputs[0].value().r#type();
-        let first_type = <&ArrayType>::try_from(first_type.as_ref())?;
-        let operation = ConcatenateOperation::new(lifted_axis, first_type.rank())?;
         let mut lifted_inputs = aligned_inputs.into_iter().map(ArrayProgramBatch::into_value).collect::<Vec<_>>();
         lifted_inputs.push(result_extent.value().clone());
+        let input_types = lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(lifted_axis, &input_types)?;
         context
             .parent()
             .bind(operation, Vec::new(), lifted_inputs.as_slice())?
@@ -839,7 +827,65 @@ where
     }
 }
 
-/// Validates concatenation array inputs and returns their static axis sum when every input extent is exact.
+/// Infers a mixed concatenation's normalized axis, output type, and runtime-assertion requirement.
+fn infer_array_program_concatenation(
+    input_types: &[ArrayProgramType],
+    axis: Axis,
+) -> Result<(usize, ArrayType, bool), TypeError> {
+    let Some((result_extent, inputs)) = input_types.split_last() else {
+        return Err(TypeError::invalid(format!(
+            "'{}' expects at least one array followed by its result extent",
+            CONCATENATE_OPERATION_NAME,
+        )));
+    };
+    if inputs.is_empty() {
+        return match result_extent {
+            ArrayProgramType::Array(_) => Err(TypeError::invalid(format!(
+                "'{}' expects a trailing result-extent dimension",
+                CONCATENATE_OPERATION_NAME,
+            ))),
+            ArrayProgramType::Dimension(_) => Err(TypeError::invalid(format!(
+                "'{}' expects at least one array before its result extent",
+                CONCATENATE_OPERATION_NAME,
+            ))),
+        };
+    }
+    let inputs = inputs.iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
+    let result_extent = <&DimensionType>::try_from(result_extent)?;
+    let rank = inputs[0].rank();
+    let axis = axis.normalize(rank).map_err(|_| {
+        TypeError::invalid(format!(
+            "'{}' axis {axis} is out of bounds for operands of rank {rank}",
+            CONCATENATE_OPERATION_NAME,
+        ))
+    })?;
+    let static_sum = validate_concatenation_inputs(&inputs, axis)?;
+    let result_dimension = result_extent.to_dimension();
+    if let Some(static_sum) = static_sum
+        && result_dimension != Dimension::Static(static_sum)
+    {
+        return Err(TypeError::invalid(format!(
+            "'{}' result extent is {} but the static input extent sum is {static_sum}",
+            CONCATENATE_OPERATION_NAME, result_dimension,
+        )));
+    }
+
+    let first = inputs[0];
+    let mut dimensions = first.shape().dimensions().to_vec();
+    dimensions[axis] = result_dimension;
+    let output_shape = Shape::new(dimensions);
+    let output_type = if inputs.len() == 1 && first.shape() == &output_shape {
+        first.clone()
+    } else {
+        ArrayType::new(first.data_type(), output_shape)
+            .with_memory(first.memory())
+            .with_sharding(infer_concatenation_sharding(&inputs)?)
+            .map_err(|error| TypeError::invalid(error.to_string()))?
+    };
+    Ok((axis, output_type, static_sum.is_none()))
+}
+
+/// Validates concatenation array inputs and returns their axis sum when every input axis is static.
 fn validate_concatenation_inputs(inputs: &[&ArrayType], axis: usize) -> Result<Option<usize>, TypeError> {
     let first = inputs[0];
     let rank = first.rank();
@@ -1016,15 +1062,32 @@ mod tests {
         assert_eq!(operation.axis(), 0);
         assert_eq!(mixed_operation.name(), CONCATENATE_OPERATION_NAME);
         assert_eq!(operation.to_string(), "concatenate [axis=0]");
-        assert_eq!(mixed_operation.effects(), Effects::single(Effect::OrderedAssertion),);
+        assert_eq!(mixed_operation.effects(), Effects::single(Effect::OrderedAssertion));
         assert_eq!(operation.effects(), Effects::PURE);
         let infer = |input_types: &[ArrayProgramType]| mixed_operation.infer_output_types(input_types, &[]);
 
         let first_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         let second_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let four = DimensionValue::constant(4).unwrap().r#type().clone();
+        let static_input_types = [first_type.clone().into(), second_type.clone().into(), four.clone().into()];
+        let proven_operation =
+            ConcatenateOperation::<ArrayProgramType>::from_input_types(-2, &static_input_types).unwrap();
+        assert_eq!(proven_operation.axis(), 0);
+        assert_eq!(proven_operation.effects(), Effects::PURE);
+        assert_ne!(proven_operation, mixed_operation);
+        let round_tripped = ConcatenateOperation::<ArrayProgramType>::from(ConcatenateOperation::<ArrayType>::from(
+            proven_operation.clone(),
+        ));
+        assert_eq!(round_tripped.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_ne!(round_tripped, proven_operation);
         assert_eq!(
-            infer(&[first_type.clone().into(), second_type.clone().into(), four.clone().into()]),
+            proven_operation.infer_output_types(&static_input_types, &[]),
+            Ok(vec![
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])).into()
+            ]),
+        );
+        assert_eq!(
+            infer(&static_input_types),
             Ok(vec![
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])).into()
             ]),
@@ -1046,8 +1109,13 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(right), Dimension::Dynamic(columns.clone())]),
         );
+        let dynamic_input_types =
+            [dynamic_left.clone().into(), dynamic_right.clone().into(), DimensionType::new(result.clone()).into()];
+        let dynamic_operation =
+            ConcatenateOperation::<ArrayProgramType>::from_input_types(0, &dynamic_input_types).unwrap();
+        assert_eq!(dynamic_operation.effects(), Effects::single(Effect::OrderedAssertion));
         assert_eq!(
-            infer(&[dynamic_left.into(), dynamic_right.into(), DimensionType::new(result.clone()).into()]),
+            dynamic_operation.infer_output_types(&dynamic_input_types, &[]),
             Ok(vec![
                 ArrayType::new(
                     DataType::F32,
@@ -1055,6 +1123,14 @@ mod tests {
                 )
                 .into()
             ]),
+        );
+        assert_eq!(
+            proven_operation.infer_output_types(&dynamic_input_types, &[]),
+            Err(TypeError::invalid(format!(
+                "'{}' was constructed for an operand signature that proves its result extent, but the provided input \
+                 types require a runtime extent check",
+                CONCATENATE_OPERATION_NAME,
+            ))),
         );
 
         let placed_first = first_type
@@ -1110,9 +1186,23 @@ mod tests {
         assert_eq!(
             infer(&[
                 first_type.clone().into(),
-                second_type.into(),
+                second_type.clone().into(),
                 DimensionValue::constant(5).unwrap().r#type().clone().into(),
             ]),
+            Err(TypeError::invalid(format!(
+                "'{}' result extent is 5 but the static input extent sum is 4",
+                CONCATENATE_OPERATION_NAME,
+            ))),
+        );
+        assert_eq!(
+            ConcatenateOperation::<ArrayProgramType>::from_input_types(
+                0,
+                &[
+                    first_type.clone().into(),
+                    second_type.into(),
+                    DimensionValue::constant(5).unwrap().r#type().clone().into(),
+                ],
+            ),
             Err(TypeError::invalid(format!(
                 "'{}' result extent is 5 but the static input extent sum is 4",
                 CONCATENATE_OPERATION_NAME,

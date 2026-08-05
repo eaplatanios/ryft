@@ -1258,8 +1258,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .to_string(),
-            "'all_gather' result extent must equal input axis 0 extent 3 multiplied by axis group size 1; expected 3 \
-             but got 4",
+            "'all_gather' output axis 0 extent must equal observed result extent 3 but got 4",
         );
         assert_eq!(
             context
@@ -2081,16 +2080,39 @@ mod tests {
 
     #[test]
     fn test_array_program_operation_forwards_payload_effects() {
-        // The mixed concatenate payload is unconditionally effectful today, so forwarding it only pins that the derived
-        // dispatcher reads the payload rather than declaring the composite family pure.
-        let concatenate = ConcatenateOperation::<ArrayProgramType>::from(ConcatenateOperation::new(0, 1).unwrap());
+        // A statically proven mixed concatenate is pure. The derived dispatcher must read that payload classification
+        // rather than declaring the composite family effectful.
+        let concatenate = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            0,
+            &[
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into(),
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
+                DimensionValue::constant(3).unwrap().r#type().clone().into(),
+            ],
+        )
+        .unwrap();
+        let operation = ArrayProgramOperation::<Array>::Concatenate(concatenate.clone());
+        assert_eq!(operation.effects(), concatenate.effects());
+        assert_eq!(operation.effects(), Effects::PURE);
+
+        // A dynamic axis sum remains an ordered assertion and reaches the outer family unchanged.
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(9)).unwrap());
+        let result = DimensionVariable::new("result", DimensionBounds::positive(Some(12)).unwrap());
+        let concatenate = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            0,
+            &[
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)])).into(),
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
+                DimensionType::new(result).into(),
+            ],
+        )
+        .unwrap();
         let operation = ArrayProgramOperation::<Array>::Concatenate(concatenate.clone());
         assert_eq!(operation.effects(), concatenate.effects());
         assert_eq!(operation.effects(), Effects::single(Effect::OrderedAssertion));
 
-        // The structural dimension member carries the only genuinely conditional payload effect: a dimension
-        // requirement is pure when it is provable from operand types and otherwise needs an ordered runtime assertion.
-        // Both states must reach the composite family unchanged, so a dispatcher that hardcoded either one is caught.
+        // A dimension requirement is likewise pure when provable and otherwise needs an ordered runtime assertion.
+        // Both states must reach the composite family unchanged.
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
         let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
@@ -2555,10 +2577,12 @@ mod tests {
         let left_atom = left.atom_id().unwrap();
         let right_atom = right.atom_id().unwrap();
         let extent_atom = extent.atom_id().unwrap();
-        let output = concatenate_context
-            .bind(ConcatenateOperation::new(0, 1).unwrap(), Vec::new(), &[left, right, extent])
-            .unwrap()
-            .remove(0);
+        let operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            0,
+            &[left.r#type().into_owned(), right.r#type().into_owned(), extent.r#type().into_owned()],
+        )
+        .unwrap();
+        let output = concatenate_context.bind(operation, Vec::new(), &[left, right, extent]).unwrap().remove(0);
         let concatenate_builder = concatenate_context.builder().borrow();
         let [instruction] = concatenate_builder.instructions() else {
             panic!("expected one concatenate instruction");
@@ -4678,12 +4702,16 @@ in (%4)
 
     #[test]
     fn test_array_program_concatenate() {
-        let operation = ConcatenateOperation::new(0, 1).unwrap();
         let left = ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0]));
         let right = ArrayProgramValue::Array(Array::vector(vec![3.0_f32]));
         let extent = ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap());
         let output = ArrayProgramValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
         let context = EagerContext::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
+        let operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            0,
+            &[left.r#type().into_owned(), right.r#type().into_owned(), extent.r#type().into_owned()],
+        )
+        .unwrap();
 
         // Eager execution consumes the explicit extent without copying either array during member projection.
         assert_eq!(
@@ -4701,8 +4729,10 @@ in (%4)
 
         let observed_extent_type =
             DimensionType::new(DimensionVariable::new("observed", DimensionBounds::new(1, Some(9)).unwrap()));
+        let checked_operation =
+            ConcatenateOperation::<ArrayProgramType>::from(ConcatenateOperation::new(0, 1).unwrap());
         assert_eq!(
-            ArrayProgramOperation::<Array>::from(operation.clone()).interpret(
+            ArrayProgramOperation::<Array>::from(checked_operation).interpret(
                 &context,
                 &EmptyRegionDriver,
                 &[
@@ -4762,6 +4792,13 @@ in (%4)
         let left_size_type = left_size_operation.result_type().clone();
         let right_size_type = right_size_operation.result_type().clone();
         let add_operation = DimensionAddOperation::new(&left_size_type, &right_size_type).unwrap();
+        let result_extent_type =
+            DimensionType::new(DimensionVariable::new(add_operation.result_name(), add_operation.result_bounds()));
+        let dynamic_operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            0,
+            &[left_type.clone().into(), right_type.clone().into(), result_extent_type.into()],
+        )
+        .unwrap();
         let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
         let left_input = builder.add_input(left_type.into());
         let right_input = builder.add_input(right_type.into());
@@ -4771,7 +4808,7 @@ in (%4)
             .add_instruction(DimensionOperation::Add(add_operation), Vec::new(), vec![left_size, right_size])
             .unwrap()[0];
         let concatenated = builder
-            .add_instruction(operation, Vec::new(), vec![left_input, right_input, result_extent])
+            .add_instruction(dynamic_operation, Vec::new(), vec![left_input, right_input, result_extent])
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
@@ -4903,13 +4940,19 @@ in (%4)
 
     #[test]
     fn test_array_program_concatenate_differentiation() {
+        let left_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+        let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
+        let extent_value = DimensionValue::constant(3).unwrap();
+        let operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            0,
+            &[left_type.clone().into(), right_type.clone().into(), extent_value.r#type().clone().into()],
+        )
+        .unwrap();
         let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
-        let left = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
-        let right = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
-        let extent = builder.add_constant(ArrayProgramValue::Dimension(DimensionValue::constant(3).unwrap()));
-        let output = builder
-            .add_instruction(ConcatenateOperation::new(0, 1).unwrap(), Vec::new(), vec![left, right, extent])
-            .unwrap()[0];
+        let left = builder.add_input(left_type.into());
+        let right = builder.add_input(right_type.into());
+        let extent = builder.add_constant(ArrayProgramValue::Dimension(extent_value));
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent]).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
                 vec![output],
@@ -4949,16 +4992,18 @@ in (%4)
         let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(12)).unwrap());
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
         let fixed_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let result_extent_type = DimensionType::new(result.clone());
+        let operation = ConcatenateOperation::<ArrayProgramType>::from_input_types(
+            0,
+            &[source_array_type.clone().into(), fixed_array_type.clone().into(), result_extent_type.clone().into()],
+        )
+        .unwrap();
         let mut builder = ProgramBuilder::<ArrayProgramValue<Array>, ArrayProgramOperation<Array>>::new();
         let source_array = builder.add_input(source_array_type.into());
         let fixed_array = builder.add_input(fixed_array_type.clone().into());
-        let result_extent = builder.add_input(DimensionType::new(result.clone()).into());
+        let result_extent = builder.add_input(result_extent_type.into());
         let output = builder
-            .add_instruction(
-                ConcatenateOperation::new(0, 1).unwrap(),
-                Vec::new(),
-                vec![source_array, fixed_array, result_extent],
-            )
+            .add_instruction(operation, Vec::new(), vec![source_array, fixed_array, result_extent])
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayProgramValue<Array>>, Vec<ArrayProgramValue<Array>>>(
