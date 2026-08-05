@@ -990,23 +990,17 @@ impl private::Codec for Complex<f64> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Encodes the provided typed elements in logical row-major order into a new physical storage buffer described by
-/// `r#type`.
-/// Explicit strided and tiled layouts determine where each element is written. Bytes not occupied by logical elements,
-/// including layout holes and tile padding, are initialized to zero.
+/// Encodes `elements`, provided in logical row-major order, into a new physical storage buffer for `r#type`. A missing
+/// [`Layout`](crate::Layout) means dense row-major storage, while explicit strided and tiled layouts determine where
+/// each element is written. Bytes that no logical element occupies, namely layout holes and tile padding, are
+/// initialized to zero.
 ///
 /// # Parameters
 ///
-///   - `r#type`: static array type that determines the element data type, shape, and physical layout.
-///   - `elements`: logical row-major elements. Their type must represent `r#type`'s [`DataType`], and their count must
-///     equal the array's logical element count.
-///
-/// # Errors
-///
-/// Returns an error if `r#type` cannot describe materialized storage, if `T` represents a different [`DataType`], or
-/// if `elements` has the wrong length.
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
+///     and [`Layout`](crate::Layout).
+///   - `elements`: Elements of the array provided in row-major order.Their type must represent `r#type`'s [`DataType`],
+///     and their count must equal the array's logical element count.
 pub fn encode_elements<T: ArrayElement>(r#type: &ArrayType, elements: &[T]) -> Result<Vec<u8>, ProgramError> {
     if r#type.data_type() != T::DATA_TYPE {
         return Err(TypeError::invalid(format!(
@@ -1042,22 +1036,20 @@ pub fn encode_elements<T: ArrayElement>(r#type: &ArrayType, elements: &[T]) -> R
             element.encode(&mut storage[addressing.byte_range_for_flat_index(index)]);
         }
     }
+
     Ok(storage)
 }
 
-/// Converts validated logical element bytes in row-major order into a new physical storage buffer described by
-/// `r#type`. The input contains only encoded logical elements; it does not include layout holes or tile padding.
-/// Explicit layouts determine where each element is written, and all unoccupied storage bytes are initialized to zero.
+/// Validates the provided logical element bytes and places them into a new physical storage buffer for `r#type`. The
+/// input is the row-major concatenation of the element encodings alone, without layout holes or tile padding. The
+/// [`Layout`](crate::Layout) of the provided [`ArrayType`] determines where each element is written, and all unoccupied
+/// storage bytes are initialized to zero.
 ///
 /// # Parameters
 ///
-///   - `r#type`: static array type that determines the element encoding, logical shape, and physical layout.
-///   - `bytes`: concatenated logical element encodings in row-major order.
-///
-/// # Errors
-///
-/// Returns an error if `r#type` cannot describe materialized storage, if `bytes` has the wrong length, or if any
-/// element is not a valid encoding of `r#type`'s [`DataType`].
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
+///     and [`Layout`](crate::Layout).
+///   - `bytes`: Concatenated logical element byte encodings provided in row-major order.
 pub fn encode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>, ProgramError> {
     let addressing = ArrayAddressing::new(r#type.clone())?;
     if bytes.len() != addressing.logical_byte_len() {
@@ -1093,13 +1085,9 @@ pub fn encode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
 ///
 /// # Parameters
 ///
-///   - `r#type`: static array type that describes the supplied physical storage.
-///   - `bytes`: physical storage bytes, including any holes or tile padding required by `r#type`.
-///
-/// # Errors
-///
-/// Returns an error if `r#type` cannot describe materialized storage, if `T` represents a different [`DataType`], or
-/// if `bytes` is not valid physical storage for `r#type`.
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
+///     and [`Layout`](crate::Layout).
+///   - `bytes`: Physical storage bytes, including any holes or tile padding required by `r#type`.
 pub fn decode_elements<T: ArrayElement>(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<T>, ProgramError> {
     if r#type.data_type() != T::DATA_TYPE {
         return Err(TypeError::invalid(format!(
@@ -1127,6 +1115,12 @@ pub fn decode_elements<T: ArrayElement>(r#type: &ArrayType, bytes: &[u8]) -> Res
 
 /// Validates physical array storage and returns its encoded elements as contiguous logical row-major bytes. Layout
 /// holes and tile padding must contain zero and are omitted from the returned representation.
+///
+/// # Parameters
+///
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
+///     and [`Layout`](crate::Layout).
+///   - `bytes`: Physical storage bytes, including any holes or tile padding required by `r#type`.
 pub fn decode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>, ProgramError> {
     let addressing = ArrayAddressing::new(r#type.clone())?;
 
@@ -1148,8 +1142,14 @@ pub fn decode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
 }
 
 /// Validates that `bytes` is a complete physical storage buffer for `r#type`. Validation covers the layout-derived
-/// storage length, every logical element encoding, and the requirement that layout holes and tile padding contain zero.
-/// Returns a [`ProgramError`] if validation fails.
+/// storage length, every logical element encoding, and the requirement that layout holes and tile padding contain
+/// zero.
+///
+/// # Parameters
+///
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
+///     and [`Layout`](crate::Layout).
+///   - `bytes`: Physical storage bytes, including any holes or tile padding required by `r#type`.
 #[inline]
 pub fn validate_storage_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<(), ProgramError> {
     let addressing = ArrayAddressing::new(r#type.clone())?;
@@ -1220,6 +1220,8 @@ fn validate_element_bytes(data_type: DataType, element: usize, bytes: &[u8]) -> 
     }
     Ok(())
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
