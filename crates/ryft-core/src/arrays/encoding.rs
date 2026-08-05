@@ -232,7 +232,7 @@ macro_rules! impl_signed_sub_byte_array_element {
 
             /// Creates a new element holding `value`, which must lie within the representable range.
             pub fn new(value: i8) -> Result<Self, TypeError> {
-                if value < Self::MIN.0 || value > Self::MAX.0 {
+                if !(Self::MIN.0..=Self::MAX.0).contains(&value) {
                     return Err(TypeError::invalid(format!(
                         "value {} is out of range for {} array elements",
                         value,
@@ -379,15 +379,13 @@ impl_unsigned_sub_byte_array_element!(u1, U1, 1);
 impl_unsigned_sub_byte_array_element!(u2, U2, 2);
 impl_unsigned_sub_byte_array_element!(u4, U4, 4);
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Special-value policy of a low-precision floating-point format. The class fixes which bit patterns a format
-/// reserves for infinities and NaNs, whether it has a negative zero, and how a conversion whose rounded result falls
-/// beyond the format's finite range is resolved.
+/// Special-value policy of a low-precision floating-point format. The class fixes which bit patterns a format reserves
+/// for infinities and NaNs, whether it has a negative zero, and how a conversion whose rounded result falls beyond the
+/// format's finite range is resolved.
 #[derive(Copy, Clone, Debug)]
-enum FloatFormatClass {
-    /// IEEE-style format that reserves its all-ones exponent field: with a zero mantissa it denotes a signed infinity
-    /// and with a nonzero mantissa a signed NaN. Overflowing conversions produce a signed infinity.
+enum LowPrecisionFloatingPointFormatClass {
+    /// IEEE-style format that reserves its all-ones exponent field. It represents a signed infinity with a zero
+    /// mantissa, and a signed NaN with a nonzero mantissa. Overflowing conversions produce a signed infinity.
     Ieee,
 
     /// Finite format whose only reserved pattern is the all-ones exponent and mantissa, denoting a signed NaN, so it
@@ -409,50 +407,50 @@ enum FloatFormatClass {
     ExponentOnly,
 }
 
-/// Descriptor of one low-precision floating-point format, driving the shared decoding and rounding engine behind every
-/// low-precision floating-point element type in this module.
-///
-/// A format lays out one storage byte as an optional sign bit above `exponent_bits` exponent bits above
-/// `mantissa_bits` mantissa bits. A zero exponent field denotes a subnormal value `2^(1 - bias) * mantissa / 2^m` and
-/// any other exponent field `e` denotes `2^(e - bias) * (1 + mantissa / 2^m)`, where `m` is `mantissa_bits`; the
-/// [`FloatFormatClass`] then reinterprets the format's reserved patterns as infinities or NaNs.
+/// Descriptor of a low-precision floating-point format, driving the shared decoding and rounding engine behind every
+/// low-precision floating-point element type in this module. A [`LowPrecisionFloatingPointFormat`] lays out one storage
+/// byte as an optional sign bit above `exponent_bits` exponent bits above `mantissa_bits` mantissa bits. A zero
+/// exponent field denotes a subnormal value `2^(1 - bias) * mantissa / 2^m` and any other exponent field `e` denotes
+/// `2^(e - bias) * (1 + mantissa / 2^m)`, where `m` is `mantissa_bits`. The [`LowPrecisionFloatingPointFormatClass`]
+/// then reinterprets the format's reserved patterns as infinities or NaNs.
 #[derive(Copy, Clone, Debug)]
-struct FloatFormat {
-    /// Data type whose element encoding this format describes.
+struct LowPrecisionFloatingPointFormat {
+    /// [`DataType`] whose element encoding this [`LowPrecisionFloatingPointFormat`] describes.
     data_type: DataType,
 
-    /// Number of exponent bits.
+    /// Number of exponent bits of this [`LowPrecisionFloatingPointFormat`].
     exponent_bits: u32,
 
-    /// Number of mantissa bits.
+    /// Number of mantissa bits of this [`LowPrecisionFloatingPointFormat`].
     mantissa_bits: u32,
 
     /// Amount subtracted from a stored exponent field to obtain the exponent it represents.
     bias: i32,
 
-    /// Special-value policy of this format.
-    class: FloatFormatClass,
+    /// [`LowPrecisionFloatingPointFormatClass`] of this [`LowPrecisionFloatingPointFormat`].
+    class: LowPrecisionFloatingPointFormatClass,
 }
 
-impl FloatFormat {
-    /// Mask selecting the sign bit, which is zero for the sign-less [`FloatFormatClass::ExponentOnly`] format.
+impl LowPrecisionFloatingPointFormat {
+    /// Bit mask selecting the sign bit, which is always zero for the sign-less
+    /// [`LowPrecisionFloatingPointFormatClass::ExponentOnly`] format.
     const fn sign_mask(self) -> u8 {
         match self.class {
-            FloatFormatClass::ExponentOnly => 0,
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => 0,
             _ => 1 << (self.exponent_bits + self.mantissa_bits),
         }
     }
 
-    /// Mask selecting the magnitude bits, namely the exponent and mantissa fields.
+    /// Bit mask selecting the magnitude bits, namely the exponent and mantissa fields.
     const fn magnitude_mask(self) -> u8 {
         match self.class {
-            FloatFormatClass::ExponentOnly => u8::MAX,
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => u8::MAX,
             _ => self.sign_mask() - 1,
         }
     }
 
-    /// Mask selecting every storage-byte bit that belongs to this format. Bits outside the mask must be zero, which
-    /// only constrains the four- and six-bit formats.
+    /// Bit mask selecting every storage-byte bit that belongs to this format. Bits outside the mask must be zero,
+    /// which only constrains the four- and six-bit formats.
     const fn bit_mask(self) -> u8 {
         self.sign_mask() | self.magnitude_mask()
     }
@@ -462,59 +460,74 @@ impl FloatFormat {
     /// candidate that anchors rounding at the top of the range.
     const fn max_finite_magnitude(self) -> u8 {
         match self.class {
-            // The whole all-ones exponent field is reserved for infinities and NaNs.
-            FloatFormatClass::Ieee => self.magnitude_mask() - (1 << self.mantissa_bits),
-            // Only the all-ones exponent and mantissa pattern is reserved, for the canonical NaN.
-            FloatFormatClass::SignedNan => self.magnitude_mask() - 1,
-            // The reserved NaN pattern carries the sign bit, so every magnitude encoding is finite.
-            FloatFormatClass::UnsignedNan | FloatFormatClass::NoNan => self.magnitude_mask(),
-            // Only `0xff` is reserved, for the single NaN.
-            FloatFormatClass::ExponentOnly => u8::MAX - 1,
+            LowPrecisionFloatingPointFormatClass::Ieee => {
+                // The whole all-ones exponent field is reserved for infinities and NaNs.
+                self.magnitude_mask() - (1 << self.mantissa_bits)
+            }
+            LowPrecisionFloatingPointFormatClass::SignedNan => {
+                // Only the all-ones exponent and mantissa pattern is reserved, for the canonical NaN.
+                self.magnitude_mask() - 1
+            }
+            LowPrecisionFloatingPointFormatClass::UnsignedNan | LowPrecisionFloatingPointFormatClass::NoNan => {
+                // The reserved NaN pattern carries the sign bit, so every magnitude encoding is finite.
+                self.magnitude_mask()
+            }
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => {
+                // Only `0xff` is reserved, for the single NaN.
+                u8::MAX - 1
+            }
         }
     }
 
     /// Encoding of the smallest representable value, which is the most negative finite value for every signed format
-    /// and the smallest positive power of two for the sign-less [`FloatFormatClass::ExponentOnly`] format.
+    /// and the smallest positive power of two for the sign-less [`LowPrecisionFloatingPointFormatClass::ExponentOnly`]
+    /// format.
     const fn min_bits(self) -> u8 {
         match self.class {
-            FloatFormatClass::ExponentOnly => 0,
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => 0,
             _ => self.max_finite_magnitude() | self.sign_mask(),
         }
     }
 
     /// Encoding whose exponent field is all ones and whose mantissa is zero, which denotes an infinity in the
-    /// IEEE-style formats.
+    /// [`LowPrecisionFloatingPointFormatClass::Ieee`] formats.
     const fn infinity_bits(self, negative: bool) -> u8 {
         let exponent = (((1u16 << self.exponent_bits) - 1) << self.mantissa_bits) as u8;
         exponent | if negative { self.sign_mask() } else { 0 }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Canonical quiet-NaN encoding of this format, or `None` for the microscaling formats, which have no NaN
     /// encoding. The sign is honored only by the classes whose NaN encodings carry a sign bit.
     const fn nan_bits(self, negative: bool) -> Option<u8> {
         match self.class {
             // A canonical quiet NaN sets the most significant mantissa bit under an all-ones exponent field.
-            FloatFormatClass::Ieee => Some(self.infinity_bits(negative) | 1 << (self.mantissa_bits - 1)),
-            FloatFormatClass::SignedNan => Some(self.magnitude_mask() | if negative { self.sign_mask() } else { 0 }),
-            FloatFormatClass::UnsignedNan => Some(self.sign_mask()),
-            FloatFormatClass::NoNan => None,
-            FloatFormatClass::ExponentOnly => Some(u8::MAX),
+            LowPrecisionFloatingPointFormatClass::Ieee => {
+                Some(self.infinity_bits(negative) | 1 << (self.mantissa_bits - 1))
+            }
+            LowPrecisionFloatingPointFormatClass::SignedNan => {
+                Some(self.magnitude_mask() | if negative { self.sign_mask() } else { 0 })
+            }
+            LowPrecisionFloatingPointFormatClass::UnsignedNan => Some(self.sign_mask()),
+            LowPrecisionFloatingPointFormatClass::NoNan => None,
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => Some(u8::MAX),
         }
     }
 
     /// Applies a sign to one finite magnitude encoding. The `fnuz` formats have no negative zero, so a negative zero
     /// collapses onto positive zero there instead of onto their NaN, which is the sign-bit-only encoding.
     fn signed_bits(self, magnitude: u8, negative: bool) -> u8 {
-        let unsigned_zero = magnitude == 0 && matches!(self.class, FloatFormatClass::UnsignedNan);
+        let unsigned_zero = magnitude == 0 && matches!(self.class, LowPrecisionFloatingPointFormatClass::UnsignedNan);
         magnitude | if negative && !unsigned_zero { self.sign_mask() } else { 0 }
     }
 
     /// Encoding produced by a conversion whose rounded result falls beyond this format's finite range, following the
-    /// overflow policy of its [`FloatFormatClass`].
+    /// overflow policy of its [`LowPrecisionFloatingPointFormatClass`].
     fn overflow_bits(self, negative: bool) -> u8 {
         match self.class {
-            FloatFormatClass::Ieee => self.infinity_bits(negative),
-            FloatFormatClass::NoNan => self.signed_bits(self.max_finite_magnitude(), negative),
+            LowPrecisionFloatingPointFormatClass::Ieee => self.infinity_bits(negative),
+            LowPrecisionFloatingPointFormatClass::NoNan => self.signed_bits(self.max_finite_magnitude(), negative),
             // The remaining classes have no infinity encoding, so an overflow lands on their canonical NaN, which
             // every one of them has.
             _ => self.nan_bits(negative).unwrap(),
@@ -523,12 +536,12 @@ impl FloatFormat {
 
     /// Exact value denoted by one magnitude encoding, evaluated purely from this format's exponent and mantissa
     /// formula. Reserved special-value patterns are not recognized, so passing one magnitude past
-    /// [`FloatFormat::max_finite_magnitude`] yields the virtual overflow candidate used while rounding.
+    /// [`LowPrecisionFloatingPointFormat::max_finite_magnitude`] yields the virtual overflow candidate used while rounding.
     fn decode_magnitude(self, magnitude: u16) -> f64 {
         let mantissa_scale = f64::from(1u32 << self.mantissa_bits);
         let mantissa = f64::from(u32::from(magnitude) & ((1u32 << self.mantissa_bits) - 1));
         let exponent = i32::from(magnitude >> self.mantissa_bits);
-        if exponent == 0 && !matches!(self.class, FloatFormatClass::ExponentOnly) {
+        if exponent == 0 && !matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly) {
             // A zero exponent field denotes a subnormal value, whose implicit leading mantissa bit is zero.
             return 2f64.powi(1 - self.bias) * mantissa / mantissa_scale;
         }
@@ -543,15 +556,15 @@ impl FloatFormat {
         let mantissa = magnitude & ((1u8 << self.mantissa_bits) - 1);
         let exponent = u16::from(magnitude >> self.mantissa_bits);
         let is_special = match self.class {
-            FloatFormatClass::Ieee => exponent == (1u16 << self.exponent_bits) - 1,
-            FloatFormatClass::SignedNan => magnitude == self.magnitude_mask(),
-            FloatFormatClass::UnsignedNan => negative && magnitude == 0,
-            FloatFormatClass::NoNan => false,
-            FloatFormatClass::ExponentOnly => bits == u8::MAX,
+            LowPrecisionFloatingPointFormatClass::Ieee => exponent == (1u16 << self.exponent_bits) - 1,
+            LowPrecisionFloatingPointFormatClass::SignedNan => magnitude == self.magnitude_mask(),
+            LowPrecisionFloatingPointFormatClass::UnsignedNan => negative && magnitude == 0,
+            LowPrecisionFloatingPointFormatClass::NoNan => false,
+            LowPrecisionFloatingPointFormatClass::ExponentOnly => bits == u8::MAX,
         };
         if is_special {
             return match self.class {
-                FloatFormatClass::Ieee if mantissa == 0 => {
+                LowPrecisionFloatingPointFormatClass::Ieee if mantissa == 0 => {
                     if negative {
                         f64::NEG_INFINITY
                     } else {
@@ -559,7 +572,11 @@ impl FloatFormat {
                     }
                 }
                 // Only the classes whose NaN encodings carry a sign bit have a negative NaN to decode.
-                FloatFormatClass::Ieee | FloatFormatClass::SignedNan if negative => -f64::NAN,
+                LowPrecisionFloatingPointFormatClass::Ieee | LowPrecisionFloatingPointFormatClass::SignedNan
+                    if negative =>
+                {
+                    -f64::NAN
+                }
                 _ => f64::NAN,
             };
         }
@@ -572,7 +589,7 @@ impl FloatFormat {
     /// Rounding scans every finite magnitude encoding of this format plus the virtual overflow candidate one step past
     /// its largest finite magnitude, which reproduces round-to-nearest-even exactly, including at the overflow
     /// boundary. NaN, infinite, and zero inputs, along with results that round onto the virtual candidate, follow the
-    /// policies of this format's [`FloatFormatClass`].
+    /// policies of this format's [`LowPrecisionFloatingPointFormatClass`].
     fn encode(self, value: f64) -> Result<u8, TypeError> {
         let negative = value.is_sign_negative();
         if value.is_nan() {
@@ -580,7 +597,7 @@ impl FloatFormat {
                 .nan_bits(negative)
                 .ok_or_else(|| TypeError::invalid(format!("data type {} cannot represent NaN", self.data_type)));
         }
-        if matches!(self.class, FloatFormatClass::ExponentOnly) {
+        if matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly) {
             if value == 0.0 {
                 return Err(TypeError::invalid(format!("data type {} cannot represent zero", self.data_type)));
             }
@@ -768,12 +785,12 @@ macro_rules! impl_low_precision_float {
     ($type:ident, $data_type:ident, $class:ident, $exponent_bits:literal, $mantissa_bits:literal, $bias:literal) => {
         impl $type {
             /// Format descriptor driving every conversion of this element type.
-            const FORMAT: FloatFormat = FloatFormat {
+            const FORMAT: LowPrecisionFloatingPointFormat = LowPrecisionFloatingPointFormat {
                 data_type: DataType::$data_type,
                 exponent_bits: $exponent_bits,
                 mantissa_bits: $mantissa_bits,
                 bias: $bias,
-                class: FloatFormatClass::$class,
+                class: LowPrecisionFloatingPointFormatClass::$class,
             };
 
             /// Smallest representable value.
