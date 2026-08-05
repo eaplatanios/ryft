@@ -2454,17 +2454,17 @@ Phase 9a1 — layout-aware byte storage and construction:
       when a traversal is non-contiguous) without per-element allocation or repeated bounds checks. Do not add a general
       view/slice type: specialized kernels may keep their own coordinate logic when the shared iterator would make them
       less clear.
-- [ ] Generalize `ArrayAddressing` to support every physical `ArrayType` layout used by reference arrays. A missing
+- [x] Generalize `ArrayAddressing` to support every physical `ArrayType` layout used by reference arrays. A missing
       layout defaults to dense row-major addressing; explicit layouts must determine actual reference-array storage.
       Cover positive and negative byte strides, derived base offsets, holes, alias rejection, tiled layouts and padding,
       checked storage-span calculation, and physical-contiguity-aware range coalescing. Keep `ArrayType` as the sole
       stored source of truth and add exact logical-index-to-storage-range tests for every layout family before routing
       physical-buffer consumers through the abstraction.
-- [ ] Pin layout-aware reference storage: construct equal logical values under layout-free, positive/negative strided,
+- [x] Pin layout-aware reference storage: construct equal logical values under layout-free, positive/negative strided,
       permuted tiled, and padded tiled types; assert each type's expected physical bytes and storage span; and decode
       each back to the same logical values through `ArrayAddressing`. Portable literal conversion must traverse logical
       coordinates and produce the target format independently of the reference array's physical byte ordering.
-- [ ] Add byte-length/range validation and the sealed typed codec at the array/data ownership boundary.
+- [x] Add byte-length/range validation and the sealed typed codec at the array/data ownership boundary.
 - [ ] Convert `Array` storage and migrate constructors, accessors, `Parameter`, equality, approximation, formatting,
       and the test-only malformed-type constructor in one complete slice.
 - [ ] Add exact encoding round trips for all supported primitives, low-precision raw bits, signed zero, infinities,
@@ -4270,3 +4270,33 @@ Verification passed the three focused addressing/range tests, all 35 reference-a
 tests, `cargo check -p ryft-core --lib` without warnings, formatting, and diff hygiene. A normal Clippy pass reports no
 diagnostics in the changed implementation; the repository-wide `-D warnings` gate remains blocked by 131 pre-existing
 diagnostics elsewhere in `ryft-core`, beginning with `operations/math/dot.rs` and `backends/scalars.rs`.
+
+### Phase 9a1 layout-aware addressing and codec boundary (2026-08-04)
+
+The second Phase 9a1 slice generalized `ArrayAddressing` without adding cached shape or layout state. Missing layouts
+remain dense row-major. Strided layouts now validate rank, derive a safe base for negative byte strides, include holes
+in their checked storage span, and reject layouts whose ordered stride spans cannot prove that element byte ranges are
+non-overlapping. Tiled layouts validate a complete minor-to-major permutation and implement XLA's suffix tiling,
+padding, repeated tiling, and combined dimensions. Exact tests pin positive, negative, holed, permuted, padded, nested,
+and combined address calculations, malformed layouts, alias rejection, and storage-span overflow.
+
+`ArrayIndexRanges` now follows logical slice order while coalescing only consecutive logical elements whose physical
+byte ranges are also consecutive in ascending address order. This preserves direct bulk-copy semantics for dense
+runs and splits safely at holes, reversals, permutations, and tile boundaries. The iterator still allocates nothing
+and validates the complete slice before iteration; because the number of physical runs is layout-dependent, it no
+longer claims `ExactSizeIterator`.
+
+The new sealed `ArrayElement` codec fixes one little-endian representation for Rust Boolean, integer, floating-point,
+half-precision, and complex values. Crate-private typed and checked-raw entrypoints encode directly into final physical
+storage without a dense intermediate allocation, validate logical and physical byte lengths, Boolean/sub-byte/4-bit/
+6-bit encodings, zero-valued holes and tile padding, and payload-free types, and decode either typed values or portable
+logical bytes independently of physical ordering. The entrypoints are intentionally established one checklist item
+before their production `Array` consumer; the module-local dead-code allowance is removed by the immediately following
+byte-storage migration rather than exposing a temporary public raw-storage API.
+
+Layout-aware storage fixtures place the same six logical `U8` values into layout-free, positive and negative strided,
+permuted tiled, and padded tiled storage, assert every physical byte and span, and decode every case back to the same
+logical values and portable bytes. Focused addressing and codec tests pass, all 1,137 core library tests pass,
+all 53 runnable core doctests pass with 16 intentional ignores, `cargo check -p ryft-core --lib` is warning-free, and
+formatting and diff hygiene pass. The next Phase 9a1 slice converts `Array` from `Vec<Scalar>` to the checked shared byte
+storage that now has a fully pinned ownership boundary.
