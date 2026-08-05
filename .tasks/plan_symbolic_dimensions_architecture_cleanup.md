@@ -2294,10 +2294,24 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         compatibility re-exports.
 - [ ] After the batching hierarchy and operation ownership have settled, consolidate the reference array stack under
       one top-level `ryft_core::arrays` hierarchy as a separate, measured API and representation change:
-  - [ ] Prove that the `Scalar` reference backend and `backends::scalars` module have no unique production role. Move
-        any still-useful `DataType`-universe tests to rank-zero arrays or narrowly scoped test fixtures, then delete
-        `Scalar`, `ScalarOperation`, `ScalarTracingContext`, the backend module, and their public exports without a
-        compatibility layer.
+  - [ ] Execute the Phase 9a representation and scalar-retirement sequence specified below. Storage must migrate
+        before scalar deletion because the current `Array` uses `Vec<Scalar>` in production; keep module paths fixed
+        throughout this sequence so storage, literal lowering, and scalar retirement remain separate from the later
+        hierarchy move.
+    - [ ] Replace the reference `Array`'s element-wise `Vec<Scalar>` payload with validated immutable contiguous bytes,
+          with allocation-free cloning and checked exact encodings for every `DataType`.
+    - [ ] Route exact array literals and XLA constant lowering through the canonical byte representation without an
+          `f64` round trip, including the sub-byte integer families.
+    - [ ] Prove that the remaining standalone scalar program universe has no unique production role. Move useful
+          `DataType`-universe tests to rank-zero arrays or narrowly scoped test fixtures, then delete `Scalar`,
+          `ScalarOperation`, `ScalarTracingContext`, `backends::scalars`, and their public exports without a
+          compatibility layer.
+    - [ ] Gate the representation/retirement sequence with exact-bit, allocation, core, macro, XLA CPU, available CUDA,
+          and before/after size and performance evidence.
+  - [ ] Define and document the final public hierarchy before moving files. The expected canonical layout is
+        `arrays::{data, dimensions, ir, layouts, memories, sharding}` with common array types re-exported from
+        `arrays`; remove ambiguous glob exports and duplicate canonical paths rather than preserving the former
+        `backends`, `types`, and `sharding` facades.
   - [ ] Move the current `backends::arrays` reference backend to `ryft_core::arrays`, and place the current dimension
         backend and heterogeneous array IR beneath the same hierarchy (expected submodules: `arrays::dimensions` and
         `arrays::ir`). Keep generic operation semantics in `operations`, generic program machinery in `programs`, and
@@ -2325,19 +2339,6 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         visualizations, and `ShardingError`) after auditing that no non-array value universe uses it independently.
         Update all paths directly without a `ryft_core::sharding` compatibility module; named-axis transform machinery
         remains outside this hierarchy where it is genuinely universe-neutral.
-  - [ ] Define and document the final public hierarchy before moving files. The expected canonical layout is
-        `arrays::{data, dimensions, ir, layouts, memories, sharding}` with common array types re-exported from
-        `arrays`; remove ambiguous glob exports and duplicate canonical paths rather than preserving the former
-        `backends`, `types`, and `sharding` facades.
-  - [ ] Replace the reference `Array`'s element-wise `Vec<Scalar>` payload with an immutable contiguous byte buffer
-        whose element type and shape determine and validate its exact storage. Specify canonical encoding for every
-        supported data type, including Boolean, sub-byte integers, low-precision floats, complex values, and tokens;
-        make cloning and read-only projection allocation-free (prefer shared immutable storage unless measurements
-        justify owned copies), and expose checked typed construction/access APIs without restoring `Scalar` storage.
-  - [ ] Route exact array literals and XLA constant lowering through the canonical byte representation so literal
-        construction does not round-trip through `f64` or per-element enum values. Preserve element bits, shapes,
-        layouts, shardings, and memory placement, and measure construction cost, clone cost, allocation count, and XLA
-        compile/runtime behavior before and after the migration.
   - [ ] Gate: the top-level hierarchy has one obvious public path for reference arrays, dimensions, and array IR; no
         scalar backend or per-element `Scalar` payload remains; all reference-backend semantics, transformations,
         exact-literal tests, core/XLA execution suites, and allocation/performance thresholds pass.
@@ -2356,6 +2357,134 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       behaviors without introducing a second batching path.
 - [ ] Run targeted searches for every old canonical path and classify all remaining matches.
 - [ ] Gate: core language semantics no longer appear to be backend implementation details.
+
+#### Phase 9a: contiguous array storage and scalar-backend retirement
+
+Objective: replace the reference `Array` backend's `Vec<Scalar>` payload with one validated immutable contiguous byte
+representation, route exact literals through that representation, and then delete the standalone `Scalar` value
+universe and `ScalarOperation` family. The final implementation must reduce production code, preserve reference
+semantics for every `DataType`, make `Array::clone` allocation-free and constant-time, and avoid introducing a second
+public scalar backend under another name.
+
+Current-tree facts and dependency order:
+
+- `Array` stores `values: Vec<Scalar>` and uses `Scalar` in production for storage, element conversion, arithmetic,
+  comparisons, reductions, indexing, formatting, and construction. Scalar deletion therefore cannot be the first
+  slice.
+- `ScalarOperation` and `ScalarTracingContext` are primarily a second eager/staged test universe. Useful generic
+  transform coverage must move to rank-zero arrays or narrowly scoped test fixtures before that universe is deleted.
+- XLA literal lowering expands each `Array` into typed vectors by matching stored `Scalar` variants, adding avoidable
+  per-element enum dispatch and leaving the sub-byte integer families unsupported.
+- Keep the current module paths fixed through Phase 9a. Storage, literal lowering, scalar retirement, and the later
+  public hierarchy move are separate review units.
+
+Target representation and API:
+
+- Store `Array { type: ArrayType, bytes: Arc<[u8]> }`. The type and static element count determine the only valid byte
+  length. Clones share immutable storage and kernels allocate only their output buffer.
+- Use a documented portable little-endian encoding. `Token` and `Zero` carry no payload bytes. Boolean, sub-byte
+  integers, and 4/6/8-bit floats occupy one validated byte per logical element; this favors constant-time reference
+  indexing, and lowering packs sub-byte integers only where the target literal format requires it. Wider integers and
+  floats use exact bit patterns, and complex values interleave real and imaginary component encodings.
+- Add checked raw construction and immutable byte access. Validate byte length, Boolean encodings, sub-byte ranges,
+  unused float bits, and payload-free types. Provide concise typed construction/decoding through one sealed
+  array-element codec for Rust primitives, `half`, and `num_complex`; ambiguous low-precision and sub-byte families
+  use the checked raw-bits path.
+- Remove `Array::new(ArrayType, Vec<Scalar>)` and `values() -> &[Scalar]` instead of retaining overloads. Preserve the
+  `scalar`, `vector`, `matrix`, `from_f64s`, and `to_f64s` conveniences with byte-backed implementations, while exact
+  literals use typed or raw-bit construction rather than `f64` conversion.
+- The existing scalar element algebra may be reused only as an implementation migration source. If a transient private
+  element enum materially keeps kernels smaller, move and narrow the implementation rather than duplicating it; it
+  must never be stored in `Array`, implement `Type`/`Value`, own an operation family, or remain publicly exported.
+
+Guardrails:
+
+- No compatibility module, deprecated alias, dual storage representation, `Vec<Scalar>` fallback, per-element box, or
+  unsafe typed-slice cast from byte storage.
+- No silent lossy conversion through `f64`, especially for integers, signed zeros, NaN payloads, low-precision floats,
+  and complex values.
+- Do not materialize a complete secondary element vector in reference kernels. Build one output byte buffer with known
+  capacity and freeze it into shared immutable storage once.
+- Keep implementation slices near the established review-size limit. A mechanical test migration may exceed it only
+  through deletions and direct substitutions, not new production abstractions.
+
+Phase 9a0 — baseline and vertical prototype:
+
+- [ ] Record the clean starting revision, production/test line counts for `backends::{arrays,scalars}`, `size_of` for
+      `Array` and `Scalar`, construction/clone byte and allocation costs for representative 4K-element arrays, and
+      current core/XLA test counts.
+- [ ] Classify every production and test use of `Scalar`, `ScalarOperation`, and `ScalarTracingContext` as
+      array-element semantics, reusable generic-transform coverage, scalar-universe-only coverage, or dead coverage.
+- [ ] Inventory every `DataType` encoding, current `Scalar` support gap, `Array` constructor/accessor call site, and XLA
+      literal route; record exact expected byte lengths and validation rules.
+- [ ] Prototype one complete F32 vertical slice: checked typed construction/decoding, one unary kernel, one broadcasting
+      binary kernel, equality/rendering, clone-allocation measurement, and exact XLA dense-literal construction.
+- [ ] Compare a narrow private transient-element implementation with direct typed byte dispatch for the prototype.
+      Select the smaller option only if it adds no per-element heap allocation or public API surface.
+- [ ] Gate: `Array::clone` performs zero allocations and copies no payload bytes; the prototype adds no unsafe cast,
+      second stored representation, or more production code than its equivalent current F32 path.
+
+Phase 9a1 — canonical byte storage and construction:
+
+- [ ] Add byte-length/range validation and the sealed typed codec at the array/data ownership boundary.
+- [ ] Convert `Array` storage and migrate constructors, accessors, `Parameter`, equality, approximation, formatting,
+      and the test-only malformed-type constructor in one complete slice.
+- [ ] Add exact encoding round trips for all supported primitives, low-precision raw bits, signed zero, infinities,
+      representative NaNs/payloads, complex values, empty arrays, `Token`, and `Zero`.
+- [ ] Add I1/I2/I4/U1/U2/U4 reference-array construction and validation, closing the current `Scalar` storage gap
+      without adding scalar enum variants.
+- [ ] Extend allocation tests to prove large-array clone, borrowed projection, and consuming projection allocate zero
+      times after setup.
+- [ ] Gate: no `Vec<Scalar>` payload, `values()` accessor, or duplicate byte ownership remains.
+
+Phase 9a2 — byte-backed reference kernels:
+
+- [ ] Migrate elementwise arithmetic, logical, comparison, complex, conversion, zero/one/fill/iota, and random kernels
+      family by family, preserving integer wrapping and fallible errors.
+- [ ] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
+      gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
+- [ ] Preserve exact equality, numeric approximation, display, Boolean concretization, and indexing semantics directly
+      over encoded bytes.
+- [ ] Gate: all reference-backend and transform tests pass; representative kernels add no allocation-count slope beyond
+      output allocation; no production array kernel depends on `Scalar`.
+
+Phase 9a3 — exact XLA literals:
+
+- [ ] Replace per-element `Scalar` matching and typed-vector reconstruction with canonical bytes. Decode only when an
+      MLIR typed helper requires it; otherwise pass validated raw bytes directly.
+- [ ] Pack sub-byte integers at the lowering boundary and cover I1/I2/I4/U1/U2/U4 constants.
+- [ ] Add exact-bit StableHLO and execution tests for low-precision floats, signed zero, preserved NaN payloads, wide
+      integers, complex values, empty tensors, and sub-byte integers.
+- [ ] Measure literal construction, lowering allocations, StableHLO size, compile time, and runtime against Phase 9a0.
+- [ ] Gate: no literal round-trips through `f64`; exact values lower and execute identically on CPU, with CUDA coverage
+      where supported by the existing backend matrix.
+
+Phase 9a4 — retire the scalar program universe:
+
+- [ ] Migrate useful `DataType`-universe transform tests to rank-zero arrays. Use a narrow test-only fixture only where
+      a test genuinely verifies universe-neutral machinery and an array would obscure that contract.
+- [ ] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
+- [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
+      exports, scalar-only doctests, and the obsolete scalar-domain compile-fail fixture.
+- [ ] Delete or privatize-and-rename any surviving transient element helper according to the prototype decision. No
+      item named `Scalar` and no standalone scalar `Value`/domain may remain in production code.
+- [ ] Update testing guidance to name rank-zero `Array` as the scalar-semantics reference.
+- [ ] Gate: targeted searches find no retired scalar identifier or path outside historical plans, and production/test
+      line counts materially decrease.
+
+Phase 9a5 — closure:
+
+- [ ] Run full core, macro integration/compile-fail, XLA, affected doctest, allocation, CPU, and available CUDA suites
+      with 300-second command timeouts.
+- [ ] Re-run Phase 9a0 measurements. Clone remains zero-allocation/constant-time and other regressions remain within
+      the master plan's evidence-based thresholds or receive explicit approval.
+- [ ] Review the complete diff for redundant codecs, duplicate conversions, compatibility residue, unnecessary trait
+      surface, and avoidable allocation; simplify before closing the review unit.
+- [ ] Record the completed review here and leave the module/type/sharding hierarchy move as the next isolated unit.
+
+Abort if the representation requires unsafe unaligned typed views, per-element boxing, two authoritative payloads, or
+cannot round-trip exact bits. Also stop if scalar-test migration reveals a genuinely independent non-array production
+use case rather than deleting it by assertion.
 
 ### Phase 10: persistence and measured performance closure
 
@@ -3845,11 +3974,12 @@ homogeneous programs over `ArrayType` remain described as programs over arrays. 
 heterogeneous dispatcher become `ArrayOperation` was deleted because the new name makes its distinct mixed-universe
 role explicit.
 
-The Phase 9 checklist now also records the subsequent, separately reviewable reference-backend consolidation: retire
-the scalar backend after proving its remaining tests have suitable replacements; move concrete arrays, dimensions, and
-the array IR under one top-level `ryft_core::arrays` hierarchy; replace `Array`'s `Vec<Scalar>` payload with validated
-immutable contiguous bytes; and route exact XLA literals through that canonical representation. The future slice has
-explicit encoding, allocation, exact-bit, CPU/XLA execution, and performance gates and does not alter this rename.
+The Phase 9 checklist now also records the subsequent, separately reviewable reference-backend consolidation: replace
+`Array`'s `Vec<Scalar>` payload with validated immutable contiguous bytes; route exact XLA literals through that
+canonical representation; retire the scalar backend after proving its remaining tests have suitable replacements; and
+then move concrete arrays, dimensions, and the array IR under one top-level `ryft_core::arrays` hierarchy. The future
+slice has explicit encoding, allocation, exact-bit, CPU/XLA execution, and performance gates and does not alter this
+rename.
 
 Verification passed the renamed two-test projection-allocation fixture, all 1,129 core library tests, all 53 runnable
 core doctests (16 ignored), all 57 macro unit tests, both macro integration suites including every compile-fail fixture,
@@ -3946,3 +4076,15 @@ Verification passed `cargo check -p ryft-core --tests`, the focused 12 array-IR 
 10 constant-family tests, all 1,129 core library tests, and all 53 runnable core doctests (16 ignored). Formatting,
 diff hygiene, dispatcher/algorithm ownership searches, transform-policy definition searches, and the stale-path search
 passed.
+
+### Phase 9a representation dependency correction and execution plan (2026-08-04)
+
+The current-tree audit found that the former checklist order could not be executed honestly: `Scalar` still has a
+production role as `Array`'s stored payload and element algebra, so deleting the scalar backend before changing array
+storage would require either breaking the reference backend or introducing a temporary replacement abstraction. Phase
+9 now migrates `Array` to canonical immutable bytes and exact byte-backed XLA literals first, retires the standalone
+scalar program universe second, and performs the public module hierarchy move only after both representation paths
+have settled.
+
+The detailed Phase 9a checklist records the representation, encoding, API, allocation, exact-bit, test-migration, and
+performance contracts plus abort criteria. Execution has not started; Phase 9a0 is the next review unit.
