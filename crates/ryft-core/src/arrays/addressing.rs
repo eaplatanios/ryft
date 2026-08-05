@@ -191,6 +191,15 @@ impl ArrayAddressing {
         Ok(self.byte_range_unchecked(|axis| index[axis]))
     }
 
+    /// Maps a prevalidated flat logical row-major index to its physical byte range.
+    pub fn byte_range_for_flat_index(&self, index: usize) -> Range<usize> {
+        let start = self.byte_offset_unchecked(|axis| {
+            let inner = (axis + 1..self.r#type.rank()).fold(1usize, |stride, axis| stride * self.dimension(axis));
+            (index / inner) % self.dimension(axis)
+        });
+        start..start + self.element_byte_width()
+    }
+
     /// Maps a contiguous flat logical element index range to its corresponding physical byte range. This operation
     /// returns an error when the logical elements are not stored contiguously in ascending physical address order.
     /// Use [`Self::ranges`] when the [`Layout`] may split a logical selection across storage ranges.
@@ -229,10 +238,9 @@ impl ArrayAddressing {
         Ok(ArrayIndexRange { elements, bytes })
     }
 
-    /// Returns an iterator over the contiguous storage ranges covered by a multidimensional slice.
-    ///
-    /// `starts` and `sizes` define the slice along each axis. `strides` optionally specifies the step along each axis;
-    /// [`None`] uses a stride of one for every axis.
+    /// Returns an [`Iterator`] over the contiguous storage ranges covered by a multidimensional slice. `starts` and
+    /// `sizes` define the slice along each axis. `strides` optionally specifies the step along each axis. [`None`] uses
+    /// a stride of one for every axis.
     #[inline]
     pub fn ranges<'a>(
         &'a self,
@@ -271,20 +279,6 @@ impl ArrayAddressing {
                 layout.tiles().is_empty() && layout.minor_to_major().iter().rev().copied().eq(0..self.r#type.rank())
             }
         }
-    }
-
-    /// Maps a flat logical row-major index to its physical byte offset.
-    fn byte_offset_for_flat_index(&self, index: usize) -> usize {
-        self.byte_offset_unchecked(|axis| {
-            let inner = (axis + 1..self.r#type.rank()).fold(1usize, |stride, axis| stride * self.dimension(axis));
-            (index / inner) % self.dimension(axis)
-        })
-    }
-
-    /// Maps a prevalidated flat logical row-major index to its physical byte range.
-    pub(crate) fn byte_range_for_flat_index(&self, index: usize) -> Range<usize> {
-        let start = self.byte_offset_for_flat_index(index);
-        start..start + self.element_byte_width()
     }
 
     /// Returns the checked logical payload byte length, rejecting static element counts or byte lengths
