@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
+use std::num::FpCategory;
 
 use half::{bf16, f16};
 use num_complex::Complex;
@@ -534,6 +535,41 @@ impl LowPrecisionFloatingPointFormat {
         }
     }
 
+    /// Encoding of the value nearest to one finite nonzero `magnitude`, with `negative` applied to the result.
+    /// Rounding scans every finite magnitude encoding of this format plus the virtual overflow candidate one step
+    /// past its largest finite magnitude, which reproduces round-to-nearest-even exactly, including at the overflow
+    /// boundary. A result beyond the finite range follows the overflow policy of this format's
+    /// [`LowPrecisionFloatingPointFormatClass`].
+    fn nearest_bits(self, magnitude: f64, negative: bool) -> u8 {
+        let max_finite_magnitude = u16::from(self.max_finite_magnitude());
+        // An input above the virtual overflow candidate is unambiguously an overflow. Resolving it before the scan
+        // also keeps the distance comparisons below meaningful, because the distances from every candidate round to
+        // the same value once the input is astronomically larger than this format's whole range.
+        if magnitude > self.decode_magnitude(max_finite_magnitude + 1) {
+            return self.overflow_bits(negative);
+        }
+        
+        let mut nearest = 0;
+        let mut nearest_distance = f64::INFINITY;
+        for candidate in 0..=max_finite_magnitude + 1 {
+            let distance = (self.decode_magnitude(candidate) - magnitude).abs();
+            
+            // Candidate values increase strictly with their encoding, so at most two candidates can be equidistant
+            // from the input and exactly one of those two has an even encoding, which is the one to round to.
+            if distance < nearest_distance || (distance == nearest_distance && candidate % 2 == 0) {
+                nearest = candidate;
+                nearest_distance = distance;
+            }
+        }
+        
+        if nearest > max_finite_magnitude {
+            return self.overflow_bits(negative);
+        }
+        
+        // A nonzero input can still round down onto the zero encoding, which the `fnuz` formats leave unsigned.
+        self.signed_bits(nearest as u8, negative)
+    }
+
     /// Exact value denoted by one magnitude encoding, evaluated purely from this format's exponent and
     /// mantissa formula. Reserved special-value patterns are not recognized, so passing one magnitude past
     /// [`LowPrecisionFloatingPointFormat::max_finite_magnitude`] yields the virtual overflow candidate
@@ -549,62 +585,28 @@ impl LowPrecisionFloatingPointFormat {
         2f64.powi(exponent - self.bias) * (1.0 + mantissa / mantissa_scale)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Encodes the value nearest to `value` in this [`LowPrecisionFloatingPointFormat`], breaking exact ties toward the
-    /// even encoding. Rounding scans every finite magnitude encoding of this format plus the virtual overflow candidate
-    /// one step past its largest finite magnitude, which reproduces round-to-nearest-even exactly, including at the
-    /// overflow boundary. NaN, infinite, and zero inputs, along with results that round onto the virtual candidate,
-    /// follow the policies of this format's [`LowPrecisionFloatingPointFormatClass`].
+    /// Encodes the value nearest to `value` in this [`LowPrecisionFloatingPointFormat`], rounding to nearest with
+    /// exact ties broken toward the even encoding. NaN, infinite, and zero inputs, along with finite inputs whose
+    /// rounded result falls beyond the format's finite range, follow the policies of this format's
+    /// [`LowPrecisionFloatingPointFormatClass`].
     fn encode(self, value: f64) -> Result<u8, TypeError> {
         let negative = value.is_sign_negative();
-        
-        if value.is_nan() {
-            return self
+        let exponent_only = matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly);
+        match value.classify() {
+            FpCategory::Nan => self
                 .nan_bits(negative)
-                .ok_or_else(|| TypeError::invalid(format!("data type {} cannot represent NaN", self.data_type)));
-        }
-        
-        if matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly) {
-            if value == 0.0 {
-                return Err(TypeError::invalid(format!("data type {} cannot represent zero", self.data_type)));
+                .ok_or_else(|| TypeError::invalid(format!("data type {} cannot represent NaN", self.data_type))),
+            FpCategory::Zero if exponent_only => {
+                Err(TypeError::invalid(format!("data type {} cannot represent zero", self.data_type)))
             }
-            if negative {
+            FpCategory::Zero => Ok(self.signed_bits(0, negative)),
+            FpCategory::Infinite => Ok(self.overflow_bits(negative)),
+            FpCategory::Normal | FpCategory::Subnormal if negative && exponent_only => {
                 // A sign-less format has no negative value to round to, so negative inputs collapse onto its NaN.
-                return Ok(self.nan_bits(negative).unwrap());
+                Ok(self.nan_bits(negative).unwrap())
             }
-        } else if value == 0.0 {
-            return Ok(self.signed_bits(0, negative));
+            FpCategory::Normal | FpCategory::Subnormal => Ok(self.nearest_bits(value.abs(), negative)),
         }
-        
-        if value.is_infinite() {
-            return Ok(self.overflow_bits(negative));
-        }
-        
-        let magnitude = value.abs();
-        let max_finite_magnitude = u16::from(self.max_finite_magnitude());
-        // An input above the virtual overflow candidate is unambiguously an overflow. Resolving it before the scan also
-        // keeps the distance comparisons below meaningful, because the distances from every candidate round to the same
-        // value once the input is astronomically larger than this format's whole range.
-        if magnitude > self.decode_magnitude(max_finite_magnitude + 1) {
-            return Ok(self.overflow_bits(negative));
-        }
-        let mut nearest = 0;
-        let mut nearest_distance = f64::INFINITY;
-        for candidate in 0..=max_finite_magnitude + 1 {
-            let distance = (self.decode_magnitude(candidate) - magnitude).abs();
-            // Candidate values increase strictly with their encoding, so at most two candidates can be equidistant
-            // from the input and exactly one of those two has an even encoding, which is the one to round to.
-            if distance < nearest_distance || (distance == nearest_distance && candidate % 2 == 0) {
-                nearest = candidate;
-                nearest_distance = distance;
-            }
-        }
-        if nearest > max_finite_magnitude {
-            return Ok(self.overflow_bits(negative));
-        }
-        // A nonzero input can still round down onto the zero encoding, which the `fnuz` formats leave unsigned.
-        Ok(self.signed_bits(nearest as u8, negative))
     }
 
     /// Decodes the exact value denoted by one storage byte in this [`LowPrecisionFloatingPointFormat`].
@@ -640,146 +642,132 @@ impl LowPrecisionFloatingPointFormat {
     }
 }
 
-/// Conversion-only 4-bit floating-point array element representing [`DataType::F4E2M1FN`] values.
-///
-/// Values occupy the low four bits of one storage byte, laid out as one sign bit, two exponent bits, and one mantissa
-/// bit with exponent bias 1, and all higher bits of the byte are zero. Every encoding denotes a finite value: the
-/// largest finite value is `6`, the smallest positive normal value is `1`, the smallest positive subnormal value is
-/// `0.5`, and negative zero is `0x08`. This microscaling format has no infinity and no NaN encoding, so infinities and
-/// values that round beyond `6` saturate to `±6`, while NaN inputs are rejected with a [`TypeError`]. Conversions
-/// round to nearest with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float4_e2m1fn).
+/// Conversion-only 4-bit floating-point array element representing [`DataType::F4E2M1FN`] values. Values occupy the low
+/// four bits of one storage byte, laid out as one sign bit, two exponent bits, and one mantissa bit with exponent bias
+/// 1, and all higher bits of the byte are zero. Every encoding denotes a finite value. The largest finite value is `6`,
+/// the smallest positive normal value is `1`, the smallest positive subnormal value is `0.5`, and negative zero is
+/// `0x08`. This microscaling format has no infinity and no NaN encoding, so infinities and values that round beyond
+/// `6` saturate to `±6`, while NaN inputs are rejected with a [`TypeError`]. Conversions round to nearest with ties
+/// to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float4_e2m1fn).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f4e2m1fn(u8);
 
-/// Conversion-only 6-bit floating-point array element representing [`DataType::F6E2M3FN`] values.
-///
-/// Values occupy the low six bits of one storage byte, laid out as one sign bit, two exponent bits, and three mantissa
-/// bits with exponent bias 1, and all higher bits of the byte are zero. Every encoding denotes a finite value: the
-/// largest finite value is `7.5`, the smallest positive normal value is `1`, the smallest positive subnormal value is
-/// `0.125`, and negative zero is `0x20`. This microscaling format has no infinity and no NaN encoding, so infinities
-/// and values that round beyond `7.5` saturate to `±7.5`, while NaN inputs are rejected with a [`TypeError`].
-/// Conversions round to nearest with ties to even, following
-/// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float6_e2m3fn).
+/// Conversion-only 6-bit floating-point array element representing [`DataType::F6E2M3FN`] values. Values occupy the low
+/// six bits of one storage byte, laid out as one sign bit, two exponent bits, and three mantissa bits with exponent
+/// bias 1, and all higher bits of the byte are zero. Every encoding denotes a finite value. The largest finite value
+/// is `7.5`, the smallest positive normal value is `1`, the smallest positive subnormal value is `0.125`, and negative
+/// zero is `0x20`. This microscaling format has no infinity and no NaN encoding, so infinities and values that round
+/// beyond `7.5` saturate to `±7.5`, while NaN inputs are rejected with a [`TypeError`]. Conversions round to nearest
+/// with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float6_e2m3fn).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f6e2m3fn(u8);
 
-/// Conversion-only 6-bit floating-point array element representing [`DataType::F6E3M2FN`] values.
-///
-/// Values occupy the low six bits of one storage byte, laid out as one sign bit, three exponent bits, and two mantissa
-/// bits with exponent bias 3, and all higher bits of the byte are zero. Every encoding denotes a finite value: the
-/// largest finite value is `28`, the smallest positive normal value is `0.25`, the smallest positive subnormal value
-/// is `0.0625`, and negative zero is `0x20`. This microscaling format has no infinity and no NaN encoding, so
-/// infinities and values that round beyond `28` saturate to `±28`, while NaN inputs are rejected with a
-/// [`TypeError`]. Conversions round to nearest with ties to even, following
-/// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float6_e3m2fn).
+/// Conversion-only 6-bit floating-point array element representing [`DataType::F6E3M2FN`] values. Values occupy the low
+/// six bits of one storage byte, laid out as one sign bit, three exponent bits, and two mantissa bits with exponent
+/// bias 3, and all higher bits of the byte are zero. Every encoding denotes a finite value. The largest finite value
+/// is `28`, the smallest positive normal value is `0.25`, the smallest positive subnormal value is `0.0625`, and
+/// negative zero is `0x20`. This microscaling format has no infinity and no NaN encoding, so infinities and values
+/// that round beyond `28` saturate to `±28`, while NaN inputs are rejected with a [`TypeError`]. Conversions round
+/// to nearest with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float6_e3m2fn).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f6e3m2fn(u8);
 
-/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E3M4`] values.
-///
-/// Values fill one storage byte laid out as one sign bit, three exponent bits, and four mantissa bits with exponent
-/// bias 3. The largest finite value is `15.5`, the smallest positive normal value is `2^-2`, the smallest positive
-/// subnormal value is `2^-6`, and negative zero is `0x80`. This IEEE-style format reserves its all-ones exponent
-/// field: `0x70` and `0xf0` are the infinities, and any nonzero mantissa under that exponent is a NaN, whose canonical
-/// quiet encoding is `0x78` (`0xf8` when negative). Infinities and values that round beyond `15.5` therefore convert
-/// to `±∞`. Conversions round to nearest with ties to even, following
-/// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e3m4).
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E3M4`] values. Values fill one storage
+/// byte laid out as one sign bit, three exponent bits, and four mantissa bits with exponent bias 3. The largest finite
+/// value is `15.5`, the smallest positive normal value is `2^-2`, the smallest positive subnormal value is `2^-6`, and
+/// negative zero is `0x80`. This IEEE-style format reserves its all-ones exponent field. `0x70` and `0xf0` are the
+/// infinities, and any nonzero mantissa under that exponent is a NaN, whose canonical quiet encoding is `0x78` (`0xf8`
+/// when negative). Infinities and values that round beyond `15.5` therefore convert to `±∞`. Conversions round to
+/// nearest with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e3m4).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f8e3m4(u8);
 
-/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3`] values.
-///
-/// Values fill one storage byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent
-/// bias 7. The largest finite value is `240`, the smallest positive normal value is `2^-6`, the smallest positive
-/// subnormal value is `2^-9`, and negative zero is `0x80`. This IEEE-style format reserves its all-ones exponent
-/// field: `0x78` and `0xf8` are the infinities, and any nonzero mantissa under that exponent is a NaN, whose canonical
-/// quiet encoding is `0x7c` (`0xfc` when negative). Infinities and values that round beyond `240` therefore convert to
-/// `±∞`. Conversions round to nearest with ties to even, following
-/// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e4m3).
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3`] values. Values fill one storage
+/// byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent bias 7. The largest finite
+/// value is `240`, the smallest positive normal value is `2^-6`, the smallest positive subnormal value is `2^-9`, and
+/// negative zero is `0x80`. This IEEE-style format reserves its all-ones exponent field. `0x78` and `0xf8` are the
+/// infinities, and any nonzero mantissa under that exponent is a NaN, whose canonical quiet encoding is `0x7c` (`0xfc`
+/// when negative). Infinities and values that round beyond `240` therefore convert to `±∞`. Conversions round to
+/// nearest with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e4m3).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f8e4m3(u8);
 
-/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3FN`] values.
-///
-/// Values fill one storage byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent
-/// bias 7. The largest finite value is `448`, the smallest positive normal value is `2^-6`, the smallest positive
-/// subnormal value is `2^-9`, and negative zero is `0x80`. The format is finite: it has no infinity encoding, and its
-/// single NaN is the all-ones exponent and mantissa pattern `0x7f` (`0xff` when negative). Infinities and values that
-/// round beyond `448`, meaning past the midpoint `464` between `448` and the next formula step `480`, therefore
-/// convert to that NaN, carrying the input's sign. Conversions round to nearest with ties to even, following
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3FN`] values. Values fill one
+/// storage byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent bias 7. The largest
+/// finite value is `448`, the smallest positive normal value is `2^-6`, the smallest positive subnormal value is
+/// `2^-9`, and negative zero is `0x80`. The format is finite. It has no infinity encoding, and its single NaN is the
+/// all-ones exponent and mantissa pattern `0x7f` (`0xff` when negative). Infinities and values that round beyond `448`,
+/// meaning past the midpoint `464` between `448` and the next formula step `480`, therefore convert to that NaN,
+/// carrying the input's sign. Conversions round to nearest with ties to even, following
 /// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e4m3fn).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f8e4m3fn(u8);
 
-/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3FNUZ`] values.
-///
-/// Values fill one storage byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent
-/// bias 8. The largest finite value is `240`, the smallest positive normal value is `2^-7`, and the smallest positive
-/// subnormal value is `2^-10`. The format is finite with unsigned zero: it has no infinity encoding and no negative
-/// zero, because `0x80`, the pattern that would be negative zero, is its single NaN. Negative zero inputs therefore
-/// encode as positive zero, while infinities and values that round beyond `240` convert to that NaN. Conversions round
-/// to nearest with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e4m3fnuz).
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3FNUZ`] values. Values fill one
+/// storage byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent bias 8. The largest
+/// finite value is `240`, the smallest positive normal value is `2^-7`, and the smallest positive subnormal value is
+/// `2^-10`. The format is finite with unsigned zero. It has no infinity encoding and no negative zero, because `0x80`,
+/// the pattern that would be negative zero, is its single NaN. Negative zero inputs therefore encode as positive zero,
+/// while infinities and values that round beyond `240` convert to that NaN. Conversions round to nearest with ties to
+/// even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e4m3fnuz).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f8e4m3fnuz(u8);
 
-/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3B11FNUZ`] values.
-///
-/// Values fill one storage byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent
-/// bias 11, which trades range for precision near zero relative to [`f8e4m3fnuz`]. The largest finite value is `30`,
-/// the smallest positive normal value is `2^-10`, and the smallest positive subnormal value is `2^-13`. The format is
-/// finite with unsigned zero: it has no infinity encoding and no negative zero, because `0x80`, the pattern that would
-/// be negative zero, is its single NaN. Negative zero inputs therefore encode as positive zero, while infinities and
-/// values that round beyond `30` convert to that NaN. Conversions round to nearest with ties to even, following
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E4M3B11FNUZ`] values. Values fill one
+/// storage byte laid out as one sign bit, four exponent bits, and three mantissa bits with exponent bias 11, which
+/// trades range for precision near zero relative to [`f8e4m3fnuz`]. The largest finite value is `30`, the smallest
+/// positive normal value is `2^-10`, and the smallest positive subnormal value is `2^-13`. The format is finite with
+/// unsigned zero. It has no infinity encoding and no negative zero, because `0x80`, the pattern that would be negative
+/// zero, is its single NaN. Negative zero inputs therefore encode as positive zero, while infinities and values that
+/// round beyond `30` convert to that NaN. Conversions round to nearest with ties to even, following
 /// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e4m3b11fnuz).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f8e4m3b11fnuz(u8);
 
-/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E5M2`] values.
-///
-/// Values fill one storage byte laid out as one sign bit, five exponent bits, and two mantissa bits with exponent bias
-/// 15, which is the truncation of [`f16`](struct@f16) to eight bits. The largest finite value is `57344`, the smallest
-/// positive normal value is `2^-14`, the smallest positive subnormal value is `2^-16`, and negative zero is `0x80`.
-/// This IEEE-style format reserves its all-ones exponent field: `0x7c` and `0xfc` are the infinities, and any nonzero
-/// mantissa under that exponent is a NaN, whose canonical quiet encoding is `0x7e` (`0xfe` when negative). Infinities
-/// and values that round beyond `57344` therefore convert to `±∞`. Conversions round to nearest with ties to even,
-/// following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e5m2).
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E5M2`] values. Values fill one storage
+/// byte laid out as one sign bit, five exponent bits, and two mantissa bits with exponent bias 15, which is the
+/// truncation of [`f16`](struct@f16) to eight bits. The largest finite value is `57344`, the smallest positive normal
+/// value is `2^-14`, the smallest positive subnormal value is `2^-16`, and negative zero is `0x80`. This IEEE-style
+/// format reserves its all-ones exponent field. `0x7c` and `0xfc` are the infinities, and any nonzero mantissa under
+/// that exponent is a NaN, whose canonical quiet encoding is `0x7e` (`0xfe` when negative). Infinities and values that
+/// round beyond `57344` therefore convert to `±∞`. Conversions round to nearest with ties to even, following
+/// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e5m2).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f8e5m2(u8);
 
-/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E5M2FNUZ`] values.
-///
-/// Values fill one storage byte laid out as one sign bit, five exponent bits, and two mantissa bits with exponent bias
-/// 16. The largest finite value is `57344`, the smallest positive normal value is `2^-15`, and the smallest positive
-/// subnormal value is `2^-17`. The format is finite with unsigned zero: it has no infinity encoding and no negative
-/// zero, because `0x80`, the pattern that would be negative zero, is its single NaN. Negative zero inputs therefore
-/// encode as positive zero, while infinities and values that round beyond `57344` convert to that NaN. Conversions
-/// round to nearest with ties to even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e5m2fnuz).
+/// Conversion-only 8-bit floating-point array element representing [`DataType::F8E5M2FNUZ`] values. Values fill one
+/// storage byte laid out as one sign bit, five exponent bits, and two mantissa bits with exponent bias 16. The largest
+/// finite value is `57344`, the smallest positive normal value is `2^-15`, and the smallest positive subnormal value is
+/// `2^-17`. The format is finite with unsigned zero: it has no infinity encoding and no negative zero, because `0x80`,
+/// the pattern that would be negative zero, is its single NaN. Negative zero inputs therefore encode as positive zero,
+/// while infinities and values that round beyond `57344` convert to that NaN. Conversions round to nearest with ties to
+/// even, following [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e5m2fnuz).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f8e5m2fnuz(u8);
 
 /// Conversion-only 8-bit floating-point array element representing [`DataType::F8E8M0FNU`] values, the block scale
-/// factors of the microscaling formats.
-///
-/// The whole storage byte is an eight-bit exponent field with bias 127 and there are no sign or mantissa bits, so
-/// every encoding `e` in `0x00..=0xfe` denotes exactly `2^(e - 127)`, spanning `2^-127` through `2^127`, and `0xff` is
-/// the single NaN. The format has no zero, no negative value, and no infinity, so [`f8e8m0fnu::MIN`] is the smallest
-/// positive value `2^-127` rather than a negative one, zero inputs are rejected with a [`TypeError`], and negative,
-/// infinite, and overflowing inputs convert to NaN. Conversions round to nearest with ties to even, so `1.5` and `3`
-/// both round to `2` while `6` rounds to `8`, following
+/// factors of the microscaling formats. The whole storage byte is an eight-bit exponent field with bias 127 and there
+/// are no sign or mantissa bits, so every encoding `e` in `0x00..=0xfe` denotes exactly `2^(e - 127)`, spanning
+/// `2^-127` through `2^127`, and `0xff` is the single NaN. The format has no zero, no negative value, and no infinity,
+/// so [`f8e8m0fnu::MIN`] is the smallest positive value `2^-127` rather than a negative one, zero inputs are rejected
+/// with a [`TypeError`], and negative, infinite, and overflowing inputs convert to NaN. Conversions round to nearest
+/// with ties to even, so `1.5` and `3` both round to `2` while `6` rounds to `8`, following
 /// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e8m0fnu).
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f8e8m0fnu(u8);
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Implements the shared conversion API and the numeric comparison semantics of a low-precision floating-point newtype
 // that wraps its storage byte, driving every conversion through the shared `FloatFormat` engine.
