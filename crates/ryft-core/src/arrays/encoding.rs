@@ -1770,50 +1770,69 @@ mod tests {
     fn test_encode_and_decode_elements_with_layouts() {
         let shape = Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]);
         let values = [1u8, 2, 3, 4, 5, 6];
-        let cases = [
-            (ArrayType::new(DataType::U8, shape.clone()), vec![1, 2, 3, 4, 5, 6]),
-            // Explicit layouts that reproduce dense row-major storage follow the bulk dense encoding paths.
-            (
-                ArrayType::new(DataType::U8, shape.clone())
-                    .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1]))),
-                vec![1, 2, 3, 4, 5, 6],
-            ),
-            (
-                ArrayType::new(DataType::U8, shape.clone())
-                    .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()))),
-                vec![1, 2, 3, 4, 5, 6],
-            ),
-            (
-                ArrayType::new(DataType::U8, shape.clone())
-                    .with_layout(Layout::Strided(StridedLayout::new(vec![4, 1]))),
-                vec![1, 2, 3, 0, 4, 5, 6],
-            ),
-            (
-                ArrayType::new(DataType::U8, shape.clone())
-                    .with_layout(Layout::Strided(StridedLayout::new(vec![-4, 1]))),
-                vec![4, 5, 6, 0, 1, 2, 3],
-            ),
-            (
-                ArrayType::new(DataType::U8, shape.clone())
-                    .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()))),
-                vec![1, 4, 2, 5, 3, 6],
-            ),
-            (
-                ArrayType::new(DataType::U8, shape).with_layout(Layout::Tiled(TiledLayout::new(
-                    vec![1, 0],
-                    vec![Tile::new(vec![TileDimension::Sized(2), TileDimension::Sized(2)])],
-                ))),
-                vec![1, 2, 4, 5, 3, 0, 6, 0],
-            ),
-        ];
 
-        for (r#type, expected_bytes) in cases {
-            let bytes = encode_elements(&r#type, &values).unwrap();
-            assert_eq!(bytes, expected_bytes);
-            assert_eq!(bytes.len(), ArrayAddressing::new(r#type.clone()).unwrap().storage_byte_len());
-            assert_eq!(decode_elements::<u8>(&r#type, &bytes), Ok(values.to_vec()));
-            assert_eq!(decode_logical_bytes(&r#type, &bytes), Ok(values.to_vec()));
-        }
+        // Layout-free arrays use dense row-major physical storage.
+        let dense = ArrayType::new(DataType::U8, shape.clone());
+        let dense_bytes = encode_elements(&dense, &values).unwrap();
+        assert_eq!(dense_bytes, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(dense_bytes.len(), ArrayAddressing::new(dense.clone()).unwrap().storage_byte_len());
+        assert_eq!(decode_elements::<u8>(&dense, &dense_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&dense, &dense_bytes), Ok(values.to_vec()));
+
+        // Explicit strided and tiled layouts that reproduce dense row-major storage follow the same bulk paths.
+        let dense_strided =
+            ArrayType::new(DataType::U8, shape.clone()).with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])));
+        let dense_strided_bytes = encode_elements(&dense_strided, &values).unwrap();
+        assert_eq!(dense_strided_bytes, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(dense_strided_bytes.len(), ArrayAddressing::new(dense_strided.clone()).unwrap().storage_byte_len(),);
+        assert_eq!(decode_elements::<u8>(&dense_strided, &dense_strided_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&dense_strided, &dense_strided_bytes), Ok(values.to_vec()));
+
+        let dense_tiled = ArrayType::new(DataType::U8, shape.clone())
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new())));
+        let dense_tiled_bytes = encode_elements(&dense_tiled, &values).unwrap();
+        assert_eq!(dense_tiled_bytes, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(dense_tiled_bytes.len(), ArrayAddressing::new(dense_tiled.clone()).unwrap().storage_byte_len(),);
+        assert_eq!(decode_elements::<u8>(&dense_tiled, &dense_tiled_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&dense_tiled, &dense_tiled_bytes), Ok(values.to_vec()));
+
+        // A positive outer stride leaves a zero-valued hole between the two logical rows.
+        let strided =
+            ArrayType::new(DataType::U8, shape.clone()).with_layout(Layout::Strided(StridedLayout::new(vec![4, 1])));
+        let strided_bytes = encode_elements(&strided, &values).unwrap();
+        assert_eq!(strided_bytes, [1, 2, 3, 0, 4, 5, 6]);
+        assert_eq!(strided_bytes.len(), ArrayAddressing::new(strided.clone()).unwrap().storage_byte_len());
+        assert_eq!(decode_elements::<u8>(&strided, &strided_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&strided, &strided_bytes), Ok(values.to_vec()));
+
+        // A negative outer stride reverses the physical row order while preserving logical row-major decoding.
+        let reversed =
+            ArrayType::new(DataType::U8, shape.clone()).with_layout(Layout::Strided(StridedLayout::new(vec![-4, 1])));
+        let reversed_bytes = encode_elements(&reversed, &values).unwrap();
+        assert_eq!(reversed_bytes, [4, 5, 6, 0, 1, 2, 3]);
+        assert_eq!(reversed_bytes.len(), ArrayAddressing::new(reversed.clone()).unwrap().storage_byte_len());
+        assert_eq!(decode_elements::<u8>(&reversed, &reversed_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&reversed, &reversed_bytes), Ok(values.to_vec()));
+
+        // A tiled permutation stores the first logical axis as the physically minor dimension.
+        let permuted = ArrayType::new(DataType::U8, shape.clone())
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
+        let permuted_bytes = encode_elements(&permuted, &values).unwrap();
+        assert_eq!(permuted_bytes, [1, 4, 2, 5, 3, 6]);
+        assert_eq!(permuted_bytes.len(), ArrayAddressing::new(permuted.clone()).unwrap().storage_byte_len());
+        assert_eq!(decode_elements::<u8>(&permuted, &permuted_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&permuted, &permuted_bytes), Ok(values.to_vec()));
+
+        // A 2-by-2 tile pads the final logical column with zero-valued physical elements.
+        let padded = ArrayType::new(DataType::U8, shape).with_layout(Layout::Tiled(TiledLayout::new(
+            vec![1, 0],
+            vec![Tile::new(vec![TileDimension::Sized(2), TileDimension::Sized(2)])],
+        )));
+        let padded_bytes = encode_elements(&padded, &values).unwrap();
+        assert_eq!(padded_bytes, [1, 2, 4, 5, 3, 0, 6, 0]);
+        assert_eq!(padded_bytes.len(), ArrayAddressing::new(padded.clone()).unwrap().storage_byte_len());
+        assert_eq!(decode_elements::<u8>(&padded, &padded_bytes), Ok(values.to_vec()));
+        assert_eq!(decode_logical_bytes(&padded, &padded_bytes), Ok(values.to_vec()));
     }
 
     #[test]
