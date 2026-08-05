@@ -2245,14 +2245,14 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
 
 ### Phase 9: module and public API cleanup
 
-- [ ] Confirm the `S4` typed `Custom`/`DimensionError` recovery behavior and canonical invalid projection diagnostics
+- [x] Confirm the `S4` typed `Custom`/`DimensionError` recovery behavior and canonical invalid projection diagnostics
       remain intact;
       do not mix another error-representation migration into the module move.
 - [x] Core dimension operation semantics are split from the eager host representation.
 - [x] Dimension operation semantics live in `operations::dimensions`.
 - [x] `DimensionValue`, its closed eager operation family, and concrete capability implementations remain under backend
       ownership.
-- [ ] Re-evaluate the historical `RuntimeDimension`/`RuntimeShape` item: neither identifier exists in the current
+- [x] Re-evaluate the historical `RuntimeDimension`/`RuntimeShape` item: neither identifier exists in the current
       tree. Confirm that the public first-class dimension capabilities cover the intended ergonomics; do not recreate
       wrapper types merely to satisfy the old module-move wording. If a neutral public alias/API is still needed, add
       only the smallest capability-based surface after the operation and transform families settle.
@@ -3738,3 +3738,20 @@ hygiene passed. A follow-up audit documented and pinned that the proof bit inten
 hashing, that the homogeneous instantiation always stores `false`, and that mixed-to-homogeneous-to-mixed conversion
 soundly loses provenness. The only production mixed-to-homogeneous conversion is the terminal delegation into the
 static homogeneous transposition rule; it never round-trips into a mixed program.
+
+### Phase 9 entry audits: error recovery and public dimension ergonomics (2026-08-04)
+
+The S4 error contract remains intact. `TypeError::Custom` stores an equality- and hash-preserving `CustomError`, the
+dimension-owned `From<DimensionError> for TypeError` conversion uses that path, and callers recover the original typed
+error with `TypeError::downcast_custom`. Array/dimension type and value projection failures remain the canonical
+`TypeError::Invalid` messages `expected array type but got dimension type` and `expected dimension type but got array
+type`; no production path branches on a redundant projection-specific error variant.
+
+The historical `RuntimeDimension` and `RuntimeShape` wrappers are deliberately retired rather than recreated. Their
+useful behavior is now supplied directly by ordinary first-class SSA values and capability traits: `DimensionSize`
+produces a dimension member, fallible dimension arithmetic stages the corresponding dimension operations,
+`DimensionRequirement` stages checked constraints, dimension/scalar gateways are explicit, and reshape, broadcast,
+slice, constructors, collectives, and transforms consume those same values. Rank remains statically represented by
+ordinary Rust parameter structure and array types, so a second shape wrapper would add neither authority nor safety;
+it would only duplicate storage-sum projection and operation APIs. Focused typed-error, type/value-projection, and
+public dimension-capability tests passed.
