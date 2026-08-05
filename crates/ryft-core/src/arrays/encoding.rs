@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use half::{bf16, f16};
 use num_complex::Complex;
 
-use crate::arrays::ArrayAddressing;
+use crate::arrays::addressing::ArrayAddressing;
 use crate::programs::ProgramError;
 use crate::programs::types::TypeError;
 use crate::types::{ArrayType, DataType};
@@ -18,8 +18,8 @@ use crate::types::{ArrayType, DataType};
 ///   - Integers encode as their little-endian two's-complement bytes.
 ///   - Sub-byte integers (i.e., [`i1`], [`i2`], [`i4`], [`u1`], [`u2`], and [`u4`]) encode as two's complement in the
 ///     low bits of one byte, with all higher bits set to zero.
-///   - Floating-point values (i.e., [`bf16`], [`f16`], [`f32`], and [`f64`]) encode as their little-endian IEEE bit
-///     patterns, preserving signed zeros and NaN payload bits exactly.
+///   - Floating-point values (i.e., [`bf16`], [`f16`](struct@f16), [`f32`], and [`f64`]) encode as their little-endian
+///     IEEE bit patterns, preserving signed zeros and NaN payload bits exactly.
 ///   - Low-precision floating-point values (e.g., [`f8e4m3fn`] and [`f4e2m1fn`]) encode as their one-byte sign,
 ///     exponent, and mantissa bit patterns, which occupy only the low bits of that byte for the four- and six-bit
 ///     formats, with all higher bits set to zero.
@@ -34,12 +34,13 @@ use crate::types::{ArrayType, DataType};
 /// write bytes that the checked storage boundary rejects, or worse, reinterprets with a different meaning. Sub-byte
 /// integers, which have no corresponding Rust type of their own, are represented by the checked [`i1`], [`i2`], [`i4`],
 /// [`u1`], [`u2`], and [`u4`] newtypes, which own the two's-complement-in-the-low-bits encoding described above (the
-/// unpacked one-element-per-byte representation that [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes) establishes for
-/// NumPy and JAX). The low-precision floating-point formats of the
-/// [StableHLO type specification](https://openxla.org/stablehlo/spec#types) are likewise represented by the
-/// conversion-only [`f4e2m1fn`], [`f6e2m3fn`], [`f6e3m2fn`], [`f8e3m4`], [`f8e4m3`], [`f8e4m3fn`], [`f8e4m3fnuz`],
-/// [`f8e4m3b11fnuz`], [`f8e5m2`], [`f8e5m2fnuz`], and [`f8e8m0fnu`] newtypes, which own their exact bit layouts along
-/// with their rounding conversions to and from [`f32`] and [`f64`].
+/// padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also
+/// use). Low-precision floating-point formats are likewise represented by the conversion-only [`f4e2m1fn`],
+/// [`f6e2m3fn`], [`f6e3m2fn`], [`f8e3m4`], [`f8e4m3`], [`f8e4m3fn`], [`f8e4m3fnuz`], [`f8e4m3b11fnuz`], [`f8e5m2`],
+/// [`f8e5m2fnuz`], and [`f8e8m0fnu`] newtypes, whose exact bit layouts follow the
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html) data-type standard and whose
+/// rounding conversions to and from [`f32`] and [`f64`] follow [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes),
+/// the reference implementation of these formats.
 pub trait ArrayElement: private::Codec {}
 
 impl<T: private::Codec> ArrayElement for T {}
@@ -170,9 +171,9 @@ impl private::Codec for Complex<f64> {
 ///
 /// The value is stored as two's complement in the low bit of one storage byte, with all higher bits set to zero, so
 /// `-1` is stored as the byte `0x01`. The wrapped native value stays sign-extended, so [`i1::value`] returns `-1`
-/// rather than `1` for that byte. This unpacked one-element-per-byte representation is the
-/// [`ml_dtypes` standard](https://github.com/jax-ml/ml_dtypes#int1-uint1-int2-int4-uint2-and-uint4) used by NumPy
-/// and JAX.
+/// rather than `1` for that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct i1(i8);
@@ -181,9 +182,9 @@ pub struct i1(i8);
 ///
 /// The value is stored as two's complement in the low two bits of one storage byte, with all higher bits set to zero,
 /// so `-1` is stored as the byte `0x03`. The wrapped native value stays sign-extended, so [`i2::value`] returns `-1`
-/// rather than `3` for that byte. This unpacked one-element-per-byte representation is the
-/// [`ml_dtypes` standard](https://github.com/jax-ml/ml_dtypes#int1-uint1-int2-int4-uint2-and-uint4) used by NumPy
-/// and JAX.
+/// rather than `3` for that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct i2(i8);
@@ -192,9 +193,9 @@ pub struct i2(i8);
 ///
 /// The value is stored as two's complement in the low four bits of one storage byte, with all higher bits set to zero,
 /// so `-1` is stored as the byte `0x0f`. The wrapped native value stays sign-extended, so [`i4::value`] returns `-1`
-/// rather than `15` for that byte. This unpacked one-element-per-byte representation is the
-/// [`ml_dtypes` standard](https://github.com/jax-ml/ml_dtypes#int1-uint1-int2-int4-uint2-and-uint4) used by NumPy
-/// and JAX.
+/// rather than `15` for that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct i4(i8);
@@ -202,9 +203,9 @@ pub struct i4(i8);
 /// Checked unsigned 1-bit integer array element representing [`DataType::U1`] values in the range `0..=1`.
 ///
 /// The value is stored in the low bit of one storage byte, with all higher bits set to zero. This unpacked
-/// one-element-per-byte representation is the
-/// [`ml_dtypes` standard](https://github.com/jax-ml/ml_dtypes#int1-uint1-int2-int4-uint2-and-uint4) used by NumPy
-/// and JAX.
+/// one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct u1(u8);
@@ -212,9 +213,9 @@ pub struct u1(u8);
 /// Checked unsigned 2-bit integer array element representing [`DataType::U2`] values in the range `0..=3`.
 ///
 /// The value is stored in the low two bits of one storage byte, with all higher bits set to zero. This unpacked
-/// one-element-per-byte representation is the
-/// [`ml_dtypes` standard](https://github.com/jax-ml/ml_dtypes#int1-uint1-int2-int4-uint2-and-uint4) used by NumPy
-/// and JAX.
+/// one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct u2(u8);
@@ -222,9 +223,9 @@ pub struct u2(u8);
 /// Checked unsigned 4-bit integer array element representing [`DataType::U4`] values in the range `0..=15`.
 ///
 /// The value is stored in the low four bits of one storage byte, with all higher bits set to zero. This unpacked
-/// one-element-per-byte representation is the
-/// [`ml_dtypes` standard](https://github.com/jax-ml/ml_dtypes#int1-uint1-int2-int4-uint2-and-uint4) used by NumPy
-/// and JAX.
+/// one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct u4(u8);
