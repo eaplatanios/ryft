@@ -165,67 +165,53 @@ impl private::Codec for Complex<f64> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Checked signed 1-bit integer array element representing [`DataType::I1`] values in the range `-1..=0`.
-///
-/// The value is stored as two's complement in the low bit of one storage byte, with all higher bits set to zero, so
-/// `-1` is stored as the byte `0x01`. The wrapped native value stays sign-extended, so [`i1::value`] returns `-1`
-/// rather than `1` for that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
-/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
-/// which NumPy and JAX also use.
+/// Checked signed 1-bit integer array element representing [`DataType::I1`] values in the range `-1..=0`. The value is
+/// stored as two's complement in the low bit of one storage byte, with all higher bits set to zero, so `-1` is stored
+/// as the byte `0x01`. The wrapped native value stays sign-extended, so [`i1::value`] returns `-1` rather than `1` for
+/// that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct i1(i8);
 
-/// Checked signed 2-bit integer array element representing [`DataType::I2`] values in the range `-2..=1`.
-///
-/// The value is stored as two's complement in the low two bits of one storage byte, with all higher bits set to zero,
-/// so `-1` is stored as the byte `0x03`. The wrapped native value stays sign-extended, so [`i2::value`] returns `-1`
-/// rather than `3` for that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
-/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
-/// which NumPy and JAX also use.
+/// Checked signed 2-bit integer array element representing [`DataType::I2`] values in the range `-2..=1`. The value is
+/// stored as two's complement in the low two bits of one storage byte, with all higher bits set to zero, so `-1` is
+/// stored as the byte `0x03`. The wrapped native value stays sign-extended, so [`i2::value`] returns `-1` rather than
+/// `3` for that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct i2(i8);
 
-/// Checked signed 4-bit integer array element representing [`DataType::I4`] values in the range `-8..=7`.
-///
-/// The value is stored as two's complement in the low four bits of one storage byte, with all higher bits set to zero,
-/// so `-1` is stored as the byte `0x0f`. The wrapped native value stays sign-extended, so [`i4::value`] returns `-1`
-/// rather than `15` for that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
-/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
-/// which NumPy and JAX also use.
+/// Checked signed 4-bit integer array element representing [`DataType::I4`] values in the range `-8..=7`. The value is
+/// stored as two's complement in the low four bits of one storage byte, with all higher bits set to zero, so `-1` is
+/// stored as the byte `0x0f`. The wrapped native value stays sign-extended, so [`i4::value`] returns `-1` rather than
+/// `15` for that byte. This unpacked one-element-per-byte representation is the padded sub-byte layout of
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct i4(i8);
 
-/// Checked unsigned 1-bit integer array element representing [`DataType::U1`] values in the range `0..=1`.
-///
-/// The value is stored in the low bit of one storage byte, with all higher bits set to zero. This unpacked
-/// one-element-per-byte representation is the padded sub-byte layout of
-/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// Checked unsigned 1-bit integer array element representing [`DataType::U1`] values in the range `0..=1`. The value
+/// is stored in the low bit of one storage byte, with all higher bits set to zero. This unpacked one-element-per-byte
+/// representation is the padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
 /// which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct u1(u8);
 
-/// Checked unsigned 2-bit integer array element representing [`DataType::U2`] values in the range `0..=3`.
-///
-/// The value is stored in the low two bits of one storage byte, with all higher bits set to zero. This unpacked
-/// one-element-per-byte representation is the padded sub-byte layout of
-/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
+/// Checked unsigned 2-bit integer array element representing [`DataType::U2`] values in the range `0..=3`. The value is
+/// stored in the low two bits of one storage byte, with all higher bits set to zero. This unpacked one-element-per-byte
+/// representation is the padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
 /// which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct u2(u8);
 
 /// Checked unsigned 4-bit integer array element representing [`DataType::U4`] values in the range `0..=15`.
-///
 /// The value is stored in the low four bits of one storage byte, with all higher bits set to zero. This unpacked
 /// one-element-per-byte representation is the padded sub-byte layout of
-/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
-/// which NumPy and JAX also use.
+/// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html), which NumPy and JAX also use.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct u4(u8);
@@ -241,14 +227,15 @@ macro_rules! impl_signed_sub_byte_array_element {
             /// Largest representable value.
             pub const MAX: Self = Self((1i8 << ($bit_count - 1)) - 1);
 
-            /// Mask selecting the storage bits that hold the two's complement value.
+            /// Bit mask selecting the storage bits that hold the two's complement value.
             const BIT_MASK: u8 = (1u8 << $bit_count) - 1;
 
             /// Creates a new element holding `value`, which must lie within the representable range.
             pub fn new(value: i8) -> Result<Self, TypeError> {
                 if value < Self::MIN.0 || value > Self::MAX.0 {
                     return Err(TypeError::invalid(format!(
-                        "value {value} is out of range for {} array elements",
+                        "value {} is out of range for {} array elements",
+                        value,
                         DataType::$data_type,
                     )));
                 }
@@ -261,15 +248,17 @@ macro_rules! impl_signed_sub_byte_array_element {
                 self.0
             }
 
-            /// Creates a new element from one storage byte whose low bits hold a two's complement value. All higher
-            /// bits must be zero.
+            /// Creates a new element from one storage byte whose low bits hold a two's complement value.
+            /// All higher bits must be zero.
             pub fn from_bits(bits: u8) -> Result<Self, TypeError> {
                 if bits & !Self::BIT_MASK != 0 {
                     return Err(TypeError::invalid(format!(
-                        "byte {bits:#04x} is not a valid {} array-element encoding",
+                        "byte {:#04x} is not a valid {} array-element encoding",
+                        bits,
                         DataType::$data_type,
                     )));
                 }
+
                 // Shift the value up to the sign bit and back down again to sign-extend it arithmetically.
                 Ok(Self(((bits << (8 - $bit_count)) as i8) >> (8 - $bit_count)))
             }
@@ -283,6 +272,7 @@ macro_rules! impl_signed_sub_byte_array_element {
         }
 
         impl Display for $type {
+            #[inline]
             fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
                 write!(formatter, "{}", self.0)
             }
@@ -317,14 +307,15 @@ macro_rules! impl_unsigned_sub_byte_array_element {
             /// Largest representable value.
             pub const MAX: Self = Self(Self::BIT_MASK);
 
-            /// Mask selecting the storage bits that hold the value.
+            /// Bit mask selecting the storage bits that hold the value.
             const BIT_MASK: u8 = (1u8 << $bit_count) - 1;
 
             /// Creates a new element holding `value`, which must lie within the representable range.
             pub fn new(value: u8) -> Result<Self, TypeError> {
                 if value > Self::MAX.0 {
                     return Err(TypeError::invalid(format!(
-                        "value {value} is out of range for {} array elements",
+                        "value {} is out of range for {} array elements",
+                        value,
                         DataType::$data_type,
                     )));
                 }
@@ -341,7 +332,8 @@ macro_rules! impl_unsigned_sub_byte_array_element {
             pub fn from_bits(bits: u8) -> Result<Self, TypeError> {
                 if bits & !Self::BIT_MASK != 0 {
                     return Err(TypeError::invalid(format!(
-                        "byte {bits:#04x} is not a valid {} array-element encoding",
+                        "byte {:#04x} is not a valid {} array-element encoding",
+                        bits,
                         DataType::$data_type,
                     )));
                 }
@@ -356,6 +348,7 @@ macro_rules! impl_unsigned_sub_byte_array_element {
         }
 
         impl Display for $type {
+            #[inline]
             fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
                 write!(formatter, "{}", self.0)
             }
@@ -385,6 +378,8 @@ impl_signed_sub_byte_array_element!(i4, I4, 4);
 impl_unsigned_sub_byte_array_element!(u1, U1, 1);
 impl_unsigned_sub_byte_array_element!(u2, U2, 2);
 impl_unsigned_sub_byte_array_element!(u4, U4, 4);
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Special-value policy of a low-precision floating-point format. The class fixes which bit patterns a format
 /// reserves for infinities and NaNs, whether it has a negative zero, and how a conversion whose rounded result falls
