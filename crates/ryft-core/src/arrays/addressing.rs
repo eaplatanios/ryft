@@ -47,6 +47,15 @@ impl ArrayAddressing {
         self.r#type.element_count().unwrap().unwrap()
     }
 
+    /// Returns the static size of the provided array axis.
+    #[inline]
+    fn dimension(&self, axis: usize) -> usize {
+        match self.r#type.shape().dimensions()[axis] {
+            Dimension::Static(dimension) => dimension,
+            Dimension::Dynamic(_) => unreachable!(),
+        }
+    }
+
     /// Returns the number of bytes occupied by the encoded logical elements, excluding layout holes and padding.
     #[inline]
     pub fn logical_byte_len(&self) -> usize {
@@ -110,34 +119,17 @@ impl ArrayAddressing {
         Ok(ArrayIndexRange { elements, bytes })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-    
-    /// Constructs a prevalidated iterator over a rectangular, potentially strided logical selection.
-    pub(crate) fn ranges<'a>(
-        &'a self,
-        starts: &'a [usize],
-        sizes: &'a [usize],
-        strides: &'a [usize],
-    ) -> Result<ArrayIndexRanges<'a>, ProgramError> {
-        ArrayIndexRanges::new(self, starts, sizes, Some(strides))
-    }
-
-    /// Constructs a prevalidated iterator over a contiguous rectangular logical selection.
-    pub(crate) fn contiguous_ranges<'a>(
-        &'a self,
-        starts: &'a [usize],
-        sizes: &'a [usize],
-    ) -> Result<ArrayIndexRanges<'a>, ProgramError> {
-        ArrayIndexRanges::new(self, starts, sizes, None)
-    }
-
-    /// Returns the static size of the provided array axis.
+    /// Returns an [`Iterator`] over the contiguous storage [`ArrayIndexRange`] covered by a multidimensional slice.
+    /// `starts` and `sizes` define the slice along each axis. `strides` optionally specifies the step along each axis.
+    /// Passing [`None`] for `strides` will result in using a stride of one for every axis.
     #[inline]
-    fn dimension(&self, axis: usize) -> usize {
-        match self.r#type.shape().dimensions()[axis] {
-            Dimension::Static(dimension) => dimension,
-            Dimension::Dynamic(_) => unreachable!(),
-        }
+    pub fn ranges<'a>(
+        &'a self,
+        starts: &'a [usize],
+        sizes: &'a [usize],
+        strides: Option<&'a [usize]>,
+    ) -> Result<ArrayIndexRanges<'a>, ProgramError> {
+        ArrayIndexRanges::new(self, starts, sizes, strides)
     }
 
     /// Returns the byte width of one element of `data_type`.
@@ -172,20 +164,33 @@ impl ArrayAddressing {
     }
 }
 
-/// One contiguous logical element range and its corresponding physical byte range.
+/// One contiguous logical element range in an array and its corresponding physical byte range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArrayIndexRange {
     /// Contiguous flat logical element range.
-    pub(crate) elements: Range<usize>,
+    elements: Range<usize>,
 
     /// Physical byte range containing `elements`.
-    pub(crate) bytes: Range<usize>,
+    bytes: Range<usize>,
 }
 
-/// Allocation-free iterator over maximal contiguous ranges in one prevalidated logical array selection.
-///
-/// The iterator borrows its selection metadata and represents its current position as one mixed-radix ordinal. It
-/// therefore allocates no coordinate or stride vectors and performs no fallible validation while iterating.
+impl ArrayIndexRange {
+    /// Returns the contiguous flat logical element range.
+    #[inline]
+    pub fn elements(&self) -> Range<usize> {
+        self.elements.clone()
+    }
+
+    /// Returns the physical byte range containing [`Self::elements`].
+    #[inline]
+    pub fn bytes(&self) -> Range<usize> {
+        self.bytes.clone()
+    }
+}
+
+/// Allocation-free [`Iterator`] over contiguous [`ArrayIndexRange`]s in one logical array selection. The iterator
+/// borrows its selection metadata and represents its current position as one mixed-radix ordinal. It therefore
+/// allocates no coordinate or stride vectors and performs no fallible validation while iterating.
 #[derive(Clone, Debug)]
 pub struct ArrayIndexRanges<'a> {
     /// Addressing used to map each emitted logical range to physical storage.
@@ -319,8 +324,27 @@ impl<'a> ArrayIndexRanges<'a> {
         })
     }
 
+    /// Returns the [`ArrayAddressing`] used to map the emitted logical ranges to physical storage.
+    #[inline]
+    pub fn addressing(&self) -> &ArrayAddressing {
+        self.addressing
+    }
+
+    /// Returns the number of selected coordinates along each logical axis.
+    #[inline]
+    pub fn sizes(&self) -> &[usize] {
+        self.sizes
+    }
+
+    /// Returns the distance between selected coordinates, or [`None`] when every stride is one.
+    #[inline]
+    pub fn strides(&self) -> Option<&[usize]> {
+        self.strides
+    }
+
     /// Returns the total number of selected logical elements.
-    pub(crate) fn element_count(&self) -> usize {
+    #[inline]
+    pub fn element_count(&self) -> usize {
         self.prefix_count * self.run_length
     }
 }
@@ -384,7 +408,9 @@ mod tests {
         assert_eq!(addressing.storage_byte_len(), 24);
         assert_eq!(addressing.index(&[0, 0]), Ok(0));
         assert_eq!(addressing.index(&[1, 2]), Ok(5));
-        assert_eq!(addressing.range(1..4), Ok(ArrayIndexRange { elements: 1..4, bytes: 4..16 }),);
+        let range = addressing.range(1..4).unwrap();
+        assert_eq!(range.elements(), 1..4);
+        assert_eq!(range.bytes(), 4..16);
 
         // Scalar and empty shapes have well-defined addressing, including empty shapes whose irrelevant suffix
         // products would overflow an ordinary row-major-stride calculation.
@@ -411,12 +437,12 @@ mod tests {
         assert!(matches!(
             addressing.index(&[0]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "dense array index rank 1 does not match array rank 2",
+                if message == "array index rank 1 does not match array rank 2",
         ));
         assert!(matches!(
             addressing.index(&[2, 0]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "dense array index 2 on axis 0 is out of bounds for dimension size 2",
+                if message == "array index 2 on axis 0 is out of bounds for dimension size 2",
         ));
         assert!(matches!(
             addressing.range(4..3),
@@ -496,12 +522,14 @@ mod tests {
         let addressing = ArrayAddressing::new(array_type(DataType::F32, &[3, 4])).unwrap();
 
         // A complete selection coalesces into one range, while a partial innermost dimension emits one range per row.
+        let ranges = addressing.ranges(&[0, 0], &[3, 4], Some(&[1, 1])).unwrap();
+        assert!(std::ptr::eq(ranges.addressing(), &addressing));
+        assert_eq!(ranges.sizes(), &[3, 4]);
+        assert_eq!(ranges.strides(), Some([1, 1].as_slice()));
+        assert_eq!(ranges.element_count(), 12);
+        assert_eq!(ranges.collect::<Vec<_>>(), vec![ArrayIndexRange { elements: 0..12, bytes: 0..48 }],);
         assert_eq!(
-            addressing.ranges(&[0, 0], &[3, 4], &[1, 1]).unwrap().collect::<Vec<_>>(),
-            vec![ArrayIndexRange { elements: 0..12, bytes: 0..48 }],
-        );
-        assert_eq!(
-            addressing.ranges(&[0, 1], &[3, 2], &[1, 1]).unwrap().collect::<Vec<_>>(),
+            addressing.ranges(&[0, 1], &[3, 2], Some(&[1, 1])).unwrap().collect::<Vec<_>>(),
             vec![
                 ArrayIndexRange { elements: 1..3, bytes: 4..12 },
                 ArrayIndexRange { elements: 5..7, bytes: 20..28 },
@@ -511,11 +539,11 @@ mod tests {
 
         // A strided outer dimension retains contiguous rows; a strided inner dimension emits individual elements.
         assert_eq!(
-            addressing.ranges(&[0, 0], &[2, 4], &[2, 1]).unwrap().collect::<Vec<_>>(),
+            addressing.ranges(&[0, 0], &[2, 4], Some(&[2, 1])).unwrap().collect::<Vec<_>>(),
             vec![ArrayIndexRange { elements: 0..4, bytes: 0..16 }, ArrayIndexRange { elements: 8..12, bytes: 32..48 },],
         );
         assert_eq!(
-            addressing.ranges(&[0, 0], &[2, 2], &[1, 2]).unwrap().collect::<Vec<_>>(),
+            addressing.ranges(&[0, 0], &[2, 2], Some(&[1, 2])).unwrap().collect::<Vec<_>>(),
             vec![
                 ArrayIndexRange { elements: 0..1, bytes: 0..4 },
                 ArrayIndexRange { elements: 2..3, bytes: 8..12 },
@@ -527,33 +555,33 @@ mod tests {
         // Rank-zero selections contain one element, while any zero selection size yields no ranges.
         let scalar = ArrayAddressing::new(ArrayType::scalar(DataType::F32)).unwrap();
         assert_eq!(
-            scalar.contiguous_ranges(&[], &[]).unwrap().collect::<Vec<_>>(),
+            scalar.ranges(&[], &[], None).unwrap().collect::<Vec<_>>(),
             vec![ArrayIndexRange { elements: 0..1, bytes: 0..4 }],
         );
         assert_eq!(
-            addressing.ranges(&[3, 0], &[0, 4], &[1, 1]).unwrap().collect::<Vec<_>>(),
+            addressing.ranges(&[3, 0], &[0, 4], Some(&[1, 1])).unwrap().collect::<Vec<_>>(),
             Vec::<ArrayIndexRange>::new(),
         );
 
         // Invalid selection metadata is rejected completely before iteration begins.
         assert!(matches!(
-            addressing.ranges(&[0], &[1, 1], &[1, 1]),
+            addressing.ranges(&[0], &[1, 1], Some(&[1, 1])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "dense array selection for rank 2 requires 2 starts, sizes, and strides but got 1, 2, and 2",
         ));
         assert!(matches!(
-            addressing.ranges(&[0, 0], &[1, 1], &[1, 0]),
+            addressing.ranges(&[0, 0], &[1, 1], Some(&[1, 0])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "dense array selection stride must be positive on axis 1",
         ));
         assert!(matches!(
-            addressing.ranges(&[0, 3], &[1, 2], &[1, 1]),
+            addressing.ranges(&[0, 3], &[1, 2], Some(&[1, 1])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "dense array selection reaches index 4 on axis 1, past dimension size 4",
         ));
         let zero_width = ArrayAddressing::new(array_type(DataType::Zero, &[usize::MAX])).unwrap();
         assert!(matches!(
-            zero_width.ranges(&[0], &[usize::MAX], &[2]),
+            zero_width.ranges(&[0], &[usize::MAX], Some(&[2])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "dense array selection index calculation overflowed on axis 0",
         ));
