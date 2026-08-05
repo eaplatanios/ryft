@@ -410,7 +410,6 @@ impl ArrayAddressing {
         }
     }
 
-    // TODO(eaplatanios): Should this be moved to `TiledLayout`?
     /// Returns the number of physical dimensions after applying the first `level` nested tiles. Every applied tile
     /// removes its input dimensions and adds one tile-count and one within-tile dimension per sized tile dimension.
     fn tiled_dimension_count(&self, layout: &TiledLayout, level: usize) -> usize {
@@ -420,7 +419,6 @@ impl ArrayAddressing {
         })
     }
 
-    // TODO(eaplatanios): Should this be moved to `TiledLayout`?
     /// Evaluates the physical coordinate and dimension bound at `position` after applying the first `level` nested
     /// tiles, with positions ordering physical dimensions from most major to most minor. At level zero, positions map
     /// logical dimensions through the layout's minor-to-major permutation. Each tile level then passes its untiled
@@ -639,7 +637,7 @@ impl<'a> ArrayIndexRanges<'a> {
         for (axis, slice_axis) in axes.iter().enumerate() {
             if slice_axis.stride == 0 {
                 return Err(
-                    TypeError::invalid(format!("array selection stride must be positive on axis {axis}")).into(),
+                    TypeError::invalid(format!("array selection stride must be positive on axis {axis}")).into()
                 );
             }
             let dimension = addressing.dimension(axis);
@@ -874,14 +872,16 @@ mod tests {
                 r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4, 4]))),
             ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "strided layout stride 4 on axis 1 is smaller than the 8-byte span occupied by more minor axes and may alias array elements",
+                if message == "strided layout stride 4 on axis 1 is smaller than the 8-byte span \
+                occupied by more minor axes and may alias array elements",
         ));
         let overflowing = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![isize::MAX])));
         assert!(matches!(
             ArrayAddressing::new(overflowing),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "physical storage span for array type f32[3][layout=strided{9223372036854775807}] cannot be represented",
+                if message == "physical storage span for array type f32[3][layout=strided{9223372036854775807}] \
+                cannot be represented",
         ));
     }
 
