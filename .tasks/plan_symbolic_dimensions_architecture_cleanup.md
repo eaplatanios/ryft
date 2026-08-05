@@ -2299,7 +2299,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         throughout this sequence so storage, literal lowering, and scalar retirement remain separate from the later
         hierarchy move.
     - [ ] Replace the reference `Array`'s element-wise `Vec<Scalar>` payload with validated immutable contiguous bytes,
-          with allocation-free cloning and checked exact encodings for every `DataType`.
+          with payload-copy-free cloning and checked exact encodings for every `DataType`.
     - [ ] Route exact array literals and XLA constant lowering through the canonical byte representation without an
           `f64` round trip, including the sub-byte integer families.
     - [ ] Prove that the remaining standalone scalar program universe has no unique production role. Move useful
@@ -2363,8 +2363,9 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
 Objective: replace the reference `Array` backend's `Vec<Scalar>` payload with one validated immutable contiguous byte
 representation, route exact literals through that representation, and then delete the standalone `Scalar` value
 universe and `ScalarOperation` family. The final implementation must reduce production code, preserve reference
-semantics for every `DataType`, make `Array::clone` allocation-free and constant-time, and avoid introducing a second
-public scalar backend under another name.
+semantics for every `DataType`, make `Array::clone` share rather than copy or allocate its element payload, and avoid
+introducing a second public scalar backend under another name. `ArrayType` remains stored by value and may retain its
+existing small metadata-clone cost.
 
 Current-tree facts and dependency order:
 
@@ -2380,12 +2381,15 @@ Current-tree facts and dependency order:
 
 Target representation and API:
 
-- Store `Array { type: ArrayType, bytes: Arc<[u8]> }`. The type and static element count determine the only valid byte
-  length. Clones share immutable storage and kernels allocate only their output buffer.
+- Store `Array { type: ArrayType, bytes: Arc<Vec<u8>> }`. The type and static element count determine the only valid
+  byte length. The privately owned `Vec` is immutable after construction, avoids the extra allocation and payload copy
+  required to convert a built `Vec<u8>` into `Arc<[u8]>`, and remains contiguous. Clones share its immutable element
+  storage; cloning the by-value `ArrayType` is intentionally permitted.
 - Use a documented portable little-endian encoding. `Token` and `Zero` carry no payload bytes. Boolean, sub-byte
   integers, and 4/6/8-bit floats occupy one validated byte per logical element; this favors constant-time reference
-  indexing, and lowering packs sub-byte integers only where the target literal format requires it. Wider integers and
-  floats use exact bit patterns, and complex values interleave real and imaginary component encodings.
+  indexing, and lowering packs Boolean and sub-byte integer elements only where the target literal format requires it.
+  Wider integers and floats use exact bit patterns, and complex values interleave real and imaginary component
+  encodings.
 - Add checked raw construction and immutable byte access. Validate byte length, Boolean encodings, sub-byte ranges,
   unused float bits, and payload-free types. Provide concise typed construction/decoding through one sealed
   array-element codec for Rust primitives, `half`, and `num_complex`; ambiguous low-precision and sub-byte families
@@ -2410,19 +2414,20 @@ Guardrails:
 
 Phase 9a0 — baseline and vertical prototype:
 
-- [ ] Record the clean starting revision, production/test line counts for `backends::{arrays,scalars}`, `size_of` for
+- [x] Record the clean starting revision, production/test line counts for `backends::{arrays,scalars}`, `size_of` for
       `Array` and `Scalar`, construction/clone byte and allocation costs for representative 4K-element arrays, and
       current core/XLA test counts.
-- [ ] Classify every production and test use of `Scalar`, `ScalarOperation`, and `ScalarTracingContext` as
+- [x] Classify every production and test use of `Scalar`, `ScalarOperation`, and `ScalarTracingContext` as
       array-element semantics, reusable generic-transform coverage, scalar-universe-only coverage, or dead coverage.
-- [ ] Inventory every `DataType` encoding, current `Scalar` support gap, `Array` constructor/accessor call site, and XLA
+- [x] Inventory every `DataType` encoding, current `Scalar` support gap, `Array` constructor/accessor call site, and XLA
       literal route; record exact expected byte lengths and validation rules.
-- [ ] Prototype one complete F32 vertical slice: checked typed construction/decoding, one unary kernel, one broadcasting
+- [x] Prototype one complete F32 vertical slice: checked typed construction/decoding, one unary kernel, one broadcasting
       binary kernel, equality/rendering, clone-allocation measurement, and exact XLA dense-literal construction.
-- [ ] Compare a narrow private transient-element implementation with direct typed byte dispatch for the prototype.
+- [x] Compare a narrow private transient-element implementation with direct typed byte dispatch for the prototype.
       Select the smaller option only if it adds no per-element heap allocation or public API surface.
-- [ ] Gate: `Array::clone` performs zero allocations and copies no payload bytes; the prototype adds no unsafe cast,
-      second stored representation, or more production code than its equivalent current F32 path.
+- [x] Gate: `Array::clone` allocates or copies no element payload bytes; only the accepted `ArrayType` metadata clone
+      may allocate. The prototype adds no unsafe cast, second stored representation, or more production code than its
+      equivalent current F32 path.
 
 Phase 9a1 — canonical byte storage and construction:
 
@@ -2433,8 +2438,8 @@ Phase 9a1 — canonical byte storage and construction:
       representative NaNs/payloads, complex values, empty arrays, `Token`, and `Zero`.
 - [ ] Add I1/I2/I4/U1/U2/U4 reference-array construction and validation, closing the current `Scalar` storage gap
       without adding scalar enum variants.
-- [ ] Extend allocation tests to prove large-array clone, borrowed projection, and consuming projection allocate zero
-      times after setup.
+- [ ] Extend allocation tests to prove large-array clone performs no payload-sized allocation, while borrowed and
+      consuming projection remain fully allocation-free after setup.
 - [ ] Gate: no `Vec<Scalar>` payload, `values()` accessor, or duplicate byte ownership remains.
 
 Phase 9a2 — byte-backed reference kernels:
@@ -2452,7 +2457,7 @@ Phase 9a3 — exact XLA literals:
 
 - [ ] Replace per-element `Scalar` matching and typed-vector reconstruction with canonical bytes. Decode only when an
       MLIR typed helper requires it; otherwise pass validated raw bytes directly.
-- [ ] Pack sub-byte integers at the lowering boundary and cover I1/I2/I4/U1/U2/U4 constants.
+- [ ] Pack Boolean and sub-byte integers at the lowering boundary and cover I1/I2/I4/U1/U2/U4 constants.
 - [ ] Add exact-bit StableHLO and execution tests for low-precision floats, signed zero, preserved NaN payloads, wide
       integers, complex values, empty tensors, and sub-byte integers.
 - [ ] Measure literal construction, lowering allocations, StableHLO size, compile time, and runtime against Phase 9a0.
@@ -2476,8 +2481,8 @@ Phase 9a5 — closure:
 
 - [ ] Run full core, macro integration/compile-fail, XLA, affected doctest, allocation, CPU, and available CUDA suites
       with 300-second command timeouts.
-- [ ] Re-run Phase 9a0 measurements. Clone remains zero-allocation/constant-time and other regressions remain within
-      the master plan's evidence-based thresholds or receive explicit approval.
+- [ ] Re-run Phase 9a0 measurements. Clone remains payload-copy-free and constant-time in array size, and other
+      regressions remain within the master plan's evidence-based thresholds or receive explicit approval.
 - [ ] Review the complete diff for redundant codecs, duplicate conversions, compatibility residue, unnecessary trait
       surface, and avoidable allocation; simplify before closing the review unit.
 - [ ] Record the completed review here and leave the module/type/sharding hierarchy move as the next isolated unit.
@@ -4088,3 +4093,100 @@ have settled.
 
 The detailed Phase 9a checklist records the representation, encoding, API, allocation, exact-bit, test-migration, and
 performance contracts plus abort criteria. Execution has not started; Phase 9a0 is the next review unit.
+
+### Phase 9a0 baseline and representation prototype (2026-08-04)
+
+Phase 9a0 completed at clean starting revision `9af35b7a17e33dc88b1f212b96a067d9913d74cd` using Rust 1.93.1. Physical
+source-line counts, including comments and blanks but separating every `#[cfg(test)]` block, are:
+
+| Module | Non-test lines | Test-only lines | Total lines |
+| --- | ---: | ---: | ---: |
+| `backends::arrays` | 2,010 | 634 | 2,644 |
+| `backends::scalars` | 2,327 | 701 | 3,028 |
+| Combined | 4,337 | 1,335 | 5,672 |
+
+On the baseline host, `size_of::<Array>()` is 208 bytes and `size_of::<Scalar>()` is 24 bytes. The temporary F32
+prototype, storing `ArrayType` by value and an `Arc<Vec<u8>>`, was 192 bytes. A counting allocator measured a
+4,096-element F32 vector as follows. The current construction measurement includes its required temporary `Vec<f32>`;
+the prototype construction borrows the already-built F32 slice and therefore isolates byte-storage construction.
+
+| Measurement | Current `Vec<Scalar>` | F32 byte prototype |
+| --- | ---: | ---: |
+| Retained element payload | 98,304 bytes | 16,384 bytes |
+| Construction allocations | 3 | 3 |
+| Construction allocated bytes | 114,704 | 16,440 |
+| Clone allocations | 2 | 1 |
+| Clone allocated bytes | 98,320 | 16 |
+
+The prototype payload is six times smaller. Its sole clone allocation is the accepted 16-byte `ArrayType` metadata
+clone; the 16-KiB element payload is shared without allocation or copying. A consuming `Vec<f32>` convenience API
+would additionally allocate its 16-KiB input vector, so Phase 9a1 must not present the isolated construction figure as
+an end-to-end constructor cost. `ArrayType` remains owned by value; shared ownership is reserved for the large element
+payload.
+
+The complete reference scan classified the scalar vocabulary as follows:
+
+- **Array-element semantics:** `backends::{scalars,arrays}` owns the current element algebra and storage. XLA literal
+  lowering decodes those elements. These semantics migrate to checked bytes and byte-backed kernels; they are not
+  deleted with the scalar program universe.
+- **Host-literal clients:** fill, attention, random, array IR scalar gateways, coordinate-basis construction, dot,
+  `erf`, collectives, and reduction use `Scalar` only to spell rank-zero or broadcast host literals. They migrate to
+  typed/rank-zero `Array` construction. No independent scalar execution requirement was found.
+- **Scalar-universe-only infrastructure:** `ScalarOperation`, `ScalarTracingContext`, their exports, scalar benchmark
+  support, macro scalar modes, and the scalar-domain compile-fail fixture exist to run standalone programs whose
+  values are `Scalar`. Useful coverage moves to rank-zero arrays; the family is then deleted.
+- **Reusable generic-transform coverage:** the scalar-heavy tests in tracing, programs/builders, partial evaluation,
+  batching, differentiation, custom derivatives, rematerialization, control flow, and elementwise operations exercise
+  generic machinery cheaply. Each must move to rank-zero arrays or an existing minimal test value before scalar
+  retirement. Exact low-precision and complex element tests instead become array-codec/kernel tests.
+- **Documentation and unrelated names:** remaining production mentions in select, program rendering, axes,
+  dimensions, slicing, transposition, and XLA prose are examples or ordinary uses of the English word “scalar.”
+  `ryft-pjrt`'s FFI attribute `Scalar` variant is an unrelated upstream concept and remains unchanged. The audit found
+  no otherwise-dead production scalar path; scalar-only tests become redundant only after their replacement coverage
+  lands.
+
+The workspace contains 2,371 constructor mentions: 77 `Array::new`, 703 `Array::scalar`, 867 `Array::vector`, 298
+`Array::matrix`, and 426 `Array::from_f64s`; 2,143 are under crate `src` trees and the rest are integration fixtures.
+There are 230 `values()` accessor mentions across 36 core/XLA files. Phase 9a1 preserves the four ergonomic typed
+constructors, replaces `new` with checked typed/raw-byte construction, and replaces each `values()` dependency with
+borrowed bytes or typed single-element decoding. `from_f64s`/`to_f64s` remain explicitly lossy test conveniences and
+must not become the exact literal route.
+
+The complete canonical little-endian byte matrix is:
+
+| Bytes per logical element | `DataType`s | Validation |
+| ---: | --- | --- |
+| 0 | `Token`, `Zero` | Entire payload must be empty for every static shape. |
+| 1 | `Boolean` | Byte must be `0` or `1`. |
+| 1 | `I1`, `I2`, `I4`, `U1`, `U2`, `U4` | High bits are zero; signed values use narrow two's-complement bits. |
+| 1 | `I8`, `U8` | Every byte is valid. |
+| 1 | `F4E2M1FN`, `F6E2M3FN`, `F6E3M2FN` | Unused high four or two bits must be zero. |
+| 1 | Every `F8*` variant | Every byte is an exact format bit pattern. |
+| 2 | `I16`, `U16`, `BF16`, `F16` | Exact little-endian integer or floating-point bits. |
+| 4 | `I32`, `U32`, `F32` | Exact little-endian integer or floating-point bits. |
+| 8 | `I64`, `U64`, `F64` | Exact little-endian integer or floating-point bits. |
+| 8 | `C64` | Interleaved real then imaginary F32 little-endian bits. |
+| 16 | `C128` | Interleaved real then imaginary F64 little-endian bits. |
+
+Every constructor checks `element_count * byte_width` for overflow and requires exactly that length. The current
+`Scalar` family covers all `DataType`s except `I1`, `I2`, `I4`, `U1`, `U2`, and `U4`; byte storage closes precisely
+those six gaps. Lowering currently reconstructs typed vectors for Boolean, ordinary integers, BF16/F16/F32/F64;
+reconstructs raw temporary vectors for low-precision floats and complex values; has a separate scalar-splat path; and
+rejects token, zero, and all six sub-byte integer types. Phase 9a3 replaces those routes with validated canonical bytes,
+packing Boolean and narrow integers only at the MLIR boundary. A big-endian host must normalize before calling MLIR's
+raw-buffer API rather than forwarding the little-endian storage unchanged.
+
+The temporary vertical prototype covered checked F32 construction/decoding, unary negation, scalar broadcasting add,
+numeric equality, signed-zero rendering, payload-sharing clone measurement, and exact raw MLIR construction including
+a NaN payload. The raw dense-elements attribute preserved all source bytes exactly. A second prototype routed F32
+negation through a stack-only private transient-element enum: it added no per-element allocation, but had identical
+allocation counts to direct dispatch and added decode/encode wrappers and variant matches. Direct typed byte dispatch
+is therefore the smaller F32 implementation and is selected for Phase 9a1. Phase 9a2 may adopt a narrowed private
+transient element only if the full 34-type kernel matrix demonstrates a net production-code reduction; it may never be
+stored, public, heap-allocated per element, or become another value/operation universe.
+
+Both probes were removed after recording their evidence, leaving no prototype production or test scaffolding. The
+Phase 9a0 gate passes: no unsafe cast, alternate stored representation, public abstraction, or payload-sized clone
+allocation is required. Baseline verification passed all 1,129 core library tests, all 53 runnable core doctests (16
+ignored), and all 436 runnable XLA library tests (one timing-sensitive benchmark ignored). Phase 9a1 is the next
+isolated implementation unit.
