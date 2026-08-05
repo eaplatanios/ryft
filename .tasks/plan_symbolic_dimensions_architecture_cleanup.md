@@ -3914,3 +3914,8 @@ doctests (16 ignored), all 57 macro unit tests, both macro integration suites in
 all 436 runnable XLA library tests (one ignored). Formatting and diff hygiene passed, the old module declaration and
 all Rust paths to `backends::array_programs::batching` are absent, and the implementation definitions occur only in
 `batching::{arrays, array_ir}`.
+
+A follow-up minimality pass inlined `array_dimensions`, `normalize_array_input`, and `dimension_constant` into their
+owning policy rules and deleted the three private helpers. The inlined code preserves the same explicit dimension-size
+reads, sharding normalization, constant binding, output-count validation, and error propagation. The full 1,129-test
+core library suite and `cargo check -p ryft-core --tests` pass after the simplification.
