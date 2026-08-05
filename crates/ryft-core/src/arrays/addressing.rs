@@ -27,10 +27,113 @@ impl ArrayAddressing {
                 TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
             );
         }
+
         let addressing = Self { r#type };
+
+        // Validate the logical size.
         addressing.logical_byte_len_checked()?;
-        addressing.validate_layout()?;
+
+        // Validate the layout.
+        match addressing.r#type.layout() {
+            None => {}
+            Some(Layout::Tiled(layout)) => {
+                let rank = addressing.r#type.rank();
+                if layout.rank() != rank {
+                    return Err(TypeError::invalid(format!(
+                        "tiled layout rank {} does not match array rank {}",
+                        layout.rank(),
+                        rank,
+                    ))
+                    .into());
+                }
+                let mut seen = vec![false; rank];
+                for axis in layout.minor_to_major() {
+                    if *axis >= rank || seen[*axis] {
+                        return Err(TypeError::invalid(format!(
+                            "tiled layout minor-to-major dimensions must be a permutation of 0..{rank}",
+                        ))
+                        .into());
+                    }
+                    seen[*axis] = true;
+                }
+                let mut dimension_count = rank;
+                for (tile_index, tile) in layout.tiles().iter().enumerate() {
+                    if tile.dimensions().is_empty() || tile.dimensions().len() > dimension_count {
+                        return Err(TypeError::invalid(format!(
+                            "tile {} has {} dimensions but the tiled shape has {}",
+                            tile_index,
+                            tile.dimensions().len(),
+                            dimension_count,
+                        ))
+                        .into());
+                    }
+                    let mut sized_count = 0usize;
+                    for (position, dimension) in tile.dimensions().iter().enumerate() {
+                        match dimension {
+                            TileDimension::Sized(0) => {
+                                return Err(TypeError::invalid(format!(
+                                    "tile {tile_index} dimension {position} must have positive size",
+                                ))
+                                .into());
+                            }
+                            TileDimension::Sized(_) => sized_count += 1,
+                            TileDimension::Combined if position + 1 == tile.dimensions().len() => {
+                                return Err(TypeError::invalid(format!(
+                                    "tile {tile_index} cannot combine its most minor dimension",
+                                ))
+                                .into());
+                            }
+                            TileDimension::Combined => {}
+                        }
+                    }
+                    dimension_count = dimension_count - tile.dimensions().len() + 2 * sized_count;
+                }
+            }
+            Some(Layout::Strided(layout)) => {
+                let rank = addressing.r#type.rank();
+                if layout.rank() != rank {
+                    return Err(TypeError::invalid(format!(
+                        "strided layout rank {} does not match array rank {}",
+                        layout.rank(),
+                        rank,
+                    ))
+                    .into());
+                }
+                if addressing.element_count() != 0 && addressing.element_byte_width() != 0 {
+                    let mut axes = layout
+                        .strides()
+                        .iter()
+                        .enumerate()
+                        .filter(|(axis, _)| addressing.dimension(*axis) > 1)
+                        .map(|(axis, stride)| (stride.unsigned_abs(), axis))
+                        .collect::<Vec<_>>();
+                    axes.sort_unstable();
+                    let mut occupied_span = addressing.element_byte_width();
+                    for (stride, axis) in axes {
+                        if stride < occupied_span {
+                            return Err(TypeError::invalid(format!(
+                                "strided layout stride {} on axis {} is smaller than the {}-byte span occupied by more minor axes and may alias array elements",
+                                layout.strides()[axis], axis, occupied_span,
+                            ))
+                            .into());
+                        }
+                        occupied_span = (addressing.dimension(axis) - 1)
+                            .checked_mul(stride)
+                            .and_then(|span| occupied_span.checked_add(span))
+                            .ok_or_else(|| {
+                                TypeError::invalid(format!(
+                                    "physical storage span for array type {} cannot be represented",
+                                    addressing.r#type,
+                                ))
+                            })?;
+                    }
+                }
+            }
+        }
+
+        // Validate the physical size.
         addressing.storage_byte_len_checked()?;
+
         Ok(addressing)
     }
 
@@ -75,6 +178,8 @@ impl ArrayAddressing {
     pub fn storage_byte_len(&self) -> usize {
         self.storage_byte_len_checked().unwrap()
     }
+    
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Maps the provided logical multi-index to its flat row-major element index.
     pub fn index(&self, index: &[usize]) -> Result<usize, ProgramError> {
@@ -254,110 +359,6 @@ impl ArrayAddressing {
                 ))
                 .into());
             }
-        }
-        Ok(())
-    }
-
-    /// Validates the structural and non-aliasing requirements of this array's physical layout.
-    fn validate_layout(&self) -> Result<(), ProgramError> {
-        match self.r#type.layout() {
-            None => Ok(()),
-            Some(Layout::Strided(layout)) => {
-                let rank = self.r#type.rank();
-                if layout.rank() != rank {
-                    return Err(TypeError::invalid(format!(
-                        "strided layout rank {} does not match array rank {}",
-                        layout.rank(),
-                        rank,
-                    ))
-                    .into());
-                }
-                if self.element_count() == 0 || self.element_byte_width() == 0 {
-                    return Ok(());
-                }
-                let mut axes = layout
-                    .strides()
-                    .iter()
-                    .enumerate()
-                    .filter(|(axis, _)| self.dimension(*axis) > 1)
-                    .map(|(axis, stride)| (stride.unsigned_abs(), axis))
-                    .collect::<Vec<_>>();
-                axes.sort_unstable();
-                let mut occupied_span = self.element_byte_width();
-                for (stride, axis) in axes {
-                    if stride < occupied_span {
-                        return Err(TypeError::invalid(format!(
-                            "strided layout stride {} on axis {} is smaller than the {}-byte span occupied by more minor axes and may alias array elements",
-                            layout.strides()[axis], axis, occupied_span,
-                        ))
-                        .into());
-                    }
-                    occupied_span = (self.dimension(axis) - 1)
-                        .checked_mul(stride)
-                        .and_then(|span| occupied_span.checked_add(span))
-                        .ok_or_else(|| {
-                            TypeError::invalid(format!(
-                                "physical storage span for array type {} cannot be represented",
-                                self.r#type,
-                            ))
-                        })?;
-                }
-                Ok(())
-            }
-            Some(Layout::Tiled(layout)) => self.validate_tiled_layout(layout),
-        }
-    }
-
-    /// Validates an XLA-compatible tiled layout.
-    fn validate_tiled_layout(&self, layout: &TiledLayout) -> Result<(), ProgramError> {
-        let rank = self.r#type.rank();
-        if layout.rank() != rank {
-            return Err(TypeError::invalid(format!(
-                "tiled layout rank {} does not match array rank {}",
-                layout.rank(),
-                rank,
-            ))
-            .into());
-        }
-        let mut seen = vec![false; rank];
-        for axis in layout.minor_to_major() {
-            if *axis >= rank || seen[*axis] {
-                return Err(TypeError::invalid(format!(
-                    "tiled layout minor-to-major dimensions must be a permutation of 0..{rank}",
-                ))
-                .into());
-            }
-            seen[*axis] = true;
-        }
-        let mut dimension_count = rank;
-        for (tile_index, tile) in layout.tiles().iter().enumerate() {
-            if tile.dimensions().is_empty() || tile.dimensions().len() > dimension_count {
-                return Err(TypeError::invalid(format!(
-                    "tile {tile_index} has {} dimensions but the tiled shape has {dimension_count}",
-                    tile.dimensions().len(),
-                ))
-                .into());
-            }
-            let mut sized_count = 0usize;
-            for (position, dimension) in tile.dimensions().iter().enumerate() {
-                match dimension {
-                    TileDimension::Sized(0) => {
-                        return Err(TypeError::invalid(format!(
-                            "tile {tile_index} dimension {position} must have positive size",
-                        ))
-                        .into());
-                    }
-                    TileDimension::Sized(_) => sized_count += 1,
-                    TileDimension::Combined if position + 1 == tile.dimensions().len() => {
-                        return Err(TypeError::invalid(format!(
-                            "tile {tile_index} cannot combine its most minor dimension",
-                        ))
-                        .into());
-                    }
-                    TileDimension::Combined => {}
-                }
-            }
-            dimension_count = dimension_count - tile.dimensions().len() + 2 * sized_count;
         }
         Ok(())
     }
