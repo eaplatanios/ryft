@@ -2278,7 +2278,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [x] Move `ArrayBatch`, batching-specific `ArrayType` normalization/unbatching, and shared mapped-axis sharding
           mechanics; keep `batching::ArrayBatch` as the intentional public batching facade and route generated and
           handwritten paths through it.
-    - [ ] Move `ArrayBatching`, `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, and their policy, recursive, and
+    - [x] Move `ArrayBatching`, `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, and their policy, recursive, and
           entrypoint implementations after the carrier slice is reviewed.
     - [ ] Move the array-specialization tests beside their owner and close the specialization-module checkbox.
   - [ ] Move the `ArrayIrType` specialization to `batching::array_ir` (`ArrayIrBatch`,
@@ -3874,3 +3874,20 @@ backend-neutral abstractions (`Type`, `Typed`, `TypeError`, `TypeRefinements`, a
 universe. Consequently, `types/mod.rs` disappears after its contents move under `arrays`; its contents are not copied
 into `programs/types.rs`. The plan uses the intended name `arrays::sharding`—not `arrays::sharing`—and retains
 universe-neutral named-axis and transform machinery outside that array-specific hierarchy.
+
+### Phase 9 array-specialization slice 2: policy and program mechanics (2026-08-04)
+
+The complete homogeneous-array policy family now lives beside `ArrayBatch` in `batching::arrays`:
+`ArrayBatching`, `ArrayBatchingPolicy`, `StaticArrayBatchingPolicy`, and `DimensionSource`, together with their
+`BatchingPolicy`, entrypoint, recursive, shared elementwise, and homogeneous region/program batching implementations.
+The parent module retains the intentional `batching::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy,
+DimensionSource, StaticArrayBatchingPolicy}` facade, while the implementation owner is now unambiguously the array
+specialization module. No compatibility module or alternate implementation path was introduced.
+
+This was a source move plus import and module-documentation adjustment: operation-specific batching rules remain with
+their payloads, universe-neutral contracts and transform machinery remain in `batching`, and the existing
+array-specialization tests remain in the parent module for the next isolated review slice. Verification passed
+`cargo check -p ryft-core --tests`, all 1,129 core library tests, all 53 runnable core doctests (16 ignored), all 57
+macro unit tests, both macro integration suites including every compile-fail fixture, and all 436 runnable XLA library
+tests (one ignored). Formatting, diff hygiene, and definition-owner searches passed; the moved implementations occur
+only in `batching::arrays`, while the parent module contains only their intentional public re-exports.
