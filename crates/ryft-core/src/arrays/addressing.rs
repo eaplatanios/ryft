@@ -238,17 +238,11 @@ impl ArrayAddressing {
         Ok(ArrayIndexRange { elements, bytes })
     }
 
-    /// Returns an [`Iterator`] over the contiguous storage ranges covered by a multidimensional slice. `starts` and
-    /// `sizes` define the slice along each axis. `strides` optionally specifies the step along each axis. [`None`] uses
-    /// a stride of one for every axis.
+    /// Returns an [`Iterator`] over the contiguous storage ranges covered by a multidimensional slice.
+    /// `axes` contains one [`ArraySliceAxis`] for each logical array axis.
     #[inline]
-    pub fn ranges<'a>(
-        &'a self,
-        starts: &'a [usize],
-        sizes: &'a [usize],
-        strides: Option<&'a [usize]>,
-    ) -> Result<ArrayIndexRanges<'a>, ProgramError> {
-        ArrayIndexRanges::new(self, starts, sizes, strides)
+    pub fn ranges<'a>(&'a self, axes: &'a [ArraySliceAxis]) -> Result<ArrayIndexRanges<'a>, ProgramError> {
+        ArrayIndexRanges::new(self, axes)
     }
 
     /// Returns `true` when the flat logical row-major element order coincides with dense, gap-free physical storage for
@@ -524,6 +518,60 @@ impl ArrayAddressing {
     }
 }
 
+/// Selection of logical coordinates along one array axis. It selects `start + index * stride` for every `index` in
+/// `0..size`. A [`Range<usize>`] converts to a unit-stride selection of the same coordinates. An empty or reversed
+/// range converts to an empty selection beginning at the range's start.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ArraySliceAxis {
+    /// First selected logical coordinate.
+    start: usize,
+
+    /// Number of selected logical coordinates.
+    size: usize,
+
+    /// Distance between consecutive selected logical coordinates.
+    stride: usize,
+}
+
+impl ArraySliceAxis {
+    /// Creates a new [`ArraySliceAxis`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `start`: first selected logical coordinate.
+    ///   - `size`: number of selected logical coordinates.
+    ///   - `stride`: distance between consecutive selected logical coordinates.
+    #[inline]
+    pub const fn new(start: usize, size: usize, stride: usize) -> Self {
+        Self { start, size, stride }
+    }
+
+    /// Returns the first selected logical coordinate.
+    #[inline]
+    pub const fn start(self) -> usize {
+        self.start
+    }
+
+    /// Returns the number of selected logical coordinates.
+    #[inline]
+    pub const fn size(self) -> usize {
+        self.size
+    }
+
+    /// Returns the distance between consecutive selected logical coordinates.
+    #[inline]
+    pub const fn stride(self) -> usize {
+        self.stride
+    }
+}
+
+impl From<Range<usize>> for ArraySliceAxis {
+    #[inline]
+    fn from(range: Range<usize>) -> Self {
+        Self::new(range.start, range.end.saturating_sub(range.start), 1)
+    }
+}
+
 /// One contiguous logical element range in an array and its corresponding physical byte range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArrayIndexRange {
@@ -548,10 +596,10 @@ impl ArrayIndexRange {
     }
 }
 
-/// Allocation-free [`Iterator`] over the contiguous [`ArrayIndexRange`]s that make up one logical array slice.
-/// Elements are visited in logical row-major slice order. Consecutive logical elements are coalesced only when their
-/// physical byte ranges are also consecutive in ascending address order, so dense slices use bulk ranges while
-/// strided, permuted, reversed, and tiled layouts split exactly where their storage does.
+/// Allocation-free [`Iterator`] over the contiguous [`ArrayIndexRange`]s that make up one logical array slice. Elements
+/// are visited in logical row-major slice order. Consecutive logical elements are coalesced only when their physical
+/// byte ranges are also consecutive in ascending address order, so dense slices use bulk ranges while strided,
+/// permuted, reversed, and tiled layouts split exactly where their storage does.
 ///
 /// The iterator borrows its slice metadata and tracks its position as one flat logical slice index. It allocates
 /// nothing, and every fallible rank, bounds, stride, and overflow check happens during construction.
@@ -560,14 +608,8 @@ pub struct ArrayIndexRanges<'a> {
     /// [`ArrayAddressing`] used to map each emitted logical range to physical storage.
     addressing: &'a ArrayAddressing,
 
-    /// First selected coordinate along each logical axis.
-    starts: &'a [usize],
-
-    /// Number of selected coordinates along each logical axis.
-    sizes: &'a [usize],
-
-    /// Distance between selected coordinates along each logical axis, or [`None`] when every stride is one.
-    strides: Option<&'a [usize]>,
+    /// Selection along each logical array axis.
+    axes: &'a [ArraySliceAxis],
 
     /// Total number of logical elements selected by this slice.
     element_count: usize,
@@ -581,53 +623,43 @@ pub struct ArrayIndexRanges<'a> {
 
 impl<'a> ArrayIndexRanges<'a> {
     /// Creates a new [`ArrayIndexRanges`] [`Iterator`].
-    pub fn new(
-        addressing: &'a ArrayAddressing,
-        starts: &'a [usize],
-        sizes: &'a [usize],
-        strides: Option<&'a [usize]>,
-    ) -> Result<Self, ProgramError> {
+    pub fn new(addressing: &'a ArrayAddressing, axes: &'a [ArraySliceAxis]) -> Result<Self, ProgramError> {
         let rank = addressing.r#type.rank();
-        let stride_count = strides.map_or(rank, <[usize]>::len);
-        if starts.len() != rank || sizes.len() != rank || stride_count != rank {
+        if axes.len() != rank {
             return Err(TypeError::invalid(format!(
-                "array selection for rank {} requires {} starts, sizes, and strides but got {}, {}, and {}",
+                "array selection for rank {} requires {} slice axes but got {}",
                 rank,
                 rank,
-                starts.len(),
-                sizes.len(),
-                stride_count,
+                axes.len(),
             ))
             .into());
         }
 
-        let stride = |axis| strides.map_or(1, |strides: &[usize]| strides[axis]);
         let mut empty = false;
-        for axis in 0..rank {
-            let axis_stride = stride(axis);
-            if axis_stride == 0 {
+        for (axis, slice_axis) in axes.iter().enumerate() {
+            if slice_axis.stride == 0 {
                 return Err(
-                    TypeError::invalid(format!("array selection stride must be positive on axis {axis}")).into()
+                    TypeError::invalid(format!("array selection stride must be positive on axis {axis}")).into(),
                 );
             }
             let dimension = addressing.dimension(axis);
-            if sizes[axis] == 0 {
+            if slice_axis.size == 0 {
                 empty = true;
-                if starts[axis] > dimension {
+                if slice_axis.start > dimension {
                     return Err(TypeError::invalid(format!(
                         "empty array selection starts at {} on axis {}, past dimension size {}",
-                        starts[axis], axis, dimension,
+                        slice_axis.start, axis, dimension,
                     ))
                     .into());
                 }
                 continue;
             }
-            let last = (sizes[axis] - 1)
-                .checked_mul(axis_stride)
-                .and_then(|offset| starts[axis].checked_add(offset))
+            let last = (slice_axis.size - 1)
+                .checked_mul(slice_axis.stride)
+                .and_then(|offset| slice_axis.start.checked_add(offset))
                 .ok_or_else(|| {
-                TypeError::invalid(format!("array selection index calculation overflowed on axis {axis}"))
-            })?;
+                    TypeError::invalid(format!("array selection index calculation overflowed on axis {axis}"))
+                })?;
             if last >= dimension {
                 return Err(TypeError::invalid(format!(
                     "array selection reaches index {last} on axis {axis}, past dimension size {dimension}",
@@ -639,9 +671,9 @@ impl<'a> ArrayIndexRanges<'a> {
         // A nonempty selection cannot contain more coordinates than the array itself, whose checked element count is
         // representable. Avoid multiplying irrelevant huge dimensions after any zero selection size.
         let element_count =
-            if empty { 0 } else { sizes.iter().try_fold(1usize, |count, size| count.checked_mul(*size)).unwrap() };
+            if empty { 0 } else { axes.iter().try_fold(1usize, |count, axis| count.checked_mul(axis.size)).unwrap() };
 
-        Ok(Self { addressing, starts, sizes, strides, element_count, ordinals: 0..element_count, pending: None })
+        Ok(Self { addressing, axes, element_count, ordinals: 0..element_count, pending: None })
     }
 
     /// Returns the total number of selected logical elements across all emitted ranges.
@@ -653,10 +685,9 @@ impl<'a> ArrayIndexRanges<'a> {
     /// Maps one flat logical slice ordinal to its single-element logical and physical ranges.
     fn element_range(&self, ordinal: usize) -> ArrayIndexRange {
         let coordinate = |axis: usize| {
-            let inner = self.sizes[axis + 1..].iter().product::<usize>();
-            let position = (ordinal / inner) % self.sizes[axis];
-            let stride = self.strides.map_or(1, |strides| strides[axis]);
-            self.starts[axis] + position * stride
+            let inner = self.axes[axis + 1..].iter().map(|axis| axis.size).product::<usize>();
+            let position = (ordinal / inner) % self.axes[axis].size;
+            self.axes[axis].start + position * self.axes[axis].stride
         };
         let element = self.addressing.logical_index_unchecked(coordinate);
         let bytes = self.addressing.byte_range_unchecked(coordinate);
@@ -1038,6 +1069,16 @@ mod tests {
     }
 
     #[test]
+    fn test_array_slice_axis() {
+        let axis = ArraySliceAxis::new(2, 3, 4);
+        assert_eq!(axis.start(), 2);
+        assert_eq!(axis.size(), 3);
+        assert_eq!(axis.stride(), 4);
+        assert_eq!(ArraySliceAxis::from(2..8), ArraySliceAxis::new(2, 6, 1));
+        assert_eq!(ArraySliceAxis::from(8..2), ArraySliceAxis::new(8, 0, 1));
+    }
+
+    #[test]
     fn test_array_index_ranges() {
         let addressing = ArrayAddressing::new(ArrayType::new(
             DataType::F32,
@@ -1046,11 +1087,15 @@ mod tests {
         .unwrap();
 
         // A complete selection coalesces into one range, while a partial innermost dimension emits one range per row.
-        let ranges = addressing.ranges(&[0, 0], &[3, 4], Some(&[1, 1])).unwrap();
+        let axes: [ArraySliceAxis; 2] = [(0..3).into(), (0..4).into()];
+        let ranges = addressing.ranges(&axes).unwrap();
         assert_eq!(ranges.element_count(), 12);
         assert_eq!(ranges.collect::<Vec<_>>(), vec![ArrayIndexRange { elements: 0..12, bytes: 0..48 }],);
         assert_eq!(
-            addressing.ranges(&[0, 1], &[3, 2], Some(&[1, 1])).unwrap().collect::<Vec<_>>(),
+            addressing
+                .ranges(&[ArraySliceAxis::new(0, 3, 1), ArraySliceAxis::new(1, 2, 1)])
+                .unwrap()
+                .collect::<Vec<_>>(),
             vec![
                 ArrayIndexRange { elements: 1..3, bytes: 4..12 },
                 ArrayIndexRange { elements: 5..7, bytes: 20..28 },
@@ -1060,11 +1105,17 @@ mod tests {
 
         // A strided outer dimension retains contiguous rows; a strided inner dimension emits individual elements.
         assert_eq!(
-            addressing.ranges(&[0, 0], &[2, 4], Some(&[2, 1])).unwrap().collect::<Vec<_>>(),
+            addressing
+                .ranges(&[ArraySliceAxis::new(0, 2, 2), ArraySliceAxis::new(0, 4, 1)])
+                .unwrap()
+                .collect::<Vec<_>>(),
             vec![ArrayIndexRange { elements: 0..4, bytes: 0..16 }, ArrayIndexRange { elements: 8..12, bytes: 32..48 },],
         );
         assert_eq!(
-            addressing.ranges(&[0, 0], &[2, 2], Some(&[1, 2])).unwrap().collect::<Vec<_>>(),
+            addressing
+                .ranges(&[ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(0, 2, 2)])
+                .unwrap()
+                .collect::<Vec<_>>(),
             vec![
                 ArrayIndexRange { elements: 0..1, bytes: 0..4 },
                 ArrayIndexRange { elements: 2..3, bytes: 8..12 },
@@ -1080,7 +1131,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            permuted.ranges(&[0, 0], &[2, 3], None).unwrap().collect::<Vec<_>>(),
+            permuted.ranges(&[(0..2).into(), (0..3).into()]).unwrap().collect::<Vec<_>>(),
             vec![
                 ArrayIndexRange { elements: 0..1, bytes: 0..4 },
                 ArrayIndexRange { elements: 1..2, bytes: 8..12 },
@@ -1096,7 +1147,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            reversed.ranges(&[0], &[3], None).unwrap().collect::<Vec<_>>(),
+            reversed.ranges(&[(0..3).into()]).unwrap().collect::<Vec<_>>(),
             vec![
                 ArrayIndexRange { elements: 0..1, bytes: 8..12 },
                 ArrayIndexRange { elements: 1..2, bytes: 4..8 },
@@ -1107,27 +1158,30 @@ mod tests {
         // Rank-zero selections contain one element, while any zero selection size yields no ranges.
         let scalar = ArrayAddressing::new(ArrayType::scalar(DataType::F32)).unwrap();
         assert_eq!(
-            scalar.ranges(&[], &[], None).unwrap().collect::<Vec<_>>(),
+            scalar.ranges(&[]).unwrap().collect::<Vec<_>>(),
             vec![ArrayIndexRange { elements: 0..1, bytes: 0..4 }],
         );
         assert_eq!(
-            addressing.ranges(&[3, 0], &[0, 4], Some(&[1, 1])).unwrap().collect::<Vec<_>>(),
+            addressing
+                .ranges(&[ArraySliceAxis::new(3, 0, 1), ArraySliceAxis::new(0, 4, 1)])
+                .unwrap()
+                .collect::<Vec<_>>(),
             Vec::<ArrayIndexRange>::new(),
         );
 
         // Invalid selection metadata is rejected completely before iteration begins.
         assert!(matches!(
-            addressing.ranges(&[0], &[1, 1], Some(&[1, 1])),
+            addressing.ranges(&[ArraySliceAxis::new(0, 1, 1)]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array selection for rank 2 requires 2 starts, sizes, and strides but got 1, 2, and 2",
+                if message == "array selection for rank 2 requires 2 slice axes but got 1",
         ));
         assert!(matches!(
-            addressing.ranges(&[0, 0], &[1, 1], Some(&[1, 0])),
+            addressing.ranges(&[ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 1, 0)]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "array selection stride must be positive on axis 1",
         ));
         assert!(matches!(
-            addressing.ranges(&[0, 3], &[1, 2], Some(&[1, 1])),
+            addressing.ranges(&[ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(3, 2, 1)]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "array selection reaches index 4 on axis 1, past dimension size 4",
         ));
@@ -1135,7 +1189,7 @@ mod tests {
             ArrayAddressing::new(ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(usize::MAX)])))
                 .unwrap();
         assert!(matches!(
-            zero_width.ranges(&[0], &[usize::MAX], Some(&[2])),
+            zero_width.ranges(&[ArraySliceAxis::new(0, usize::MAX, 2)]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "array selection index calculation overflowed on axis 0",
         ));
