@@ -208,7 +208,11 @@ mod tests {
 
     #[test]
     fn test_rem_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = RemOperation::new(), inputs = [7.5, 2.0], expected = 1.5,);
+        check_operation_partial_evaluation!(
+            operation = RemOperation::new(),
+            inputs = [Array::scalar(7.5), Array::scalar(2.0)],
+            expected = Array::scalar(1.5),
+        );
     }
 
     #[test]

@@ -167,8 +167,8 @@ mod tests {
     fn test_logistic_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = LogisticOperation::new(),
-            inputs = [0.7],
-            expected = 1.0 / (1.0 + (-0.7f64).exp()),
+            inputs = [Array::scalar(0.7)],
+            expected = Array::scalar(1.0 / (1.0 + (-0.7f64).exp())),
         );
     }
 

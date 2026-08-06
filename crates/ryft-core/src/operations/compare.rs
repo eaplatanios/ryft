@@ -320,7 +320,6 @@ mod tests {
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
-    use crate::backends::scalars::Scalar;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::DifferentiationError;
     use crate::differentiation::forward::{DifferentiationTracer, jvp};
@@ -353,8 +352,6 @@ mod tests {
 
     #[test]
     fn test_compare() {
-        assert_eq!(Scalar::from(2.0).less_than(&Scalar::from(3.0)).unwrap(), Scalar::from(true));
-        assert_eq!(Scalar::from(2.0f32).greater_than(&Scalar::from(3.0f32)).unwrap(), Scalar::from(false));
         let left = || Array::vector(vec![1.0, 2.0, 3.0]);
         let right = || Array::vector(vec![2.0, 2.0, 2.0]);
         assert_eq!(left().equal(&right()).unwrap().elements::<bool>(), Ok(vec![false, true, false]));
@@ -486,8 +483,8 @@ mod tests {
     fn test_compare_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = CompareOperation::new(ComparisonDirection::GreaterThan),
-            inputs = [Scalar::from(1.0), Scalar::from(0.0)],
-            expected = Scalar::from(true),
+            inputs = [Array::scalar(1.0), Array::scalar(0.0)],
+            expected = Array::scalar(true),
         );
 
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();

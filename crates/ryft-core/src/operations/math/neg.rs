@@ -233,7 +233,11 @@ mod tests {
 
     #[test]
     fn test_neg_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = NegOperation::new(), inputs = [2.0], expected = -2.0,);
+        check_operation_partial_evaluation!(
+            operation = NegOperation::new(),
+            inputs = [Array::scalar(2.0)],
+            expected = Array::scalar(-2.0),
+        );
     }
 
     #[test]

@@ -132,7 +132,11 @@ mod tests {
 
     #[test]
     fn test_floor_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = FloorOperation::new(), inputs = [2.7], expected = 2.0,);
+        check_operation_partial_evaluation!(
+            operation = FloorOperation::new(),
+            inputs = [Array::scalar(2.7)],
+            expected = Array::scalar(2.0),
+        );
     }
 
     #[test]

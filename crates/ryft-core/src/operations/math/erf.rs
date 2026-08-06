@@ -185,7 +185,11 @@ mod tests {
 
     #[test]
     fn test_erf_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = ErfOperation::new(), inputs = [0.5], expected = ERF_HALF,);
+        check_operation_partial_evaluation!(
+            operation = ErfOperation::new(),
+            inputs = [Array::scalar(0.5)],
+            expected = Array::scalar(ERF_HALF),
+        );
     }
 
     #[test]

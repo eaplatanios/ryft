@@ -196,7 +196,11 @@ mod tests {
 
     #[test]
     fn test_sqrt_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = SqrtOperation::new(), inputs = [4.0], expected = 2.0,);
+        check_operation_partial_evaluation!(
+            operation = SqrtOperation::new(),
+            inputs = [Array::scalar(4.0)],
+            expected = Array::scalar(2.0),
+        );
     }
 
     #[test]

@@ -300,8 +300,8 @@ mod tests {
     fn test_atan2_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = Atan2Operation::new(),
-            inputs = [0.5, -0.25],
-            expected = 0.5f64.atan2(-0.25),
+            inputs = [Array::scalar(0.5), Array::scalar(-0.25)],
+            expected = Array::scalar(0.5f64.atan2(-0.25)),
         );
     }
 

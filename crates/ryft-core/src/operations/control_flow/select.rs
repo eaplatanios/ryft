@@ -485,9 +485,9 @@ mod tests {
 
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
-            operation = scalar_operation,
-            inputs = [Scalar::from(true), Scalar::from(2.0_f32), Scalar::from(3.0_f64)],
-            expected = Scalar::from(2.0_f64),
+            operation = SelectOperation::<ArrayType>::new(),
+            inputs = [Array::scalar(true), Array::scalar(2.0_f32), Array::scalar(3.0_f64)],
+            expected = Array::scalar(2.0_f64),
         );
 
         // Check elementwise batching with mapped conditions and a replicated branch.

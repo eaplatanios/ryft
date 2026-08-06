@@ -176,7 +176,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -191,40 +190,40 @@ mod tests {
 
     #[test]
     fn test_one() {
-        // Verify canonical one values across every supported scalar data-type family.
-        let context = EagerContext::<Scalar, OneOperation<DataType>>::new();
+        // Verify canonical rank-zero one values across every supported data-type family.
+        let context = EagerContext::<Array, OneOperation<ArrayType>>::new();
         for (r#type, expected) in [
-            (DataType::Boolean, Scalar::from(true)),
-            (DataType::I8, Scalar::from(1i8)),
-            (DataType::I16, Scalar::from(1i16)),
-            (DataType::I32, Scalar::from(1i32)),
-            (DataType::I64, Scalar::from(1i64)),
-            (DataType::U8, Scalar::from(1u8)),
-            (DataType::U16, Scalar::from(1u16)),
-            (DataType::U32, Scalar::from(1u32)),
-            (DataType::U64, Scalar::from(1u64)),
-            (DataType::BF16, Scalar::from(bf16::ONE)),
-            (DataType::F16, Scalar::from(f16::ONE)),
-            (DataType::F32, Scalar::from(1.0f32)),
-            (DataType::F64, Scalar::from(1.0f64)),
+            (DataType::Boolean, Array::scalar(true)),
+            (DataType::I8, Array::scalar(1i8)),
+            (DataType::I16, Array::scalar(1i16)),
+            (DataType::I32, Array::scalar(1i32)),
+            (DataType::I64, Array::scalar(1i64)),
+            (DataType::U8, Array::scalar(1u8)),
+            (DataType::U16, Array::scalar(1u16)),
+            (DataType::U32, Array::scalar(1u32)),
+            (DataType::U64, Array::scalar(1u64)),
+            (DataType::BF16, Array::scalar(bf16::ONE)),
+            (DataType::F16, Array::scalar(f16::ONE)),
+            (DataType::F32, Array::scalar(1.0f32)),
+            (DataType::F64, Array::scalar(1.0f64)),
         ] {
-            assert_eq!(context.one(&r#type), Ok(expected));
+            assert_eq!(context.one(&ArrayType::scalar(r#type)), Ok(expected));
         }
 
         // Verify the operation's stored type, identity, rendering, and eager interpretation.
-        let operation = OneOperation::new(DataType::F64);
+        let operation = OneOperation::new(ArrayType::scalar(DataType::F64));
         assert_eq!(operation.name(), ONE_OPERATION_NAME);
-        assert_eq!(format!("{operation}"), "one [type=f64]");
-        assert_eq!(operation.r#type(), &DataType::F64);
-        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![DataType::F64]));
+        assert_eq!(format!("{operation}"), "one [type=f64[]]");
+        assert_eq!(operation.r#type(), &ArrayType::scalar(DataType::F64));
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
-            Ok(vec![Scalar::from(1.0)]),
+            Ok(vec![Array::scalar(1.0)]),
         );
 
         // A nullary one does not acquire a physical batch axis because the same value serves every batch item.
@@ -256,14 +255,14 @@ mod tests {
         assert_eq!(OneOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
 
         // Verify the operation's textual form when it appears in a program.
-        let mut builder = ProgramBuilder::<Scalar, OneOperation<DataType>>::new();
+        let mut builder = ProgramBuilder::<Array, OneOperation<ArrayType>>::new();
         let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
-        let program = builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
+        let program = builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64 = one [type=f64]
+                let %0:f64[] = one [type=f64[]]
                 in (%0)
             "}
             .trim_end(),

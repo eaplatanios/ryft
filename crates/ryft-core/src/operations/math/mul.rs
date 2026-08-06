@@ -402,7 +402,11 @@ mod tests {
 
     #[test]
     fn test_mul_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = MulOperation::new(), inputs = [2.0, 3.5], expected = 7.0,);
+        check_operation_partial_evaluation!(
+            operation = MulOperation::new(),
+            inputs = [Array::scalar(2.0), Array::scalar(3.5)],
+            expected = Array::scalar(7.0),
+        );
     }
 
     #[test]

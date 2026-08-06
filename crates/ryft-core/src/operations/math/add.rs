@@ -225,7 +225,11 @@ mod tests {
 
     #[test]
     fn test_add_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = AddOperation::new(), inputs = [2.0, 3.5], expected = 5.5,);
+        check_operation_partial_evaluation!(
+            operation = AddOperation::new(),
+            inputs = [Array::scalar(2.0), Array::scalar(3.5)],
+            expected = Array::scalar(5.5),
+        );
     }
 
     #[test]

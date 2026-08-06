@@ -198,7 +198,11 @@ mod tests {
 
     #[test]
     fn test_exp_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = ExpOperation::new(), inputs = [0.7], expected = 0.7f64.exp(),);
+        check_operation_partial_evaluation!(
+            operation = ExpOperation::new(),
+            inputs = [Array::scalar(0.7)],
+            expected = Array::scalar(0.7f64.exp()),
+        );
     }
 
     #[test]

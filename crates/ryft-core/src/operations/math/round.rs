@@ -135,7 +135,11 @@ mod tests {
 
     #[test]
     fn test_round_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = RoundOperation::new(), inputs = [2.5], expected = 2.0,);
+        check_operation_partial_evaluation!(
+            operation = RoundOperation::new(),
+            inputs = [Array::scalar(2.5)],
+            expected = Array::scalar(2.0),
+        );
     }
 
     #[test]

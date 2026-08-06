@@ -276,7 +276,11 @@ mod tests {
 
     #[test]
     fn test_abs_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = AbsOperation::new(), inputs = [-2.0], expected = 2.0,);
+        check_operation_partial_evaluation!(
+            operation = AbsOperation::new(),
+            inputs = [Array::scalar(-2.0)],
+            expected = Array::scalar(2.0),
+        );
     }
 
     #[test]

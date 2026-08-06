@@ -192,7 +192,11 @@ mod tests {
 
     #[test]
     fn test_log_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = LogOperation::new(), inputs = [0.7], expected = 0.7f64.ln(),);
+        check_operation_partial_evaluation!(
+            operation = LogOperation::new(),
+            inputs = [Array::scalar(0.7)],
+            expected = Array::scalar(0.7f64.ln()),
+        );
     }
 
     #[test]

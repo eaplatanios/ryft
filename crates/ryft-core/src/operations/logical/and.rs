@@ -68,7 +68,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::{DifferentiationTracer, jvp};
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
@@ -144,8 +143,8 @@ mod tests {
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
             operation = AndOperation::new(),
-            inputs = [Scalar::from(true), Scalar::from(false)],
-            expected = Scalar::from(false),
+            inputs = [Array::scalar(true), Array::scalar(false)],
+            expected = Array::scalar(false),
         );
     }
 

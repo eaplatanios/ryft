@@ -195,7 +195,11 @@ mod tests {
 
     #[test]
     fn test_cos_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = CosOperation::new(), inputs = [0.5], expected = 0.5f64.cos(),);
+        check_operation_partial_evaluation!(
+            operation = CosOperation::new(),
+            inputs = [Array::scalar(0.5)],
+            expected = Array::scalar(0.5f64.cos()),
+        );
     }
 
     #[test]

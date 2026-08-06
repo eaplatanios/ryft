@@ -2566,7 +2566,10 @@ Phase 9a4 — retire the scalar program universe:
       - [x] Migrate elementwise differentiation, custom-derivative, and rematerialization fixtures.
       - [x] Migrate forward-mode differentiation fixtures.
       - [x] Migrate reverse-mode differentiation fixtures.
-  - [ ] Migrate remaining operation-local scalar fixtures or delete coverage already pinned by array tests.
+  - [ ] Migrate remaining operation-local scalar fixtures or delete coverage already covered by array tests.
+    - [x] Migrate constants, comparison, logical, conversion, and stop-gradient fixtures.
+    - [ ] Migrate control-flow fixtures.
+    - [ ] Migrate mathematical and complex-number fixtures.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
       exports, scalar-only doctests, and the obsolete scalar-domain compile-fail fixture.
@@ -4880,3 +4883,16 @@ references from `differentiation::reverse`; the sole remaining `Scalar` substrin
 `NonScalarGradientOutput` diagnostic variant. All 17 focused reverse-mode tests and the complete 1,154-test core library
 suite pass. This closes the generic context, tracing, partial-evaluation, batching, differentiation, custom-derivative,
 and rematerialization fixture migration. Remaining operation-local scalar fixtures are the next Phase 9a4 unit.
+
+The first operation-local slice moves constants, comparisons, logical operations, element-type conversion, and
+stop-gradient fixtures to rank-zero arrays. Repeated scalar assertions were deleted where rank-zero or rank-positive
+array cases already covered the same contract. `check_operation_partial_evaluation!` now has one canonical array-backed
+concise form rather than a scalar default or a transitional concise backend selector. Every concise scalar-backed caller
+has migrated, including `select`, all 24 mathematical callers, the macro examples, and the macro's own tests. The
+pre-existing explicit-case backend form remains available for genuinely different value families such as `ArrayIrValue`.
+
+This review unit changes 534 lines across 38 Rust source files with 48 net additions, principally from making rank-zero
+array construction explicit at the mathematical call sites. It removes 92 retired scalar references and reduces the
+operation-local residual audit from 410 matches across 40 files to 318 matches across 28 files. All 53 focused partial-
+evaluation tests, all 37 macro integration tests, the complete 1,154-test core library suite, and all 54 runnable
+doctests (16 intentional ignores) pass. Control-flow fixtures are the next bounded operation-local slice.

@@ -266,8 +266,8 @@ mod tests {
     fn test_max_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = MaxOperation::new(),
-            inputs = [Scalar::from(0.7), Scalar::from(0.3)],
-            expected = Scalar::from(0.7),
+            inputs = [Array::scalar(0.7), Array::scalar(0.3)],
+            expected = Array::scalar(0.7),
         );
     }
 

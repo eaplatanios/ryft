@@ -183,7 +183,11 @@ mod tests {
 
     #[test]
     fn test_sign_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = SignOperation::new(), inputs = [-0.7], expected = -1.0,);
+        check_operation_partial_evaluation!(
+            operation = SignOperation::new(),
+            inputs = [Array::scalar(-0.7)],
+            expected = Array::scalar(-1.0),
+        );
     }
 
     #[test]

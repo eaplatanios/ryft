@@ -107,55 +107,54 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::jacobian::JacobianDifferentiate;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
     #[test]
     fn test_one_like() {
-        // Verify value-driven one synthesis across representative scalar data-type families.
+        // Verify value-driven one synthesis across representative rank-zero array data-type families.
         for (input, expected) in [
-            (Scalar::from(false), Scalar::from(true)),
-            (Scalar::from(5i32), Scalar::from(1i32)),
-            (Scalar::from(5u32), Scalar::from(1u32)),
-            (Scalar::from(bf16::from_f32(5.0)), Scalar::from(bf16::ONE)),
-            (Scalar::from(f16::from_f32(5.0)), Scalar::from(f16::ONE)),
-            (Scalar::from(3.0f32), Scalar::from(1.0f32)),
-            (Scalar::from(7.0f64), Scalar::from(1.0f64)),
+            (Array::scalar(false), Array::scalar(true)),
+            (Array::scalar(5i32), Array::scalar(1i32)),
+            (Array::scalar(5u32), Array::scalar(1u32)),
+            (Array::scalar(bf16::from_f32(5.0)), Array::scalar(bf16::ONE)),
+            (Array::scalar(f16::from_f32(5.0)), Array::scalar(f16::ONE)),
+            (Array::scalar(3.0f32), Array::scalar(1.0f32)),
+            (Array::scalar(7.0f64), Array::scalar(1.0f64)),
         ] {
             assert_eq!(input.one_like(), expected);
         }
 
         // Verify the operation's identity, rendering, and eager interpretation.
-        let operation = OneLikeOperation::<DataType>::new();
+        let operation = OneLikeOperation::<ArrayType>::new();
         assert_eq!(format!("{operation}"), ONE_LIKE_OPERATION_NAME);
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(2.5)],
+                &[Array::scalar(2.5)],
             ),
-            Ok(vec![Scalar::from(1.0)]),
+            Ok(vec![Array::scalar(1.0)]),
         );
 
         // Verify the operation's textual form when it appears in a program.
-        let mut builder = ProgramBuilder::<Scalar, OneLikeOperation<DataType>>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, OneLikeOperation<ArrayType>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = one_like %0
+                lambda %0:f64[] .
+                let %1:f64[] = one_like %0
                 in (%1)
             "}
             .trim_end(),

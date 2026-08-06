@@ -193,7 +193,11 @@ mod tests {
 
     #[test]
     fn test_sin_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = SinOperation::new(), inputs = [0.5], expected = 0.5f64.sin(),);
+        check_operation_partial_evaluation!(
+            operation = SinOperation::new(),
+            inputs = [Array::scalar(0.5)],
+            expected = Array::scalar(0.5f64.sin()),
+        );
     }
 
     #[test]

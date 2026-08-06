@@ -308,7 +308,11 @@ mod tests {
 
     #[test]
     fn test_div_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = DivOperation::new(), inputs = [7.0, 2.0], expected = 3.5,);
+        check_operation_partial_evaluation!(
+            operation = DivOperation::new(),
+            inputs = [Array::scalar(7.0), Array::scalar(2.0)],
+            expected = Array::scalar(3.5),
+        );
     }
 
     #[test]

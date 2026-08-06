@@ -253,8 +253,8 @@ mod tests {
     fn test_min_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = MinOperation::new(),
-            inputs = [Scalar::from(0.7), Scalar::from(0.3)],
-            expected = Scalar::from(0.3),
+            inputs = [Array::scalar(0.7), Array::scalar(0.3)],
+            expected = Array::scalar(0.3),
         );
     }
 

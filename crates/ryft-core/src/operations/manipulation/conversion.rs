@@ -249,7 +249,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::jvp;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -263,21 +262,20 @@ mod tests {
     #[test]
     fn test_convert_element_type() {
         // Check operation metadata and exact inference, including structural array metadata and token rejection.
-        let scalar_operation = ConvertElementTypeOperation::<DataType>::new(DataType::F32);
         let array_operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32);
-        assert_eq!(scalar_operation.name(), CONVERT_ELEMENT_TYPE_OPERATION_NAME);
-        assert_eq!(scalar_operation.data_type(), DataType::F32);
-        assert_eq!(scalar_operation.to_string(), "convert_element_type [data_type=f32]");
+        assert_eq!(array_operation.name(), CONVERT_ELEMENT_TYPE_OPERATION_NAME);
+        assert_eq!(array_operation.data_type(), DataType::F32);
+        assert_eq!(array_operation.to_string(), "convert_element_type [data_type=f32]");
 
         check_operation_type_inference!(
-            operation = scalar_operation,
+            operation = array_operation,
             cases = [
                 {
-                    input_types = [DataType::F64],
-                    output_types = [DataType::F32],
+                    input_types = [ArrayType::scalar(DataType::F64)],
+                    output_types = [ArrayType::scalar(DataType::F32)],
                 },
                 {
-                    input_types = [DataType::Token],
+                    input_types = [ArrayType::scalar(DataType::Token)],
                     error = "cannot convert values to or from the token data type",
                 },
             ],
@@ -295,18 +293,18 @@ mod tests {
         );
 
         check_operation_type_inference!(
-            operation = ConvertElementTypeOperation::<DataType>::new(DataType::Token),
+            operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::Token),
             cases = [{
-                input_types = [DataType::F64],
+                input_types = [ArrayType::scalar(DataType::F64)],
                 error = "cannot convert values to or from the token data type",
             }],
         );
 
         // Check the default fold-or-residualize rule and preservation of mapped batch placement.
         check_operation_partial_evaluation!(
-            operation = scalar_operation,
-            inputs = [Scalar::from(2.0_f64)],
-            expected = Scalar::from(2.0_f32),
+            operation = array_operation,
+            inputs = [Array::scalar(2.0_f64)],
+            expected = Array::scalar(2.0_f32),
         );
 
         check_operation_batching!(

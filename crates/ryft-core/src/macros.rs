@@ -3407,19 +3407,19 @@ macro_rules! check_operation_type_inference {
 /// operation, every individual unknown-input position residualizes it, and an all-unknown input set does the same.
 /// The explicit form builds a one-instruction program for each case and checks its output classification, residual
 /// instruction count, and replayed values. Inputs use `(@known, value)` or `(@unknown(type = ..., replay = ...))`.
-/// Outputs use `(@known, value)` or `(@residual, value)`. The default form uses the eager [`Scalar`](crate::Scalar)
-/// reference backend, while `backend = (Value, Operation)` supports downstream value and operation families.
+/// Outputs use `(@known, value)` or `(@residual, value)`. The default form uses the eager [`Array`](crate::Array)
+/// reference backend, while `backend = (Value, Operation)` supports other value and operation families.
 ///
 /// # Examples
 ///
 /// This is an example of how to use this macro to check the elementwise [`NegOperation`](crate::NegOperation):
 ///
 /// ```rust
-/// # use ryft_core::{NegOperation, Scalar, check_operation_partial_evaluation};
+/// # use ryft_core::{Array, NegOperation, check_operation_partial_evaluation};
 /// check_operation_partial_evaluation!(
 ///     operation = NegOperation::new(),
-///     inputs = [Scalar::from(2.0)],
-///     expected = Scalar::from(-2.0),
+///     inputs = [Array::scalar(2.0)],
+///     expected = Array::scalar(-2.0),
 /// );
 /// ```
 ///
@@ -3429,15 +3429,16 @@ macro_rules! check_operation_type_inference {
 /// input when interpreting that residual program, and the resulting output is compared with the declared value:
 ///
 /// ```rust
-/// # use ryft_core::{AddOperation, DataType, Scalar, check_operation_partial_evaluation};
+/// # use ryft_core::{AddOperation, Array, ArrayType, DataType, check_operation_partial_evaluation};
+///
 /// check_operation_partial_evaluation!(
 ///     operation = AddOperation::new(),
 ///     cases = [{
 ///         inputs = [
-///             (@known, Scalar::from(2.0)),
-///             (@unknown(type = DataType::F64, replay = Scalar::from(3.0))),
+///             (@known, Array::scalar(2.0)),
+///             (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.0))),
 ///         ],
-///         outputs = [(@residual, Scalar::from(5.0))],
+///         outputs = [(@residual, Array::scalar(5.0))],
 ///         residual_instructions = 1,
 ///     }],
 /// );
@@ -3454,32 +3455,31 @@ macro_rules! check_operation_type_inference {
 ///     for downstream operation families.
 #[macro_export]
 macro_rules! check_operation_partial_evaluation {
-    // This branch checks the standard fold-or-residualize contract using the scalar reference backend.
+    // This branch checks the standard fold-or-residualize contract using the array reference backend.
     (
         operation = $operation:expr,
         inputs = [$($input:expr),+ $(,)?],
         expected = $expected:expr $(,)?
     ) => {{
         let operation = $operation;
-        let inputs: Vec<$crate::backends::scalars::Scalar> =
-            vec![$(::core::convert::Into::into($input)),+];
-        let expected: $crate::backends::scalars::Scalar = ::core::convert::Into::into($expected);
+        let inputs: Vec<$crate::backends::arrays::Array> = vec![$($input),+];
+        let expected: $crate::backends::arrays::Array = $expected;
         let mut builder = $crate::programs::builders::ProgramBuilder::<
-            $crate::backends::scalars::Scalar,
-            $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar>,
+            $crate::backends::arrays::Array,
+            $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
         >::new();
         let input_ids = inputs
             .iter()
             .map(|input| builder.add_input($crate::programs::types::Typed::r#type(input).into_owned()))
             .collect::<Vec<_>>();
-        let operation: $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar> =
+        let operation: $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array> =
             ::core::convert::Into::into(operation);
         let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
         assert_eq!(output_ids.len(), 1);
         let program = builder
             .build::<
-                Vec<$crate::backends::scalars::Scalar>,
-                Vec<$crate::backends::scalars::Scalar>,
+                Vec<$crate::backends::arrays::Array>,
+                Vec<$crate::backends::arrays::Array>,
             >(
                 output_ids,
                 vec![$crate::parameters::Placeholder; inputs.len()],
@@ -3487,8 +3487,8 @@ macro_rules! check_operation_partial_evaluation {
             )
             .unwrap();
         let context = $crate::contexts::EagerContext::<
-            $crate::backends::scalars::Scalar,
-            $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar>,
+            $crate::backends::arrays::Array,
+            $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
         >::new();
 
         let known = inputs
@@ -3534,15 +3534,15 @@ macro_rules! check_operation_partial_evaluation {
         }
     }};
 
-    // This branch forwards explicit cases to the scalar reference backend form.
+    // This branch forwards explicit cases to the array reference backend form.
     (
         operation = $operation:expr,
         cases = $cases:tt $(,)?
     ) => {
         $crate::check_operation_partial_evaluation!(
             backend = (
-                $crate::backends::scalars::Scalar,
-                $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar>
+                $crate::backends::arrays::Array,
+                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>
             ),
             operation = $operation,
             cases = $cases,
@@ -5359,49 +5359,49 @@ mod tests {
     fn test_check_operation_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = NegOperation::new(),
-            inputs = [Scalar::from(2.0)],
-            expected = Scalar::from(-2.0),
+            inputs = [Array::scalar(2.0)],
+            expected = Array::scalar(-2.0),
         );
         check_operation_partial_evaluation!(
             operation = AddOperation::new(),
             cases = [
                 {
                     inputs = [
-                        (@known, Scalar::from(2.0)),
-                        (@known, Scalar::from(3.5)),
+                        (@known, Array::scalar(2.0)),
+                        (@known, Array::scalar(3.5)),
                     ],
                     outputs = [
-                        (@known, Scalar::from(5.5)),
+                        (@known, Array::scalar(5.5)),
                     ],
                     residual_instructions = 0,
                 },
                 {
                     inputs = [
-                        (@unknown(type = DataType::F64, replay = Scalar::from(2.0))),
-                        (@known, Scalar::from(3.5)),
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(2.0))),
+                        (@known, Array::scalar(3.5)),
                     ],
                     outputs = [
-                        (@residual, Scalar::from(5.5)),
+                        (@residual, Array::scalar(5.5)),
                     ],
                     residual_instructions = 1,
                 },
                 {
                     inputs = [
-                        (@known, Scalar::from(2.0)),
-                        (@unknown(type = DataType::F64, replay = Scalar::from(3.5))),
+                        (@known, Array::scalar(2.0)),
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.5))),
                     ],
                     outputs = [
-                        (@residual, Scalar::from(5.5)),
+                        (@residual, Array::scalar(5.5)),
                     ],
                     residual_instructions = 1,
                 },
                 {
                     inputs = [
-                        (@unknown(type = DataType::F64, replay = Scalar::from(2.0))),
-                        (@unknown(type = DataType::F64, replay = Scalar::from(3.5))),
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(2.0))),
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.5))),
                     ],
                     outputs = [
-                        (@residual, Scalar::from(5.5)),
+                        (@residual, Array::scalar(5.5)),
                     ],
                     residual_instructions = 1,
                 },

@@ -132,7 +132,11 @@ mod tests {
 
     #[test]
     fn test_ceil_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = CeilOperation::new(), inputs = [2.3], expected = 3.0,);
+        check_operation_partial_evaluation!(
+            operation = CeilOperation::new(),
+            inputs = [Array::scalar(2.3)],
+            expected = Array::scalar(3.0),
+        );
     }
 
     #[test]

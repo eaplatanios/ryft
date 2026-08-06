@@ -212,7 +212,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -227,42 +226,42 @@ mod tests {
 
     #[test]
     fn test_zero() {
-        // Verify canonical zero values across every supported scalar data-type family.
-        let context = EagerContext::<Scalar, ZeroOperation<DataType>>::new();
+        // Verify canonical rank-zero zero values across every supported data-type family.
+        let context = EagerContext::<Array, ZeroOperation<ArrayType>>::new();
         for (r#type, expected) in [
-            (DataType::Boolean, Scalar::from(false)),
-            (DataType::I8, Scalar::from(0i8)),
-            (DataType::I16, Scalar::from(0i16)),
-            (DataType::I32, Scalar::from(0i32)),
-            (DataType::I64, Scalar::from(0i64)),
-            (DataType::U8, Scalar::from(0u8)),
-            (DataType::U16, Scalar::from(0u16)),
-            (DataType::U32, Scalar::from(0u32)),
-            (DataType::U64, Scalar::from(0u64)),
-            (DataType::BF16, Scalar::from(bf16::ZERO)),
-            (DataType::F16, Scalar::from(f16::ZERO)),
-            (DataType::F32, Scalar::from(0.0f32)),
-            (DataType::F64, Scalar::from(0.0f64)),
+            (DataType::Boolean, Array::scalar(false)),
+            (DataType::I8, Array::scalar(0i8)),
+            (DataType::I16, Array::scalar(0i16)),
+            (DataType::I32, Array::scalar(0i32)),
+            (DataType::I64, Array::scalar(0i64)),
+            (DataType::U8, Array::scalar(0u8)),
+            (DataType::U16, Array::scalar(0u16)),
+            (DataType::U32, Array::scalar(0u32)),
+            (DataType::U64, Array::scalar(0u64)),
+            (DataType::BF16, Array::scalar(bf16::ZERO)),
+            (DataType::F16, Array::scalar(f16::ZERO)),
+            (DataType::F32, Array::scalar(0.0f32)),
+            (DataType::F64, Array::scalar(0.0f64)),
         ] {
-            assert_eq!(context.zero(&r#type), Ok(expected));
+            assert_eq!(context.zero(&ArrayType::scalar(r#type)), Ok(expected));
         }
 
         // Verify the operation's stored type, identity, zero metadata, rendering, and eager interpretation.
-        let operation = ZeroOperation::new(DataType::F64);
+        let operation = ZeroOperation::new(ArrayType::scalar(DataType::F64));
         assert_eq!(operation.name(), ZERO_OPERATION_NAME);
         assert!(operation.is_zero(0));
         assert!(!operation.is_zero(1));
-        assert_eq!(format!("{operation}"), "zero [type=f64]");
-        assert_eq!(operation.r#type(), &DataType::F64);
-        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![DataType::F64]));
+        assert_eq!(format!("{operation}"), "zero [type=f64[]]");
+        assert_eq!(operation.r#type(), &ArrayType::scalar(DataType::F64));
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[]
             ),
-            Ok(vec![Scalar::from(0.0)]),
+            Ok(vec![Array::scalar(0.0)]),
         );
 
         // A nullary zero does not acquire a physical batch axis because the same value serves every batch item.
@@ -296,14 +295,14 @@ mod tests {
         assert_eq!(ZeroOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
 
         // Verify the operation's textual form when it appears in a program.
-        let mut builder = ProgramBuilder::<Scalar, ZeroOperation<DataType>>::new();
+        let mut builder = ProgramBuilder::<Array, ZeroOperation<ArrayType>>::new();
         let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
-        let program = builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
+        let program = builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64 = zero [type=f64]
+                let %0:f64[] = zero [type=f64[]]
                 in (%0)
             "}
             .trim_end(),

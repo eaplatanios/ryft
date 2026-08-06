@@ -166,7 +166,11 @@ mod tests {
 
     #[test]
     fn test_tanh_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = TanhOperation::new(), inputs = [0.7], expected = 0.7f64.tanh(),);
+        check_operation_partial_evaluation!(
+            operation = TanhOperation::new(),
+            inputs = [Array::scalar(0.7)],
+            expected = Array::scalar(0.7f64.tanh()),
+        );
     }
 
     #[test]

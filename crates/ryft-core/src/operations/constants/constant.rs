@@ -213,7 +213,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
@@ -222,34 +222,34 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::tracing::DomainTracingContext;
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
     #[test]
     fn test_constant() {
         // Verify the operation's literal value, identity, and rendering.
-        let operation = ConstantOperation::<Scalar>::new(Scalar::from(3.5));
+        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5));
         assert_eq!(operation.name(), CONSTANT_OPERATION_NAME);
-        assert_eq!(format!("{operation}"), "constant [value=3.5]");
-        assert_eq!(operation.value(), &Scalar::from(3.5));
-        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![DataType::F64]));
+        assert_eq!(format!("{operation}"), "constant [value=[3.5]]");
+        assert_eq!(operation.value(), &Array::scalar(3.5));
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
 
         // Eager interpretation returns the literal value unchanged.
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<Scalar>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
-            Ok(vec![Scalar::from(3.5)]),
+            Ok(vec![Array::scalar(3.5)]),
         );
 
         // Staged interpretation records the payload as a constant atom without emitting an instruction.
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let output =
-            InterpretableOperation::<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>::interpret(
+            InterpretableOperation::<DomainTracingContext<EagerContext<Array, ArrayOperation<Array>>>>::interpret(
                 &operation,
                 &context,
                 &EmptyRegionDriver,
@@ -260,17 +260,17 @@ mod tests {
         assert_eq!(output.atom_id(), Ok(AtomId::new(0)));
         let staged_builder = context.builder().borrow();
         assert!(staged_builder.instructions().is_empty());
-        assert!(matches!(&staged_builder.atoms()[0], Atom::Constant(value) if *value == 3.5));
+        assert!(matches!(&staged_builder.atoms()[0], Atom::Constant(value) if *value == Array::scalar(3.5)));
 
         // Verify the operation's textual form when it appears in a program.
-        let mut program_builder = ProgramBuilder::<Scalar, ConstantOperation<Scalar>>::new();
+        let mut program_builder = ProgramBuilder::<Array, ConstantOperation<Array>>::new();
         let output = program_builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
-        let program = program_builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
+        let program = program_builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64 = constant [value=3.5]
+                let %0:f64[] = constant [value=[3.5]]
                 in (%0)
             "}
             .trim_end(),

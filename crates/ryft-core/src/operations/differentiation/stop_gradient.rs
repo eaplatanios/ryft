@@ -187,7 +187,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{LinearizationTracer, gradient, jvp, value_and_gradient};
@@ -206,27 +205,8 @@ mod tests {
 
     #[test]
     fn test_stop_gradient() {
-        let scalar_operation = StopGradientOperation::<DataType>::new();
         let array_operation = StopGradientOperation::<ArrayType>::new();
 
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &scalar_operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(2.0)],
-            ),
-            Ok(vec![Scalar::from(2.0)]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &scalar_operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(Complex::new(1.0f64, -2.0))],
-            ),
-            Ok(vec![Scalar::from(Complex::new(1.0f64, -2.0))]),
-        );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &array_operation,
@@ -235,6 +215,15 @@ mod tests {
                 &[Array::scalar(2.0)],
             ),
             Ok(vec![Array::scalar(2.0)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &array_operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(Complex::new(1.0f64, -2.0))],
+            ),
+            Ok(vec![Array::scalar(Complex::new(1.0f64, -2.0))]),
         );
 
         let input = Array::vector(vec![1.0, -2.0]);
@@ -257,10 +246,10 @@ mod tests {
                 let stopped = crate::stop_gradient((input.clone(), vec![input.clone(), input]));
                 stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
             },
-            Scalar::from(2.0),
+            Array::scalar(2.0),
         )
         .unwrap();
-        assert_eq!(first_derivative, 0.0);
+        assert_eq!(first_derivative, Array::scalar(0.0));
 
         let second_derivative = gradient(
             |input| {
@@ -272,23 +261,16 @@ mod tests {
                     input,
                 )
             },
-            Scalar::from(2.0),
+            Array::scalar(2.0),
         )
         .unwrap();
-        assert_eq!(second_derivative, 0.0);
+        assert_eq!(second_derivative, Array::scalar(0.0));
     }
 
     #[test]
     fn test_stop_gradient_type_inference() {
         // Gradient stopping is the identity on every data type, including types the numeric operations reject.
         for input_type in [DataType::Token, DataType::Boolean, DataType::I32, DataType::C64] {
-            check_operation_type_inference!(
-                operation = StopGradientOperation::<DataType>::new(),
-                cases = [{
-                    input_types = [input_type],
-                    output_types = [input_type],
-                }],
-            );
             let input_type = ArrayType::new(input_type, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
             check_operation_type_inference!(
                 operation = StopGradientOperation::<ArrayType>::new(),
@@ -416,22 +398,22 @@ mod tests {
     fn test_stop_gradient_differentiation() {
         // The JVP passes the primal through and severs the tangent. This intentionally differs from the numerical
         // derivative of the identity primal function, so the finite-difference operation helper does not apply.
-        let (primal, tangent) = jvp(|x| Ok(x.stop_gradient()), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
-        assert_eq!(primal, 2.0);
-        assert_eq!(tangent, 0.0);
+        let (primal, tangent) = jvp(|x| Ok(x.stop_gradient()), Array::scalar(2.0), Array::scalar(3.0)).unwrap();
+        assert_eq!(primal, Array::scalar(2.0));
+        assert_eq!(tangent, Array::scalar(0.0));
 
         // The JAX documentation example: `f(x) = x * stop_gradient(x)` differentiates like `x * c` with `c` frozen
         // at the primal value, so `f'(x) = stop_gradient(x)`.
         let (value, first_derivative) =
-            value_and_gradient(|x| x.clone() * x.stop_gradient(), Scalar::from(3.0)).unwrap();
-        assert_eq!(value, 9.0);
-        assert_eq!(first_derivative, 3.0);
+            value_and_gradient(|x| x.clone() * x.stop_gradient(), Array::scalar(3.0)).unwrap();
+        assert_eq!(value, Array::scalar(9.0));
+        assert_eq!(first_derivative, Array::scalar(3.0));
 
         // A stop-gradient barrier applies to every active differentiation level. The first derivative of
         // `x * stop_gradient(x)` is the frozen primal `x`, but an enclosing derivative cannot differentiate it again.
         let second_derivative =
-            gradient(|x| gradient(|y| y.clone() * y.stop_gradient(), x), Scalar::from(3.0)).unwrap();
-        assert_eq!(second_derivative, 0.0);
+            gradient(|x| gradient(|y| y.clone() * y.stop_gradient(), x), Array::scalar(3.0)).unwrap();
+        assert_eq!(second_derivative, Array::scalar(0.0));
 
         // The staged tangent program replays the primal operation and stages no tangent computation: the severed
         // tangent output materializes as a canonical zero.
@@ -458,9 +440,9 @@ mod tests {
     #[test]
     fn test_stop_gradient_partial_evaluation() {
         check_operation_partial_evaluation!(
-            operation = StopGradientOperation::<DataType>::new(),
-            inputs = [2.0],
-            expected = 2.0,
+            operation = StopGradientOperation::<ArrayType>::new(),
+            inputs = [Array::scalar(2.0)],
+            expected = Array::scalar(2.0),
         );
     }
 
