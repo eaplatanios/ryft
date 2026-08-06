@@ -2485,6 +2485,8 @@ Phase 9a2 — byte-backed reference kernels:
         construction for U8/U16/U32/U64 outputs, without routing state or generated bits through `Scalar`.
 - [ ] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
       gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
+  - [x] P9a2c: migrate broadcast, transpose, reshape, static and dynamic slice/update, pad, and concatenate to direct
+        layout-aware byte copies, retaining exact validation order and bulk-copying physically contiguous selections.
 - [ ] Route raw-buffer access through the Phase 9a1 addressing contract and reuse its rectangular traversal where it
       removes today's duplicated row-major stride, odometer, block-copy, and block-replacement logic. Keep operation
       semantics in their kernels; the addressing layer owns only checked logical-index-to-byte-range mapping.
@@ -4430,3 +4432,23 @@ Philox tests continue to cover U32/U64 word expansion, odd output counts, state 
 materialization, and batching. All 1,152 `ryft-core` library tests and all 436 runnable `ryft-xla` library tests pass
 (one intentional timing-sensitive ignore); formatting and diff hygiene pass. The broader Phase 9a2 family checkbox
 remains open for the remaining arithmetic, comparison, complex, conversion, and constructor kernels.
+
+### Phase 9a2c structural byte-copy reference kernels (2026-08-05)
+
+Broadcast, transpose, reshape, static and dynamic slice/update, pad, and concatenate now move exact element encodings
+between physical buffers through `ArrayAddressing`; none decodes the copied array payload through `Scalar`. Transpose,
+reshape, and broadcast map logical output coordinates directly to addressed source and destination byte ranges. Slice
+and update share two small block-copy methods that consume `ArrayIndexRanges`, bulk-copy physically contiguous runs
+when the other side is dense, and fall back to addressed element copies only for arbitrary layouts. Copy-on-write
+updates use `Arc::make_mut`, so an owned concatenation destination is filled in place while an update of a shared input
+allocates exactly one independent output buffer. Pad initializes every logical output element from the rank-zero
+padding encoding and then overlays addressed input elements. Concatenation no longer needs a temporary seed element or
+an element-wise scalar buffer, including for `f8e8m0fnu`, which cannot represent zero.
+
+Focused reference tests now pin reversed and holed strided inputs, exact output physical bytes, broadcast into a holed
+layout, layout-clearing transpose/reshape/concatenate behavior, destination-layout-preserving updates, and exact U16
+padding. The full core suite caught and the implementation corrected one validation-order regression: oversized
+broadcast shapes must retain their established shape-element-count diagnostic before byte-span validation. All 1,152
+`ryft-core` library tests and all 436 runnable `ryft-xla` library tests pass (one intentional timing-sensitive ignore);
+formatting and diff hygiene pass. The structural parent remains open for gather/scatter, reduce, sort, dot/attention,
+collectives, and control flow.

@@ -1607,23 +1607,24 @@ impl Transpose for Array {
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
-        let input_values = self.scalar_values();
-        if input_values.is_empty() {
-            return Self::from_scalar_values(output_type, Vec::new());
-        }
         let shape = self.r#type.static_shape().unwrap();
         let rank = shape.rank();
         let permuted_shape = StaticShape::new(permutation.iter().map(|axis| shape[*axis]).collect());
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if output_addressing.element_count() == 0 {
+            return Ok(Self { r#type: output_type, bytes: Arc::new(bytes) });
+        }
         let input_strides = shape.row_major_strides();
-        let element_count: usize = shape.dimensions().iter().product();
-        let mut values = Vec::with_capacity(element_count);
         let mut permuted_index = vec![0usize; rank];
-        while values.len() < element_count {
+        for output_flat in 0..output_addressing.element_count() {
             let mut input_flat = 0usize;
             for (position, &input_axis) in permutation.iter().enumerate() {
                 input_flat += permuted_index[position] * input_strides[input_axis];
             }
-            values.push(input_values[input_flat]);
+            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
+                .copy_from_slice(&self.bytes[input_addressing.byte_range_for_flat_index(input_flat)]);
             for position in (0..rank).rev() {
                 permuted_index[position] += 1;
                 if permuted_index[position] < permuted_shape[position] {
@@ -1632,7 +1633,7 @@ impl Transpose for Array {
                 permuted_index[position] = 0;
             }
         }
-        Self::from_scalar_values(output_type, values)
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
     }
 }
 
@@ -1642,11 +1643,20 @@ impl Reshape for Array {
         // reshape so all element-count and sharding validation remains shared with staged execution.
         let parameters = parameters.into().resolve_target(self.r#type.shape())?;
         let output_type = self.r#type.reshape(parameters.clone())?;
-        let logical_bytes = match parameters.dimensions() {
-            Some(dimensions) => self.transpose(dimensions)?.logical_bytes(),
-            None => self.logical_bytes(),
-        };
-        Self::from_logical_bytes(output_type, &logical_bytes)
+        let transposed = parameters.dimensions().map(|dimensions| self.transpose(dimensions)).transpose()?;
+        let input = transposed.as_ref().unwrap_or(self);
+        let input_addressing = ArrayAddressing::new(input.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if input_addressing.is_dense_row_major() && output_addressing.is_dense_row_major() {
+            bytes.copy_from_slice(&input.bytes);
+        } else {
+            for index in 0..input_addressing.element_count() {
+                bytes[output_addressing.byte_range_for_flat_index(index)]
+                    .copy_from_slice(&input.bytes[input_addressing.byte_range_for_flat_index(index)]);
+            }
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
     }
 }
 
@@ -1664,19 +1674,24 @@ impl BroadcastKernel for Array {
         let input_shape = self.r#type.static_shape().unwrap();
         let input_rank = input_shape.rank();
         let target_rank = target_shape.rank();
-        let input_strides = input_shape.row_major_strides();
         let output_count = Self::materialized_element_count(&r#type)?;
-        let input_values = self.scalar_values();
-        let mut values = Vec::with_capacity(output_count);
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(r#type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if output_count == 0 {
+            return Ok(Self { r#type, bytes: Arc::new(bytes) });
+        }
+        let input_strides = input_shape.row_major_strides();
         let mut target_index = vec![0usize; target_rank];
-        while values.len() < output_count {
+        for output_flat in 0..output_count {
             let mut input_flat = 0usize;
             for input_axis in 0..input_rank {
                 let target_axis = output_axes[input_axis];
                 let coordinate = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
                 input_flat += coordinate * input_strides[input_axis];
             }
-            values.push(input_values[input_flat]);
+            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
+                .copy_from_slice(&self.bytes[input_addressing.byte_range_for_flat_index(input_flat)]);
             for position in (0..target_rank).rev() {
                 target_index[position] += 1;
                 if target_index[position] < target_shape[position] {
@@ -1685,7 +1700,7 @@ impl BroadcastKernel for Array {
                 target_index[position] = 0;
             }
         }
-        Self::from_scalar_values(r#type, values)
+        Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
 }
 
@@ -1697,41 +1712,73 @@ impl LegacyBroadcast for Array {
 }
 
 impl Array {
-    /// Copies the row-major block selected by `axes` out of this array's payload. The caller guarantees that the block
-    /// lies in bounds.
-    fn copy_block(&self, axes: &[ArraySliceAxis]) -> Vec<Scalar> {
-        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
-        let ranges = addressing.ranges(axes).unwrap();
-        let input_values = self.scalar_values();
-        let mut values = Vec::with_capacity(ranges.element_count());
+    /// Copies the logical block selected by `axes` into a new array of `output_type`. The caller guarantees that the
+    /// selection lies in bounds and contains exactly the output's logical element count.
+    fn copy_block(&self, output_type: ArrayType, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let ranges = input_addressing.ranges(axes)?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        debug_assert_eq!(ranges.element_count(), output_addressing.element_count());
+        let element_byte_width = input_addressing.element_byte_width();
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        let output_is_dense = output_addressing.is_dense_row_major();
+        let mut output_index = 0usize;
         for range in ranges {
-            values.extend_from_slice(&input_values[range.elements()]);
+            let input_bytes = range.bytes();
+            let element_count = range.elements().len();
+            if output_is_dense {
+                let output_start = output_index * element_byte_width;
+                bytes[output_start..output_start + input_bytes.len()].copy_from_slice(&self.bytes[input_bytes]);
+                output_index += element_count;
+                continue;
+            }
+            for offset in 0..element_count {
+                let input_start = input_bytes.start + offset * element_byte_width;
+                bytes[output_addressing.byte_range_for_flat_index(output_index)]
+                    .copy_from_slice(&self.bytes[input_start..input_start + element_byte_width]);
+                output_index += 1;
+            }
         }
-        values
+        debug_assert_eq!(output_index, output_addressing.element_count());
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
     }
 
-    /// Overwrites the row-major block of `update`'s shape starting at `start_indices` in this array's payload with
-    /// `update`'s payload. The caller guarantees that the block lies in bounds.
+    /// Overwrites the logical block of `update`'s shape starting at `start_indices` in this array with `update`. The
+    /// caller guarantees that the block lies in bounds.
     fn replace_block(self, update: &Array, start_indices: &[usize]) -> Self {
         let update_shape = update.r#type.static_shape().unwrap();
         let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
-        let mut values = self.scalar_values();
-        let update_values = update.scalar_values();
+        let update_addressing = ArrayAddressing::new(update.r#type.clone()).unwrap();
         let axes = start_indices
             .iter()
             .zip(update_shape.dimensions())
             .map(|(start, size)| ArraySliceAxis::new(*start, *size, 1))
             .collect::<Vec<_>>();
         let ranges = addressing.ranges(&axes).unwrap();
+        let element_byte_width = addressing.element_byte_width();
+        let mut output = self;
+        let bytes = Arc::make_mut(&mut output.bytes);
+        let update_is_dense = update_addressing.is_dense_row_major();
         let mut written = 0usize;
         for range in ranges {
-            let elements = range.elements();
-            let length = elements.len();
-            values[elements].copy_from_slice(&update_values[written..written + length]);
-            written += length;
+            let output_bytes = range.bytes();
+            let element_count = range.elements().len();
+            if update_is_dense {
+                let update_start = written * element_byte_width;
+                bytes[output_bytes]
+                    .copy_from_slice(&update.bytes[update_start..update_start + element_count * element_byte_width]);
+                written += element_count;
+                continue;
+            }
+            for offset in 0..element_count {
+                let output_start = output_bytes.start + offset * element_byte_width;
+                bytes[output_start..output_start + element_byte_width]
+                    .copy_from_slice(&update.bytes[update_addressing.byte_range_for_flat_index(written)]);
+                written += 1;
+            }
         }
-        debug_assert_eq!(written, update_values.len());
-        Self::from_scalar_values(self.r#type, values).unwrap()
+        debug_assert_eq!(written, update_addressing.element_count());
+        output
     }
 
     /// Extracts the in-band scalar start indices of a dynamic slicing operation and clamps them per StableHLO
@@ -1772,13 +1819,28 @@ impl Pad for Array {
             return Ok(self.clone());
         }
         let output_shape = output_type.static_shape().unwrap();
-        let output_strides = output_shape.row_major_strides();
         let rank = input_shape.rank();
-        let input_values = self.scalar_values();
-        let mut values = vec![padding_value.scalar_values()[0]; Self::element_count(&output_type)];
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let padding_addressing = ArrayAddressing::new(padding_value.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let padding_bytes = &padding_value.bytes[padding_addressing.byte_range_for_flat_index(0)];
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if output_addressing.is_dense_row_major() && output_addressing.element_byte_width() != 0 {
+            for output_bytes in bytes.chunks_exact_mut(output_addressing.element_byte_width()) {
+                output_bytes.copy_from_slice(padding_bytes);
+            }
+        } else {
+            for output_index in 0..output_addressing.element_count() {
+                bytes[output_addressing.byte_range_for_flat_index(output_index)].copy_from_slice(padding_bytes);
+            }
+        }
+        if input_addressing.element_count() == 0 {
+            return Ok(Self { r#type: output_type, bytes: Arc::new(bytes) });
+        }
+        let output_strides = output_shape.row_major_strides();
         let mut input_index = vec![0usize; rank];
         let mut written = 0usize;
-        'elements: while written < input_values.len() {
+        'elements: while written < input_addressing.element_count() {
             let mut output_flat = 0usize;
             for axis in 0..rank {
                 let input_coordinate = i128::try_from(input_index[axis])
@@ -1815,7 +1877,8 @@ impl Pad for Array {
                         })?)
                         .ok_or_else(|| TypeError::invalid(format!("'pad' output index overflows on axis {axis}")))?;
             }
-            values[output_flat] = input_values[written];
+            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
+                .copy_from_slice(&self.bytes[input_addressing.byte_range_for_flat_index(written)]);
             written += 1;
             for position in (0..rank).rev() {
                 input_index[position] += 1;
@@ -1825,7 +1888,7 @@ impl Pad for Array {
                 input_index[position] = 0;
             }
         }
-        Self::from_scalar_values(output_type, values)
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
     }
 }
 
@@ -1846,19 +1909,13 @@ impl Concatenate for Array {
         let operation = ConcatenateOperation::new(axis, first.r#type.rank())?;
         let axis = operation.axis();
         let output_type = ArrayType::concatenate(inputs.iter().map(|input| &input.r#type), axis)?;
-        // Each operand owns a contiguous run of `axis` coordinates; writing its block at the running offset along
-        // `axis` (and offset zero on every other axis) reuses the row-major odometer in `replace_block`.
-        let output_element_count = Self::element_count(&output_type);
-        let values = if output_element_count == 0 {
-            Vec::new()
-        } else {
-            // A nonempty concatenation result necessarily has at least one operand element. Seed the destination with
-            // that representable element before `replace_block` overwrites every slot, avoiding an artificial
-            // requirement that the element data type support an additive zero (e.g., `f8e8m0fnu` does not).
-            let seed = inputs.iter().find_map(|input| input.scalar_values().first().copied()).unwrap();
-            vec![seed; output_element_count]
-        };
-        let mut output = Self::from_scalar_values(output_type.clone(), values)?;
+        // Each operand owns a contiguous run of `axis` coordinates. Write its logical block at the running offset
+        // along `axis` and offset zero on every other axis.
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        // Zero-initialization establishes every layout hole and tile-padding byte. Every logical element is replaced
+        // below, so this does not require the element data type itself to represent zero.
+        let mut output =
+            Self { r#type: output_type.clone(), bytes: Arc::new(vec![0; output_addressing.storage_byte_len()]) };
         let mut offset = 0usize;
         for input in inputs {
             let input_axis_size = input.r#type.static_shape().unwrap()[axis];
@@ -2071,8 +2128,7 @@ impl Slice for Array {
             .zip(strides.iter())
             .map(|((start, limit), stride)| ArraySliceAxis::new(*start, (limit - start).div_ceil(*stride), *stride))
             .collect::<Vec<_>>();
-        let values = self.copy_block(&axes);
-        Self::from_scalar_values(output_type, values)
+        self.copy_block(output_type, &axes)
     }
 }
 
@@ -2094,8 +2150,7 @@ impl DynamicSlice for Array {
             .zip(sizes)
             .map(|(start, size)| ArraySliceAxis::new(*start, *size, 1))
             .collect::<Vec<_>>();
-        let values = self.copy_block(&axes);
-        Self::from_scalar_values(output_type, values)
+        self.copy_block(output_type, &axes)
     }
 }
 
@@ -2948,6 +3003,17 @@ mod tests {
         assert_eq!(broadcast.r#type().into_owned(), output_type);
         assert_eq!(broadcast.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
 
+        // Broadcasting reads a reversed input layout and writes the output's requested physical layout, retaining
+        // zero in its holes.
+        let input_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let input = Array::from_elements(input_type, &[0x1122u16, 0x3344]).unwrap();
+        let output_type =
+            array_type(DataType::U16, &[2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![6, 2])));
+        let broadcast = input.broadcast_to_type(output_type.clone(), &[1]).unwrap();
+        assert_eq!(broadcast.r#type().as_ref(), &output_type);
+        assert_eq!(broadcast.elements::<u16>(), Ok(vec![0x1122, 0x3344, 0x1122, 0x3344]));
+        assert_eq!(broadcast.storage_bytes(), [0x22, 0x11, 0x44, 0x33, 0, 0, 0x22, 0x11, 0x44, 0x33]);
+
         // Deliberately malformed concrete values with dynamic types fail through the structured materialization
         // diagnostic before either the identity fast path or static-shape payload logic can accept or panic on them.
         let dynamic = DimensionVariable::new("dynamic", DimensionBounds::unbounded());
@@ -2976,6 +3042,15 @@ mod tests {
         assert_eq!(transposed.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
         assert!(matrix.transpose([0, 0]).is_err());
 
+        // Transposition traverses the input's physical layout while producing the canonical layout-free output type.
+        let input_type =
+            array_type(DataType::U16, &[2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
+        let matrix = Array::from_elements(input_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
+        let transposed = matrix.transpose([1, 0]).unwrap();
+        assert_eq!(transposed.r#type().into_owned(), array_type(DataType::U16, &[3, 2]));
+        assert_eq!(transposed.elements::<u16>(), Ok(vec![1, 4, 2, 5, 3, 6]));
+        assert_eq!(transposed.storage_bytes(), [1, 0, 4, 0, 2, 0, 5, 0, 3, 0, 6, 0]);
+
         // Empty arrays transpose without calculating strides that may overflow for otherwise irrelevant dimensions.
         let empty = Array::new(array_type(DataType::F64, &[0, usize::MAX, usize::MAX]), Vec::new()).unwrap();
         assert_eq!(
@@ -2991,6 +3066,14 @@ mod tests {
         assert_eq!(reshaped.r#type().into_owned(), array_type(DataType::F64, &[3, 2]));
         assert_eq!(reshaped.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert!(matrix.reshape(Shape::new(vec![Dimension::Static(4)])).is_err());
+
+        // Reshaping preserves logical order independently of the input's physical placement.
+        let input_type =
+            array_type(DataType::U16, &[2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
+        let matrix = Array::from_elements(input_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
+        let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
+        assert_eq!(reshaped.elements::<u16>(), Ok(vec![1, 2, 3, 4, 5, 6]));
+        assert_eq!(reshaped.storage_bytes(), [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
     }
 
     #[test]
@@ -3008,6 +3091,18 @@ mod tests {
             vector.dynamic_update_slice(&Array::vector(vec![10.0, 20.0]), &start).unwrap(),
             Array::vector(vec![1.0, 2.0, 3.0, 10.0, 20.0]),
         );
+
+        // Static slicing and updating traverse arbitrary source and update layouts while preserving the destination
+        // layout for updates.
+        let input_type = array_type(DataType::U16, &[5]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let vector = Array::from_elements(input_type.clone(), &[1u16, 2, 3, 4, 5]).unwrap();
+        assert_eq!(vector.slice(&[1], &[5], &[2]).unwrap().elements::<u16>(), Ok(vec![2, 4]));
+        let update_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let update = Array::from_elements(update_type, &[10u16, 20]).unwrap();
+        let updated = vector.update_slice(&update, &[1]).unwrap();
+        assert_eq!(updated.r#type().as_ref(), &input_type);
+        assert_eq!(updated.elements::<u16>(), Ok(vec![1, 10, 20, 4, 5]));
+        assert_eq!(updated.storage_bytes(), [5, 0, 4, 0, 20, 0, 10, 0, 1, 0]);
     }
 
     #[test]
@@ -3015,6 +3110,14 @@ mod tests {
         let vector = Array::vector(vec![1.0, 2.0]);
         let padded = vector.pad(&Array::scalar(0.5), &[1], &[2], &[1]).unwrap();
         assert_eq!(padded, Array::vector(vec![0.5, 1.0, 0.5, 2.0, 0.5, 0.5]));
+
+        // Padding copies both the reversed input layout and the rank-zero padding element by their exact bytes.
+        let input_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let vector = Array::from_elements(input_type, &[1u16, 2]).unwrap();
+        let padded = vector.pad(&Array::scalar(9u16), &[1], &[1], &[1]).unwrap();
+        assert_eq!(padded.r#type().into_owned(), array_type(DataType::U16, &[5]));
+        assert_eq!(padded.elements::<u16>(), Ok(vec![9, 1, 9, 2, 9]));
+        assert_eq!(padded.storage_bytes(), [9, 0, 1, 0, 9, 0, 2, 0, 9, 0]);
     }
 
     #[test]
@@ -3034,6 +3137,16 @@ mod tests {
         let concatenated = Array::concatenate([&first, &second], 1).unwrap();
         assert_eq!(concatenated.r#type().into_owned(), array_type(DataType::F64, &[2, 3, 2]));
         assert_eq!(concatenated.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0],);
+
+        // Concatenation traverses each input's physical layout and emits the canonical layout-free result.
+        let first_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let second_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let first = Array::from_elements(first_type, &[1u16, 2]).unwrap();
+        let second = Array::from_elements(second_type, &[3u16, 4]).unwrap();
+        let concatenated = Array::concatenate([&first, &second], 0).unwrap();
+        assert_eq!(concatenated.r#type().into_owned(), array_type(DataType::U16, &[4]));
+        assert_eq!(concatenated.elements::<u16>(), Ok(vec![1, 2, 3, 4]));
+        assert_eq!(concatenated.storage_bytes(), [1, 0, 2, 0, 3, 0, 4, 0]);
 
         // Concatenation does not require an artificial additive zero, including when the output itself is empty.
         let element_type = array_type(DataType::F8E8M0FNU, &[1]);
