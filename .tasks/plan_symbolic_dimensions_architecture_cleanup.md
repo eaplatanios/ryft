@@ -2471,9 +2471,9 @@ Phase 9a1 — layout-aware byte storage and construction:
       representative NaNs/payloads, complex values, empty arrays, `Token`, and `Zero`.
 - [x] Add I1/I2/I4/U1/U2/U4 reference-array construction and validation, closing the current `Scalar` storage gap
       without adding scalar enum variants.
-- [ ] Extend allocation tests to prove large-array clone performs no payload-sized allocation, while borrowed and
+- [x] Extend allocation tests to prove large-array clone performs no payload-sized allocation, while borrowed and
       consuming projection remain fully allocation-free after setup.
-- [ ] Gate: no `Vec<Scalar>` payload, `values()` accessor, or duplicate byte ownership remains.
+- [x] Gate: no `Vec<Scalar>` payload, `values()` accessor, or duplicate byte ownership remains.
 
 Phase 9a2 — byte-backed reference kernels:
 
@@ -4381,3 +4381,18 @@ representation.
 The byte-backed `Array` implementation imports codec functions directly from `arrays::encoding`; those implementation
 entrypoints are not re-exported from `arrays`. Verification passes the focused sub-byte integration test, all 1,151
 core library tests, formatting, and diff hygiene. The allocation-proof item remains the next isolated Phase 9a1 slice.
+
+### Phase 9a1 allocation and ownership gate (2026-08-05)
+
+The dedicated allocation-test binary now records allocation requests, total requested bytes, and the largest request.
+Cloning a one-element F32 array and a 4,096-element F32 array produces identical allocation statistics, and both clones
+retain the exact physical-storage pointer of their source. The large clone's total and largest allocations are each
+strictly smaller than its 16-KiB payload, proving that clone cost is metadata-only and independent of element count.
+Borrowed array-member projection remains allocation-free over 1,000 iterations, while consuming projection performs
+zero allocations and transfers the owned array directly.
+
+The Phase 9a1 ownership audit confirms that `Array` stores only its `ArrayType` and one `Arc<Vec<u8>>`; it has no
+`Vec<Scalar>` payload, public `values()` compatibility accessor, or second stored byte representation. The private
+`scalar_values()` bridge materializes temporary kernel inputs and remains explicitly owned by Phase 9a2 rather than
+stored state. All `ryft-core` test targets pass, including 1,151 library tests, the three allocation tests, the six
+remaining integration tests, and the compile-fail contract; formatting and diff hygiene pass. Phase 9a1 is complete.
