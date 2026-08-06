@@ -2571,7 +2571,7 @@ Phase 9a4 — retire the scalar program universe:
     - [x] Migrate control-flow fixtures.
     - [ ] Migrate mathematical and complex-number fixtures.
       - [x] Migrate arithmetic, ordering, clamping, sign, and rounding fixtures.
-      - [ ] Migrate transcendental and special-function fixtures.
+      - [x] Migrate transcendental and special-function fixtures.
       - [ ] Migrate complex construction and projection fixtures.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
@@ -4924,3 +4924,15 @@ checklist split that bounds the remaining review units and this review record. I
 and reduces the operation-local residual audit from 292 matches across 26 files to 181 matches across 18 files.
 Formatting and diff hygiene pass, and the complete 1,153-test core library suite passes. Transcendental and special-
 function fixtures are the next bounded operation-local slice.
+
+The transcendental and special-function slice moves all remaining scalar-backed fixtures in `abs`, `atan2`, `cos`,
+`erf`, `exp`, `log`, `logistic`, `pow`, `rsqrt`, `sin`, `sqrt`, and `tanh` to rank-zero arrays. The migrated coverage
+retains mixed and low precision, complex principal branches and holomorphic derivatives, overflow-resistant
+differentiation, exact error-function regimes, signed special values, and extreme complex trigonometric results. The
+two tests that inspect complex infinities decode the typed array payload explicitly; all other approximate checks use
+the array backend's existing comparison contract directly.
+
+This review unit changes 313 lines across 12 Rust source files with nine net additions from explicit typed rank-zero
+expectations. It removes 139 retired scalar references and reduces the operation-local residual audit from 181 matches
+across 18 files to 42 matches across six files. Formatting and diff hygiene pass, and the complete 1,153-test core
+library suite passes. Complex construction and projection fixtures are the final mathematical/complex-number subunit.

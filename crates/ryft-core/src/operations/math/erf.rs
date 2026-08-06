@@ -65,7 +65,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -84,29 +83,28 @@ mod tests {
     #[test]
     fn test_erf() {
         // Exact fixed points and symmetry.
-        assert_eq!(Scalar::from(0.0f64).erf().unwrap(), 0.0f64);
-        assert_eq!(Scalar::from(f64::INFINITY).erf().unwrap(), 1.0f64);
-        assert_eq!(Scalar::from(f64::NEG_INFINITY).erf().unwrap(), -1.0f64);
-        assert_eq!(Scalar::from(1.5f64).erf().unwrap(), -Scalar::from(-1.5f64).erf().unwrap());
-        let Scalar::F64(not_a_number) = Scalar::from(f64::NAN).erf().unwrap() else { panic!("expected an f64 result") };
-        assert!(not_a_number.is_nan());
+        assert_eq!(Array::scalar(0.0f64).erf().unwrap(), Array::scalar(0.0f64));
+        assert_eq!(Array::scalar(f64::INFINITY).erf().unwrap(), Array::scalar(1.0f64));
+        assert_eq!(Array::scalar(f64::NEG_INFINITY).erf().unwrap(), Array::scalar(-1.0f64));
+        assert_eq!(Array::scalar(1.5f64).erf().unwrap(), -Array::scalar(-1.5f64).erf().unwrap());
+        assert!(Array::scalar(f64::NAN).erf().unwrap().to_f64s()[0].is_nan());
 
         // Known values covering every rational-approximation regime of the reference implementation: the small
         // series (|x| < 2⁻²⁸), the primary interval (|x| < 0.84375), the [0.84375, 1.25) interval, both tail
         // intervals of the complementary-function path, and the saturated |x| ≥ 6 regime.
-        assert_abs_diff_eq!(Scalar::from(1e-12f64).erf().unwrap(), Scalar::from(FRAC_2_SQRT_PI * 1e-12));
-        assert_eq!(Scalar::from(0.5f64).erf().unwrap(), ERF_HALF);
-        assert_eq!(Scalar::from(1.0f64).erf().unwrap(), ERF_ONE);
-        assert_eq!(Scalar::from(2.0f64).erf().unwrap(), ERF_TWO);
-        assert_eq!(Scalar::from(3.0f64).erf().unwrap(), ERF_THREE);
-        assert_eq!(Scalar::from(4.0f64).erf().unwrap(), 0.9999999845827421);
-        assert_eq!(Scalar::from(6.5f64).erf().unwrap(), 1.0f64);
-        assert_eq!(Scalar::from(-6.5f64).erf().unwrap(), -1.0f64);
+        assert_abs_diff_eq!(Array::scalar(1e-12f64).erf().unwrap(), Array::scalar(FRAC_2_SQRT_PI * 1e-12));
+        assert_eq!(Array::scalar(0.5f64).erf().unwrap(), Array::scalar(ERF_HALF));
+        assert_eq!(Array::scalar(1.0f64).erf().unwrap(), Array::scalar(ERF_ONE));
+        assert_eq!(Array::scalar(2.0f64).erf().unwrap(), Array::scalar(ERF_TWO));
+        assert_eq!(Array::scalar(3.0f64).erf().unwrap(), Array::scalar(ERF_THREE));
+        assert_eq!(Array::scalar(4.0f64).erf().unwrap(), Array::scalar(0.9999999845827421));
+        assert_eq!(Array::scalar(6.5f64).erf().unwrap(), Array::scalar(1.0f64));
+        assert_eq!(Array::scalar(-6.5f64).erf().unwrap(), Array::scalar(-1.0f64));
 
         // The narrower variants round the double-precision evaluation to their own precision.
-        assert_eq!(Scalar::from(0.5f32).erf().unwrap(), ERF_HALF as f32);
-        assert_eq!(Scalar::from(bf16::from_f32(0.5)).erf().unwrap(), bf16::from_f64(ERF_HALF));
-        assert_eq!(Scalar::from(f16::from_f32(0.5)).erf().unwrap(), f16::from_f64(ERF_HALF));
+        assert_eq!(Array::scalar(0.5f32).erf().unwrap(), Array::scalar(ERF_HALF as f32));
+        assert_eq!(Array::scalar(bf16::from_f32(0.5)).erf().unwrap(), Array::scalar(bf16::from_f64(ERF_HALF)),);
+        assert_eq!(Array::scalar(f16::from_f32(0.5)).erf().unwrap(), Array::scalar(f16::from_f64(ERF_HALF)));
 
         assert_eq!(Array::scalar(0.5).erf().unwrap(), Array::scalar(ERF_HALF));
     }

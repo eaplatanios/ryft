@@ -70,7 +70,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::gradient_holomorphic;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -82,13 +81,19 @@ mod tests {
 
     #[test]
     fn test_rsqrt() {
-        assert_eq!(Scalar::from(0.5f32).rsqrt().unwrap(), 1.0 / 0.5f32.sqrt());
-        assert_eq!(Scalar::from(0.5f64).rsqrt().unwrap(), 1.0 / 0.5f64.sqrt());
-        assert_eq!(Scalar::from(bf16::from_f32(0.5)).rsqrt().unwrap(), bf16::from_f32(1.0 / 0.5f32.sqrt()));
-        assert_eq!(Scalar::from(f16::from_f32(0.5)).rsqrt().unwrap(), f16::from_f32(1.0 / 0.5f32.sqrt()));
+        assert_eq!(Array::scalar(0.5f32).rsqrt().unwrap(), Array::scalar(1.0 / 0.5f32.sqrt()));
+        assert_eq!(Array::scalar(0.5f64).rsqrt().unwrap(), Array::scalar(1.0 / 0.5f64.sqrt()));
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).rsqrt().unwrap(),
+            Array::scalar(bf16::from_f32(1.0 / 0.5f32.sqrt())),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).rsqrt().unwrap(),
+            Array::scalar(f16::from_f32(1.0 / 0.5f32.sqrt())),
+        );
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         let expected = ComplexNumber::new(1.0, 0.0) / input.sqrt();
-        assert_abs_diff_eq!(Scalar::from(input).rsqrt().unwrap(), Scalar::from(expected), epsilon = 1e-12);
+        assert_abs_diff_eq!(Array::scalar(input).rsqrt().unwrap(), Array::scalar(expected), epsilon = 1e-12);
 
         assert_eq!(Array::scalar(4.0).rsqrt().unwrap(), Array::scalar(0.5),);
     }
@@ -150,8 +155,8 @@ mod tests {
         // d(1/√z)/dz = -z^{-3/2} / 2 on the principal branch.
         let expected = input.powc(ComplexNumber::new(-1.5, 0.0)) * ComplexNumber::new(-0.5, 0.0);
         assert_abs_diff_eq!(
-            Scalar::from(expected),
-            gradient_holomorphic(|input| input.rsqrt().unwrap(), Scalar::from(input)).unwrap(),
+            Array::scalar(expected),
+            gradient_holomorphic(|input| input.rsqrt().unwrap(), Array::scalar(input)).unwrap(),
             epsilon = 1e-12,
         );
     }

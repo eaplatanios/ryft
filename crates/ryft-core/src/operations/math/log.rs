@@ -63,7 +63,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::{gradient_holomorphic, jvp};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -78,16 +77,16 @@ mod tests {
 
     #[test]
     fn test_log() {
-        assert_eq!(Scalar::from(0.5f32).log().unwrap(), 0.5f32.ln());
-        assert_eq!(Scalar::from(0.5f64).log().unwrap(), 0.5f64.ln());
-        assert_eq!(Scalar::from(bf16::from_f32(0.5)).log().unwrap(), bf16::from_f32(0.5f32.ln()));
-        assert_eq!(Scalar::from(f16::from_f32(0.5)).log().unwrap(), f16::from_f32(0.5f32.ln()));
+        assert_eq!(Array::scalar(0.5f32).log().unwrap(), Array::scalar(0.5f32.ln()));
+        assert_eq!(Array::scalar(0.5f64).log().unwrap(), Array::scalar(0.5f64.ln()));
+        assert_eq!(Array::scalar(bf16::from_f32(0.5)).log().unwrap(), Array::scalar(bf16::from_f32(0.5f32.ln())),);
+        assert_eq!(Array::scalar(f16::from_f32(0.5)).log().unwrap(), Array::scalar(f16::from_f32(0.5f32.ln())),);
         let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_abs_diff_eq!(Scalar::from(input).log().unwrap(), Scalar::from(input.ln()), epsilon = 1e-12);
+        assert_abs_diff_eq!(Array::scalar(input).log().unwrap(), Array::scalar(input.ln()), epsilon = 1e-12);
         // The principal branch maps the negative real axis to `ln|x| + iπ`.
         assert_abs_diff_eq!(
-            Scalar::from(ComplexNumber::new(-1.0f64, 0.0)).log().unwrap(),
-            Scalar::from(ComplexNumber::new(0.0f64, std::f64::consts::PI)),
+            Array::scalar(ComplexNumber::new(-1.0f64, 0.0)).log().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, std::f64::consts::PI)),
             epsilon = 1e-12,
         );
 
@@ -154,8 +153,8 @@ mod tests {
     fn test_log_complex_differentiation() {
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
-            gradient_holomorphic(|input| input.log().unwrap(), Scalar::from(input)),
-            Ok(Scalar::from(ComplexNumber::new(1.0, 0.0) / input)),
+            gradient_holomorphic(|input| input.log().unwrap(), Array::scalar(input)),
+            Ok(Array::scalar(ComplexNumber::new(1.0, 0.0) / input)),
         );
     }
 

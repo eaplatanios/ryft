@@ -92,7 +92,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::gradient_holomorphic;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -107,22 +106,22 @@ mod tests {
 
     #[test]
     fn test_pow() {
-        assert_eq!(Scalar::from(2.0f32).pow(&Scalar::from(3.0f32)).unwrap(), 2.0f32.powf(3.0));
-        assert_eq!(Scalar::from(2.0f64).pow(&Scalar::from(3.0f64)).unwrap(), 2.0f64.powf(3.0));
+        assert_eq!(Array::scalar(2.0f32).pow(&Array::scalar(3.0f32)).unwrap(), Array::scalar(2.0f32.powf(3.0)),);
+        assert_eq!(Array::scalar(2.0f64).pow(&Array::scalar(3.0f64)).unwrap(), Array::scalar(2.0f64.powf(3.0)),);
         assert_eq!(
-            Scalar::from(bf16::from_f32(2.0)).pow(&Scalar::from(bf16::from_f32(3.0))).unwrap(),
-            bf16::from_f32(2.0f32.powf(3.0)),
+            Array::scalar(bf16::from_f32(2.0)).pow(&Array::scalar(bf16::from_f32(3.0))).unwrap(),
+            Array::scalar(bf16::from_f32(2.0f32.powf(3.0))),
         );
         assert_eq!(
-            Scalar::from(f16::from_f32(2.0)).pow(&Scalar::from(f16::from_f32(3.0))).unwrap(),
-            f16::from_f32(2.0f32.powf(3.0)),
+            Array::scalar(f16::from_f32(2.0)).pow(&Array::scalar(f16::from_f32(3.0))).unwrap(),
+            Array::scalar(f16::from_f32(2.0f32.powf(3.0))),
         );
         // The complex power is the principal value `exp(y · log(x))`.
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         let exponent = ComplexNumber::new(2.0f64, 0.0f64);
         assert_abs_diff_eq!(
-            Scalar::from(input).pow(&Scalar::from(exponent)).unwrap(),
-            Scalar::from(input.powc(exponent)),
+            Array::scalar(input).pow(&Array::scalar(exponent)).unwrap(),
+            Array::scalar(input.powc(exponent)),
             epsilon = 1e-12,
         );
         assert_eq!(Array::scalar(2.0).pow(&Array::scalar(3.0)).unwrap(), Array::scalar(8.0),);
@@ -215,10 +214,10 @@ mod tests {
                     let exponent = input.one_like() + input.one_like();
                     input.pow(&exponent).unwrap()
                 },
-                Scalar::from(input),
+                Array::scalar(input),
             )
             .unwrap(),
-            Scalar::from(input * 2.0),
+            Array::scalar(input * 2.0),
             epsilon = 1e-12,
         );
     }

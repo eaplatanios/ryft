@@ -63,7 +63,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::{gradient_holomorphic, jvp};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -78,16 +77,16 @@ mod tests {
 
     #[test]
     fn test_sqrt() {
-        assert_eq!(Scalar::from(0.25f32).sqrt().unwrap(), 0.5f32);
-        assert_eq!(Scalar::from(0.25f64).sqrt().unwrap(), 0.5f64);
-        assert_eq!(Scalar::from(bf16::from_f32(0.25)).sqrt().unwrap(), bf16::from_f32(0.5));
-        assert_eq!(Scalar::from(f16::from_f32(0.25)).sqrt().unwrap(), f16::from_f32(0.5));
+        assert_eq!(Array::scalar(0.25f32).sqrt().unwrap(), Array::scalar(0.5f32));
+        assert_eq!(Array::scalar(0.25f64).sqrt().unwrap(), Array::scalar(0.5f64));
+        assert_eq!(Array::scalar(bf16::from_f32(0.25)).sqrt().unwrap(), Array::scalar(bf16::from_f32(0.5)));
+        assert_eq!(Array::scalar(f16::from_f32(0.25)).sqrt().unwrap(), Array::scalar(f16::from_f32(0.5)));
         let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_abs_diff_eq!(Scalar::from(input).sqrt().unwrap(), Scalar::from(input.sqrt()), epsilon = 1e-12);
+        assert_abs_diff_eq!(Array::scalar(input).sqrt().unwrap(), Array::scalar(input.sqrt()), epsilon = 1e-12);
         // The principal branch maps the negative real axis to the positive imaginary axis.
         assert_abs_diff_eq!(
-            Scalar::from(ComplexNumber::new(-4.0f64, 0.0)).sqrt().unwrap(),
-            Scalar::from(ComplexNumber::new(0.0f64, 2.0)),
+            Array::scalar(ComplexNumber::new(-4.0f64, 0.0)).sqrt().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, 2.0)),
             epsilon = 1e-12,
         );
 
@@ -155,8 +154,8 @@ mod tests {
     fn test_sqrt_complex_differentiation() {
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
-            gradient_holomorphic(|input| input.sqrt().unwrap(), Scalar::from(input)),
-            Ok(Scalar::from(ComplexNumber::new(1.0, 0.0) / (input.sqrt() + input.sqrt()))),
+            gradient_holomorphic(|input| input.sqrt().unwrap(), Array::scalar(input)),
+            Ok(Array::scalar(ComplexNumber::new(1.0, 0.0) / (input.sqrt() + input.sqrt()))),
         );
     }
 

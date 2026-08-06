@@ -65,7 +65,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::{gradient_holomorphic, jvp};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -80,13 +79,15 @@ mod tests {
 
     #[test]
     fn test_cos() {
-        assert_eq!(Scalar::from(0.5f32).cos().unwrap(), 0.5f32.cos());
-        assert_eq!(Scalar::from(0.5f64).cos().unwrap(), 0.5f64.cos());
-        assert_eq!(Scalar::from(bf16::from_f32(0.5)).cos().unwrap(), bf16::from_f32(0.5f32.cos()));
-        assert_eq!(Scalar::from(f16::from_f32(0.5)).cos().unwrap(), f16::from_f32(0.5f32.cos()));
-        let Scalar::C128(extreme) = Scalar::from(ComplexNumber::new(0.0f64, 1000.0)).cos().unwrap() else {
-            panic!("expected a c128 result")
-        };
+        assert_eq!(Array::scalar(0.5f32).cos().unwrap(), Array::scalar(0.5f32.cos()));
+        assert_eq!(Array::scalar(0.5f64).cos().unwrap(), Array::scalar(0.5f64.cos()));
+        assert_eq!(Array::scalar(bf16::from_f32(0.5)).cos().unwrap(), Array::scalar(bf16::from_f32(0.5f32.cos())),);
+        assert_eq!(Array::scalar(f16::from_f32(0.5)).cos().unwrap(), Array::scalar(f16::from_f32(0.5f32.cos())),);
+        let extreme = Array::scalar(ComplexNumber::new(0.0f64, 1000.0))
+            .cos()
+            .unwrap()
+            .elements::<ComplexNumber<f64>>()
+            .unwrap()[0];
         assert!(extreme.re.is_infinite() && extreme.re.is_sign_positive());
         assert_eq!(extreme.im, 0.0);
 
@@ -155,8 +156,8 @@ mod tests {
     fn test_cos_complex_differentiation() {
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
-            gradient_holomorphic(|input| input.cos().unwrap(), Scalar::from(input)),
-            Ok(Scalar::from(-input.sin())),
+            gradient_holomorphic(|input| input.cos().unwrap(), Array::scalar(input)),
+            Ok(Array::scalar(-input.sin())),
         );
     }
 

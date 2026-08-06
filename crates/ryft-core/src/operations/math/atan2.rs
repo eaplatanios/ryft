@@ -129,7 +129,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::{jvp, value_and_gradient_holomorphic};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -142,30 +141,36 @@ mod tests {
 
     #[test]
     fn test_atan2() {
-        assert_eq!(Scalar::from(0.5f32).atan2(&Scalar::from(-0.25f32)).unwrap(), 0.5f32.atan2(-0.25f32));
-        assert_eq!(Scalar::from(0.5f64).atan2(&Scalar::from(-0.25f64)).unwrap(), 0.5f64.atan2(-0.25f64));
         assert_eq!(
-            Scalar::from(bf16::from_f32(0.5)).atan2(&Scalar::from(bf16::from_f32(-0.25))).unwrap(),
-            bf16::from_f32(0.5f32.atan2(-0.25f32)),
+            Array::scalar(0.5f32).atan2(&Array::scalar(-0.25f32)).unwrap(),
+            Array::scalar(0.5f32.atan2(-0.25f32)),
         );
         assert_eq!(
-            Scalar::from(f16::from_f32(0.5)).atan2(&Scalar::from(f16::from_f32(-0.25))).unwrap(),
-            f16::from_f32(0.5f32.atan2(-0.25f32)),
+            Array::scalar(0.5f64).atan2(&Array::scalar(-0.25f64)).unwrap(),
+            Array::scalar(0.5f64.atan2(-0.25f64)),
+        );
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).atan2(&Array::scalar(bf16::from_f32(-0.25))).unwrap(),
+            Array::scalar(bf16::from_f32(0.5f32.atan2(-0.25f32))),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).atan2(&Array::scalar(f16::from_f32(-0.25))).unwrap(),
+            Array::scalar(f16::from_f32(0.5f32.atan2(-0.25f32))),
         );
         let y = Complex::new(0.5f32, 0.25);
         let x = Complex::new(-0.75f32, 0.125);
         let imaginary_unit = Complex::new(0.0, 1.0);
         assert_abs_diff_eq!(
-            Scalar::from(y).atan2(&Scalar::from(x)).unwrap(),
-            Scalar::from(-imaginary_unit * ((x + imaginary_unit * y) / (x * x + y * y).sqrt()).ln()),
+            Array::scalar(y).atan2(&Array::scalar(x)).unwrap(),
+            Array::scalar(-imaginary_unit * ((x + imaginary_unit * y) / (x * x + y * y).sqrt()).ln()),
             epsilon = 1e-6,
         );
         let y = Complex::new(0.5f64, 0.0);
         let x = Complex::new(-0.75f64, 0.125);
         let imaginary_unit = Complex::new(0.0, 1.0);
         assert_abs_diff_eq!(
-            Scalar::from(0.5f32).atan2(&Scalar::from(x)).unwrap(),
-            Scalar::from(-imaginary_unit * ((x + imaginary_unit * y) / (x * x + y * y).sqrt()).ln()),
+            Array::scalar(0.5f32).atan2(&Array::scalar(x)).unwrap(),
+            Array::scalar(-imaginary_unit * ((x + imaginary_unit * y) / (x * x + y * y).sqrt()).ln()),
             epsilon = 1e-12,
         );
 
@@ -259,13 +264,13 @@ mod tests {
 
     #[test]
     fn test_atan2_differentiation_avoids_overflow() {
-        let (_, tangent): (Scalar, Scalar) = jvp(
+        let (_, tangent): (Array, Array) = jvp(
             |(y, x)| y.atan2(&x),
-            (Scalar::from(1.0e308), Scalar::from(1.0e308)),
-            (Scalar::from(1.0e308), Scalar::from(1.0e308)),
+            (Array::scalar(1.0e308), Array::scalar(1.0e308)),
+            (Array::scalar(1.0e308), Array::scalar(1.0e308)),
         )
         .unwrap();
-        assert_eq!(tangent, Scalar::from(0.0));
+        assert_eq!(tangent, Array::scalar(0.0));
     }
 
     #[test]
@@ -273,27 +278,27 @@ mod tests {
         let y = Complex::new(0.7f64, -0.2);
         let x = Complex::new(-0.3f64, 0.4);
         let (value, (y_gradient, x_gradient)) =
-            value_and_gradient_holomorphic(|(y, x)| y.atan2(&x).unwrap(), (Scalar::from(y), Scalar::from(x))).unwrap();
+            value_and_gradient_holomorphic(|(y, x)| y.atan2(&x).unwrap(), (Array::scalar(y), Array::scalar(x)))
+                .unwrap();
         let denominator = x * x + y * y;
         let imaginary_unit = Complex::new(0.0, 1.0);
         assert_abs_diff_eq!(
             value,
-            Scalar::from(-imaginary_unit * ((x + imaginary_unit * y) / denominator.sqrt()).ln()),
+            Array::scalar(-imaginary_unit * ((x + imaginary_unit * y) / denominator.sqrt()).ln()),
             epsilon = 1e-12,
         );
-        assert_abs_diff_eq!(y_gradient, Scalar::from(x / denominator), epsilon = 1e-12);
-        assert_abs_diff_eq!(x_gradient, Scalar::from(-y / denominator), epsilon = 1e-12);
+        assert_abs_diff_eq!(y_gradient, Array::scalar(x / denominator), epsilon = 1e-12);
+        assert_abs_diff_eq!(x_gradient, Array::scalar(-y / denominator), epsilon = 1e-12);
     }
 
     #[test]
     fn test_atan2_low_precision_differentiation_uses_widened_tangents() {
-        let y = Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
-        let x = Scalar::from(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
-        let (primal, tangent): (Scalar, Scalar) =
-            jvp(|(y, x)| y.atan2(&x), (y, x), (Scalar::from(1.0f32), Scalar::from(1.0f32))).unwrap();
-        assert!(matches!(primal, Scalar::F8E8M0FNU(_)));
-        let Scalar::F32(tangent) = tangent else { panic!("expected an f32 tangent") };
-        assert_abs_diff_eq!(tangent, 0.1f32, epsilon = 1e-6);
+        let y = Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let x = Array::scalar(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let (primal, tangent): (Array, Array) =
+            jvp(|(y, x)| y.atan2(&x), (y, x), (Array::scalar(1.0f32), Array::scalar(1.0f32))).unwrap();
+        assert_eq!(primal.r#type().data_type(), DataType::F8E8M0FNU);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 0.1f32 as f64, epsilon = 1e-6);
     }
 
     #[test]

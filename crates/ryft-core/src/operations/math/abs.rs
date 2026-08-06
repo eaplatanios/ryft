@@ -188,7 +188,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, jvp, value_and_gradient};
     use crate::interpretation::InterpretableOperation;
@@ -207,22 +206,22 @@ mod tests {
         let operation = AbsOperation::new();
 
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(-2.0)],
+                &[Array::scalar(-2.0)],
             ),
-            Ok(vec![Scalar::from(2.0)]),
+            Ok(vec![Array::scalar(2.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(ComplexNumber::new(3.0f64, -4.0f64))],
+                &[Array::scalar(ComplexNumber::new(3.0f64, -4.0f64))],
             ),
-            Ok(vec![Scalar::from(5.0)]),
+            Ok(vec![Array::scalar(5.0)]),
         );
     }
 
@@ -330,10 +329,14 @@ mod tests {
     #[test]
     fn test_abs_differentiation_at_zero() {
         // The real rule chooses the right derivative at zero and remains constant under another derivative.
-        assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(0.0f64)).unwrap(), 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(
-            gradient(|x| gradient(|x| x.abs().unwrap(), x).unwrap(), Scalar::from(0.0f64)).unwrap(),
-            0.0,
+            gradient(|x| x.abs().unwrap(), Array::scalar(0.0f64)).unwrap(),
+            Array::scalar(1.0),
+            epsilon = 1e-9,
+        );
+        assert_abs_diff_eq!(
+            gradient(|x| gradient(|x| x.abs().unwrap(), x).unwrap(), Array::scalar(0.0f64)).unwrap(),
+            Array::scalar(0.0),
             epsilon = 1e-9,
         );
     }
@@ -344,11 +347,10 @@ mod tests {
         // d|z| = Re(z̄ · dz) / |z|, the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction):
         // the reverse-mode counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
-        let (value, gradient_value) = value_and_gradient(|z| z.abs().unwrap(), Scalar::from(z)).unwrap();
-        assert_eq!(value, Scalar::from(z.norm()));
+        let (value, gradient_value) = value_and_gradient(|z| z.abs().unwrap(), Array::scalar(z)).unwrap();
+        assert_eq!(value, Array::scalar(z.norm()));
         let expected = z.conj() / z.norm();
-        let Scalar::C128(actual) = gradient_value else { panic!("expected a c128 gradient") };
-        assert!((actual - expected).norm() < 1e-12, "expected {expected} but got {actual}");
+        assert_abs_diff_eq!(gradient_value, Array::scalar(expected), epsilon = 1e-12);
 
         // The array universe agrees: summing the elementwise magnitudes of a complex vector is again ℂⁿ → ℝ, and the
         // finite-difference oracle perturbs each element's real and imaginary parts independently.
@@ -364,14 +366,14 @@ mod tests {
         assert_eq!(
             jvp(
                 |z| z.abs(),
-                Scalar::from(ComplexNumber::new(0.0f64, 0.0f64)),
-                Scalar::from(ComplexNumber::new(1.0f64, 2.0f64)),
+                Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)),
+                Array::scalar(ComplexNumber::new(1.0f64, 2.0f64)),
             ),
-            Ok((Scalar::from(0.0f64), Scalar::from(0.0f64))),
+            Ok((Array::scalar(0.0f64), Array::scalar(0.0f64))),
         );
         assert_eq!(
-            gradient(|z| z.abs().unwrap(), Scalar::from(ComplexNumber::new(0.0f64, 0.0f64))),
-            Ok(Scalar::from(ComplexNumber::new(0.0f64, 0.0f64))),
+            gradient(|z| z.abs().unwrap(), Array::scalar(ComplexNumber::new(0.0f64, 0.0f64))),
+            Ok(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64))),
         );
     }
 
@@ -382,10 +384,10 @@ mod tests {
         assert_eq!(
             jvp(
                 |z| z.abs(),
-                Scalar::from(ComplexNumber::new(1e308f64, 0.0)),
-                Scalar::from(ComplexNumber::new(2.0f64, 0.0)),
+                Array::scalar(ComplexNumber::new(1e308f64, 0.0)),
+                Array::scalar(ComplexNumber::new(2.0f64, 0.0)),
             ),
-            Ok((Scalar::from(1e308f64), Scalar::from(2.0f64))),
+            Ok((Array::scalar(1e308f64), Array::scalar(2.0f64))),
         );
     }
 

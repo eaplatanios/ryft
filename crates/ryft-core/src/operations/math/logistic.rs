@@ -68,7 +68,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::gradient_holomorphic;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -80,16 +79,19 @@ mod tests {
 
     #[test]
     fn test_logistic() {
-        assert_eq!(Scalar::from(0.5f32).logistic().unwrap(), 1.0 / (1.0 + (-0.5f32).exp()));
-        assert_eq!(Scalar::from(0.5f64).logistic().unwrap(), 1.0 / (1.0 + (-0.5f64).exp()));
+        assert_eq!(Array::scalar(0.5f32).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.5f32).exp())),);
+        assert_eq!(Array::scalar(0.5f64).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.5f64).exp())),);
         assert_eq!(
-            Scalar::from(bf16::from_f32(0.5)).logistic().unwrap(),
-            bf16::from_f32(1.0 / (1.0 + (-0.5f32).exp())),
+            Array::scalar(bf16::from_f32(0.5)).logistic().unwrap(),
+            Array::scalar(bf16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))),
         );
-        assert_eq!(Scalar::from(f16::from_f32(0.5)).logistic().unwrap(), f16::from_f32(1.0 / (1.0 + (-0.5f32).exp())),);
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).logistic().unwrap(),
+            Array::scalar(f16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))),
+        );
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         let expected = ComplexNumber::new(1.0, 0.0) / (ComplexNumber::new(1.0, 0.0) + (-input).exp());
-        assert_abs_diff_eq!(Scalar::from(input).logistic().unwrap(), Scalar::from(expected), epsilon = 1e-12);
+        assert_abs_diff_eq!(Array::scalar(input).logistic().unwrap(), Array::scalar(expected), epsilon = 1e-12);
 
         assert_eq!(Array::scalar(0.7).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.7f64).exp())),);
     }
@@ -157,8 +159,8 @@ mod tests {
             logistic * (ComplexNumber::new(1.0, 0.0) - logistic)
         };
         assert_abs_diff_eq!(
-            Scalar::from(expected),
-            gradient_holomorphic(|input| input.logistic().unwrap(), Scalar::from(input)).unwrap(),
+            Array::scalar(expected),
+            gradient_holomorphic(|input| input.logistic().unwrap(), Array::scalar(input)).unwrap(),
             epsilon = 1e-12,
         );
     }
