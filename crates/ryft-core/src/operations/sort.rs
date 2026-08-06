@@ -336,25 +336,27 @@ where
     }
 }
 
-/// Applies the permutation computed from precomputed key ranks to every operand's values, sorting along `axis` of
-/// an array with the provided static `dimensions`. This is the shared reference-backend evaluator behind the
-/// concrete [`Sort`] implementations: `key_ranks` holds one order-preserving `u64` rank slice per key operand (each
-/// slice with one rank per element in row-major order), elements are compared lexicographically across the key
-/// slices in order (ties on earlier keys fall through to later keys), the sort is stable (elements equal on every
-/// key keep their original relative order), and [`SortDirection::Descending`] reverses every key comparison.
-pub fn sort_evaluate<T: Clone>(
+/// Computes the flat gather map of a multi-key sort along `axis` of an array with the provided static `dimensions`:
+/// for every flat row-major output position, the returned vector holds the flat input position whose element the
+/// sorted output takes, and positions outside the sort axis map to themselves. This is the shared reference-backend
+/// evaluator behind the concrete [`Sort`] implementations, and backends apply the map with element-type-agnostic
+/// element gathers instead of shuffling decoded values. `key_ranks` holds one order-preserving `u64` rank slice per
+/// key operand (each slice with one rank per element in row-major order), elements are compared lexicographically
+/// across the key slices in order (ties on earlier keys fall through to later keys), the sort is stable (elements
+/// equal on every key keep their original relative order), and [`SortDirection::Descending`] reverses every key
+/// comparison.
+pub fn sort_permutation(
     key_ranks: &[&[u64]],
-    operand_values: &[&[T]],
     dimensions: &[usize],
     axis: usize,
     direction: SortDirection,
-) -> Vec<Vec<T>> {
+) -> Vec<usize> {
     let axis_size = dimensions[axis];
     let inner_stride: usize = dimensions[axis + 1..].iter().product();
     let outer_count: usize = dimensions[..axis].iter().product();
-    let mut outputs = operand_values.iter().map(|values| values.to_vec()).collect::<Vec<_>>();
+    let mut gather = (0..dimensions.iter().product()).collect::<Vec<_>>();
     if axis_size == 0 {
-        return outputs;
+        return gather;
     }
     let mut permutation = Vec::with_capacity(axis_size);
     for outer in 0..outer_count {
@@ -376,15 +378,12 @@ pub fn sort_evaluate<T: Clone>(
                     .find(|ordering| ordering.is_ne())
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            for (operand, output) in operand_values.iter().zip(outputs.iter_mut()) {
-                for (target_position, &source_position) in permutation.iter().enumerate() {
-                    output[base + target_position * inner_stride] =
-                        operand[base + source_position * inner_stride].clone();
-                }
+            for (target_position, &source_position) in permutation.iter().enumerate() {
+                gather[base + target_position * inner_stride] = base + source_position * inner_stride;
             }
         }
     }
-    outputs
+    gather
 }
 
 /// Value-level top-k capability, selecting the `k` largest elements along one axis together with their indices.
@@ -393,7 +392,7 @@ pub fn sort_evaluate<T: Clone>(
 /// entries. This staged form is exactly the sort-plus-slice idiom that XLA's top-k rewriter recognizes and replaces
 /// with its fast top-k implementation. When the ranked axis is the trailing axis, leading size-1 dimensions are
 /// reshaped away before the composition and reinserted afterward (refer to the documentation of
-/// [`top_k_via_squeezed_view`] for why). Ties select the lowest index (the sort is stable), NaNs order above `+∞`
+/// `top_k_via_squeezed_view` for why). Ties select the lowest index (the sort is stable), NaNs order above `+∞`
 /// (the IEEE 754 total order), and the returned indices are `i32`.
 pub trait TopK: Sized {
     /// Returns the `k` largest elements of this value along `axis` together with their `i32` indices, both with the

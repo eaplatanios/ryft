@@ -24,7 +24,7 @@ use approx::AbsDiffEq;
 use half::{bf16, f16};
 use num_complex::Complex;
 
-use ryft_macros::Operation;
+use ryft_macros::{Operation, Parameter};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -85,7 +85,7 @@ use crate::operations::random::{
 };
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use crate::operations::sort::{
-    ArgMax, ArgMin, Sort, SortDirection, SortOperation, TopK, extremal_index_from_index_passenger, sort_evaluate,
+    ArgMax, ArgMin, Sort, SortDirection, SortOperation, TopK, extremal_index_from_index_passenger, sort_permutation,
     top_k_from_index_passenger, top_k_via_squeezed_view,
 };
 use crate::operations::tag::{Tag, TagOperation};
@@ -227,7 +227,7 @@ pub type ArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
 /// let right = Array::vector(vec![3.0, 4.0]);
 /// assert_eq!(left.add(&right).unwrap(), Array::vector(vec![4.0, 6.0]));
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Parameter)]
 pub struct Array {
     /// Staged array type of this array value.
     r#type: ArrayType,
@@ -693,6 +693,12 @@ impl Array {
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
 
+    /// Creates an array of `type` by repeating one scalar element, which must already have `type`'s element data
+    /// type, across every logical element.
+    fn from_scalar_element(r#type: &ArrayType, element: Scalar) -> Result<Self, ProgramError> {
+        Self::from_scalar_values(r#type.clone(), vec![element; Self::materialized_element_count(r#type)?])
+    }
+
     /// Applies an elementwise unary function to the payload, preserving this array's type.
     fn unary(&self, function: impl Fn(&Scalar) -> Result<Scalar, ProgramError>) -> Result<Self, ProgramError> {
         let values = self.scalar_values();
@@ -901,12 +907,27 @@ impl Array {
         }
     }
 
-    /// Extracts the in-band integer payload of a scalar index element. Panics for non-integer elements, which the
-    /// type-level validation performed by every indexing kernel rules out before payload access.
-    fn index_value(index: Scalar) -> i64 {
-        match index.convert_element_type(DataType::I64) {
-            Ok(Scalar::I64(value)) => value,
-            _ => panic!("cannot use a scalar of data type {} as an index", index.r#type()),
+    /// Decodes one logical integer element as the signed index representation used by reference indexing kernels.
+    /// Unsigned `u64` values narrow with Rust's two's-complement `as i64` semantics, matching the former scalar
+    /// conversion path. The type-level validation performed by every caller rules out non-integer element types.
+    fn index_value(&self, addressing: &ArrayAddressing, index: usize) -> i64 {
+        let bytes = &self.bytes[addressing.byte_range_for_flat_index(index)];
+        match self.r#type.data_type() {
+            DataType::I1 => i64::from(crate::arrays::i1::decode(bytes).value()),
+            DataType::I2 => i64::from(crate::arrays::i2::decode(bytes).value()),
+            DataType::I4 => i64::from(crate::arrays::i4::decode(bytes).value()),
+            DataType::I8 => i64::from(i8::decode(bytes)),
+            DataType::I16 => i64::from(i16::decode(bytes)),
+            DataType::I32 => i64::from(i32::decode(bytes)),
+            DataType::I64 => i64::decode(bytes),
+            DataType::U1 => i64::from(crate::arrays::u1::decode(bytes).value()),
+            DataType::U2 => i64::from(crate::arrays::u2::decode(bytes).value()),
+            DataType::U4 => i64::from(crate::arrays::u4::decode(bytes).value()),
+            DataType::U8 => i64::from(u8::decode(bytes)),
+            DataType::U16 => i64::from(u16::decode(bytes)),
+            DataType::U32 => i64::from(u32::decode(bytes)),
+            DataType::U64 => u64::decode(bytes) as i64,
+            data_type => unreachable!("cannot use an array of element data type {data_type} as indices"),
         }
     }
 }
@@ -921,15 +942,17 @@ impl Array {
     }
 }
 
-impl Parameter for Array {}
-
 impl Debug for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Array")
-            .field("type", &self.r#type)
-            .field("values", &self.scalar_values())
-            .finish()
+        // The payload renders through `Display`, which supports every element data type, including the sub-byte ones
+        // that have no `Scalar` representation.
+        struct Values<'a>(&'a Array);
+        impl Debug for Values<'_> {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                Display::fmt(self.0, formatter)
+            }
+        }
+        formatter.debug_struct("Array").field("type", &self.r#type).field("values", &Values(self)).finish()
     }
 }
 
@@ -951,18 +974,43 @@ impl PartialEq for Array {
 // diagnostics involving constant arrays stay readable and stable.
 impl Display for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("[")?;
-        for (index, value) in self.scalar_values().into_iter().enumerate() {
-            if index > 0 {
-                formatter.write_str(", ")?;
+        // Writes one bracketed, comma-separated element list through the provided per-element renderer.
+        fn write_elements<T>(
+            formatter: &mut std::fmt::Formatter<'_>,
+            elements: impl IntoIterator<Item = T>,
+            mut write_element: impl FnMut(&mut std::fmt::Formatter<'_>, T) -> std::fmt::Result,
+        ) -> std::fmt::Result {
+            formatter.write_str("[")?;
+            for (index, element) in elements.into_iter().enumerate() {
+                if index > 0 {
+                    formatter.write_str(", ")?;
+                }
+                write_element(formatter, element)?;
             }
-            match value {
-                Scalar::F32(value) => write!(formatter, "{value:?}")?,
-                Scalar::F64(value) => write!(formatter, "{value:?}")?,
-                other => Display::fmt(&other, formatter)?,
-            }
+            formatter.write_str("]")
         }
-        formatter.write_str("]")
+        let data_type = self.r#type.data_type();
+        match data_type {
+            // The payload-free element data types have no element encoding to decode.
+            DataType::Token | DataType::Zero => {
+                write_elements(formatter, 0..Self::element_count(&self.r#type), |formatter, _| {
+                    formatter.write_str(if data_type == DataType::Token { "token" } else { "zero" })
+                })
+            }
+            // `f32` and `f64` payloads keep a decimal point through debug formatting, per the rendering contract
+            // stated above this implementation.
+            DataType::F32 => write_elements(formatter, self.elements::<f32>().unwrap(), |formatter, value| {
+                write!(formatter, "{value:?}")
+            }),
+            DataType::F64 => write_elements(formatter, self.elements::<f64>().unwrap(), |formatter, value| {
+                write!(formatter, "{value:?}")
+            }),
+            _ => dispatch_on_array_element_type!(data_type, |Element| {
+                write_elements(formatter, self.elements::<Element>().unwrap(), |formatter, value| {
+                    Display::fmt(&value, formatter)
+                })
+            }),
+        }
     }
 }
 
@@ -1029,7 +1077,7 @@ impl AbsDiffEq for Array {
 impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
     fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
         let element = Array::zero_element(r#type.data_type())?;
-        Array::from_scalar_values(r#type.clone(), vec![element; Array::materialized_element_count(r#type)?])
+        Array::from_scalar_element(r#type, element)
     }
 }
 
@@ -1043,7 +1091,7 @@ impl ZeroLike for Array {
 impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
     fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
         let element = EagerContext::<Scalar>::new().one(&r#type.data_type())?;
-        Array::from_scalar_values(r#type.clone(), vec![element; Array::materialized_element_count(r#type)?])
+        Array::from_scalar_element(r#type, element)
     }
 }
 
@@ -1064,7 +1112,7 @@ impl StopGradient for Array {
 impl<O: Operation<Type = ArrayType>> Fill<Scalar, Array> for EagerContext<Array, O> {
     fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array, ProgramError> {
         let element = value.convert_element_type(r#type.data_type())?;
-        Array::from_scalar_values(r#type.clone(), vec![element; Array::materialized_element_count(r#type)?])
+        Array::from_scalar_element(r#type, element)
     }
 }
 
@@ -1355,33 +1403,30 @@ impl Sort for Array {
         let key_ranks = operands[..key_count]
             .iter()
             .map(|key| {
+                let data_type = key.r#type.data_type();
+                let unsupported = || {
+                    ProgramError::from(TypeError::invalid(format!("'sort' does not support key data type {data_type}")))
+                };
+                // The rank computation still rides the temporary scalar bridge, which has no sub-byte representation.
+                if matches!(
+                    data_type,
+                    DataType::I1 | DataType::I2 | DataType::I4 | DataType::U1 | DataType::U2 | DataType::U4,
+                ) {
+                    return Err(unsupported());
+                }
                 key.scalar_values()
                     .iter()
-                    .map(|value| {
-                        value.total_order_rank().ok_or_else(|| {
-                            ProgramError::from(TypeError::invalid(format!(
-                                "'sort' does not support key data type {}",
-                                key.r#type.data_type(),
-                            )))
-                        })
-                    })
+                    .map(|value| value.total_order_rank().ok_or_else(unsupported))
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
         let key_rank_slices = key_ranks.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let operand_values = operands.iter().map(|operand| operand.scalar_values()).collect::<Vec<_>>();
-        let operand_value_slices = operand_values.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let outputs = sort_evaluate(
-            key_rank_slices.as_slice(),
-            operand_value_slices.as_slice(),
-            shape.dimensions(),
-            axis,
-            direction,
-        );
+        let gather = sort_permutation(key_rank_slices.as_slice(), shape.dimensions(), axis, direction);
+        // Applying the gather map moves whole element encodings, so non-key operands of any element data type
+        // (including the sub-byte ones without a scalar representation) sort without being decoded.
         operands
             .iter()
-            .zip(outputs)
-            .map(|(operand, values)| Array::from_scalar_values(operand.r#type.clone(), values))
+            .map(|operand| operand.gather_elements(operand.r#type.clone(), |index| gather[index]))
             .collect()
     }
 }
@@ -1399,9 +1444,9 @@ fn eager_index_passenger(value: &Array, axis: usize) -> Result<(Array, Vec<usize
     }
     let inner_stride: usize = dimensions[axis + 1..].iter().product();
     let axis_size = dimensions[axis];
-    let count: usize = dimensions.iter().product();
-    let values = (0..count).map(|index| Scalar::I32(((index / inner_stride) % axis_size) as i32)).collect::<Vec<_>>();
-    let indices = Array::from_scalar_values(ArrayType::new(DataType::I32, value.r#type.shape().clone()), values)?;
+    let indices = Array::from_fn_elements(ArrayType::new(DataType::I32, value.r#type.shape().clone()), |index| {
+        Ok(((index / inner_stride) % axis_size) as i32)
+    })?;
     Ok((indices, dimensions))
 }
 
@@ -1737,48 +1782,71 @@ impl crate::operations::complex::Complex for Array {
                 .into());
             }
         };
-        let real_values = self.scalar_values();
-        let imaginary_values = imaginary.scalar_values();
-        let values = real_values
-            .iter()
-            .zip(imaginary_values.iter())
-            .map(|(real, imaginary)| real.complex(imaginary))
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::from_scalar_values(self.r#type.clone().with_data_type(data_type), values)
+        let output_type = self.r#type.clone().with_data_type(data_type);
+        if data_type == DataType::C64 {
+            self.binary_elements::<f32, Complex<f32>>(imaginary, output_type, |real, imaginary| {
+                Ok(Complex::new(real, imaginary))
+            })
+        } else {
+            self.binary_elements::<f64, Complex<f64>>(imaginary, output_type, |real, imaginary| {
+                Ok(Complex::new(real, imaginary))
+            })
+        }
     }
 }
 
 impl Conjugate for Array {
     fn conjugate(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.conjugate())
+        match self.r#type.data_type() {
+            DataType::C64 => {
+                self.map_elements::<Complex<f32>, Complex<f32>>(self.r#type.clone(), |value| Ok(value.conj()))
+            }
+            DataType::C128 => {
+                self.map_elements::<Complex<f64>, Complex<f64>>(self.r#type.clone(), |value| Ok(value.conj()))
+            }
+            other => Err(TypeError::invalid(format!("cannot conjugate a scalar of data type {other}")).into()),
+        }
     }
 }
 
 impl Real for Array {
     fn real(&self) -> Result<Self, ProgramError> {
         // The real part of a complex array has the parts' real data type, mirroring the `RealOperation`
-        // type-inference contract; real arrays keep their element data type.
-        let data_type = match self.r#type.data_type() {
-            DataType::C64 => DataType::F32,
-            DataType::C128 => DataType::F64,
-            other => other,
-        };
-        let values = self.scalar_values().iter().map(|value| value.real()).collect::<Result<Vec<_>, _>>()?;
-        Self::from_scalar_values(self.r#type.clone().with_data_type(data_type), values)
+        // type-inference contract, which requires a complex operand.
+        match self.r#type.data_type() {
+            DataType::C64 => self
+                .map_elements::<Complex<f32>, f32>(self.r#type.clone().with_data_type(DataType::F32), |value| {
+                    Ok(value.re)
+                }),
+            DataType::C128 => self
+                .map_elements::<Complex<f64>, f64>(self.r#type.clone().with_data_type(DataType::F64), |value| {
+                    Ok(value.re)
+                }),
+            other => {
+                Err(TypeError::invalid(format!("cannot extract the real part of a scalar of data type {other}")).into())
+            }
+        }
     }
 }
 
 impl Imaginary for Array {
     fn imaginary(&self) -> Result<Self, ProgramError> {
         // The imaginary part of a complex array has the parts' real data type, mirroring the `ImaginaryOperation`
-        // type-inference contract; real arrays keep their element data type.
-        let data_type = match self.r#type.data_type() {
-            DataType::C64 => DataType::F32,
-            DataType::C128 => DataType::F64,
-            other => other,
-        };
-        let values = self.scalar_values().iter().map(|value| value.imaginary()).collect::<Result<Vec<_>, _>>()?;
-        Self::from_scalar_values(self.r#type.clone().with_data_type(data_type), values)
+        // type-inference contract, which requires a complex operand.
+        match self.r#type.data_type() {
+            DataType::C64 => self
+                .map_elements::<Complex<f32>, f32>(self.r#type.clone().with_data_type(DataType::F32), |value| {
+                    Ok(value.im)
+                }),
+            DataType::C128 => self
+                .map_elements::<Complex<f64>, f64>(self.r#type.clone().with_data_type(DataType::F64), |value| {
+                    Ok(value.im)
+                }),
+            other => {
+                Err(TypeError::invalid(format!("cannot extract the imaginary part of a scalar of data type {other}",))
+                    .into())
+            }
+        }
     }
 }
 
@@ -2099,7 +2167,8 @@ impl Array {
             .iter()
             .enumerate()
             .map(|(axis, index)| {
-                let raw = Self::index_value(index.scalar_values()[0]);
+                let addressing = ArrayAddressing::new(index.r#type.clone()).unwrap();
+                let raw = index.index_value(&addressing, 0);
                 let maximum = (input_shape[axis] - block_sizes[axis]) as i64;
                 raw.clamp(0, maximum) as usize
             })
@@ -2265,27 +2334,38 @@ impl Gather for Array {
             (0..output_rank).filter(|position| !offset_positions.contains(position)).collect();
         let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
 
-        let dropped_fill = Self::zero_element(output_type.data_type())?;
-        let input_values = self.scalar_values();
-        let indices_values = indices.scalar_values();
+        // Only `FillOrDrop` needs an out-of-bounds fill element. Construct it through the ordinary array capability so
+        // this kernel does not assume an all-zero encoding; the other modes therefore also support element formats
+        // such as F8E8M0FNU that cannot represent zero at all.
+        let dropped_fill = if operation.mode() == GatherScatterMode::FillOrDrop {
+            let value = EagerContext::<Array>::new().zero(&ArrayType::scalar(output_type.data_type()))?;
+            let addressing = ArrayAddressing::new(value.r#type.clone())?;
+            Some((value, addressing))
+        } else {
+            None
+        };
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let indices_addressing = ArrayAddressing::new(indices.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let extents = output_shape.dimensions();
-        let output_count: usize = extents.iter().product();
-        let mut values = Vec::with_capacity(output_count);
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
         let mut output_index = vec![0usize; output_rank];
-        for _ in 0..output_count {
+        let mut indices_index = vec![0usize; indices_rank];
+        let mut starts = vec![0i64; index_vector_extent];
+        let mut operand_index = vec![0i64; operand_rank];
+        for output_element in 0..output_addressing.element_count() {
             // Place the output's batch coordinates into the indices multi-index and read this query's start vector.
-            let mut indices_index = vec![0usize; indices_rank];
+            indices_index.fill(0);
             for (position, &output_position) in batch_output_positions.iter().enumerate() {
                 indices_index[indices_batch_axes[position]] = output_index[output_position];
             }
-            let mut starts = vec![0i64; index_vector_extent];
             for (component, start) in starts.iter_mut().enumerate() {
                 indices_index[index_vector_dimension] = component;
                 let flat: usize = (0..indices_rank).map(|axis| indices_index[axis] * indices_strides[axis]).sum();
-                *start = Self::index_value(indices_values[flat]);
+                *start = indices.index_value(&indices_addressing, flat);
             }
             // Assemble the operand multi-index: window offsets, then batching coordinates, then start offsets.
-            let mut operand_index = vec![0i64; operand_rank];
+            operand_index.fill(0);
             for (window, &operand_axis) in operand_window_axes.iter().enumerate() {
                 operand_index[operand_axis] = output_index[dimensions.offset_dimensions()[window]] as i64;
             }
@@ -2309,14 +2389,15 @@ impl Gather for Array {
                     }
                 }
             }
-            let value = if dropped {
-                dropped_fill
+            let source = if dropped {
+                let (value, addressing) = dropped_fill.as_ref().unwrap();
+                &value.bytes[addressing.byte_range_for_flat_index(0)]
             } else {
                 let flat: usize =
                     (0..operand_rank).map(|axis| operand_index[axis] as usize * operand_strides[axis]).sum();
-                input_values[flat]
+                &self.bytes[input_addressing.byte_range_for_flat_index(flat)]
             };
-            values.push(value);
+            bytes[output_addressing.byte_range_for_flat_index(output_element)].copy_from_slice(source);
             for position in (0..output_rank).rev() {
                 output_index[position] += 1;
                 if output_index[position] < extents[position] {
@@ -2325,7 +2406,7 @@ impl Gather for Array {
                 output_index[position] = 0;
             }
         }
-        Self::from_scalar_values(output_type, values)
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
     }
 }
 
@@ -2337,6 +2418,7 @@ impl Scatter for Array {
         let operand_strides = operand_shape.row_major_strides();
         let indices_shape = indices.r#type.static_shape().unwrap();
         let indices_strides = indices_shape.row_major_strides();
+        let indices_addressing = ArrayAddressing::new(indices.r#type.clone())?;
         let updates_shape = updates.r#type.static_shape().unwrap();
         let operand_rank = operand_shape.rank();
         let indices_rank = indices_shape.rank();
@@ -2359,23 +2441,24 @@ impl Scatter for Array {
         }
 
         let mut values = self.scalar_values();
-        let indices_values = indices.scalar_values();
         let update_values = updates.scalar_values();
         let extents = updates_shape.dimensions();
         let update_count: usize = extents.iter().product();
         let mut update_index = vec![0usize; updates_rank];
+        let mut indices_index = vec![0usize; indices_rank];
+        let mut starts = vec![0i64; index_vector_extent];
+        let mut operand_index = vec![0i64; operand_rank];
         for written in 0..update_count {
-            let mut indices_index = vec![0usize; indices_rank];
+            indices_index.fill(0);
             for (position, &update_axis) in update_scatter_axes.iter().enumerate() {
                 indices_index[indices_batch_axes[position]] = update_index[update_axis];
             }
-            let mut starts = vec![0i64; index_vector_extent];
             for (component, start) in starts.iter_mut().enumerate() {
                 indices_index[index_vector_dimension] = component;
                 let flat: usize = (0..indices_rank).map(|axis| indices_index[axis] * indices_strides[axis]).sum();
-                *start = Self::index_value(indices_values[flat]);
+                *start = indices.index_value(&indices_addressing, flat);
             }
-            let mut operand_index = vec![0i64; operand_rank];
+            operand_index.fill(0);
             for (window, &operand_axis) in operand_window_axes.iter().enumerate() {
                 operand_index[operand_axis] = update_index[dimensions.update_window_dimensions()[window]] as i64;
             }
@@ -3069,6 +3152,35 @@ mod tests {
         let complex = Array::vector(vec![1.0]).complex(&Array::vector(vec![2.0])).unwrap();
         assert_eq!(complex.to_string(), "[1+2i]");
         assert_eq!(Array::vector(Vec::<f64>::new()).to_string(), "[]");
+
+        // Sub-byte payloads render through their typed elements, which have no scalar representation, and the debug
+        // rendering shares the same element list.
+        let narrow =
+            Array::from_elements(array_type(DataType::I4, &[2]), &[i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap();
+        assert_eq!(narrow.to_string(), "[-8, 7]");
+        assert!(format!("{narrow:?}").ends_with("values: [-8, 7] }"));
+    }
+
+    #[test]
+    fn test_array_sort_gathers_sub_byte_operands() {
+        // Non-key operands sort by moving whole element encodings, so sub-byte operands (which have no scalar
+        // representation) ride an f32 key without being decoded.
+        let key = Array::vector(vec![3.0f32, 1.0, 2.0]);
+        let passenger = Array::from_elements(
+            array_type(DataType::I4, &[3]),
+            &[i4::new(-8).unwrap(), i4::new(0).unwrap(), i4::new(7).unwrap()],
+        )
+        .unwrap();
+        let outputs = Array::sort_with_key_count(&[key, passenger.clone()], 0, SortDirection::Ascending, 1).unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(outputs[1].storage_bytes(), [0x00, 0x07, 0x08]);
+
+        // Sub-byte keys stay rejected with an error rather than a panic while key ranks ride the scalar bridge.
+        assert!(matches!(
+            Array::sort_with_key_count(&[passenger], 0, SortDirection::Ascending, 1),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "'sort' does not support key data type i4",
+        ));
     }
 
     #[test]
@@ -3573,6 +3685,9 @@ mod tests {
             vector.dynamic_update_slice(&Array::vector(vec![10.0, 20.0]), &start).unwrap(),
             Array::vector(vec![1.0, 2.0, 3.0, 10.0, 20.0]),
         );
+        // Index decoding is typed and supports sub-byte integers directly; a negative start still clamps to zero.
+        let start = [Array::scalar(crate::arrays::i4::new(-1).unwrap())];
+        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![1.0, 2.0]));
 
         // Static slicing and updating traverse arbitrary source and update layouts while preserving the destination
         // layout for updates.
@@ -3647,11 +3762,39 @@ mod tests {
     fn test_array_gather() {
         // Gather rows 2 and 0 of a 3x2 matrix.
         let operand = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let indices = Array::from_f64s(array_type(DataType::I64, &[2, 1]), vec![2.0, 0.0]);
+        let indices = Array::matrix(2, 1, vec![2i64, 0]);
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let gathered = operand.gather(&indices, &operation).unwrap();
         assert_eq!(gathered.r#type().into_owned(), array_type(DataType::F64, &[2, 2]));
         assert_eq!(gathered.to_f64s(), vec![5.0, 6.0, 1.0, 2.0]);
+
+        // In-bounds and clipping modes do not materialize an unused zero fill, so they work for formats that cannot
+        // represent zero.
+        let operand = Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![0x7f, 0x80]).unwrap();
+        let indices = Array::matrix(1, 1, vec![1i64]);
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
+        assert_eq!(operand.gather(&indices, &operation), Array::new(array_type(DataType::F8E8M0FNU, &[1]), vec![0x80]));
+
+        // Gather reads both a reversed operand and reversed sub-byte indices through their physical addressing. An
+        // out-of-bounds query in fill-or-drop mode writes the element type's zero encoding into the dense result.
+        let operand_type = array_type(DataType::U16, &[3]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let operand = Array::from_elements(operand_type, &[10u16, 20, 30]).unwrap();
+        let indices_type =
+            array_type(DataType::I4, &[3, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
+        let indices = Array::from_elements(
+            indices_type,
+            &[
+                crate::arrays::i4::new(2).unwrap(),
+                crate::arrays::i4::new(-1).unwrap(),
+                crate::arrays::i4::new(1).unwrap(),
+            ],
+        )
+        .unwrap();
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
+            .with_mode(GatherScatterMode::FillOrDrop);
+        let gathered = operand.gather(&indices, &operation).unwrap();
+        assert_eq!(gathered.elements::<u16>(), Ok(vec![30, 0, 20]));
+        assert_eq!(gathered.storage_bytes(), [30, 0, 0, 0, 20, 0]);
     }
 
     #[test]
@@ -3664,6 +3807,16 @@ mod tests {
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Add);
         let scattered = operand.scatter(&indices, &updates, &operation).unwrap();
         assert_eq!(scattered, Array::vector(vec![21.0, 2.0, 3.0, 14.0]));
+
+        // Scatter decodes sub-byte indices through their physical layout without materializing a scalar index vector.
+        let indices_type =
+            array_type(DataType::I4, &[2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
+        let indices = Array::from_elements(
+            indices_type,
+            &[crate::arrays::i4::new(3).unwrap(), crate::arrays::i4::new(0).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(operand.scatter(&indices, &updates, &operation).unwrap(), Array::vector(vec![21.0, 2.0, 3.0, 14.0]),);
     }
 
     #[test]
