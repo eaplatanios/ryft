@@ -876,7 +876,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::axes::NamedAxes;
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -888,48 +888,53 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::RegionInterface;
     use crate::programs::types::{TypeError, Typed};
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
     #[test]
     fn test_trace() {
-        let (output_type, program) =
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(|x| Ok(x.clone() * x), DataType::F64).unwrap();
-        assert_eq!(output_type, DataType::F64);
-        assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(9.0)));
+        let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x| Ok(x.clone() * x),
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
+        assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(9.0)));
 
         // The free function traces at the abstract signature of example values, which contribute only their types
         // (i.e., the resulting program neither captures nor depends on the example values themselves).
-        let (output_type, program) = trace(|x| Ok(x.clone() * x), Scalar::from(2.0)).unwrap();
-        assert_eq!(output_type, DataType::F64);
-        assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(9.0)));
+        let (output_type, program) = trace(|x| Ok(x.clone() * x), Array::scalar(2.0)).unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
+        assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(9.0)));
 
         // Structured inputs trace at the structured signature of the example values.
-        let (output_type, program) = trace(|(x, y)| Ok(x * y), (Scalar::from(2.0), Scalar::from(3.0))).unwrap();
-        assert_eq!(output_type, DataType::F64);
-        assert_eq!(program.interpret((Scalar::from(4.0), Scalar::from(5.0))), Ok(Scalar::from(20.0)));
+        let (output_type, program) = trace(|(x, y)| Ok(x * y), (Array::scalar(2.0), Array::scalar(3.0))).unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
+        assert_eq!(program.interpret((Array::scalar(4.0), Array::scalar(5.0))), Ok(Array::scalar(20.0)));
     }
 
     #[test]
     fn test_interpret_and_trace() {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (output, program) =
-            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Scalar::from(2.0)).unwrap();
-        assert_eq!(output, 2.0 * 2.0 + 2.0f64.sin());
-        assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(3.0 * 3.0 + 3.0f64.sin())));
+            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Array::scalar(2.0)).unwrap();
+        assert_eq!(output, Array::scalar(2.0 * 2.0 + 2.0f64.sin()));
+        assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(3.0 * 3.0 + 3.0f64.sin())));
     }
 
     #[test]
     fn test_infer_output_type() {
-        let output_type =
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::infer_output_type(|x| Ok(x.sin()?), DataType::F64)
-                .unwrap();
-        assert_eq!(output_type, DataType::F64);
+        let output_type = EagerContext::<Array, ArrayOperation<Array>>::infer_output_type(
+            |x| Ok(x.sin()?),
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
 
         // The free function infers output types at the abstract signature of example values.
-        let output_type = infer_output_type(|x| Ok(x.sin()?), Scalar::from(1.5)).unwrap();
-        assert_eq!(output_type, DataType::F64);
+        let output_type = infer_output_type(|x| Ok(x.sin()?), Array::scalar(1.5)).unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
     }
 
     #[test]
@@ -945,11 +950,12 @@ mod tests {
     #[test]
     fn test_tracer() {
         // Test handles, atom lookup, cloning, typing, and rendering.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = tracing_context.builder().clone();
-        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let tracer = tracing_context.tracer(atom, None);
-        let poisoned: Tracer<_> = Tracer::new(tracing_context.clone(), TracerState::Poison, DataType::F64);
+        let poisoned: Tracer<_> =
+            Tracer::new(tracing_context.clone(), TracerState::Poison, ArrayType::scalar(DataType::F64));
         let cloned_tracer = tracer.clone();
         assert!(Rc::ptr_eq(tracer.builder(), &builder));
         assert_eq!(tracer.atom_id(), Ok(atom));
@@ -957,97 +963,102 @@ mod tests {
         assert_eq!(cloned_tracer.state(), tracer.state());
         assert_eq!(cloned_tracer.r#type(), tracer.r#type());
         assert!(Rc::ptr_eq(cloned_tracer.builder(), &builder));
-        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
+        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
         assert_eq!(tracer.to_string(), "%0");
-        assert_eq!(format!("{tracer:?}"), "Tracer { state: Live(AtomId { index: 0 }), type: F64, .. }");
-        assert_eq!(poisoned.to_string(), "<poison:f64>");
-        assert_eq!(format!("{poisoned:?}"), "Tracer { state: Poison, type: F64, .. }");
+        assert_eq!(
+            format!("{tracer:?}"),
+            "Tracer { state: Live(AtomId { index: 0 }), type: ArrayType { data_type: F64, shape: Shape { dimensions: \
+             [] }, layout: None, sharding: None, memory: Device }, .. }",
+        );
+        assert_eq!(poisoned.to_string(), "<poison:f64[]>");
+        assert_eq!(
+            format!("{poisoned:?}"),
+            "Tracer { state: Poison, type: ArrayType { data_type: F64, shape: Shape { dimensions: [] }, layout: None, \
+             sharding: None, memory: Device }, .. }",
+        );
 
         // Test staging value-level identity helpers through the tracer convenience API.
         let zero = tracer.zero_like();
         let one = tracer.one_like();
-        assert_eq!(zero.r#type().into_owned(), DataType::F64);
-        assert_eq!(one.r#type().into_owned(), DataType::F64);
+        assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(one.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         let zero_atom = zero.atom_id().expect("zero_like output should remain live");
         let one_atom = one.atom_id().expect("one_like output should remain live");
         let program = builder
             .borrow()
             .clone()
-            .build::<Scalar, Vec<Scalar>>(vec![zero_atom, one_atom], Placeholder, vec![Placeholder, Placeholder])
+            .build::<Array, Vec<Array>>(vec![zero_atom, one_atom], Placeholder, vec![Placeholder, Placeholder])
             .unwrap();
-        assert_eq!(program.interpret(Scalar::from(2.0)), Ok(vec![Scalar::from(0.0), Scalar::from(1.0)]));
+        assert_eq!(program.interpret(Array::scalar(2.0)), Ok(vec![Array::scalar(0.0), Array::scalar(1.0)]));
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = zero_like %0
-                    %2:f64 = one_like %0
+                lambda %0:f64[] .
+                let %1:f64[] = zero_like %0
+                    %2:f64[] = one_like %0
                 in (%1, %2)
             "}
             .trim_end(),
         );
 
         // Test staging a unary operation through the tracer convenience API.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = tracing_context.builder().clone();
-        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let tracer = tracing_context.tracer(atom, None);
         let output = tracer.unary(NegOperation::new());
-        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         let output_atom = output.atom_id().expect("unary output should remain live");
-        let program = builder
-            .borrow()
-            .clone()
-            .build::<Scalar, Scalar>(vec![output_atom], Placeholder, Placeholder)
-            .unwrap();
-        assert_eq!(program.interpret(Scalar::from(2.0)), Ok(Scalar::from(-2.0)));
+        let program =
+            builder.borrow().clone().build::<Array, Array>(vec![output_atom], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.interpret(Array::scalar(2.0)), Ok(Array::scalar(-2.0)));
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = neg %0
+                lambda %0:f64[] .
+                let %1:f64[] = neg %0
                 in (%1)
             "}
             .trim_end(),
         );
 
         // Test staging a binary operation through the tracer convenience API.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = tracing_context.builder().clone();
-        let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
-        let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
+        let lhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let rhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
         let output = lhs.binary(&rhs, AddOperation::new());
-        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         let output_atom = output.atom_id().expect("binary output should remain live");
         let program = builder
             .borrow()
             .clone()
-            .build::<(Scalar, Scalar), Scalar>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret((Scalar::from(2.0), Scalar::from(3.0))), Ok(Scalar::from(5.0)));
+        assert_eq!(program.interpret((Array::scalar(2.0), Array::scalar(3.0))), Ok(Array::scalar(5.0)));
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = add %0 %1
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = add %0 %1
                 in (%2)
             "}
             .trim_end(),
         );
 
         // Test that binary operations poison the result when inputs belong to different builders.
-        let context_a = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let context_b = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context_a = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let context_b = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder_a = context_a.builder().clone();
-        let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
-        let atom_b = context_b.builder().borrow_mut().add_input(DataType::F64);
+        let atom_a = builder_a.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let atom_b = context_b.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let tracer_a = context_a.tracer(atom_a, None);
         let tracer_b = context_b.tracer(atom_b, None);
         let output = tracer_a.binary(&tracer_b, AddOperation::new());
         assert!(matches!(output.state(), TracerState::Poison));
-        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
     }
 
@@ -1057,7 +1068,7 @@ mod tests {
         struct NoOutputOperation;
 
         impl Operation for NoOutputOperation {
-            type Type = DataType;
+            type Type = ArrayType;
 
             #[inline]
             fn name(&self) -> &'static str {
@@ -1066,32 +1077,32 @@ mod tests {
 
             fn infer_output_types(
                 &self,
-                _input_types: &[DataType],
-                _region_interfaces: &[RegionInterface<DataType>],
-            ) -> Result<Vec<DataType>, TypeError> {
+                _input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
                 Ok(Vec::new())
             }
         }
 
-        impl<C: Domain<Type = DataType, Value = Scalar>> InterpretableOperation<C> for NoOutputOperation {
+        impl<C: Domain<Type = ArrayType, Value = Array>> InterpretableOperation<C> for NoOutputOperation {
             #[inline]
             fn interpret<D: InterpretationDriver<C>>(
                 &self,
                 _context: &C,
                 _driver: &D,
-                _inputs: &[Scalar],
-            ) -> Result<Vec<Scalar>, ProgramError> {
+                _inputs: &[Array],
+            ) -> Result<Vec<Array>, ProgramError> {
                 Ok(Vec::new())
             }
         }
 
-        let context = TracingContext::<Scalar, NoOutputOperation>::new();
+        let context = TracingContext::<Array, NoOutputOperation>::new();
         let builder = context.builder().clone();
-        let input_type = DataType::F64;
+        let input_type = ArrayType::scalar(DataType::F64);
         let tracer = context.input(input_type);
         let output = tracer.unary(NoOutputOperation);
         assert!(matches!(output.state(), TracerState::Poison));
-        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(
             builder.borrow().error().cloned(),
             Some(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
@@ -1100,10 +1111,10 @@ mod tests {
 
     #[test]
     fn test_tracing_context() {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         // Test construction, cloning, and debug formatting.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = tracing_context.builder().clone();
         let cloned_context = tracing_context.clone();
         assert!(Rc::ptr_eq(tracing_context.builder(), &builder));
@@ -1111,36 +1122,36 @@ mod tests {
         assert_eq!(format!("{tracing_context:?}"), "TracingContext { .. }");
 
         // Test creating a program constant in the staged program.
-        let constant = tracing_context.constant(Scalar::from(2.5));
-        assert_eq!(constant.r#type().into_owned(), DataType::F64);
+        let constant = tracing_context.constant(Array::scalar(2.5));
+        assert_eq!(constant.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         let constant_atom = constant.atom_id().expect("constant tracer should remain live");
         assert_eq!(constant_atom.index(), 0);
         let program = builder
             .borrow()
             .clone()
-            .build::<Vec<Scalar>, Scalar>(vec![constant_atom], Vec::<Placeholder>::new(), Placeholder)
+            .build::<Vec<Array>, Array>(vec![constant_atom], Vec::<Placeholder>::new(), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret(Vec::new()), Ok(Scalar::from(2.5)));
+        assert_eq!(program.interpret(Vec::new()), Ok(Array::scalar(2.5)));
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64 = const
+                let %0:f64[] = const
                 in (%0)
             "}
             .trim_end(),
         );
 
         // Test constructing tracers from builder-owned and explicitly cached types.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let atom = tracing_context.builder().borrow_mut().add_input(DataType::F64);
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let atom = tracing_context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let builder_typed = tracing_context.tracer(atom, None);
-        let cached_typed = tracing_context.tracer(atom, Some(DataType::F64));
-        assert!(matches!(builder_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-        assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
+        let cached_typed = tracing_context.tracer(atom, Some(ArrayType::scalar(DataType::F64)));
+        assert!(matches!(builder_typed.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
 
         // Test that only the first recorded builder error is retained.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = tracing_context.builder().clone();
         let first_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         let second_error = ProgramError::InvalidOutputCount { expected: 1, actual: 0 };
@@ -1149,39 +1160,39 @@ mod tests {
         assert_eq!(builder.borrow().error().cloned(), Some(first_error));
 
         // Test staging a valid operation through the context.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = tracing_context.builder().clone();
-        let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
-        let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
+        let lhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let rhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
         let outputs = tracing_context.stage_operation(AddOperation::new(), Vec::new(), &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].state(), &TracerState::Live(AtomId::new(2)));
-        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
         let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
         let program = builder
             .borrow()
             .clone()
-            .build::<(Scalar, Scalar), Scalar>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret((Scalar::from(2.0), Scalar::from(3.0))), Ok(Scalar::from(5.0)));
+        assert_eq!(program.interpret((Array::scalar(2.0), Array::scalar(3.0))), Ok(Array::scalar(5.0)));
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = add %0 %1
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = add %0 %1
                 in (%2)
             "}
             .trim_end(),
         );
 
         // Test rejecting inputs that belong to a different program builder.
-        let context_a = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let context_b = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context_a = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let context_b = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder_a = context_a.builder().clone();
-        let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
-        let atom_b = context_b.builder().borrow_mut().add_input(DataType::F64);
+        let atom_a = builder_a.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let atom_b = context_b.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let tracer_a = context_a.tracer(atom_a, None);
         let tracer_b = context_b.tracer(atom_b, None);
         assert!(matches!(
@@ -1191,16 +1202,16 @@ mod tests {
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
 
         // Test tracing after a builder failure by returning poisoned tracers when output types can still be inferred.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = tracing_context.builder().clone();
-        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let builder_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         builder.borrow_mut().error = Some(builder_error.clone());
         let tracer = tracing_context.tracer(atom, None);
         let outputs = tracing_context.stage_operation(NegOperation::new(), Vec::new(), &[&tracer]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].state(), &TracerState::Poison));
-        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error.clone()));
         assert!(matches!(
             tracing_context.stage_operation(AddOperation::new(), Vec::new(), &[&tracer]),
@@ -1209,10 +1220,10 @@ mod tests {
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
 
         // Test propagating abstract-evaluation errors and recording them on the builder.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = tracing_context.builder().clone();
-        let lhs_atom = builder.borrow_mut().add_input(DataType::F8E3M4);
-        let rhs_atom = builder.borrow_mut().add_input(DataType::F32);
+        let lhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F8E3M4));
+        let rhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F32));
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
         let result = tracing_context.stage_operation(AddOperation::new(), Vec::new(), &[&lhs, &rhs]);
@@ -1228,16 +1239,26 @@ mod tests {
         ));
 
         // Test staging program constants through the context without requiring the context itself to be a domain.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = tracing_context.builder().clone();
         let zero = tracing_context.constant(
-            domain.bind(ZeroOperation::new(DataType::F64), Vec::new(), &[]).unwrap().into_iter().next().unwrap(),
+            domain
+                .bind(ZeroOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[])
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
         );
         let one = tracing_context.constant(
-            domain.bind(OneOperation::new(DataType::F64), Vec::new(), &[]).unwrap().into_iter().next().unwrap(),
+            domain
+                .bind(OneOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[])
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
         );
-        assert_eq!(zero.r#type().into_owned(), DataType::F64);
-        assert_eq!(one.r#type().into_owned(), DataType::F64);
+        assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(one.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         let zero_atom = zero.atom_id().expect("zero tracer should remain live");
         let one_atom = one.atom_id().expect("one tracer should remain live");
         assert_eq!(zero_atom.index(), 0);
@@ -1245,19 +1266,19 @@ mod tests {
         let program = builder
             .borrow()
             .clone()
-            .build::<Vec<Scalar>, Vec<Scalar>>(
+            .build::<Vec<Array>, Vec<Array>>(
                 vec![zero_atom, one_atom],
                 Vec::<Placeholder>::new(),
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        assert_eq!(program.interpret(Vec::new()), Ok(vec![Scalar::from(0.0), Scalar::from(1.0)]));
+        assert_eq!(program.interpret(Vec::new()), Ok(vec![Array::scalar(0.0), Array::scalar(1.0)]));
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64 = const
-                    %1:f64 = const
+                let %0:f64[] = const
+                    %1:f64[] = const
                 in (%0, %1)
             "}
             .trim_end(),
@@ -1266,20 +1287,20 @@ mod tests {
 
     #[test]
     fn test_tracing_context_trace() {
-        let (output_type, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+        let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| Ok(x.clone() * x.clone() + x.one_like()),
-            DataType::F64,
+            ArrayType::scalar(DataType::F64),
         )
         .unwrap();
-        assert_eq!(output_type, DataType::F64);
-        assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(10.0)));
+        assert_eq!(output_type, ArrayType::scalar(DataType::F64));
+        assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(10.0)));
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = mul %0 %0
-                    %2:f64 = one_like %0
-                    %3:f64 = add %1 %2
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = one_like %0
+                    %3:f64[] = add %1 %2
                 in (%3)
             "}
             .trim_end(),
@@ -1288,19 +1309,22 @@ mod tests {
         // Test using an escaped `ProgramBuilder`.
         let escaped_builder = Rc::new(RefCell::new(None));
         assert!(matches!(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+            EagerContext::<Array, ArrayOperation<Array>>::trace(
                 |x| {
                     *escaped_builder.borrow_mut() = Some(x.builder().clone());
                     Ok(x)
                 },
-                DataType::F64,
+                ArrayType::scalar(DataType::F64),
             ),
             Err(ProgramError::EscapedProgramBuilder),
         ));
 
         // Test that `TypeError`s are returned in certain cases.
         assert!(matches!(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(|inputs| Ok(inputs.0 + inputs.1), (DataType::F8E3M4, DataType::F32)),
+            EagerContext::<Array, ArrayOperation<Array>>::trace(
+                |inputs| Ok(inputs.0 + inputs.1),
+                (ArrayType::scalar(DataType::F8E3M4), ArrayType::scalar(DataType::F32)),
+            ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "'add' input types are not broadcast-compatible",
         ));
@@ -1308,19 +1332,19 @@ mod tests {
 
     #[test]
     fn test_tracing_context_interpret_and_trace() {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (output, program) =
-            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Scalar::from(2.0)).unwrap();
-        assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
-        assert_eq!(program.interpret(Scalar::from(0.5)), Ok(Scalar::from(0.5f64 * 0.5f64 + 0.5f64.sin())));
+            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Array::scalar(2.0)).unwrap();
+        assert_eq!(output, Array::scalar(2.0f64 * 2.0f64 + 2.0f64.sin()));
+        assert_eq!(program.interpret(Array::scalar(0.5)), Ok(Array::scalar(0.5f64 * 0.5f64 + 0.5f64.sin())));
         assert_eq!(program.input_ids().len(), 1);
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = mul %0 %0
-                    %2:f64 = sin %0
-                    %3:f64 = add %1 %2
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = sin %0
+                    %3:f64[] = add %1 %2
                 in (%3)
             "}
             .trim_end(),
@@ -1328,15 +1352,15 @@ mod tests {
 
         // Test using a function with a tuple argument.
         let (_, compiled) = domain
-            .interpret_and_trace(|(x, y)| Ok(x.clone() * y + x.sin()?), (Scalar::from(2.0), Scalar::from(3.0)))
+            .interpret_and_trace(|(x, y)| Ok(x.clone() * y + x.sin()?), (Array::scalar(2.0), Array::scalar(3.0)))
             .unwrap();
         assert_eq!(
             compiled.to_string(),
             indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = mul %0 %1
-                    %3:f64 = sin %0
-                    %4:f64 = add %2 %3
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %1
+                    %3:f64[] = sin %0
+                    %4:f64[] = add %2 %3
                 in (%4)
             "}
             .trim_end(),
@@ -1349,16 +1373,16 @@ mod tests {
                     let _ = x.sin()?;
                     Ok(x.clone() * x)
                 },
-                Scalar::from(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
-        assert_eq!(output, 4.0);
-        assert_eq!(program.interpret(Scalar::from(0.5)), Ok(Scalar::from(0.25)));
+        assert_eq!(output, Array::scalar(4.0));
+        assert_eq!(program.interpret(Array::scalar(0.5)), Ok(Array::scalar(0.25)));
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = mul %0 %0
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
                 in (%1)
             "}
             .trim_end(),
@@ -1366,14 +1390,14 @@ mod tests {
 
         // Test tracing value-level identity helpers as ordinary operations.
         let (output, program) =
-            domain.interpret_and_trace(|x| Ok((x.zero_like(), x.one_like())), Scalar::from(2.0)).unwrap();
-        assert_eq!(output, (Scalar::from(0.0), Scalar::from(1.0)));
+            domain.interpret_and_trace(|x| Ok((x.zero_like(), x.one_like())), Array::scalar(2.0)).unwrap();
+        assert_eq!(output, (Array::scalar(0.0), Array::scalar(1.0)));
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = zero_like %0
-                    %2:f64 = one_like %0
+                lambda %0:f64[] .
+                let %1:f64[] = zero_like %0
+                    %2:f64[] = one_like %0
                 in (%1, %2)
             "}
             .trim_end(),
@@ -1382,9 +1406,9 @@ mod tests {
 
     #[test]
     fn test_nested_tracing_context() {
-        // A nested trace over an eager `EagerContext<Scalar, ScalarOperation<Scalar>>` parent stages its own independent primal program and,
-        // like the root `TracingContext`, shares that program's builder across cloned contexts.
-        let nested = NestedTracingContext::new(EagerContext::<Scalar, ScalarOperation<Scalar>>::new());
+        // A nested trace over an eager `EagerContext<Array, ArrayOperation<Array>>` parent stages its own independent
+        // primal program and, like the root `TracingContext`, shares that program's builder across cloned contexts.
+        let nested = NestedTracingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
         let builder = nested.builder().clone();
         let cloned_context = nested.clone();
         assert!(Rc::ptr_eq(nested.builder(), &builder));
@@ -1393,23 +1417,23 @@ mod tests {
 
         // Staging an operation appends to the nested program, which interprets and renders exactly
         // as a root trace would.
-        let lhs = nested.input(DataType::F64);
-        let rhs = nested.input(DataType::F64);
+        let lhs = nested.input(ArrayType::scalar(DataType::F64));
+        let rhs = nested.input(ArrayType::scalar(DataType::F64));
         let outputs = nested.stage_operation(AddOperation::new(), Vec::new(), &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
         let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
         let program = builder
             .borrow()
             .clone()
-            .build::<(Scalar, Scalar), Scalar>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret((Scalar::from(2.0), Scalar::from(3.0))), Ok(Scalar::from(5.0)));
+        assert_eq!(program.interpret((Array::scalar(2.0), Array::scalar(3.0))), Ok(Array::scalar(5.0)));
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = add %0 %1
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = add %0 %1
                 in (%2)
             "}
             .trim_end(),
@@ -1417,11 +1441,11 @@ mod tests {
 
         // Runtime captures are not owned by the nested context. They delegate to the enclosing capturing context,
         // so a value captured through the nested context lands in the parent's shared capture table.
-        let capturing_parent = TracingContext::<CaptureReference<DataType>, NegOperation<DataType>, Scalar>::new();
+        let capturing_parent = TracingContext::<CaptureReference<ArrayType>, NegOperation<ArrayType>, Array>::new();
         let nested = NestedTracingContext::new(capturing_parent.clone());
-        let reference = nested.capture(Scalar::from(7.0)).expect("capture should delegate to the enclosing context");
-        assert_eq!(reference.r#type().into_owned(), DataType::F64);
-        assert_eq!(capturing_parent.captures().borrow().as_slice(), &[Scalar::from(7.0)]);
+        let reference = nested.capture(Array::scalar(7.0)).expect("capture should delegate to the enclosing context");
+        assert_eq!(reference.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(capturing_parent.captures().borrow().as_slice(), &[Array::scalar(7.0)]);
     }
 
     #[test]
@@ -1429,19 +1453,22 @@ mod tests {
         // `trace` runs the closure once on tracer inputs standing in for the provided input types and finalizes
         // the staged flat program together with the closure's output structure.
         let (output_structure, program) = NestedTracingContext::trace(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+            EagerContext::<Array, ArrayOperation<Array>>::new(),
             |inputs: Vec<Tracer<_>>| Ok(vec![inputs[0].clone() * inputs[0].clone(), inputs[0].sin()?]),
-            vec![DataType::F64],
+            vec![ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
         assert_eq!(output_structure, vec![Placeholder, Placeholder]);
-        assert_eq!(program.interpret(vec![Scalar::from(2.0)]), Ok(vec![Scalar::from(4.0), Scalar::from(2.0f64.sin())]));
+        assert_eq!(
+            program.interpret(vec![Array::scalar(2.0)]),
+            Ok(vec![Array::scalar(4.0), Array::scalar(2.0f64.sin())])
+        );
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = mul %0 %0
-                    %2:f64 = sin %0
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = sin %0
                 in (%1, %2)
             "}
             .trim_end(),
@@ -1451,12 +1478,12 @@ mod tests {
         let escaped_tracer = Rc::new(RefCell::new(None));
         assert!(matches!(
             NestedTracingContext::trace(
-                EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                EagerContext::<Array, ArrayOperation<Array>>::new(),
                 |inputs: Vec<Tracer<_>>| {
                     *escaped_tracer.borrow_mut() = Some(inputs[0].clone());
                     Ok(inputs)
                 },
-                vec![DataType::F64],
+                vec![ArrayType::scalar(DataType::F64)],
             ),
             Err(ProgramError::EscapedProgramBuilder),
         ));
@@ -1464,16 +1491,16 @@ mod tests {
         // `trace_with_named_axes` seeds the nested context with axis bindings that named-axis readers resolve inside
         // the closure, while unseeded names keep delegating to the parent (an eager parent binds none).
         let (_, program) = NestedTracingContext::trace_with_named_axes(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+            EagerContext::<Array, ArrayOperation<Array>>::new(),
             |inputs: Vec<Tracer<_>>| {
                 assert_eq!(inputs[0].context().named_axis("model"), Some(NamedAxis::Batched { size: Some(4) }));
                 assert_eq!(inputs[0].context().named_axis("unbound"), None);
                 Ok(inputs)
             },
-            vec![DataType::F64],
+            vec![ArrayType::scalar(DataType::F64)],
             vec![("model".to_string(), NamedAxis::Batched { size: Some(4) })],
         )
         .unwrap();
-        assert_eq!(program.interpret(vec![Scalar::from(3.0)]), Ok(vec![Scalar::from(3.0)]));
+        assert_eq!(program.interpret(vec![Array::scalar(3.0)]), Ok(vec![Array::scalar(3.0)]));
     }
 }

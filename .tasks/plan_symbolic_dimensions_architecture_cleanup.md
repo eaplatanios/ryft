@@ -2560,6 +2560,9 @@ Phase 9a4 — retire the scalar program universe:
         consumer graph uses rank-zero arrays without introducing another test value universe.
   - [ ] Migrate the generic context, tracing, partial-evaluation, batching, differentiation, custom-derivative, and
         rematerialization fixtures.
+    - [x] Migrate generic context and tracing fixtures.
+    - [ ] Migrate partial-evaluation and batching fixtures.
+    - [ ] Migrate differentiation, custom-derivative, and rematerialization fixtures.
   - [ ] Migrate remaining operation-local scalar fixtures or delete coverage already pinned by array tests.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
@@ -4812,3 +4815,14 @@ identifier from `programs::{atoms,builders,operations,regions}` and reduces the 
 across 63 files to 365 matches across 59 files. All 121 program-layer tests, the five directly affected capture and
 interpretation tests, the complete 1,158-test core library suite, and all 54 runnable doctests (16 intentional ignores)
 pass. Generic transform and operation-local fixture migration remain open in the checklist above.
+
+The context-and-tracing slice moves every generic context and tracing fixture to rank-zero `Array` values and
+`ArrayType` signatures. The two test-only operations that isolate staging and invalid-output behavior now use
+`ArrayType` directly, and rendered-program expectations expose rank-zero shapes as `f64[]`. This preserves the tests'
+universe-neutral contracts while removing their dependency on the scalar backend.
+
+This review unit changes 559 lines across two test modules with 51 net additions, caused by explicit rank-zero type and
+value construction rather than new machinery. It removes all retired scalar identifiers from `contexts.rs` and
+`tracing.rs`, reducing the core residual audit from 365 matches across 59 files to 289 matches across 57 files. All 39
+focused context and tracing tests and the complete 1,158-test core library suite pass. Partial evaluation and batching
+are the next bounded generic-transform fixture unit.

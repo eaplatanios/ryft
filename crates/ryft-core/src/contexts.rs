@@ -727,8 +727,7 @@ pub(crate) mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::Array;
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::differentiation::forward::{
         DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,
     };
@@ -1141,38 +1140,64 @@ pub(crate) mod tests {
 
     #[test]
     fn test_domain() {
-        // `EagerContext<Scalar, ScalarOperation<Scalar>>` is an eager `Context` over the self-describing `Scalar` value
-        // type, so binding a nullary zero/one `Operation` interprets it directly to the `Scalar` variant matching the
-        // requested `DataType`.
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        // `EagerContext<Array, ArrayOperation<Array>>` is an eager context over self-describing arrays, so binding a
+        // nullary zero or one operation interprets it directly as a rank-zero array of the requested `ArrayType`.
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         assert_eq!(
-            domain.bind(ZeroOperation::new(DataType::BF16), Vec::new(), &[]),
-            Ok(vec![Scalar::BF16(bf16::ZERO)])
+            domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::BF16)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(bf16::ZERO)])
         );
-        assert_eq!(domain.bind(OneOperation::new(DataType::BF16), Vec::new(), &[]), Ok(vec![Scalar::BF16(bf16::ONE)]));
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::F16), Vec::new(), &[]), Ok(vec![Scalar::F16(f16::ZERO)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::F16), Vec::new(), &[]), Ok(vec![Scalar::F16(f16::ONE)]));
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::F32), Vec::new(), &[]), Ok(vec![Scalar::F32(0.0)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::F32), Vec::new(), &[]), Ok(vec![Scalar::F32(1.0)]));
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::F64), Vec::new(), &[]), Ok(vec![Scalar::F64(0.0)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::F64), Vec::new(), &[]), Ok(vec![Scalar::F64(1.0)]));
+        assert_eq!(
+            domain.bind(OneOperation::new(ArrayType::scalar(DataType::BF16)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(bf16::ONE)])
+        );
+        assert_eq!(
+            domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::F16)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(f16::ZERO)])
+        );
+        assert_eq!(
+            domain.bind(OneOperation::new(ArrayType::scalar(DataType::F16)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(f16::ONE)])
+        );
+        assert_eq!(
+            domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(0.0f32)])
+        );
+        assert_eq!(
+            domain.bind(OneOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(1.0f32)])
+        );
+        assert_eq!(
+            domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(0.0)])
+        );
+        assert_eq!(
+            domain.bind(OneOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(1.0)])
+        );
     }
 
     #[test]
     fn test_eager_context_binds_and_lifts_values() {
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let default_context = EagerContext::<Scalar, ScalarOperation<Scalar>>::default();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let default_context = EagerContext::<Array, ArrayOperation<Array>>::default();
         let copied_context = context;
         let cloned_context = copied_context.clone();
         assert_eq!(format!("{context:?}"), "EagerContext");
         assert_eq!(format!("{default_context:?}"), "EagerContext");
         assert_eq!(format!("{cloned_context:?}"), "EagerContext");
-        assert_eq!(context.lift(Scalar::from(2.5)), Ok(Scalar::from(2.5)));
-        assert_eq!(context.bind(ZeroOperation::new(DataType::F64), [], &[]), Ok(vec![Scalar::from(0.0)]));
-        assert_eq!(context.bind(OneOperation::new(DataType::F64), Vec::new(), &[]), Ok(vec![Scalar::from(1.0)]));
+        assert_eq!(context.lift(Array::scalar(2.5)), Ok(Array::scalar(2.5)));
         assert_eq!(
-            context.bind(AddOperation::new(), Vec::new(), &[Scalar::from(2.0), Scalar::from(3.5)]),
-            Ok(vec![Scalar::from(5.5)]),
+            context.bind(ZeroOperation::new(ArrayType::scalar(DataType::F64)), [], &[]),
+            Ok(vec![Array::scalar(0.0)])
+        );
+        assert_eq!(
+            context.bind(OneOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[]),
+            Ok(vec![Array::scalar(1.0)])
+        );
+        assert_eq!(
+            context.bind(AddOperation::new(), Vec::new(), &[Array::scalar(2.0), Array::scalar(3.5)]),
+            Ok(vec![Array::scalar(5.5)]),
         );
     }
 
@@ -1181,32 +1206,32 @@ pub(crate) mod tests {
         // Shared callee programs bind through the same eager interpretation driver as owned regions. The while loop
         // below receives its condition and body as callee attachments and runs to completion.
         let condition = {
-            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-            let carry = builder.add_input(DataType::F64);
-            let eight = builder.add_constant(Scalar::from(8.0));
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let carry = builder.add_input(ArrayType::scalar(DataType::F64));
+            let eight = builder.add_constant(Array::scalar(8.0));
             let predicate = builder
                 .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![carry, eight])
                 .unwrap()[0];
             builder
-                .build::<Vec<Scalar>, Vec<Scalar>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
         let body = {
-            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-            let carry = builder.add_input(DataType::F64);
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let carry = builder.add_input(ArrayType::scalar(DataType::F64));
             let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry]).unwrap()[0];
             builder
-                .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         assert_eq!(
             context.bind(
-                ScalarOperation::While(WhileOperation::new()),
+                ArrayOperation::While(WhileOperation::new()),
                 CalleeRegionDriver::new(&[Rc::new(condition), Rc::new(body)]),
-                &[Scalar::from(1.0)],
+                &[Array::scalar(1.0)],
             ),
-            Ok(vec![Scalar::from(8.0)]),
+            Ok(vec![Array::scalar(8.0)]),
         );
     }
 
@@ -1303,46 +1328,47 @@ pub(crate) mod tests {
 
     #[test]
     fn test_staging_context_creates_inputs_constants_and_tracers() {
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = context.builder().clone();
 
-        let input = context.input(DataType::F64);
-        let constant = context.constant(Scalar::from(2.5));
+        let input = context.input(ArrayType::scalar(DataType::F64));
+        let constant = context.constant(Array::scalar(2.5));
         let builder_typed = context.tracer(AtomId::new(0), None);
-        let cached_typed = context.tracer(AtomId::new(0), Some(DataType::F64));
+        let cached_typed = context.tracer(AtomId::new(0), Some(ArrayType::scalar(DataType::F64)));
 
         assert_eq!(input.atom_id(), Ok(AtomId::new(0)));
         assert_eq!(constant.atom_id(), Ok(AtomId::new(1)));
-        assert_eq!(input.r#type().into_owned(), DataType::F64);
-        assert_eq!(constant.r#type().into_owned(), DataType::F64);
-        assert!(matches!(builder_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-        assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
+        assert_eq!(input.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(constant.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert!(matches!(builder_typed.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
 
         let builder = builder.borrow();
         assert_eq!(builder.input_ids(), &[AtomId::new(0)]);
         assert!(builder.instructions().is_empty());
-        assert!(matches!(&builder.atoms()[0], Atom::Variable(r#type) if *r#type == DataType::F64));
-        assert!(matches!(&builder.atoms()[1], Atom::Constant(value) if *value == 2.5));
+        assert!(matches!(&builder.atoms()[0], Atom::Variable(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(&builder.atoms()[1], Atom::Constant(value) if *value == Array::scalar(2.5)));
     }
 
     #[test]
     fn test_staging_context_stages_nullary_and_regular_operations() {
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = context.builder().clone();
 
-        let mut nullary_outputs = context.stage_nullary_operation(ZeroOperation::new(DataType::F64)).unwrap();
+        let mut nullary_outputs =
+            context.stage_nullary_operation(ZeroOperation::new(ArrayType::scalar(DataType::F64))).unwrap();
         assert_eq!(nullary_outputs.len(), 1);
         let zero = nullary_outputs.remove(0);
         assert_eq!(zero.atom_id(), Ok(AtomId::new(0)));
-        assert_eq!(zero.r#type().into_owned(), DataType::F64);
+        assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(DataType::F64));
 
-        let lhs = context.input(DataType::F64);
-        let rhs = context.input(DataType::F64);
+        let lhs = context.input(ArrayType::scalar(DataType::F64));
+        let rhs = context.input(ArrayType::scalar(DataType::F64));
         let mut add_outputs = context.stage_operation(AddOperation::new(), [], &[&lhs, &rhs]).unwrap();
         assert_eq!(add_outputs.len(), 1);
         let sum = add_outputs.remove(0);
         assert_eq!(sum.atom_id(), Ok(AtomId::new(3)));
-        assert_eq!(sum.r#type().into_owned(), DataType::F64);
+        assert_eq!(sum.r#type().into_owned(), ArrayType::scalar(DataType::F64));
 
         {
             let builder = builder.borrow();
@@ -1357,16 +1383,16 @@ pub(crate) mod tests {
         let program = builder
             .borrow()
             .clone()
-            .build::<(Scalar, Scalar), Scalar>(vec![sum.atom_id().unwrap()], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![sum.atom_id().unwrap()], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret((Scalar::from(2.0), Scalar::from(3.5))), Ok(Scalar::from(5.5)));
+        assert_eq!(program.interpret((Array::scalar(2.0), Array::scalar(3.5))), Ok(Array::scalar(5.5)));
     }
 
     #[test]
     fn test_staging_context_records_errors_and_returns_poisoned_outputs_after_failure() {
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = context.builder().clone();
-        let input = context.input(DataType::F64);
+        let input = context.input(ArrayType::scalar(DataType::F64));
 
         let first_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         let second_error = ProgramError::InvalidOutputCount { expected: 1, actual: 0 };
@@ -1378,14 +1404,14 @@ pub(crate) mod tests {
         assert_eq!(outputs.len(), 1);
         let output = outputs.remove(0);
         assert_eq!(output.state(), &TracerState::Poison);
-        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(builder.borrow().error().cloned(), Some(first_error));
 
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = context.builder().clone();
-        let input = context.input(DataType::F64);
-        let foreign_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let foreign_input = foreign_context.input(DataType::F64);
+        let input = context.input(ArrayType::scalar(DataType::F64));
+        let foreign_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let foreign_input = foreign_context.input(ArrayType::scalar(DataType::F64));
 
         assert!(matches!(
             context.stage_operation(AddOperation::new(), Vec::new(), &[&input, &foreign_input]),
@@ -1403,7 +1429,7 @@ pub(crate) mod tests {
         }
 
         impl Operation for StagingRegionOperation {
-            type Type = DataType;
+            type Type = ArrayType;
 
             fn name(&self) -> &'static str {
                 "staging_region"
@@ -1415,9 +1441,9 @@ pub(crate) mod tests {
 
             fn infer_region_input_types(
                 &self,
-                _input_types: &[DataType],
-                _region_interfaces: &[RegionInterface<DataType>],
-            ) -> Result<Vec<Option<Vec<DataType>>>, TypeError> {
+                _input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<Option<Vec<ArrayType>>>, TypeError> {
                 if self.fail_region_input_inference {
                     return Err(TypeError::invalid("failed to infer staging region input types"));
                 }
@@ -1426,9 +1452,9 @@ pub(crate) mod tests {
 
             fn infer_output_types(
                 &self,
-                input_types: &[DataType],
-                region_interfaces: &[RegionInterface<DataType>],
-            ) -> Result<Vec<DataType>, TypeError> {
+                input_types: &[ArrayType],
+                region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
                 let [region_interface] = region_interfaces else {
                     return Err(TypeError::invalid(format!(
                         "staging region expects 1 attached region but got {}",
@@ -1480,16 +1506,14 @@ pub(crate) mod tests {
         }
 
         let region = {
-            let mut builder = ProgramBuilder::<Scalar, StagingRegionOperation>::new();
-            let input = builder.add_input(DataType::F64);
-            builder
-                .build::<Vec<Scalar>, Vec<Scalar>>(vec![input], vec![Placeholder], vec![Placeholder])
-                .unwrap()
+            let mut builder = ProgramBuilder::<Array, StagingRegionOperation>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
         };
 
         // Attachment-count mismatches are rejected before inference or import and become the trace's recorded error.
-        let context = TracingContext::<Scalar, StagingRegionOperation>::new();
-        let input = context.input(DataType::F64);
+        let context = TracingContext::<Array, StagingRegionOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
             context.stage_operation(
                 StagingRegionOperation { region_input_type_count: 1, fail_region_input_inference: false },
@@ -1506,8 +1530,8 @@ pub(crate) mod tests {
         ));
 
         // The operation must return exactly one instantiation request per declared region.
-        let context = TracingContext::<Scalar, StagingRegionOperation>::new();
-        let input = context.input(DataType::F64);
+        let context = TracingContext::<Array, StagingRegionOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
             context.stage_operation(
                 StagingRegionOperation { region_input_type_count: 0, fail_region_input_inference: false },
@@ -1524,8 +1548,8 @@ pub(crate) mod tests {
         ));
 
         // Region-input inference failures are recorded on the builder just like output-inference and import failures.
-        let context = TracingContext::<Scalar, StagingRegionOperation>::new();
-        let input = context.input(DataType::F64);
+        let context = TracingContext::<Array, StagingRegionOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
         let error = ProgramError::Type(TypeError::invalid("failed to infer staging region input types"));
         assert!(matches!(
             context.stage_operation(
@@ -1539,8 +1563,8 @@ pub(crate) mod tests {
 
         // A poisoned trace infers the outputs against the hypothetical instantiated interface but imports and records
         // nothing, preserving the original builder error.
-        let context = TracingContext::<Scalar, StagingRegionOperation>::new();
-        let input = context.input(DataType::F64);
+        let context = TracingContext::<Array, StagingRegionOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
         let original_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         context.error(original_error.clone());
         let outputs = context
@@ -1552,7 +1576,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].state(), &TracerState::Poison);
-        assert_eq!(outputs[0].r#type().as_ref(), &DataType::F64);
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayType::scalar(DataType::F64));
         let builder = context.builder().borrow();
         assert_eq!(builder.error(), Some(&original_error));
         assert!(builder.instructions().is_empty());
@@ -1593,21 +1617,21 @@ pub(crate) mod tests {
 
     #[test]
     fn test_staging_context_resolve() {
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let input = context.input(DataType::F64);
-        let constant = context.constant(Scalar::from(2.5));
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
+        let constant = context.constant(Array::scalar(2.5));
         let mut add_outputs = context.stage_operation(AddOperation::new(), Vec::new(), &[&input, &constant]).unwrap();
         let sum = add_outputs.remove(0);
 
         // Literal-backed tracers resolve to their program-constant payload, while inputs and operation outputs
         // resolve to their staged atoms.
         assert_eq!(context.resolve(&input), ValueResolution::Staged(AtomId::new(0)));
-        assert_eq!(context.resolve(&constant), ValueResolution::Constant(Scalar::from(2.5)));
+        assert_eq!(context.resolve(&constant), ValueResolution::Constant(Array::scalar(2.5)));
         assert_eq!(context.resolve(&sum), ValueResolution::Staged(AtomId::new(2)));
 
         // Tracers belonging to a different builder are opaque, in both directions.
-        let foreign_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let foreign_input = foreign_context.input(DataType::F64);
+        let foreign_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let foreign_input = foreign_context.input(ArrayType::scalar(DataType::F64));
         assert_eq!(context.resolve(&foreign_input), ValueResolution::Opaque);
         assert_eq!(foreign_context.resolve(&input), ValueResolution::Opaque);
 
