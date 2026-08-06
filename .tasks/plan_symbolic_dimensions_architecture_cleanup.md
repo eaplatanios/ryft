@@ -2479,6 +2479,8 @@ Phase 9a2 — byte-backed reference kernels:
 
 - [ ] Migrate elementwise arithmetic, logical, comparison, complex, conversion, zero/one/fill/iota, and random kernels
       family by family, preserving integer wrapping and fallible errors.
+  - [x] P9a2a: migrate `Not`, `And`, `Or`, and `Xor` directly over layout-aware Boolean and integer storage, including
+        sub-byte masks and complete NumPy-style broadcasting, without temporary scalar or logical-byte payloads.
 - [ ] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
       gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
 - [ ] Route raw-buffer access through the Phase 9a1 addressing contract and reuse its rectangular traversal where it
@@ -4396,3 +4398,19 @@ The Phase 9a1 ownership audit confirms that `Array` stores only its `ArrayType` 
 `scalar_values()` bridge materializes temporary kernel inputs and remains explicitly owned by Phase 9a2 rather than
 stored state. All `ryft-core` test targets pass, including 1,151 library tests, the three allocation tests, the six
 remaining integration tests, and the compile-fail contract; formatting and diff hygiene pass. Phase 9a1 is complete.
+
+### Phase 9a2a logical and bitwise reference kernels (2026-08-05)
+
+`Not`, `And`, `Or`, and `Xor` no longer decode through `Scalar` or allocate temporary logical input and output buffers.
+The unary kernel traverses each logical element's physical byte range through `ArrayAddressing`, masks complements to
+the declared Boolean or sub-byte width, and leaves layout holes and tile padding zero. The shared binary kernel reads
+both physical inputs through their addressing descriptors, maps arbitrary NumPy-style broadcast coordinates into the
+common output shape, and writes one zero-initialized layout-aware physical result. Full-width signed and unsigned
+integers use the same bytewise truth tables, which are independent of signedness and host endianness.
+
+The focused tests now cover Boolean truth tables, two-dimensional `(2, 1)` with `(1, 3)` broadcasting, multi-byte
+integer complement, signed I2 masking, U4 bitwise combination, explicit strided storage with a preserved zero hole,
+and the exact unsupported-floating-point diagnostic. All 1,151 `ryft-core` library tests and all 436 runnable
+`ryft-xla` library tests pass (one intentional timing-sensitive ignore); formatting and diff hygiene pass. The broader
+Phase 9a2 family checkbox remains open for the remaining arithmetic, comparison, complex, conversion, constructor, and
+random kernels.

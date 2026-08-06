@@ -523,6 +523,69 @@ impl Array {
         Self::from_scalar_values(output_type, values)
     }
 
+    /// Applies a binary logical or bitwise operation directly to validated Boolean or integer element bytes. Since
+    /// bitwise operations act independently on every bit, their result is independent of integer signedness and host
+    /// endianness. Logical Boolean encodings use the same `0` and `1` bitwise truth tables.
+    fn binary_logical(
+        &self,
+        rhs: &Self,
+        operation: &str,
+        function: impl Fn(u8, u8) -> u8,
+    ) -> Result<Self, ProgramError> {
+        let left_data_type = self.r#type.data_type();
+        let right_data_type = rhs.r#type.data_type();
+        let output_type = Broadcastable::broadcast(&self.r#type, &rhs.r#type)
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        if left_data_type != right_data_type || !(left_data_type.is_boolean() || left_data_type.is_integer()) {
+            return Err(TypeError::invalid(format!(
+                "cannot apply `{operation}` to arrays of element data types {left_data_type} and {right_data_type}",
+            ))
+            .into());
+        }
+
+        let output_shape = output_type.static_shape().unwrap();
+        let left_shape = self.r#type.static_shape().unwrap();
+        let right_shape = rhs.r#type.static_shape().unwrap();
+        let output_strides = output_shape.row_major_strides();
+        let left_strides = left_shape.row_major_strides();
+        let right_strides = right_shape.row_major_strides();
+        let left_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let right_addressing = ArrayAddressing::new(rhs.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let left_bytes = self.storage_bytes();
+        let right_bytes = rhs.storage_bytes();
+        let element_byte_width = output_addressing.element_byte_width();
+        let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
+        // NumPy-style broadcasting right-aligns input axes. An input extent of one always selects coordinate zero;
+        // every other input coordinate is recovered from the row-major output index.
+        let broadcast_index = |output_index: usize, input_shape: &StaticShape, input_strides: &[usize]| {
+            let output_axis_offset = output_shape.rank() - input_shape.rank();
+            (0..input_shape.rank()).fold(0, |index, input_axis| {
+                let output_axis = output_axis_offset + input_axis;
+                let coordinate = if input_shape[input_axis] == 1 {
+                    0
+                } else {
+                    (output_index / output_strides[output_axis]) % output_shape[output_axis]
+                };
+                index + coordinate * input_strides[input_axis]
+            })
+        };
+        for output_index in 0..output_addressing.element_count() {
+            let left_range =
+                left_addressing.byte_range_for_flat_index(broadcast_index(output_index, &left_shape, &left_strides));
+            let right_range =
+                right_addressing.byte_range_for_flat_index(broadcast_index(output_index, &right_shape, &right_strides));
+            let output_range = output_addressing.byte_range_for_flat_index(output_index);
+            for byte in 0..element_byte_width {
+                output_bytes[output_range.start + byte] =
+                    function(left_bytes[left_range.start + byte], right_bytes[right_range.start + byte]);
+            }
+        }
+        // Valid inputs, bitwise closure outputs, and zero-initialized unoccupied storage preserve every `Array`
+        // encoding invariant without a second validation traversal.
+        Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
+    }
+
     /// Broadcasts the payload to `output_len`.
     fn broadcast_values(&self, output_len: usize) -> Vec<Scalar> {
         let values = self.scalar_values();
@@ -1271,25 +1334,47 @@ impl CustomCall for Array {
 
 impl Not for Array {
     fn not(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.not())
+        let mask = match self.r#type.data_type() {
+            DataType::Boolean | DataType::I1 | DataType::U1 => 0b1,
+            DataType::I2 | DataType::U2 => 0b11,
+            DataType::I4 | DataType::U4 => 0b1111,
+            data_type if data_type.is_integer() => u8::MAX,
+            data_type => {
+                return Err(TypeError::invalid(format!(
+                    "cannot apply `not` to an array of element data type {data_type}"
+                ))
+                .into());
+            }
+        };
+        let addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let input_bytes = self.storage_bytes();
+        let mut bytes = vec![0; addressing.storage_byte_len()];
+        for element in 0..addressing.element_count() {
+            for byte in addressing.byte_range_for_flat_index(element) {
+                bytes[byte] = !input_bytes[byte] & mask;
+            }
+        }
+        // Masking retains valid Boolean and sub-byte encodings; full-width integers admit every bit pattern, and
+        // zero-initialization preserves all layout holes and padding.
+        Ok(Self { r#type: self.r#type.clone(), bytes: Arc::new(bytes) })
     }
 }
 
 impl And for Array {
     fn and(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        self.binary(rhs, |left, right| left.and(right))
+        self.binary_logical(rhs, "and", |left, right| left & right)
     }
 }
 
 impl Or for Array {
     fn or(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        self.binary(rhs, |left, right| left.or(right))
+        self.binary_logical(rhs, "or", |left, right| left | right)
     }
 }
 
 impl Xor for Array {
     fn xor(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        self.binary(rhs, |left, right| left.xor(right))
+        self.binary_logical(rhs, "xor", |left, right| left ^ right)
     }
 }
 
@@ -2216,7 +2301,7 @@ mod tests {
     use crate::operations::manipulation::{GatherDimensionNumbers, ScatterDimensionNumbers};
     use crate::operations::sharding::{ConstrainSharding, Reshard};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DimensionBounds, DimensionVariable, Memory};
+    use crate::types::{DimensionBounds, DimensionVariable, Layout, Memory, StridedLayout};
 
     use super::*;
 
@@ -2714,11 +2799,41 @@ mod tests {
         assert_eq!(left.or(&right).unwrap(), Array::vector(vec![true, true, true, false]));
         assert_eq!(left.xor(&right).unwrap(), Array::vector(vec![false, true, true, false]));
         assert_eq!(left.not().unwrap(), Array::vector(vec![false, false, true, true]));
-        // Same-data-type integer operands combine bitwise.
+        // General NumPy-style broadcasting maps each input coordinate into the common output shape.
+        assert_eq!(
+            Array::matrix(2, 1, vec![true, false]).and(&Array::matrix(1, 3, vec![true, false, true])).unwrap(),
+            Array::matrix(2, 3, vec![true, false, true, false, false, false]),
+        );
+        // Same-data-type integers combine bitwise directly over all bytes of each encoding.
         let bits = Array::vector(vec![0b1100u8]).and(&Array::vector(vec![0b1010u8])).unwrap();
         assert_eq!(bits.elements::<u8>(), Ok(vec![0b1000]));
+        assert_eq!(Array::vector(vec![0x00ff_i16, -1]).not().unwrap().elements::<i16>(), Ok(vec![-256, 0]));
+        // Sub-byte negation complements only the declared low bits, retaining a valid sign-extended encoding.
+        let signed_sub_byte = Array::vector(vec![i2::MIN, i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::MAX]);
+        assert_eq!(
+            signed_sub_byte.not().unwrap().elements::<i2>(),
+            Ok(vec![i2::MAX, i2::new(0).unwrap(), i2::new(-1).unwrap(), i2::MIN]),
+        );
+        assert_eq!(
+            Array::scalar(u4::new(0b1100).unwrap())
+                .xor(&Array::scalar(u4::new(0b1010).unwrap()))
+                .unwrap()
+                .elements::<u4>(),
+            Ok(vec![u4::new(0b0110).unwrap()]),
+        );
+        // Physical layouts are traversed through addressing, so holes stay zero rather than being complemented.
+        let strided_type =
+            array_type(DataType::Boolean, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![2])));
+        let strided = Array::new(strided_type.clone(), vec![1, 0, 0]).unwrap().not().unwrap();
+        assert_eq!(strided.r#type().as_ref(), &strided_type);
+        assert_eq!(strided.storage_bytes(), [0, 0, 1]);
+        assert_eq!(strided.elements::<bool>(), Ok(vec![false, true]));
         // Real floating-point operands are rejected, matching the scalar reference backend.
-        assert!(Array::vector(vec![1.0]).and(&Array::vector(vec![0.0])).is_err());
+        assert!(matches!(
+            Array::vector(vec![1.0]).and(&Array::vector(vec![0.0])),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot apply `and` to arrays of element data types f64 and f64",
+        ));
         // The `std::ops` sugar delegates to the fallible capabilities.
         assert_eq!(left.clone() & right.clone(), Array::vector(vec![true, false, false, false]));
         assert_eq!(!left.clone(), Array::vector(vec![false, false, true, true]));
