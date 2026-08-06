@@ -2490,6 +2490,10 @@ Phase 9a2 — byte-backed reference kernels:
         type. Preserve Boolean, integer narrowing, sub-byte, low-precision, complex-to-real, fallible encoding,
         payload-free rejection, same-type bit preservation, and arbitrary-layout semantics without a temporary
         [`Scalar`] payload.
+  - [x] P9a2l: migrate `Abs`, `Neg`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Max`, and `Min` to direct typed codecs.
+        Normalize mixed data types through the canonical conversion kernel, retain the one-output-buffer fast path for
+        already-matching operands, preserve complete broadcasting, arbitrary layouts, integer wrapping and failure
+        diagnostics, low-precision re-encoding, complex magnitude and stable division, and exact extremum selection.
 - [x] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
       gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
   - [x] P9a2c: migrate broadcast, transpose, reshape, static and dynamic slice/update, pad, and concatenate to direct
@@ -4669,3 +4673,22 @@ overflow policy and keeping reference and compiled execution aligned.
 All 1,157 core library tests, 54 runnable core doctests (16 intentional ignores), and all 438 runnable XLA library
 tests (one intentional timing-sensitive ignore) pass. Formatting and diff hygiene pass. The Phase 9a2 elementwise
 parent remains open for arithmetic, complex, and constructor kernels.
+
+### Phase 9a2l direct core arithmetic kernels (2026-08-06)
+
+`Abs`, `Neg`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Max`, and `Min` now decode and encode sealed element types directly.
+The binary operations share one generated promotion-and-broadcast path: already-matching operands are borrowed and
+the result is the only payload-sized allocation, while mixed element types reuse the canonical direct conversion
+kernel for only the mismatched operands. The path supports complete NumPy-style broadcasting and arbitrary physical
+input layouts.
+
+Per-element capabilities preserve modular native and sub-byte integer arithmetic; exact integer division/remainder
+errors; checked low-precision re-encoding; complex magnitude, arithmetic, and overflow-resistant division; and exact
+NaN-payload and signed-zero extremum selection. `Array * f64` now constructs its typed rank-zero factor through the
+direct conversion codec and delegates to the same multiplication kernel rather than reconstructing a scalar payload.
+
+Focused tests pin mixed-type multidimensional broadcasting across reversed layouts, sub-byte wrapping, low-precision
+operations, integer error diagnostics, stable large-complex division, and exact floating-point extremum encodings.
+All 1,157 core library tests, 54 runnable core doctests (16 intentional ignores), and all 438 runnable XLA library tests
+(one intentional timing-sensitive ignore) pass. Formatting and diff hygiene pass. The Phase 9a2 elementwise parent
+remains open for transcendental/sign/rounding math, complex construction and accessors, and constructors.
