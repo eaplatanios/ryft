@@ -961,7 +961,6 @@ mod tests {
 
     use crate::axes::AxisIndexOperation;
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{
         ArrayBatch, ArrayBatching, Batch, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy,
         RecursiveBatchingDriver,
@@ -1075,60 +1074,17 @@ mod tests {
         builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
     }
 
-    /// Builds the scalar `f(x) = sin(x)` program.
-    fn scalar_sin_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
-    /// Builds the deliberately wrong scalar rule `jvp(x, dx) = (sin(x), 2 * cos(x) * dx)`.
-    fn scalar_doubled_sin_jvp_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
-        let mut builder = ProgramBuilder::new();
-        let x = builder.add_input(DataType::F64);
-        let dx = builder.add_input(DataType::F64);
-        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
-        let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x]).unwrap()[0];
-        let two = builder.add_constant(Scalar::from(2.0));
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![two, cosine]).unwrap()[0];
-        let tangent = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, dx]).unwrap()[0];
-        builder
-            .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
-            .unwrap()
-    }
-
     /// Builds the malformed rule `jvp(x, dx) = (sin(x), 1)`. Its tangent ignores `dx` and is therefore an affine
     /// constant rather than a linear tangent map.
-    fn scalar_known_tangent_jvp_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
+    fn known_tangent_jvp_program(r#type: &ArrayType) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
-        let x = builder.add_input(DataType::F64);
-        builder.add_input(DataType::F64);
+        let x = builder.add_input(r#type.clone());
+        builder.add_input(r#type.clone());
         let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
-        let tangent = builder.add_constant(Scalar::from(1.0));
+        let tangent = builder.add_constant(Array::scalar(1.0));
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
-    }
-
-    /// Builds the scalar forward rule `forward(x) = (sin(x), cos(x))`, with the cosine as the residual.
-    fn scalar_sin_forward_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
-        let mut builder = ProgramBuilder::new();
-        let x = builder.add_input(DataType::F64);
-        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
-        let residual = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x]).unwrap()[0];
-        builder.build(vec![y, residual], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap()
-    }
-
-    /// Builds the deliberately wrong scalar rule `backward(residual, cotangent) = 3 * residual * cotangent`.
-    fn scalar_tripled_sin_backward_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
-        let mut builder = ProgramBuilder::new();
-        let residual = builder.add_input(DataType::F64);
-        let cotangent = builder.add_input(DataType::F64);
-        let three = builder.add_constant(Scalar::from(3.0));
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![three, residual]).unwrap()[0];
-        let gradient = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, cotangent]).unwrap()[0];
-        builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
     #[test]
@@ -1451,58 +1407,40 @@ mod tests {
 
     #[test]
     fn test_custom_jvp_rejects_known_tangent_outputs() {
-        let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
-        let operation_regions = || vec![scalar_sin_program(), scalar_known_tangent_jvp_program()];
+        let r#type = test_type(&[]);
+        let operation = ArrayOperation::CustomJvp(CustomJvpOperation::new());
+        let operation_regions = || vec![sin_program(&r#type), known_tangent_jvp_program(&r#type)];
         let expected = "linearization produced a known tangent output; differentiation rules must represent \
                         input-independent zero tangents structurally";
 
         // Program-level direct linearization must reject the malformed rule rather than silently replacing its
         // constant tangent with zero.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let region_ids = operation_regions()
             .iter()
             .map(|region| builder.import_region(region.entry_region_ref()))
             .collect::<Vec<_>>();
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(r#type.clone());
         let output = builder.add_instruction(operation.clone(), region_ids, vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert!(matches!(
             program.linearize(),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message))) if message == expected,
         ));
 
         // Value-level direct linearization enforces the same rule contract before exposing a reusable pushforward.
-        let result = EagerContext::<Scalar, ScalarOperation<Scalar>>::new().linearize(
+        let result = EagerContext::<Array, ArrayOperation<Array>>::new().linearize(
             |input| {
                 let mut outputs = input.context().bind(operation, operation_regions(), &[input.clone()])?;
                 Ok(outputs.remove(0))
             },
-            Scalar::from(2.0),
+            Array::scalar(2.0),
         );
         assert!(matches!(
             result,
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message))) if message == expected,
         ));
-    }
-
-    #[test]
-    fn test_scalar_custom_jvp_governs_forward_mode() {
-        let (primal, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .jvp(
-                |x| {
-                    let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
-                    let operation_regions = vec![scalar_sin_program(), scalar_doubled_sin_jvp_program()];
-                    Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
-                },
-                Scalar::from(2.0),
-                Scalar::from(1.0),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(primal, 2.0f64.sin(), epsilon = 1e-9);
-        // The custom rule doubles the true derivative, proving it is in control.
-        assert_abs_diff_eq!(tangent, 2.0 * 2.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1769,24 +1707,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_custom_vjp_governs_reverse_mode() {
-        let (value, gradient) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .value_and_gradient(
-                |x| {
-                    let operation = ScalarOperation::CustomVjp(CustomVjpOperation::new());
-                    let operation_regions =
-                        vec![scalar_sin_program(), scalar_sin_forward_program(), scalar_tripled_sin_backward_program()];
-                    x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
-                },
-                Scalar::from(2.0),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
-        // The custom backward rule triples the true gradient, proving it is in control.
-        assert_abs_diff_eq!(gradient, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
-    }
-
-    #[test]
     fn test_custom_jvp_wrapper_traces_closures_lazily() {
         // No manual programs: the wrapper traces the closures at the call site, specialized to the input types.
         let function = custom_jvp(
@@ -1996,41 +1916,27 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_custom_vjp_wrapper_governs_reverse_mode() {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let function = custom_vjp(
-            |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.sin()?),
-            |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok((x.sin()?, x.cos()?)),
-            |residual, cotangent| {
-                let product = residual * cotangent;
-                Ok(product.clone() + product.clone() + product)
-            },
-        );
-        let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
-        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
-    }
-
-    #[test]
     fn test_custom_derivative_wrappers_use_zero_space_boundaries() {
-        type ScalarContext = EagerContext<Scalar, ScalarOperation<Scalar>>;
+        type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
 
         let function = custom_jvp(
-            |token: DomainTracer<ScalarContext>| Ok(token),
-            |token: DomainTracer<ScalarContext>, tangent| Ok((token, tangent)),
+            |token: DomainTracer<ArrayContext>| Ok(token),
+            |token: DomainTracer<ArrayContext>, tangent| Ok((token, tangent)),
         );
         assert_eq!(
-            ScalarContext::new().jvp(|token| function.call(token), Scalar::Token, Scalar::Zero),
-            Ok((Scalar::Token, Scalar::Zero)),
+            ArrayContext::new().jvp(|token| function.call(token), token.clone(), zero.clone()),
+            Ok((token.clone(), zero.clone())),
         );
 
         let function = custom_vjp(
-            |token: DomainTracer<ScalarContext>| Ok(token),
-            |token: DomainTracer<ScalarContext>| Ok((token.clone(), token)),
-            |_residual: DomainTracer<ScalarContext>, cotangent| Ok(cotangent),
+            |token: DomainTracer<ArrayContext>| Ok(token),
+            |token: DomainTracer<ArrayContext>| Ok((token.clone(), token)),
+            |_residual: DomainTracer<ArrayContext>, cotangent| Ok(cotangent),
         );
-        let (value, pullback) = ScalarContext::new().vjp(|token| function.call(token), Scalar::Token).unwrap();
-        assert_eq!(value, Scalar::Token);
-        assert_eq!(pullback.apply(Scalar::Zero), Ok(Scalar::Zero));
+        let (value, pullback) = ArrayContext::new().vjp(|token| function.call(token), token.clone()).unwrap();
+        assert_eq!(value, token);
+        assert_eq!(pullback.apply(zero.clone()), Ok(zero));
     }
 }

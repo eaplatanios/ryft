@@ -2147,7 +2147,6 @@ mod tests {
     use std::rc::Rc;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -2602,15 +2601,15 @@ mod tests {
 
     #[test]
     fn test_tag_is_transparent_to_differentiation() {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (primal, tangent) =
-            domain.jvp(|x| Ok((x.clone() * x).tag("square")), Scalar::from(2.0), Scalar::from(1.0)).unwrap();
-        assert_eq!(primal, 4.0);
-        assert_eq!(tangent, 4.0);
+            domain.jvp(|x| Ok((x.clone() * x).tag("square")), Array::scalar(2.0), Array::scalar(1.0)).unwrap();
+        assert_eq!(primal, Array::scalar(4.0));
+        assert_eq!(tangent, Array::scalar(4.0));
         let (value, gradient) =
-            domain.value_and_gradient(|x| (x.clone() * x).tag("square"), Scalar::from(3.0)).unwrap();
-        assert_eq!(value, 9.0);
-        assert_eq!(gradient, 6.0);
+            domain.value_and_gradient(|x| (x.clone() * x).tag("square"), Array::scalar(3.0)).unwrap();
+        assert_eq!(value, Array::scalar(9.0));
+        assert_eq!(gradient, Array::scalar(6.0));
     }
 
     #[test]
@@ -2649,25 +2648,6 @@ mod tests {
         check(SaveAnyNamesButThese::new(["other"]), 3, &input, &expected_gradient);
         check(SaveAnythingExceptTheseNames::new(["u"]), 4, &input, &expected_gradient);
         check(SaveAnythingExceptTheseNames::new(["other"]), 5, &input, &expected_gradient);
-    }
-
-    #[test]
-    fn test_scalar_rematerialization_matches_the_unrematerialized_gradient() {
-        // The unconstrained save-all and recompute-all policies work for the scalar domain, whose operation family
-        // has no dot or scan variants: no scan- or dot-related bounds appear anywhere in this test.
-        fn check(policy: impl RematerializationPolicy<DataType, ScalarOperation<Scalar>>) {
-            let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-            let function = rematerialize::<EagerContext<Scalar, ScalarOperation<Scalar>>, _, _, _>(
-                |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok((x.clone() * x).sin()?),
-            )
-            .with_policy(policy);
-            let (value, gradient) =
-                domain.value_and_gradient(|x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
-            assert_abs_diff_eq!(value, 4.0f64.sin(), epsilon = 1e-9);
-            assert_abs_diff_eq!(gradient, 4.0f64.cos() * 4.0, epsilon = 1e-9);
-        }
-        check(NothingSaveable);
-        check(EverythingSaveable);
     }
 
     #[test]
@@ -2905,21 +2885,21 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_scalar_rematerialization_matches_the_unrematerialized_gradient() {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let inner = rematerialize::<EagerContext<Scalar, ScalarOperation<Scalar>>, _, _, _>(
-            |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok((x.clone() * x).sin()?),
+    fn test_nested_rank_zero_rematerialization_matches_the_unrematerialized_gradient() {
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let inner = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let outer = rematerialize::<EagerContext<Scalar, ScalarOperation<Scalar>>, _, _, _>(
-            |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| {
+        let outer = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let y = inner.call(x.clone())?;
                 Ok(y * x)
             },
         );
         // f(x) = sin(x²) x, so f'(x) = sin(x²) + 2 x² cos(x²).
-        let (value, gradient) = domain.value_and_gradient(|x| outer.call(x).unwrap(), Scalar::from(0.7)).unwrap();
-        assert_abs_diff_eq!(value, 0.49f64.sin() * 0.7, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, 0.49f64.sin() + 2.0 * 0.49 * 0.49f64.cos(), epsilon = 1e-9);
+        let (value, gradient) = domain.value_and_gradient(|x| outer.call(x).unwrap(), Array::scalar(0.7)).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 0.49f64.sin() * 0.7, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 0.49f64.sin() + 2.0 * 0.49 * 0.49f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -3235,14 +3215,12 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_second_order_through_rematerialization_matches_the_analytic_second_derivative() {
-        use crate::backends::scalars::ScalarOperation;
-
-        // The scalar counterpart of the test above, composed through nested transforms: the outer reverse pass
-        // differentiates a closure that takes the rematerialized gradient on its nested tracing context.
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let function = rematerialize::<EagerContext<Scalar, ScalarOperation<Scalar>>, _, _, _>(
-            |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok((x.clone() * x).sin()?),
+    fn test_rank_zero_second_order_through_rematerialization_matches_the_analytic_second_derivative() {
+        // This composes through nested reverse transforms: the outer reverse pass differentiates a closure that takes
+        // the rematerialized gradient on its nested tracing context.
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
         let (gradient, second_derivative) = domain
             .value_and_gradient(
@@ -3250,12 +3228,16 @@ mod tests {
                     let context = x.context().clone();
                     context.gradient(|y| function.call(y).unwrap(), x).unwrap()
                 },
-                Scalar::from(0.7),
+                Array::scalar(0.7),
             )
             .unwrap();
         let x: f64 = 0.7;
-        assert_abs_diff_eq!(gradient, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(second_derivative, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            second_derivative.to_f64s()[0],
+            2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(),
+            epsilon = 1e-9,
+        );
     }
 
     #[test]

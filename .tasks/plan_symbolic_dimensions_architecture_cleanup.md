@@ -2563,6 +2563,9 @@ Phase 9a4 — retire the scalar program universe:
     - [x] Migrate generic context and tracing fixtures.
     - [x] Migrate partial-evaluation and batching fixtures.
     - [ ] Migrate differentiation, custom-derivative, and rematerialization fixtures.
+      - [x] Migrate elementwise differentiation, custom-derivative, and rematerialization fixtures.
+      - [ ] Migrate forward-mode differentiation fixtures.
+      - [ ] Migrate reverse-mode differentiation fixtures.
   - [ ] Migrate remaining operation-local scalar fixtures or delete coverage already pinned by array tests.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
@@ -4839,3 +4842,15 @@ construction and formatting. It removes every retired scalar identifier from `pa
 the core residual audit falls from 289 matches across 57 files to 260 matches across 56 files. All seven focused partial
 evaluation tests and the complete 1,158-test core library suite pass. Differentiation, custom derivatives, and
 rematerialization are the next generic-transform fixture unit.
+
+The first differentiation slice migrates the generic elementwise rule fixtures and every custom-derivative and
+rematerialization fixture to arrays. Rank-zero array tests now cover elementwise tangent/cotangent alignment,
+zero-tangent propagation, zero-space outputs, custom-JVP affine-tangent rejection, token/zero boundaries, tagged
+rematerialization, nested rematerialization, and nested second-order reverse mode. Four scalar-only tests—three repeated
+custom-derivative cases and one unconstrained-policy rematerialization repetition—were deleted because existing array
+tests pin the same behavior more completely.
+
+This review unit changes 387 lines across three test modules with 109 net deletions. It removes all retired scalar
+identifiers from the three modules and reduces the core residual audit from 260 matches across 56 files to 227 matches
+across 53 files. All 77 focused tests and the complete 1,154-test core library suite pass. Forward-mode and reverse-mode
+differentiation fixtures remain as separate review-sized substeps.
