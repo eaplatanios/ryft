@@ -84,7 +84,7 @@ pub(crate) mod tests {
     use crate::programs::regions::{RegionDriver, RegionInterface, RegionRef, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::programs::values::Value;
-    use crate::types::DataType;
+    use crate::types::ArrayType;
 
     /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`](crate::Region) machinery
     /// (i.e., construction, interning and sharing, interface derivation, validation, effects propagation, rendering,
@@ -106,7 +106,7 @@ pub(crate) mod tests {
     }
 
     impl Operation for TestRegionOperation {
-        type Type = DataType;
+        type Type = ArrayType;
 
         fn name(&self) -> &'static str {
             match self {
@@ -125,17 +125,17 @@ pub(crate) mod tests {
 
         fn infer_output_types(
             &self,
-            input_types: &[DataType],
-            region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
+            input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
             match self {
                 Self::Add => {
                     check_count!("input", input_types, 2, TypeError);
-                    Ok(vec![input_types[0]])
+                    Ok(vec![input_types[0].clone()])
                 }
                 Self::Effectful => {
                     check_count!("input", input_types, 1, TypeError);
-                    Ok(vec![input_types[0]])
+                    Ok(vec![input_types[0].clone()])
                 }
                 Self::WithRegions(names) => {
                     check_count!("input", input_types, 1, TypeError);

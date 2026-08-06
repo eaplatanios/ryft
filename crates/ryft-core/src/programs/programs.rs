@@ -2585,15 +2585,15 @@ mod tests {
         // A shared region renders its body once (labeled with its identifier, at its first reference) and later
         // references render as that identifier alone, while a singly referenced region renders nested inline.
         // Regions are labeled with the operation-declared names.
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let shared = builder.import_region(region_program.entry_region_ref());
         let inline = builder.import_region(region_program.entry_region_ref());
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let first = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(
@@ -2610,23 +2610,22 @@ mod tests {
                 vec![first],
             )
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![second], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = with_regions %0 [
+                lambda %0:f64[] .
+                let %1:f64[] = with_regions %0 [
                     first=^0={
-                        lambda %0:f64 .
+                        lambda %0:f64[] .
                         in (%0)
                     },
                     second=^0,
                 ]
-                    %2:f64 = with_regions %1 [
+                    %2:f64[] = with_regions %1 [
                         body={
-                            lambda %0:f64 .
+                            lambda %0:f64[] .
                             in (%0)
                         },
                     ]
@@ -2640,17 +2639,17 @@ mod tests {
     fn test_program_instruction_effects_include_attached_regions() {
         // An instruction whose operation is pure but whose attached region contains an effectful instruction reports
         // impure effects, while a sibling pure instruction stays pure.
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_output = region_builder
             .add_instruction(TestRegionOperation::Effectful, Vec::new(), vec![region_input])
             .unwrap()[0];
         let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![region_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let sealed = builder.import_region(region_program.entry_region_ref());
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let with_regions = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -2660,9 +2659,8 @@ mod tests {
             .unwrap()[0];
         let output = builder.add_instruction(TestRegionOperation::Add, Vec::new(), vec![input, with_regions]).unwrap();
         let output = output[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let entry = program.entry();
         assert_eq!(
             program.instruction_effects(InstructionId::new(entry, 0)).unwrap(),
@@ -2694,23 +2692,23 @@ mod tests {
         // referenced by another dead instruction. Simplification drops the pure dead instruction together with its
         // region, keeps the effectful dead instruction alive (its attached region's effects are observable), and
         // compacts the surviving region identifiers (the effectful region moves from ^1 to ^0).
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut pure_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let pure_input = pure_builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut pure_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let pure_input = pure_builder.add_input(ArrayType::scalar(DataType::F64));
         let pure_program = pure_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![pure_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![pure_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let pure_region = builder.import_region(pure_program.entry_region_ref());
-        let mut effectful_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let effectful_input = effectful_builder.add_input(DataType::F64);
+        let mut effectful_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let effectful_input = effectful_builder.add_input(ArrayType::scalar(DataType::F64));
         let effectful_output = effectful_builder
             .add_instruction(TestRegionOperation::Effectful, Vec::new(), vec![effectful_input])
             .unwrap()[0];
         let effectful_program = effectful_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![effectful_output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![effectful_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let effectful_region = builder.import_region(effectful_program.entry_region_ref());
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -2726,9 +2724,8 @@ mod tests {
             )
             .unwrap();
         let output = builder.add_instruction(TestRegionOperation::Add, Vec::new(), vec![input, input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(program.regions().len(), 3);
         let simplified = program.simplified().unwrap();
         assert_eq!(simplified.regions().len(), 2);

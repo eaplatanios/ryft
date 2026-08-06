@@ -1160,7 +1160,6 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
@@ -1173,7 +1172,7 @@ mod tests {
 
     use super::*;
 
-    type TestProgram = Program<Scalar, TestRegionOperation, Vec<Scalar>, Vec<Scalar>>;
+    type TestProgram = Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>>;
 
     /// Nominal identity used by the structural closure prototype.
     #[derive(Clone, Debug, Parameter)]
@@ -1376,7 +1375,7 @@ mod tests {
     }
 
     /// Builds an identity program with one input and one output of `r#type`.
-    fn identity_program(r#type: DataType) -> TestProgram {
+    fn identity_program(r#type: ArrayType) -> TestProgram {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(r#type);
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -1385,8 +1384,8 @@ mod tests {
     /// Builds a program whose two instructions attach the same nested identity region.
     fn program_with_reused_region() -> TestProgram {
         let mut builder = ProgramBuilder::new();
-        let region = builder.import_program(identity_program(DataType::F64));
-        let input = builder.add_input(DataType::F64);
+        let region = builder.import_program(identity_program(ArrayType::scalar(DataType::F64)));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let first = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
@@ -1407,8 +1406,8 @@ mod tests {
     /// Builds a program whose two distinct root regions share one identity-region descendant.
     fn program_with_shared_descendant() -> SharedDescendantFixture {
         let mut root_builder = ProgramBuilder::new();
-        let descendant = root_builder.import_program(identity_program(DataType::F64));
-        let input = root_builder.add_input(DataType::F64);
+        let descendant = root_builder.import_program(identity_program(ArrayType::scalar(DataType::F64)));
+        let input = root_builder.add_input(ArrayType::scalar(DataType::F64));
         let output = root_builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("nested")] }),
@@ -1420,14 +1419,14 @@ mod tests {
         let mut root_region = root_program.entry_region().clone();
 
         let mut builder = ProgramBuilder::new();
-        let shared_descendant = builder.import_program(identity_program(DataType::F64));
+        let shared_descendant = builder.import_program(identity_program(ArrayType::scalar(DataType::F64)));
         root_region.instructions[0].regions[0] = shared_descendant;
         let first_root = RegionId::new(builder.regions.len());
         builder.regions.push(root_region.clone()).unwrap();
         let second_root = RegionId::new(builder.regions.len());
         builder.regions.push(root_region).unwrap();
 
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(
@@ -1602,29 +1601,29 @@ mod tests {
         assert_eq!(region.arena().len(), program.regions().len());
         assert_eq!(region.atoms().len(), program.atoms().len());
         assert_eq!(region.input_ids(), program.input_ids());
-        assert_eq!(region.input_types(), vec![DataType::F64]);
+        assert_eq!(region.input_types(), vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(region.output_ids(), program.output_ids());
-        assert_eq!(region.output_types(), vec![DataType::F64]);
+        assert_eq!(region.output_types(), vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(region.instructions().len(), 2);
         let interface = region.interface();
-        assert_eq!(interface.input_types(), &[DataType::F64]);
-        assert_eq!(interface.output_types(), &[DataType::F64]);
+        assert_eq!(interface.input_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(interface.output_types(), &[ArrayType::scalar(DataType::F64)]);
         assert_eq!(interface.effects(), Effects::PURE);
     }
 
     #[test]
     fn test_region_arena_retains_derived_metadata() {
-        let mut body_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let body_input = body_builder.add_input(DataType::F64);
+        let mut body_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let body_input = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let body_output =
             body_builder.add_instruction(TestRegionOperation::Effectful, Vec::new(), vec![body_input]).unwrap()[0];
         let body = body_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![body_output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let body = builder.import_program(body);
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
@@ -1632,14 +1631,13 @@ mod tests {
                 vec![input],
             )
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let arena = program.regions();
         assert_eq!(arena.len(), 2);
         assert_eq!(arena.iter().count(), 2);
-        assert_eq!(arena[body.index()].input_types(), vec![DataType::F64]);
+        assert_eq!(arena[body.index()].input_types(), vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(program.region_ref(body).unwrap().effects(), Effects::single(Effect::OrderedIo));
         assert_eq!(program.entry_region_ref().effects(), Effects::single(Effect::OrderedIo));
         assert!(std::ptr::eq(
@@ -1651,8 +1649,8 @@ mod tests {
     #[test]
     fn test_region_arena_rejects_unsealed_region_reference() {
         let atom = AtomId::new(0);
-        let region: Region<Scalar, TestRegionOperation> = Region {
-            atoms: vec![Atom::Variable(DataType::F64)],
+        let region: Region<Array, TestRegionOperation> = Region {
+            atoms: vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
             input_ids: vec![atom],
             output_ids: vec![atom],
             instructions: vec![Instruction::new(
@@ -1677,8 +1675,8 @@ mod tests {
         let nested = entry.with_id(nested_id).unwrap();
         assert_eq!(nested.id(), nested_id);
         assert!(std::ptr::eq(nested.arena(), entry.arena()));
-        assert_eq!(nested.input_types(), vec![DataType::F64]);
-        assert_eq!(nested.output_types(), vec![DataType::F64]);
+        assert_eq!(nested.input_types(), vec![ArrayType::scalar(DataType::F64)]);
+        assert_eq!(nested.output_types(), vec![ArrayType::scalar(DataType::F64)]);
         assert!(matches!(
             entry.with_id(RegionId::new(42)),
             Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
@@ -1687,7 +1685,7 @@ mod tests {
 
     #[test]
     fn test_region_ref_rejects_out_of_range_id() {
-        let program = identity_program(DataType::F64);
+        let program = identity_program(ArrayType::scalar(DataType::F64));
         assert!(matches!(
             RegionRef::new(program.regions(), RegionId::new(42)),
             Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
@@ -1700,8 +1698,8 @@ mod tests {
         let materialized = program.entry_region_ref().to_program();
         assert_eq!(materialized.regions().len(), 2);
         assert_eq!(materialized.instructions()[0].regions(), materialized.instructions()[1].regions());
-        assert_eq!(materialized.input_types(), vec![DataType::F64]);
-        assert_eq!(materialized.output_types(), vec![DataType::F64]);
+        assert_eq!(materialized.input_types(), vec![ArrayType::scalar(DataType::F64)]);
+        assert_eq!(materialized.output_types(), vec![ArrayType::scalar(DataType::F64)]);
     }
 
     #[test]
@@ -1710,10 +1708,11 @@ mod tests {
         let empty_driver: [TestProgram; 0] = [];
         assert_eq!(empty_driver.import_into(&empty_builder, &[]), Ok(Vec::new()));
         assert!(empty_builder.borrow().regions.is_empty());
-        let array_driver = [identity_program(DataType::F32), identity_program(DataType::F64)];
+        let array_driver =
+            [identity_program(ArrayType::scalar(DataType::F32)), identity_program(ArrayType::scalar(DataType::F64))];
         assert_eq!(
-            array_driver.regions().map(|region| region.input_types()[0]).collect::<Vec<_>>(),
-            vec![DataType::F32, DataType::F64],
+            array_driver.regions().map(|region| region.input_types()[0].clone()).collect::<Vec<_>>(),
+            vec![ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
         );
         let array_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         assert_eq!(
@@ -1722,10 +1721,13 @@ mod tests {
         );
         assert_eq!(array_builder.borrow().regions.len(), 2);
 
-        let vector_driver = vec![identity_program(DataType::F64), identity_program(DataType::F32)];
+        let vector_driver = vec![
+            identity_program(ArrayType::scalar(DataType::F64)),
+            identity_program(ArrayType::scalar(DataType::F32)),
+        ];
         assert_eq!(
-            vector_driver.regions().map(|region| region.input_types()[0]).collect::<Vec<_>>(),
-            vec![DataType::F64, DataType::F32],
+            vector_driver.regions().map(|region| region.input_types()[0].clone()).collect::<Vec<_>>(),
+            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F32)],
         );
         let vector_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         assert_eq!(
@@ -1737,12 +1739,12 @@ mod tests {
 
     #[test]
     fn test_callee_region_driver() {
-        let callee = Rc::new(identity_program(DataType::F64));
+        let callee = Rc::new(identity_program(ArrayType::scalar(DataType::F64)));
         let callees = [Rc::clone(&callee), callee];
         let driver = CalleeRegionDriver::new(&callees);
         assert_eq!(
-            driver.regions().map(|region| region.input_types()[0]).collect::<Vec<_>>(),
-            vec![DataType::F64, DataType::F64],
+            driver.regions().map(|region| region.input_types()[0].clone()).collect::<Vec<_>>(),
+            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         assert_eq!(driver.import_into(&builder, &[None, None]), Ok(vec![RegionId::new(0), RegionId::new(0)]));
@@ -1760,7 +1762,7 @@ mod tests {
 
     #[test]
     fn test_replay_region_driver_rejects_out_of_range_root() {
-        let program = identity_program(DataType::F64);
+        let program = identity_program(ArrayType::scalar(DataType::F64));
         let mappings = RegionReplayMappings::new();
         let roots = [RegionId::new(42)];
         assert!(matches!(
@@ -1870,7 +1872,7 @@ mod tests {
         let mappings = RegionReplayMappings::new();
         let first_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         let second_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
-        second_destination.borrow_mut().import_program(identity_program(DataType::F32));
+        second_destination.borrow_mut().import_program(identity_program(ArrayType::scalar(DataType::F32)));
         let roots = [first_root];
         let first_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
         assert_eq!(first_driver.import_into(&first_destination, &[None]), Ok(vec![RegionId::new(1)]));

@@ -169,8 +169,8 @@ impl<V: Typed> Typed for Atom<V> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
-    use crate::types::DataType;
+    use crate::backends::arrays::Array;
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
@@ -181,16 +181,16 @@ mod tests {
 
     #[test]
     fn test_atom() {
-        let constant = Atom::<Scalar>::Constant(Scalar::from(3.0));
-        let variable = Atom::<Scalar>::Variable(DataType::F64);
+        let constant = Atom::<Array>::Constant(Array::scalar(3.0));
+        let variable = Atom::<Array>::Variable(ArrayType::scalar(DataType::F64));
 
         assert!(constant.is_constant());
         assert!(!constant.is_variable());
-        assert_eq!(constant.as_constant(), Some(&Scalar::from(3.0)));
-        assert_eq!(constant.r#type().into_owned(), DataType::F64);
+        assert_eq!(constant.as_constant(), Some(&Array::scalar(3.0)));
+        assert_eq!(constant.r#type().into_owned(), ArrayType::scalar(DataType::F64));
 
         assert!(variable.is_variable());
         assert_eq!(variable.as_constant(), None);
-        assert_eq!(variable.r#type().into_owned(), DataType::F64);
+        assert_eq!(variable.r#type().into_owned(), ArrayType::scalar(DataType::F64));
     }
 }

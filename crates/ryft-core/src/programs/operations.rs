@@ -115,7 +115,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// # Deriving Operation Enums
 ///
 /// Ryft provides a `#[derive(Operation)]` procedural macro via the `ryft-macros` crate for [`Operation`] sum types.
-/// It is meant for enums such as [`ScalarOperation`](crate::ScalarOperation), where every variant wraps one concrete
+/// It is meant for enums such as [`ArrayOperation`](crate::ArrayOperation), where every variant wraps one concrete
 /// operation payload and the enum should behave exactly like whichever payload it contains. Operation-specific
 /// semantics always live on the payload implementations, so the derived enum is only an adapter and a dispatcher.
 /// The sections below are the canonical reference for the derivation macro, including information on the enum-level
@@ -345,17 +345,16 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// ```rust
 /// # use ryft_core as ryft;
-/// # use ryft_core::{ConstantOperation, DataType, Operation, Value, ZeroOperation};
-/// # use ryft_core::backends::scalars::Scalar;
+/// # use ryft_core::{Array, ArrayType, ConstantOperation, DataType, Operation, Value, ZeroOperation};
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
-/// enum BackendOperation<V: Value<Type = DataType>> {
-///     Zero(ZeroOperation<DataType>),
+/// enum BackendOperation<V: Value<Type = ArrayType>> {
+///     Zero(ZeroOperation<ArrayType>),
 ///     Constant(ConstantOperation<V>),
 /// }
 ///
-/// let operation = BackendOperation::<Scalar>::from(ZeroOperation::new(DataType::F32));
+/// let operation = BackendOperation::<Array>::from(ZeroOperation::new(ArrayType::scalar(DataType::F32)));
 /// assert_eq!(operation.name(), "zero");
 /// ```
 ///
@@ -820,7 +819,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
+    use crate::backends::arrays::Array;
     use crate::operations::differentiation::StopGradientOperation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
@@ -922,10 +921,10 @@ mod tests {
         );
 
         // Check that program fields are rendered over multiple lines.
-        let mut builder = ProgramBuilder::<Scalar, StopGradientOperation<DataType>>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, StopGradientOperation<ArrayType>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             std::fmt::from_fn(|formatter| {
                 OperationFormatter::new(formatter, 0, "nested")?.bracketed(|operation| {
@@ -939,8 +938,8 @@ mod tests {
                 nested [
                     tag=before,
                     body={
-                        lambda %0:f64 .
-                        let %1:f64 = stop_gradient %0
+                        lambda %0:f64[] .
+                        let %1:f64[] = stop_gradient %0
                         in (%1)
                     },
                     tag=after,

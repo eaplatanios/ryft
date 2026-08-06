@@ -552,7 +552,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
     use crate::programs::TypeError;
@@ -566,29 +566,32 @@ mod tests {
 
     #[test]
     fn test_program_builder() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let i1 = builder.add_input(DataType::F64);
-        let c0 = builder.add_constant(Scalar::from(2.0f64));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(Array::scalar(2.0f64));
         let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
         let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1]).unwrap()[0];
         assert_eq!(builder.input_ids, vec![i0, i1]);
         assert!(matches!(
             builder.atoms.get(i0.index()),
-            Some(Atom::Variable(r#type)) if *r#type == DataType::F64
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
         ));
         assert!(matches!(
             builder.atoms.get(i1.index()),
-            Some(Atom::Variable(r#type)) if *r#type == DataType::F64
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
         ));
-        assert!(matches!(builder.atoms.get(c0.index()), Some(Atom::Constant(value)) if *value == 2.0));
+        assert!(matches!(
+            builder.atoms.get(c0.index()),
+            Some(Atom::Constant(value)) if *value == Array::scalar(2.0)
+        ));
         assert!(matches!(
             builder.atoms.get(v0.index()),
-            Some(Atom::Variable(r#type)) if *r#type == DataType::F64
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
         ));
         assert!(matches!(
             builder.atoms.get(v1.index()),
-            Some(Atom::Variable(r#type)) if *r#type == DataType::F64
+            Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64)
         ));
         assert_eq!(builder.instructions.len(), 2);
         assert_eq!(builder.instructions[0].inputs, vec![i0]);
@@ -596,71 +599,73 @@ mod tests {
         assert_eq!(builder.instructions[1].inputs, vec![v0, i1]);
         assert_eq!(builder.instructions[1].outputs, vec![v1]);
 
-        let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![v1], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
+        let program =
+            builder.build::<(Array, Array), Array>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
         assert_eq!(program.input_ids(), vec![i0, i1]);
         assert_eq!(program.output_ids(), vec![v1]);
         assert_eq!(program.instructions().len(), 2);
-        assert_eq!(program.interpret((Scalar::from(2.0f64), Scalar::from(38.0f64))), Ok(Scalar::from(36.0f64)));
+        assert_eq!(program.interpret((Array::scalar(2.0f64), Array::scalar(38.0f64))), Ok(Array::scalar(36.0f64)));
 
         // `splice_program` appends the program's reachable instructions into a fresh builder, remapping its inputs to
         // the provided builder atoms and returning the builder atoms for its outputs. The program's `2.0` constant is
         // dead (i.e., no instruction consumes it), and so only the two reachable instructions are rebuilt.
-        let mut outer = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let a0 = outer.add_input(DataType::F64);
-        let a1 = outer.add_input(DataType::F64);
+        let mut outer = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a0 = outer.add_input(ArrayType::scalar(DataType::F64));
+        let a1 = outer.add_input(ArrayType::scalar(DataType::F64));
         let outputs = outer.splice_program(&program, &[a0, a1]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outer.instructions.len(), 2);
         let outer_program =
-            outer.build::<(Scalar, Scalar), Scalar>(outputs, (Placeholder, Placeholder), Placeholder).unwrap();
-        assert_eq!(outer_program.interpret((Scalar::from(2.0f64), Scalar::from(38.0f64))), Ok(Scalar::from(36.0f64)));
+            outer.build::<(Array, Array), Array>(outputs, (Placeholder, Placeholder), Placeholder).unwrap();
+        assert_eq!(
+            outer_program.interpret((Array::scalar(2.0f64), Array::scalar(38.0f64))),
+            Ok(Array::scalar(36.0f64))
+        );
     }
 
     #[test]
     fn test_program_builder_rejects_unbound_instruction_inputs() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let v0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![AtomId::new(42), AtomId::new(99)]);
         assert!(matches!(v0, Err(ProgramError::UnboundAtomId { id }) if id == AtomId::new(42)));
     }
 
     #[test]
     fn test_program_builder_build_returns_error() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         builder.error = Some(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
         assert!(matches!(
-            builder.build::<Scalar, Scalar>(Vec::new(), Placeholder, Placeholder),
+            builder.build::<Array, Array>(Vec::new(), Placeholder, Placeholder),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
     }
 
     #[test]
     fn test_program_builder_build_rejects_invalid_input_count() {
-        let builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         assert!(matches!(
-            builder.build::<Scalar, ()>(Vec::new(), Placeholder, ()),
+            builder.build::<Array, ()>(Vec::new(), Placeholder, ()),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
     }
 
     #[test]
     fn test_program_builder_build_rejects_invalid_output_count() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
-            builder.build::<Scalar, Scalar>(Vec::new(), Placeholder, Placeholder),
+            builder.build::<Array, Array>(Vec::new(), Placeholder, Placeholder),
             Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
         ));
     }
 
     #[test]
     fn test_program_builder_build_rejects_malformed_atom_providers() {
-        let mut duplicate_input_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = duplicate_input_builder.add_input(DataType::F64);
+        let mut duplicate_input_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = duplicate_input_builder.add_input(ArrayType::scalar(DataType::F64));
         duplicate_input_builder.input_ids.push(input);
         assert!(matches!(
-            duplicate_input_builder.build::<Vec<Scalar>, Vec<Scalar>>(
+            duplicate_input_builder.build::<Vec<Array>, Vec<Array>>(
                 vec![input],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
@@ -669,16 +674,16 @@ mod tests {
                 if message == format!("program input atom {input} appears more than once")
         ));
 
-        let mut input_output_overlap_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = input_output_overlap_builder.add_input(DataType::F64);
+        let mut input_output_overlap_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = input_output_overlap_builder.add_input(ArrayType::scalar(DataType::F64));
         input_output_overlap_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Neg(NegOperation::new()),
+            ArrayOperation::Neg(NegOperation::new()),
             vec![input],
             vec![input],
             Vec::new(),
         ));
         assert!(matches!(
-            input_output_overlap_builder.build::<Vec<Scalar>, Vec<Scalar>>(
+            input_output_overlap_builder.build::<Vec<Array>, Vec<Array>>(
                 vec![input],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -687,23 +692,23 @@ mod tests {
                 if message == format!("instruction output atom {input} is a program input")
         ));
 
-        let mut duplicate_output_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = duplicate_output_builder.add_input(DataType::F64);
-        let output = duplicate_output_builder.add_variable(DataType::F64);
+        let mut duplicate_output_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = duplicate_output_builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = duplicate_output_builder.add_variable(ArrayType::scalar(DataType::F64));
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Neg(NegOperation::new()),
+            ArrayOperation::Neg(NegOperation::new()),
             vec![input],
             vec![output],
             Vec::new(),
         ));
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Neg(NegOperation::new()),
+            ArrayOperation::Neg(NegOperation::new()),
             vec![input],
             vec![output],
             Vec::new(),
         ));
         assert!(matches!(
-            duplicate_output_builder.build::<Vec<Scalar>, Vec<Scalar>>(
+            duplicate_output_builder.build::<Vec<Array>, Vec<Array>>(
                 vec![output],
                 vec![Placeholder],
                 vec![Placeholder],
@@ -716,14 +721,14 @@ mod tests {
     #[test]
     fn test_program_builder_import_region_and_intern_callee() {
         // A source program with one sealed region attached to its entry instruction.
-        let mut source_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let sealed = source_builder.import_region(region_program.entry_region_ref());
-        let input = source_builder.add_input(DataType::F64);
+        let input = source_builder.add_input(ArrayType::scalar(DataType::F64));
         let output = source_builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -732,11 +737,11 @@ mod tests {
             )
             .unwrap()[0];
         let source = source_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         // Fresh borrowed imports copy the complete closure independently: two imports produce two subtrees.
-        let mut destination = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
         let first = destination.import_region(source.entry_region_ref());
         let second = destination.import_region(source.entry_region_ref());
         assert_ne!(first, second);
@@ -748,7 +753,7 @@ mod tests {
         // but independently built programs remain distinct.
         let flat = Rc::new(source.to_flat_program());
         let equal_but_distinct = Rc::new(flat.as_ref().clone());
-        let mut destination = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
         let first = destination.intern_callee(&flat, None).unwrap();
         let second = destination.intern_callee(&flat, None).unwrap();
         let third = destination.intern_callee(&equal_but_distinct, None).unwrap();
@@ -852,19 +857,19 @@ mod tests {
 
     #[test]
     fn test_program_builder_build_multi_region_program() {
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let doubled = region_builder
             .add_instruction(TestRegionOperation::Add, Vec::new(), vec![region_input, region_input])
             .unwrap()[0];
         let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let sealed = builder.import_region(region_program.entry_region_ref());
         assert_eq!(sealed, RegionId::new(0));
 
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -872,9 +877,8 @@ mod tests {
                 vec![input],
             )
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // The regions arena holds the sealed region plus the entry region, and producers resolve per region.
         assert_eq!(program.regions().len(), 2);
@@ -915,12 +919,12 @@ mod tests {
         let (filtered, live_inputs) = program.filtered(&[input], program.output_ids(), &[]).unwrap();
         assert_eq!(filtered.regions().len(), 2);
         assert_eq!(live_inputs, vec![0]);
-        let mut relocation_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let relocation_input = relocation_builder.add_input(DataType::F64);
+        let mut relocation_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let relocation_input = relocation_builder.add_input(ArrayType::scalar(DataType::F64));
         let relocated_outputs =
             relocation_builder.splice_program(&program.to_flat_program(), &[relocation_input]).unwrap();
         let relocated = relocation_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(relocated_outputs, vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(relocated_outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(relocated.regions().len(), 2);
         let simplified = program.into_simplified().unwrap();
@@ -929,21 +933,21 @@ mod tests {
 
     #[test]
     fn test_program_builder_region_ref_and_import_region() {
-        let mut source_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let sealed = source_builder.import_region(region_program.entry_region_ref());
         let sealed_ref = source_builder.region_ref(sealed).unwrap();
         assert_eq!(sealed_ref.id(), sealed);
-        assert_eq!(sealed_ref.input_types(), vec![DataType::F64]);
+        assert_eq!(sealed_ref.input_types(), vec![ArrayType::scalar(DataType::F64)]);
         assert!(matches!(
             source_builder.region_ref(RegionId::new(7)),
             Err(ProgramError::MalformedProgram(message)) if message == "region ^7 is not part of this builder",
         ));
-        let input = source_builder.add_input(DataType::F64);
+        let input = source_builder.add_input(ArrayType::scalar(DataType::F64));
         let first = source_builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -959,10 +963,10 @@ mod tests {
             )
             .unwrap()[0];
         let source = source_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![second], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut destination = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
         let imported = destination.import_region(source.entry_region_ref());
         let imported_region = destination.region_ref(imported).unwrap().region();
         assert_eq!(imported_region.instructions()[0].regions(), imported_region.instructions()[1].regions());
@@ -971,15 +975,15 @@ mod tests {
 
     #[test]
     fn test_program_builder_import_regions_preserves_sharing() {
-        let mut leaf_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let leaf_input = leaf_builder.add_input(DataType::F64);
+        let mut leaf_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let leaf_input = leaf_builder.add_input(ArrayType::scalar(DataType::F64));
         let leaf = leaf_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![leaf_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![leaf_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut root_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut root_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let nested = root_builder.import_region(leaf.entry_region_ref());
-        let root_input = root_builder.add_input(DataType::F64);
+        let root_input = root_builder.add_input(ArrayType::scalar(DataType::F64));
         let root_output = root_builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -988,17 +992,17 @@ mod tests {
             )
             .unwrap()[0];
         let root = root_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![root_output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![root_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         // Construct two distinct roots in one source arena that both reference the same previously sealed leaf.
-        let mut source_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let shared_leaf = source_builder.import_region(leaf.entry_region_ref());
         let first_root = RegionId::new(source_builder.regions.len());
         source_builder.regions.push(root.entry_region().clone()).unwrap();
         let second_root = RegionId::new(source_builder.regions.len());
         source_builder.regions.push(root.entry_region().clone()).unwrap();
-        let source_input = source_builder.add_input(DataType::F64);
+        let source_input = source_builder.add_input(ArrayType::scalar(DataType::F64));
         let source_output = source_builder
             .add_instruction(
                 TestRegionOperation::WithRegions(
@@ -1009,13 +1013,13 @@ mod tests {
             )
             .unwrap()[0];
         let source = source_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![source_output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![source_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(source.region(first_root).unwrap().instructions()[0].regions(), &[shared_leaf]);
         assert_eq!(source.region(second_root).unwrap().instructions()[0].regions(), &[shared_leaf]);
 
         let roots = [source.region_ref(first_root).unwrap(), source.region_ref(second_root).unwrap()];
-        let mut destination = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
         let imported = destination.import_regions(&roots).unwrap();
         assert_ne!(imported[0], imported[1]);
         assert_eq!(destination.regions.len(), 3);
@@ -1024,18 +1028,18 @@ mod tests {
             destination.regions[imported[1].index()].instructions()[0].regions(),
         );
 
-        let mut duplicate_destination = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut duplicate_destination = ProgramBuilder::<Array, TestRegionOperation>::new();
         let duplicate_roots = [source.region_ref(first_root).unwrap(), source.region_ref(first_root).unwrap()];
         let imported = duplicate_destination.import_regions(&duplicate_roots).unwrap();
         assert_eq!(imported[0], imported[1]);
         assert_eq!(duplicate_destination.regions.len(), 2);
 
-        let mut other_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let other_input = other_builder.add_input(DataType::F64);
+        let mut other_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let other_input = other_builder.add_input(ArrayType::scalar(DataType::F64));
         let other = other_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![other_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![other_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut mixed_destination = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut mixed_destination = ProgramBuilder::<Array, TestRegionOperation>::new();
         assert!(matches!(
             mixed_destination.import_regions(&[source.entry_region_ref(), other.entry_region_ref()]),
             Err(ProgramError::MalformedProgram(message))
@@ -1047,14 +1051,14 @@ mod tests {
     #[test]
     fn test_program_builder_build_shares_region_across_instructions() {
         // Sharing is legal: several instructions (and several slots of one instruction) may reference one region.
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let sealed = builder.import_region(region_program.entry_region_ref());
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let first = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(
@@ -1071,9 +1075,8 @@ mod tests {
                 vec![first],
             )
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![second], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(program.regions().len(), 2);
         assert_eq!(program.instructions()[0].regions(), &[sealed, sealed]);
         assert_eq!(program.instructions()[1].regions(), &[sealed]);
@@ -1084,14 +1087,14 @@ mod tests {
         // The region-carrying operation's output types are its first region interface's output types, so an entry
         // input type that differs from the region output type pins that the builder derived and delivered the
         // interface (rather than the inference falling back to the operation inputs).
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::I64);
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::I64));
         let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let sealed = builder.import_region(region_program.entry_region_ref());
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -1099,20 +1102,20 @@ mod tests {
                 vec![input],
             )
             .unwrap()[0];
-        assert_eq!(builder.atoms()[output.index()].r#type().into_owned(), DataType::I64);
+        assert_eq!(builder.atoms()[output.index()].r#type().into_owned(), ArrayType::scalar(DataType::I64));
     }
 
     #[test]
     fn test_program_builder_splice_program_preserves_region_sharing() {
-        let mut leaf_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let leaf_input = leaf_builder.add_input(DataType::F64);
+        let mut leaf_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let leaf_input = leaf_builder.add_input(ArrayType::scalar(DataType::F64));
         let leaf = leaf_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![leaf_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![leaf_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut root_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut root_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let nested = root_builder.import_region(leaf.entry_region_ref());
-        let root_input = root_builder.add_input(DataType::F64);
+        let root_input = root_builder.add_input(ArrayType::scalar(DataType::F64));
         let root_output = root_builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -1121,18 +1124,18 @@ mod tests {
             )
             .unwrap()[0];
         let root = root_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![root_output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![root_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         // Two distinct attached roots share one nested leaf, and both entry instructions reuse those same roots.
         // Splicing must preserve both levels of sharing through one source-to-destination remapping.
-        let mut source_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let shared_leaf = source_builder.import_region(leaf.entry_region_ref());
         let first_root = RegionId::new(source_builder.regions.len());
         source_builder.regions.push(root.entry_region().clone()).unwrap();
         let second_root = RegionId::new(source_builder.regions.len());
         source_builder.regions.push(root.entry_region().clone()).unwrap();
-        let source_input = source_builder.add_input(DataType::F64);
+        let source_input = source_builder.add_input(ArrayType::scalar(DataType::F64));
         let first_output = source_builder
             .add_instruction(
                 TestRegionOperation::WithRegions(
@@ -1152,17 +1155,16 @@ mod tests {
             )
             .unwrap()[0];
         let source = source_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![source_output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![source_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(source.region(first_root).unwrap().instructions()[0].regions(), &[shared_leaf]);
         assert_eq!(source.region(second_root).unwrap().instructions()[0].regions(), &[shared_leaf]);
 
-        let mut destination = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let destination_input = destination.add_input(DataType::F64);
+        let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let destination_input = destination.add_input(ArrayType::scalar(DataType::F64));
         let outputs = destination.splice_program(&source.to_flat_program(), &[destination_input]).unwrap();
-        let relocated = destination
-            .build::<Vec<Scalar>, Vec<Scalar>>(outputs, vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let relocated =
+            destination.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(relocated.regions().len(), 4);
         let relocated_instructions = relocated.instructions();
         assert_eq!(relocated_instructions[0].regions(), relocated_instructions[1].regions());
@@ -1178,8 +1180,8 @@ mod tests {
     fn test_program_builder_build_rejects_malformed_regions() {
         // Instruction regions must reference previously sealed regions (which keeps the graph acyclic by
         // construction). The checked instruction path rejects at insertion time and the unchecked path at build time.
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
             builder.add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -1189,7 +1191,7 @@ mod tests {
             Err(ProgramError::MalformedProgram(message))
                 if message == "instruction references region ^3 which has not been sealed yet",
         ));
-        let output = builder.add_variable(DataType::F64);
+        let output = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.add_instruction_unchecked(Instruction::new(
             TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
             vec![input],
@@ -1197,27 +1199,27 @@ mod tests {
             vec![RegionId::new(3)],
         ));
         assert!(matches!(
-            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder]),
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]),
             Err(ProgramError::MalformedProgram(message))
                 if message == "instruction references region ^3 which has not been sealed yet",
         ));
 
         // The attached-region count must match the operation's declared slot count. The checked instruction path
         // rejects at insertion time and the unchecked path at build time.
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let sealed = builder.import_region(region_program.entry_region_ref());
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
             builder.add_instruction(TestRegionOperation::Add, vec![sealed], vec![input, input]),
             Err(ProgramError::MalformedProgram(message))
                 if message == "operation `add` declares 0 region slots but 1 regions were attached",
         ));
-        let output = builder.add_variable(DataType::F64);
+        let output = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.add_instruction_unchecked(Instruction::new(
             TestRegionOperation::Add,
             vec![input, input],
@@ -1225,22 +1227,22 @@ mod tests {
             vec![sealed],
         ));
         assert!(matches!(
-            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder]),
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]),
             Err(ProgramError::MalformedProgram(message))
                 if message == "operation `add` declares 0 region slots but 1 regions were attached",
         ));
 
         // Every sealed region must be reachable from the entry root.
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         builder.import_region(region_program.entry_region_ref());
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
-            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![input], vec![Placeholder], vec![Placeholder]),
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]),
             Err(ProgramError::MalformedProgram(message))
                 if message == "region ^0 is not reachable from the program entry region",
         ));

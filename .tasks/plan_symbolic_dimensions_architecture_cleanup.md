@@ -2555,6 +2555,12 @@ Phase 9a4 — retire the scalar program universe:
 
 - [ ] Migrate useful `DataType`-universe transform tests to rank-zero arrays. Use a narrow test-only fixture only where
       a test genuinely verifies universe-neutral machinery and an array would obscure that contract.
+  - [x] Migrate the foundational atom, builder, operation-formatting, program, region-graph, capture-region, and
+        interpretation-replay fixtures. Make the shared test-only region operation use `ArrayType` so its complete
+        consumer graph uses rank-zero arrays without introducing another test value universe.
+  - [ ] Migrate the generic context, tracing, partial-evaluation, batching, differentiation, custom-derivative, and
+        rematerialization fixtures.
+  - [ ] Migrate remaining operation-local scalar fixtures or delete coverage already pinned by array tests.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
       exports, scalar-only doctests, and the obsolete scalar-domain compile-fail fixture.
@@ -4793,3 +4799,16 @@ Phase 9a4 slice removes 85 net lines and leaves no `@scalar` or `@array` gradien
 the complex absolute-value differentiation tests, and the error-function differentiation test pass. The complete
 1,158-test core library suite and all 54 runnable doctests (16 intentional ignores) also pass. The reusable generic-
 transform test migration remains the next Phase 9a4 unit.
+
+The next migration slice moves the foundational program machinery to rank-zero arrays. `TestRegionOperation`, which
+exists solely to isolate generic attached-region behavior, now operates on `ArrayType`; this moves its complete
+builder, region-graph, capture-region, and interpretation-replay consumer graph to `Array` without creating a renamed
+scalar test value. Atom and operation-formatting doctest coverage also use arrays, and the entire `programs::builders`
+test module now exercises both construction and eager interpretation through `ArrayOperation<Array>`. Expected
+program renderings change only by making the rank-zero shape explicit (`f64[]`).
+
+This review unit changes 516 lines across eight source files with four net deletions. It removes every retired scalar
+identifier from `programs::{atoms,builders,operations,regions}` and reduces the core residual audit from 408 matches
+across 63 files to 365 matches across 59 files. All 121 program-layer tests, the five directly affected capture and
+interpretation tests, the complete 1,158-test core library suite, and all 54 runnable doctests (16 intentional ignores)
+pass. Generic transform and operation-local fixture migration remain open in the checklist above.

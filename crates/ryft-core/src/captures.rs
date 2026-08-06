@@ -687,18 +687,18 @@ mod tests {
         // Captures referenced only inside an attached region survive pruning, and reference indices rewrite in every
         // region. Capture #0 is unused (dropped), #1 is referenced only by the nested region (kept, becomes #0), and
         // #2 is referenced only by the entry region (kept, becomes #1).
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
-        let nested_capture = region_builder.add_constant(CaptureReference::new(1, DataType::F64));
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<CaptureReference<ArrayType>, TestRegionOperation>::new();
+        let nested_capture = region_builder.add_constant(CaptureReference::new(1, ArrayType::scalar(DataType::F64)));
         let region_program = region_builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![nested_capture],
                 Vec::<Placeholder>::new(),
                 vec![Placeholder],
             )
             .unwrap();
         let sealed = builder.import_region(region_program.entry_region_ref());
-        let entry_capture = builder.add_constant(CaptureReference::new(2, DataType::F64));
+        let entry_capture = builder.add_constant(CaptureReference::new(2, ArrayType::scalar(DataType::F64)));
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -707,16 +707,16 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![output],
                 Vec::<Placeholder>::new(),
                 vec![Placeholder],
             )
             .unwrap();
         let program =
-            ClosedProgram::new(program, vec![Scalar::from(1.0), Scalar::from(2.0), Scalar::from(3.0)]).unwrap();
+            ClosedProgram::new(program, vec![Array::scalar(1.0), Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
         let pruned = program.without_unused_captures().unwrap();
-        assert_eq!(pruned.captures(), &[Scalar::from(2.0), Scalar::from(3.0)]);
+        assert_eq!(pruned.captures(), &[Array::scalar(2.0), Array::scalar(3.0)]);
         let nested_indices = pruned.program().regions()[0]
             .atoms()
             .iter()
@@ -792,18 +792,18 @@ mod tests {
     fn test_closed_program_to_program_with_lifted_captures_with_attached_regions() {
         // Lifting supports capture-free attached regions (imported verbatim ahead of the entry replay) and rejects
         // nested-region capture references until region boundaries can thread them.
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<CaptureReference<ArrayType>, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_program = region_builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![region_input],
                 vec![Placeholder],
                 vec![Placeholder],
             )
             .unwrap();
         let sealed = builder.import_region(region_program.entry_region_ref());
-        let entry_capture = builder.add_constant(CaptureReference::new(0, DataType::F64));
+        let entry_capture = builder.add_constant(CaptureReference::new(0, ArrayType::scalar(DataType::F64)));
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -812,13 +812,13 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![output],
                 Vec::<Placeholder>::new(),
                 vec![Placeholder],
             )
             .unwrap();
-        let program = ClosedProgram::new(program, vec![Scalar::from(1.0)]).unwrap();
+        let program = ClosedProgram::new(program, vec![Array::scalar(1.0)]).unwrap();
         let lifted = program.to_program_with_lifted_captures().unwrap();
         assert_eq!(lifted.regions().len(), 2);
         assert_eq!(lifted.input_ids().len(), 1);
@@ -826,18 +826,18 @@ mod tests {
 
         // A nested region that references a capture keeps that reference for backends that resolve nested constants
         // against the lifted capture prefix while lowering attached regions.
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
-        let nested_capture = region_builder.add_constant(CaptureReference::new(0, DataType::F64));
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<CaptureReference<ArrayType>, TestRegionOperation>::new();
+        let nested_capture = region_builder.add_constant(CaptureReference::new(0, ArrayType::scalar(DataType::F64)));
         let region_program = region_builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![nested_capture],
                 Vec::<Placeholder>::new(),
                 vec![Placeholder],
             )
             .unwrap();
         let sealed = builder.import_region(region_program.entry_region_ref());
-        let entry_input = builder.add_input(DataType::F64);
+        let entry_input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -846,13 +846,13 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![output],
                 vec![Placeholder],
                 vec![Placeholder],
             )
             .unwrap();
-        let program = ClosedProgram::new(program, vec![Scalar::from(1.0)]).unwrap();
+        let program = ClosedProgram::new(program, vec![Array::scalar(1.0)]).unwrap();
         let lifted = program.to_program_with_lifted_captures().unwrap();
         assert_eq!(lifted.input_ids().len(), 2);
         assert_eq!(lifted.instructions()[0].regions(), &[RegionId::new(0)]);

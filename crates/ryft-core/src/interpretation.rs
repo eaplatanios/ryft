@@ -695,14 +695,14 @@ mod tests {
 
     #[test]
     fn test_program_interpret_in_context_preserves_replayed_region_sharing() {
-        let mut nested_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let nested_input = nested_builder.add_input(DataType::F64);
+        let mut nested_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let nested_input = nested_builder.add_input(ArrayType::scalar(DataType::F64));
         let nested = nested_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![nested_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![nested_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut source_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let shared = source_builder.import_program(nested);
-        let source_input = source_builder.add_input(DataType::F64);
+        let source_input = source_builder.add_input(ArrayType::scalar(DataType::F64));
         let first = source_builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
@@ -718,20 +718,16 @@ mod tests {
             )
             .unwrap()[0];
         let source = source_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![second], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let context = TracingContext::<Scalar, TestRegionOperation>::new();
-        let input = context.input(DataType::F64);
+        let context = TracingContext::<Array, TestRegionOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F64));
         let outputs = source.interpret_in_context(&context, vec![input]).unwrap();
         let destination = context
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<Scalar>, Vec<Scalar>>(
-                vec![outputs[0].atom_id().unwrap()],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[0].atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(destination.regions().len(), 2);
         assert_eq!(destination.instructions().len(), 2);
