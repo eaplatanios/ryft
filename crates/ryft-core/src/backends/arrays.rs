@@ -37,7 +37,7 @@ use crate::arrays::{
     f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
 use crate::axes::{Axis, AxisIndexOperation};
-use crate::backends::scalars::{Scalar, erf_f64};
+use crate::backends::scalars::erf_f64;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::differentiation::LinearCallOperation;
@@ -54,7 +54,7 @@ use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
 };
 use crate::operations::constants::{
-    ConstantOperation, Fill, IOTA_OPERATION_NAME, IotaOperation, One, OneLike, OneLikeOperation, OneOperation, Zero,
+    ConstantOperation, IOTA_OPERATION_NAME, IotaOperation, One, OneLike, OneLikeOperation, OneOperation, Zero,
     ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
@@ -2308,151 +2308,6 @@ impl Array {
         })
     }
 
-    /// Returns the zero [`Scalar`] of the provided element data type, used by kernels that need a payload identity
-    /// element (e.g., dot-product accumulators and dropped gather results).
-    fn zero_element(data_type: DataType) -> Result<Scalar, ProgramError> {
-        EagerContext::<Scalar>::new().zero(&data_type)
-    }
-
-    /// Decodes the physical payload into the temporary scalar representation used by kernels that have not yet moved
-    /// to direct typed-byte dispatch. Phase 9a2 removes this bridge family by family; it is deliberately private and
-    /// never becomes stored state or a public compatibility accessor.
-    fn scalar_values(&self) -> Vec<Scalar> {
-        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
-        if self.r#type.data_type() == DataType::Token {
-            return vec![Scalar::Token; addressing.element_count()];
-        }
-        if self.r#type.data_type() == DataType::Zero {
-            return vec![Scalar::Zero; addressing.element_count()];
-        }
-        let logical_bytes = self.logical_bytes();
-        logical_bytes
-            .chunks_exact(addressing.element_byte_width())
-            .map(|bytes| match self.r#type.data_type() {
-                DataType::Boolean => Scalar::Bool(bytes[0] != 0),
-                DataType::I8 => Scalar::I8(bytes[0] as i8),
-                DataType::I16 => Scalar::I16(i16::from_le_bytes(bytes.try_into().unwrap())),
-                DataType::I32 => Scalar::I32(i32::from_le_bytes(bytes.try_into().unwrap())),
-                DataType::I64 => Scalar::I64(i64::from_le_bytes(bytes.try_into().unwrap())),
-                DataType::U8 => Scalar::U8(bytes[0]),
-                DataType::U16 => Scalar::U16(u16::from_le_bytes(bytes.try_into().unwrap())),
-                DataType::U32 => Scalar::U32(u32::from_le_bytes(bytes.try_into().unwrap())),
-                DataType::U64 => Scalar::U64(u64::from_le_bytes(bytes.try_into().unwrap())),
-                DataType::F4E2M1FN
-                | DataType::F6E2M3FN
-                | DataType::F6E3M2FN
-                | DataType::F8E3M4
-                | DataType::F8E4M3
-                | DataType::F8E4M3FN
-                | DataType::F8E4M3FNUZ
-                | DataType::F8E4M3B11FNUZ
-                | DataType::F8E5M2
-                | DataType::F8E5M2FNUZ
-                | DataType::F8E8M0FNU => {
-                    Scalar::from_low_precision_float_bits(self.r#type.data_type(), bytes[0]).unwrap()
-                }
-                DataType::BF16 => Scalar::BF16(bf16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap()))),
-                DataType::F16 => Scalar::F16(f16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap()))),
-                DataType::F32 => Scalar::F32(f32::from_le_bytes(bytes.try_into().unwrap())),
-                DataType::F64 => Scalar::F64(f64::from_le_bytes(bytes.try_into().unwrap())),
-                DataType::C64 => Scalar::C64(Complex::new(
-                    f32::from_le_bytes(bytes[..4].try_into().unwrap()),
-                    f32::from_le_bytes(bytes[4..].try_into().unwrap()),
-                )),
-                DataType::C128 => Scalar::C128(Complex::new(
-                    f64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                    f64::from_le_bytes(bytes[8..].try_into().unwrap()),
-                )),
-                DataType::Token | DataType::Zero => unreachable!(),
-                DataType::I1 | DataType::I2 | DataType::I4 | DataType::U1 | DataType::U2 | DataType::U4 => {
-                    panic!("scalar-backed reference kernels do not yet support {} elements", self.r#type.data_type())
-                }
-            })
-            .collect()
-    }
-
-    /// Encodes a temporary scalar sequence directly into the final physical storage selected by `type`.
-    pub(crate) fn from_scalar_values(
-        r#type: ArrayType,
-        values: impl IntoIterator<Item = Scalar>,
-    ) -> Result<Self, ProgramError> {
-        let addressing = ArrayAddressing::new(r#type.clone())?;
-        let mut bytes = vec![0; addressing.storage_byte_len()];
-        let mut count = 0;
-        for (index, value) in values.into_iter().enumerate() {
-            if index >= addressing.element_count() {
-                return Err(TypeError::invalid(format!(
-                    "array type {} requires {} logical elements but got more",
-                    r#type,
-                    addressing.element_count(),
-                ))
-                .into());
-            }
-            let value_type = value.r#type().into_owned();
-            if value_type != r#type.data_type() {
-                return Err(TypeError::invalid(format!(
-                    "array of element data type {} cannot store an element of data type {}",
-                    r#type.data_type(),
-                    value_type,
-                ))
-                .into());
-            }
-            let element_bytes = &mut bytes[addressing.byte_range_for_flat_index(index)];
-            match value {
-                Scalar::Token | Scalar::Zero => {}
-                Scalar::Bool(value) => element_bytes[0] = u8::from(value),
-                Scalar::I8(value) => element_bytes[0] = value as u8,
-                Scalar::I16(value) => element_bytes.copy_from_slice(&value.to_le_bytes()),
-                Scalar::I32(value) => element_bytes.copy_from_slice(&value.to_le_bytes()),
-                Scalar::I64(value) => element_bytes.copy_from_slice(&value.to_le_bytes()),
-                Scalar::U8(value) => element_bytes[0] = value,
-                Scalar::U16(value) => element_bytes.copy_from_slice(&value.to_le_bytes()),
-                Scalar::U32(value) => element_bytes.copy_from_slice(&value.to_le_bytes()),
-                Scalar::U64(value) => element_bytes.copy_from_slice(&value.to_le_bytes()),
-                Scalar::F4E2M1FN(value)
-                | Scalar::F6E2M3FN(value)
-                | Scalar::F6E3M2FN(value)
-                | Scalar::F8E3M4(value)
-                | Scalar::F8E4M3(value)
-                | Scalar::F8E4M3FN(value)
-                | Scalar::F8E4M3FNUZ(value)
-                | Scalar::F8E4M3B11FNUZ(value)
-                | Scalar::F8E5M2(value)
-                | Scalar::F8E5M2FNUZ(value)
-                | Scalar::F8E8M0FNU(value) => element_bytes[0] = value,
-                Scalar::BF16(value) => element_bytes.copy_from_slice(&value.to_bits().to_le_bytes()),
-                Scalar::F16(value) => element_bytes.copy_from_slice(&value.to_bits().to_le_bytes()),
-                Scalar::F32(value) => element_bytes.copy_from_slice(&value.to_le_bytes()),
-                Scalar::F64(value) => element_bytes.copy_from_slice(&value.to_le_bytes()),
-                Scalar::C64(value) => {
-                    element_bytes[..4].copy_from_slice(&value.re.to_le_bytes());
-                    element_bytes[4..].copy_from_slice(&value.im.to_le_bytes());
-                }
-                Scalar::C128(value) => {
-                    element_bytes[..8].copy_from_slice(&value.re.to_le_bytes());
-                    element_bytes[8..].copy_from_slice(&value.im.to_le_bytes());
-                }
-            }
-            count = index + 1;
-        }
-        if count != addressing.element_count() {
-            return Err(TypeError::invalid(format!(
-                "array type {} requires {} logical elements but got {}",
-                r#type,
-                addressing.element_count(),
-                count,
-            ))
-            .into());
-        }
-        Ok(Self { r#type, bytes: Arc::new(bytes) })
-    }
-
-    /// Creates an array of `type` by repeating one scalar element, which must already have `type`'s element data
-    /// type, across every logical element.
-    fn from_scalar_element(r#type: &ArrayType, element: Scalar) -> Result<Self, ProgramError> {
-        Self::from_scalar_values(r#type.clone(), vec![element; Self::materialized_element_count(r#type)?])
-    }
-
     /// Applies a typed binary element function with NumPy-style broadcasting directly over addressed storage. Inputs
     /// and outputs use their sealed codecs one element at a time, so the only payload allocation is the result buffer.
     fn binary_elements<Input: ArrayElement, Output: ArrayElement>(
@@ -2886,29 +2741,52 @@ impl AbsDiffEq for Array {
 
 impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
     fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-        let element = Array::zero_element(r#type.data_type())?;
-        Array::from_scalar_element(r#type, element)
+        match r#type.data_type() {
+            DataType::Token => Err(TypeError::invalid("data type token cannot represent zero".to_string()).into()),
+            DataType::Zero => Array::new(r#type.clone(), Vec::new()),
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = <Element as ElementConversionTarget>::from_unsigned(0)?;
+                Array::from_fn_elements(r#type.clone(), |_| Ok(element))
+            }),
+        }
     }
 }
 
 impl ZeroLike for Array {
     fn zero_like(&self) -> Self {
-        Self::from_scalar_values(self.r#type.clone(), self.scalar_values().iter().map(|value| value.zero_like()))
-            .unwrap()
+        match self.r#type.data_type() {
+            DataType::Token | DataType::Zero | DataType::F8E8M0FNU => self.clone(),
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = <Element as ElementConversionTarget>::from_unsigned(0).unwrap();
+                Self::from_fn_elements(self.r#type.clone(), |_| Ok(element)).unwrap()
+            }),
+        }
     }
 }
 
 impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
     fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-        let element = EagerContext::<Scalar>::new().one(&r#type.data_type())?;
-        Array::from_scalar_element(r#type, element)
+        match r#type.data_type() {
+            DataType::Token | DataType::Zero => {
+                Err(TypeError::invalid(format!("data type {} cannot represent one", r#type.data_type())).into())
+            }
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = <Element as ElementConversionTarget>::from_unsigned(1)?;
+                Array::from_fn_elements(r#type.clone(), |_| Ok(element))
+            }),
+        }
     }
 }
 
 impl OneLike for Array {
     fn one_like(&self) -> Self {
-        Self::from_scalar_values(self.r#type.clone(), self.scalar_values().iter().map(|value| value.one_like()))
-            .unwrap()
+        match self.r#type.data_type() {
+            DataType::Token | DataType::Zero => self.clone(),
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = <Element as ElementConversionTarget>::from_unsigned(1).unwrap();
+                Self::from_fn_elements(self.r#type.clone(), |_| Ok(element)).unwrap()
+            }),
+        }
     }
 }
 
@@ -2916,13 +2794,6 @@ impl StopGradient for Array {
     #[inline]
     fn stop_gradient(&self) -> Self {
         self.clone()
-    }
-}
-
-impl<O: Operation<Type = ArrayType>> Fill<Scalar, Array> for EagerContext<Array, O> {
-    fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array, ProgramError> {
-        let element = value.convert_element_type(r#type.data_type())?;
-        Array::from_scalar_element(r#type, element)
     }
 }
 
@@ -2957,11 +2828,11 @@ impl<O: Operation<Type = ArrayType>> crate::operations::constants::Iota<Array> f
         let size = sizes[dimension];
         let stride: usize = sizes[dimension + 1..].iter().product();
         let data_type = r#type.data_type();
-        let element_count = Array::materialized_element_count(r#type)?;
-        let values = (0..element_count)
-            .map(|flat| Scalar::from(((flat / stride) % size) as u64).convert_element_type(data_type))
-            .collect::<Result<Vec<_>, _>>()?;
-        Array::from_scalar_values(r#type.clone(), values)
+        dispatch_on_array_element_type!(data_type, |Element| {
+            Array::from_fn_elements(r#type.clone(), |flat| {
+                <Element as ElementConversionTarget>::from_unsigned(((flat / stride) % size) as u64)
+            })
+        })
     }
 }
 
@@ -4673,7 +4544,7 @@ mod tests {
         f8e8m0fnu, i1, i2, i4, u1, u2, u4,
     };
     use crate::operations::complex::Complex;
-    use crate::operations::constants::Iota;
+    use crate::operations::constants::{Fill, Iota};
     use crate::operations::manipulation::{GatherDimensionNumbers, ScatterDimensionNumbers};
     use crate::operations::sharding::{ConstrainSharding, Reshard};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -5139,26 +5010,26 @@ mod tests {
             Array::from_elements(r#type.clone(), &[1.0f32; 4]).map_err(|_| unreachable!())
         );
         assert_eq!(
-            context.fill(&r#type, Scalar::F32(2.5)),
+            context.fill(&r#type, 2.5f32),
             Array::from_elements(r#type.clone(), &[2.5f32; 4]).map_err(|_| unreachable!()),
         );
         // Explicit output types use ordinary element conversion, including narrowing.
         assert_eq!(
-            context.fill(&r#type, Scalar::F64(2.5)),
+            context.fill(&r#type, 2.5f64),
             Array::from_elements(r#type.clone(), &[2.5f32; 4]).map_err(|_| unreachable!()),
         );
         assert_eq!(
-            context.fill(&r#type, Scalar::C64(ComplexNumber::new(1.0, 2.0))),
+            context.fill(&r#type, ComplexNumber::new(1.0f32, 2.0)),
             Array::from_elements(r#type.clone(), &[1.0f32; 4]).map_err(|_| unreachable!()),
         );
         let integer_type = array_type(DataType::I32, &[2]);
         assert_eq!(
-            context.fill(&integer_type, Scalar::F64(2.5)),
+            context.fill(&integer_type, 2.5f64),
             Array::from_elements(integer_type, &[2i32; 2]).map_err(|_| unreachable!()),
         );
         let boolean_type = array_type(DataType::Boolean, &[2]);
         assert_eq!(
-            context.fill(&boolean_type, Scalar::C64(ComplexNumber::new(0.0, 2.0))),
+            context.fill(&boolean_type, ComplexNumber::new(0.0f32, 2.0)),
             Array::from_elements(boolean_type, &[true; 2]).map_err(|_| unreachable!()),
         );
         // Iota materializes coordinates along the requested dimension in the declared element data type.
@@ -5170,6 +5041,33 @@ mod tests {
         assert_eq!(
             context.iota(&array_type(DataType::C64, &[3]), 0).unwrap().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(0.0, 0.0), ComplexNumber::new(1.0, 0.0), ComplexNumber::new(2.0, 0.0),]),
+        );
+        // Constructors dispatch over element codecs that have no scalar representation and honor physical layout.
+        let strided_type = array_type(DataType::I4, &[3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+        let zero = context.zero(&strided_type).unwrap();
+        assert_eq!(zero.elements::<i4>(), Ok(vec![i4::new(0).unwrap(); 3]));
+        assert_eq!(zero.storage_bytes(), [0, 0, 0]);
+        let one = context.one(&strided_type).unwrap();
+        assert_eq!(one.elements::<i4>(), Ok(vec![i4::new(1).unwrap(); 3]));
+        assert_eq!(one.storage_bytes(), [1, 1, 1]);
+        assert_eq!(
+            context.iota(&array_type(DataType::U4, &[2, 3]), 1).unwrap().elements::<u4>(),
+            Ok(vec![
+                u4::new(0).unwrap(),
+                u4::new(1).unwrap(),
+                u4::new(2).unwrap(),
+                u4::new(0).unwrap(),
+                u4::new(1).unwrap(),
+                u4::new(2).unwrap(),
+            ]),
+        );
+        assert_eq!(
+            context.fill(&array_type(DataType::F6E2M3FN, &[2]), f6e2m3fn::from_bits(0x08).unwrap()),
+            Array::from_elements(array_type(DataType::F6E2M3FN, &[2]), &[f6e2m3fn::from_bits(0x08).unwrap(); 2],),
+        );
+        assert_eq!(
+            context.fill(&array_type(DataType::U4, &[2]), 2.5f64).unwrap().elements::<u4>(),
+            Ok(vec![u4::new(2).unwrap(); 2]),
         );
         // Kernels that materialize a payload from a type reject dynamically sized types.
         let dynamic_type = ArrayType::new(
@@ -5188,10 +5086,7 @@ mod tests {
             context.one(&dynamic_type),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == expected_message,
         ));
-        assert!(matches!(
-            context.fill(&dynamic_type, Scalar::from(42.0)),
-            Err(ProgramError::Type(TypeError::Invalid { message })) if message == expected_message,
-        ));
+        assert_eq!(context.fill(&dynamic_type, 42.0f64).unwrap_err().to_string(), expected_message);
     }
 
     #[test]
@@ -5200,6 +5095,15 @@ mod tests {
         assert_eq!(array.zero_like().elements::<f32>(), Ok(vec![0.0, 0.0]));
         assert_eq!(array.one_like().elements::<f32>(), Ok(vec![1.0, 1.0]));
         assert_eq!(array.zero_like().r#type().into_owned(), array_type(DataType::F32, &[2]));
+
+        // `f8e8m0fnu` cannot represent zero, so zero-like retains each value while one-like produces exact ones.
+        let array = Array::from_elements(
+            array_type(DataType::F8E8M0FNU, &[2]),
+            &[f8e8m0fnu::from_bits(0x7e), f8e8m0fnu::from_bits(0x80)],
+        )
+        .unwrap();
+        assert_eq!(array.zero_like(), array);
+        assert_eq!(array.one_like().elements::<f8e8m0fnu>(), Ok(vec![f8e8m0fnu::from_bits(0x7f); 2]));
     }
 
     #[test]

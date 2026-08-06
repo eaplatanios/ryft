@@ -19,8 +19,6 @@ use ryft_core::backends::array_programs::ArrayIrValue;
 #[cfg(test)]
 use ryft_core::backends::arrays::Array as ReferenceArray;
 use ryft_core::backends::dimensions::{DimensionOperation, DimensionValue};
-#[cfg(test)]
-use ryft_core::backends::scalars::Scalar;
 use ryft_core::batching::BatchingError;
 use ryft_core::compilation::{
     AnalyzableCompilationDomain, CallRequest, CompilationCacheDomain, CompilationContext, CompilationDomain,
@@ -5437,7 +5435,7 @@ mod tests {
 
         for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
             let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).with_memory(memory);
-            let output = domain.fill(&r#type, Scalar::from(2.5f64)).unwrap();
+            let output = domain.fill(&r#type, 2.5f64).unwrap();
 
             assert_eq!(output.r#type().memory(), memory);
             assert_eq!(output.shape(), StaticShape::new(vec![3]));
@@ -5445,14 +5443,14 @@ mod tests {
         }
 
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
-        let value = Scalar::from(num_complex::Complex::new(1.5f64, -2.0f64));
+        let value = num_complex::Complex::new(1.5f64, -2.0f64);
         let output = domain.fill(&r#type, value).unwrap();
         assert_eq!(read_f32s(&client, &output), vec![1.5, 1.5]);
 
         // A complex fill value lowers as two real part splats composed through `stablehlo.complex`, and a `c64`
         // buffer's bytes are the interleaved `f32` real and imaginary parts of its elements.
         let r#type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2)]));
-        let value = Scalar::from(num_complex::Complex::new(1.5f32, -2.0f32));
+        let value = num_complex::Complex::new(1.5f32, -2.0f32);
         let output = domain.fill(&r#type, value).unwrap();
 
         assert_eq!(output.shape(), StaticShape::new(vec![2]));
@@ -5462,7 +5460,7 @@ mod tests {
         // cannot be represented exactly by the floating-point intermediary used for floating-point constants.
         let r#type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
         let value = u64::MAX - 1;
-        let output = domain.fill(&r#type, Scalar::U64(value)).unwrap();
+        let output = domain.fill(&r#type, value).unwrap();
         assert_eq!(read_u64s(&client, &output), vec![value, value]);
     }
 

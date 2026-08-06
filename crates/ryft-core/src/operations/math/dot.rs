@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
-use crate::backends::scalars::Scalar;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
@@ -1648,7 +1647,7 @@ where
         + Reduce
         + Reshape
         + Sub,
-    V::DispatchDomain: Fill<Scalar, V>,
+    V::DispatchDomain: Fill<f64, V>,
 {
     fn block_quantize(
         &self,
@@ -1709,10 +1708,7 @@ where
             Shape::new(scale_dimensions.iter().map(|&size| Dimension::Static(size)).collect()),
         );
         let domain = self.dispatch_domain();
-        let fill = |value: f64| -> Result<V, ProgramError> {
-            let scalar = if compute_type == DataType::F32 { Scalar::from(value as f32) } else { Scalar::from(value) };
-            domain.fill(&scale_value_type, scalar)
-        };
+        let fill = |value: f64| domain.fill(&scale_value_type, value);
 
         // Per-block maximum magnitude along the trailing dimension.
         let block_max = self.reshape(block_shape.clone())?.abs()?.reduce(&[scale_dimensions.len()], ReductionKind::Max);
@@ -1745,10 +1741,7 @@ where
         let expanded_scales = stored_scales
             .legacy_broadcast(expanded_type, scale_axes.as_slice())?
             .reshape(input_type.shape().clone())?;
-        let fill_scalar = |value: f64| -> Result<V, ProgramError> {
-            let scalar = if compute_type == DataType::F32 { Scalar::from(value as f32) } else { Scalar::from(value) };
-            domain.fill(&ArrayType::scalar(compute_type), scalar)
-        };
+        let fill_scalar = |value: f64| domain.fill(&ArrayType::scalar(compute_type), value);
         let elements = self
             .div(&expanded_scales)?
             .clamp(&fill_scalar(-element_max)?, &fill_scalar(element_max)?)?

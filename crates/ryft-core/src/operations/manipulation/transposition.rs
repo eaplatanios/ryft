@@ -452,8 +452,8 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::f8e8m0fnu;
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::forward::DifferentiableOperation;
     use crate::differentiation::reverse::TransposableOperation;
@@ -954,33 +954,18 @@ mod tests {
         );
         assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
-        // The eager kernel reorders exact scalar payloads without changing their element representation.
-        for values in [
-            vec![
-                Scalar::Bool(false),
-                Scalar::Bool(true),
-                Scalar::Bool(true),
-                Scalar::Bool(false),
-                Scalar::Bool(false),
-                Scalar::Bool(true),
-            ],
-            (0..6).map(Scalar::I32).collect(),
-            (0..6).map(|bits| Scalar::F8E8M0FNU(bits + 1)).collect(),
-            (0..6).map(|value| Scalar::C128(ComplexNumber::new(f64::from(value), -f64::from(value)))).collect(),
-        ] {
-            let data_type = values[0].r#type().into_owned();
-            let expected_values = [0, 3, 1, 4, 2, 5].map(|index| values[index]).to_vec();
-            let input =
-                Array::from_scalar_values(ArrayType::new(data_type, Shape::new(vec![2.into(), 3.into()])), values)
-                    .unwrap();
-            assert_eq!(
-                input.transpose([1, 0]),
-                Array::from_scalar_values(
-                    ArrayType::new(data_type, Shape::new(vec![3.into(), 2.into()])),
-                    expected_values,
-                ),
-            );
-        }
+        // The eager kernel reorders exact typed payloads without changing their element representation.
+        let input = Array::matrix(2, 3, vec![false, true, true, false, false, true]);
+        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, vec![false, false, true, false, true, true])));
+        let input = Array::matrix(2, 3, (0..6).collect::<Vec<i32>>());
+        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, vec![0, 3, 1, 4, 2, 5])));
+        let input = Array::matrix(2, 3, (1..=6).map(f8e8m0fnu::from_bits).collect());
+        let expected = [1, 4, 2, 5, 3, 6].map(f8e8m0fnu::from_bits).to_vec();
+        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, expected)));
+        let input =
+            Array::matrix(2, 3, (0..6).map(|value| ComplexNumber::new(f64::from(value), -f64::from(value))).collect());
+        let expected = [0, 3, 1, 4, 2, 5].map(|value| ComplexNumber::new(f64::from(value), -f64::from(value))).to_vec();
+        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, expected)));
 
         // Rank-3 permutation moving the last axis to the front.
         let input_type = ArrayType::new(

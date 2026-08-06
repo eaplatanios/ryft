@@ -1,6 +1,5 @@
 use std::fmt::Display;
 
-use crate::backends::scalars::Scalar;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
@@ -1403,9 +1402,9 @@ where
 fn attention_fill<C, V>(context: &C, r#type: &ArrayType, value: f64) -> Result<V, ProgramError>
 where
     V: Typed<Type = ArrayType>,
-    C: Fill<Scalar, V>,
+    C: Fill<f64, V>,
 {
-    context.fill(r#type, Scalar::from(value).convert_element_type(r#type.data_type())?)
+    context.fill(r#type, value)
 }
 
 /// Expands grouped key/value heads to one head per query head for the attention compositions: a
@@ -1457,7 +1456,7 @@ fn apply_attention_masks<C, V>(
 ) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayType> + And + LegacyBroadcast + Compare<V> + Select + Sub,
-    C: Fill<Scalar, V> + Iota<V>,
+    C: Fill<f64, V> + Fill<u64, V> + Iota<V>,
 {
     if mask == AttentionMask::None && key_value_sequence_lengths.is_none() {
         return Ok(scores);
@@ -1471,7 +1470,10 @@ where
         if let Some(window) = sliding_window {
             let window = i32::try_from(window)
                 .map_err(|_| TypeError::invalid("sliding window must fit in a 32-bit integer".to_string()))?;
-            let lower_bound = rows.sub(&context.fill(&index_type, Scalar::from(window))?)?;
+            let window = u64::try_from(window).map_err(|_| ProgramError::InvalidArgument {
+                message: format!("attention window size {window} does not fit in u64"),
+            })?;
+            let lower_bound = rows.sub(&context.fill(&index_type, window)?)?;
             causal_visible = causal_visible.and(&columns.compare(&lower_bound, ComparisonDirection::GreaterThan)?)?;
         }
         visible = Some(causal_visible);
@@ -1515,7 +1517,7 @@ where
         + Mul
         + Select
         + Sub,
-    C: Fill<Scalar, V> + Iota<V>,
+    C: Fill<f64, V> + Fill<u64, V> + Iota<V>,
 {
     let data_type = query.r#type().data_type();
     // Scores over `[batch, heads]`: `query [b, qs, n, d] · key [b, ks, n, d]` contracting `d` -> `[b, n, qs, ks]`.
@@ -1559,7 +1561,7 @@ fn zero_out_of_range_query_rows<C, V>(
 ) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayType> + LegacyBroadcast + Compare<V> + Select,
-    C: Fill<Scalar, V> + Iota<V>,
+    C: Fill<f64, V> + Fill<u64, V> + Iota<V>,
 {
     let value_type = value.r#type().into_owned();
     let index_type = ArrayType::new(DataType::I32, value_type.shape().clone());
@@ -1613,7 +1615,7 @@ where
         + Select
         + Sub
         + Transpose,
-    C: Fill<Scalar, V> + Iota<V>,
+    C: Fill<f64, V> + Fill<u64, V> + Iota<V>,
 {
     if dropout.is_some() {
         return Err(ProgramError::UnsupportedOperation {
@@ -1744,7 +1746,7 @@ where
         + Select
         + Sub
         + Transpose,
-    C: Fill<Scalar, V> + Iota<V>,
+    C: Fill<f64, V> + Fill<u64, V> + Iota<V>,
 {
     if dropout.is_some() {
         return Err(ProgramError::UnsupportedOperation {

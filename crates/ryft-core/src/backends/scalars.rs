@@ -18,7 +18,7 @@ use num_complex::Complex;
 
 use ryft_macros::{Operation, Parameter};
 
-use crate::contexts::EagerContext;
+use crate::contexts::{Context, EagerContext};
 use crate::differentiation::LinearCallOperation;
 use crate::macros::check_types;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
@@ -27,7 +27,7 @@ use crate::operations::complex::{
 };
 use crate::operations::constants::{
     ConstantOperation, Fill, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation,
-    ZeroOperation,
+    ZeroOperation, fill::FillContext,
 };
 use crate::operations::control_flow::{Select, SelectOperation, WhileOperation, WhilePredicate};
 use crate::operations::debugging::PrintOperation;
@@ -753,10 +753,20 @@ impl<O: Operation<Type = DataType>> One<Scalar> for EagerContext<Scalar, O> {
     }
 }
 
-impl<O: Operation<Type = DataType>> Fill<Scalar, Scalar> for EagerContext<Scalar, O> {
+impl<S: Into<Scalar>, O: Operation<Type = DataType>> Fill<S, Scalar> for EagerContext<Scalar, O> {
     #[inline]
-    fn fill(&self, r#type: &DataType, value: Scalar) -> Result<Scalar, ProgramError> {
-        value.convert_element_type(*r#type)
+    fn fill(&self, r#type: &DataType, value: S) -> Result<Scalar, ProgramError> {
+        value.into().convert_element_type(*r#type)
+    }
+}
+
+impl<S: Into<Scalar>, C: Context<Type = DataType, Operation: From<ConstantOperation<Scalar>>>> FillContext<S, DataType>
+    for C
+{
+    #[inline]
+    fn fill_literal(&self, r#type: &DataType, value: S) -> Result<Self::Value, ProgramError> {
+        let value = value.into().convert_element_type(*r#type)?;
+        Ok(self.bind(ConstantOperation::new(value), Vec::new(), &[])?.remove(0))
     }
 }
 
@@ -2683,6 +2693,26 @@ mod tests {
         assert_eq!(context.one(&DataType::Boolean), Ok(Scalar::from(true)));
         assert_eq!(context.zero(&DataType::F32), Ok(Scalar::from(0.0f32)));
         assert_eq!(context.fill(&DataType::F32, Scalar::from(2.5_f64)), Ok(Scalar::from(2.5_f32)));
+
+        // Staged scalar filling remains an ordinary literal constant even though the generic fill machinery no longer
+        // depends on the scalar backend.
+        let context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let output = context.fill(&DataType::F32, 2.5f64).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32 = constant [value=2.5]
+                in (%0)
+            "}
+            .trim_end(),
+        );
 
         // The like-typed constants adopt the source scalar's variant.
         assert_eq!(Scalar::from(5i16).zero_like(), Scalar::from(0i16));

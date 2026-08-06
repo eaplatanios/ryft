@@ -1,7 +1,6 @@
 use std::fmt::{Display, Formatter};
 use std::ops::{Add, Mul};
 
-use crate::backends::scalars::Scalar;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
@@ -168,7 +167,7 @@ impl Operation for CoordinateBasisOperation<ArrayType> {
 
 impl<C> InterpretableOperation<C> for CoordinateBasisOperation<ArrayType>
 where
-    C: Domain<Type = ArrayType> + Fill<Scalar, C::Value> + Iota<C::Value> + One<C::Value> + Zero<C::Value>,
+    C: Domain<Type = ArrayType> + Fill<u64, C::Value> + Iota<C::Value> + One<C::Value> + Zero<C::Value>,
     C::Value: Add<Output = C::Value> + Mul<Output = C::Value> + Compare<C::Value> + Select,
 {
     fn interpret<D: InterpretationDriver<C>>(
@@ -207,7 +206,7 @@ where
             let coordinate = if stride == 1 {
                 coordinate
             } else {
-                let stride_value = context.fill(&index_type, Scalar::U64(stride))?;
+                let stride_value = context.fill(&index_type, stride)?;
                 coordinate * stride_value
             };
             flat_coordinate = Some(match flat_coordinate {
@@ -224,13 +223,13 @@ where
         }
         let mut flat_coordinate = match flat_coordinate {
             Some(flat_coordinate) => flat_coordinate,
-            None => context.fill(&index_type, Scalar::U64(0))?,
+            None => context.fill(&index_type, 0u64)?,
         };
         if self.coordinate_offset != 0 {
             let offset = u64::try_from(self.coordinate_offset).map_err(|_| ProgramError::InvalidArgument {
                 message: format!("coordinate offset {} does not fit in u64", self.coordinate_offset),
             })?;
-            let offset_value = context.fill(&index_type, Scalar::U64(offset))?;
+            let offset_value = context.fill(&index_type, offset)?;
             flat_coordinate = flat_coordinate + offset_value;
         }
 
@@ -276,15 +275,14 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Coordina
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{f6e2m3fn, f6e3m2fn};
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{jacobian_forward, jacobian_reverse};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_type_inference;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::Typed;
     use crate::types::DataType::{Boolean, F6E2M3FN, F6E3M2FN, F8E8M0FNU, F32, I32};
     use crate::types::{ArrayType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
@@ -317,48 +315,57 @@ mod tests {
 
     #[test]
     fn test_coordinate_basis_operation_interprets_fp6_packed_fragments() {
-        for (data_type, zero, one) in [
-            (F6E2M3FN, Scalar::F6E2M3FN(0), Scalar::F6E2M3FN(0x08)),
-            (F6E3M2FN, Scalar::F6E3M2FN(0), Scalar::F6E3M2FN(0x0c)),
-        ] {
-            let leaf_type = ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)]));
-            let basis_type = leaf_type.with_inserted_dimension(0, Dimension::Static(4)).unwrap();
-            let operation = CoordinateBasisOperation::new(leaf_type, 1, 4);
-            let context = EagerContext::<Array, CoordinateBasisOperation<ArrayType>>::new();
+        let leaf_type = ArrayType::new(F6E2M3FN, Shape::new(vec![Dimension::Static(2)]));
+        let basis_type = leaf_type.with_inserted_dimension(0, Dimension::Static(4)).unwrap();
+        let operation = CoordinateBasisOperation::new(leaf_type, 1, 4);
+        let context = EagerContext::<Array, CoordinateBasisOperation<ArrayType>>::new();
+        let zero = f6e2m3fn::from_bits(0).unwrap();
+        let one = f6e2m3fn::from_bits(0x08).unwrap();
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[]),
+            Ok(vec![Array::from_elements(basis_type, &[zero, zero, one, zero, zero, one, zero, zero]).unwrap()]),
+        );
 
-            assert_eq!(
-                operation.interpret(&context, &EmptyRegionDriver, &[]),
-                Ok(vec![
-                    Array::from_scalar_values(basis_type, [zero, zero, one, zero, zero, one, zero, zero],).unwrap()
-                ]),
-            );
-        }
+        let leaf_type = ArrayType::new(F6E3M2FN, Shape::new(vec![Dimension::Static(2)]));
+        let basis_type = leaf_type.with_inserted_dimension(0, Dimension::Static(4)).unwrap();
+        let operation = CoordinateBasisOperation::new(leaf_type, 1, 4);
+        let zero = f6e3m2fn::from_bits(0).unwrap();
+        let one = f6e3m2fn::from_bits(0x0c).unwrap();
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[]),
+            Ok(vec![Array::from_elements(basis_type, &[zero, zero, one, zero, zero, one, zero, zero]).unwrap()]),
+        );
     }
 
     #[test]
     fn test_coordinate_basis_operation_supports_fp6_dense_jacobians() {
-        for (zero, one, two) in [
-            (Scalar::F6E2M3FN(0), Scalar::F6E2M3FN(0x08), Scalar::F6E2M3FN(0x10)),
-            (Scalar::F6E3M2FN(0), Scalar::F6E3M2FN(0x0c), Scalar::F6E3M2FN(0x10)),
-        ] {
-            let data_type = zero.r#type().into_owned();
-            let input = Array::from_scalar_values(
-                ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)])),
-                [one, two],
-            )
-            .unwrap();
-            let expected = Array::from_scalar_values(
-                ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-                [one, zero, zero, one],
-            )
-            .unwrap();
+        let zero = f6e2m3fn::from_bits(0).unwrap();
+        let one = f6e2m3fn::from_bits(0x08).unwrap();
+        let two = f6e2m3fn::from_bits(0x10).unwrap();
+        let input = Array::from_elements(ArrayType::new(F6E2M3FN, Shape::new(vec![2.into()])), &[one, two]).unwrap();
+        let expected = Array::from_elements(
+            ArrayType::new(F6E2M3FN, Shape::new(vec![2.into(), 2.into()])),
+            &[one, zero, zero, one],
+        )
+        .unwrap();
+        let forward = jacobian_forward(|input| Ok(input), input.clone()).unwrap();
+        assert_eq!(forward.iter_blocks().next().unwrap().value(), &expected);
+        let reverse = jacobian_reverse(|input| Ok(input), input).unwrap();
+        assert_eq!(reverse.iter_blocks().next().unwrap().value(), &expected);
 
-            let forward = jacobian_forward(|input| Ok(input), input.clone()).unwrap();
-            assert_eq!(forward.iter_blocks().next().unwrap().value(), &expected);
-
-            let reverse = jacobian_reverse(|input| Ok(input), input).unwrap();
-            assert_eq!(reverse.iter_blocks().next().unwrap().value(), &expected);
-        }
+        let zero = f6e3m2fn::from_bits(0).unwrap();
+        let one = f6e3m2fn::from_bits(0x0c).unwrap();
+        let two = f6e3m2fn::from_bits(0x10).unwrap();
+        let input = Array::from_elements(ArrayType::new(F6E3M2FN, Shape::new(vec![2.into()])), &[one, two]).unwrap();
+        let expected = Array::from_elements(
+            ArrayType::new(F6E3M2FN, Shape::new(vec![2.into(), 2.into()])),
+            &[one, zero, zero, one],
+        )
+        .unwrap();
+        let forward = jacobian_forward(|input| Ok(input), input.clone()).unwrap();
+        assert_eq!(forward.iter_blocks().next().unwrap().value(), &expected);
+        let reverse = jacobian_reverse(|input| Ok(input), input).unwrap();
+        assert_eq!(reverse.iter_blocks().next().unwrap().value(), &expected);
     }
 
     #[test]

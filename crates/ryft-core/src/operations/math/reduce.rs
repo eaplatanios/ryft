@@ -3,7 +3,6 @@ use std::ops::{Div, Mul};
 
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
-use crate::backends::scalars::Scalar;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
@@ -839,7 +838,7 @@ where
                             // Stage a rank-zero literal holding `1 / N` and rely on implicit rank-zero broadcasting in
                             // the subsequent multiplication to scale the broadcast-back cotangent to the input shape.
                             let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
-                            let factor = context.fill(&factor_type, Scalar::from(inverse_count))?;
+                            let factor = context.fill(&factor_type, inverse_count)?;
                             factor * broadcasted
                         }
                         _ => unreachable!("outer match handled the only two supported kinds"),

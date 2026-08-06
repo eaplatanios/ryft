@@ -16,7 +16,6 @@ use std::ops::Mul as StdMul;
 use crate::axes::{AxisError, AxisIndexOperation, NamedAxes, NamedAxis};
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
-use crate::backends::scalars::Scalar;
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, DynamicArrayBatchingPolicy, broadcast_array};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -408,7 +407,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Collecti
 /// trace under a staging parent — so one rule serves eager and staged batching alike.
 impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for CollectiveOperation
 where
-    C: Context<Type = ArrayType> + Fill<Scalar, C::Value>,
+    C: Context<Type = ArrayType> + Fill<f64, C::Value>,
     C::Operation: From<CollectiveOperation>,
     <C as Domain>::Value: Reduce + StdMul<Output = <C as Domain>::Value>,
 {
@@ -433,7 +432,7 @@ where
         collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
             // The `1 / N` rank-0 factor binds into the batching context's parent — interpreted eagerly under an eager
             // parent, staged into the enclosing trace under a staging parent.
-            context.parent().fill(&factor_type, Scalar::from(inverse_axis_size))
+            context.parent().fill(&factor_type, inverse_axis_size)
         })
     }
 }

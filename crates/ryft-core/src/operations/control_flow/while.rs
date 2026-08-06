@@ -3501,8 +3501,8 @@ mod tests {
         }
     }
 
-    impl crate::operations::constants::Fill<Scalar, Array> for StagedDispatchTestDomain {
-        fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array, ProgramError> {
+    impl<S: crate::arrays::ArrayElement> crate::operations::constants::Fill<S, Array> for StagedDispatchTestDomain {
+        fn fill(&self, r#type: &ArrayType, value: S) -> Result<Array, ProgramError> {
             crate::operations::constants::Fill::fill(&crate::EagerContext::<Array>::new(), r#type, value)
         }
     }
@@ -3585,8 +3585,8 @@ mod tests {
         }
     }
 
-    impl crate::operations::constants::Fill<Scalar, Array> for CountingPrintContext {
-        fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array, ProgramError> {
+    impl<S: crate::arrays::ArrayElement> crate::operations::constants::Fill<S, Array> for CountingPrintContext {
+        fn fill(&self, r#type: &ArrayType, value: S) -> Result<Array, ProgramError> {
             crate::operations::constants::Fill::fill(&EagerContext::<Array>::new(), r#type, value)
         }
     }

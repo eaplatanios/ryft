@@ -1,9 +1,10 @@
-//! Allocation regression tests for projecting array members out of [`ArrayIrValue`].
+//! Allocation regression tests for reference arrays and projecting array members out of [`ArrayIrValue`].
 //!
 //! The reference [`Array`] backend shares its immutable physical byte storage, so cloning an array must not copy or
-//! allocate storage proportional to its payload. Projecting an array member out of [`ArrayIrValue`] must add no
-//! allocation at all. These tests use a counting global allocator to pin both contracts. They live in a dedicated
-//! integration-test binary so its global allocator and serialized measurement state cannot affect unrelated tests.
+//! allocate storage proportional to its payload. Direct typed kernels must allocate output storage without adding a
+//! payload-sized intermediate, and projecting an array member out of [`ArrayIrValue`] must add no allocation at all.
+//! These tests use a counting global allocator to pin those contracts. They live in a dedicated integration-test
+//! binary so its global allocator and serialized measurement state cannot affect unrelated tests.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -12,7 +13,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ryft_core::backends::arrays::Array;
-use ryft_core::{ArrayIrValue, ArrayType, ValueProjection};
+use ryft_core::contexts::EagerContext;
+use ryft_core::operations::constants::{Fill, Iota};
+use ryft_core::operations::math::{Add, Sin};
+use ryft_core::{ArrayIrValue, ArrayType, DataType, Dimension, Shape, ValueProjection};
 
 /// Allocator that counts allocations made by this integration-test binary.
 struct CountingAllocator;
@@ -127,6 +131,58 @@ fn test_large_array_clone_does_not_allocate_payload_storage() {
     assert_eq!(large_statistics, small_statistics);
     assert!(large_statistics.allocated_byte_count < payload_byte_count);
     assert!(large_statistics.largest_allocation_byte_count < payload_byte_count);
+}
+
+#[test]
+fn test_reference_elementwise_kernels_allocate_only_one_payload_buffer() {
+    let small_unary = measure_allocations(|| Array::vector(vec![1.0f32]), |array| array.sin().unwrap());
+    let large_unary = measure_allocations(
+        || Array::vector((0..4096).map(|value| value as f32).collect()),
+        |array| array.sin().unwrap(),
+    );
+    assert_eq!(large_unary.allocation_count, small_unary.allocation_count);
+    assert_eq!(large_unary.allocated_byte_count - small_unary.allocated_byte_count, (4096 - 1) * size_of::<f32>());
+
+    let small_binary = measure_allocations(
+        || (Array::vector(vec![1.0f32]), Array::vector(vec![2.0f32])),
+        |(left, right)| left.add(&right).unwrap(),
+    );
+    let large_binary = measure_allocations(
+        || {
+            (
+                Array::vector((0..4096).map(|value| value as f32).collect()),
+                Array::vector((0..4096).map(|value| value as f32).collect()),
+            )
+        },
+        |(left, right)| left.add(&right).unwrap(),
+    );
+    assert_eq!(large_binary.allocation_count, small_binary.allocation_count);
+    assert_eq!(large_binary.allocated_byte_count - small_binary.allocated_byte_count, (4096 - 1) * size_of::<f32>());
+}
+
+#[test]
+fn test_reference_constructor_kernels_allocate_only_one_payload_buffer() {
+    let small_fill = measure_allocations(
+        || ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])),
+        |r#type| EagerContext::<Array>::new().fill(&r#type, 2.5f32).unwrap(),
+    );
+    let large_fill = measure_allocations(
+        || ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4096)])),
+        |r#type| EagerContext::<Array>::new().fill(&r#type, 2.5f32).unwrap(),
+    );
+    assert_eq!(large_fill.allocation_count, small_fill.allocation_count);
+    assert_eq!(large_fill.allocated_byte_count - small_fill.allocated_byte_count, (4096 - 1) * size_of::<f32>());
+
+    let small_iota = measure_allocations(
+        || ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(1)])),
+        |r#type| EagerContext::<Array>::new().iota(&r#type, 0).unwrap(),
+    );
+    let large_iota = measure_allocations(
+        || ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(4096)])),
+        |r#type| EagerContext::<Array>::new().iota(&r#type, 0).unwrap(),
+    );
+    assert_eq!(large_iota.allocation_count, small_iota.allocation_count);
+    assert_eq!(large_iota.allocated_byte_count - small_iota.allocated_byte_count, (4096 - 1) * size_of::<u32>());
 }
 
 #[test]

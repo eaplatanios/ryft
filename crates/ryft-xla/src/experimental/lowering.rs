@@ -14692,7 +14692,7 @@ mod tests {
         ] {
             let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
             let output_type = test_vector_type(4).with_memory(memory);
-            let output = context.fill(&output_type, Scalar::F64(2.5)).unwrap();
+            let output = context.fill(&output_type, 2.5f64).unwrap();
             assert_eq!(*output.r#type(), output_type);
             let program = context
                 .builder()
@@ -14716,7 +14716,7 @@ mod tests {
 
             let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
             let output_type = ArrayType::scalar(DataType::F32).with_memory(memory);
-            let output = context.fill(&output_type, Scalar::F64(2.5)).unwrap();
+            let output = context.fill(&output_type, 2.5f64).unwrap();
             assert_eq!(*output.r#type(), output_type);
             let program = context
                 .builder()

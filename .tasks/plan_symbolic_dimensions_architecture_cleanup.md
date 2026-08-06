@@ -2477,7 +2477,7 @@ Phase 9a1 — layout-aware byte storage and construction:
 
 Phase 9a2 — byte-backed reference kernels:
 
-- [ ] Migrate elementwise arithmetic, logical, comparison, complex, conversion, zero/one/fill/iota, and random kernels
+- [x] Migrate elementwise arithmetic, logical, comparison, complex, conversion, zero/one/fill/iota, and random kernels
       family by family, preserving integer wrapping and fallible errors.
   - [x] P9a2a: migrate `Not`, `And`, `Or`, and `Xor` directly over layout-aware Boolean and integer storage, including
         sub-byte masks and complete NumPy-style broadcasting, without temporary scalar or logical-byte payloads.
@@ -2498,6 +2498,11 @@ Phase 9a2 — byte-backed reference kernels:
         `Floor`, `Ceil`, and `Round` to direct typed codecs. Preserve each operation's exact real/complex dtype
         contract, low-precision re-encoding, IEEE special values and ties-to-even rounding, mixed-type promotion and
         complete broadcasting for binary operations, arbitrary physical layouts, and existing diagnostics.
+  - [x] P9a2n: confirm complex construction/accessors already use direct typed codecs, then migrate zero, one,
+        zero-like, one-like, fill, and iota construction to direct typed codecs. Make `Fill` generic over sealed typed
+        host elements rather than accepting the scalar backend's value representation; delete the scalar-sequence
+        encode/decode bridge, migrate its remaining tests to typed elements, and preserve payload-free, sub-byte,
+        low-precision, complex, arbitrary-layout, dynamic-shape-rejection, and exact diagnostic semantics.
 - [x] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
       gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
   - [x] P9a2c: migrate broadcast, transpose, reshape, static and dynamic slice/update, pad, and concatenate to direct
@@ -2530,7 +2535,7 @@ Phase 9a2 — byte-backed reference kernels:
       semantics in their kernels; the addressing layer owns only checked logical-index-to-byte-range mapping.
 - [x] Preserve exact equality, numeric approximation, display, Boolean concretization, and indexing semantics directly
       over encoded bytes.
-- [ ] Gate: all reference-backend and transform tests pass; representative kernels add no allocation-count slope beyond
+- [x] Gate: all reference-backend and transform tests pass; representative kernels add no allocation-count slope beyond
       output allocation; no production array kernel depends on `Scalar`; and unchecked byte-offset arithmetic is not
       duplicated across kernels.
 
@@ -4718,3 +4723,28 @@ low-precision re-encoding, real rounding/error behavior, exact signed-zero and N
 sign extraction. All 1,159 core library tests, 54 runnable core doctests (16 intentional ignores), and all 438 runnable
 XLA library tests (one intentional timing-sensitive ignore) pass. Formatting and diff hygiene pass. The Phase 9a2
 elementwise parent remains open only for complex construction/accessors and zero/one/fill/iota constructors.
+
+### Phase 9a2n direct constructors and Phase 9a2 closure (2026-08-06)
+
+The existing complex construction, conjugation, and real/imaginary accessor kernels were audited and already used the
+shared typed element loops directly, so they required no migration. Zero, one, zero-like, one-like, and iota now
+construct addressed output storage through sealed element dispatch without a scalar payload. This adds the sub-byte
+integer behavior their operation contracts already admitted, preserves `f8e8m0fnu`'s no-zero zero-like semantics,
+retains payload-free Token/Zero handling, and writes arbitrary physical layouts directly.
+
+Eager and staged array fill now accept sealed typed host elements directly. Each implementation creates one rank-zero
+typed `Array`, applies the canonical element conversion and memory placement, and uses ordinary broadcast for the
+requested output; `fill.rs` no longer imports, matches, or otherwise depends on the scalar backend. The generic
+transform forwarding is payload-agnostic, while the scalar backend retains its temporary scalar-domain behavior in
+its own module. No scalar sequence or logical-byte intermediate is materialized. The obsolete `scalar_values`,
+`from_scalar_values`, `from_scalar_element`, and `zero_element` bridge family was deleted, and its remaining tests now
+construct typed elements directly.
+
+Allocation regression tests compare one-element and 4,096-element unary, binary, fill, and iota executions. Allocation
+counts stay constant and allocated-byte growth is exactly one output payload; no payload-sized intermediate remains.
+The residual production-kernel audit finds no `Vec<Scalar>` bridge and no unchecked byte-offset arithmetic outside
+`ArrayAddressing`; row-major arithmetic that remains computes logical broadcasting or contraction coordinates only.
+
+All 1,158 core library tests, the five allocation regression tests, 54 runnable core doctests (16 intentional ignores),
+and all 438 runnable XLA library tests (one intentional timing-sensitive ignore) pass. Formatting and diff hygiene
+pass, closing the complete Phase 9a2 gate. Phase 9a3 exact XLA literals is the next isolated implementation unit.

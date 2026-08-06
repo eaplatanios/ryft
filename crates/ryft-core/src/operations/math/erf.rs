@@ -1,12 +1,11 @@
 use std::f64::consts::FRAC_2_SQRT_PI;
 use std::ops::{Mul as StandardMul, Neg as StandardNeg};
 
-use crate::backends::scalars::Scalar;
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
 use crate::operations::constants::Fill;
-use crate::operations::manipulation::conversion::{ConvertElementType, ElementType};
+use crate::operations::manipulation::conversion::ElementType;
 use crate::programs::types::Typed;
 use crate::programs::values::Value;
 
@@ -35,14 +34,13 @@ impl_differentiable_elementwise_operation! {
     where
         C::Type: ElementType,
         C::Value: Exp + StandardMul<Output = C::Value> + StandardNeg<Output = C::Value>,
-        <C::Value as Value>::DispatchDomain: Fill<Scalar, C::Value>,
+        <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
     {
         // d(erf(x)) = (2/√π) · exp(-x²) · dx, with the coefficient `2/√π` rounded to the aligned input's element
         // data type and staged as a nullary fill of the aligned input type.
         |(input, input_tangent)| {
             let input_type = input.r#type().into_owned();
-            let coefficient = Scalar::from(FRAC_2_SQRT_PI).convert_element_type(input_type.element_type())?;
-            let coefficient = input.dispatch_domain().fill(&input_type, coefficient)?;
+            let coefficient = input.dispatch_domain().fill(&input_type, FRAC_2_SQRT_PI)?;
             coefficient * (-(input.clone() * input)).exp()? * input_tangent
         }
     },

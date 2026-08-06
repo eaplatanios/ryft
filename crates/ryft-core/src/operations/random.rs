@@ -4,7 +4,6 @@ use std::marker::PhantomData;
 use crate::axes::Axis;
 use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
-use crate::backends::scalars::Scalar;
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -571,13 +570,9 @@ fn fill_float_constant<V: Value<Type = ArrayType>>(
     value: f64,
 ) -> Result<V, ProgramError>
 where
-    V::DispatchDomain: Fill<Scalar, V>,
+    V::DispatchDomain: Fill<f64, V>,
 {
-    let scalar = match array_type.data_type() {
-        DataType::F32 => Scalar::from(value as f32),
-        _ => Scalar::from(value),
-    };
-    domain.fill(array_type, scalar)
+    domain.fill(array_type, value)
 }
 
 impl<V> Random for V
@@ -597,7 +592,7 @@ where
         + Sqrt
         + Sub
         + ZeroLike,
-    V::DispatchDomain: Fill<Scalar, V>,
+    V::DispatchDomain: Fill<f64, V>,
 {
     fn split_key(&self, count: usize) -> Result<(Self, Vec<Self>), ProgramError> {
         let keys_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(count)]));
@@ -620,13 +615,13 @@ where
             DataType::F32 => {
                 // The top 24 bits are exactly representable in `f32`, so the division, conversion, and scaling are
                 // all exact and the samples cover `[0, 1 - 2⁻²⁴]` without ever rounding up to `1.0`.
-                let shifted = bits.div(&domain.fill(&bits_type, Scalar::from(1u32 << 8))?)?;
-                let scale = domain.fill(&sample_type, Scalar::from(2.0f32.powi(-24)))?;
+                let shifted = bits.div(&domain.fill(&bits_type, f64::from(1u32 << 8))?)?;
+                let scale = domain.fill(&sample_type, f64::from(2.0f32.powi(-24)))?;
                 shifted.convert_element_type(DataType::F32)?.mul(&scale)?
             }
             DataType::F64 => {
                 // All 32 bits are exactly representable in `f64` and `u32::MAX · 2⁻³² < 1` exactly.
-                let scale = domain.fill(&sample_type, Scalar::from(2.0f64.powi(-32)))?;
+                let scale = domain.fill(&sample_type, 2.0f64.powi(-32))?;
                 bits.convert_element_type(DataType::F64)?.mul(&scale)?
             }
             data_type => {

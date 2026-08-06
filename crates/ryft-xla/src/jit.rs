@@ -1267,7 +1267,6 @@ where
 mod tests {
     use ryft_core::backends::array_programs::ArrayIrValue;
     use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
-    use ryft_core::backends::scalars::Scalar;
     use ryft_core::contexts::{Context, EagerContext};
     use ryft_core::differentiation::hessian::{Hessian, HessianDifferentiate};
     use ryft_core::differentiation::jacobian::{Jacobian, JacobianDifferentiate};
@@ -3290,7 +3289,7 @@ mod tests {
             + CustomCall
             + OneLike
             + ZeroLike,
-        C: Fill<Scalar, V> + Iota<V>,
+        C: Fill<f32, V> + Fill<i32, V> + Iota<V>,
     {
         let dimension = configuration.dimension;
         let position = state[0].clone();
@@ -3327,13 +3326,13 @@ mod tests {
                 let scores =
                     cache_keys.dot(&query, &DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()));
                 let scores_type = scores.r#type().into_owned();
-                let scale = context.fill(&scores_type, Scalar::F32(1.0 / (dimension as f32).sqrt()))?;
+                let scale = context.fill(&scores_type, 1.0 / (dimension as f32).sqrt())?;
                 let scores = scores.mul(&scale)?;
                 let positions_type = tokens.r#type().into_owned();
                 let positions = context.iota(&positions_type, 0)?;
                 let visible = positions
                     .compare(&position.legacy_broadcast(positions_type, &[])?, ComparisonDirection::LessThanOrEqual)?;
-                let masked = V::select(&visible, &scores, &context.fill(&scores_type, Scalar::F32(-1.0e30))?)?;
+                let masked = V::select(&visible, &scores, &context.fill(&scores_type, -1.0e30f32)?)?;
                 let stabilized =
                     masked.sub(&masked.reduce(&[0], ReductionKind::Max).legacy_broadcast(scores_type.clone(), &[])?)?;
                 let exponentials = stabilized.exp()?;
@@ -3403,8 +3402,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 let position = &state[0];
-                let limit =
-                    position.dispatch_domain().fill(&position.r#type().into_owned(), Scalar::I32(steps as i32))?;
+                let limit = position.dispatch_domain().fill(&position.r#type().into_owned(), steps as i32)?;
                 Ok(vec![position.compare(&limit, ComparisonDirection::LessThan)?.into_value()])
             },
             carry_types.clone(),
