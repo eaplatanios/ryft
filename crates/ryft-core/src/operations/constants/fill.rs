@@ -50,7 +50,8 @@ impl<
     #[inline]
     fn fill_scalar(&self, r#type: &ArrayType, value: Scalar) -> Result<Self::Value, ProgramError> {
         let value = value.convert_element_type(r#type.data_type())?;
-        let literal = Array::new(ArrayType::scalar(r#type.data_type()).with_memory(r#type.memory()), vec![value])?;
+        let literal =
+            Array::from_scalar_values(ArrayType::scalar(r#type.data_type()).with_memory(r#type.memory()), [value])?;
         let scalar = self.bind(ConstantOperation::new(literal), Vec::new(), &[])?.remove(0);
         scalar.legacy_broadcast(r#type.clone(), &[])
     }

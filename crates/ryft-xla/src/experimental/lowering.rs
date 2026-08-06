@@ -5041,16 +5041,9 @@ impl MlirLowerableValue for CpuArray {
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
         let data_type = self.r#type().data_type();
         macro_rules! typed_elements {
-            // Extract one natively supported scalar family and construct its matching typed MLIR dense attribute.
-            ($method:ident, $variant:ident, $element:ty) => {{
-                let values = self
-                    .values()
-                    .iter()
-                    .map(|value| match value {
-                        Scalar::$variant(value) => *value,
-                        _ => unreachable!("array payload types are validated during construction"),
-                    })
-                    .collect::<Vec<$element>>();
+            // Decode one natively supported element family and construct its matching typed MLIR dense attribute.
+            ($method:ident, $element:ty) => {{
+                let values = self.elements::<$element>().unwrap();
                 context
                     .$method(tensor_type, values.as_slice())
                     .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
@@ -5058,74 +5051,37 @@ impl MlirLowerableValue for CpuArray {
                     .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type })
             }};
         }
-        macro_rules! raw_elements {
-            // Preserve an unsupported-by-typed-MLIR scalar family's native storage bits through the raw constructor.
-            ($variant:ident, $element:ty) => {{
-                let values = self
-                    .values()
-                    .iter()
-                    .map(|value| match value {
-                        Scalar::$variant(value) => *value,
-                        _ => unreachable!("array payload types are validated during construction"),
-                    })
-                    .collect::<Vec<$element>>();
-                context
-                    .dense_elements_attribute_from_raw_buffer(tensor_type, values.as_slice())
-                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
-            }};
-        }
 
         match data_type {
-            DataType::Boolean => typed_elements!(dense_bool_elements_attribute, Bool, bool),
-            DataType::I8 => typed_elements!(dense_i8_elements_attribute, I8, i8),
-            DataType::I16 => typed_elements!(dense_i16_elements_attribute, I16, i16),
-            DataType::I32 => typed_elements!(dense_i32_elements_attribute, I32, i32),
-            DataType::I64 => typed_elements!(dense_i64_elements_attribute, I64, i64),
-            DataType::U8 => typed_elements!(dense_u8_elements_attribute, U8, u8),
-            DataType::U16 => typed_elements!(dense_u16_elements_attribute, U16, u16),
-            DataType::U32 => typed_elements!(dense_u32_elements_attribute, U32, u32),
-            DataType::U64 => typed_elements!(dense_u64_elements_attribute, U64, u64),
-            DataType::F4E2M1FN => raw_elements!(F4E2M1FN, u8),
-            DataType::F6E2M3FN => raw_elements!(F6E2M3FN, u8),
-            DataType::F6E3M2FN => raw_elements!(F6E3M2FN, u8),
-            DataType::F8E3M4 => raw_elements!(F8E3M4, u8),
-            DataType::F8E4M3 => raw_elements!(F8E4M3, u8),
-            DataType::F8E4M3FN => raw_elements!(F8E4M3FN, u8),
-            DataType::F8E4M3FNUZ => raw_elements!(F8E4M3FNUZ, u8),
-            DataType::F8E4M3B11FNUZ => raw_elements!(F8E4M3B11FNUZ, u8),
-            DataType::F8E5M2 => raw_elements!(F8E5M2, u8),
-            DataType::F8E5M2FNUZ => raw_elements!(F8E5M2FNUZ, u8),
-            DataType::F8E8M0FNU => raw_elements!(F8E8M0FNU, u8),
-            DataType::BF16 => typed_elements!(dense_bf16_elements_attribute, BF16, half::bf16),
-            DataType::F16 => typed_elements!(dense_f16_elements_attribute, F16, half::f16),
-            DataType::F32 => typed_elements!(dense_f32_elements_attribute, F32, f32),
-            DataType::F64 => typed_elements!(dense_f64_elements_attribute, F64, f64),
-            DataType::C64 => {
-                let values = self
-                    .values()
-                    .iter()
-                    .flat_map(|value| match value {
-                        Scalar::C64(value) => [value.re, value.im],
-                        _ => unreachable!("array payload types are validated during construction"),
-                    })
-                    .collect::<Vec<_>>();
-                context
-                    .dense_elements_attribute_from_raw_buffer(tensor_type, values.as_slice())
-                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
-            }
-            DataType::C128 => {
-                let values = self
-                    .values()
-                    .iter()
-                    .flat_map(|value| match value {
-                        Scalar::C128(value) => [value.re, value.im],
-                        _ => unreachable!("array payload types are validated during construction"),
-                    })
-                    .collect::<Vec<_>>();
-                context
-                    .dense_elements_attribute_from_raw_buffer(tensor_type, values.as_slice())
-                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
-            }
+            DataType::Boolean => typed_elements!(dense_bool_elements_attribute, bool),
+            DataType::I8 => typed_elements!(dense_i8_elements_attribute, i8),
+            DataType::I16 => typed_elements!(dense_i16_elements_attribute, i16),
+            DataType::I32 => typed_elements!(dense_i32_elements_attribute, i32),
+            DataType::I64 => typed_elements!(dense_i64_elements_attribute, i64),
+            DataType::U8 => typed_elements!(dense_u8_elements_attribute, u8),
+            DataType::U16 => typed_elements!(dense_u16_elements_attribute, u16),
+            DataType::U32 => typed_elements!(dense_u32_elements_attribute, u32),
+            DataType::U64 => typed_elements!(dense_u64_elements_attribute, u64),
+            DataType::F4E2M1FN
+            | DataType::F6E2M3FN
+            | DataType::F6E3M2FN
+            | DataType::F8E3M4
+            | DataType::F8E4M3
+            | DataType::F8E4M3FN
+            | DataType::F8E4M3FNUZ
+            | DataType::F8E4M3B11FNUZ
+            | DataType::F8E5M2
+            | DataType::F8E5M2FNUZ
+            | DataType::F8E8M0FNU => context
+                .dense_elements_attribute_from_raw_buffer(tensor_type, self.logical_bytes().as_slice())
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+            DataType::BF16 => typed_elements!(dense_bf16_elements_attribute, half::bf16),
+            DataType::F16 => typed_elements!(dense_f16_elements_attribute, half::f16),
+            DataType::F32 => typed_elements!(dense_f32_elements_attribute, f32),
+            DataType::F64 => typed_elements!(dense_f64_elements_attribute, f64),
+            DataType::C64 | DataType::C128 => context
+                .dense_elements_attribute_from_raw_buffer(tensor_type, self.logical_bytes().as_slice())
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
             DataType::Token
             | DataType::Zero
             | DataType::I1
@@ -5149,9 +5105,45 @@ impl MlirLowerableValue for CpuArray {
         L: Copy + Location<'c, 't>,
     {
         let value_type = self.r#type().into_owned();
-        if value_type.is_scalar() {
+        if value_type.is_scalar() && !value_type.data_type().is_complex() {
             // A scalar array has exactly one value by construction.
-            let value = self.values().first().copied().unwrap();
+            let value = match value_type.data_type() {
+                DataType::Boolean => Scalar::Bool(self.elements::<bool>().unwrap()[0]),
+                DataType::I8 => Scalar::I8(self.elements::<i8>().unwrap()[0]),
+                DataType::I16 => Scalar::I16(self.elements::<i16>().unwrap()[0]),
+                DataType::I32 => Scalar::I32(self.elements::<i32>().unwrap()[0]),
+                DataType::I64 => Scalar::I64(self.elements::<i64>().unwrap()[0]),
+                DataType::U8 => Scalar::U8(self.elements::<u8>().unwrap()[0]),
+                DataType::U16 => Scalar::U16(self.elements::<u16>().unwrap()[0]),
+                DataType::U32 => Scalar::U32(self.elements::<u32>().unwrap()[0]),
+                DataType::U64 => Scalar::U64(self.elements::<u64>().unwrap()[0]),
+                DataType::F4E2M1FN
+                | DataType::F6E2M3FN
+                | DataType::F6E3M2FN
+                | DataType::F8E3M4
+                | DataType::F8E4M3
+                | DataType::F8E4M3FN
+                | DataType::F8E4M3FNUZ
+                | DataType::F8E4M3B11FNUZ
+                | DataType::F8E5M2
+                | DataType::F8E5M2FNUZ
+                | DataType::F8E8M0FNU => {
+                    Scalar::from_low_precision_float_bits(value_type.data_type(), self.logical_bytes()[0]).unwrap()
+                }
+                DataType::BF16 => Scalar::BF16(self.elements::<half::bf16>().unwrap()[0]),
+                DataType::F16 => Scalar::F16(self.elements::<half::f16>().unwrap()[0]),
+                DataType::F32 => Scalar::F32(self.elements::<f32>().unwrap()[0]),
+                DataType::F64 => Scalar::F64(self.elements::<f64>().unwrap()[0]),
+                DataType::C64 | DataType::C128 => unreachable!(),
+                DataType::Token
+                | DataType::Zero
+                | DataType::I1
+                | DataType::I2
+                | DataType::I4
+                | DataType::U1
+                | DataType::U2
+                | DataType::U4 => return Err(LoweringError::UnsupportedDataType { data_type: value_type.data_type() }),
+            };
             let scalar_type = ArrayType::scalar(value_type.data_type());
             let scalar_tensor_type = lower_tensor_type(&scalar_type, context, location)?;
             let constant =
@@ -8664,7 +8656,51 @@ mod tests {
     /// Creates a rank-one literal whose element type is inferred from its homogeneous scalar payload.
     fn test_literal(values: Vec<Scalar>) -> CpuArray {
         let data_type = values.first().unwrap().r#type().into_owned();
-        CpuArray::new(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(values.len())])), values).unwrap()
+        let element_count = values.len();
+        let mut bytes = Vec::new();
+        for value in values {
+            assert_eq!(value.r#type().as_ref(), &data_type);
+            match value {
+                Scalar::Token | Scalar::Zero => {}
+                Scalar::Bool(value) => bytes.push(u8::from(value)),
+                Scalar::I8(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Scalar::I16(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Scalar::I32(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Scalar::I64(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Scalar::U8(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Scalar::U16(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Scalar::U32(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Scalar::U64(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Scalar::F4E2M1FN(value)
+                | Scalar::F6E2M3FN(value)
+                | Scalar::F6E3M2FN(value)
+                | Scalar::F8E3M4(value)
+                | Scalar::F8E4M3(value)
+                | Scalar::F8E4M3FN(value)
+                | Scalar::F8E4M3FNUZ(value)
+                | Scalar::F8E4M3B11FNUZ(value)
+                | Scalar::F8E5M2(value)
+                | Scalar::F8E5M2FNUZ(value)
+                | Scalar::F8E8M0FNU(value) => bytes.push(value),
+                Scalar::BF16(value) => bytes.extend_from_slice(&value.to_bits().to_le_bytes()),
+                Scalar::F16(value) => bytes.extend_from_slice(&value.to_bits().to_le_bytes()),
+                Scalar::F32(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Scalar::F64(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Scalar::C64(value) => {
+                    bytes.extend_from_slice(&value.re.to_le_bytes());
+                    bytes.extend_from_slice(&value.im.to_le_bytes());
+                }
+                Scalar::C128(value) => {
+                    bytes.extend_from_slice(&value.re.to_le_bytes());
+                    bytes.extend_from_slice(&value.im.to_le_bytes());
+                }
+            }
+        }
+        CpuArray::from_logical_bytes(
+            ArrayType::new(data_type, Shape::new(vec![Dimension::Static(element_count)])),
+            &bytes,
+        )
+        .unwrap()
     }
 
     /// Copies the exact raw storage bytes from the MLIR dense attribute built for `literal`.
@@ -14465,7 +14501,7 @@ mod tests {
     #[test]
     fn test_rank_positive_literal_constant_preserves_signed_zero_elements() {
         let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
-        let literal = CpuArray::new(test_vector_type(2), vec![Scalar::from(-0.0_f32), Scalar::from(0.0_f32)]).unwrap();
+        let literal = CpuArray::from_elements(test_vector_type(2), &[-0.0_f32, 0.0]).unwrap();
         let output = context.bind(ConstantOperation::new(literal), Vec::new(), &[]).unwrap().remove(0);
         let program = context
             .builder()
@@ -14481,7 +14517,7 @@ mod tests {
 
         // A rank-positive one-element literal remains an ordinary shaped dense constant rather than being rewritten
         // as a rank-zero constant plus broadcast.
-        let literal = CpuArray::new(test_vector_type(1), vec![Scalar::from(2.5_f32)]).unwrap();
+        let literal = CpuArray::from_elements(test_vector_type(1), &[2.5_f32]).unwrap();
         let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
         let output = builder
             .add_instruction(ArrayOperation::Constant(ConstantOperation::new(literal)), Vec::new(), Vec::new())
@@ -14613,11 +14649,10 @@ mod tests {
         let tensor_type = context
             .tensor_type(context.signless_integer_type(1), &[MlirSize::Static(2)], None, location)
             .unwrap();
-        for (data_type, values) in
-            [(DataType::Zero, vec![Scalar::Zero, Scalar::Zero]), (DataType::Token, vec![Scalar::Token, Scalar::Token])]
-        {
+        for data_type in [DataType::Zero, DataType::Token] {
             let literal =
-                CpuArray::new(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)])), values).unwrap();
+                CpuArray::from_logical_bytes(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)])), &[])
+                    .unwrap();
             assert_eq!(
                 literal.to_dense_elements_attribute(tensor_type, &context),
                 Err(LoweringError::UnsupportedDataType { data_type }),

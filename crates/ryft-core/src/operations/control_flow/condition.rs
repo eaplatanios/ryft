@@ -1353,7 +1353,6 @@ mod tests {
     use std::borrow::Cow;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
@@ -1794,7 +1793,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let outputs = evaluation.program.interpret(inputs).unwrap();
-        assert_eq!(outputs[0].values(), &[Scalar::I32(0)]);
+        assert_eq!(outputs[0].elements::<i32>(), Ok(vec![0]));
     }
 
     #[test]
@@ -2092,13 +2091,13 @@ mod tests {
         // before selecting between the `[2, 3]` branch values.
         let output = batch_vector_condition(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(output.batch_axis(), BatchAxis::new(0));
-        assert_eq!(output.value().values(), &[2.0, 4.0, 6.0, 12.0, 15.0, 18.0]);
+        assert_eq!(output.value().to_f64s(), vec![2.0, 4.0, 6.0, 12.0, 15.0, 18.0]);
 
         // Equal batch and item sizes previously allowed trailing-axis broadcasting to select columns rather than
         // rows. Pin the row-wise result explicitly.
         let output = batch_vector_condition(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(output.batch_axis(), BatchAxis::new(0));
-        assert_eq!(output.value().values(), &[2.0, 4.0, 9.0, 12.0]);
+        assert_eq!(output.value().to_f64s(), vec![2.0, 4.0, 9.0, 12.0]);
     }
 
     #[test]
@@ -2126,7 +2125,7 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].batch().value().values(), &[10.0, 20.0, 30.0, 12.0, 15.0, 18.0]);
+        assert_eq!(outputs[0].batch().value().to_f64s(), vec![10.0, 20.0, 30.0, 12.0, 15.0, 18.0]);
     }
 
     /// Effectful branches cannot be batched under a batch-varying predicate: both branches would run for the whole
@@ -2220,7 +2219,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(primal, Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
-        assert_eq!(tangent, Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
+        assert_eq!(tangent, Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap());
     }
 
     #[test]
@@ -2229,13 +2228,13 @@ mod tests {
 
         let forward = context.jacobian_forward(stage_runtime_predicate_condition, Array::scalar(4.0)).unwrap();
         let reverse = context.jacobian_reverse(stage_runtime_predicate_condition, Array::scalar(4.0)).unwrap();
-        assert_eq!(forward.iter_blocks().next().unwrap().value().values(), &[2.0]);
-        assert_eq!(reverse.iter_blocks().next().unwrap().value().values(), &[2.0]);
+        assert_eq!(forward.iter_blocks().next().unwrap().value().to_f64s(), vec![2.0]);
+        assert_eq!(reverse.iter_blocks().next().unwrap().value().to_f64s(), vec![2.0]);
 
         let forward = context.jacobian_forward(stage_runtime_predicate_condition, Array::scalar(-4.0)).unwrap();
         let reverse = context.jacobian_reverse(stage_runtime_predicate_condition, Array::scalar(-4.0)).unwrap();
-        assert_eq!(forward.iter_blocks().next().unwrap().value().values(), &[3.0]);
-        assert_eq!(reverse.iter_blocks().next().unwrap().value().values(), &[3.0]);
+        assert_eq!(forward.iter_blocks().next().unwrap().value().to_f64s(), vec![3.0]);
+        assert_eq!(reverse.iter_blocks().next().unwrap().value().to_f64s(), vec![3.0]);
     }
 
     #[test]
@@ -2255,7 +2254,7 @@ mod tests {
             .unwrap();
         let cotangents = pullback.apply(Array::scalar(5.0)).unwrap();
         assert_eq!(output.to_f64s(), vec![8.0]);
-        assert_eq!(cotangents.0.values(), &[Scalar::Zero]);
+        assert!(cotangents.0.storage_bytes().is_empty());
         assert_eq!(cotangents.1.to_f64s(), vec![10.0]);
 
         let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
@@ -2273,7 +2272,7 @@ mod tests {
             .unwrap();
         let cotangents = pullback.apply(Array::scalar(5.0)).unwrap();
         assert_eq!(output.to_f64s(), vec![12.0]);
-        assert_eq!(cotangents.0.values(), &[Scalar::Zero]);
+        assert!(cotangents.0.storage_bytes().is_empty());
         assert_eq!(cotangents.1.to_f64s(), vec![15.0]);
     }
 }

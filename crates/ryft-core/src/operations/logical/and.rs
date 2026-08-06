@@ -95,8 +95,8 @@ mod tests {
         // Check elementwise and scalar-broadcast eager value semantics.
         let left = Array::vector(vec![true, true, false, false]);
         let right = Array::vector(vec![true, false, true, false]);
-        assert_eq!((left & right).values(), &[true, false, false, false]);
-        assert_eq!((Array::vector(vec![true, false]) & Array::scalar(true)).values(), &[true, false]);
+        assert_eq!((left & right).elements::<bool>(), Ok(vec![true, false, false, false]));
+        assert_eq!((Array::vector(vec![true, false]) & Array::scalar(true)).elements::<bool>(), Ok(vec![true, false]));
 
         // Check the shared elementwise type-inference contract in both type universes.
         check_operation_type_inference!(

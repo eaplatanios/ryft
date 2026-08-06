@@ -628,7 +628,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::jacobian::jacobian_forward;
     use crate::operations::math::Sin;
     use crate::parameters::{ParameterPath, Parameterized};
@@ -679,17 +678,17 @@ mod tests {
             hessian(|(x, y)| Ok(x.clone() * y + x.sin()?), (Array::scalar(2.0), Array::scalar(3.0))).unwrap();
         let blocks = scalar_hessian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 4);
-        assert_abs_diff_eq!(blocks[0].value().values()[0], -2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[1].value().values()[0], 1.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[2].value().values()[0], 1.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[3].value().values()[0], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], -2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[2].value().to_f64s()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[3].value().to_f64s()[0], 0.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Hessian blocks.
         let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
         let widened_hessian = hessian(|value| value.sin(), input).unwrap();
         let block = widened_hessian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
-        assert_abs_diff_eq!(block.value().values()[0], -2.0f64.sin(), epsilon = 1e-6);
+        assert_abs_diff_eq!(block.value().to_f64s()[0], -2.0f64.sin(), epsilon = 1e-6);
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
@@ -697,7 +696,7 @@ mod tests {
             hessian(|input| Ok(input.clone() * input), Array::from_f64s(r#type, Vec::new())).unwrap();
         let block = zero_sized_hessian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().static_shape().unwrap().as_slice(), &[0, 0, 0]);
-        assert!(block.value().values().is_empty());
+        assert!(block.value().storage_bytes().is_empty());
 
         // Structured outputs retain a distinct Hessian block for each output leaf.
         let structured_hessian =
@@ -707,9 +706,9 @@ mod tests {
         assert_eq!(blocks[0].output_path().to_string(), "$.0");
         assert_eq!(blocks[0].first_input_path().to_string(), "$");
         assert_eq!(blocks[0].second_input_path().to_string(), "$");
-        assert_abs_diff_eq!(blocks[0].value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 2.0, epsilon = 1e-9);
         assert_eq!(blocks[1].output_path().to_string(), "$.1");
-        assert_abs_diff_eq!(blocks[1].value().values()[0], 12.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 12.0, epsilon = 1e-9);
 
         // Mixed-rank structured inputs materialize the entire block Cartesian product with output axes leading both
         // input-axis groups.
@@ -724,31 +723,31 @@ mod tests {
         assert_eq!(blocks[0].first_input_path().to_string(), "$.0");
         assert_eq!(blocks[0].second_input_path().to_string(), "$.0");
         assert_eq!(blocks[0].value().r#type().static_shape().unwrap().as_slice(), &[2, 2, 2]);
-        assert_eq!(blocks[0].value().values(), &[2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0]);
+        assert_eq!(blocks[0].value().to_f64s(), vec![2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0]);
         assert_eq!(blocks[1].value().r#type().static_shape().unwrap().as_slice(), &[2, 2]);
-        assert_eq!(blocks[1].value().values(), &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(blocks[1].value().to_f64s(), vec![0.0, 0.0, 0.0, 0.0]);
         assert_eq!(blocks[2].value().r#type().static_shape().unwrap().as_slice(), &[2, 2]);
-        assert_eq!(blocks[2].value().values(), &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(blocks[2].value().to_f64s(), vec![0.0, 0.0, 0.0, 0.0]);
         assert_eq!(blocks[3].value().r#type().static_shape().unwrap().as_slice(), &[2]);
-        assert_eq!(blocks[3].value().values(), &[0.0, 0.0]);
+        assert_eq!(blocks[3].value().to_f64s(), vec![0.0, 0.0]);
         assert_eq!(blocks[4].output_path().to_string(), "$.1");
         assert_eq!(blocks[4].value().r#type().static_shape().unwrap().as_slice(), &[2, 2]);
-        assert_eq!(blocks[4].value().values(), &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(blocks[4].value().to_f64s(), vec![0.0, 0.0, 0.0, 0.0]);
         assert_eq!(blocks[5].value().r#type().static_shape().unwrap().as_slice(), &[2]);
-        assert_eq!(blocks[5].value().values(), &[0.0, 0.0]);
+        assert_eq!(blocks[5].value().to_f64s(), vec![0.0, 0.0]);
         assert_eq!(blocks[6].value().r#type().static_shape().unwrap().as_slice(), &[2]);
-        assert_eq!(blocks[6].value().values(), &[0.0, 0.0]);
+        assert_eq!(blocks[6].value().to_f64s(), vec![0.0, 0.0]);
         assert_eq!(blocks[7].first_input_path().to_string(), "$.1");
         assert_eq!(blocks[7].second_input_path().to_string(), "$.1");
         assert!(blocks[7].value().r#type().static_shape().unwrap().as_slice().is_empty());
-        assert_eq!(blocks[7].value().values(), &[2.0]);
+        assert_eq!(blocks[7].value().to_f64s(), vec![2.0]);
 
         // Holomorphic Hessians remain complex linear at both derivative levels.
-        let input = Array::scalar(Scalar::C64(ComplexNumber::new(2.0, 1.0)));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
         let holomorphic_hessian = hessian_holomorphic(|x| Ok(x.clone() * x.clone() * x), input).unwrap();
         assert_eq!(
-            holomorphic_hessian.iter_blocks().next().unwrap().value().values(),
-            &[Scalar::C64(ComplexNumber::new(12.0, 6.0))],
+            holomorphic_hessian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(12.0, 6.0)]),
         );
     }
 
@@ -764,17 +763,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(evaluations.get(), 1);
-        assert_abs_diff_eq!(ordinary_hessian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
-        assert_eq!(auxiliary.values(), &[2.0]);
+        assert_abs_diff_eq!(ordinary_hessian.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
+        assert_eq!(auxiliary.to_f64s(), vec![2.0]);
 
-        let input = Array::scalar(Scalar::C64(ComplexNumber::new(2.0, 1.0)));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
         let (holomorphic_hessian, auxiliary) =
             hessian_holomorphic_with_aux(|x| Ok((x.clone() * x.clone() * x.clone(), x)), input.clone()).unwrap();
         assert_eq!(
-            holomorphic_hessian.iter_blocks().next().unwrap().value().values(),
-            &[Scalar::C64(ComplexNumber::new(12.0, 6.0))],
+            holomorphic_hessian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(12.0, 6.0)]),
         );
-        assert_eq!(auxiliary.values(), input.values());
+        assert_eq!(auxiliary, input);
     }
 
     #[test]
@@ -793,6 +792,6 @@ mod tests {
             Array::scalar(2.0),
         )
         .unwrap();
-        assert_abs_diff_eq!(derivative.iter_blocks().next().unwrap().value().values()[0], 6.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(derivative.iter_blocks().next().unwrap().value().to_f64s()[0], 6.0, epsilon = 1e-9);
     }
 }

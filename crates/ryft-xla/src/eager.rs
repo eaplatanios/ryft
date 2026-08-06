@@ -290,7 +290,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::backends::arrays::Array as CpuArray;
-    use ryft_core::backends::scalars::Scalar;
     use ryft_core::batching::{BatchAxis, batch};
     use ryft_core::contexts::ProjectedContext;
     use ryft_core::differentiation::hessian::HessianDifferentiate;
@@ -546,13 +545,7 @@ mod tests {
         // the reference backend's encoded bits bit for bit.
         let converted = left.convert_element_type(DataType::F8E4M3FN).unwrap();
         let converted_bytes = shard_host_bytes(&converted.addressable_shards().next().unwrap()).unwrap();
-        let reference_bits = reference_left
-            .convert_element_type(DataType::F8E4M3FN)
-            .unwrap()
-            .values()
-            .iter()
-            .map(|value| value.low_precision_float_bits().unwrap())
-            .collect::<Vec<_>>();
+        let reference_bits = reference_left.convert_element_type(DataType::F8E4M3FN).unwrap().logical_bytes();
         assert_eq!(converted_bytes, reference_bits);
 
         // Selection agrees.
@@ -579,22 +572,14 @@ mod tests {
             values_to_bytes::<i32>(&integer_values).as_slice(),
         )
         .unwrap();
-        let reference_integer = CpuArray::new(
+        let reference_integer = CpuArray::from_elements(
             ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(integer_values.len())])),
-            integer_values.iter().copied().map(Scalar::I32).collect(),
+            &integer_values,
         )
         .unwrap();
         for kind in [ReductionKind::Sum, ReductionKind::Mean, ReductionKind::Max, ReductionKind::Min] {
             let device_values = read_i32s(&integer.reduce(&[0], kind));
-            let reference_values = reference_integer
-                .reduce(&[0], kind)
-                .values()
-                .iter()
-                .map(|value| match value {
-                    Scalar::I32(value) => *value,
-                    other => panic!("expected an i32 reduction result but got {other:?}"),
-                })
-                .collect::<Vec<_>>();
+            let reference_values = reference_integer.reduce(&[0], kind).elements::<i32>().unwrap();
             assert_eq!(device_values, reference_values, "integer '{kind}' reduction disagrees");
         }
 
@@ -606,9 +591,7 @@ mod tests {
         let device_product = read_c64s(&complex_left.mul(&complex_right).unwrap())[0];
         let reference_product =
             CpuArray::scalar(complex_left_value).mul(&CpuArray::scalar(complex_right_value)).unwrap();
-        let Scalar::C64(reference_product) = reference_product.values()[0] else {
-            panic!("expected a c64 reference product");
-        };
+        let reference_product = reference_product.elements::<num_complex::Complex<f32>>().unwrap()[0];
         assert!((device_product - reference_product).norm() < 1e-5);
     }
 
@@ -811,9 +794,9 @@ mod tests {
         .unwrap();
         let secondary = f32_vector(&client, &mesh, &secondary_values);
         let passenger = f32_vector(&client, &mesh, &passenger_values);
-        let reference_primary = CpuArray::new(
+        let reference_primary = CpuArray::from_elements(
             ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(primary_values.len())])),
-            primary_values.iter().copied().map(Scalar::I32).collect(),
+            &primary_values,
         )
         .unwrap();
         let reference_secondary = CpuArray::vector(secondary_values.iter().map(|value| f64::from(*value)).collect());
@@ -880,9 +863,9 @@ mod tests {
             values_to_bytes::<u64>(&state_values).as_slice(),
         )
         .unwrap();
-        let reference_state = CpuArray::new(
+        let reference_state = CpuArray::from_elements(
             ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)])),
-            state_values.iter().copied().map(Scalar::U64).collect(),
+            &state_values,
         )
         .unwrap();
 
@@ -894,14 +877,7 @@ mod tests {
         let device_words = values_from_bytes::<u32>(
             shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
         );
-        let reference_words = reference_bits
-            .values()
-            .iter()
-            .map(|value| match value {
-                Scalar::U32(word) => *word,
-                _ => panic!("expected u32 reference bits"),
-            })
-            .collect::<Vec<_>>();
+        let reference_words = reference_bits.elements::<u32>().unwrap();
         assert_eq!(device_words, reference_words);
         // Generating five `u32` words runs three cipher invocations, and the counter advances by that invocation
         // count (`7 + 3 = 10`).
@@ -909,7 +885,7 @@ mod tests {
             shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
         );
         assert_eq!(device_state_words, vec![42u64, 10u64]);
-        assert_eq!(reference_new_state.values(), &[Scalar::U64(42), Scalar::U64(10)]);
+        assert_eq!(reference_new_state.elements::<u64>().unwrap(), vec![42, 10]);
 
         let u64_output_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]));
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u64_output_type).unwrap();
@@ -918,28 +894,11 @@ mod tests {
         let device_state_words = values_from_bytes::<u64>(
             shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
         );
-        assert_eq!(
-            device_state_words,
-            reference_new_state
-                .values()
-                .iter()
-                .map(|value| match value {
-                    Scalar::U64(word) => *word,
-                    _ => panic!("expected a u64 reference state"),
-                })
-                .collect::<Vec<_>>(),
-        );
+        assert_eq!(device_state_words, reference_new_state.elements::<u64>().unwrap(),);
         let device_words = values_from_bytes::<u64>(
             shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
         );
-        let reference_words = reference_bits
-            .values()
-            .iter()
-            .map(|value| match value {
-                Scalar::U64(word) => *word,
-                _ => panic!("expected u64 reference bits"),
-            })
-            .collect::<Vec<_>>();
+        let reference_words = reference_bits.elements::<u64>().unwrap();
         assert_eq!(device_words, reference_words);
     }
 
@@ -963,9 +922,9 @@ mod tests {
             values_to_bytes::<u64>(&state_values).as_slice(),
         )
         .unwrap();
-        let reference_state = CpuArray::new(
+        let reference_state = CpuArray::from_elements(
             ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)])),
-            state_values.iter().copied().map(Scalar::U64).collect(),
+            &state_values,
         )
         .unwrap();
 
@@ -977,14 +936,7 @@ mod tests {
         let device_words = values_from_bytes::<u32>(
             shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
         );
-        let reference_words = reference_bits
-            .values()
-            .iter()
-            .map(|value| match value {
-                Scalar::U32(word) => *word,
-                _ => panic!("expected u32 reference bits"),
-            })
-            .collect::<Vec<_>>();
+        let reference_words = reference_bits.elements::<u32>().unwrap();
         assert_eq!(device_words, reference_words);
         // Generating five `u32` words runs two cipher invocations, and the low counter half advances by that
         // invocation count (`7 + 2 = 9`) while the key and high counter half are unchanged.
@@ -992,7 +944,7 @@ mod tests {
             shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
         );
         assert_eq!(device_state_words, vec![42u64, 9u64, 9u64]);
-        assert_eq!(reference_new_state.values(), &[Scalar::U64(42), Scalar::U64(9), Scalar::U64(9)]);
+        assert_eq!(reference_new_state.elements::<u64>().unwrap(), vec![42, 9, 9]);
 
         let u64_output_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]));
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u64_output_type).unwrap();
@@ -1001,28 +953,11 @@ mod tests {
         let device_state_words = values_from_bytes::<u64>(
             shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
         );
-        assert_eq!(
-            device_state_words,
-            reference_new_state
-                .values()
-                .iter()
-                .map(|value| match value {
-                    Scalar::U64(word) => *word,
-                    _ => panic!("expected a u64 reference state"),
-                })
-                .collect::<Vec<_>>(),
-        );
+        assert_eq!(device_state_words, reference_new_state.elements::<u64>().unwrap(),);
         let device_words = values_from_bytes::<u64>(
             shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
         );
-        let reference_words = reference_bits
-            .values()
-            .iter()
-            .map(|value| match value {
-                Scalar::U64(word) => *word,
-                _ => panic!("expected u64 reference bits"),
-            })
-            .collect::<Vec<_>>();
+        let reference_words = reference_bits.elements::<u64>().unwrap();
         assert_eq!(device_words, reference_words);
     }
 
@@ -1047,9 +982,9 @@ mod tests {
             values_to_bytes::<u64>(&state_values).as_slice(),
         )
         .unwrap();
-        let reference_state = CpuArray::new(
+        let reference_state = CpuArray::from_elements(
             ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)])),
-            state_values.iter().copied().map(Scalar::U64).collect(),
+            &state_values,
         )
         .unwrap();
 
@@ -1082,7 +1017,7 @@ mod tests {
         let (_, device_samples) = state.categorical(&device_logits, 0).unwrap();
         let (_, reference_samples) = reference_state.categorical(&reference_logits, 0).unwrap();
         assert_eq!(read_i32s(&device_samples), vec![1]);
-        assert_eq!(reference_samples.values(), &[Scalar::I32(1)]);
+        assert_eq!(reference_samples.elements::<i32>().unwrap(), vec![1]);
 
         let (_, device_keys) = state.split_key(2).unwrap();
         let (_, reference_keys) = reference_state.split_key(2).unwrap();
@@ -1090,14 +1025,7 @@ mod tests {
             let device_words = values_from_bytes::<u64>(
                 shard_host_bytes(&device_key.addressable_shards().next().unwrap()).unwrap().as_slice(),
             );
-            let reference_words = reference_key
-                .values()
-                .iter()
-                .map(|value| match value {
-                    Scalar::U64(word) => *word,
-                    _ => panic!("expected u64 key words"),
-                })
-                .collect::<Vec<_>>();
+            let reference_words = reference_key.elements::<u64>().unwrap();
             assert_eq!(device_words, reference_words);
         }
     }
@@ -1119,16 +1047,8 @@ mod tests {
         let rhs_values = [1.0f64, 0.5, 0.5, 1.0];
         let reference_lhs = CpuArray::from_f64s(operand_type.clone(), lhs_values.to_vec());
         let reference_rhs = CpuArray::from_f64s(operand_type.clone(), rhs_values.to_vec());
-        let lhs_bytes = reference_lhs
-            .values()
-            .iter()
-            .map(|value| value.low_precision_float_bits().unwrap())
-            .collect::<Vec<_>>();
-        let rhs_bytes = reference_rhs
-            .values()
-            .iter()
-            .map(|value| value.low_precision_float_bits().unwrap())
-            .collect::<Vec<_>>();
+        let lhs_bytes = reference_lhs.logical_bytes();
+        let rhs_bytes = reference_rhs.logical_bytes();
         let device_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 2]);
         let lhs = Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), lhs_bytes.as_slice()).unwrap();
         let rhs = Array::from_host_buffer(&client, device_type, mesh.clone(), rhs_bytes.as_slice()).unwrap();
@@ -1165,13 +1085,7 @@ mod tests {
         let reference_rhs = CpuArray::from_f64s(element_type.clone(), element_values(3));
         let reference_lhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![0.5, 2.0]);
         let reference_rhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![2.0, 0.5]);
-        let bits = |reference: &CpuArray| {
-            reference
-                .values()
-                .iter()
-                .map(|value| value.low_precision_float_bits().unwrap())
-                .collect::<Vec<u8>>()
-        };
+        let bits = CpuArray::logical_bytes;
         let device_element_type = replicated_type(&mesh, DataType::F4E2M1FN, &[2, 16]);
         let device_scale_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 1]);
         let lhs = Array::from_host_buffer(

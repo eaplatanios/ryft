@@ -357,12 +357,12 @@ mod tests {
         assert_eq!(Scalar::from(2.0f32).greater_than(&Scalar::from(3.0f32)).unwrap(), Scalar::from(false));
         let left = || Array::vector(vec![1.0, 2.0, 3.0]);
         let right = || Array::vector(vec![2.0, 2.0, 2.0]);
-        assert_eq!(left().equal(&right()).unwrap().values(), &[false, true, false]);
-        assert_eq!(left().not_equal(&right()).unwrap().values(), &[true, false, true]);
-        assert_eq!(left().less_than(&right()).unwrap().values(), &[true, false, false]);
-        assert_eq!(left().less_than_or_equal(&right()).unwrap().values(), &[true, true, false]);
-        assert_eq!(left().greater_than(&right()).unwrap().values(), &[false, false, true]);
-        assert_eq!(left().greater_than_or_equal(&right()).unwrap().values(), &[false, true, true]);
+        assert_eq!(left().equal(&right()).unwrap().elements::<bool>(), Ok(vec![false, true, false]));
+        assert_eq!(left().not_equal(&right()).unwrap().elements::<bool>(), Ok(vec![true, false, true]));
+        assert_eq!(left().less_than(&right()).unwrap().elements::<bool>(), Ok(vec![true, false, false]));
+        assert_eq!(left().less_than_or_equal(&right()).unwrap().elements::<bool>(), Ok(vec![true, true, false]));
+        assert_eq!(left().greater_than(&right()).unwrap().elements::<bool>(), Ok(vec![false, false, true]));
+        assert_eq!(left().greater_than_or_equal(&right()).unwrap().elements::<bool>(), Ok(vec![false, true, true]));
 
         let left = DimensionValue::constant(3).unwrap();
         let right = DimensionValue::constant(5).unwrap();

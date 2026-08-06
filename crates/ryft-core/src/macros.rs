@@ -4421,7 +4421,7 @@ macro_rules! check_gradient {
         };
 
         let input_type = $crate::programs::types::Typed::r#type(&input).into_owned();
-        let element_count = input.values().len();
+        let element_count = $crate::backends::arrays::Array::materialized_element_count(&input_type).unwrap();
         match input_type.data_type() {
             $crate::types::DataType::F64 => {
                 let perturbed = |index: usize, delta: f64| {
@@ -4438,23 +4438,32 @@ macro_rules! check_gradient {
             $crate::types::DataType::C128 => {
                 // Per input element, the two central differences estimate the real partials that assemble the
                 // conjugate steepest-ascent gradient `complex(∂f/∂re, -∂f/∂im)`.
-                let (real_step, imaginary_step) = $crate::check_gradient!(@complex_perturbation_steps(step));
-                let perturbed = |index: usize, delta: $crate::backends::scalars::Scalar| {
-                    let mut values = input.values().to_vec();
-                    values[index] = values[index] + delta;
-                    $crate::backends::arrays::Array::new(input_type.clone(), values).unwrap()
+                let part_type = input_type.clone().with_data_type($crate::types::DataType::F64);
+                let real_values = $crate::operations::complex::Real::real(&input).unwrap().to_f64s();
+                let imaginary_values = $crate::operations::complex::Imaginary::imaginary(&input).unwrap().to_f64s();
+                let perturbed = |index: usize, real_delta: f64, imaginary_delta: f64| {
+                    let mut real_values = real_values.clone();
+                    let mut imaginary_values = imaginary_values.clone();
+                    real_values[index] += real_delta;
+                    imaginary_values[index] += imaginary_delta;
+                    $crate::operations::complex::Complex::complex(
+                        &$crate::backends::arrays::Array::from_f64s(part_type.clone(), real_values),
+                        &$crate::backends::arrays::Array::from_f64s(part_type.clone(), imaginary_values),
+                    )
+                    .unwrap()
                 };
                 let mut real_estimates = Vec::with_capacity(element_count);
                 let mut imaginary_estimates = Vec::with_capacity(element_count);
                 for index in 0..element_count {
-                    real_estimates
-                        .push(central_difference(perturbed(index, real_step), perturbed(index, -real_step)));
+                    real_estimates.push(central_difference(
+                        perturbed(index, step, 0.0),
+                        perturbed(index, -step, 0.0),
+                    ));
                     imaginary_estimates.push(-central_difference(
-                        perturbed(index, imaginary_step),
-                        perturbed(index, -imaginary_step),
+                        perturbed(index, 0.0, step),
+                        perturbed(index, 0.0, -step),
                     ));
                 }
-                let part_type = input_type.clone().with_data_type($crate::types::DataType::F64);
                 let estimate = $crate::operations::complex::Complex::complex(
                     &$crate::backends::arrays::Array::from_f64s(part_type.clone(), real_estimates),
                     &$crate::backends::arrays::Array::from_f64s(part_type, imaginary_estimates),

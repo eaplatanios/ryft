@@ -970,10 +970,15 @@ mod tests {
         ] {
             let data_type = values[0].r#type().into_owned();
             let expected_values = [0, 3, 1, 4, 2, 5].map(|index| values[index]).to_vec();
-            let input = Array::new(ArrayType::new(data_type, Shape::new(vec![2.into(), 3.into()])), values).unwrap();
+            let input =
+                Array::from_scalar_values(ArrayType::new(data_type, Shape::new(vec![2.into(), 3.into()])), values)
+                    .unwrap();
             assert_eq!(
                 input.transpose([1, 0]),
-                Array::new(ArrayType::new(data_type, Shape::new(vec![3.into(), 2.into()])), expected_values),
+                Array::from_scalar_values(
+                    ArrayType::new(data_type, Shape::new(vec![3.into(), 2.into()])),
+                    expected_values,
+                ),
             );
         }
 

@@ -2337,7 +2337,7 @@ mod tests {
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
             assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), physical_sharding.dimensions(),);
             assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(0), Dimension::Static(3)]);
-            assert!(outputs[0].value().values().is_empty());
+            assert!(outputs[0].value().storage_bytes().is_empty());
         }
     }
 }

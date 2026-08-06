@@ -1330,7 +1330,7 @@ mod tests {
             let index = builder
                 .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new())
                 .unwrap()[0];
-            let tangent = builder.add_constant(Array::scalar(Scalar::Zero));
+            let tangent = builder.add_constant(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap());
             builder.build(vec![index, tangent], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
         };
         let regions = vec![primal, jvp];
@@ -1346,7 +1346,7 @@ mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value(), &Array::vector(vec![Scalar::U64(0), Scalar::U64(1), Scalar::U64(2)]));
+        assert_eq!(outputs[0].value(), &Array::vector(vec![0u64, 1, 2]));
     }
 
     #[test]
@@ -1762,10 +1762,10 @@ mod tests {
         )
         .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
-        assert_abs_diff_eq!(block.value().values()[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[3], 3.0 * 1.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[1], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[2], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[3], 3.0 * 1.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]

@@ -3228,7 +3228,7 @@ mod tests {
         let block = hessian.iter_blocks().next().unwrap();
         let x: f64 = 0.7;
         assert_abs_diff_eq!(
-            block.value().values()[0],
+            block.value().to_f64s()[0],
             2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(),
             epsilon = 1e-9
         );
@@ -3289,10 +3289,10 @@ mod tests {
         let jacobian =
             jacobian_reverse(|x| function.call(x), Array::from_f64s(vector_type(2), vec![0.5, 1.0])).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
-        assert_abs_diff_eq!(block.value().values()[0], 0.25f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[3], 1.0f64.cos() * 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[0], 0.25f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[1], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[2], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[3], 1.0f64.cos() * 2.0, epsilon = 1e-9);
     }
 
     /// Canonical offload destination used by the offloading policy tests.

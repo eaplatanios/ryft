@@ -1326,7 +1326,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::batching::{Batch, BatchingTracer, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::{ForwardModeDifferentiate, LinearizationTracer};
@@ -1791,7 +1790,7 @@ mod tests {
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
             assert_eq!(outputs[0].r#type(), Cow::Borrowed(&sharded_type));
-            assert_eq!(outputs[0].value().values(), &[11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
+            assert_eq!(outputs[0].value().to_f64s(), vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
         }
     }
 
@@ -2054,7 +2053,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.r#type(), Cow::Borrowed(&sharded_type));
-        assert_eq!(output.values(), &[3.0, 4.0]);
+        assert_eq!(output.to_f64s(), vec![3.0, 4.0]);
     }
 
     #[test]
@@ -2219,7 +2218,7 @@ mod tests {
                 DataType::F64,
                 Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
             ),
-            vec![Scalar::F64(1.0), Scalar::F64(2.0), Scalar::F64(3.0)],
+            [1.0f64, 2.0, 3.0].into_iter().flat_map(f64::to_le_bytes).collect(),
         );
         let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
             |x| Ok(x.clone() + x),

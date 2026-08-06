@@ -42,7 +42,13 @@ use crate::types::{ArrayType, DataType};
 /// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html) data-type standard and whose
 /// rounding conversions to and from [`f32`] and [`f64`] follow [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes),
 /// the reference implementation of these formats.
-pub trait ArrayElement: private::Codec {}
+pub trait ArrayElement: private::Codec {
+    /// Returns the [`DataType`] represented by this element type.
+    #[inline]
+    fn data_type() -> DataType {
+        <Self as private::Codec>::DATA_TYPE
+    }
+}
 
 impl<T: private::Codec> ArrayElement for T {}
 

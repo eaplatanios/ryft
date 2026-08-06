@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn test_not() {
         // Check the operation-specific eager value semantics.
-        assert_eq!((!Array::vector(vec![true, false, true])).values(), &[false, true, false]);
+        assert_eq!((!Array::vector(vec![true, false, true])).elements::<bool>(), Ok(vec![false, true, false]));
 
         // Check the shared elementwise type-inference contract in both type universes.
         check_operation_type_inference!(

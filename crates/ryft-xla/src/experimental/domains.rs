@@ -5638,7 +5638,7 @@ mod tests {
         let condition = {
             let mut builder = XlaProgramBuilder::new();
             let state = builder.add_input(scalar_type.clone().into());
-            let literal = ReferenceArray::new(scalar_type.clone(), vec![Scalar::from(3.0f32)]).unwrap();
+            let literal = ReferenceArray::from_elements(scalar_type.clone(), &[3.0f32]).unwrap();
             let limit = builder.add_instruction(ConstantOperation::new(literal), Vec::new(), vec![]).unwrap()[0];
             let predicate = builder
                 .add_instruction(

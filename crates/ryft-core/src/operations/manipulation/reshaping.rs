@@ -1938,8 +1938,8 @@ mod tests {
         assert_eq!(
             scalar
                 .reshape(ReshapeParameters::from_dimension_expressions(Vec::new()))
-                .map(|output| (output.r#type().into_owned(), output.values().to_vec())),
-            Ok((scalar.r#type().into_owned(), scalar.values().to_vec())),
+                .map(|output| (output.r#type().into_owned(), output.elements::<i32>().unwrap())),
+            Ok((scalar.r#type().into_owned(), scalar.elements::<i32>().unwrap())),
         );
 
         // The transpose target is derivable when each dynamic input dimension remains individually recoverable.

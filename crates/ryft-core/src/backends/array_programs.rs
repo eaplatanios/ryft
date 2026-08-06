@@ -49,7 +49,9 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::programs::{AtomId, ProgramBuilder, ProgramError};
 use crate::sharding::Sharding;
-use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
+use crate::types::{
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape,
+};
 
 mod differentiation;
 
@@ -1003,19 +1005,42 @@ impl DimensionFromScalar<DimensionValue> for Array {
     fn to_dimension(&self, result: DimensionVariable) -> Result<DimensionValue, ProgramError> {
         let operation = DimensionFromScalarOperation::new(result);
         DimensionFromScalarOperation::validate_input_type(self.r#type().as_ref())?;
-        let scalar = self.values()[0];
-        let extent = match scalar {
-            crate::backends::scalars::Scalar::I8(value) => usize::try_from(value),
-            crate::backends::scalars::Scalar::I16(value) => usize::try_from(value),
-            crate::backends::scalars::Scalar::I32(value) => usize::try_from(value),
-            crate::backends::scalars::Scalar::I64(value) => usize::try_from(value),
-            crate::backends::scalars::Scalar::U8(value) => Ok(usize::from(value)),
-            crate::backends::scalars::Scalar::U16(value) => Ok(usize::from(value)),
-            crate::backends::scalars::Scalar::U32(value) => usize::try_from(value),
-            crate::backends::scalars::Scalar::U64(value) => usize::try_from(value),
+        let (scalar, extent) = match self.r#type().data_type() {
+            DataType::I8 => {
+                let value = self.elements::<i8>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::I16 => {
+                let value = self.elements::<i16>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::I32 => {
+                let value = self.elements::<i32>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::I64 => {
+                let value = self.elements::<i64>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::U8 => {
+                let value = self.elements::<u8>()?[0];
+                (value.to_string(), Ok(usize::from(value)))
+            }
+            DataType::U16 => {
+                let value = self.elements::<u16>()?[0];
+                (value.to_string(), Ok(usize::from(value)))
+            }
+            DataType::U32 => {
+                let value = self.elements::<u32>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::U64 => {
+                let value = self.elements::<u64>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
             _ => unreachable!("dimension_from_scalar input type is validated before reading its payload"),
-        }
-        .map_err(|_| ProgramError::InvalidArgument {
+        };
+        let extent = extent.map_err(|_| ProgramError::InvalidArgument {
             message: format!(
                 "'{}' scalar input must be a nonnegative host-representable extent but is {scalar}",
                 operation.name(),
@@ -1149,7 +1174,6 @@ mod tests {
 
     use crate::axes::NamedAxis;
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::compilation::{
@@ -1761,18 +1785,18 @@ mod tests {
     #[test]
     fn test_array_ir_value_projection() {
         let array = Array::vector((0..4096).map(|value| value as f32).collect());
-        let payload = array.values().as_ptr();
+        let payload = array.storage_bytes().as_ptr();
         let stored = ArrayIrValue::Array(array);
 
         let projected = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&stored).unwrap();
-        assert_eq!(projected.values().as_ptr(), payload);
+        assert_eq!(projected.storage_bytes().as_ptr(), payload);
         assert_eq!(
             <ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(&stored),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
 
         let projected = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(stored).unwrap();
-        assert_eq!(projected.values().as_ptr(), payload);
+        assert_eq!(projected.storage_bytes().as_ptr(), payload);
     }
 
     #[test]
@@ -2229,16 +2253,9 @@ mod tests {
         assert_eq!(
             dynamic_iota,
             vec![ArrayIrValue::Array(
-                Array::new(
+                Array::from_elements(
                     ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]),),
-                    vec![
-                        Scalar::I32(0),
-                        Scalar::I32(0),
-                        Scalar::I32(0),
-                        Scalar::I32(1),
-                        Scalar::I32(1),
-                        Scalar::I32(1),
-                    ],
+                    &[0i32, 0, 0, 1, 1, 1],
                 )
                 .unwrap(),
             )],
@@ -2248,11 +2265,8 @@ mod tests {
         let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
         let extent_program_type = extent.r#type().into_owned();
         let output = ArrayIrValue::Array(
-            Array::new(
-                ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])),
-                vec![Scalar::I32(0), Scalar::I32(1), Scalar::I32(2)],
-            )
-            .unwrap(),
+            Array::from_elements(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])), &[0i32, 1, 2])
+                .unwrap(),
         );
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
@@ -2883,7 +2897,7 @@ mod tests {
                     Ok(context.bind(OneOperation::new(dynamic_type), Vec::new(), &[extent])?.remove(0))
                 },
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
-                ArrayIrValue::Array(Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap()),
+                ArrayIrValue::Array(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()),
             )
             .unwrap();
         assert_eq!(primal, ArrayIrValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0])));
@@ -3070,9 +3084,9 @@ mod tests {
             instantiated
                 .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(caller), 3).unwrap())]),
             Ok(vec![ArrayIrValue::Array(
-                Array::new(
+                Array::from_elements(
                     ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])),
-                    vec![Scalar::I32(0), Scalar::I32(1), Scalar::I32(2)],
+                    &[0i32, 1, 2],
                 )
                 .unwrap(),
             )]),

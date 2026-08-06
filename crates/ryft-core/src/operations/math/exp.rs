@@ -167,13 +167,10 @@ mod tests {
         // The primal output stays genuinely `f8e8m0fnu`-encoded (not an `f64` pun): `exp(2) ≈ 7.39` rounds to the
         // nearest representable power of two, `8 = 2^3`, whose biased-exponent encoding is `0x82`.
         assert_eq!(primal_output.r#type().as_ref(), &ArrayType::scalar(DataType::F8E8M0FNU));
-        assert_eq!(
-            primal_output.values(),
-            &[Scalar::from_low_precision_float_bits(DataType::F8E8M0FNU, 0x82).unwrap()],
-        );
+        assert_eq!(primal_output.logical_bytes(), vec![0x82]);
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
-        assert_abs_diff_eq!(tangent.values()[0], 3.0 * 2.0f64.exp(), epsilon = 1e-6);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 * 2.0f64.exp(), epsilon = 1e-6);
 
         // The widened staged tangent program recomputes the coefficient in the widened differential representation
         // instead of converting the narrower primal output.

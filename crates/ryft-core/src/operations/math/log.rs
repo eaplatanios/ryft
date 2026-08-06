@@ -165,7 +165,7 @@ mod tests {
         let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
         let (_, tangent) = jvp(|input| input.log(), primal, input_tangent).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        assert_abs_diff_eq!(tangent.values()[0], 1.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 1.5, epsilon = 1e-9);
 
         // The widened staged tangent program divides by the input converted to the widened differential
         // representation.

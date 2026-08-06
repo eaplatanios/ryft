@@ -352,8 +352,8 @@ mod tests {
                     dimension(&extent_type, 3),
                 ],
                 vec![
-                    array(Array::new(ArrayType::scalar(DataType::Zero), vec![crate::Scalar::Zero]).unwrap()),
-                    array(Array::new(ArrayType::scalar(DataType::Zero), vec![crate::Scalar::Zero]).unwrap()),
+                    array(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()),
+                    array(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()),
                 ],
             )
             .unwrap();

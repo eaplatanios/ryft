@@ -829,7 +829,7 @@ mod tests {
 
     /// Returns a ThreeFry `[key, counter]` state array for the reference backend.
     fn state(key: u64, counter: u64) -> Array {
-        Array::new(RandomAlgorithm::ThreeFry.state_type(), vec![Scalar::U64(key), Scalar::U64(counter)]).unwrap()
+        Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[key, counter]).unwrap()
     }
 
     /// Returns the `u32[count]` bits output type used throughout these tests.
@@ -958,9 +958,9 @@ mod tests {
         )
         .unwrap();
         let (expected_words, expected_counter) = threefry_u32_words(42, 7, 5);
-        assert_eq!(outputs[0].values(), &[Scalar::U64(42), Scalar::U64(expected_counter)]);
+        assert_eq!(outputs[0].elements::<u64>(), Ok(vec![42, expected_counter]));
         assert_eq!(expected_counter, 10);
-        assert_eq!(outputs[1].values(), expected_words.into_iter().map(Scalar::U32).collect::<Vec<_>>());
+        assert_eq!(outputs[1].elements::<u32>(), Ok(expected_words));
         let replayed = InterpretableOperation::<EagerContext<Array>>::interpret(
             &operation,
             &EagerContext::new(),
@@ -1099,9 +1099,9 @@ mod tests {
     fn test_rng_bit_generator_batching_threefry() {
         // Two distinct ThreeFry states stacked at batch axis 1 (`u64[2, b]` holding `[[k0, k1], [c0, c1]]`) exercise
         // the realignment to batch axis 0 before the scan consumes one state row per iteration.
-        let states = Array::new(
+        let states = Array::from_elements(
             ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-            vec![Scalar::U64(42), Scalar::U64(3), Scalar::U64(7), Scalar::U64(11)],
+            &[42u64, 3, 7, 11],
         )
         .unwrap();
         let input = ArrayBatch::new(states.r#type().into_owned(), states, Some(1)).unwrap();
@@ -1116,18 +1116,19 @@ mod tests {
             state(42, 7).rng_bit_generator(RandomAlgorithm::ThreeFry, &bits_type(5)).unwrap();
         let (second_state, second_bits) =
             state(3, 11).rng_bit_generator(RandomAlgorithm::ThreeFry, &bits_type(5)).unwrap();
-        let expected_states = [first_state.values(), second_state.values()].concat();
-        let expected_bits = [first_bits.values(), second_bits.values()].concat();
-        assert_eq!(outputs[0].value().values(), expected_states);
-        assert_eq!(outputs[1].value().values(), expected_bits);
+        let expected_states =
+            [first_state.elements::<u64>().unwrap(), second_state.elements::<u64>().unwrap()].concat();
+        let expected_bits = [first_bits.elements::<u32>().unwrap(), second_bits.elements::<u32>().unwrap()].concat();
+        assert_eq!(outputs[0].value().elements::<u64>(), Ok(expected_states));
+        assert_eq!(outputs[1].value().elements::<u32>(), Ok(expected_bits));
     }
 
     #[test]
     fn test_rng_bit_generator_batching_philox() {
         // Two distinct Philox `u64[3]` states stacked at batch axis 0 (`u64[2, 3]`).
-        let states = Array::new(
+        let states = Array::from_elements(
             ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
-            vec![Scalar::U64(42), Scalar::U64(7), Scalar::U64(9), Scalar::U64(3), Scalar::U64(11), Scalar::U64(0)],
+            &[42u64, 7, 9, 3, 11, 0],
         )
         .unwrap();
         let input = ArrayBatch::new(states.r#type().into_owned(), states, Some(0)).unwrap();
@@ -1139,20 +1140,17 @@ mod tests {
 
         // Each batch item's advanced state and bits equal the unbatched per-state results exactly.
         let philox_state = |key: u64, counter_low: u64, counter_high: u64| {
-            Array::new(
-                RandomAlgorithm::Philox.state_type(),
-                vec![Scalar::U64(key), Scalar::U64(counter_low), Scalar::U64(counter_high)],
-            )
-            .unwrap()
+            Array::from_elements(RandomAlgorithm::Philox.state_type(), &[key, counter_low, counter_high]).unwrap()
         };
         let (first_state, first_bits) =
             philox_state(42, 7, 9).rng_bit_generator(RandomAlgorithm::Philox, &bits_type(5)).unwrap();
         let (second_state, second_bits) =
             philox_state(3, 11, 0).rng_bit_generator(RandomAlgorithm::Philox, &bits_type(5)).unwrap();
-        let expected_states = [first_state.values(), second_state.values()].concat();
-        let expected_bits = [first_bits.values(), second_bits.values()].concat();
-        assert_eq!(outputs[0].value().values(), expected_states);
-        assert_eq!(outputs[1].value().values(), expected_bits);
+        let expected_states =
+            [first_state.elements::<u64>().unwrap(), second_state.elements::<u64>().unwrap()].concat();
+        let expected_bits = [first_bits.elements::<u32>().unwrap(), second_bits.elements::<u32>().unwrap()].concat();
+        assert_eq!(outputs[0].value().elements::<u64>(), Ok(expected_states));
+        assert_eq!(outputs[1].value().elements::<u32>(), Ok(expected_bits));
     }
 
     #[test]
@@ -1200,9 +1198,9 @@ mod tests {
         );
 
         // The batched program computes each batch item's unbatched result exactly.
-        let states = Array::new(
+        let states = Array::from_elements(
             ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
-            vec![Scalar::U64(42), Scalar::U64(7), Scalar::U64(3), Scalar::U64(11), Scalar::U64(5), Scalar::U64(0)],
+            &[42u64, 7, 3, 11, 5, 0],
         )
         .unwrap();
         let outputs = batched.interpret(vec![states]).unwrap();
@@ -1211,11 +1209,11 @@ mod tests {
         for (key, counter) in [(42, 7), (3, 11), (5, 0)] {
             let (advanced, bits) =
                 state(key, counter).rng_bit_generator(RandomAlgorithm::ThreeFry, &bits_type(4)).unwrap();
-            expected_states.extend_from_slice(advanced.values());
-            expected_bits.extend_from_slice(bits.values());
+            expected_states.extend(advanced.elements::<u64>().unwrap());
+            expected_bits.extend(bits.elements::<u32>().unwrap());
         }
-        assert_eq!(outputs[0].values(), expected_states);
-        assert_eq!(outputs[1].values(), expected_bits);
+        assert_eq!(outputs[0].elements::<u64>(), Ok(expected_states));
+        assert_eq!(outputs[1].elements::<u32>(), Ok(expected_bits));
     }
 
     #[test]
@@ -1318,31 +1316,23 @@ mod tests {
     fn test_philox_rng_bit_generator() {
         // The reference backend maps the `ui64[3]` state to `[key, counter]` with the 128-bit counter split into
         // its low and high `u64` halves.
-        let state =
-            Array::new(RandomAlgorithm::Philox.state_type(), vec![Scalar::U64(42), Scalar::U64(7), Scalar::U64(9)])
-                .unwrap();
+        let state = Array::from_elements(RandomAlgorithm::Philox.state_type(), &[42u64, 7, 9]).unwrap();
         let counter = 7u128 | (9u128 << 64);
 
         // Five `u32` words run two cipher invocations, and the counter advances by that invocation count.
         let (advanced, bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &bits_type(5)).unwrap();
         let (expected_words, expected_counter) = philox_u32_words(42, counter, 5);
         assert_eq!(expected_counter, counter + 2);
-        assert_eq!(
-            advanced.values(),
-            &[Scalar::U64(42), Scalar::U64(expected_counter as u64), Scalar::U64((expected_counter >> 64) as u64)],
-        );
-        assert_eq!(bits.values(), expected_words.into_iter().map(Scalar::U32).collect::<Vec<_>>());
+        assert_eq!(advanced.elements::<u64>(), Ok(vec![42, expected_counter as u64, (expected_counter >> 64) as u64]),);
+        assert_eq!(bits.elements::<u32>(), Ok(expected_words));
 
         // Three `u64` words also run two cipher invocations (two words per invocation, truncated).
         let u64_bits_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]));
         let (advanced, bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u64_bits_type).unwrap();
         let (expected_words, expected_counter) = philox_u64_words(42, counter, 3);
         assert_eq!(expected_counter, counter + 2);
-        assert_eq!(
-            advanced.values(),
-            &[Scalar::U64(42), Scalar::U64(expected_counter as u64), Scalar::U64((expected_counter >> 64) as u64)],
-        );
-        assert_eq!(bits.values(), expected_words.into_iter().map(Scalar::U64).collect::<Vec<_>>());
+        assert_eq!(advanced.elements::<u64>(), Ok(vec![42, expected_counter as u64, (expected_counter >> 64) as u64]),);
+        assert_eq!(bits.elements::<u64>(), Ok(expected_words));
     }
 
     #[test]
@@ -1352,18 +1342,18 @@ mod tests {
 
         // Splitting draws three `u64` keys, so the parent state advances by three cipher invocations.
         let (expected_keys, expected_counter) = threefry_u64_words(42, 7, 3);
-        assert_eq!(advanced.values(), &[Scalar::U64(42), Scalar::U64(expected_counter)]);
-        assert_ne!(advanced.values(), parent.values());
+        assert_eq!(advanced.elements::<u64>(), Ok(vec![42, expected_counter]));
+        assert_ne!(advanced, parent);
 
         // Each fresh state is a `u64[2]` seeded by one generated key with a zero counter, and the keys are distinct.
         assert_eq!(fresh_states.len(), 3);
         for (fresh_state, expected_key) in fresh_states.iter().zip(expected_keys) {
             assert_eq!(fresh_state.r#type().into_owned(), RandomAlgorithm::ThreeFry.state_type());
-            assert_eq!(fresh_state.values(), &[Scalar::U64(expected_key), Scalar::U64(0)]);
+            assert_eq!(fresh_state.elements::<u64>(), Ok(vec![expected_key, 0]));
         }
-        assert_ne!(fresh_states[0].values(), fresh_states[1].values());
-        assert_ne!(fresh_states[0].values(), fresh_states[2].values());
-        assert_ne!(fresh_states[1].values(), fresh_states[2].values());
+        assert_ne!(fresh_states[0], fresh_states[1]);
+        assert_ne!(fresh_states[0], fresh_states[2]);
+        assert_ne!(fresh_states[1], fresh_states[2]);
     }
 
     #[test]
@@ -1411,7 +1401,7 @@ mod tests {
         for _ in 0..64 {
             let (advanced, sample) = state.categorical(&logits, 0).unwrap();
             assert_eq!(sample.r#type().into_owned(), ArrayType::scalar(DataType::I32));
-            assert_eq!(sample.values(), &[Scalar::I32(1)]);
+            assert_eq!(sample.elements::<i32>(), Ok(vec![1]));
             state = advanced;
         }
     }

@@ -586,7 +586,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -960,11 +959,8 @@ mod tests {
         // Ties select the lowest index first because the descending ranking sort is stable.
         assert_eq!(
             indices,
-            Array::new(
-                ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])),
-                vec![Scalar::I32(0), Scalar::I32(2), Scalar::I32(5)],
-            )
-            .unwrap(),
+            Array::from_elements(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])), &[0i32, 2, 5],)
+                .unwrap(),
         );
         assert!(matches!(
             input.top_k(7, 0),
@@ -977,13 +973,13 @@ mod tests {
         /// Returns the static `f64` array of the provided dimensions holding `values`.
         fn f64_array(dimensions: Vec<usize>, values: Vec<f64>) -> Array {
             let shape = Shape::new(dimensions.into_iter().map(Dimension::Static).collect());
-            Array::new(ArrayType::new(DataType::F64, shape), values.into_iter().map(Scalar::F64).collect()).unwrap()
+            Array::from_elements(ArrayType::new(DataType::F64, shape), &values).unwrap()
         }
 
         /// Returns the static `i32` array of the provided dimensions holding `indices`.
         fn i32_array(dimensions: Vec<usize>, indices: Vec<i32>) -> Array {
             let shape = Shape::new(dimensions.into_iter().map(Dimension::Static).collect());
-            Array::new(ArrayType::new(DataType::I32, shape), indices.into_iter().map(Scalar::I32).collect()).unwrap()
+            Array::from_elements(ArrayType::new(DataType::I32, shape), &indices).unwrap()
         }
 
         // A trailing ranked axis behind leading size-1 dimensions squeezes those dimensions away before the
@@ -1025,7 +1021,7 @@ mod tests {
         /// Returns the expected `i32` index array of the provided static dimensions.
         fn index_array(dimensions: Vec<usize>, indices: Vec<i32>) -> Array {
             let shape = Shape::new(dimensions.into_iter().map(Dimension::Static).collect());
-            Array::new(ArrayType::new(DataType::I32, shape), indices.into_iter().map(Scalar::I32).collect()).unwrap()
+            Array::from_elements(ArrayType::new(DataType::I32, shape), &indices).unwrap()
         }
 
         // NaN orders above `+∞` in the descending total order, so `argmax` reports the NaN's index, while `argmin`

@@ -3762,7 +3762,7 @@ mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().values(), &[6.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![6.0]);
     }
 
     #[test]
@@ -3777,7 +3777,7 @@ mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().values(), &[4.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![4.0]);
     }
 
     #[test]
@@ -3812,7 +3812,7 @@ mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().values(), &[1.0, 2.0, 3.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -4450,7 +4450,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].values(), &[1.0, 2.0]);
+        assert_eq!(outputs[0].to_f64s(), vec![1.0, 2.0]);
 
         // Any larger axis has no per-item semantics: the other participants do not exist outside an enclosing binder.
         let error = AllGatherOperation::new(
@@ -4531,7 +4531,7 @@ mod tests {
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().values(), &[1.0, 2.0, 1.0, 2.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 1.0, 2.0]);
     }
 
     #[test]

@@ -166,7 +166,7 @@ mod tests {
         let (_, tangent) = jvp(|input| input.sin(), primal, input_tangent).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
-        assert_abs_diff_eq!(tangent.values()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-6);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-6);
 
         // The widened staged tangent program computes the coefficient in the widened differential representation.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();

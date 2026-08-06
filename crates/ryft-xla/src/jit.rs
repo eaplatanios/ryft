@@ -3678,31 +3678,20 @@ mod tests {
 
         let unsharded = |data_type: DataType, dimensions: &[usize]| ArrayType::new(data_type, static_shape(dimensions));
         let mut reference_state = vec![
-            CpuArray::new(unsharded(DataType::I32, &[]), vec![Scalar::I32(0)]).unwrap(),
-            CpuArray::new(unsharded(DataType::I32, &[]), vec![Scalar::I32(3)]).unwrap(),
-            CpuArray::new(unsharded(DataType::F32, &[steps, dimension]), vec![Scalar::F32(0.0); steps * dimension])
+            CpuArray::from_elements(unsharded(DataType::I32, &[]), &[0_i32]).unwrap(),
+            CpuArray::from_elements(unsharded(DataType::I32, &[]), &[3_i32]).unwrap(),
+            CpuArray::from_elements(unsharded(DataType::F32, &[steps, dimension]), &vec![0.0_f32; steps * dimension])
                 .unwrap(),
-            CpuArray::new(unsharded(DataType::F32, &[steps, dimension]), vec![Scalar::F32(0.0); steps * dimension])
+            CpuArray::from_elements(unsharded(DataType::F32, &[steps, dimension]), &vec![0.0_f32; steps * dimension])
                 .unwrap(),
-            CpuArray::new(unsharded(DataType::I32, &[steps]), vec![Scalar::I32(0); steps]).unwrap(),
-            CpuArray::new(unsharded(DataType::U64, &[2]), vec![Scalar::U64(42), Scalar::U64(0)]).unwrap(),
+            CpuArray::from_elements(unsharded(DataType::I32, &[steps]), &vec![0_i32; steps]).unwrap(),
+            CpuArray::from_elements(unsharded(DataType::U64, &[2]), &[42_u64, 0]).unwrap(),
         ];
         reference_state.extend(weight_dimensions.iter().zip(&weights).map(|(dimensions, values)| {
-            CpuArray::new(
-                unsharded(DataType::F32, dimensions),
-                values.iter().map(|&value| Scalar::F32(value)).collect(),
-            )
-            .unwrap()
+            CpuArray::from_elements(unsharded(DataType::F32, dimensions), values).unwrap()
         }));
         let reference_state = reference_decode_loop(reference_state, &configuration, sampling);
-        let reference_tokens: Vec<i32> = reference_state[4]
-            .values()
-            .iter()
-            .map(|value| match value {
-                Scalar::I32(token) => *token,
-                value => panic!("expected an i32 reference token but got {value:?}"),
-            })
-            .collect();
+        let reference_tokens = reference_state[4].elements::<i32>().unwrap();
 
         // The decoded token sequences must agree exactly: greedy selection and the categorical draws (over
         // bit-identical ThreeFry bits) are only sensitive to floating-point differences at exact logit ties,

@@ -1202,7 +1202,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
@@ -1270,7 +1269,7 @@ mod tests {
             block.value().r#type().into_owned(),
             ArrayType::new(F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(3)])),
         );
-        assert_eq!(block.value().values(), &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(block.value().to_f64s(), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
 
         // Structured inputs and outputs produce blocks in output-major/input-minor order.
         let jacobian = jacobian_forward(
@@ -1282,16 +1281,16 @@ mod tests {
         assert_eq!(blocks.len(), 4);
         assert_eq!(blocks[0].output_path().to_string(), "$.0");
         assert_eq!(blocks[0].input_path().to_string(), "$.0");
-        assert_abs_diff_eq!(blocks[0].value().values()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
         assert_eq!(blocks[1].output_path().to_string(), "$.0");
         assert_eq!(blocks[1].input_path().to_string(), "$.1");
-        assert_abs_diff_eq!(blocks[1].value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 2.0, epsilon = 1e-9);
         assert_eq!(blocks[2].output_path().to_string(), "$.1");
         assert_eq!(blocks[2].input_path().to_string(), "$.0");
-        assert_abs_diff_eq!(blocks[2].value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[2].value().to_f64s()[0], 1.0, epsilon = 1e-9);
         assert_eq!(blocks[3].output_path().to_string(), "$.1");
         assert_eq!(blocks[3].input_path().to_string(), "$.1");
-        assert_abs_diff_eq!(blocks[3].value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[3].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
         // An output independent of one input retains an explicit zero block in the Cartesian product.
         let jacobian = jacobian_forward(
@@ -1301,26 +1300,26 @@ mod tests {
         .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 6);
-        assert_abs_diff_eq!(blocks[0].value().values()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[1].value().values()[0], 2.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[2].value().values()[0], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[3].value().values()[0], 1.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[4].value().values()[0], 1.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[5].value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[2].value().to_f64s()[0], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[3].value().to_f64s()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[4].value().to_f64s()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[5].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
         // Forward replay follows primal control flow and selects the tangent of the branch taken at the primal point.
         let jacobian = jacobian_forward(|x| Ok(piecewise_select(x)), Array::scalar(2.0)).unwrap();
-        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
 
         let jacobian = jacobian_forward(|x| Ok(piecewise_select(x)), Array::scalar(-2.0)).unwrap();
-        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 3.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Jacobian blocks.
         let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
         let jacobian = jacobian_forward(|value| value.sin(), input).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
-        assert_abs_diff_eq!(block.value().values()[0], 2.0f64.cos(), epsilon = 1e-6);
+        assert_abs_diff_eq!(block.value().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-6);
 
         // Scalar inputs broadcast into vector outputs are unbroadcast when their dense block is reconstructed.
         let jacobian = jacobian_forward(
@@ -1331,9 +1330,9 @@ mod tests {
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].value().r#type().static_shape().unwrap().as_slice(), &[2]);
-        assert_eq!(blocks[0].value().values(), &[4.0, 5.0]);
+        assert_eq!(blocks[0].value().to_f64s(), vec![4.0, 5.0]);
         assert_eq!(blocks[1].value().r#type().static_shape().unwrap().as_slice(), &[2, 2]);
-        assert_eq!(blocks[1].value().values(), &[2.0, 0.0, 0.0, 2.0]);
+        assert_eq!(blocks[1].value().to_f64s(), vec![2.0, 0.0, 0.0, 2.0]);
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
@@ -1343,14 +1342,14 @@ mod tests {
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[0]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[0]);
         assert_eq!(block.value().r#type().as_ref(), &r#type.with_inserted_dimension(0, Dimension::Static(0)).unwrap(),);
-        assert!(block.value().values().is_empty());
+        assert!(block.value().storage_bytes().is_empty());
 
         // The holomorphic entry point treats a complex derivative as complex linear.
-        let input = Array::scalar(Scalar::C64(ComplexNumber::new(2.0, 1.0)));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
         let jacobian = jacobian_forward_holomorphic(|x| Ok(x.clone() * x), input).unwrap();
         assert_eq!(
-            jacobian.iter_blocks().next().unwrap().value().values(),
-            &[Scalar::C64(ComplexNumber::new(4.0, 2.0))],
+            jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(4.0, 2.0)]),
         );
     }
 
@@ -1366,23 +1365,23 @@ mod tests {
         assert_eq!(blocks.len(), 4);
         assert_eq!(blocks[0].output_path().to_string(), "$.0");
         assert_eq!(blocks[0].input_path().to_string(), "$.0");
-        assert_abs_diff_eq!(blocks[0].value().values()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
         assert_eq!(blocks[1].output_path().to_string(), "$.0");
         assert_eq!(blocks[1].input_path().to_string(), "$.1");
-        assert_abs_diff_eq!(blocks[1].value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 2.0, epsilon = 1e-9);
         assert_eq!(blocks[2].output_path().to_string(), "$.1");
         assert_eq!(blocks[2].input_path().to_string(), "$.0");
-        assert_abs_diff_eq!(blocks[2].value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[2].value().to_f64s()[0], 1.0, epsilon = 1e-9);
         assert_eq!(blocks[3].output_path().to_string(), "$.1");
         assert_eq!(blocks[3].input_path().to_string(), "$.1");
-        assert_abs_diff_eq!(blocks[3].value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[3].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
         // Reverse replay routes output cotangents through the branch selected at the primal point.
         let jacobian = jacobian_reverse(|x| Ok(piecewise_select(x)), Array::scalar(2.0)).unwrap();
-        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
 
         let jacobian = jacobian_reverse(|x| Ok(piecewise_select(x)), Array::scalar(-2.0)).unwrap();
-        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 3.0, epsilon = 1e-9);
 
         // Per-element masking over a vector input makes the Jacobian diagonal, with entries 2 for positive inputs and
         // 3 otherwise.
@@ -1390,10 +1389,10 @@ mod tests {
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[2]);
-        assert_abs_diff_eq!(block.value().values()[0], 2.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[3], 3.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[1], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[2], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().to_f64s()[3], 3.0, epsilon = 1e-9);
 
         // Pullback replay unbroadcasts a selected scalar branch and preserves each input's differential data type.
         let scalar = Array::from_f64s(ArrayType::scalar(F32), vec![5.0]);
@@ -1444,25 +1443,25 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].value().r#type().data_type(), F32);
         assert_eq!(blocks[1].value().r#type().data_type(), F64);
-        assert_abs_diff_eq!(blocks[0].value().values()[0], 1.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[1].value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
         let jacobian = jacobian_reverse(|(left, right)| Ok(left - right), (f32.clone(), f64.clone())).unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
-        assert_abs_diff_eq!(blocks[0].value().values()[0], 1.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[1].value().values()[0], -1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], -1.0, epsilon = 1e-9);
 
         let jacobian = jacobian_reverse(|(left, right)| Ok(left * right), (f32, f64)).unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
-        assert_abs_diff_eq!(blocks[0].value().values()[0], 3.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(blocks[1].value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 3.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 2.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Jacobian blocks.
         let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
         let jacobian = jacobian_reverse(|value| value.sin(), input).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
-        assert_abs_diff_eq!(block.value().values()[0], 2.0f64.cos(), epsilon = 1e-6);
+        assert_abs_diff_eq!(block.value().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-6);
 
         // Scalar inputs broadcast into vector outputs are unbroadcast when their dense block is reconstructed.
         let jacobian = jacobian_reverse(
@@ -1473,9 +1472,9 @@ mod tests {
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].value().r#type().static_shape().unwrap().as_slice(), &[2]);
-        assert_eq!(blocks[0].value().values(), &[4.0, 5.0]);
+        assert_eq!(blocks[0].value().to_f64s(), vec![4.0, 5.0]);
         assert_eq!(blocks[1].value().r#type().static_shape().unwrap().as_slice(), &[2, 2]);
-        assert_eq!(blocks[1].value().values(), &[2.0, 0.0, 0.0, 2.0]);
+        assert_eq!(blocks[1].value().to_f64s(), vec![2.0, 0.0, 0.0, 2.0]);
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
@@ -1485,14 +1484,14 @@ mod tests {
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[0]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[0]);
         assert_eq!(block.value().r#type().as_ref(), &r#type.with_inserted_dimension(0, Dimension::Static(0)).unwrap(),);
-        assert!(block.value().values().is_empty());
+        assert!(block.value().storage_bytes().is_empty());
 
         // The holomorphic entry point transposes a complex-linear pushforward without conjugating it.
-        let input = Array::scalar(Scalar::C64(ComplexNumber::new(2.0, 1.0)));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
         let jacobian = jacobian_reverse_holomorphic(|x| Ok(x.clone() * x), input).unwrap();
         assert_eq!(
-            jacobian.iter_blocks().next().unwrap().value().values(),
-            &[Scalar::C64(ComplexNumber::new(4.0, 2.0))],
+            jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(4.0, 2.0)]),
         );
     }
 
@@ -1508,8 +1507,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(forward_evaluations.get(), 1);
-        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 4.0, epsilon = 1e-9);
-        assert_eq!(auxiliary.values(), &[2.0]);
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 4.0, epsilon = 1e-9);
+        assert_eq!(auxiliary.to_f64s(), vec![2.0]);
 
         let reverse_evaluations = Cell::new(0);
         let (jacobian, auxiliary) = jacobian_reverse_with_aux(
@@ -1521,25 +1520,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reverse_evaluations.get(), 1);
-        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 4.0, epsilon = 1e-9);
-        assert_eq!(auxiliary.values(), &[2.0]);
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 4.0, epsilon = 1e-9);
+        assert_eq!(auxiliary.to_f64s(), vec![2.0]);
 
-        let input = Array::scalar(Scalar::C64(ComplexNumber::new(2.0, 1.0)));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
         let (jacobian, auxiliary) =
             jacobian_forward_holomorphic_with_aux(|x| Ok((x.clone() * x.clone(), x)), input.clone()).unwrap();
         assert_eq!(
-            jacobian.iter_blocks().next().unwrap().value().values(),
-            &[Scalar::C64(ComplexNumber::new(4.0, 2.0))],
+            jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(4.0, 2.0)]),
         );
-        assert_eq!(auxiliary.values(), input.values());
+        assert_eq!(auxiliary, input);
 
         let (jacobian, auxiliary) =
             jacobian_reverse_holomorphic_with_aux(|x| Ok((x.clone() * x.clone(), x)), input.clone()).unwrap();
         assert_eq!(
-            jacobian.iter_blocks().next().unwrap().value().values(),
-            &[Scalar::C64(ComplexNumber::new(4.0, 2.0))],
+            jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(4.0, 2.0)]),
         );
-        assert_eq!(auxiliary.values(), input.values());
+        assert_eq!(auxiliary, input);
     }
 
     #[test]
@@ -1562,7 +1561,7 @@ mod tests {
             },
         );
 
-        let complex = Array::scalar(Scalar::C64(ComplexNumber::new(2.0, 0.0)));
+        let complex = Array::scalar(ComplexNumber::new(2.0f32, 0.0));
         assert_eq!(
             context.jacobian_forward(|x| Ok(x), complex).unwrap_err(),
             DifferentiationError::ComplexParameter {
@@ -1584,7 +1583,7 @@ mod tests {
 
         let complex_output_error = context
             .jacobian_reverse(
-                |input| Ok(input.context().lift(Array::scalar(Scalar::C64(ComplexNumber::new(1.0, 0.0))))?),
+                |input| Ok(input.context().lift(Array::scalar(ComplexNumber::new(1.0f32, 0.0)))?),
                 Array::scalar(2.0),
             )
             .unwrap_err();
@@ -1602,7 +1601,7 @@ mod tests {
             F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
         );
-        let dynamic = Array::with_unchecked_type(dynamic_type.clone(), vec![Scalar::F64(1.0)]);
+        let dynamic = Array::with_unchecked_type(dynamic_type.clone(), 1.0f64.to_le_bytes().to_vec());
         assert_eq!(
             context.jacobian_forward(|x| Ok(x), dynamic).unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
@@ -1617,7 +1616,7 @@ mod tests {
                 .jacobian_forward(
                     |input| Ok(input
                         .context()
-                        .lift(Array::with_unchecked_type(dynamic_type.clone(), vec![Scalar::F64(1.0)]))?),
+                        .lift(Array::with_unchecked_type(dynamic_type.clone(), 1.0f64.to_le_bytes().to_vec()))?),
                     Array::scalar(1.0),
                 )
                 .unwrap_err(),
@@ -1629,7 +1628,7 @@ mod tests {
             },
         );
 
-        let dynamic = Array::with_unchecked_type(dynamic_type, vec![Scalar::F64(1.0)]);
+        let dynamic = Array::with_unchecked_type(dynamic_type, 1.0f64.to_le_bytes().to_vec());
         assert_eq!(
             context
                 .jacobian_reverse(|input| Ok(input.context().lift(Array::scalar(1.0))?), dynamic)
@@ -1659,7 +1658,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(jacobian.iter_blocks().next().unwrap().value().values(), &[2.0, 4.0, 6.0]);
+        assert_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s(), vec![2.0, 4.0, 6.0]);
     }
 
     #[test]
@@ -1677,7 +1676,7 @@ mod tests {
             Array::scalar(3.0),
         )
         .unwrap();
-        assert_abs_diff_eq!(derivative.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(derivative.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
     }
 
     #[test]

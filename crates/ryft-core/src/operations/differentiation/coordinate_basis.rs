@@ -284,6 +284,7 @@ mod tests {
     use crate::macros::check_operation_type_inference;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::types::Typed;
     use crate::types::DataType::{Boolean, F6E2M3FN, F6E3M2FN, F8E8M0FNU, F32, I32};
     use crate::types::{ArrayType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
@@ -327,7 +328,9 @@ mod tests {
 
             assert_eq!(
                 operation.interpret(&context, &EmptyRegionDriver, &[]),
-                Ok(vec![Array::new(basis_type, vec![zero, zero, one, zero, zero, one, zero, zero],).unwrap()]),
+                Ok(vec![
+                    Array::from_scalar_values(basis_type, [zero, zero, one, zero, zero, one, zero, zero],).unwrap()
+                ]),
             );
         }
     }
@@ -338,8 +341,17 @@ mod tests {
             (Scalar::F6E2M3FN(0), Scalar::F6E2M3FN(0x08), Scalar::F6E2M3FN(0x10)),
             (Scalar::F6E3M2FN(0), Scalar::F6E3M2FN(0x0c), Scalar::F6E3M2FN(0x10)),
         ] {
-            let input = Array::vector(vec![one, two]);
-            let expected = Array::matrix(2, 2, vec![one, zero, zero, one]);
+            let data_type = zero.r#type().into_owned();
+            let input = Array::from_scalar_values(
+                ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)])),
+                [one, two],
+            )
+            .unwrap();
+            let expected = Array::from_scalar_values(
+                ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+                [one, zero, zero, one],
+            )
+            .unwrap();
 
             let forward = jacobian_forward(|input| Ok(input), input.clone()).unwrap();
             assert_eq!(forward.iter_blocks().next().unwrap().value(), &expected);

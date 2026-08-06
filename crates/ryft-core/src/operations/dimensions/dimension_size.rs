@@ -441,7 +441,7 @@ mod tests {
         let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0f32; 6]));
         let payload = <ArrayIrValue<Array> as crate::ValueProjection<ArrayType>>::projected(&array)
             .unwrap()
-            .values()
+            .storage_bytes()
             .as_ptr();
         let result = array.dimension_size(-1).unwrap();
         let ArrayIrValue::Dimension(result) = result else {
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(
             <ArrayIrValue<Array> as crate::ValueProjection<ArrayType>>::projected(&array)
                 .unwrap()
-                .values()
+                .storage_bytes()
                 .as_ptr(),
             payload,
         );

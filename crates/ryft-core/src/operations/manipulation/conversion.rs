@@ -349,7 +349,7 @@ mod tests {
                 {
                     inputs = [(@linear(type = ArrayType::scalar(DataType::I32)))],
                     output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
-                    input_cotangents = [Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap()],
+                    input_cotangents = [Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()],
                 },
             ],
         );

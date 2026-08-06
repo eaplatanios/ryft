@@ -1042,7 +1042,7 @@ mod tests {
     use crate::tracing::TracingContext;
     use crate::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::types::{DataType, Dimension, Shape};
-    use crate::{ArrayIrOperation, ArrayOperation, Scalar};
+    use crate::{ArrayIrOperation, ArrayOperation};
 
     use super::*;
 
@@ -2551,9 +2551,9 @@ mod tests {
         assert_eq!(
             dynamic_iota_output[0].value(),
             &ArrayIrValue::Array(
-                Array::new(
+                Array::from_elements(
                     ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])),
-                    vec![Scalar::I32(0), Scalar::I32(1), Scalar::I32(2)],
+                    &[0i32, 1, 2],
                 )
                 .unwrap(),
             ),
@@ -2928,9 +2928,9 @@ mod tests {
 
         // Mapped RNG state batching is scan-based: each mapped state is advanced independently and the generated bits
         // retain the mapped axis as their leading axis.
-        let states = Array::new(
+        let states = Array::from_elements(
             ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-            vec![Scalar::U64(1), Scalar::U64(0), Scalar::U64(2), Scalar::U64(0)],
+            &[1u64, 0, 2, 0],
         )
         .unwrap();
         let state_batch = ArrayIrBatch::new(ArrayIrValue::Array(states.clone()), BatchAxis::new(0)).unwrap();

@@ -2465,7 +2465,7 @@ Phase 9a1 — layout-aware byte storage and construction:
       each back to the same logical values through `ArrayAddressing`. Portable literal conversion must traverse logical
       coordinates and produce the target format independently of the reference array's physical byte ordering.
 - [x] Add byte-length/range validation and the sealed typed codec at the array/data ownership boundary.
-- [ ] Convert `Array` storage and migrate constructors, accessors, `Parameter`, equality, approximation, formatting,
+- [x] Convert `Array` storage and migrate constructors, accessors, `Parameter`, equality, approximation, formatting,
       and the test-only malformed-type constructor in one complete slice.
 - [ ] Add exact encoding round trips for all supported primitives, low-precision raw bits, signed zero, infinities,
       representative NaNs/payloads, complex values, empty arrays, `Token`, and `Zero`.
@@ -4332,3 +4332,25 @@ one axis's start, selected-coordinate count, and stride, exposes those values th
 now construct the same descriptor consumed by addressing instead of passing parallel metadata through another layer.
 All 90 focused array, addressing, codec, and reference-backend tests pass, and `cargo check -p ryft-core --lib`
 succeeds; its eight warnings are confined to the concurrently developed, not-yet-consumed codec entrypoints.
+
+### Phase 9a1 byte-backed `Array` storage (2026-08-05)
+
+`Array` now owns exactly one shared immutable physical byte buffer alongside its `ArrayType`; cloning shares that
+buffer without copying its payload. `Array::new` accepts and validates complete layout-aware physical storage,
+`from_elements` and `from_logical_bytes` construct physical storage from typed or encoded logical row-major elements,
+and `storage_bytes`, `elements`, and `logical_bytes` expose the corresponding checked views. The scalar, vector, and
+matrix conveniences are typed through the sealed `ArrayElement` contract, while the explicitly lossy `from_f64s` and
+`to_f64s` test conveniences remain. The old public `values()` accessor and `Vec<Scalar>` stored representation are
+deleted, and the test-only malformed-type constructor now carries raw bytes without weakening production validation.
+
+All core and XLA consumers were migrated in the same slice. Reference-array fixtures use typed decoding or exact
+logical bytes, finite-difference tests perturb real and imaginary projections without inspecting scalar variants, and
+XLA dense-literal lowering decodes typed elements or traverses logical bytes so physical reference layouts never leak
+into portable literals. Existing equality, approximation, debug/display, and reference kernels temporarily decode
+through one private transient scalar bridge; it is neither stored nor public, and Phase 9a2 removes it family by family
+in favor of direct typed-byte dispatch as already required by that phase's gate.
+
+Verification passes all 1,146 core library tests, all 53 runnable core doctests (16 intentional ignores), all 436
+runnable XLA library tests (one intentional timing-sensitive ignore), `cargo check -p ryft-xla --tests`, formatting,
+and diff hygiene. The next Phase 9a1 slice adds the exhaustive encoding-round-trip matrix before the dedicated
+sub-byte construction and allocation gates.

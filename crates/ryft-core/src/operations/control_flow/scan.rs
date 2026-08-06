@@ -3333,13 +3333,13 @@ mod tests {
 
         let blocks = forward.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].value().values(), &[24.0]);
-        assert_eq!(blocks[1].value().values(), &[12.0, 8.0, 6.0]);
+        assert_eq!(blocks[0].value().to_f64s(), vec![24.0]);
+        assert_eq!(blocks[1].value().to_f64s(), vec![12.0, 8.0, 6.0]);
 
         let blocks = reverse.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].value().values(), &[24.0]);
-        assert_eq!(blocks[1].value().values(), &[12.0, 8.0, 6.0]);
+        assert_eq!(blocks[0].value().to_f64s(), vec![24.0]);
+        assert_eq!(blocks[1].value().to_f64s(), vec![12.0, 8.0, 6.0]);
     }
 
     #[test]
@@ -3356,12 +3356,12 @@ mod tests {
 
         let blocks = hessian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 4);
-        assert_eq!(blocks[0].value().values(), &[0.0]);
-        assert_eq!(blocks[1].value().values(), &[12.0, 8.0, 6.0]);
-        assert_eq!(blocks[2].value().values(), &[12.0, 8.0, 6.0]);
+        assert_eq!(blocks[0].value().to_f64s(), vec![0.0]);
+        assert_eq!(blocks[1].value().to_f64s(), vec![12.0, 8.0, 6.0]);
+        assert_eq!(blocks[2].value().to_f64s(), vec![12.0, 8.0, 6.0]);
         assert_eq!(
-            blocks[3].value().values(),
-            &[
+            blocks[3].value().to_f64s(),
+            vec![
                 0.0, 4.0, 3.0, //
                 4.0, 0.0, 2.0, //
                 3.0, 2.0, 0.0, //
@@ -4064,7 +4064,6 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_with_zero_space_key_carry() {
-        use crate::backends::scalars::Scalar;
         use crate::types::{Dimension, Shape};
 
         // A scan whose carries mix a differentiable accumulator with a zero-differential-space element — here a
@@ -4137,7 +4136,7 @@ mod tests {
                 |(accumulator, key, values)| stage_keyed_product_scan(accumulator, key, values),
                 (
                     Array::scalar(1.0),
-                    Array::new(ArrayType::scalar(DataType::U64), vec![Scalar::U64(7)]).unwrap(),
+                    Array::from_elements(ArrayType::scalar(DataType::U64), &[7u64]).unwrap(),
                     Array::vector(vec![2.0, 3.0, 4.0]),
                 ),
             )
@@ -4147,7 +4146,7 @@ mod tests {
         let (accumulator_cotangent, key_cotangent, values_cotangent) =
             pullback.apply((Array::scalar(1.0), Array::vector(vec![0.0, 0.0, 0.0]))).unwrap();
         assert_eq!(accumulator_cotangent.to_f64s(), vec![24.0]);
-        assert_eq!(key_cotangent, Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
+        assert_eq!(key_cotangent, Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap());
         assert_eq!(values_cotangent.to_f64s(), vec![12.0, 8.0, 6.0]);
     }
 
@@ -4557,11 +4556,11 @@ mod tests {
                 outputs[1].r#type().sharding().unwrap().dimensions(),
                 &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
             );
-            assert!(outputs[1].value().values().is_empty());
+            assert!(outputs[1].value().storage_bytes().is_empty());
             assert_eq!(outputs[2].batch_axis(), BatchAxis::replicated());
             assert_eq!(outputs[2].r#type().shape().dimensions(), &[Dimension::Static(0)]);
             assert_eq!(outputs[2].r#type().sharding().unwrap().dimensions(), &[ShardingDimension::replicated()],);
-            assert!(outputs[2].value().values().is_empty());
+            assert!(outputs[2].value().storage_bytes().is_empty());
         }
     }
 

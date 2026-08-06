@@ -2981,8 +2981,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let outputs = evaluation.program.interpret(inputs).unwrap();
-        assert_eq!(outputs[0].values(), &[Scalar::I32(-1)]);
-        assert_eq!(outputs[1].values(), &[Scalar::I32(0)]);
+        assert_eq!(outputs[0].elements::<i32>(), Ok(vec![-1]));
+        assert_eq!(outputs[1].elements::<i32>(), Ok(vec![0]));
     }
 
     #[test]
@@ -4445,7 +4445,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
             builder.add_input(float_type.clone());
             let counter = builder.add_input(counter_type.clone());
-            let bound = builder.add_constant(Array::new(counter_type.clone(), vec![Scalar::I64(3)]).unwrap());
+            let bound = builder.add_constant(Array::from_elements(counter_type.clone(), &[3i64]).unwrap());
             let predicate = builder
                 .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![counter, bound])
                 .unwrap()[0];
@@ -4458,7 +4458,7 @@ mod tests {
             let state = builder.add_input(float_type.clone());
             let counter = builder.add_input(counter_type.clone());
             let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
-            let one = builder.add_constant(Array::new(counter_type.clone(), vec![Scalar::I64(1)]).unwrap());
+            let one = builder.add_constant(Array::from_elements(counter_type.clone(), &[1i64]).unwrap());
             let incremented = builder.add_instruction(AddOperation::new(), Vec::new(), vec![counter, one]).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![squared, incremented], vec![Placeholder; 2], vec![Placeholder; 2])
@@ -4490,12 +4490,12 @@ mod tests {
         let outputs = fused
             .interpret(vec![
                 Array::scalar(2.0),
-                Array::new(counter_type, vec![Scalar::I64(0)]).unwrap(),
+                Array::from_elements(counter_type, &[0i64]).unwrap(),
                 Array::scalar(1.0),
             ])
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![256.0]);
-        assert_eq!(outputs[1].values(), &[Scalar::I64(3)]);
+        assert_eq!(outputs[1].elements::<i64>(), Ok(vec![3]));
         assert_eq!(outputs[2].to_f64s(), vec![1024.0]);
     }
 

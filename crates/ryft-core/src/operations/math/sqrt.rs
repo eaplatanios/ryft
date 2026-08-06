@@ -167,7 +167,7 @@ mod tests {
         let (_, tangent) = jvp(|input| input.sqrt(), primal, input_tangent).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
-        assert_abs_diff_eq!(tangent.values()[0], 3.0 / (2.0 * 2.0f64.sqrt()), epsilon = 1e-6);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 / (2.0 * 2.0f64.sqrt()), epsilon = 1e-6);
 
         // The widened staged tangent program recomputes the denominator in the widened differential representation
         // instead of converting the narrower primal output.

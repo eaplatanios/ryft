@@ -81,7 +81,7 @@ fn test_borrowed_array_ir_projection_does_not_allocate() {
     let allocations = measure_allocations(stored_array, |stored| {
         for _ in 0..1_000 {
             let projected = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(black_box(&stored)).unwrap();
-            black_box(projected.values().as_ptr());
+            black_box(projected.storage_bytes().as_ptr());
         }
     });
     assert_eq!(allocations, 0);

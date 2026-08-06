@@ -1216,7 +1216,7 @@ mod tests {
                 .with_sharding(output_sharding)
                 .unwrap(),
         );
-        assert_eq!(output.values(), &[6.0, 15.0]);
+        assert_eq!(output.to_f64s(), vec![6.0, 15.0]);
     }
 
     #[test]
@@ -1333,14 +1333,14 @@ mod tests {
             let input = Array::vector(vec![1.0, 1.0]);
             let (primal, tangent) =
                 jvp(|input| Ok(input.reduce(&[0], kind)), input.clone(), Array::vector(vec![1.0, 3.0])).unwrap();
-            assert_eq!(primal.values(), &[1.0]);
-            assert_eq!(tangent.values(), &[2.0]);
+            assert_eq!(primal.to_f64s(), vec![1.0]);
+            assert_eq!(tangent.to_f64s(), vec![2.0]);
 
             let (primal, gradient) =
                 value_and_gradient(|input| Ok::<_, ProgramError>(input.reduce(&[0], kind)), input).unwrap();
-            assert_eq!(primal.values(), &[1.0]);
-            assert_abs_diff_eq!(gradient.values()[0], 0.5, epsilon = 1e-9);
-            assert_abs_diff_eq!(gradient.values()[1], 0.5, epsilon = 1e-9);
+            assert_eq!(primal.to_f64s(), vec![1.0]);
+            assert_abs_diff_eq!(gradient.to_f64s()[0], 0.5, epsilon = 1e-9);
+            assert_abs_diff_eq!(gradient.to_f64s()[1], 0.5, epsilon = 1e-9);
         }
     }
 
