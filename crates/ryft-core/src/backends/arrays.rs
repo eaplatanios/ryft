@@ -556,25 +556,21 @@ impl Array {
         let right_bytes = rhs.storage_bytes();
         let element_byte_width = output_addressing.element_byte_width();
         let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
-        // NumPy-style broadcasting right-aligns input axes. An input extent of one always selects coordinate zero;
-        // every other input coordinate is recovered from the row-major output index.
-        let broadcast_index = |output_index: usize, input_shape: &StaticShape, input_strides: &[usize]| {
-            let output_axis_offset = output_shape.rank() - input_shape.rank();
-            (0..input_shape.rank()).fold(0, |index, input_axis| {
-                let output_axis = output_axis_offset + input_axis;
-                let coordinate = if input_shape[input_axis] == 1 {
-                    0
-                } else {
-                    (output_index / output_strides[output_axis]) % output_shape[output_axis]
-                };
-                index + coordinate * input_strides[input_axis]
-            })
-        };
         for output_index in 0..output_addressing.element_count() {
-            let left_range =
-                left_addressing.byte_range_for_flat_index(broadcast_index(output_index, &left_shape, &left_strides));
-            let right_range =
-                right_addressing.byte_range_for_flat_index(broadcast_index(output_index, &right_shape, &right_strides));
+            let left_range = left_addressing.byte_range_for_flat_index(Self::broadcast_index(
+                output_index,
+                &output_shape,
+                &output_strides,
+                &left_shape,
+                &left_strides,
+            ));
+            let right_range = right_addressing.byte_range_for_flat_index(Self::broadcast_index(
+                output_index,
+                &output_shape,
+                &output_strides,
+                &right_shape,
+                &right_strides,
+            ));
             let output_range = output_addressing.byte_range_for_flat_index(output_index);
             for byte in 0..element_byte_width {
                 output_bytes[output_range.start + byte] =
@@ -584,6 +580,27 @@ impl Array {
         // Valid inputs, bitwise closure outputs, and zero-initialized unoccupied storage preserve every `Array`
         // encoding invariant without a second validation traversal.
         Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
+    }
+
+    /// Maps one flat row-major output index to the corresponding flat input index under NumPy-style broadcasting.
+    /// Input axes are right-aligned with output axes, and an input extent of one always selects coordinate zero.
+    fn broadcast_index(
+        output_index: usize,
+        output_shape: &StaticShape,
+        output_strides: &[usize],
+        input_shape: &StaticShape,
+        input_strides: &[usize],
+    ) -> usize {
+        let output_axis_offset = output_shape.rank() - input_shape.rank();
+        (0..input_shape.rank()).fold(0, |index, input_axis| {
+            let output_axis = output_axis_offset + input_axis;
+            let coordinate = if input_shape[input_axis] == 1 {
+                0
+            } else {
+                (output_index / output_strides[output_axis]) % output_shape[output_axis]
+            };
+            index + coordinate * input_strides[input_axis]
+        })
     }
 
     /// Broadcasts the payload to `output_len`.
@@ -2203,17 +2220,56 @@ impl Select for Array {
             &on_false.r#type,
         )
         .map_err(|error| TypeError::invalid(error.to_string()))?;
-        let output_len = Self::element_count(&output_type);
-        let condition = condition.broadcast_values(output_len);
-        let on_true = on_true.broadcast_values(output_len);
-        let on_false = on_false.broadcast_values(output_len);
-        let values = condition
-            .iter()
-            .zip(on_true.iter())
-            .zip(on_false.iter())
-            .map(|((condition, on_true), on_false)| Scalar::select(condition, on_true, on_false))
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::from_scalar_values(output_type, values)
+
+        // Convert only when promotion requires it. Equal-typed branches retain their original physical storage and
+        // arbitrary layouts; conversion remains responsible for the element semantics until its own typed-byte slice.
+        let output_data_type = output_type.data_type();
+        let on_true = if on_true.r#type.data_type() == output_data_type {
+            Cow::Borrowed(on_true)
+        } else {
+            Cow::Owned(on_true.convert_element_type(output_data_type)?)
+        };
+        let on_false = if on_false.r#type.data_type() == output_data_type {
+            Cow::Borrowed(on_false)
+        } else {
+            Cow::Owned(on_false.convert_element_type(output_data_type)?)
+        };
+
+        let output_shape = output_type.static_shape().unwrap();
+        let condition_shape = condition.r#type.static_shape().unwrap();
+        let true_shape = on_true.r#type.static_shape().unwrap();
+        let false_shape = on_false.r#type.static_shape().unwrap();
+        let output_strides = output_shape.row_major_strides();
+        let condition_strides = condition_shape.row_major_strides();
+        let true_strides = true_shape.row_major_strides();
+        let false_strides = false_shape.row_major_strides();
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let condition_addressing = ArrayAddressing::new(condition.r#type.clone())?;
+        let true_addressing = ArrayAddressing::new(on_true.r#type.clone())?;
+        let false_addressing = ArrayAddressing::new(on_false.r#type.clone())?;
+        let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
+        for output_index in 0..output_addressing.element_count() {
+            let condition_index = Self::broadcast_index(
+                output_index,
+                &output_shape,
+                &output_strides,
+                &condition_shape,
+                &condition_strides,
+            );
+            let condition_range = condition_addressing.byte_range_for_flat_index(condition_index);
+            let (source, source_range) = if condition.bytes[condition_range.start] != 0 {
+                let source_index =
+                    Self::broadcast_index(output_index, &output_shape, &output_strides, &true_shape, &true_strides);
+                (&on_true.bytes, true_addressing.byte_range_for_flat_index(source_index))
+            } else {
+                let source_index =
+                    Self::broadcast_index(output_index, &output_shape, &output_strides, &false_shape, &false_strides);
+                (&on_false.bytes, false_addressing.byte_range_for_flat_index(source_index))
+            };
+            let output_range = output_addressing.byte_range_for_flat_index(output_index);
+            output_bytes[output_range].copy_from_slice(&source[source_range]);
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
     }
 }
 
@@ -2221,9 +2277,9 @@ impl Concretizable<bool> for Array {
     fn concretize(&self) -> Result<bool, ProgramError> {
         // Accept scalar Boolean predicates (rank-0, one element) so that batch-varying while can extract a final
         // `any(mask)` result. Higher-rank predicates still error because they cannot collapse to a single Boolean.
-        let values = self.scalar_values();
-        if self.r#type.rank() == 0 && self.r#type.data_type().is_boolean() && values.len() == 1 {
-            return values[0].concretize();
+        if self.r#type.rank() == 0 && self.r#type.data_type().is_boolean() {
+            let range = ArrayAddressing::new(self.r#type.clone())?.byte_range_for_flat_index(0);
+            return Ok(self.bytes[range.start] != 0);
         }
         Err(ProgramError::Concretization {
             message: format!(
@@ -2244,22 +2300,18 @@ impl crate::operations::control_flow::WhilePredicate for Array {
                 message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type),
             });
         }
-        for value in self.scalar_values() {
-            if value.concretize()? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let addressing = ArrayAddressing::new(self.r#type.clone())?;
+        Ok((0..addressing.element_count())
+            .any(|index| self.bytes[addressing.byte_range_for_flat_index(index).start] != 0))
     }
 
     fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let predicate_values = self.scalar_values();
-        let true_values = on_true.scalar_values();
-        let false_values = on_false.scalar_values();
+        let predicate_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let true_addressing = ArrayAddressing::new(on_true.r#type.clone())?;
         if !self.r#type.data_type().is_boolean()
             || on_true.r#type != on_false.r#type
-            || predicate_values.is_empty()
-            || !true_values.len().is_multiple_of(predicate_values.len())
+            || predicate_addressing.element_count() == 0
+            || !true_addressing.element_count().is_multiple_of(predicate_addressing.element_count())
         {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -2269,16 +2321,15 @@ impl crate::operations::control_flow::WhilePredicate for Array {
                 ),
             });
         }
-        let block = true_values.len() / predicate_values.len();
-        let values = true_values
-            .iter()
-            .zip(false_values.iter())
-            .enumerate()
-            .map(|(index, (on_true, on_false))| {
-                Ok(if predicate_values[index / block].concretize()? { *on_true } else { *on_false })
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        Self::from_scalar_values(on_true.r#type.clone(), values)
+        let block = true_addressing.element_count() / predicate_addressing.element_count();
+        let mut output_bytes = vec![0; true_addressing.storage_byte_len()];
+        for index in 0..true_addressing.element_count() {
+            let predicate_range = predicate_addressing.byte_range_for_flat_index(index / block);
+            let source = if self.bytes[predicate_range.start] != 0 { &on_true.bytes } else { &on_false.bytes };
+            let source_range = true_addressing.byte_range_for_flat_index(index);
+            output_bytes[source_range.clone()].copy_from_slice(&source[source_range]);
+        }
+        Ok(Self { r#type: on_true.r#type.clone(), bytes: Arc::new(output_bytes) })
     }
 }
 
@@ -2965,6 +3016,22 @@ mod tests {
             Array::select(&Array::scalar(true), &Array::vector(vec![1.0f32, 2.0]), &Array::vector(vec![-1.0f64, -2.0]))
                 .unwrap();
         assert_eq!(broadcast, Array::vector(vec![1.0f64, 2.0]));
+
+        // General broadcasting reads every input through its physical layout and writes one dense output without
+        // converting equal-typed branch elements through an intermediate representation.
+        let condition_type =
+            array_type(DataType::Boolean, &[2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-3, 1])));
+        let condition = Array::from_elements(condition_type, &[true, false]).unwrap();
+        let true_type =
+            array_type(DataType::U16, &[1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, -2])));
+        let on_true = Array::from_elements(true_type, &[0x1111u16, 0x2222, 0x3333]).unwrap();
+        let false_type =
+            array_type(DataType::U16, &[2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-4, 2])));
+        let on_false = Array::from_elements(false_type, &[0xaaaau16, 0xbbbb]).unwrap();
+        let selected = Array::select(&condition, &on_true, &on_false).unwrap();
+        assert_eq!(selected.r#type().as_ref(), &array_type(DataType::U16, &[2, 3]));
+        assert_eq!(selected.elements::<u16>(), Ok(vec![0x1111, 0x2222, 0x3333, 0xbbbb, 0xbbbb, 0xbbbb]),);
+        assert_eq!(selected.storage_bytes(), [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb],);
     }
 
     #[test]
@@ -2993,6 +3060,21 @@ mod tests {
             predicate.mask_select(&on_true, &on_false).unwrap(),
             Array::from_f64s(array_type(DataType::F64, &[2, 2]), vec![-1.0, -2.0, 3.0, 4.0]),
         );
+
+        // Predicate and branch layouts are independent of logical masking. The output preserves the congruent branch
+        // layout, including its hole, while selecting exact element bytes in logical order.
+        let predicate_type =
+            array_type(DataType::Boolean, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+        let predicate = Array::from_elements(predicate_type, &[false, true]).unwrap();
+        assert_eq!(predicate.any_true(), Ok(true));
+        let branch_type =
+            array_type(DataType::U16, &[2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
+        let on_true = Array::from_elements(branch_type.clone(), &[0x1111u16, 0x2222, 0x3333, 0x4444]).unwrap();
+        let on_false = Array::from_elements(branch_type.clone(), &[0xaaaau16, 0xbbbb, 0xcccc, 0xdddd]).unwrap();
+        let selected = predicate.mask_select(&on_true, &on_false).unwrap();
+        assert_eq!(selected.r#type().as_ref(), &branch_type);
+        assert_eq!(selected.elements::<u16>(), Ok(vec![0xaaaa, 0xbbbb, 0x3333, 0x4444]));
+        assert_eq!(selected.storage_bytes(), [0x33, 0x33, 0x44, 0x44, 0, 0, 0xaa, 0xaa, 0xbb, 0xbb]);
     }
 
     #[test]

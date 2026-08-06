@@ -2487,6 +2487,8 @@ Phase 9a2 — byte-backed reference kernels:
       gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
   - [x] P9a2c: migrate broadcast, transpose, reshape, static and dynamic slice/update, pad, and concatenate to direct
         layout-aware byte copies, retaining exact validation order and bulk-copying physically contiguous selections.
+  - [x] P9a2d: migrate `Select`, Boolean concretization, and batched while-predicate reduction/masking to direct,
+        layout-aware byte routing. Preserve branch encodings exactly and support complete NumPy-style broadcasting.
 - [ ] Route raw-buffer access through the Phase 9a1 addressing contract and reuse its rectangular traversal where it
       removes today's duplicated row-major stride, odometer, block-copy, and block-replacement logic. Keep operation
       semantics in their kernels; the addressing layer owns only checked logical-index-to-byte-range mapping.
@@ -4452,3 +4454,20 @@ broadcast shapes must retain their established shape-element-count diagnostic be
 `ryft-core` library tests and all 436 runnable `ryft-xla` library tests pass (one intentional timing-sensitive ignore);
 formatting and diff hygiene pass. The structural parent remains open for gather/scatter, reduce, sort, dot/attention,
 collectives, and control flow.
+
+### Phase 9a2d Boolean and control-flow reference kernels (2026-08-05)
+
+`Select`, scalar Boolean concretization, batched while-predicate reduction, and masked loop-state selection now read
+and route encoded bytes directly through `ArrayAddressing`; none materializes temporary `Scalar` payloads. `Select`
+converts branch elements only when data-type promotion requires it, preserves equal-typed encodings byte-for-byte,
+and uses the shared broadcast-index mapping introduced by the logical kernels. This also closes an existing semantic
+gap: reference selection now supports arbitrary right-aligned NumPy-style broadcasting rather than only equal element
+counts and scalar expansion. Masked loop-state selection retains the congruent branch type and its physical layout,
+including holes and negative strides.
+
+Focused tests cover independently strided `(2, 1)` conditions, `(1, 3)` true branches, and `(2, 1)` false branches;
+exact U16 result bytes; negative-stride while predicates; and holed negative-stride branch storage. All 38 focused
+reference-array tests, all 1,152 core library tests, and all 436 runnable XLA library tests pass (one intentional
+timing-sensitive ignore); formatting and diff hygiene pass. The structural parent remains open for gather/scatter,
+reduce, sort, dot/attention, and collectives; the elementwise parent remains open for comparison, conversion,
+arithmetic, complex, and constructor kernels.
