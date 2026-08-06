@@ -2513,10 +2513,10 @@ Phase 9a2 — byte-backed reference kernels:
         preferred accumulation through its canonical operand-conversion composition followed by the same direct
         kernel. Delete the superseded flat-`Vec` evaluator; verify attention through its existing composition and
         record that collectives own no local reference-array payload kernel requiring migration.
-- [ ] Route raw-buffer access through the Phase 9a1 addressing contract and reuse its rectangular traversal where it
+- [x] Route raw-buffer access through the Phase 9a1 addressing contract and reuse its rectangular traversal where it
       removes today's duplicated row-major stride, odometer, block-copy, and block-replacement logic. Keep operation
       semantics in their kernels; the addressing layer owns only checked logical-index-to-byte-range mapping.
-- [ ] Preserve exact equality, numeric approximation, display, Boolean concretization, and indexing semantics directly
+- [x] Preserve exact equality, numeric approximation, display, Boolean concretization, and indexing semantics directly
       over encoded bytes.
 - [ ] Gate: all reference-backend and transform tests pass; representative kernels add no allocation-count slope beyond
       output allocation; no production array kernel depends on `Scalar`; and unchecked byte-offset arithmetic is not
@@ -4626,3 +4626,19 @@ lowering, so there was no scalar payload bridge to replace.
 All 1,157 core library tests and all 438 runnable XLA library tests pass (one intentional ignore), with XLA tests run
 serially to isolate the concurrency-sensitive live-array telemetry assertion. Formatting and diff hygiene pass. The
 structural migration parent is complete; the next review unit is the cross-family addressing/traversal cleanup.
+
+### Phase 9a2 cross-family addressing and observation closure (2026-08-06)
+
+`ArrayAddressing` now provides crate-private prevalidated multi-index byte mapping and row-major index advancement for
+reference kernels. Reduction, generalized-dot operand reads, transpose, broadcast, pad, gather, and scatter delegate
+their physical lookup and repeated index advancement to that contract instead of reconstructing flat row-major
+indices or open-coding local odometers. The kernels retain only operation-specific coordinate construction. Gather,
+scatter, and dynamic slicing share the same direct typed-index decoder over addressed logical multi-indices.
+
+The existing static/dynamic slice and update paths already share `copy_block` and `replace_block`, both driven by
+`ArrayIndexRanges`; the audit retained those two direction-specific methods because each has a distinct dense-side
+bulk-copy fast path and extracting a generic byte-copy cursor would add more machinery than duplication removed.
+Exact equality, approximate equality, display, Boolean concretization, and indexing were also audited and remain
+direct typed-codec/addressing consumers with arbitrary-layout coverage. The focused 40-test reference-array suite,
+all 1,157 core library tests, and all 438 runnable XLA library tests pass (one intentional ignore). The review unit is
+net code-negative outside its focused addressing tests and adds no public API.

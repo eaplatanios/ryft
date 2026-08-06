@@ -188,14 +188,43 @@ impl ArrayAddressing {
         Ok(self.logical_index_unchecked(|axis| index[axis]))
     }
 
-    /// Maps one logical multi-index to the byte range occupied by its element in physical storage.
+    /// Advances a prevalidated logical multi-index by one element in row-major order. Returns `true` when a next
+    /// element exists. At the final element, it resets every coordinate to zero and returns `false`. This traversal
+    /// primitive lets reference kernels retain one rank-sized coordinate buffer without duplicating an odometer or
+    /// physical-layout logic. A rank-zero scalar has one logical index, `[]`, and therefore has no next index.
+    pub fn advance_index(&self, index: &mut [usize]) -> bool {
+        debug_assert_eq!(index.len(), self.r#type.rank());
+        debug_assert!(index.iter().enumerate().all(|(axis, coordinate)| *coordinate < self.dimension(axis)));
+        for axis in (0..index.len()).rev() {
+            index[axis] += 1;
+            if index[axis] < self.dimension(axis) {
+                return true;
+            }
+            index[axis] = 0;
+        }
+        false
+    }
+
+    /// Maps a logical multi-index to the byte range occupied by its element in physical storage.
+    #[inline]
     pub fn byte_range(&self, index: &[usize]) -> Result<Range<usize>, ProgramError> {
         self.validate_index(index)?;
-        Ok(self.byte_range_unchecked(|axis| index[axis]))
+        Ok(self.byte_range_unchecked(index))
+    }
+
+    /// Maps a prevalidated logical multi-index to its physical byte range. Relative to [`Self::byte_range`], this form
+    /// avoids repeating rank and bounds checks inside reference kernels whose operation-level type inference and index
+    /// construction already establish them.
+    #[inline]
+    pub fn byte_range_unchecked(&self, index: &[usize]) -> Range<usize> {
+        debug_assert_eq!(index.len(), self.r#type.rank());
+        debug_assert!(index.iter().enumerate().all(|(axis, coordinate)| *coordinate < self.dimension(axis)));
+        self.byte_range_with_coordinates(|axis| index[axis])
     }
 
     /// Maps a prevalidated flat logical row-major index to its physical byte range.
     pub fn byte_range_for_flat_index(&self, index: usize) -> Range<usize> {
+        debug_assert!(index < self.element_count());
         let start = self.byte_offset_unchecked(|axis| {
             let inner = (axis + 1..self.r#type.rank()).fold(1usize, |stride, axis| stride * self.dimension(axis));
             (index / inner) % self.dimension(axis)
@@ -372,7 +401,10 @@ impl ArrayAddressing {
 
     /// Returns a physical byte range without validating its coordinates. `coordinate_fn` is called with each logical
     /// axis and must return the selected coordinate along that axis.
-    fn byte_range_unchecked<CoordinateFn: Fn(usize) -> usize>(&self, coordinate_fn: CoordinateFn) -> Range<usize> {
+    fn byte_range_with_coordinates<CoordinateFn: Fn(usize) -> usize>(
+        &self,
+        coordinate_fn: CoordinateFn,
+    ) -> Range<usize> {
         let start = self.byte_offset_unchecked(coordinate_fn);
         start..start + self.element_byte_width()
     }
@@ -691,7 +723,7 @@ impl<'a> ArrayIndexRanges<'a> {
             self.axes[axis].start + position * self.axes[axis].stride
         };
         let element = self.addressing.logical_index_unchecked(coordinate);
-        let bytes = self.addressing.byte_range_unchecked(coordinate);
+        let bytes = self.addressing.byte_range_with_coordinates(coordinate);
         ArrayIndexRange { elements: element..element + 1, bytes }
     }
 }
@@ -748,9 +780,24 @@ mod tests {
         assert_eq!(addressing.index(&[0, 0]), Ok(0));
         assert_eq!(addressing.index(&[1, 2]), Ok(5));
         assert_eq!(addressing.byte_range(&[1, 2]), Ok(20..24));
+        assert_eq!(addressing.byte_range_unchecked(&[1, 2]), 20..24);
         let range = addressing.range(1..4).unwrap();
         assert_eq!(range.elements(), 1..4);
         assert_eq!(range.bytes(), 4..16);
+
+        let mut index = vec![0, 0];
+        assert!(addressing.advance_index(&mut index));
+        assert_eq!(index, vec![0, 1]);
+        assert!(addressing.advance_index(&mut index));
+        assert_eq!(index, vec![0, 2]);
+        assert!(addressing.advance_index(&mut index));
+        assert_eq!(index, vec![1, 0]);
+        assert!(addressing.advance_index(&mut index));
+        assert_eq!(index, vec![1, 1]);
+        assert!(addressing.advance_index(&mut index));
+        assert_eq!(index, vec![1, 2]);
+        assert!(!addressing.advance_index(&mut index));
+        assert_eq!(index, vec![0, 0]);
 
         // Scalar and empty shapes have well-defined addressing, including empty shapes whose irrelevant suffix
         // products would overflow an ordinary row-major-stride calculation.
@@ -758,6 +805,7 @@ mod tests {
         assert_eq!(scalar.element_count(), 1);
         assert_eq!(scalar.logical_byte_len(), 16);
         assert_eq!(scalar.storage_byte_len(), 16);
+        assert!(!scalar.advance_index(&mut []));
         assert_eq!(scalar.index(&[]), Ok(0));
         let empty = ArrayAddressing::new(ArrayType::new(
             DataType::C128,

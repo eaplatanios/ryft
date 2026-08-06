@@ -929,9 +929,6 @@ impl Array {
         debug_assert_eq!(self.r#type.data_type(), T::data_type());
         debug_assert_eq!(output_type.data_type(), T::data_type());
         let input_shape = self.r#type.static_shape().unwrap();
-        let input_strides = input_shape.row_major_strides();
-        let output_shape = output_type.static_shape().unwrap();
-        let output_strides = output_shape.row_major_strides();
         let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let mut reduce_mask = vec![false; input_shape.rank()];
@@ -942,20 +939,21 @@ impl Array {
             identity.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output)]);
         }
 
-        for input in 0..input_addressing.element_count() {
-            let mut output = 0usize;
+        let mut input_index = vec![0usize; input_shape.rank()];
+        let mut output_index = vec![0usize; output_type.rank()];
+        for _ in 0..input_addressing.element_count() {
             let mut output_axis = 0usize;
             for axis in 0..input_shape.rank() {
-                let coordinate = (input / input_strides[axis]) % input_shape[axis];
                 if !reduce_mask[axis] {
-                    output += coordinate * output_strides[output_axis];
+                    output_index[output_axis] = input_index[axis];
                     output_axis += 1;
                 }
             }
-            let input_value = T::decode(&self.bytes[input_addressing.byte_range_for_flat_index(input)]);
-            let output_range = output_addressing.byte_range_for_flat_index(output);
+            let input_value = T::decode(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
+            let output_range = output_addressing.byte_range_unchecked(&output_index);
             let value = combine(T::decode(&bytes[output_range.clone()]), input_value)?;
             value.encode(&mut bytes[output_range]);
+            input_addressing.advance_index(&mut input_index);
         }
         Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
     }
@@ -994,8 +992,6 @@ impl Array {
         let lhs_shape = self.r#type.static_shape().unwrap();
         let rhs_shape = rhs.r#type.static_shape().unwrap();
         let output_shape = output_type.static_shape().unwrap();
-        let lhs_strides = lhs_shape.row_major_strides();
-        let rhs_strides = rhs_shape.row_major_strides();
         let output_strides = output_shape.row_major_strides();
         let lhs_addressing = ArrayAddressing::new(self.r#type.clone())?;
         let rhs_addressing = ArrayAddressing::new(rhs.r#type.clone())?;
@@ -1047,10 +1043,8 @@ impl Array {
                     lhs_index[lhs_axis] = coordinate;
                     rhs_index[rhs_axis] = coordinate;
                 }
-                let lhs_flat = lhs_index.iter().zip(&lhs_strides).map(|(index, stride)| index * stride).sum();
-                let rhs_flat = rhs_index.iter().zip(&rhs_strides).map(|(index, stride)| index * stride).sum();
-                let lhs_value = T::decode(&self.bytes[lhs_addressing.byte_range_for_flat_index(lhs_flat)]);
-                let rhs_value = T::decode(&rhs.bytes[rhs_addressing.byte_range_for_flat_index(rhs_flat)]);
+                let lhs_value = T::decode(&self.bytes[lhs_addressing.byte_range_unchecked(&lhs_index)]);
+                let rhs_value = T::decode(&rhs.bytes[rhs_addressing.byte_range_unchecked(&rhs_index)]);
                 accumulator = accumulator.add(lhs_value.mul(rhs_value)?)?;
             }
             accumulator.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output_flat)]);
@@ -1654,11 +1648,12 @@ impl Array {
         })
     }
 
-    /// Decodes one logical integer element as the signed index representation used by reference indexing kernels.
-    /// Unsigned `u64` values narrow with Rust's two's-complement `as i64` semantics, matching the former scalar
-    /// conversion path. The type-level validation performed by every caller rules out non-integer element types.
-    fn index_value(&self, addressing: &ArrayAddressing, index: usize) -> i64 {
-        let bytes = &self.bytes[addressing.byte_range_for_flat_index(index)];
+    /// Decodes the logical integer element at `index` as the signed representation used by reference indexing
+    /// kernels. Unsigned `u64` values narrow with Rust's two's-complement `as i64` semantics, matching the former
+    /// scalar conversion path. The type-level validation performed by every caller rules out non-integer element
+    /// types and invalid indices.
+    fn index_value(&self, addressing: &ArrayAddressing, index: &[usize]) -> i64 {
+        let bytes = &self.bytes[addressing.byte_range_unchecked(index)];
         match self.r#type.data_type() {
             DataType::I1 => i64::from(i1::decode(bytes).value()),
             DataType::I2 => i64::from(i2::decode(bytes).value()),
@@ -2700,31 +2695,22 @@ impl Transpose for Array {
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
-        let shape = self.r#type.static_shape().unwrap();
-        let rank = shape.rank();
-        let permuted_shape = StaticShape::new(permutation.iter().map(|axis| shape[*axis]).collect());
+        let rank = self.r#type.rank();
         let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         if output_addressing.element_count() == 0 {
             return Ok(Self { r#type: output_type, bytes: Arc::new(bytes) });
         }
-        let input_strides = shape.row_major_strides();
-        let mut permuted_index = vec![0usize; rank];
+        let mut output_index = vec![0usize; rank];
+        let mut input_index = vec![0usize; rank];
         for output_flat in 0..output_addressing.element_count() {
-            let mut input_flat = 0usize;
             for (position, &input_axis) in permutation.iter().enumerate() {
-                input_flat += permuted_index[position] * input_strides[input_axis];
+                input_index[input_axis] = output_index[position];
             }
             bytes[output_addressing.byte_range_for_flat_index(output_flat)]
-                .copy_from_slice(&self.bytes[input_addressing.byte_range_for_flat_index(input_flat)]);
-            for position in (0..rank).rev() {
-                permuted_index[position] += 1;
-                if permuted_index[position] < permuted_shape[position] {
-                    break;
-                }
-                permuted_index[position] = 0;
-            }
+                .copy_from_slice(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
+            output_addressing.advance_index(&mut output_index);
         }
         Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
     }
@@ -2774,24 +2760,16 @@ impl BroadcastKernel for Array {
         if output_count == 0 {
             return Ok(Self { r#type, bytes: Arc::new(bytes) });
         }
-        let input_strides = input_shape.row_major_strides();
         let mut target_index = vec![0usize; target_rank];
+        let mut input_index = vec![0usize; input_rank];
         for output_flat in 0..output_count {
-            let mut input_flat = 0usize;
             for input_axis in 0..input_rank {
                 let target_axis = output_axes[input_axis];
-                let coordinate = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
-                input_flat += coordinate * input_strides[input_axis];
+                input_index[input_axis] = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
             }
             bytes[output_addressing.byte_range_for_flat_index(output_flat)]
-                .copy_from_slice(&self.bytes[input_addressing.byte_range_for_flat_index(input_flat)]);
-            for position in (0..target_rank).rev() {
-                target_index[position] += 1;
-                if target_index[position] < target_shape[position] {
-                    break;
-                }
-                target_index[position] = 0;
-            }
+                .copy_from_slice(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
+            output_addressing.advance_index(&mut target_index);
         }
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
@@ -2883,7 +2861,7 @@ impl Array {
             .enumerate()
             .map(|(axis, index)| {
                 let addressing = ArrayAddressing::new(index.r#type.clone()).unwrap();
-                let raw = index.index_value(&addressing, 0);
+                let raw = index.index_value(&addressing, &[]);
                 let maximum = (input_shape[axis] - block_sizes[axis]) as i64;
                 raw.clamp(0, maximum) as usize
             })
@@ -2931,11 +2909,10 @@ impl Pad for Array {
         if input_addressing.element_count() == 0 {
             return Ok(Self { r#type: output_type, bytes: Arc::new(bytes) });
         }
-        let output_strides = output_shape.row_major_strides();
         let mut input_index = vec![0usize; rank];
+        let mut output_index = vec![0usize; rank];
         let mut written = 0usize;
         'elements: while written < input_addressing.element_count() {
-            let mut output_flat = 0usize;
             for axis in 0..rank {
                 let input_coordinate = i128::try_from(input_index[axis])
                     .map_err(|_| TypeError::invalid(format!("'pad' input index is too large on axis {axis}")))?;
@@ -2943,7 +2920,7 @@ impl Pad for Array {
                     .ok()
                     .and_then(|padding| padding.checked_add(1))
                     .ok_or_else(|| TypeError::invalid(format!("'pad' stride is too large on axis {axis}")))?;
-                let output_index =
+                let output_coordinate =
                     i128::from(edge_padding_low[axis])
                         .checked_add(input_coordinate.checked_mul(stride).ok_or_else(|| {
                             TypeError::invalid(format!("'pad' output index overflows on axis {axis}"))
@@ -2951,36 +2928,18 @@ impl Pad for Array {
                         .ok_or_else(|| TypeError::invalid(format!("'pad' output index overflows on axis {axis}")))?;
                 let output_extent = i128::try_from(output_shape[axis])
                     .map_err(|_| TypeError::invalid(format!("'pad' output extent is too large on axis {axis}")))?;
-                if output_index < 0 || output_index >= output_extent {
+                if output_coordinate < 0 || output_coordinate >= output_extent {
                     written += 1;
-                    for position in (0..rank).rev() {
-                        input_index[position] += 1;
-                        if input_index[position] < input_shape[position] {
-                            break;
-                        }
-                        input_index[position] = 0;
-                    }
+                    input_addressing.advance_index(&mut input_index);
                     continue 'elements;
                 }
-                let output_index = usize::try_from(output_index)
+                output_index[axis] = usize::try_from(output_coordinate)
                     .map_err(|_| TypeError::invalid(format!("'pad' output index is too large on axis {axis}")))?;
-                output_flat =
-                    output_flat
-                        .checked_add(output_index.checked_mul(output_strides[axis]).ok_or_else(|| {
-                            TypeError::invalid(format!("'pad' output index overflows on axis {axis}"))
-                        })?)
-                        .ok_or_else(|| TypeError::invalid(format!("'pad' output index overflows on axis {axis}")))?;
             }
-            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
-                .copy_from_slice(&self.bytes[input_addressing.byte_range_for_flat_index(written)]);
+            bytes[output_addressing.byte_range_unchecked(&output_index)]
+                .copy_from_slice(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
             written += 1;
-            for position in (0..rank).rev() {
-                input_index[position] += 1;
-                if input_index[position] < input_shape[position] {
-                    break;
-                }
-                input_index[position] = 0;
-            }
+            input_addressing.advance_index(&mut input_index);
         }
         Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
     }
@@ -3028,13 +2987,10 @@ impl Gather for Array {
         let dimensions = operation.dimensions();
         let slice_sizes = operation.slice_sizes();
         let operand_shape = self.r#type.static_shape().unwrap();
-        let operand_strides = operand_shape.row_major_strides();
         let indices_shape = indices.r#type.static_shape().unwrap();
-        let indices_strides = indices_shape.row_major_strides();
-        let output_shape = output_type.static_shape().unwrap();
         let operand_rank = operand_shape.rank();
         let indices_rank = indices_shape.rank();
-        let output_rank = output_shape.rank();
+        let output_rank = output_type.rank();
         let index_vector_dimension = indices_rank - 1;
         let index_vector_extent = indices_shape[index_vector_dimension];
 
@@ -3062,12 +3018,12 @@ impl Gather for Array {
         let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
         let indices_addressing = ArrayAddressing::new(indices.r#type.clone())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let extents = output_shape.dimensions();
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         let mut output_index = vec![0usize; output_rank];
         let mut indices_index = vec![0usize; indices_rank];
         let mut starts = vec![0i64; index_vector_extent];
         let mut operand_index = vec![0i64; operand_rank];
+        let mut operand_storage_index = vec![0usize; operand_rank];
         for output_element in 0..output_addressing.element_count() {
             // Place the output's batch coordinates into the indices multi-index and read this query's start vector.
             indices_index.fill(0);
@@ -3076,8 +3032,7 @@ impl Gather for Array {
             }
             for (component, start) in starts.iter_mut().enumerate() {
                 indices_index[index_vector_dimension] = component;
-                let flat: usize = (0..indices_rank).map(|axis| indices_index[axis] * indices_strides[axis]).sum();
-                *start = indices.index_value(&indices_addressing, flat);
+                *start = indices.index_value(&indices_addressing, &indices_index);
             }
             // Assemble the operand multi-index: window offsets, then batching coordinates, then start offsets.
             operand_index.fill(0);
@@ -3108,18 +3063,13 @@ impl Gather for Array {
                 let (value, addressing) = dropped_fill.as_ref().unwrap();
                 &value.bytes[addressing.byte_range_for_flat_index(0)]
             } else {
-                let flat: usize =
-                    (0..operand_rank).map(|axis| operand_index[axis] as usize * operand_strides[axis]).sum();
-                &self.bytes[input_addressing.byte_range_for_flat_index(flat)]
+                for axis in 0..operand_rank {
+                    operand_storage_index[axis] = operand_index[axis] as usize;
+                }
+                &self.bytes[input_addressing.byte_range_unchecked(&operand_storage_index)]
             };
             bytes[output_addressing.byte_range_for_flat_index(output_element)].copy_from_slice(source);
-            for position in (0..output_rank).rev() {
-                output_index[position] += 1;
-                if output_index[position] < extents[position] {
-                    break;
-                }
-                output_index[position] = 0;
-            }
+            output_addressing.advance_index(&mut output_index);
         }
         Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
     }
@@ -3138,10 +3088,8 @@ impl Array {
     ) -> Result<Self, ProgramError> {
         let dimensions = operation.dimensions();
         let operand_shape = self.r#type.static_shape().unwrap();
-        let operand_strides = operand_shape.row_major_strides();
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let indices_shape = indices.r#type.static_shape().unwrap();
-        let indices_strides = indices_shape.row_major_strides();
         let indices_addressing = ArrayAddressing::new(indices.r#type.clone())?;
         let updates_shape = updates.r#type.static_shape().unwrap();
         let updates_addressing = ArrayAddressing::new(updates.r#type.clone())?;
@@ -3167,21 +3115,19 @@ impl Array {
 
         let mut output = Self { r#type: output_type, bytes: self.bytes.clone() };
         let output_bytes = Arc::make_mut(&mut output.bytes);
-        let extents = updates_shape.dimensions();
-        let update_count: usize = extents.iter().product();
         let mut update_index = vec![0usize; updates_rank];
         let mut indices_index = vec![0usize; indices_rank];
         let mut starts = vec![0i64; index_vector_extent];
         let mut operand_index = vec![0i64; operand_rank];
-        for written in 0..update_count {
+        let mut operand_storage_index = vec![0usize; operand_rank];
+        for written in 0..updates_addressing.element_count() {
             indices_index.fill(0);
             for (position, &update_axis) in update_scatter_axes.iter().enumerate() {
                 indices_index[indices_batch_axes[position]] = update_index[update_axis];
             }
             for (component, start) in starts.iter_mut().enumerate() {
                 indices_index[index_vector_dimension] = component;
-                let flat: usize = (0..indices_rank).map(|axis| indices_index[axis] * indices_strides[axis]).sum();
-                *start = indices.index_value(&indices_addressing, flat);
+                *start = indices.index_value(&indices_addressing, &indices_index);
             }
             operand_index.fill(0);
             for (window, &operand_axis) in operand_window_axes.iter().enumerate() {
@@ -3208,20 +3154,15 @@ impl Array {
                 }
             }
             if !dropped {
-                let flat: usize =
-                    (0..operand_rank).map(|axis| operand_index[axis] as usize * operand_strides[axis]).sum();
+                for axis in 0..operand_rank {
+                    operand_storage_index[axis] = operand_index[axis] as usize;
+                }
                 combine(
-                    &mut output_bytes[output_addressing.byte_range_for_flat_index(flat)],
+                    &mut output_bytes[output_addressing.byte_range_unchecked(&operand_storage_index)],
                     &updates.bytes[updates_addressing.byte_range_for_flat_index(written)],
                 )?;
             }
-            for position in (0..updates_rank).rev() {
-                update_index[position] += 1;
-                if update_index[position] < extents[position] {
-                    break;
-                }
-                update_index[position] = 0;
-            }
+            updates_addressing.advance_index(&mut update_index);
         }
         Ok(output)
     }
