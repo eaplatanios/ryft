@@ -2561,7 +2561,7 @@ Phase 9a4 — retire the scalar program universe:
   - [ ] Migrate the generic context, tracing, partial-evaluation, batching, differentiation, custom-derivative, and
         rematerialization fixtures.
     - [x] Migrate generic context and tracing fixtures.
-    - [ ] Migrate partial-evaluation and batching fixtures.
+    - [x] Migrate partial-evaluation and batching fixtures.
     - [ ] Migrate differentiation, custom-derivative, and rematerialization fixtures.
   - [ ] Migrate remaining operation-local scalar fixtures or delete coverage already pinned by array tests.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
@@ -4826,3 +4826,16 @@ value construction rather than new machinery. It removes all retired scalar iden
 `tracing.rs`, reducing the core residual audit from 365 matches across 59 files to 289 matches across 57 files. All 39
 focused context and tracing tests and the complete 1,158-test core library suite pass. Partial evaluation and batching
 are the next bounded generic-transform fixture unit.
+
+The partial-evaluation slice moves all seven generic partial-evaluation fixtures to rank-zero arrays, including eager
+folding, staged known-side evaluation, residual replay, program partitioning, effect placement, poison propagation, and
+constant recovery. Boolean concretization now uses `bool[]` values explicitly instead of relying on the retired scalar
+backend's numeric truthiness, and the one value reused after becoming a residual input is cloned because `Array` is not
+`Copy`. The generic batching fixtures were already fully array-backed, so their half of this checklist unit required no
+source changes.
+
+This review unit changes 371 lines in one test module with 15 net additions, all from explicit rank-zero type/value
+construction and formatting. It removes every retired scalar identifier from `partial.rs`; batching remains clean; and
+the core residual audit falls from 289 matches across 57 files to 260 matches across 56 files. All seven focused partial
+evaluation tests and the complete 1,158-test core library suite pass. Differentiation, custom derivatives, and
+rematerialization are the next generic-transform fixture unit.
