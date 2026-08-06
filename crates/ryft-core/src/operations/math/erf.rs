@@ -176,7 +176,6 @@ mod tests {
             }],
         );
         check_gradient!(
-            @array,
             |x| x.erf().map(|values| values.reduce(&[0], ReductionKind::Sum)),
             at = Array::vector(vec![-2.5f64, -0.3, 0.0, 0.9, 3.0]),
             step = 1e-6,

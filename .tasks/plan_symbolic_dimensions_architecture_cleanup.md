@@ -2548,14 +2548,14 @@ Phase 9a3 — exact XLA literals:
 - [x] Add exact-bit StableHLO and execution tests for low-precision floats, signed zero, preserved NaN payloads, wide
       integers, complex values, empty tensors, and sub-byte integers.
 - [x] Measure literal construction, lowering allocations, StableHLO size, compile time, and runtime against Phase 9a0.
-- [ ] Gate: no literal round-trips through `f64`; exact values lower and execute identically on CPU, with CUDA coverage
+- [x] Gate: no literal round-trips through `f64`; exact values lower and execute identically on CPU, with CUDA coverage
       where supported by the existing backend matrix.
 
 Phase 9a4 — retire the scalar program universe:
 
 - [ ] Migrate useful `DataType`-universe transform tests to rank-zero arrays. Use a narrow test-only fixture only where
       a test genuinely verifies universe-neutral machinery and an array would obscure that contract.
-- [ ] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
+- [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
       exports, scalar-only doctests, and the obsolete scalar-domain compile-fail fixture.
 - [ ] Delete or privatize-and-rename any surviving transient element helper according to the prototype decision. No
@@ -4777,6 +4777,19 @@ when asked to execute the F4/F6/F8 formats, so those formats retain exact attrib
 claiming unsupported CPU execution.
 
 Local gates pass: all 438 runnable `ryft-xla` library tests (one timing-sensitive ignore), the five array allocation
-guards, formatting, and diff hygiene. The exact-source CUDA run remains the sole open Phase 9a3 gate. The offered DGX
-Spark is online (NVIDIA GB10, driver 580.142), but exporting the uncommitted source tree to its isolated `/tmp`
-directory requires explicit user approval under the current execution policy; no source was transferred.
+guards, formatting, and diff hygiene. After the Phase 9a3 source was committed and pushed, revision
+`65bc37eafcdf46822c47eee0ca51a28bfecb46d4` was cloned into an isolated DGX Spark checkout and verified with the
+CUDA 13 feature. All six focused literal tests pass, including exact CPU execution, and the complete serialized
+CUDA-feature library suite passes with 439 tests and one timing-sensitive ignore. This closes the Phase 9a3 gate;
+Phase 9a4 scalar-program-universe retirement is the next isolated implementation unit.
+
+### Phase 9a4 scalar program universe retirement (in progress, 2026-08-06)
+
+The gradient-checking macro now has one array-valued implementation instead of parallel scalar and array selectors.
+Rank-zero F64 and C128 arrays pin scalar-function coverage through the same reverse-mode and finite-difference path as
+rank-positive arrays. The public selector and the scalar-only central-difference, complex-perturbation, and assertion
+branches were deleted; existing array call sites now use the direct `check_gradient!(function, ...)` form. This first
+Phase 9a4 slice removes 85 net lines and leaves no `@scalar` or `@array` gradient syntax. All four focused macro tests,
+the complex absolute-value differentiation tests, and the error-function differentiation test pass. The complete
+1,158-test core library suite and all 54 runnable doctests (16 intentional ignores) also pass. The reusable generic-
+transform test migration remains the next Phase 9a4 unit.

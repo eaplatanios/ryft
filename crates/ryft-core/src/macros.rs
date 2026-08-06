@@ -4262,23 +4262,19 @@ macro_rules! check_operation_transposition {
 /// hand-deriving the expected derivative and without trusting the machinery under test (i.e., the gradient side runs
 /// the function through [`gradient`](crate::gradient), while the finite-difference side evaluates the function directly
 /// on concrete values at the perturbed points, never touching the differentiation machinery that it is checking). That
-/// double instantiation is why this is a macro: the function must be a closure literal (or a generic function), and the
-/// internal `@check` rule shared by both selectors instantiates it once over
-/// [`LinearizationTracer`](crate::LinearizationTracer) inputs and once over concrete [`Scalar`](crate::Scalar)
-/// or [`Array`](crate::Array) inputs before dispatching to the selector's internal assertion rule.
+/// double instantiation is why this is a macro: the function must be a closure literal (or a generic function), and
+/// the macro instantiates it once over [`LinearizationTracer`](crate::LinearizationTracer) inputs and once over
+/// concrete [`Array`](crate::Array) inputs.
 ///
-/// An `f64`-typed input estimates the ordinary derivative `(f(x + h) - f(x - h)) / (2h)` for `@scalar`. For `@array`,
-/// this is computed once per input element with all other elements held fixed, assembling the estimated gradient array.
-/// A `c128`-typed input requires a ℂ → ℝ function and estimates both real partials (per element under `@array`) with
-/// central differences along the real and imaginary axes, assembling `complex(∂f/∂re, -∂f/∂im)`, the conjugate
-/// steepest-ascent gradient the bilinear transposition pairing returns (e.g., `2z̄` for `f(z) = |z|²`). Other input
-/// data types (including `c64`, whose `f32` precision cannot support a meaningful central difference) panic!
+/// An `f64`-typed input estimates each ordinary partial derivative with `(f(x + h) - f(x - h)) / (2h)`, holding all
+/// other elements fixed. Rank-zero arrays therefore cover scalar functions without requiring a separate scalar value
+/// universe. A `c128`-typed input requires a ℂⁿ → ℝ function and estimates both real partials per element with central
+/// differences along the real and imaginary axes, assembling `complex(∂f/∂re, -∂f/∂im)`, the conjugate steepest-ascent
+/// gradient returned by the bilinear transposition pairing (e.g., `2z̄` for `f(z) = |z|²`). Other input data types
+/// (including `c64`, whose `f32` precision cannot support a meaningful central difference) panic!
 ///
 /// # Parameters
 ///
-///   - `@scalar` / `@array`: Selects the value universe: `@scalar` checks a [`Scalar`](crate::Scalar)-valued function,
-///     while `@array` checks an [`Array`](crate::Array)-valued function of any input shape whose output is a rank-0
-///     real `f64` array (i.e., the only shape the plain [`gradient`](crate::gradient) entry point accepts).
 ///   - `$function`: Closure literal (or generic function) to differentiate. The function may return its output value
 ///     either directly or wrapped in a [`Result`] whose error type converts into the differentiation machinery's error
 ///     types (which holds for the [`ProgramError`](crate::ProgramError) that the value capability traits return), so
@@ -4290,37 +4286,9 @@ macro_rules! check_operation_transposition {
 ///     truncation error of the central difference.
 #[macro_export]
 macro_rules! check_gradient {
-    // This branch configures the shared finite-difference check for scalar-valued execution.
-    (@scalar, $function:expr, at = $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {
-        $crate::check_gradient!(
-            @check(
-                $crate::backends::scalars::Scalar,
-                $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar>,
-                @assert_scalar,
-            )
-            $function, $input, $step, $tolerance
-        )
-    };
-
-    // This branch configures the shared finite-difference check for array-valued execution.
-    (@array, $function:expr, at = $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {
-        $crate::check_gradient!(
-            @check(
-                $crate::backends::arrays::Array,
-                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
-                @assert_array,
-            )
-            $function, $input, $step, $tolerance
-        )
-    };
-
-    // Internal rule shared by both scalar and array branches of this macro. `$value` and `$operation` pick the eager
-    // context whose linearization tracer pins the traced instantiation of `$function`, and `@$assert` names the
-    // internal rule below that checks the resulting gradient against the concrete-side finite-difference estimate.
-    (
-        @check($value:ty, $operation:ty, @$assert:ident $(,)?)
-        $function:expr, $input:expr, $step:expr, $tolerance:expr
-    ) => {{
+    // This public branch evaluates an array function through reverse-mode differentiation and concrete finite
+    // differences. Rank-zero arrays represent scalar inputs and outputs.
+    ($function:expr, at = $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {{
         // Closure parameter types flow one way in Rust. A closure literal takes its signature from the expected type at
         // the point where the closure expression appears, and function calls in its body require the parameter type to
         // already be known there (i.e., a later call of the bound closure cannot type the body retroactively). Each
@@ -4340,7 +4308,12 @@ macro_rules! check_gradient {
 
         fn pin_traced<
             __F: Fn(
-                $crate::differentiation::LinearizationTracer<$crate::contexts::EagerContext<$value, $operation>>,
+                $crate::differentiation::LinearizationTracer<
+                    $crate::contexts::EagerContext<
+                        $crate::backends::arrays::Array,
+                        $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
+                    >,
+                >,
             ) -> __Output,
             __Output,
         >(function: __F) -> __F {
@@ -4348,67 +4321,28 @@ macro_rules! check_gradient {
         }
 
         fn pin_eager<
-            __F: Fn($value) -> __Output,
-            __Output: $crate::MaybeFallible<$value, $crate::ProgramError>,
+            __F: Fn($crate::backends::arrays::Array) -> __Output,
+            __Output: $crate::MaybeFallible<$crate::backends::arrays::Array, $crate::ProgramError>,
         >(
             function: __F,
-        ) -> impl Fn($value) -> $value {
+        ) -> impl Fn($crate::backends::arrays::Array) -> $crate::backends::arrays::Array {
             move |input| {
                 $crate::MaybeFallible::into_result(function(input)).unwrap_or_else(|error| panic!("{error}"))
             }
         }
 
-        let input: $value = ::core::convert::Into::into($input);
+        let input: $crate::backends::arrays::Array = ::core::convert::Into::into($input);
         let step: f64 = $step;
         let tolerance: f64 = $tolerance;
         let gradient = $crate::differentiation::gradient(pin_traced($function), input.clone()).unwrap();
 
-        $crate::check_gradient!(@$assert(gradient, pin_eager($function), input, step, tolerance))
+        $crate::check_gradient!(@assert(gradient, pin_eager($function), input, step, tolerance))
     }};
 
-    // Internal rule behind the `@scalar` branch of this macro. It checks a reverse-mode `$gradient` of the ℝ → ℝ or
-    // ℂ → ℝ function `$evaluate` at `$input` against the central finite-difference estimate of its derivative.
-    (@assert_scalar($gradient:expr, $evaluate:expr, $input:expr, $step:expr, $tolerance:expr $(,)?)) => {{
-        let gradient = $gradient;
-        let evaluate = $evaluate;
-        let input = $input;
-        let step = $step;
-        let tolerance = $tolerance;
-
-        let central_difference = |plus: $crate::backends::scalars::Scalar, minus: $crate::backends::scalars::Scalar| {
-            (evaluate(plus) - evaluate(minus)) / $crate::backends::scalars::Scalar::from(2.0 * step)
-        };
-
-        match input {
-            $crate::backends::scalars::Scalar::F64(input) => {
-                let estimate = central_difference(
-                    $crate::backends::scalars::Scalar::from(input + step),
-                    $crate::backends::scalars::Scalar::from(input - step),
-                );
-                ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
-            }
-            $crate::backends::scalars::Scalar::C128(_) => {
-                // The two central differences estimate the real partials that assemble the conjugate
-                // steepest-ascent gradient `complex(∂f/∂re, -∂f/∂im)`.
-                let (real_step, imaginary_step) = $crate::check_gradient!(@complex_perturbation_steps(step));
-                let real_estimate = central_difference(input + real_step, input - real_step);
-                let imaginary_estimate = central_difference(input + imaginary_step, input - imaginary_step);
-                let estimate =
-                    $crate::operations::complex::Complex::complex(&real_estimate, &(-imaginary_estimate)).unwrap();
-                ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
-            }
-            other => panic!(
-                "finite-difference gradient checking requires an f64 or c128 input but got {}",
-                $crate::programs::types::Typed::r#type(&other).into_owned(),
-            ),
-        }
-    }};
-
-    // Internal rule behind the `@array` branch of this macro. It checks a reverse-mode `$gradient` of the ℝⁿ → ℝ or
-    // ℂⁿ → ℝ function `$evaluate` at `$input` (an array of any shape whose output is a rank-0 real `f64` array) against
-    // the central finite-difference estimates of its partials, perturbing one input element at a time with all others
-    // held fixed.
-    (@assert_array($gradient:expr, $evaluate:expr, $input:expr, $step:expr, $tolerance:expr $(,)?)) => {{
+    // This internal branch checks a reverse-mode `$gradient` of the ℝⁿ → ℝ or ℂⁿ → ℝ function `$evaluate` at `$input`
+    // (an array of any shape whose output is a rank-0 real `f64` array) against the central finite-difference estimates
+    // of its partials, perturbing one input element at a time with all others held fixed.
+    (@assert($gradient:expr, $evaluate:expr, $input:expr, $step:expr, $tolerance:expr $(,)?)) => {{
         let gradient = $gradient;
         let evaluate = $evaluate;
         let input = $input;
@@ -4473,22 +4407,6 @@ macro_rules! check_gradient {
             }
             other => panic!("finite-difference gradient checking requires an f64 or c128 input but got {other}"),
         }
-    }};
-
-    // Internal rule shared by the complex arms of both assertion rules of this macro. It builds the complex-valued
-    // real- and imaginary-axis perturbation steps so that the central differences remain in the complex tangent space.
-    (@complex_perturbation_steps($step:expr)) => {{
-        let real_step = $crate::operations::complex::Complex::complex(
-            &$crate::backends::scalars::Scalar::from($step),
-            &$crate::backends::scalars::Scalar::from(0.0),
-        )
-        .unwrap();
-        let imaginary_step = $crate::operations::complex::Complex::complex(
-            &$crate::backends::scalars::Scalar::from(0.0),
-            &$crate::backends::scalars::Scalar::from($step),
-        )
-        .unwrap();
-        (real_step, imaginary_step)
     }};
 }
 
@@ -6484,16 +6402,15 @@ mod tests {
     }
 
     #[test]
-    fn test_check_gradient_scalar() {
+    fn test_check_gradient_rank_zero_array() {
         fn square<V: Clone + std::ops::Mul<Output = V>>(input: V) -> V {
             input.clone() * input
         }
 
-        check_gradient!(@scalar, square, at = 0.7, step = 1e-6, tolerance = 1e-6);
+        check_gradient!(square, at = Array::scalar(0.7), step = 1e-6, tolerance = 1e-6);
         check_gradient!(
-            @scalar,
             |input| input.abs(),
-            at = Complex::new(0.7f64, -0.3),
+            at = Array::scalar(Complex::new(0.7f64, -0.3)),
             step = 1e-6,
             tolerance = 1e-6,
         );
@@ -6506,14 +6423,12 @@ mod tests {
         }
 
         check_gradient!(
-            @array,
             |input| square(input).reduce(&[0], ReductionKind::Sum),
             at = Array::vector(vec![0.7f64, -1.3, 2.1]),
             step = 1e-6,
             tolerance = 1e-6,
         );
         check_gradient!(
-            @array,
             |input| input.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum)),
             at = Array::vector(vec![Complex::new(0.7f64, -0.3), Complex::new(-1.2f64, 0.8)]),
             step = 1e-6,
@@ -6523,15 +6438,14 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "finite-difference gradient checking requires an f64 or c128 input but got f32")]
-    fn test_check_gradient_scalar_unsupported_input_type() {
-        check_gradient!(@scalar, |input| input, at = 0.7f32, step = 1e-3, tolerance = 1e-3);
+    fn test_check_gradient_rank_zero_array_unsupported_input_type() {
+        check_gradient!(|input| input, at = Array::scalar(0.7f32), step = 1e-3, tolerance = 1e-3);
     }
 
     #[test]
     #[should_panic(expected = "finite-difference gradient checking requires an f64 or c128 input but got f32")]
     fn test_check_gradient_array_unsupported_input_type() {
         check_gradient!(
-            @array,
             |input| input.reduce(&[0], ReductionKind::Sum),
             at = Array::vector(vec![0.7f32, -1.3]),
             step = 1e-3,
