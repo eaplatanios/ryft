@@ -24,6 +24,7 @@
 /// capability traits still compile:
 ///
 ///   - `@numeric`: Every element type except Booleans.
+///   - `@ordered`: Every partially ordered element type, namely every element type except the unordered complex ones.
 ///   - `@real`: Every integer and floating-point element type (no Booleans and no complex numbers).
 ///   - `@integer`: Every sub-byte and primitive integer element type.
 ///   - `@float`: Every low-precision, half-precision, and primitive floating-point element type.
@@ -106,6 +107,40 @@ macro_rules! dispatch_on_array_element_type {
             (F64, f64),
             (C64, $crate::arrays::encoding::Complex<f32>),
             (C128, $crate::arrays::encoding::Complex<f64>),
+        ) $data_type, |$element| $body)
+    };
+    (@ordered $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
+            (Boolean, bool),
+            (I1, $crate::arrays::encoding::i1),
+            (I2, $crate::arrays::encoding::i2),
+            (I4, $crate::arrays::encoding::i4),
+            (I8, i8),
+            (I16, i16),
+            (I32, i32),
+            (I64, i64),
+            (U1, $crate::arrays::encoding::u1),
+            (U2, $crate::arrays::encoding::u2),
+            (U4, $crate::arrays::encoding::u4),
+            (U8, u8),
+            (U16, u16),
+            (U32, u32),
+            (U64, u64),
+            (F4E2M1FN, $crate::arrays::encoding::f4e2m1fn),
+            (F6E2M3FN, $crate::arrays::encoding::f6e2m3fn),
+            (F6E3M2FN, $crate::arrays::encoding::f6e3m2fn),
+            (F8E3M4, $crate::arrays::encoding::f8e3m4),
+            (F8E4M3, $crate::arrays::encoding::f8e4m3),
+            (F8E4M3FN, $crate::arrays::encoding::f8e4m3fn),
+            (F8E4M3FNUZ, $crate::arrays::encoding::f8e4m3fnuz),
+            (F8E4M3B11FNUZ, $crate::arrays::encoding::f8e4m3b11fnuz),
+            (F8E5M2, $crate::arrays::encoding::f8e5m2),
+            (F8E5M2FNUZ, $crate::arrays::encoding::f8e5m2fnuz),
+            (F8E8M0FNU, $crate::arrays::encoding::f8e8m0fnu),
+            (BF16, $crate::arrays::encoding::bf16),
+            (F16, $crate::arrays::encoding::f16),
+            (F32, f32),
+            (F64, f64),
         ) $data_type, |$element| $body)
     };
     (@real $data_type:expr, |$element:ident| $body:expr $(,)?) => {
@@ -267,56 +302,70 @@ mod tests {
             DataType::C64,
             DataType::C128,
         ];
-        for data_type in all {
+
+        all.iter().copied().for_each(|data_type| {
             assert_eq!(dispatch_on_array_element_type!(data_type, |Element| element_data_type::<Element>()), data_type);
-        }
+        });
 
         // Every class selector covers exactly the data types of its class and dispatches each to its element type.
-        for data_type in all.into_iter().filter(|data_type| *data_type != DataType::Boolean) {
+        all.iter().copied().filter(|data_type| *data_type != DataType::Boolean).for_each(|data_type| {
             assert_eq!(
                 dispatch_on_array_element_type!(@numeric data_type, |Element| element_data_type::<Element>()),
                 data_type,
             );
-        }
+        });
 
-        for data_type in all.into_iter().filter(|data_type| data_type.is_integer() || data_type.is_floating_point()) {
+        all.iter().copied().filter(|data_type| !data_type.is_complex()).for_each(|data_type| {
             assert_eq!(
-                dispatch_on_array_element_type!(@real data_type, |Element| element_data_type::<Element>()),
+                dispatch_on_array_element_type!(@ordered data_type, |Element| element_data_type::<Element>()),
                 data_type,
             );
-        }
+        });
 
-        for data_type in all.into_iter().filter(|data_type| data_type.is_integer()) {
+        all.iter()
+            .copied()
+            .filter(|data_type| data_type.is_integer() || data_type.is_floating_point())
+            .for_each(|data_type| {
+                assert_eq!(
+                    dispatch_on_array_element_type!(@real data_type, |Element| element_data_type::<Element>()),
+                    data_type,
+                );
+            });
+
+        all.iter().copied().filter(|data_type| data_type.is_integer()).for_each(|data_type| {
             assert_eq!(
                 dispatch_on_array_element_type!(@integer data_type, |Element| element_data_type::<Element>()),
                 data_type,
             );
-        }
+        });
 
-        for data_type in all.into_iter().filter(|data_type| data_type.is_floating_point()) {
+        all.iter().copied().filter(|data_type| data_type.is_floating_point()).for_each(|data_type| {
             assert_eq!(
                 dispatch_on_array_element_type!(@float data_type, |Element| element_data_type::<Element>()),
                 data_type,
             );
-        }
+        });
 
-        for data_type in all.into_iter().filter(|data_type| data_type.is_complex()) {
+        all.iter().copied().filter(|data_type| data_type.is_complex()).for_each(|data_type| {
             assert_eq!(
                 dispatch_on_array_element_type!(@complex data_type, |Element| element_data_type::<Element>()),
                 data_type,
             );
-        }
+        });
 
-        for data_type in all.into_iter().filter(|data_type| *data_type == DataType::Boolean || data_type.is_integer()) {
-            assert_eq!(
-                dispatch_on_array_element_type!(
-                    @boolean_or_integer
+        all.iter()
+            .copied()
+            .filter(|data_type| *data_type == DataType::Boolean || data_type.is_integer())
+            .for_each(|data_type| {
+                assert_eq!(
+                    dispatch_on_array_element_type!(
+                        @boolean_or_integer
+                        data_type,
+                        |Element| element_data_type::<Element>(),
+                    ),
                     data_type,
-                    |Element| element_data_type::<Element>(),
-                ),
-                data_type,
-            );
-        }
+                );
+            });
 
         // The body is instantiated per element type, so type-position uses such as `size_of` resolve per arm.
         assert_eq!(dispatch_on_array_element_type!(DataType::F8E4M3FN, |Element| size_of::<Element>()), 1);
