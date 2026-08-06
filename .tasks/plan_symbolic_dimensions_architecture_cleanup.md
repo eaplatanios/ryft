@@ -2486,6 +2486,10 @@ Phase 9a2 — byte-backed reference kernels:
   - [x] P9a2e: add exhaustive sealed-element dispatch and a zero-intermediate-allocation broadcasted binary loop, then
         migrate exact equality and comparison to direct typed codecs. Preserve signed-zero, NaN, complex-ordering,
         payload-free, promotion, arbitrary-layout, and complete NumPy-style broadcasting semantics.
+  - [x] P9a2k: migrate element-type conversion to direct typed codecs for every supported source and destination data
+        type. Preserve Boolean, integer narrowing, sub-byte, low-precision, complex-to-real, fallible encoding,
+        payload-free rejection, same-type bit preservation, and arbitrary-layout semantics without a temporary
+        [`Scalar`] payload.
 - [x] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
       gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
   - [x] P9a2c: migrate broadcast, transpose, reshape, static and dynamic slice/update, pad, and concatenate to direct
@@ -4642,3 +4646,26 @@ Exact equality, approximate equality, display, Boolean concretization, and index
 direct typed-codec/addressing consumers with arbitrary-layout coverage. The focused 40-test reference-array suite,
 all 1,157 core library tests, and all 438 runnable XLA library tests pass (one intentional ignore). The review unit is
 net code-negative outside its focused addressing tests and adds no public API.
+
+### Phase 9a2k direct element-type conversion (2026-08-06)
+
+Reference-array conversion now decodes and encodes one addressed element at a time through two private typed
+capabilities: source types select an exact signed-integer, unsigned-integer, real, or complex conversion category, and
+destination types implement that category's conversion without a dynamic scalar value or payload-sized intermediate.
+The implementation covers every pair of Boolean, signed and unsigned sub-byte and native integer, low-precision,
+BF16/F16/F32/F64, and C64/C128 data types. Same-type conversion shares the original byte storage to preserve NaN
+payloads and layout padding exactly; token and structural-zero rules retain their established diagnostics.
+
+The exhaustive conversion test instantiates all 1,024 materialized source/destination pairs and separately pins
+Boolean truth conversion, modular sub-byte narrowing, complex component handling, exact and fallible low-precision
+encoding, negative-stride traversal, and same-type storage sharing. `Array::from_f64s` now uses the same destination
+codec contract directly, removing another production constructor dependency on `Scalar`.
+
+This migration exposed one latent block-quantization dependency on the obsolete scalar encoder's saturating
+`f8e4m3fn` overflow. The portable block-quantization composition now clamps normalized elements explicitly to the
+format's finite range before conversion, preserving the OCP MX saturation rule independently of StableHLO conversion
+overflow policy and keeping reference and compiled execution aligned.
+
+All 1,157 core library tests, 54 runnable core doctests (16 intentional ignores), and all 438 runnable XLA library
+tests (one intentional timing-sensitive ignore) pass. Formatting and diff hygiene pass. The Phase 9a2 elementwise
+parent remains open for arithmetic, complex, and constructor kernels.

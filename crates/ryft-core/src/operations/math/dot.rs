@@ -18,7 +18,7 @@ use crate::operations::manipulation::{
     ConvertElementType, ConvertElementTypeOperation, LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation,
     Reshape, Transpose,
 };
-use crate::operations::math::{Abs, Div, Exp, Floor, Log, Max, Mul, MulOperation, Reduce, ReductionKind, Sub};
+use crate::operations::math::{Abs, Clamp, Div, Exp, Floor, Log, Max, Mul, MulOperation, Reduce, ReductionKind, Sub};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
@@ -1605,8 +1605,9 @@ fn static_scaled_dot_dimensions(descriptor: &str, value_type: &ArrayType) -> Res
 ///   - **`f8e8m0fnu` scales** (the [OCP MX](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
 ///     recipe, e.g. MXFP8): each block's shared scale is the power of two `2^(floor(log2(max_abs(block))) - emax)`,
 ///     where `emax` is the element type's maximum exponent (`8` for `f8e4m3fn` and `15` for `f8e5m2`), so the
-///     block's largest element lands in the element type's top binade (elements just past the maximum finite
-///     magnitude — up to `2^(emax + 1)` — saturate on conversion, exactly as the OCP MX specification prescribes).
+///     block's largest element lands in the element type's top binade. Elements just past the maximum finite
+///     magnitude — up to `2^(emax + 1)` — are explicitly clamped before conversion, as the OCP MX specification
+///     prescribes; this avoids relying on a floating-point format's overflow conversion policy.
 ///
 /// In both recipes the elements are the input divided by its block's *stored* (already narrowed) scale and
 /// converted to the element type, so dequantization (see [`ScaledDotOperation`]) reproduces the input up to element
@@ -1635,6 +1636,7 @@ impl<V> BlockQuantize for V
 where
     V: Value<Type = ArrayType>
         + Abs
+        + Clamp
         + LegacyBroadcast
         + ConvertElementType
         + Div
@@ -1743,7 +1745,14 @@ where
         let expanded_scales = stored_scales
             .legacy_broadcast(expanded_type, scale_axes.as_slice())?
             .reshape(input_type.shape().clone())?;
-        let elements = self.div(&expanded_scales)?.convert_element_type(element_type)?;
+        let fill_scalar = |value: f64| -> Result<V, ProgramError> {
+            let scalar = if compute_type == DataType::F32 { Scalar::from(value as f32) } else { Scalar::from(value) };
+            domain.fill(&ArrayType::scalar(compute_type), scalar)
+        };
+        let elements = self
+            .div(&expanded_scales)?
+            .clamp(&fill_scalar(-element_max)?, &fill_scalar(element_max)?)?
+            .convert_element_type(element_type)?;
         Ok((elements, scales))
     }
 }
