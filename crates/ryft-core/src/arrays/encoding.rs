@@ -48,9 +48,27 @@ pub trait ArrayElement: private::Codec {
     fn data_type() -> DataType {
         <Self as private::Codec>::DATA_TYPE
     }
+
+    /// Writes this element's portable representation to an exactly sized byte slice.
+    fn encode(self, bytes: &mut [u8]);
+
+    /// Decodes one element from a byte slice whose length matches its portable representation.
+    fn decode(bytes: &[u8]) -> Self;
 }
 
-impl<T: private::Codec> ArrayElement for T {}
+impl<T: private::Codec> ArrayElement for T {
+    #[inline]
+    fn encode(self, bytes: &mut [u8]) {
+        debug_assert_eq!(bytes.len(), T::BYTE_COUNT);
+        <Self as private::Codec>::encode_unchecked(self, bytes);
+    }
+
+    #[inline]
+    fn decode(bytes: &[u8]) -> Self {
+        debug_assert_eq!(bytes.len(), T::BYTE_COUNT);
+        <Self as private::Codec>::decode_unchecked(bytes)
+    }
+}
 
 mod private {
     use crate::types::DataType;
@@ -64,10 +82,10 @@ mod private {
         const BYTE_COUNT: usize;
 
         /// Writes this value's portable representation to an exactly sized byte slice.
-        fn encode(self, bytes: &mut [u8]);
+        fn encode_unchecked(self, bytes: &mut [u8]);
 
         /// Decodes one value from a byte slice whose length matches its representation.
-        fn decode(bytes: &[u8]) -> Self;
+        fn decode_unchecked(bytes: &[u8]) -> Self;
     }
 }
 
@@ -76,12 +94,12 @@ impl private::Codec for bool {
     const BYTE_COUNT: usize = 1;
 
     #[inline]
-    fn encode(self, bytes: &mut [u8]) {
+    fn encode_unchecked(self, bytes: &mut [u8]) {
         bytes[0] = u8::from(self);
     }
 
     #[inline]
-    fn decode(bytes: &[u8]) -> Self {
+    fn decode_unchecked(bytes: &[u8]) -> Self {
         bytes[0] != 0
     }
 }
@@ -180,12 +198,12 @@ macro_rules! impl_codec_for_signed_sub_byte_integer_type {
             const BYTE_COUNT: usize = 1;
 
             #[inline]
-            fn encode(self, bytes: &mut [u8]) {
+            fn encode_unchecked(self, bytes: &mut [u8]) {
                 bytes[0] = self.to_bits();
             }
 
             #[inline]
-            fn decode(bytes: &[u8]) -> Self {
+            fn decode_unchecked(bytes: &[u8]) -> Self {
                 // Storage bytes are validated before they are decoded, so their high bits are known to be zero.
                 Self::from_bits(bytes[0]).unwrap()
             }
@@ -205,12 +223,12 @@ macro_rules! impl_codec_for_integer_type {
             const BYTE_COUNT: usize = size_of::<Self>();
 
             #[inline]
-            fn encode(self, bytes: &mut [u8]) {
+            fn encode_unchecked(self, bytes: &mut [u8]) {
                 bytes.copy_from_slice(&self.to_le_bytes());
             }
 
             #[inline]
-            fn decode(bytes: &[u8]) -> Self {
+            fn decode_unchecked(bytes: &[u8]) -> Self {
                 Self::from_le_bytes(bytes.try_into().unwrap())
             }
         }
@@ -309,12 +327,12 @@ macro_rules! impl_unsigned_sub_byte_array_element {
             const BYTE_COUNT: usize = 1;
 
             #[inline]
-            fn encode(self, bytes: &mut [u8]) {
+            fn encode_unchecked(self, bytes: &mut [u8]) {
                 bytes[0] = self.to_bits();
             }
 
             #[inline]
-            fn decode(bytes: &[u8]) -> Self {
+            fn decode_unchecked(bytes: &[u8]) -> Self {
                 // Storage bytes are validated before they are decoded, so their high bits are known to be zero.
                 Self::from_bits(bytes[0]).unwrap()
             }
@@ -847,12 +865,12 @@ macro_rules! impl_codec_for_byte_low_precision_floating_point_type {
             const BYTE_COUNT: usize = 1;
 
             #[inline]
-            fn encode(self, bytes: &mut [u8]) {
+            fn encode_unchecked(self, bytes: &mut [u8]) {
                 bytes[0] = self.to_bits();
             }
 
             #[inline]
-            fn decode(bytes: &[u8]) -> Self {
+            fn decode_unchecked(bytes: &[u8]) -> Self {
                 Self::from_bits(bytes[0])
             }
         }
@@ -882,12 +900,12 @@ macro_rules! impl_codec_for_sub_byte_low_precision_floating_point_type {
             const BYTE_COUNT: usize = 1;
 
             #[inline]
-            fn encode(self, bytes: &mut [u8]) {
+            fn encode_unchecked(self, bytes: &mut [u8]) {
                 bytes[0] = self.to_bits();
             }
 
             #[inline]
-            fn decode(bytes: &[u8]) -> Self {
+            fn decode_unchecked(bytes: &[u8]) -> Self {
                 // Storage bytes are validated before they are decoded, so their high bits are known to be zero.
                 Self::from_bits(bytes[0]).unwrap()
             }
@@ -947,12 +965,12 @@ macro_rules! impl_codec_for_floating_point_type {
             const BYTE_COUNT: usize = size_of::<$bits>();
 
             #[inline]
-            fn encode(self, bytes: &mut [u8]) {
+            fn encode_unchecked(self, bytes: &mut [u8]) {
                 bytes.copy_from_slice(&self.to_bits().to_le_bytes());
             }
 
             #[inline]
-            fn decode(bytes: &[u8]) -> Self {
+            fn decode_unchecked(bytes: &[u8]) -> Self {
                 Self::from_bits(<$bits>::from_le_bytes(bytes.try_into().unwrap()))
             }
         }
@@ -969,14 +987,14 @@ impl private::Codec for Complex<f32> {
     const BYTE_COUNT: usize = 8;
 
     #[inline]
-    fn encode(self, bytes: &mut [u8]) {
+    fn encode_unchecked(self, bytes: &mut [u8]) {
         self.re.encode(&mut bytes[..4]);
         self.im.encode(&mut bytes[4..]);
     }
 
     #[inline]
-    fn decode(bytes: &[u8]) -> Self {
-        Self::new(<f32 as private::Codec>::decode(&bytes[..4]), <f32 as private::Codec>::decode(&bytes[4..]))
+    fn decode_unchecked(bytes: &[u8]) -> Self {
+        Self::new(f32::decode(&bytes[..4]), f32::decode(&bytes[4..]))
     }
 }
 
@@ -985,14 +1003,14 @@ impl private::Codec for Complex<f64> {
     const BYTE_COUNT: usize = 16;
 
     #[inline]
-    fn encode(self, bytes: &mut [u8]) {
+    fn encode_unchecked(self, bytes: &mut [u8]) {
         self.re.encode(&mut bytes[..8]);
         self.im.encode(&mut bytes[8..]);
     }
 
     #[inline]
-    fn decode(bytes: &[u8]) -> Self {
-        Self::new(<f64 as private::Codec>::decode(&bytes[..8]), <f64 as private::Codec>::decode(&bytes[8..]))
+    fn decode_unchecked(bytes: &[u8]) -> Self {
+        Self::new(f64::decode(&bytes[..8]), f64::decode(&bytes[8..]))
     }
 }
 
