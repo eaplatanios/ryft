@@ -2495,6 +2495,9 @@ Phase 9a2 — byte-backed reference kernels:
   - [x] P9a2f: migrate dynamic slice/update, gather, and scatter index decoding to direct typed integer storage,
         including signed and unsigned sub-byte indices and arbitrary layouts. Migrate gather payload routing and the
         eager sort index passenger to direct layout-aware construction/copying without payload-sized intermediates.
+  - [x] P9a2g: migrate `to_f64s`, approximate equality, and sort key ranking to direct typed, layout-aware decoding.
+        Support every ordered key type, including signed and unsigned sub-byte integers, while retaining stable IEEE
+        total ordering for all floating-point formats and exact componentwise complex approximation.
 - [ ] Route raw-buffer access through the Phase 9a1 addressing contract and reuse its rectangular traversal where it
       removes today's duplicated row-major stride, odometer, block-copy, and block-replacement logic. Keep operation
       semantics in their kernels; the addressing layer owns only checked logical-index-to-byte-range mapping.
@@ -4520,3 +4523,24 @@ indices, fill-or-drop zero bytes, zero-free F8E8M0FNU promise-in-bounds gather, 
 All 1,156 core library tests and all 436 runnable XLA library tests pass (one intentional timing-sensitive ignore);
 formatting and diff hygiene pass. The structural parent remains open for scatter payload combining, sort, reduce,
 dot/attention, and collectives.
+
+### Phase 9a2g direct observation and sort ranking (2026-08-05)
+
+`Array::to_f64s`, `AbsDiffEq`, and eager sort key ranking now decode each logical element directly from its
+`ArrayAddressing` range. One shared real-element decoder covers Booleans, every signed and unsigned integer width,
+every low-precision floating-point format, BF16/F16, and F32/F64 without allocating a temporary dynamic payload.
+Approximate equality retains exact fallback semantics for Boolean, integer, token, and structural-zero elements;
+widens floating-point values exactly to F64; and compares both complex components after widening C64 components
+before subtraction. Arbitrary physical layouts are traversed logically throughout.
+
+Sort ranking now reads all ordered element types directly, including I1/I2/I4/U1/U2/U4 keys that the transitional
+scalar bridge could not represent. Signed integers retain sign-biased two's-complement ranking, and every
+floating-point format retains the established stable IEEE total ordering, including signed zero, infinities, and NaNs.
+The now-unused `Scalar::total_order_rank` method was deleted rather than retained as dead compatibility machinery; no
+new trait or public API was introduced.
+
+Focused tests pin sub-byte conversion to F64, negative-stride I4 key sorting, and negative-stride F8E4M3FN approximate
+equality. All 1,157 core library tests and all 436 runnable XLA library tests pass (one intentional timing-sensitive
+ignore); formatting and diff hygiene pass. The structural parent remains open for scatter payload combining, reduce,
+dot/attention, and collectives, while the elementwise parent remains open for conversion, arithmetic, complex, and
+constructor kernels.

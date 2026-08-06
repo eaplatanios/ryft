@@ -530,11 +530,11 @@ impl Array {
         if data_type.is_complex() {
             panic!("cannot view an array of complex element data type {data_type} as f64 values");
         }
-        self.scalar_values()
-            .iter()
-            .map(|value| match value.convert_element_type(DataType::F64) {
-                Ok(Scalar::F64(converted)) => converted,
-                _ => panic!("cannot view an array of element data type {data_type} as f64 values"),
+        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
+        (0..addressing.element_count())
+            .map(|index| {
+                Self::element_as_f64(data_type, &self.bytes[addressing.byte_range_for_flat_index(index)])
+                    .unwrap_or_else(|| panic!("cannot view an array of element data type {data_type} as f64 values"))
             })
             .collect()
     }
@@ -907,6 +907,77 @@ impl Array {
         }
     }
 
+    /// Decodes one real-valued element as `f64`, returning `None` for complex and payload-free element data types.
+    /// Integer conversions use Rust's ordinary `as f64` semantics, matching the former scalar conversion path.
+    fn element_as_f64(data_type: DataType, bytes: &[u8]) -> Option<f64> {
+        Some(match data_type {
+            DataType::Boolean => f64::from(u8::from(bool::decode(bytes))),
+            DataType::I1 => f64::from(crate::arrays::i1::decode(bytes).value()),
+            DataType::I2 => f64::from(crate::arrays::i2::decode(bytes).value()),
+            DataType::I4 => f64::from(crate::arrays::i4::decode(bytes).value()),
+            DataType::I8 => f64::from(i8::decode(bytes)),
+            DataType::I16 => f64::from(i16::decode(bytes)),
+            DataType::I32 => f64::from(i32::decode(bytes)),
+            DataType::I64 => i64::decode(bytes) as f64,
+            DataType::U1 => f64::from(crate::arrays::u1::decode(bytes).value()),
+            DataType::U2 => f64::from(crate::arrays::u2::decode(bytes).value()),
+            DataType::U4 => f64::from(crate::arrays::u4::decode(bytes).value()),
+            DataType::U8 => f64::from(u8::decode(bytes)),
+            DataType::U16 => f64::from(u16::decode(bytes)),
+            DataType::U32 => f64::from(u32::decode(bytes)),
+            DataType::U64 => u64::decode(bytes) as f64,
+            DataType::F4E2M1FN => crate::arrays::f4e2m1fn::decode(bytes).to_f64(),
+            DataType::F6E2M3FN => crate::arrays::f6e2m3fn::decode(bytes).to_f64(),
+            DataType::F6E3M2FN => crate::arrays::f6e3m2fn::decode(bytes).to_f64(),
+            DataType::F8E3M4 => crate::arrays::f8e3m4::decode(bytes).to_f64(),
+            DataType::F8E4M3 => crate::arrays::f8e4m3::decode(bytes).to_f64(),
+            DataType::F8E4M3FN => crate::arrays::f8e4m3fn::decode(bytes).to_f64(),
+            DataType::F8E4M3FNUZ => crate::arrays::f8e4m3fnuz::decode(bytes).to_f64(),
+            DataType::F8E4M3B11FNUZ => crate::arrays::f8e4m3b11fnuz::decode(bytes).to_f64(),
+            DataType::F8E5M2 => crate::arrays::f8e5m2::decode(bytes).to_f64(),
+            DataType::F8E5M2FNUZ => crate::arrays::f8e5m2fnuz::decode(bytes).to_f64(),
+            DataType::F8E8M0FNU => crate::arrays::f8e8m0fnu::decode(bytes).to_f64(),
+            DataType::BF16 => bf16::decode(bytes).to_f64(),
+            DataType::F16 => f16::decode(bytes).to_f64(),
+            DataType::F32 => f64::from(f32::decode(bytes)),
+            DataType::F64 => f64::decode(bytes),
+            DataType::C64 | DataType::C128 | DataType::Token | DataType::Zero => return None,
+        })
+    }
+
+    /// Returns the stable-sort rank of one ordered element, or `None` for complex and payload-free element data
+    /// types. Signed integers use sign-biased two's complement and floating-point values use IEEE total ordering.
+    fn element_total_order_rank(data_type: DataType, bytes: &[u8]) -> Option<u64> {
+        /// Maps an `f64` to its IEEE 754 total-order rank.
+        fn floating_point_rank(value: f64) -> u64 {
+            let bits = value.to_bits();
+            if bits >> 63 == 1 { !bits } else { bits | (1 << 63) }
+        }
+
+        Some(match data_type {
+            DataType::Boolean => u64::from(bool::decode(bytes)),
+            DataType::I1 => (crate::arrays::i1::decode(bytes).value() as u64) ^ (1 << 63),
+            DataType::I2 => (crate::arrays::i2::decode(bytes).value() as u64) ^ (1 << 63),
+            DataType::I4 => (crate::arrays::i4::decode(bytes).value() as u64) ^ (1 << 63),
+            DataType::I8 => (i8::decode(bytes) as u64) ^ (1 << 63),
+            DataType::I16 => (i16::decode(bytes) as u64) ^ (1 << 63),
+            DataType::I32 => (i32::decode(bytes) as u64) ^ (1 << 63),
+            DataType::I64 => (i64::decode(bytes) as u64) ^ (1 << 63),
+            DataType::U1 => u64::from(crate::arrays::u1::decode(bytes).value()),
+            DataType::U2 => u64::from(crate::arrays::u2::decode(bytes).value()),
+            DataType::U4 => u64::from(crate::arrays::u4::decode(bytes).value()),
+            DataType::U8 => u64::from(u8::decode(bytes)),
+            DataType::U16 => u64::from(u16::decode(bytes)),
+            DataType::U32 => u64::from(u32::decode(bytes)),
+            DataType::U64 => u64::decode(bytes),
+            data_type if data_type.is_floating_point() => {
+                floating_point_rank(Self::element_as_f64(data_type, bytes).unwrap())
+            }
+            DataType::C64 | DataType::C128 | DataType::Token | DataType::Zero => return None,
+            _ => unreachable!(),
+        })
+    }
+
     /// Decodes one logical integer element as the signed index representation used by reference indexing kernels.
     /// Unsigned `u64` values narrow with Rust's two's-complement `as i64` semantics, matching the former scalar
     /// conversion path. The type-level validation performed by every caller rules out non-integer element types.
@@ -1055,9 +1126,8 @@ impl DimensionSize<usize> for Array {
     }
 }
 
-// Approximate equality requires identical array types and delegates to the elementwise `Scalar` approximation, which
-// compares real floating-point payloads through their exactly widened `f64` values and complex payloads through both
-// parts.
+// Approximate equality requires identical array types. Floating-point payloads compare through their exactly widened
+// `f64` values, complex payloads compare both components, and all other element types use exact equality.
 impl AbsDiffEq for Array {
     type Epsilon = f64;
 
@@ -1066,11 +1136,35 @@ impl AbsDiffEq for Array {
     }
 
     fn abs_diff_eq(&self, other: &Self, epsilon: f64) -> bool {
-        let left = self.scalar_values();
-        let right = other.scalar_values();
-        self.r#type == other.r#type
-            && left.len() == right.len()
-            && left.iter().zip(right.iter()).all(|(left, right)| left.abs_diff_eq(right, epsilon))
+        if self.r#type != other.r#type {
+            return false;
+        }
+        let data_type = self.r#type.data_type();
+        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
+        if data_type.is_floating_point() {
+            return (0..addressing.element_count()).all(|index| {
+                let range = addressing.byte_range_for_flat_index(index);
+                let left = Self::element_as_f64(data_type, &self.bytes[range.clone()]).unwrap();
+                let right = Self::element_as_f64(data_type, &other.bytes[range]).unwrap();
+                (left - right).abs() <= epsilon
+            });
+        }
+        match data_type {
+            DataType::C64 => (0..addressing.element_count()).all(|index| {
+                let range = addressing.byte_range_for_flat_index(index);
+                let left = Complex::<f32>::decode(&self.bytes[range.clone()]);
+                let right = Complex::<f32>::decode(&other.bytes[range]);
+                (f64::from(left.re) - f64::from(right.re)).abs() <= epsilon
+                    && (f64::from(left.im) - f64::from(right.im)).abs() <= epsilon
+            }),
+            DataType::C128 => (0..addressing.element_count()).all(|index| {
+                let range = addressing.byte_range_for_flat_index(index);
+                let left = Complex::<f64>::decode(&self.bytes[range.clone()]);
+                let right = Complex::<f64>::decode(&other.bytes[range]);
+                (left.re - right.re).abs() <= epsilon && (left.im - right.im).abs() <= epsilon
+            }),
+            _ => self == other,
+        }
     }
 }
 
@@ -1407,16 +1501,15 @@ impl Sort for Array {
                 let unsupported = || {
                     ProgramError::from(TypeError::invalid(format!("'sort' does not support key data type {data_type}")))
                 };
-                // The rank computation still rides the temporary scalar bridge, which has no sub-byte representation.
-                if matches!(
-                    data_type,
-                    DataType::I1 | DataType::I2 | DataType::I4 | DataType::U1 | DataType::U2 | DataType::U4,
-                ) {
-                    return Err(unsupported());
-                }
-                key.scalar_values()
-                    .iter()
-                    .map(|value| value.total_order_rank().ok_or_else(unsupported))
+                let addressing = ArrayAddressing::new(key.r#type.clone())?;
+                (0..addressing.element_count())
+                    .map(|index| {
+                        Self::element_total_order_rank(
+                            data_type,
+                            &key.bytes[addressing.byte_range_for_flat_index(index)],
+                        )
+                        .ok_or_else(unsupported)
+                    })
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -3069,6 +3162,12 @@ mod tests {
         assert_eq!(Array::vector(vec![1.5, 2.5]).to_f64s(), vec![1.5, 2.5]);
         assert_eq!(Array::vector(vec![true, false]).to_f64s(), vec![1.0, 0.0]);
         assert_eq!(Array::vector(vec![1i32, -2]).to_f64s(), vec![1.0, -2.0]);
+        assert_eq!(
+            Array::from_elements(array_type(DataType::I4, &[2]), &[i4::new(-8).unwrap(), i4::new(7).unwrap()],)
+                .unwrap()
+                .to_f64s(),
+            vec![-8.0, 7.0],
+        );
         // Low-precision floating-point elements decode to the exact values they denote.
         assert_eq!(Array::from_f64s(array_type(DataType::F8E4M3FN, &[1]), vec![1.5]).to_f64s(), vec![1.5]);
     }
@@ -3162,7 +3261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_sort_gathers_sub_byte_operands() {
+    fn test_array_sort() {
         // Non-key operands sort by moving whole element encodings, so sub-byte operands (which have no scalar
         // representation) ride an f32 key without being decoded.
         let key = Array::vector(vec![3.0f32, 1.0, 2.0]);
@@ -3175,12 +3274,13 @@ mod tests {
         assert_eq!(outputs[0].to_f64s(), vec![1.0, 2.0, 3.0]);
         assert_eq!(outputs[1].storage_bytes(), [0x00, 0x07, 0x08]);
 
-        // Sub-byte keys stay rejected with an error rather than a panic while key ranks ride the scalar bridge.
-        assert!(matches!(
-            Array::sort_with_key_count(&[passenger], 0, SortDirection::Ascending, 1),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "'sort' does not support key data type i4",
-        ));
+        // Sub-byte keys decode directly through arbitrary physical layouts and therefore sort like every other
+        // ordered element type.
+        let key_type = array_type(DataType::I4, &[3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+        let key =
+            Array::from_elements(key_type, &[i4::new(3).unwrap(), i4::new(-2).unwrap(), i4::new(1).unwrap()]).unwrap();
+        let output = Array::sort_with_key_count(&[key], 0, SortDirection::Ascending, 1).unwrap().remove(0);
+        assert_eq!(output.elements::<i4>(), Ok(vec![i4::new(-2).unwrap(), i4::new(1).unwrap(), i4::new(3).unwrap()]),);
     }
 
     #[test]
@@ -3205,6 +3305,15 @@ mod tests {
         let left = Array::vector(vec![1.0]).complex(&Array::vector(vec![2.0])).unwrap();
         let right = Array::vector(vec![1.0 + 1e-10]).complex(&Array::vector(vec![2.0])).unwrap();
         assert_abs_diff_eq!(left, right, epsilon = 1e-9);
+        // Approximate equality reads low-precision, arbitrarily laid-out values directly from physical storage.
+        let r#type = array_type(DataType::F8E4M3FN, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+        let left =
+            Array::from_elements(r#type.clone(), &[f8e4m3fn::from_f64(1.0).unwrap(), f8e4m3fn::from_f64(2.0).unwrap()])
+                .unwrap();
+        let right =
+            Array::from_elements(r#type, &[f8e4m3fn::from_f64(1.125).unwrap(), f8e4m3fn::from_f64(2.0).unwrap()])
+                .unwrap();
+        assert_abs_diff_eq!(left, right, epsilon = 0.2);
     }
 
     #[test]

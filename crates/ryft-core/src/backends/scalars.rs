@@ -276,40 +276,6 @@ impl Scalar {
         })
     }
 
-    /// Returns an order-preserving `u64` rank for this scalar within its own data type, or `None` for data types
-    /// with no total order (complex, token, and structural-zero scalars). Integer ranks are sign-biased two's
-    /// complement, and floating-point ranks follow the IEEE 754 total order
-    /// (`-NaN < -∞ < … < -0.0 < +0.0 < … < +∞ < NaN`), which is what stable ranking sorts (see
-    /// [`SortOperation`](crate::operations::sort::SortOperation)) compare by. Distinct NaN payloads of one sign may
-    /// share a rank, which stable sorts resolve by original position.
-    pub(crate) fn total_order_rank(&self) -> Option<u64> {
-        /// Maps an `f64` to its IEEE 754 total-order rank.
-        fn float_rank(value: f64) -> u64 {
-            let bits = value.to_bits();
-            if bits >> 63 == 1 { !bits } else { bits | (1 << 63) }
-        }
-
-        if let Some((r#type, bits)) = self.low_precision_float_parts() {
-            return Some(float_rank(Self::decode_low_precision_float(r#type, bits)));
-        }
-        Some(match self {
-            Scalar::Bool(value) => u64::from(*value),
-            Scalar::I8(value) => (*value as u64) ^ (1 << 63),
-            Scalar::I16(value) => (*value as u64) ^ (1 << 63),
-            Scalar::I32(value) => (*value as u64) ^ (1 << 63),
-            Scalar::I64(value) => (*value as u64) ^ (1 << 63),
-            Scalar::U8(value) => u64::from(*value),
-            Scalar::U16(value) => u64::from(*value),
-            Scalar::U32(value) => u64::from(*value),
-            Scalar::U64(value) => *value,
-            Scalar::BF16(value) => float_rank(value.to_f64()),
-            Scalar::F16(value) => float_rank(value.to_f64()),
-            Scalar::F32(value) => float_rank(f64::from(*value)),
-            Scalar::F64(value) => float_rank(*value),
-            _ => return None,
-        })
-    }
-
     /// Decodes the raw bit representation of a low-precision floating-point scalar into the exact `f64` value it
     /// denotes, driven by a per-format table of exponent/mantissa widths, biases, NaN encodings, and infinity
     /// support. `f8e8m0fnu` is handled separately because its finite values are bias-127 powers of two with no sign or
