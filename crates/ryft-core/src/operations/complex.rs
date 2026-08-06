@@ -364,36 +364,25 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::differentiation::jvp;
-
-    use super::*;
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::jvp;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_type_inference;
     use crate::programs::regions::EmptyRegionDriver;
 
+    use super::*;
+
     #[test]
     fn test_complex() {
-        let operation = ComplexOperation::<DataType>::new();
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(1.5f32), Scalar::from(-2.0f32)],
-            ),
-            Ok(vec![Scalar::from(ComplexNumber::new(1.5f32, -2.0f32))]),
-        );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &ComplexOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(1.5), Array::scalar(-2.0)],
+                &[Array::scalar(1.5f32), Array::scalar(-2.0f32)],
             ),
-            Ok(vec![Array::scalar(ComplexNumber::new(1.5f64, -2.0f64))]),
+            Ok(vec![Array::scalar(ComplexNumber::new(1.5f32, -2.0f32))]),
         );
     }
 
@@ -425,16 +414,6 @@ mod tests {
 
     #[test]
     fn test_conjugate() {
-        let operation = ConjugateOperation::<DataType>::new();
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
-            ),
-            Ok(vec![Scalar::from(ComplexNumber::new(1.5f64, 2.0f64))]),
-        );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &ConjugateOperation::<ArrayType>::new(),
@@ -466,16 +445,6 @@ mod tests {
 
     #[test]
     fn test_real() {
-        let operation = RealOperation::<DataType>::new();
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
-            ),
-            Ok(vec![Scalar::from(1.5f64)]),
-        );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &RealOperation::<ArrayType>::new(),
@@ -511,16 +480,6 @@ mod tests {
 
     #[test]
     fn test_imaginary() {
-        let operation = ImaginaryOperation::<DataType>::new();
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
-            ),
-            Ok(vec![Scalar::from(-2.0f64)]),
-        );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &ImaginaryOperation::<ArrayType>::new(),
@@ -556,39 +515,39 @@ mod tests {
         let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
 
         // Conjugation: d(z̄) = d̄z.
-        let (primal, tangent) = jvp(|x| x.conjugate(), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
-        assert_eq!(primal, Scalar::from(z.conj()));
-        assert_eq!(tangent, Scalar::from(tangent_seed.conj()));
+        let (primal, tangent) = jvp(|x| x.conjugate(), Array::scalar(z), Array::scalar(tangent_seed)).unwrap();
+        assert_eq!(primal, Array::scalar(z.conj()));
+        assert_eq!(tangent, Array::scalar(tangent_seed.conj()));
 
         // Part extraction: d(Re(z)) = Re(dz) and d(Im(z)) = Im(dz).
-        let (primal, tangent) = jvp(|x| x.real(), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
-        assert_eq!(primal, Scalar::from(z.re));
-        assert_eq!(tangent, Scalar::from(tangent_seed.re));
-        let (primal, tangent) = jvp(|x| x.imaginary(), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
-        assert_eq!(primal, Scalar::from(z.im));
-        assert_eq!(tangent, Scalar::from(tangent_seed.im));
+        let (primal, tangent) = jvp(|x| x.real(), Array::scalar(z), Array::scalar(tangent_seed)).unwrap();
+        assert_eq!(primal, Array::scalar(z.re));
+        assert_eq!(tangent, Array::scalar(tangent_seed.re));
+        let (primal, tangent) = jvp(|x| x.imaginary(), Array::scalar(z), Array::scalar(tangent_seed)).unwrap();
+        assert_eq!(primal, Array::scalar(z.im));
+        assert_eq!(tangent, Array::scalar(tangent_seed.im));
 
         // Construction: d(complex(re, im)) = complex(dre, dim), including the mixed case where one part tangent is a
         // structural zero that must be materialized to keep the staged `complex` arity.
         let (primal, tangent) = jvp(
             |(real, imaginary)| real.complex(&imaginary),
-            (Scalar::from(1.5f64), Scalar::from(-2.0f64)),
-            (Scalar::from(0.25f64), Scalar::from(4.0f64)),
+            (Array::scalar(1.5f64), Array::scalar(-2.0f64)),
+            (Array::scalar(0.25f64), Array::scalar(4.0f64)),
         )
         .unwrap();
-        assert_eq!(primal, Scalar::from(ComplexNumber::new(1.5f64, -2.0f64)));
-        assert_eq!(tangent, Scalar::from(ComplexNumber::new(0.25f64, 4.0f64)));
+        assert_eq!(primal, Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)));
+        assert_eq!(tangent, Array::scalar(ComplexNumber::new(0.25f64, 4.0f64)));
         let (_, tangent) = jvp(
             |(real, imaginary)| {
-                let constant = imaginary.context().lift(Scalar::from(0.0f64))?;
+                let constant = imaginary.context().lift(Array::scalar(0.0f64))?;
                 let _ = imaginary;
                 real.complex(&constant)
             },
-            (Scalar::from(1.5f64), Scalar::from(-2.0f64)),
-            (Scalar::from(0.25f64), Scalar::from(4.0f64)),
+            (Array::scalar(1.5f64), Array::scalar(-2.0f64)),
+            (Array::scalar(0.25f64), Array::scalar(4.0f64)),
         )
         .unwrap();
-        assert_eq!(tangent, Scalar::from(ComplexNumber::new(0.25f64, 0.0f64)));
+        assert_eq!(tangent, Array::scalar(ComplexNumber::new(0.25f64, 0.0f64)));
     }
 
     #[test]
@@ -599,16 +558,18 @@ mod tests {
         // z̄ (from the `z` factor) plus conjugate(z) (from the transposed conjugation branch), so the gradient is
         // 2·z̄ — the same value JAX's `grad` returns for real-valued functions of complex inputs.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
-        let gradient =
-            crate::differentiation::gradient(|x| (x.clone() * x.conjugate().unwrap()).real().unwrap(), Scalar::from(z))
-                .unwrap();
-        assert_eq!(gradient, Scalar::from(z.conj() + z.conj()));
+        let gradient = crate::differentiation::gradient(
+            |x| (x.clone() * x.conjugate().unwrap()).real().unwrap(),
+            Array::scalar(z),
+        )
+        .unwrap();
+        assert_eq!(gradient, Array::scalar(z.conj() + z.conj()));
 
         // Forward and reverse agree through the ℝ-linear rules: the jvp of f at tangent ż is 2·Re(z̄ · ż).
         let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
         let (primal, tangent) =
-            jvp(|x| Ok((x.clone() * x.conjugate()?).real()?), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
-        assert_eq!(primal, Scalar::from(z.norm_sqr()));
-        assert_eq!(tangent, Scalar::from((tangent_seed * z.conj() + z * tangent_seed.conj()).re));
+            jvp(|x| Ok((x.clone() * x.conjugate()?).real()?), Array::scalar(z), Array::scalar(tangent_seed)).unwrap();
+        assert_eq!(primal, Array::scalar(z.norm_sqr()));
+        assert_eq!(tangent, Array::scalar((tangent_seed * z.conj() + z * tangent_seed.conj()).re));
     }
 }

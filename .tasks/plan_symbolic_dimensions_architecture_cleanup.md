@@ -2566,13 +2566,13 @@ Phase 9a4 — retire the scalar program universe:
       - [x] Migrate elementwise differentiation, custom-derivative, and rematerialization fixtures.
       - [x] Migrate forward-mode differentiation fixtures.
       - [x] Migrate reverse-mode differentiation fixtures.
-  - [ ] Migrate remaining operation-local scalar fixtures or delete coverage already covered by array tests.
+  - [x] Migrate remaining operation-local scalar fixtures or delete coverage already covered by array tests.
     - [x] Migrate constants, comparison, logical, conversion, and stop-gradient fixtures.
     - [x] Migrate control-flow fixtures.
-    - [ ] Migrate mathematical and complex-number fixtures.
+    - [x] Migrate mathematical and complex-number fixtures.
       - [x] Migrate arithmetic, ordering, clamping, sign, and rounding fixtures.
       - [x] Migrate transcendental and special-function fixtures.
-      - [ ] Migrate complex construction and projection fixtures.
+      - [x] Migrate complex construction and projection fixtures.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
       exports, scalar-only doctests, and the obsolete scalar-domain compile-fail fixture.
@@ -4936,3 +4936,16 @@ This review unit changes 313 lines across 12 Rust source files with nine net add
 expectations. It removes 139 retired scalar references and reduces the operation-local residual audit from 181 matches
 across 18 files to 42 matches across six files. Formatting and diff hygiene pass, and the complete 1,153-test core
 library suite passes. Complex construction and projection fixtures are the final mathematical/complex-number subunit.
+
+The complex construction and projection slice moves the remaining conjugation, part extraction, complex construction,
+JVP, and non-holomorphic gradient fixtures to rank-zero arrays. Duplicate scalar eager assertions for conjugation and
+part extraction were deleted because the existing vector-array assertions cover the same contracts; the construction
+assertion now uses rank-zero F32 arrays so concrete C64 materialization remains pinned. Structural-zero tangent
+materialization and the bilinear complex-gradient convention retain direct operation-local coverage.
+
+This review unit changes 101 lines in `operations::complex` with 39 net deletions. It removes all 35 scalar references
+from that module and reduces the operation-local residual audit from 42 matches across six files to seven matches
+across five files. Those seven references are production documentation for scalar values or the still-live scalar
+`WhileOperation` specialization rather than test fixtures, so this closes the operation-local fixture checklist; the
+following scalar-universe deletion item owns their removal or rewording. Formatting and diff hygiene pass, and the
+complete 1,153-test core library suite passes.
