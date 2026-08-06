@@ -31,7 +31,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value, ValueProjection};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape, StaticShape};
+use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape, StaticShape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -94,7 +94,7 @@ impl Display for ReductionKind {
 ///
 /// Validates that:
 ///   - `axes` are unique and within `0..rank(input)`;
-///   - `kind` matches the input data type (Boolean for Any/All, non-Boolean for the others).
+///   - `kind` matches the input data type (Boolean for Any/All, numeric or structural-zero for the others).
 ///
 /// The reduced axes are removed from the output shape; non-reduced axes keep their order. The output [`Sharding`]
 /// follows JAX's reduction sharding rule (`_reduce_op_sharding_rule` in `jax/_src/lax/lax.py`): the reduced axes'
@@ -126,7 +126,7 @@ pub fn reduce_abstract(
     if kind.requires_boolean() && !data_type.is_boolean() {
         return Err(TypeError::invalid(format!("'{op}' kind {kind} requires Boolean inputs but got {data_type}")));
     }
-    if !kind.requires_boolean() && data_type.is_boolean() {
+    if !kind.requires_boolean() && !data_type.is_numeric() && data_type != DataType::Zero {
         return Err(TypeError::invalid(format!("'{op}' kind {kind} requires numeric inputs but got {data_type}")));
     }
     // Min/max reductions select elements by order, and complex element types are unordered.
@@ -1087,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_abstract_enforces_boolean_data_type_for_any_and_all() {
+    fn test_reduce_abstract_enforces_reduction_data_types() {
         let numeric = array_type(&[2, 3], DataType::F64);
         assert!(reduce_abstract(&numeric, &[1], ReductionKind::Any, "reduce_any").is_err());
         let boolean = array_type(&[2, 3], DataType::Boolean);
@@ -1095,6 +1095,18 @@ mod tests {
         assert_eq!(
             reduce_abstract(&boolean, &[1], ReductionKind::Any, "reduce_any"),
             Ok(array_type(&[2], DataType::Boolean))
+        );
+        let token = array_type(&[2, 3], DataType::Token);
+        assert_eq!(
+            reduce_abstract(&token, &[1], ReductionKind::Sum, "reduce_sum"),
+            Err(TypeError::invalid("'reduce_sum' kind sum requires numeric inputs but got token".to_string())),
+        );
+        // The structural-zero element type represents an already-known zero tangent and remains closed under numeric
+        // reductions even though it has no numeric payload bytes.
+        let zero = array_type(&[2, 3], DataType::Zero);
+        assert_eq!(
+            reduce_abstract(&zero, &[1], ReductionKind::Sum, "reduce_sum"),
+            Ok(array_type(&[2], DataType::Zero)),
         );
     }
 

@@ -24,7 +24,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{LogicalMesh, Sharding};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Dimension};
+use crate::types::{ArrayType, DataType, Dimension};
 
 // TODO(eaplatanios): Review this.
 
@@ -630,6 +630,31 @@ impl Scatter for ArrayType {
             ))
             .into());
         }
+        let data_type = operand.data_type();
+        match operation.kind() {
+            ScatterReductionKind::Overwrite => {}
+            ScatterReductionKind::Add | ScatterReductionKind::Mul
+                if !data_type.is_numeric() && data_type != DataType::Zero =>
+            {
+                return Err(TypeError::invalid(format!(
+                    "'{SCATTER_OPERATION_NAME}' kind {} requires numeric operand and update elements but got \
+                     {data_type}",
+                    operation.kind(),
+                ))
+                .into());
+            }
+            ScatterReductionKind::Min | ScatterReductionKind::Max
+                if !data_type.is_boolean() && !data_type.is_real() && data_type != DataType::Zero =>
+            {
+                return Err(TypeError::invalid(format!(
+                    "'{SCATTER_OPERATION_NAME}' kind {} requires ordered operand and update elements but got \
+                     {data_type}",
+                    operation.kind(),
+                ))
+                .into());
+            }
+            _ => {}
+        }
         let index_vector_dimension = indices_rank - 1;
         let Dimension::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
             return Err(TypeError::invalid(format!(
@@ -893,6 +918,8 @@ mod tests {
         let operand = float_type(vec![3, 2]);
         let indices = indices_type(vec![2, 1]);
         let updates = float_type(vec![2, 2]);
+        let boolean_operand = ArrayType::new(DataType::Boolean, operand.shape().clone());
+        let boolean_updates = ArrayType::new(DataType::Boolean, updates.shape().clone());
         let host_operand = operand.clone().with_memory(Memory::Host { pinned: true });
         let host_indices = indices.clone().with_memory(Memory::Host { pinned: true });
         let host_updates = updates.clone().with_memory(Memory::Host { pinned: true });
@@ -916,6 +943,10 @@ mod tests {
                     error = "'scatter' indices must be integer-typed but have type f32[2, 1]",
                 },
                 {
+                    input_types = [boolean_operand, indices.clone(), boolean_updates],
+                    error = "'scatter' kind add requires numeric operand and update elements but got bool",
+                },
+                {
                     input_types = [host_operand.clone(), host_indices, host_updates],
                     output_types = [host_operand.clone()],
                 },
@@ -926,6 +957,17 @@ mod tests {
                 },
             ],
         );
+        let complex_operand = ArrayType::new(DataType::C64, operand.shape().clone());
+        let complex_updates = ArrayType::new(DataType::C64, updates.shape().clone());
+        assert!(matches!(
+            complex_operand.scatter(
+                &indices,
+                &complex_updates,
+                &ScatterOperation::new(operation.dimensions().clone(), ScatterReductionKind::Max),
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "'scatter' kind max requires ordered operand and update elements but got c64",
+        ));
 
         assert_eq!(
             format!("{operation}"),

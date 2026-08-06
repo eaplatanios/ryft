@@ -2498,6 +2498,15 @@ Phase 9a2 — byte-backed reference kernels:
   - [x] P9a2g: migrate `to_f64s`, approximate equality, and sort key ranking to direct typed, layout-aware decoding.
         Support every ordered key type, including signed and unsigned sub-byte integers, while retaining stable IEEE
         total ordering for all floating-point formats and exact componentwise complex approximation.
+  - [x] P9a2h: migrate scatter payload combining and reduction to direct typed, layout-aware kernels. Share one private
+        arithmetic-element capability across both families; support every numeric codec, sub-byte modular arithmetic,
+        low-precision floating-point formats, complex sum/mean, Boolean reductions, arbitrary physical layouts, and
+        structural-zero payloads without a payload-sized `Scalar` intermediate.
+  - [ ] P9a2i: close the existing JAX extremum-semantics gap before moving to dot/attention and collectives. Match
+        `lax.reduce_min`, `lax.reduce_max`, `lax.scatter_min`, and `lax.scatter_max` for Boolean extrema, IEEE-754 NaN
+        and signed-zero behavior, lexicographic complex ordering, dtype-specific reduction identities, and empty-axis
+        reductions. Keep reference and XLA execution identical, including complex identity lowering, and pin each
+        behavior with exact type-rule, reference, StableHLO, and execution tests.
 - [ ] Route raw-buffer access through the Phase 9a1 addressing contract and reuse its rectangular traversal where it
       removes today's duplicated row-major stride, odometer, block-copy, and block-replacement logic. Keep operation
       semantics in their kernels; the addressing layer owns only checked logical-index-to-byte-range mapping.
@@ -4544,3 +4553,24 @@ equality. All 1,157 core library tests and all 436 runnable XLA library tests pa
 ignore); formatting and diff hygiene pass. The structural parent remains open for scatter payload combining, reduce,
 dot/attention, and collectives, while the elementwise parent remains open for conversion, arithmetic, complex, and
 constructor kernels.
+
+### Phase 9a2h direct scatter and reduction kernels (2026-08-05)
+
+Scatter now performs its shared index/window traversal once and combines operand and update encodings directly in one
+copy-on-write output payload. Overwrite preserves exact bytes, while add, multiply, minimum, and maximum decode only the
+two elements being combined. Reduction likewise traverses arbitrary input layouts directly into one addressed output
+buffer: sum and mean use typed arithmetic, minimum and maximum use the established ordered-element behavior, and any
+and all use direct Boolean accumulation. Structural-zero arrays remain payload-free throughout.
+
+A single private `ArrayArithmeticElement` capability centralizes zero, wrapping addition and multiplication, and mean
+division for every numeric codec. It covers primitive and sub-byte integers, all low-precision floating-point formats,
+BF16/F16/F32/F64, and C64/C128 without expanding the public array API. The abstract rules now reject unsupported
+reduction and scatter combiner data types before execution. Focused tests pin reversed and holed layouts, sub-byte
+wrapping, low-precision arithmetic, complex sum/mean, Boolean reduction, exact zero-free overwrite, and empty sum.
+
+The current upstream JAX and StableHLO audit also exposed a pre-existing extrema gap that is deliberately recorded as
+P9a2i rather than hidden inside this storage migration: Ryft does not yet implement JAX's Boolean reduction extrema,
+IEEE floating-point maximum/minimum details, lexicographic complex extrema, or dtype-specific empty-reduction
+identities consistently across reference and XLA execution. All 1,157 core library tests and all 436 runnable XLA
+library tests pass (one intentional timing-sensitive ignore); formatting and diff hygiene pass. The structural parent
+remains open for P9a2i, dot/attention, and collectives.
