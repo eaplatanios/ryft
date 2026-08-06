@@ -2558,14 +2558,14 @@ Phase 9a4 — retire the scalar program universe:
   - [x] Migrate the foundational atom, builder, operation-formatting, program, region-graph, capture-region, and
         interpretation-replay fixtures. Make the shared test-only region operation use `ArrayType` so its complete
         consumer graph uses rank-zero arrays without introducing another test value universe.
-  - [ ] Migrate the generic context, tracing, partial-evaluation, batching, differentiation, custom-derivative, and
+  - [x] Migrate the generic context, tracing, partial-evaluation, batching, differentiation, custom-derivative, and
         rematerialization fixtures.
     - [x] Migrate generic context and tracing fixtures.
     - [x] Migrate partial-evaluation and batching fixtures.
-    - [ ] Migrate differentiation, custom-derivative, and rematerialization fixtures.
+    - [x] Migrate differentiation, custom-derivative, and rematerialization fixtures.
       - [x] Migrate elementwise differentiation, custom-derivative, and rematerialization fixtures.
-      - [ ] Migrate forward-mode differentiation fixtures.
-      - [ ] Migrate reverse-mode differentiation fixtures.
+      - [x] Migrate forward-mode differentiation fixtures.
+      - [x] Migrate reverse-mode differentiation fixtures.
   - [ ] Migrate remaining operation-local scalar fixtures or delete coverage already pinned by array tests.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
@@ -4854,3 +4854,29 @@ This review unit changes 387 lines across three test modules with 109 net deleti
 identifiers from the three modules and reduces the core residual audit from 260 matches across 56 files to 227 matches
 across 53 files. All 77 focused tests and the complete 1,154-test core library suite pass. Forward-mode and reverse-mode
 differentiation fixtures remain as separate review-sized substeps.
+
+The forward-mode differentiation slice moves all six formerly scalar-backed JVP and linearization fixtures to rank-zero
+arrays. Program construction, fused JVP rendering, direct linearization, pullback construction, eager and traced
+transform entrypoints, nested transform composition, complex and half-precision arithmetic, symbolic-zero
+canonicalization, and token/zero-space boundaries now run through `ArrayOperation<Array>`. The eager host-control-flow
+cases use an explicit Boolean primal and structural-zero tangent, because array concretization intentionally accepts
+only `bool[]` instead of the retired scalar backend's numeric truthiness.
+
+This review unit changes 345 lines in one test module with 19 net additions, all from explicit rank-zero array types,
+payload-free token/zero construction, ownership-preserving clones, and array payload assertions. It removes all 104
+previously audited scalar-reference lines from `differentiation::forward`. All nine focused forward-mode tests and the
+complete 1,154-test core library suite pass. Reverse-mode differentiation fixtures are the next bounded substep.
+
+The reverse-mode differentiation slice moves the remaining scalar-backed transpose, VJP, gradient, auxiliary-output,
+holomorphic, and nested-differentiation fixtures to rank-zero arrays. Its test-only malformed-transpose operation family
+now uses `ArrayType`, so builder ownership, structural-zero materialization, known-producer replay, attached-region
+replay, effect rejection, and transposition diagnostics are tested without retaining a second type universe. Complex,
+E8M0, token, zero-space, traced, and non-`Copy` boundaries retain their prior coverage. As in forward mode, eager host
+control flow now receives an explicit Boolean primal because array concretization accepts only `bool[]`.
+
+This review unit changes 581 lines in one test module with 21 net additions, all from explicit rank-zero types, array
+payload extraction, payload-free value construction, and ownership-preserving clones. It removes all 150 retired scalar
+references from `differentiation::reverse`; the sole remaining `Scalar` substring belongs to the unrelated
+`NonScalarGradientOutput` diagnostic variant. All 17 focused reverse-mode tests and the complete 1,154-test core library
+suite pass. This closes the generic context, tracing, partial-evaluation, batching, differentiation, custom-derivative,
+and rematerialization fixture migration. Remaining operation-local scalar fixtures are the next Phase 9a4 unit.

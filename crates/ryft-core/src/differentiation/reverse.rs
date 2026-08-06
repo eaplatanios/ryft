@@ -1626,7 +1626,7 @@ define_value_and_gradient_auxiliary_function!(
 /// # Parameters
 ///
 ///   - `context`: Context that executes or stages the reverse-mode transform.
-///   - `function`: Scalar-output function to differentiate.
+///   - `function`: Scalar-valued function to differentiate.
 ///   - `primals`: Structured input values specifying the differentiation point.
 ///   - `holomorphic`: Whether the output is validated under a holomorphy promise.
 fn value_and_gradient_in_context<C, F, Input, Output>(
@@ -1911,7 +1911,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedProgramOperation, ProjectedProgramType,
         ProjectedProgramValue,
@@ -1934,16 +1933,16 @@ mod tests {
     use crate::programs::types::{TypeError, Typed};
     use crate::programs::values::{Concretizable, Value};
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
-    type TestTracingValue = DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>;
+    type TestTracingValue = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
 
-    /// Test-only linear operation type used to exercise transposition validation paths. Most variants model tiny scalar
-    /// primitives so the generated programs stay readable. The sentinel variants intentionally violate transpose rule
-    /// contracts or builder ownership rules. Built-in scalar operations cannot represent those failures because their
-    /// transpose implementations are valid by construction.
+    /// Test-only linear operation type used to exercise transposition validation paths. Most variants model tiny
+    /// rank-zero array primitives so the generated programs stay readable. The sentinel variants intentionally violate
+    /// transpose rule contracts or builder ownership rules. Built-in array operations cannot represent those failures
+    /// because their transpose implementations are valid by construction.
     #[derive(Clone, Debug)]
     enum TestLinearOperation {
         /// Single-input passthrough used when a test needs a live instruction whose transpose forwards its cotangent.
@@ -1965,7 +1964,7 @@ mod tests {
 
         /// Single-input operation whose transpose stages a [`ZeroOperation`] as the input cotangent contribution. The
         /// staged zero remains an input-free [`ZeroOperation`] instruction in the pullback and is materialized at
-        /// interpretation time. Built-in scalar operations do not stage that exact structural-zero contribution, so
+        /// interpretation time. Built-in array operations do not stage that exact structural-zero contribution, so
         /// this sentinel keeps that path directly covered.
         StagedZeroContribution,
 
@@ -1981,11 +1980,11 @@ mod tests {
 
         /// Real zero operation wrapper used by the `From<ZeroOperation>`/`TryFrom<ZeroOperation>` conversions for this
         /// test operation enum.
-        Zero(ZeroOperation<DataType>),
+        Zero(ZeroOperation<ArrayType>),
     }
 
     impl Operation for TestLinearOperation {
-        type Type = DataType;
+        type Type = ArrayType;
 
         #[inline]
         fn name(&self) -> &'static str {
@@ -2011,9 +2010,9 @@ mod tests {
 
         fn infer_output_types(
             &self,
-            input_types: &[DataType],
-            region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
+            input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
             match self {
                 Self::Identity
                 | Self::EffectfulIdentity
@@ -2060,23 +2059,23 @@ mod tests {
         }
     }
 
-    impl From<AddOperation<DataType>> for TestLinearOperation {
+    impl From<AddOperation<ArrayType>> for TestLinearOperation {
         #[inline]
-        fn from(_operation: AddOperation<DataType>) -> Self {
+        fn from(_operation: AddOperation<ArrayType>) -> Self {
             Self::Add
         }
     }
 
-    impl From<ZeroOperation<DataType>> for TestLinearOperation {
+    impl From<ZeroOperation<ArrayType>> for TestLinearOperation {
         #[inline]
-        fn from(operation: ZeroOperation<DataType>) -> Self {
+        fn from(operation: ZeroOperation<ArrayType>) -> Self {
             Self::Zero(operation)
         }
     }
 
     // This mirrors the borrowed payload projection that `#[derive(Operation)]` generates,
     // including its canonical wrong-payload diagnostic.
-    impl<'o> TryFrom<&'o TestLinearOperation> for &'o ZeroOperation<DataType> {
+    impl<'o> TryFrom<&'o TestLinearOperation> for &'o ZeroOperation<ArrayType> {
         type Error = TypeError;
 
         #[inline]
@@ -2084,14 +2083,14 @@ mod tests {
             match value {
                 TestLinearOperation::Zero(zero) => Ok(zero),
                 _ => Err(TypeError::invalid(format!(
-                    "cannot project operation '{}' into a 'ZeroOperation<DataType>' payload",
+                    "cannot project operation '{}' into a 'ZeroOperation<ArrayType>' payload",
                     value.name(),
                 ))),
             }
         }
     }
 
-    impl<V: Value<Type = DataType>> TransposableOperation<V, TestLinearOperation> for TestLinearOperation {
+    impl<V: Value<Type = ArrayType>> TransposableOperation<V, TestLinearOperation> for TestLinearOperation {
         fn transpose<D: TranspositionDriver<V, TestLinearOperation>>(
             &self,
             context: &mut TracingContext<V, TestLinearOperation>,
@@ -2118,7 +2117,7 @@ mod tests {
                     let zero = {
                         let mut builder = context.builder().borrow_mut();
                         let outputs = builder.add_instruction(
-                            Self::Zero(ZeroOperation::new(DataType::F64)),
+                            Self::Zero(ZeroOperation::new(ArrayType::scalar(DataType::F64))),
                             Vec::new(),
                             Vec::new(),
                         )?;
@@ -2134,7 +2133,7 @@ mod tests {
                 Self::ForeignContribution => {
                     check_count!("output", outputs, 1, ProgramError);
                     let foreign_context = TracingContext::<V, TestLinearOperation>::new();
-                    Ok(vec![MaybeZero::Value(foreign_context.input(DataType::F64))])
+                    Ok(vec![MaybeZero::Value(foreign_context.input(ArrayType::scalar(DataType::F64)))])
                 }
                 Self::Zero(_) => {
                     check_count!("output", outputs, 1, ProgramError);
@@ -2157,10 +2156,10 @@ mod tests {
     #[test]
     fn test_program_transpose() {
         // Test that transposing an identity instruction forwards the output cotangent straight to the input.
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
         assert_eq!(transposed.output_ids(), &[AtomId::new(0)]);
@@ -2168,7 +2167,7 @@ mod tests {
         assert_eq!(
             transposed.to_string(),
             indoc! {"
-                lambda %0:f64 .
+                lambda %0:f64[] .
                 in (%0)
             "}
             .trim_end(),
@@ -2176,32 +2175,35 @@ mod tests {
 
         // A primal representation may use a different cotangent representation. E8M0 cannot represent zero or
         // negative values, so both pullback boundaries use F32 while the source program remains E8M0-typed.
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F8E8M0FNU);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
         let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
-        assert_eq!(transposed.input_types(), vec![DataType::F32]);
-        assert_eq!(transposed.output_types(), vec![DataType::F32]);
+        assert_eq!(transposed.input_types(), vec![ArrayType::scalar(DataType::F32)]);
+        assert_eq!(transposed.output_types(), vec![ArrayType::scalar(DataType::F32)]);
         assert!(transposed.instructions().is_empty());
 
         // Zero-space cotangent boundary leaves preserve the primal leaf structure, but can never carry live adjoints.
         // Transposing identity programs over non-differentiable types therefore returns the zero-space value.
-        for data_type in [DataType::Token, DataType::Boolean, DataType::I32] {
-            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        for data_type in
+            [ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I32)]
+        {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(data_type);
-            let program = builder.build::<Scalar, Scalar>(vec![input], Placeholder, Placeholder).unwrap();
+            let program = builder.build::<Array, Array>(vec![input], Placeholder, Placeholder).unwrap();
             let transposed = program.transpose().unwrap();
-            assert_eq!(transposed.input_types(), vec![DataType::Zero]);
-            assert_eq!(transposed.output_types(), vec![DataType::Zero]);
-            assert_eq!(transposed.interpret(Scalar::Zero), Ok(Scalar::Zero));
+            assert_eq!(transposed.input_types(), vec![ArrayType::scalar(DataType::Zero)]);
+            assert_eq!(transposed.output_types(), vec![ArrayType::scalar(DataType::Zero)]);
+            let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+            assert_eq!(transposed.interpret(zero.clone()), Ok(zero));
         }
 
         // Test that repeated uses of one input accumulate their cotangent contributions through a staged `add`.
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![input, input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
         assert_eq!(transposed.output_ids(), &[AtomId::new(1)]);
@@ -2212,8 +2214,8 @@ mod tests {
         assert_eq!(
             transposed.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = add %0 %0
+                lambda %0:f64[] .
+                let %1:f64[] = add %0 %0
                 in (%1)
             "}
             .trim_end(),
@@ -2221,11 +2223,11 @@ mod tests {
 
         // Test that unused instruction outputs are passed to transpose rules as structural zero cotangents (the
         // `TwoOutputs` rule asserts that its second output cotangent is a structural zero).
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let outputs =
             builder.add_instruction(TestLinearOperation::TwoOutputs, Vec::new(), vec![input]).unwrap().to_vec();
-        let program = builder.build::<Scalar, Scalar>(vec![outputs[0]], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![outputs[0]], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(outputs, &[AtomId::new(1), AtomId::new(2)]);
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
@@ -2234,7 +2236,7 @@ mod tests {
         assert_eq!(
             transposed.to_string(),
             indoc! {"
-                lambda %0:f64 .
+                lambda %0:f64[] .
                 in (%0)
             "}
             .trim_end(),
@@ -2242,9 +2244,9 @@ mod tests {
 
         // Test that a disconnected primal input's cotangent is emitted as an input-free `ZeroOperation` instruction,
         // which is materialized at interpretation time rather than at transpose time.
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        builder.add_input(DataType::F64);
-        let program = builder.build::<Scalar, ()>(Vec::new(), Placeholder, ()).unwrap();
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<Array, ()>(Vec::new(), Placeholder, ()).unwrap();
         let transposed = program.transpose().unwrap();
         assert!(transposed.input_ids().is_empty());
         assert_eq!(transposed.output_ids(), &[AtomId::new(0)]);
@@ -2253,13 +2255,13 @@ mod tests {
         assert_eq!(transposed.instructions()[0].outputs(), &[AtomId::new(0)]);
         assert!(matches!(
             transposed.instructions()[0].operation(),
-            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+            TestLinearOperation::Zero(zero) if zero.r#type() == &ArrayType::scalar(DataType::F64),
         ));
         assert_eq!(
             transposed.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64 = zero [type=f64]
+                let %0:f64[] = zero [type=f64[]]
                 in (%0)
             "}
             .trim_end(),
@@ -2267,14 +2269,14 @@ mod tests {
 
         // Test that instructions whose outputs carry no adjoint are skipped in the reverse walk, with the dead input
         // still receiving a zero cotangent output.
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let dead_input = builder.add_input(DataType::F64);
-        let live_input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let dead_input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let live_input = builder.add_input(ArrayType::scalar(DataType::F64));
         let dead_output =
             builder.add_instruction(TestLinearOperation::BadArity, Vec::new(), vec![dead_input]).unwrap()[0];
         let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![live_input]).unwrap()[0];
         let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(dead_output, AtomId::new(2));
@@ -2285,13 +2287,13 @@ mod tests {
         assert_eq!(transposed.instructions()[0].outputs(), &[AtomId::new(1)]);
         assert!(matches!(
             transposed.instructions()[0].operation(),
-            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+            TestLinearOperation::Zero(zero) if zero.r#type() == &ArrayType::scalar(DataType::F64),
         ));
         assert_eq!(
             transposed.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = zero [type=f64]
+                lambda %0:f64[] .
+                let %1:f64[] = zero [type=f64[]]
                 in (%1, %0)
             "}
             .trim_end(),
@@ -2300,11 +2302,11 @@ mod tests {
         // Test that transposing a program whose values are tracers of an outer trace stays self-contained: the
         // disconnected input's zero is emitted as an instruction in the pullback and nothing is staged into the
         // outer tracing context.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let outer_builder = tracing_context.builder().clone();
         let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
-        let connected_input = builder.add_input(DataType::F64);
-        let disconnected_input = builder.add_input(DataType::F64);
+        let connected_input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let disconnected_input = builder.add_input(ArrayType::scalar(DataType::F64));
         let program = builder
             .build::<Vec<TestTracingValue>, TestTracingValue>(
                 vec![connected_input],
@@ -2321,13 +2323,13 @@ mod tests {
         assert_eq!(pullback.instructions()[0].outputs(), &[AtomId::new(1)]);
         assert!(matches!(
             pullback.instructions()[0].operation(),
-            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+            TestLinearOperation::Zero(zero) if zero.r#type() == &ArrayType::scalar(DataType::F64),
         ));
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = zero [type=f64]
+                lambda %0:f64[] .
+                let %1:f64[] = zero [type=f64[]]
                 in (%0, %1)
             "}
             .trim_end(),
@@ -2337,10 +2339,10 @@ mod tests {
 
         // Test that a transpose-rule-staged structural zero contribution stays an input-free `ZeroOperation`
         // instruction in the pullback, again leaving the outer tracing context untouched.
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let outer_builder = tracing_context.builder().clone();
         let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(TestLinearOperation::StagedZeroContribution, Vec::new(), vec![input])
             .unwrap()[0];
@@ -2354,13 +2356,13 @@ mod tests {
         assert_eq!(pullback.instructions()[0].outputs(), &[AtomId::new(1)]);
         assert!(matches!(
             pullback.instructions()[0].operation(),
-            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+            TestLinearOperation::Zero(zero) if zero.r#type() == &ArrayType::scalar(DataType::F64),
         ));
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = zero [type=f64]
+                lambda %0:f64[] .
+                let %1:f64[] = zero [type=f64[]]
                 in (%1)
             "}
             .trim_end(),
@@ -2370,10 +2372,10 @@ mod tests {
 
         // Test that a transpose rule returning the wrong number of input cotangent contributions is rejected instead
         // of silently dropping cotangents.
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TestLinearOperation::BadArity, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.transpose(),
             Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
@@ -2381,11 +2383,11 @@ mod tests {
 
         // Test that a cotangent contribution staged in a foreign builder is rejected before its atom ID can alias an
         // unrelated atom in the destination pullback.
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output =
             builder.add_instruction(TestLinearOperation::ForeignContribution, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.transpose(),
             Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders)),
@@ -2393,7 +2395,7 @@ mod tests {
 
         // Test that an unbound program input atom is reported.
         let input = AtomId::new(0);
-        let program = Program::<Scalar, TestLinearOperation, Scalar, ()>::new(
+        let program = Program::<Array, TestLinearOperation, Array, ()>::new(
             Placeholder,
             (),
             vec![Region {
@@ -2412,11 +2414,11 @@ mod tests {
         // Test that an unbound instruction output atom is reported.
         let input = AtomId::new(0);
         let missing_output = AtomId::new(1);
-        let program = Program::<Scalar, TestLinearOperation, Scalar, Scalar>::new(
+        let program = Program::<Array, TestLinearOperation, Array, Array>::new(
             Placeholder,
             Placeholder,
             vec![Region {
-                atoms: vec![Atom::Variable(DataType::F64)],
+                atoms: vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
                 input_ids: vec![input],
                 output_ids: vec![input],
                 instructions: vec![Instruction::new(
@@ -2436,12 +2438,12 @@ mod tests {
 
     #[test]
     fn test_program_transpose_with_respect_to() {
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let left = builder.add_input(DataType::F64);
-        let right = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right]).unwrap()[0];
         let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
 
         // Test that the pullback's cotangent outputs follow the requested index order rather than program-input
@@ -2472,29 +2474,29 @@ mod tests {
         // A live transpose rule may need a pure value produced entirely from known inputs. For `f(a, x) = (a², a²x)`,
         // transposing only with respect to `x` must replay `a²` in the pullback, ignore the cotangent supplied for the
         // non-linear `a²` output, and produce `d_x = d_product · a²`.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let known = builder.add_input(DataType::F64);
-        let linear = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let known = builder.add_input(ArrayType::scalar(DataType::F64));
+        let linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let known_square = builder.add_instruction(MulOperation::new(), Vec::new(), vec![known, known]).unwrap()[0];
         let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![known_square, linear]).unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(
+            .build::<Vec<Array>, Vec<Array>>(
                 vec![known_square, product],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[1]).unwrap();
-        let outputs = pullback.interpret(vec![Scalar::F64(100.0), Scalar::F64(2.0), Scalar::F64(3.0)]).unwrap();
-        assert_eq!(outputs, vec![Scalar::F64(18.0)]);
+        let outputs = pullback.interpret(vec![Array::scalar(100.0), Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
+        assert_eq!(outputs, vec![Array::scalar(18.0)]);
 
         // Two live transpose rules that demand the same pure known intermediate must share one rematerialized producer.
         // The pullback contains one `identity`, not one copy per `add` consumer, and both linear inputs still receive
         // their corresponding output cotangents.
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let known = builder.add_input(DataType::F64);
-        let first_linear = builder.add_input(DataType::F64);
-        let second_linear = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let known = builder.add_input(ArrayType::scalar(DataType::F64));
+        let first_linear = builder.add_input(ArrayType::scalar(DataType::F64));
+        let second_linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let known_intermediate =
             builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![known]).unwrap()[0];
         let first_output = builder
@@ -2504,7 +2506,7 @@ mod tests {
             .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, second_linear])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(
+            .build::<Vec<Array>, Vec<Array>>(
                 vec![first_output, second_output],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -2528,14 +2530,14 @@ mod tests {
 
         // Region-bearing known producers retain their attached closure when replayed, and two producers that attach
         // the same source region reuse one imported destination region rather than cloning equivalent closures.
-        let mut region_builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
-        let region = region_builder.build::<Scalar, Scalar>(vec![region_input], Placeholder, Placeholder).unwrap();
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let mut region_builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
+        let region = region_builder.build::<Array, Array>(vec![region_input], Placeholder, Placeholder).unwrap();
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let shared_region = builder.import_region(region.entry_region_ref());
-        let known = builder.add_input(DataType::F64);
-        let first_linear = builder.add_input(DataType::F64);
-        let second_linear = builder.add_input(DataType::F64);
+        let known = builder.add_input(ArrayType::scalar(DataType::F64));
+        let first_linear = builder.add_input(ArrayType::scalar(DataType::F64));
+        let second_linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let first_known = builder
             .add_instruction(TestLinearOperation::RegionIdentity, vec![shared_region], vec![known])
             .unwrap()[0];
@@ -2549,7 +2551,7 @@ mod tests {
             .add_instruction(TestLinearOperation::Add, Vec::new(), vec![second_known, second_linear])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(
+            .build::<Vec<Array>, Vec<Array>>(
                 vec![first_output, second_output],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -2569,16 +2571,16 @@ mod tests {
 
         // Replaying a known producer with observable effects in the pullback could duplicate or reorder that effect,
         // so the partition-aware transpose must require partial evaluation to residualize the value instead.
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let known = builder.add_input(DataType::F64);
-        let linear = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let known = builder.add_input(ArrayType::scalar(DataType::F64));
+        let linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let known_intermediate =
             builder.add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![known]).unwrap()[0];
         let output = builder
             .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Scalar>(vec![output], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<Array>, Array>(vec![output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert!(matches!(
             program.transpose_with_respect_to(&[1]),
@@ -2589,11 +2591,11 @@ mod tests {
         // An effectful instruction whose *output is linear* is rejected outright, even when its adjoint is dead:
         // skipping it would silently drop the effect from the pullback, and transposing it would replay the effect
         // in the reversed program.
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let linear = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let effectful =
             builder.add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![linear]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![effectful], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![effectful], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.transpose_with_respect_to(&[0]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
@@ -2604,23 +2606,23 @@ mod tests {
 
         // Effects nested inside a known producer's attached region are equally observable. The outer operation is
         // intrinsically pure, so this specifically verifies recursive effect accounting through the region closure.
-        let mut region_builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
+        let mut region_builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_output = region_builder
             .add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![region_input])
             .unwrap()[0];
-        let region = region_builder.build::<Scalar, Scalar>(vec![region_output], Placeholder, Placeholder).unwrap();
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let region = region_builder.build::<Array, Array>(vec![region_output], Placeholder, Placeholder).unwrap();
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let region = builder.import_region(region.entry_region_ref());
-        let known = builder.add_input(DataType::F64);
-        let linear = builder.add_input(DataType::F64);
+        let known = builder.add_input(ArrayType::scalar(DataType::F64));
+        let linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let known_intermediate =
             builder.add_instruction(TestLinearOperation::RegionIdentity, vec![region], vec![known]).unwrap()[0];
         let output = builder
             .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Scalar>(vec![output], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<Array>, Array>(vec![output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert!(matches!(
             program.transpose_with_respect_to(&[1]),
@@ -2637,9 +2639,9 @@ mod tests {
         // any interpretation backend.
         const CHAIN_LENGTH: usize = 10_000;
 
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let known = builder.add_input(DataType::F64);
-        let linear = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let known = builder.add_input(ArrayType::scalar(DataType::F64));
+        let linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let mut known_intermediate = known;
         for _ in 0..CHAIN_LENGTH {
             known_intermediate = builder
@@ -2650,7 +2652,7 @@ mod tests {
             .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Scalar>(vec![output], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<Array>, Array>(vec![output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[1]).unwrap();
         assert_eq!(
@@ -2669,65 +2671,69 @@ mod tests {
         // `x = 2` the primal output is `sin(2)`, and the returned pullback maps any number of output cotangents back
         // through the transposed Jacobian without re-tracing or re-differentiating.
         let (value, pullback) =
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::new().vjp(|x| x.sin(), Scalar::from(2.0)).unwrap();
-        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(pullback.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(pullback.apply(Scalar::from(3.0)).unwrap(), 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+            EagerContext::<Array, ArrayOperation<Array>>::new().vjp(|x| x.sin(), Array::scalar(2.0)).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            pullback.apply(Array::scalar(3.0)).unwrap().to_f64s()[0],
+            3.0 * 2.0f64.cos(),
+            epsilon = 1e-9
+        );
 
         // The free `vjp` serves top-level concrete values through their `Value::ExecutionDomain` declarations: a
-        // plain `Scalar` input recovers the eager scalar domain.
-        let (value, pullback) = vjp(|x| x.sin(), Scalar::from(2.0)).unwrap();
-        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(pullback.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos(), epsilon = 1e-9);
+        // rank-zero `Array` input recovers the eager array domain.
+        let (value, pullback) = vjp(|x| x.sin(), Array::scalar(2.0)).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
 
-        let (value, pullback) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .vjp(|token| Ok(token), Scalar::Token)
-            .unwrap();
-        assert_eq!(value, Scalar::Token);
-        assert_eq!(pullback.apply(Scalar::Zero), Ok(Scalar::Zero));
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        let (value, pullback) =
+            EagerContext::<Array, ArrayOperation<Array>>::new().vjp(|token| Ok(token), token.clone()).unwrap();
+        assert_eq!(value, token.clone());
+        assert_eq!(pullback.apply(zero.clone()), Ok(zero.clone()));
         assert!(matches!(
-            pullback.apply(Scalar::Token),
+            pullback.apply(token.clone()),
             Err(ProgramError::MalformedProgram(message))
-                if message == "pullback cotangent 0 has type token but its primal boundary requires cotangent type zero",
+                if message
+                    == "pullback cotangent 0 has type token[] but its primal boundary requires cotangent type zero[]",
         ));
 
         // Under an active trace, the free `vjp` recovers the staging context from its tracer input instead, so the
         // primal work and the pullback replay both stage into the enclosing trace.
-        let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, pullback) = vjp(|x| x.sin(), inputs[0].clone())?;
                 let cotangent = pullback.apply(inputs[1].clone())?;
                 Ok(vec![value, cotangent])
             },
-            vec![DataType::F64, DataType::F64],
+            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
-        let outputs = program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]).unwrap();
+        let outputs = program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
-        assert_abs_diff_eq!(outputs[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(outputs[1], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[1].to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // Replaying a pullback inside an enclosing trace likewise carries absent token cotangents through zero-space
         // leaves and never constructs a token-valued zero operation.
-        let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, pullback) = vjp(|token| Ok(token), inputs[0].clone())?;
                 let cotangent = pullback.apply(inputs[1].clone())?;
                 Ok(vec![value, cotangent])
             },
-            vec![DataType::Token, DataType::Zero],
+            vec![ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Zero)],
         )
         .unwrap();
-        assert_eq!(program.interpret(vec![Scalar::Token, Scalar::Zero]), Ok(vec![Scalar::Token, Scalar::Zero]),);
+        assert_eq!(program.interpret(vec![token.clone(), zero.clone()]), Ok(vec![token, zero]));
 
         // With no leaf value to recover a context from, the free `vjp` reports that differentiation requires
         // at least one input leaf.
-        let error = vjp(
-            |x: Vec<LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| Ok(x),
-            Vec::<Scalar>::new(),
-        )
-        .map(|(outputs, _)| outputs)
-        .unwrap_err();
+        let error =
+            vjp(|x: Vec<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>| Ok(x), Vec::<Array>::new())
+                .map(|(outputs, _)| outputs)
+                .unwrap_err();
         assert_eq!(error, DifferentiationError::EmptyInput);
     }
 
@@ -2771,52 +2777,53 @@ mod tests {
     fn test_value_and_gradient() {
         // `ReverseModeDifferentiate::value_and_gradient` on an explicit context: `f(x, y) = x * y + x` has value `8`
         // and gradient `(y + 1, x) = (4, 2)` at `(2, 3)`, reshaped into the closure's input structure.
-        let (value, gradient): (Scalar, (Scalar, Scalar)) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .value_and_gradient(|(x, y)| x.clone() * y + x, (Scalar::from(2.0), Scalar::from(3.0)))
+        let (value, gradient): (Array, (Array, Array)) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(|(x, y)| x.clone() * y + x, (Array::scalar(2.0), Array::scalar(3.0)))
             .unwrap();
-        assert_abs_diff_eq!(value, 8.0, epsilon = 1e-9);
-        assert_eq!(gradient, (Scalar::from(4.0), Scalar::from(2.0)));
+        assert_abs_diff_eq!(value.to_f64s()[0], 8.0, epsilon = 1e-9);
+        assert_eq!(gradient, (Array::scalar(4.0), Array::scalar(2.0)));
 
         // The free `value_and_gradient` recovers the eager domain from the concrete primals.
-        let (value, gradient) = value_and_gradient(|x| x.clone() * x.sin().unwrap(), Scalar::from(0.7)).unwrap();
-        assert_abs_diff_eq!(value, 0.7 * 0.7f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
+        let (value, gradient) = value_and_gradient(|x| x.clone() * x.sin().unwrap(), Array::scalar(0.7)).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 0.7 * 0.7f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
         // Under an active trace, the free `value_and_gradient` recovers the staging context from its tracer input
         // instead, so the primal work and the pullback replay both stage into the enclosing trace.
-        let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, gradient) = value_and_gradient(|x| x.sin().unwrap(), inputs[0].clone()).unwrap();
                 Ok(vec![value, gradient])
             },
-            vec![DataType::F64],
+            vec![ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
-        let outputs = program.interpret(vec![Scalar::from(2.0)]).unwrap();
+        let outputs = program.interpret(vec![Array::scalar(2.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
-        assert_abs_diff_eq!(outputs[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(outputs[1], 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[1].to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
 
-        // JAX-parity marquee behavior: the closure can branch on a *primal* with host control flow, because the duals'
-        // primal halves carry concrete known values under an eager context (exactly like branching on concrete primals
-        // under JAX's `grad`). For `x = 3` the predicate is true, so `f(x) = x * x` with gradient `2x = 6`, and the
-        // untaken `sin(x)` branch is never traced at all.
-        let (value, gradient) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
+        // JAX-parity marquee behavior: the closure can branch on a Boolean *primal* with host control flow, because the
+        // duals' primal halves carry concrete known values under an eager context (exactly like branching on concrete
+        // primals under JAX's `grad`). For a true predicate and `x = 3`, `f(x) = x * x` with gradient `2x = 6`, and
+        // the untaken `sin(x)` branch is never traced at all. The Boolean's cotangent remains in the zero space.
+        let (value, (predicate_gradient, gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
-                |x| if x.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() },
-                Scalar::from(3.0),
+                |(predicate, x)| if predicate.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() },
+                (Array::scalar(true), Array::scalar(3.0)),
             )
             .unwrap();
-        assert_abs_diff_eq!(value, 9.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, 6.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 9.0, epsilon = 1e-9);
+        assert_eq!(predicate_gradient, Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap(),);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 6.0, epsilon = 1e-9);
 
         // The closure is invoked exactly once: a single linearizing replay produces both the value and the gradient.
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let primal = context.input(DataType::F64);
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let primal = context.input(ArrayType::scalar(DataType::F64));
         let calls = Cell::new(0);
         let (_, gradient): (
-            DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
-            Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
+            DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>,
         ) = context
             .value_and_gradient(
                 |inputs| {
@@ -2833,9 +2840,9 @@ mod tests {
         // differentiation duals whose operator sugar has no deferral point of its own, so the partial-evaluation
         // context defers the failed bind by poisoning its outputs, and the original error surfaces as a plain `Err`
         // at the evaluation boundary.
-        let foreign_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let primal = context.input(DataType::F64);
-        let foreign_primal = foreign_context.input(DataType::F64);
+        let foreign_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let primal = context.input(ArrayType::scalar(DataType::F64));
+        let foreign_primal = foreign_context.input(ArrayType::scalar(DataType::F64));
         let result =
             context.value_and_gradient(|inputs| inputs[0].clone() + inputs[1].clone(), vec![primal, foreign_primal]);
         assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
@@ -2843,11 +2850,11 @@ mod tests {
         // A complex scalar output is rejected toward the holomorphic entry points, and inputs with no leaf values
         // report an invalid input count.
         let z = Complex::new(0.7f64, -0.3f64);
-        let error = value_and_gradient(|x| x.clone() * x, Scalar::from(z)).unwrap_err();
+        let error = value_and_gradient(|x| x.clone() * x, Array::scalar(z)).unwrap_err();
         assert!(matches!(error, DifferentiationError::ComplexGradientOutput { .. }));
         let error = value_and_gradient(
-            |x: Vec<LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| x.into_iter().next().unwrap(),
-            Vec::<Scalar>::new(),
+            |x: Vec<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>| x.into_iter().next().unwrap(),
+            Vec::<Array>::new(),
         )
         .unwrap_err();
         assert_eq!(error, DifferentiationError::EmptyInput);
@@ -2856,21 +2863,21 @@ mod tests {
     #[test]
     fn test_gradient() {
         // `ReverseModeDifferentiate::gradient` is the gradient-only counterpart of `value_and_gradient`.
-        let method_gradient: (Scalar, Scalar) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .gradient(|(x, y)| x.clone() * y + x, (Scalar::from(2.0), Scalar::from(3.0)))
+        let method_gradient: (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .gradient(|(x, y)| x.clone() * y + x, (Array::scalar(2.0), Array::scalar(3.0)))
             .unwrap();
-        assert_eq!(method_gradient, (Scalar::from(4.0), Scalar::from(2.0)));
+        assert_eq!(method_gradient, (Array::scalar(4.0), Array::scalar(2.0)));
 
         // The free `gradient` recovers the eager domain from the concrete primal and agrees with the value-carrying
         // form.
-        let free_gradient = gradient(|x| x.clone() * x.sin().unwrap(), Scalar::from(0.7)).unwrap();
-        assert_abs_diff_eq!(free_gradient, 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
+        let free_gradient = gradient(|x| x.clone() * x.sin().unwrap(), Array::scalar(0.7)).unwrap();
+        assert_abs_diff_eq!(free_gradient.to_f64s()[0], 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
         // With no leaf value to recover a context from, the free `gradient` reports that differentiation requires
         // at least one input leaf.
         let error = gradient(
-            |x: Vec<LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| x.into_iter().next().unwrap(),
-            Vec::<Scalar>::new(),
+            |x: Vec<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>| x.into_iter().next().unwrap(),
+            Vec::<Array>::new(),
         )
         .unwrap_err();
         assert_eq!(error, DifferentiationError::EmptyInput);
@@ -2881,41 +2888,41 @@ mod tests {
         // `ReverseModeDifferentiate::value_and_gradient_holomorphic` on an explicit context recovers the complex
         // derivative under the holomorphy promise: `∂z²/∂z = 2z` at a genuinely complex point.
         let z = Complex::new(0.7f64, -0.3f64);
-        let (value, gradient) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .value_and_gradient_holomorphic(|x| x.clone() * x, Scalar::from(z))
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient_holomorphic(|x| x.clone() * x, Array::scalar(z))
             .unwrap();
-        assert_eq!(value, Scalar::from(z * z));
-        assert_eq!(gradient, Scalar::from(z + z));
+        assert_eq!(value, Array::scalar(z * z));
+        assert_eq!(gradient, Array::scalar(z + z));
 
         // The free form recovers the eager domain from the concrete primal, and for real outputs the holomorphy
         // promise changes nothing.
-        let (value, gradient) = value_and_gradient_holomorphic(|x| x.clone() * x, Scalar::from(2.0)).unwrap();
-        assert_abs_diff_eq!(value, 4.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, 4.0, epsilon = 1e-9);
+        let (value, gradient) = value_and_gradient_holomorphic(|x| x.clone() * x, Array::scalar(2.0)).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 4.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 4.0, epsilon = 1e-9);
 
         // Under an active trace the guards run at the type level (the identity closure performs no complex arithmetic).
         // The plain entry point rejects a complex output toward the holomorphic one, which accepts it and seeds `one`
         // at the complex cotangent type, while a real output flows through the holomorphic entry point exactly like
         // the plain one.
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let primal = context.input(DataType::C64);
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let primal = context.input(ArrayType::scalar(DataType::C64));
         let result = context.value_and_gradient(|inputs: Vec<_>| inputs[0].clone(), vec![primal]);
         assert!(matches!(
             result,
-            Err(DifferentiationError::ComplexGradientOutput { output_type }) if output_type == "c64",
+            Err(DifferentiationError::ComplexGradientOutput { output_type }) if output_type == "c64[]",
         ));
-        let primal = context.input(DataType::C64);
+        let primal = context.input(ArrayType::scalar(DataType::C64));
         let (value, gradient) =
             context.value_and_gradient_holomorphic(|inputs: Vec<_>| inputs[0].clone(), vec![primal]).unwrap();
-        assert_eq!(*value.r#type(), DataType::C64);
+        assert_eq!(*value.r#type(), ArrayType::scalar(DataType::C64));
         assert_eq!(gradient.len(), 1);
-        assert_eq!(*gradient[0].r#type(), DataType::C64);
-        let primal = context.input(DataType::F64);
+        assert_eq!(*gradient[0].r#type(), ArrayType::scalar(DataType::C64));
+        let primal = context.input(ArrayType::scalar(DataType::F64));
         let (value, gradient) =
             context.value_and_gradient_holomorphic(|inputs: Vec<_>| inputs[0].clone(), vec![primal]).unwrap();
-        assert_eq!(*value.r#type(), DataType::F64);
+        assert_eq!(*value.r#type(), ArrayType::scalar(DataType::F64));
         assert_eq!(gradient.len(), 1);
-        assert_eq!(*gradient[0].r#type(), DataType::F64);
+        assert_eq!(*gradient[0].r#type(), ArrayType::scalar(DataType::F64));
     }
 
     #[test]
@@ -2923,78 +2930,85 @@ mod tests {
         // `ReverseModeDifferentiate::gradient_holomorphic` is the gradient-only counterpart of
         // `value_and_gradient_holomorphic`: `∂sin(z)/∂z = cos(z)` at a genuinely complex point.
         let z = Complex::new(0.7f64, -0.3f64);
-        let method_gradient = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .gradient_holomorphic(|x| x.sin().unwrap(), Scalar::from(z))
+        let method_gradient = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .gradient_holomorphic(|x| x.sin().unwrap(), Array::scalar(z))
             .unwrap();
-        assert_eq!(method_gradient, Scalar::from(z.cos()));
+        assert_eq!(method_gradient, Array::scalar(z.cos()));
 
         // The free form recovers the eager domain from the concrete primal and agrees.
-        let free_gradient = gradient_holomorphic(|x| x.sin().unwrap(), Scalar::from(z)).unwrap();
-        assert_eq!(free_gradient, Scalar::from(z.cos()));
+        let free_gradient = gradient_holomorphic(|x| x.sin().unwrap(), Array::scalar(z)).unwrap();
+        assert_eq!(free_gradient, Array::scalar(z.cos()));
     }
 
     #[test]
     fn test_value_and_gradient_with_aux() {
         // `ReverseModeDifferentiate::value_and_gradient_with_aux` on an explicit context returns the auxiliary
         // outputs as ordinary primal values seeded with zero cotangents, so they do not contribute to the gradient.
-        let ((value, aux), gradient): ((Scalar, Scalar), (Scalar, Scalar)) = EagerContext::<
-            Scalar,
-            ScalarOperation<Scalar>,
-        >::new()
-        .value_and_gradient_with_aux(|(x, y)| (x.clone() * y.clone(), x + y), (Scalar::from(2.0), Scalar::from(3.0)))
-        .unwrap();
-        assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(aux, 5.0, epsilon = 1e-9);
-        assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
+        let ((value, aux), gradient): ((Array, Array), (Array, Array)) =
+            EagerContext::<Array, ArrayOperation<Array>>::new()
+                .value_and_gradient_with_aux(
+                    |(x, y)| (x.clone() * y.clone(), x + y),
+                    (Array::scalar(2.0), Array::scalar(3.0)),
+                )
+                .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 6.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
+        assert_eq!(gradient, (Array::scalar(3.0), Array::scalar(2.0)));
 
         // The free form recovers the eager domain from the concrete primals, and the auxiliary structure can carry
         // multiple leaves (each rides along as a primal value with a zero cotangent seed, so none contributes to the
         // gradient of `x * y`).
-        let ((value, aux), gradient): ((Scalar, (Scalar, Scalar)), (Scalar, Scalar)) = value_and_gradient_with_aux(
+        let ((value, aux), gradient): ((Array, (Array, Array)), (Array, Array)) = value_and_gradient_with_aux(
             |(x, y)| {
                 let value = x.clone() * y.clone();
                 let aux = (x.clone() + y, x.clone() * x);
                 (value, aux)
             },
-            (Scalar::from(2.0), Scalar::from(3.0)),
+            (Array::scalar(2.0), Array::scalar(3.0)),
         )
         .unwrap();
-        assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
-        assert_eq!(aux, (Scalar::from(5.0), Scalar::from(4.0)));
-        assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
+        assert_abs_diff_eq!(value.to_f64s()[0], 6.0, epsilon = 1e-9);
+        assert_eq!(aux, (Array::scalar(5.0), Array::scalar(4.0)));
+        assert_eq!(gradient, (Array::scalar(3.0), Array::scalar(2.0)));
 
         // Auxiliary cotangent seeds use each auxiliary leaf's cotangent type. This matters both for non-differentiable
         // leaves, whose cotangent type is the first-class zero space, and for differentiable storage representations
         // such as E8M0, whose cotangent type is widened to F32 and can represent zero.
-        let ((value, aux), gradient): ((Scalar, (Scalar, Scalar)), Scalar) = value_and_gradient_with_aux(
+        let ((value, aux), gradient): ((Array, (Array, Array)), Array) = value_and_gradient_with_aux(
             |x| {
-                let integer = x.context().constant(Scalar::from(7i32))?;
-                let e8m0 = x.context().constant(Scalar::F8E8M0FNU(0x7f))?;
+                let integer = x.context().constant(Array::scalar(7i32))?;
+                let e8m0 = x
+                    .context()
+                    .constant(Array::from_logical_bytes(ArrayType::scalar(DataType::F8E8M0FNU), &[0x7f]).unwrap())?;
                 Ok::<_, ProgramError>((x.clone() * x, (integer, e8m0)))
             },
-            Scalar::from(2.0),
+            Array::scalar(2.0),
         )
         .unwrap();
-        assert_eq!(value, Scalar::from(4.0));
-        assert_eq!(aux, (Scalar::from(7i32), Scalar::F8E8M0FNU(0x7f)));
-        assert_eq!(gradient, Scalar::from(4.0));
+        assert_eq!(value, Array::scalar(4.0));
+        assert_eq!(
+            aux,
+            (Array::scalar(7i32), Array::from_logical_bytes(ArrayType::scalar(DataType::F8E8M0FNU), &[0x7f]).unwrap(),),
+        );
+        assert_eq!(gradient, Array::scalar(4.0));
     }
 
     #[test]
     fn test_gradient_with_aux() {
         // `ReverseModeDifferentiate::gradient_with_aux` is the gradient-only counterpart
         // of `value_and_gradient_with_aux`, returning `(gradient, aux)`.
-        let (method_gradient, aux): ((Scalar, Scalar), Scalar) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .gradient_with_aux(|(x, y)| (x.clone() * y.clone(), x + y), (Scalar::from(2.0), Scalar::from(3.0)))
+        let (method_gradient, aux): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .gradient_with_aux(|(x, y)| (x.clone() * y.clone(), x + y), (Array::scalar(2.0), Array::scalar(3.0)))
             .unwrap();
-        assert_eq!(method_gradient, (Scalar::from(3.0), Scalar::from(2.0)));
-        assert_abs_diff_eq!(aux, 5.0, epsilon = 1e-9);
+        assert_eq!(method_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
+        assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
 
         // The free form recovers the eager domain from the concrete primals and agrees.
-        let (free_gradient, aux): ((Scalar, Scalar), Scalar) =
-            gradient_with_aux(|(x, y)| (x.clone() * y.clone(), x + y), (Scalar::from(2.0), Scalar::from(3.0))).unwrap();
-        assert_eq!(free_gradient, (Scalar::from(3.0), Scalar::from(2.0)));
-        assert_abs_diff_eq!(aux, 5.0, epsilon = 1e-9);
+        let (free_gradient, aux): ((Array, Array), Array) =
+            gradient_with_aux(|(x, y)| (x.clone() * y.clone(), x + y), (Array::scalar(2.0), Array::scalar(3.0)))
+                .unwrap();
+        assert_eq!(free_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
+        assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -3003,49 +3017,48 @@ mod tests {
         // auxiliary outputs: the gradient is `∂z²/∂z = 2z` while the auxiliary value rides along with a zero
         // cotangent seed.
         let z = Complex::new(0.7f64, -0.3f64);
-        let ((value, aux), gradient): ((Scalar, Scalar), Scalar) =
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-                .value_and_gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Scalar::from(z))
-                .unwrap();
-        assert_eq!(value, Scalar::from(z * z));
-        assert_eq!(aux, Scalar::from(z));
-        assert_eq!(gradient, Scalar::from(z + z));
+        let ((value, aux), gradient): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Array::scalar(z))
+            .unwrap();
+        assert_eq!(value, Array::scalar(z * z));
+        assert_eq!(aux, Array::scalar(z));
+        assert_eq!(gradient, Array::scalar(z + z));
 
         // The free form recovers the eager domain from the concrete primal and agrees.
-        let ((value, aux), gradient): ((Scalar, Scalar), Scalar) =
-            value_and_gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Scalar::from(z)).unwrap();
-        assert_eq!(value, Scalar::from(z * z));
-        assert_eq!(aux, Scalar::from(z));
-        assert_eq!(gradient, Scalar::from(z + z));
+        let ((value, aux), gradient): ((Array, Array), Array) =
+            value_and_gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Array::scalar(z)).unwrap();
+        assert_eq!(value, Array::scalar(z * z));
+        assert_eq!(aux, Array::scalar(z));
+        assert_eq!(gradient, Array::scalar(z + z));
 
         // The holomorphic entry point uses the same zero-space cotangent rule for non-differentiable auxiliary leaves.
-        let ((value, aux), gradient): ((Scalar, Scalar), Scalar) = value_and_gradient_holomorphic_with_aux(
+        let ((value, aux), gradient): ((Array, Array), Array) = value_and_gradient_holomorphic_with_aux(
             |x| {
-                let aux = x.context().constant(Scalar::from(7i32))?;
+                let aux = x.context().constant(Array::scalar(7i32))?;
                 Ok::<_, ProgramError>((x.clone() * x, aux))
             },
-            Scalar::from(z),
+            Array::scalar(z),
         )
         .unwrap();
-        assert_eq!(value, Scalar::from(z * z));
-        assert_eq!(aux, Scalar::from(7i32));
-        assert_eq!(gradient, Scalar::from(z + z));
+        assert_eq!(value, Array::scalar(z * z));
+        assert_eq!(aux, Array::scalar(7i32));
+        assert_eq!(gradient, Array::scalar(z + z));
 
         // The holomorphy gate also runs at the type level under an active trace. A complex output with
         // an auxiliary output is accepted end to end and seeds `one` at the complex cotangent type.
-        type TestTracer = DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>;
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let primal = context.input(DataType::C64);
+        type TestTracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let primal = context.input(ArrayType::scalar(DataType::C64));
         let ((value, aux), gradient): ((TestTracer, TestTracer), Vec<TestTracer>) = context
             .value_and_gradient_holomorphic_with_aux(
                 |inputs: Vec<_>| (inputs[0].clone(), inputs[0].clone()),
                 vec![primal],
             )
             .unwrap();
-        assert_eq!(*value.r#type(), DataType::C64);
-        assert_eq!(*aux.r#type(), DataType::C64);
+        assert_eq!(*value.r#type(), ArrayType::scalar(DataType::C64));
+        assert_eq!(*aux.r#type(), ArrayType::scalar(DataType::C64));
         assert_eq!(gradient.len(), 1);
-        assert_eq!(*gradient[0].r#type(), DataType::C64);
+        assert_eq!(*gradient[0].r#type(), ArrayType::scalar(DataType::C64));
     }
 
     #[test]
@@ -3053,17 +3066,17 @@ mod tests {
         // `ReverseModeDifferentiate::gradient_holomorphic_with_aux` is the gradient-only counterpart of
         // `value_and_gradient_holomorphic_with_aux`, returning `(gradient, aux)`.
         let z = Complex::new(0.7f64, -0.3f64);
-        let (method_gradient, aux): (Scalar, Scalar) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Scalar::from(z))
+        let (method_gradient, aux): (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Array::scalar(z))
             .unwrap();
-        assert_eq!(method_gradient, Scalar::from(z + z));
-        assert_eq!(aux, Scalar::from(z));
+        assert_eq!(method_gradient, Array::scalar(z + z));
+        assert_eq!(aux, Array::scalar(z));
 
         // The free form recovers the eager domain from the concrete primal and agrees.
-        let (free_gradient, aux): (Scalar, Scalar) =
-            gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Scalar::from(z)).unwrap();
-        assert_eq!(free_gradient, Scalar::from(z + z));
-        assert_eq!(aux, Scalar::from(z));
+        let (free_gradient, aux): (Array, Array) =
+            gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Array::scalar(z)).unwrap();
+        assert_eq!(free_gradient, Array::scalar(z + z));
+        assert_eq!(aux, Array::scalar(z));
     }
 
     #[test]
@@ -3073,25 +3086,29 @@ mod tests {
         // free differentiation functions from their tracer inputs or explicitly through `x.context()`. Every closure
         // is fallible, propagating staging failures outward through `?` (or by returning the inner transform's
         // `Result` directly) instead of unwrapping.
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let x: f64 = 0.7;
 
         // Reverse-over-reverse through the free functions alone: the outer value is `f'(x) = 2x cos(x²)` and the
         // outer gradient is the analytic second derivative `f''(x) = 2 cos(x²) - 4x² sin(x²)`.
         let (value, second_derivative) =
-            value_and_gradient(|x| gradient(|y| (y.clone() * y).sin(), x), Scalar::from(x)).unwrap();
-        assert_abs_diff_eq!(value, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(second_derivative, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
+            value_and_gradient(|x| gradient(|y| (y.clone() * y).sin(), x), Array::scalar(x)).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            second_derivative.to_f64s()[0],
+            2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(),
+            epsilon = 1e-9
+        );
 
         // Three levels of nesting exercise the recursive `NestedTracingContext<NestedTracingContext<...>>` types
         // through the trait solver, with every inner transform run through an explicitly recovered context receiver.
         // The outer gradient is the analytic third derivative `f'''(x) = -12x sin(x²) - 8x³ cos(x²)`.
         let (value, third_derivative) = domain
-            .value_and_gradient(|x| gradient(|y| gradient(|z| (z.clone() * z).sin(), y), x), Scalar::from(x))
+            .value_and_gradient(|x| gradient(|y| gradient(|z| (z.clone() * z).sin(), y), x), Array::scalar(x))
             .unwrap();
-        assert_abs_diff_eq!(value, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(
-            third_derivative,
+            third_derivative.to_f64s()[0],
             -12.0 * x * (x * x).sin() - 8.0 * x * x * x * (x * x).cos(),
             epsilon = 1e-9,
         );
@@ -3101,9 +3118,13 @@ mod tests {
         // duals' stamped `DifferentiationContext` is itself a `ReverseModeDifferentiate` the inner transform nests
         // on.
         let (primal, tangent) =
-            jvp(|x| Ok(gradient(|y| (y.clone() * y).sin(), x)?), Scalar::from(x), Scalar::from(2.0)).unwrap();
-        assert_abs_diff_eq!(primal, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 2.0 * (2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin()), epsilon = 1e-9);
+            jvp(|x| Ok(gradient(|y| (y.clone() * y).sin(), x)?), Array::scalar(x), Array::scalar(2.0)).unwrap();
+        assert_abs_diff_eq!(primal.to_f64s()[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            tangent.to_f64s()[0],
+            2.0 * (2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin()),
+            epsilon = 1e-9
+        );
     }
 
     #[test]

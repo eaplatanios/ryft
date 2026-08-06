@@ -2196,7 +2196,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
         ProjectedProgramType, ProjectedProgramValue,
@@ -2210,32 +2209,37 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::values::Concretizable;
     use crate::tracing::{NestedTracingContext, Trace};
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
     #[test]
     fn test_differentiation_dual_new_validates_and_canonicalizes_tangents() {
-        let differentiable = DifferentiationDual::new(Scalar::F64(2.0), Scalar::F64(3.0)).unwrap();
+        let differentiable = DifferentiationDual::new(Array::scalar(2.0), Array::scalar(3.0)).unwrap();
         let (primal, tangent) = differentiable.into_parts();
-        assert_eq!(primal, Scalar::F64(2.0));
-        assert!(matches!(tangent, MaybeZero::Value(Scalar::F64(3.0))));
+        assert_eq!(primal, Array::scalar(2.0));
+        assert!(matches!(tangent, MaybeZero::Value(value) if value == Array::scalar(3.0)));
 
-        let differentiable_zero =
-            DifferentiationDual::new(Scalar::F64(2.0), MaybeZero::<Scalar>::Zero(DataType::Boolean)).unwrap();
+        let differentiable_zero = DifferentiationDual::new(
+            Array::scalar(2.0),
+            MaybeZero::<Array>::Zero(ArrayType::scalar(DataType::Boolean)),
+        )
+        .unwrap();
         let (primal, tangent) = differentiable_zero.into_parts();
-        assert_eq!(primal, Scalar::F64(2.0));
-        assert!(matches!(tangent, MaybeZero::Zero(DataType::F64)));
+        assert_eq!(primal, Array::scalar(2.0));
+        assert!(matches!(tangent, MaybeZero::Zero(r#type) if r#type == ArrayType::scalar(DataType::F64)));
 
-        let non_differentiable = DifferentiationDual::new(Scalar::Token, Scalar::Zero).unwrap();
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        let non_differentiable = DifferentiationDual::new(token.clone(), zero).unwrap();
         let (primal, tangent) = non_differentiable.into_parts();
-        assert_eq!(primal, Scalar::Token);
-        assert!(matches!(tangent, MaybeZero::Zero(DataType::Zero)));
+        assert_eq!(primal, token.clone());
+        assert!(matches!(tangent, MaybeZero::Zero(r#type) if r#type == ArrayType::scalar(DataType::Zero)));
 
         assert!(matches!(
-            DifferentiationDual::new(Scalar::Token, Scalar::Token),
+            DifferentiationDual::new(token.clone(), token),
             Err(TypeError::Invalid { message })
-                if message == "tangent type token does not match type zero required by primal type token",
+                if message == "tangent type token[] does not match type zero[] required by primal type token[]",
         ));
     }
 
@@ -2267,41 +2271,40 @@ mod tests {
         // Test that the fused JVP program of `f(x) = sin(x)` presents the `[x, ẋ] ↦ [sin(x), cos(x) · ẋ]` boundary.
         // The primal input leads, one fresh tangent input follows, and the outputs are the primal output followed by
         // its tangent.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let fused = program.jvp().unwrap();
         assert_eq!(fused.input_ids().len(), 2);
         assert_eq!(fused.output_ids().len(), 2);
         assert_eq!(
             fused.to_string(),
             indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = sin %0
-                    %3:f64 = cos %0
-                    %4:f64 = mul %3 %1
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = sin %0
+                    %3:f64[] = cos %0
+                    %4:f64[] = mul %3 %1
                 in (%2, %4)
             "}
             .trim_end(),
         );
-        let outputs = fused.interpret(vec![Scalar::F64(3.0), Scalar::F64(1.0)]).unwrap();
-        assert_eq!(outputs, vec![Scalar::F64(3.0f64.sin()), Scalar::F64(3.0f64.cos())]);
+        let outputs = fused.interpret(vec![Array::scalar(3.0), Array::scalar(1.0)]).unwrap();
+        assert_eq!(outputs, vec![Array::scalar(3.0f64.sin()), Array::scalar(3.0f64.cos())]);
 
         // Test that structural zero tangents are materialized as typed `zero` instructions only at the output boundary,
         // preserving the `(primal_outputs ++ tangent_outputs)` contract. Both zero producers are covered: the
         // constant-valued output's tangent is a *derived* zero (a constant is connected to no input tangent) and the
         // `stop_gradient` output's tangent is a *rule-returned* zero, and exactly one `zero` instruction is staged per
         // zero tangent output with none staged mid-program.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let constant = builder.add_constant(Scalar::F64(2.0));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant = builder.add_constant(Array::scalar(2.0));
         let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant]).unwrap()[0];
         let severed = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![scaled]).unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![scaled, constant, severed], vec![Placeholder], vec![Placeholder; 3])
+            .build::<Vec<Array>, Vec<Array>>(vec![scaled, constant, severed], vec![Placeholder], vec![Placeholder; 3])
             .unwrap();
         let fused = program.jvp().unwrap();
         assert_eq!(fused.input_ids().len(), 2);
@@ -2309,16 +2312,16 @@ mod tests {
         let zero_count =
             fused.instructions().iter().filter(|instruction| instruction.operation().name() == "zero").count();
         assert_eq!(zero_count, 2, "expected exactly one boundary zero per zero tangent output, but got:\n{fused}");
-        let outputs = fused.interpret(vec![Scalar::F64(3.0), Scalar::F64(1.0)]).unwrap();
+        let outputs = fused.interpret(vec![Array::scalar(3.0), Array::scalar(1.0)]).unwrap();
         assert_eq!(
             outputs,
             vec![
-                Scalar::F64(6.0),
-                Scalar::F64(2.0),
-                Scalar::F64(6.0),
-                Scalar::F64(2.0),
-                Scalar::F64(0.0),
-                Scalar::F64(0.0),
+                Array::scalar(6.0),
+                Array::scalar(2.0),
+                Array::scalar(6.0),
+                Array::scalar(2.0),
+                Array::scalar(0.0),
+                Array::scalar(0.0),
             ],
             "the fused outputs must be the primal outputs [3 * 2, 2, 3 * 2] followed by the tangents [2 * 1, 0, 0]",
         );
@@ -2353,20 +2356,19 @@ mod tests {
     fn test_program_linearize() {
         // Test that directly linearizing `f(x) = sin(x)` produces the primal sub-program `x ↦ (sin(x), cos(x))`,
         // whose trailing output is the `cos(x)` residual, and the linear tangent sub-program `(ẋ, r) ↦ r · ẋ`.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 1);
         assert_eq!(
             linearization.primal().to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = sin %0
-                    %2:f64 = cos %0
+                lambda %0:f64[] .
+                let %1:f64[] = sin %0
+                    %2:f64[] = cos %0
                 in (%1, %2)
             "}
             .trim_end(),
@@ -2374,17 +2376,17 @@ mod tests {
         assert_eq!(
             linearization.tangent().to_string(),
             indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = mul %1 %0
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
                 in (%2)
             "}
             .trim_end(),
         );
-        let primal_outputs = linearization.primal().interpret(vec![Scalar::F64(3.0)]).unwrap();
-        assert_eq!(primal_outputs, vec![Scalar::F64(3.0f64.sin()), Scalar::F64(3.0f64.cos())]);
+        let primal_outputs = linearization.primal().interpret(vec![Array::scalar(3.0)]).unwrap();
+        assert_eq!(primal_outputs, vec![Array::scalar(3.0f64.sin()), Array::scalar(3.0f64.cos())]);
         let tangent_outputs =
-            linearization.tangent().interpret(vec![Scalar::F64(1.0), Scalar::F64(3.0f64.cos())]).unwrap();
-        assert_eq!(tangent_outputs, vec![Scalar::F64(3.0f64.cos())]);
+            linearization.tangent().interpret(vec![Array::scalar(1.0), Array::scalar(3.0f64.cos())]).unwrap();
+        assert_eq!(tangent_outputs, vec![Array::scalar(3.0f64.cos())]);
 
         // The ordinary direct-linearization boundary carries `cos(x)` as a residual, so transposing its tangent map
         // must not invoke known-intermediate replay. In particular, the primal-only `cos` chain must be absent from
@@ -2395,45 +2397,46 @@ mod tests {
             "ordinary linearize -> transpose unexpectedly replayed a primal-only producer:\n{pullback}",
         );
         assert_eq!(
-            pullback.interpret(vec![Scalar::F64(1.0), Scalar::F64(3.0f64.cos())]).unwrap(),
-            vec![Scalar::F64(3.0f64.cos())],
+            pullback.interpret(vec![Array::scalar(1.0), Array::scalar(3.0f64.cos())]).unwrap(),
+            vec![Array::scalar(3.0f64.cos())],
         );
 
         // Test that a structurally zero tangent output (here, the tangent of a constant-valued program output) folds to
         // the known side during the split and is restored in the tangent sub-program as a staged `zero` instruction, so
         // the tangent sub-program keeps one tangent output per primal output.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let constant = builder.add_constant(Scalar::F64(2.0));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant = builder.add_constant(Array::scalar(2.0));
         let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant]).unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![scaled, constant], vec![Placeholder], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(vec![scaled, constant], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.primal().output_ids().len(), 2 + linearization.residual_count());
         assert_eq!(linearization.tangent().output_ids().len(), 2);
-        let tangent_inputs = [vec![Scalar::F64(1.0)], vec![Scalar::F64(2.0); linearization.residual_count()]].concat();
+        let tangent_inputs =
+            [vec![Array::scalar(1.0)], vec![Array::scalar(2.0); linearization.residual_count()]].concat();
         let tangent_outputs = linearization.tangent().interpret(tangent_inputs).unwrap();
         assert_eq!(
             tangent_outputs,
-            vec![Scalar::F64(2.0), Scalar::F64(0.0)],
+            vec![Array::scalar(2.0), Array::scalar(0.0)],
             "the tangent outputs must be [2 * ẋ] for the scaled output and a restored zero for the constant output",
         );
 
         // Boundary-degenerate programs retain their canonical signatures. A zero-input constant program has one
         // primal output and one zero tangent output, while a zero-output program still retains the dead tangent
         // input corresponding to its primal input.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let constant = builder.add_constant(Scalar::F64(5.0));
-        let program = builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![constant], Vec::new(), vec![Placeholder]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let constant = builder.add_constant(Array::scalar(5.0));
+        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![constant], Vec::new(), vec![Placeholder]).unwrap();
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 0);
-        assert_eq!(linearization.primal().interpret(Vec::new()).unwrap(), vec![Scalar::F64(5.0)]);
-        assert_eq!(linearization.tangent().interpret(Vec::new()).unwrap(), vec![Scalar::F64(0.0)]);
+        assert_eq!(linearization.primal().interpret(Vec::new()).unwrap(), vec![Array::scalar(5.0)]);
+        assert_eq!(linearization.tangent().interpret(Vec::new()).unwrap(), vec![Array::scalar(0.0)]);
 
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        builder.add_input(DataType::F64);
-        let program = builder.build::<Vec<Scalar>, Vec<Scalar>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.primal().input_ids().len(), 1);
         assert!(linearization.primal().output_ids().is_empty());
@@ -2445,11 +2448,11 @@ mod tests {
     fn test_program_linearize_restores_pruned_tangent_inputs() {
         // `stop_gradient` disconnects `dy` from the tangent output while `y` remains live in the primal program.
         // The split must restore the canonical `dy` boundary slot after partial-evaluation liveness pruning.
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (_, program) = NestedTracingContext::trace(
             context,
             |inputs| Ok(vec![inputs[0].sin()? + inputs[1].stop_gradient()]),
-            vec![DataType::F64, DataType::F64],
+            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
         let linearization = program.into_simplified().unwrap().linearize().unwrap();
@@ -2458,14 +2461,14 @@ mod tests {
 
         let mut primal_outputs = linearization
             .primal()
-            .interpret_in_context(&context, vec![Scalar::from(0.7), Scalar::from(1.3)])
+            .interpret_in_context(&context, vec![Array::scalar(0.7), Array::scalar(1.3)])
             .unwrap();
         let residuals = primal_outputs.split_off(1);
-        let mut tangent_inputs = vec![Scalar::from(1.0), Scalar::from(123.0)];
+        let mut tangent_inputs = vec![Array::scalar(1.0), Array::scalar(123.0)];
         tangent_inputs.extend(residuals);
         assert_eq!(
             linearization.tangent().interpret_in_context(&context, tangent_inputs),
-            Ok(vec![Scalar::from(0.7f64.cos())]),
+            Ok(vec![Array::scalar(0.7f64.cos())]),
         );
     }
 
@@ -2474,91 +2477,96 @@ mod tests {
         // `ForwardModeDifferentiate::jvp` on an explicit context runs the closure directly on duals. For
         // `f(x) = sin(x)` at `x = 2` along the tangent `ẋ = 3`, the primal output is `sin(2)` and the tangent
         // output is `3 · cos(2)`.
-        let (value, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .jvp(|x| x.sin(), Scalar::from(2.0), Scalar::from(3.0))
+        let (value, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(|x| x.sin(), Array::scalar(2.0), Array::scalar(3.0))
             .unwrap();
-        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // The free `jvp` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
-        // A plain `Scalar` input recovers the eager scalar domain, so both dual halves are concrete.
-        let (value, tangent): (Scalar, Scalar) = jvp(|x| x.sin(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
-        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        // A concrete array input recovers the eager array domain, so both dual halves are concrete.
+        let (value, tangent): (Array, Array) = jvp(|x| x.sin(), Array::scalar(2.0), Array::scalar(3.0)).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // Complex duals flow through the same rules. The jvp of z² pushes the tangent ż to `2z · ż`
         // at a genuinely complex point.
         let z = num_complex::Complex::new(0.7f64, -0.3f64);
         let tangent_seed = num_complex::Complex::new(1.0f64, 0.5f64);
-        let (value, tangent) = jvp(|x| Ok(x.clone() * x), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
-        assert_eq!(value, Scalar::from(z * z));
-        assert_eq!(tangent, Scalar::from((z + z) * tangent_seed));
+        let (value, tangent) = jvp(|x| Ok(x.clone() * x), Array::scalar(z), Array::scalar(tangent_seed)).unwrap();
+        assert_eq!(value.elements::<num_complex::Complex<f64>>().unwrap(), vec![z * z]);
+        assert_eq!(tangent.elements::<num_complex::Complex<f64>>().unwrap(), vec![(z + z) * tangent_seed],);
 
-        // Eager JVP duals carry concrete primal halves, so ordinary host control flow can branch on a primal without
-        // tracing the untaken branch.
-        let (value, tangent) =
-            jvp(|x| Ok(if x.concretize()? { x.clone() * x.sin()? } else { -x }), Scalar::from(0.7), Scalar::from(1.0))
-                .unwrap();
-        assert_abs_diff_eq!(value, 0.7 * 0.7f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
+        // Eager JVP duals carry concrete primal halves, so ordinary host control flow can branch on a Boolean primal
+        // without tracing the untaken branch. The Boolean has no tangent space and therefore receives a structural-zero
+        // tangent alongside the live tangent of `x`.
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        let (value, tangent) = jvp(
+            |(predicate, x)| Ok(if predicate.concretize()? { x.clone() * x.sin()? } else { -x }),
+            (Array::scalar(true), Array::scalar(0.7)),
+            (zero.clone(), Array::scalar(1.0)),
+        )
+        .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 0.7 * 0.7f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
         // Inputs without tangent spaces retain first-class zero-space boundary leaves. Their only valid tangent value
-        // is `Scalar::Zero`, and output structural zeros materialize with the same type.
-        let (value, tangent): ((Scalar, Scalar), (Scalar, Scalar)) =
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-                .jvp(
-                    |inputs| Ok(inputs),
-                    (Scalar::from(2.0f64), Scalar::from(3i32)),
-                    (Scalar::from(1.0f64), Scalar::Zero),
-                )
-                .unwrap();
-        assert_eq!(value, (Scalar::from(2.0f64), Scalar::from(3i32)));
-        assert_eq!(tangent, (Scalar::from(1.0f64), Scalar::Zero));
-
-        let (value, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .jvp(|token| Ok(token), Scalar::Token, Scalar::Zero)
+        // is a rank-zero structural-zero array, and output structural zeros materialize with the same type.
+        let (value, tangent): ((Array, Array), (Array, Array)) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(
+                |inputs| Ok(inputs),
+                (Array::scalar(2.0f64), Array::scalar(3i32)),
+                (Array::scalar(1.0f64), zero.clone()),
+            )
             .unwrap();
-        assert_eq!(value, Scalar::Token);
-        assert_eq!(tangent, Scalar::Zero);
+        assert_eq!(value, (Array::scalar(2.0f64), Array::scalar(3i32)));
+        assert_eq!(tangent, (Array::scalar(1.0f64), zero.clone()));
+
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        let (value, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(|token| Ok(token), token.clone(), zero.clone())
+            .unwrap();
+        assert_eq!(value, token.clone());
+        assert_eq!(tangent, zero.clone());
         assert!(matches!(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-                .jvp(|token| Ok(token), Scalar::Token, Scalar::Token),
+            EagerContext::<Array, ArrayOperation<Array>>::new().jvp(|token| Ok(token), token.clone(), token.clone()),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
-                if message == "tangent type token does not match type zero required by primal type token",
+                if message == "tangent type token[] does not match type zero[] required by primal type token[]",
         ));
 
         // Under an active trace, the free `jvp` recovers the staging context from its tracer inputs instead, so it
         // composes inside traced code without threading a context. The closure stages the fused primal and tangent
         // operations into the enclosing trace.
-        let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, tangent) = jvp(|x| x.sin(), inputs[0].clone(), inputs[1].clone())?;
                 Ok(vec![value, tangent])
             },
-            vec![DataType::F64, DataType::F64],
+            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
-        let outputs = program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]).unwrap();
+        let outputs = program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
-        assert_abs_diff_eq!(outputs[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(outputs[1], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[1].to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // The same composition preserves zero-space leaves for tokens instead of attempting to stage token
         // arithmetic while constructing the enclosing program.
-        let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, tangent) = jvp(|token| Ok(token), inputs[0].clone(), inputs[1].clone())?;
                 Ok(vec![value, tangent])
             },
-            vec![DataType::Token, DataType::Zero],
+            vec![ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Zero)],
         )
         .unwrap();
-        assert_eq!(program.interpret(vec![Scalar::Token, Scalar::Zero]), Ok(vec![Scalar::Token, Scalar::Zero]),);
+        assert_eq!(program.interpret(vec![token.clone(), zero.clone()]), Ok(vec![token.clone(), zero.clone()]));
 
         // Tangents pair with primals leaf-for-leaf and so a tangent structure that does not match the primal
         // structure is rejected.
         assert!(matches!(
-            jvp(|x: Vec<_>| Ok(x), vec![Scalar::from(1.0)], vec![Scalar::from(1.0), Scalar::from(2.0)]).unwrap_err(),
+            jvp(|x: Vec<_>| Ok(x), vec![Array::scalar(1.0)], vec![Array::scalar(1.0), Array::scalar(2.0)],)
+                .unwrap_err(),
             DifferentiationError::Program(ProgramError::Parameter(
                 ParameterError::MismatchedParameterStructures { .. },
             )),
@@ -2568,22 +2576,22 @@ mod tests {
         // at least one input leaf.
         assert_eq!(
             jvp(
-                |x: Vec<DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| Ok(x),
-                Vec::<Scalar>::new(),
+                |x: Vec<DifferentiationTracer<EagerContext<Array, ArrayOperation<Array>>>>| Ok(x),
+                Vec::<Array>::new(),
                 Vec::new(),
             )
             .unwrap_err(),
             DifferentiationError::EmptyInput,
         );
 
-        // The unified scalar domain supports both half-precision variants through their ordinary scalar operations.
+        // Rank-zero arrays support both half-precision variants through the ordinary array operations.
         assert_eq!(
-            jvp(|x| Ok(x.clone() + x), Scalar::BF16(bf16::from_f32(3.0)), Scalar::BF16(bf16::ONE)),
-            Ok((Scalar::BF16(bf16::from_f32(6.0)), Scalar::BF16(bf16::from_f32(2.0)))),
+            jvp(|x| Ok(x.clone() + x), Array::scalar(bf16::from_f32(3.0)), Array::scalar(bf16::ONE)),
+            Ok((Array::scalar(bf16::from_f32(6.0)), Array::scalar(bf16::from_f32(2.0)))),
         );
         assert_eq!(
-            jvp(|x| Ok(x.clone() + x), Scalar::F16(f16::from_f32(3.0)), Scalar::F16(f16::ONE)),
-            Ok((Scalar::F16(f16::from_f32(6.0)), Scalar::F16(f16::from_f32(2.0)))),
+            jvp(|x| Ok(x.clone() + x), Array::scalar(f16::from_f32(3.0)), Array::scalar(f16::ONE)),
+            Ok((Array::scalar(f16::from_f32(6.0)), Array::scalar(f16::from_f32(2.0)))),
         );
     }
 
@@ -2592,95 +2600,106 @@ mod tests {
         // `ForwardModeDifferentiate::linearize` on an explicit context runs the closure once at the primal point and
         // returns the primal output together with a reusable pushforward: applying it pushes any number of tangents
         // through the Jacobian at that point without re-tracing or re-differentiating.
-        let (value, pushforward) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .linearize(|x| x.sin(), Scalar::from(2.0))
+        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .linearize(|x| x.sin(), Array::scalar(2.0))
             .unwrap();
-        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(pushforward.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(pushforward.apply(Scalar::from(3.0)).unwrap(), 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(pushforward.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            pushforward.apply(Array::scalar(3.0)).unwrap().to_f64s()[0],
+            3.0 * 2.0f64.cos(),
+            epsilon = 1e-9,
+        );
 
         // The free `linearize` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
         // Primal work executes eagerly at the concrete linearization point while the pushforward program accumulates.
-        let (value, pushforward) = linearize(|x| x.sin(), Scalar::from(2.0)).unwrap();
-        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(pushforward.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos(), epsilon = 1e-9);
+        let (value, pushforward) = linearize(|x| x.sin(), Array::scalar(2.0)).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(pushforward.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
 
-        let (value, pushforward) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .linearize(|token| Ok(token), Scalar::Token)
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .linearize(|token| Ok(token), token.clone())
             .unwrap();
-        assert_eq!(value, Scalar::Token);
-        assert_eq!(pushforward.apply(Scalar::Zero), Ok(Scalar::Zero));
+        assert_eq!(value, token.clone());
+        assert_eq!(pushforward.apply(zero.clone()), Ok(zero.clone()));
         assert!(matches!(
-            pushforward.apply(Scalar::Token),
+            pushforward.apply(token.clone()),
             Err(ProgramError::MalformedProgram(message))
-                if message == "pushforward tangent 0 has type token but its primal boundary requires tangent type zero",
+                if message == "pushforward tangent 0 has type token[] but its primal boundary requires tangent type zero[]",
         ));
 
         // Under an active trace, the free `linearize` recovers the staging context from its tracer input instead,
         // so primal work stages into the enclosing trace and the pushforward replays there when applied.
-        let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, pushforward) = linearize(|x| x.sin(), inputs[0].clone())?;
                 let tangent = pushforward.apply(inputs[1].clone())?;
                 Ok(vec![value, tangent])
             },
-            vec![DataType::F64, DataType::F64],
+            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
-        let outputs = program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]).unwrap();
+        let outputs = program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
-        assert_abs_diff_eq!(outputs[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(outputs[1], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[1].to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
-        let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let (value, pushforward) = linearize(|token| Ok(token), inputs[0].clone())?;
                 let tangent = pushforward.apply(inputs[1].clone())?;
                 Ok(vec![value, tangent])
             },
-            vec![DataType::Token, DataType::Zero],
+            vec![ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Zero)],
         )
         .unwrap();
-        assert_eq!(program.interpret(vec![Scalar::Token, Scalar::Zero]), Ok(vec![Scalar::Token, Scalar::Zero]),);
+        assert_eq!(program.interpret(vec![token.clone(), zero.clone()]), Ok(vec![token.clone(), zero]));
 
-        // The closure can branch on a *primal* with host control flow, because the duals' primal halves carry concrete
-        // known values under an eager context. For `x = 3` the predicate is true, so `f(x) = x * x` linearizes to the
-        // pushforward `ẋ ↦ 2x · ẋ = 6ẋ`, and the untaken `sin(x)` branch is never traced at all. Neither `sin` nor its
-        // `cos` derivative can appear in the pushforward program.
-        let (value, pushforward) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
+        // The closure can branch on a Boolean *primal* with host control flow, because the duals' primal halves carry
+        // concrete known values under an eager context. For a true predicate and `x = 3`, `f(x) = x * x` linearizes to
+        // the pushforward `ẋ ↦ 2x · ẋ = 6ẋ`, and the untaken `sin(x)` branch is never traced at all. Neither `sin` nor
+        // its `cos` derivative can appear in the pushforward program.
+        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .linearize(
-                |x| Ok(if x.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() }),
-                Scalar::from(3.0),
+                |(predicate, x)| Ok(if predicate.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() }),
+                (Array::scalar(true), Array::scalar(3.0)),
             )
             .unwrap();
-        assert_abs_diff_eq!(value, 9.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 9.0, epsilon = 1e-9);
         let program = pushforward.program().to_string();
         assert!(program.contains("mul"), "{program}");
         assert!(
             !program.contains("sin") && !program.contains("cos"),
             "the untaken branch must never be traced: {program}",
         );
-        assert_abs_diff_eq!(pushforward.apply(Scalar::from(1.0)).unwrap(), 6.0, epsilon = 1e-9);
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        assert_abs_diff_eq!(pushforward.apply((zero, Array::scalar(1.0))).unwrap().to_f64s()[0], 6.0, epsilon = 1e-9,);
 
         // Structured inputs preserve their leaf order through a reusable multi-input pushforward.
         let function = |(a, b): (
-            LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
-            LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
         )| Ok(a.clone() * b + a.sin()?);
-        let (_, pushforward) = linearize(function, (Scalar::from(0.5), Scalar::from(1.3))).unwrap();
+        let (_, pushforward) = linearize(function, (Array::scalar(0.5), Array::scalar(1.3))).unwrap();
         assert_abs_diff_eq!(
-            pushforward.apply((Scalar::from(1.0), Scalar::from(0.0))).unwrap(),
+            pushforward.apply((Array::scalar(1.0), Array::scalar(0.0))).unwrap().to_f64s()[0],
             1.3 + 0.5f64.cos(),
             epsilon = 1e-9,
         );
-        assert_abs_diff_eq!(pushforward.apply((Scalar::from(0.0), Scalar::from(1.0))).unwrap(), 0.5, epsilon = 1e-9,);
+        assert_abs_diff_eq!(
+            pushforward.apply((Array::scalar(0.0), Array::scalar(1.0))).unwrap().to_f64s()[0],
+            0.5,
+            epsilon = 1e-9,
+        );
 
         // With no leaf value to recover a context from, the free `linearize` reports that differentiation requires
         // at least one input leaf.
         assert_eq!(
             linearize(
-                |x: Vec<LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| Ok(x),
-                Vec::<Scalar>::new(),
+                |x: Vec<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>| Ok(x),
+                Vec::<Array>::new(),
             )
             .map(|(outputs, _)| outputs)
             .unwrap_err(),
