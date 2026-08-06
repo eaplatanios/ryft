@@ -2467,7 +2467,7 @@ Phase 9a1 — layout-aware byte storage and construction:
 - [x] Add byte-length/range validation and the sealed typed codec at the array/data ownership boundary.
 - [x] Convert `Array` storage and migrate constructors, accessors, `Parameter`, equality, approximation, formatting,
       and the test-only malformed-type constructor in one complete slice.
-- [ ] Add exact encoding round trips for all supported primitives, low-precision raw bits, signed zero, infinities,
+- [x] Add exact encoding round trips for all supported primitives, low-precision raw bits, signed zero, infinities,
       representative NaNs/payloads, complex values, empty arrays, `Token`, and `Zero`.
 - [ ] Add I1/I2/I4/U1/U2/U4 reference-array construction and validation, closing the current `Scalar` storage gap
       without adding scalar enum variants.
@@ -4354,3 +4354,17 @@ Verification passes all 1,146 core library tests, all 53 runnable core doctests 
 runnable XLA library tests (one intentional timing-sensitive ignore), `cargo check -p ryft-xla --tests`, formatting,
 and diff hygiene. The next Phase 9a1 slice adds the exhaustive encoding-round-trip matrix before the dedicated
 sub-byte construction and allocation gates.
+
+### Phase 9a1 exhaustive encoding round trips (2026-08-05)
+
+Four focused reference-array tests now pin exact physical and logical bytes across every byte-aligned primitive
+family. Boolean and signed/unsigned integers cover boundary and representative bit patterns. BF16, F16, F32, and F64
+cover positive and negative zero, both infinities, and retained NaN payloads. Every low-precision floating-point format
+round-trips representative raw encodings through typed decoding and re-encoding. C64 and C128 preserve those same
+component-level edge cases, including complex NaN payloads and infinities. Empty shaped arrays and positive-element-
+count `Token`/`Zero` arrays prove that zero-byte storage is valid without introducing an alternate representation. The
+dedicated following checklist item still owns construction and validation coverage for sub-byte integers.
+
+The public codec re-exports were restored because the byte-backed `Array` implementation already consumes those
+canonical entrypoints through `crate::arrays`; no compatibility alias or second API was added. Verification passes all
+1,150 core library tests, the focused 36-test reference-array suite, formatting, and diff hygiene.

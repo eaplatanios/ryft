@@ -2203,10 +2203,14 @@ impl Tag for Array {
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
+    use half::{bf16, f16};
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{f8e4m3fn, f8e5m2, f8e8m0fnu};
+    use crate::arrays::{
+        f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz,
+        f8e8m0fnu,
+    };
     use crate::operations::complex::Complex;
     use crate::operations::constants::Iota;
     use crate::operations::manipulation::{GatherDimensionNumbers, ScatterDimensionNumbers};
@@ -2250,6 +2254,172 @@ mod tests {
         assert_eq!(array.r#type().into_owned(), array_type(DataType::F64, &[2]));
         assert_eq!(array.elements::<f64>(), Ok(vec![1.0, 2.0]));
         assert_eq!(array.storage_bytes(), array.logical_bytes());
+    }
+
+    #[test]
+    fn test_array_boolean_and_integer_encoding_round_trips() {
+        macro_rules! check_integer_round_trip {
+            ($data_type:expr, $element_type:ty, $values:expr $(,)?) => {{
+                let values: &[$element_type] = &$values;
+                let r#type = array_type($data_type, &[values.len()]);
+                let expected_bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+                let array = Array::from_elements(r#type.clone(), values).unwrap();
+                assert_eq!(array.storage_bytes(), expected_bytes);
+                assert_eq!(array.logical_bytes(), expected_bytes);
+                assert_eq!(array.elements::<$element_type>(), Ok(values.to_vec()));
+                assert_eq!(Array::new(r#type.clone(), expected_bytes.clone()).unwrap().elements(), Ok(values.to_vec()));
+                assert_eq!(Array::from_logical_bytes(r#type, &expected_bytes).unwrap().elements(), Ok(values.to_vec()));
+            }};
+        }
+
+        let booleans = Array::from_elements(array_type(DataType::Boolean, &[2]), &[false, true]).unwrap();
+        assert_eq!(booleans.storage_bytes(), [0, 1]);
+        assert_eq!(booleans.logical_bytes(), [0, 1]);
+        assert_eq!(booleans.elements::<bool>(), Ok(vec![false, true]));
+
+        check_integer_round_trip!(DataType::I8, i8, [i8::MIN, -1, 0, i8::MAX]);
+        check_integer_round_trip!(DataType::I16, i16, [i16::MIN, -0x1234, 0x2345, i16::MAX]);
+        check_integer_round_trip!(DataType::I32, i32, [i32::MIN, -0x1234_567, 0x2345_678, i32::MAX]);
+        check_integer_round_trip!(DataType::I64, i64, [i64::MIN, -0x1234_5678_9abc_def, i64::MAX]);
+        check_integer_round_trip!(DataType::U8, u8, [0, 0x12, 0xfe, u8::MAX]);
+        check_integer_round_trip!(DataType::U16, u16, [0, 0x1234, 0xfedc, u16::MAX]);
+        check_integer_round_trip!(DataType::U32, u32, [0, 0x1234_5678, 0xfedc_ba98, u32::MAX]);
+        check_integer_round_trip!(DataType::U64, u64, [0, (1_u64 << 53) + 1, u64::MAX - 1, u64::MAX]);
+    }
+
+    #[test]
+    fn test_array_floating_point_encoding_round_trips() {
+        macro_rules! check_float_round_trip {
+            ($data_type:expr, $element_type:ty, $bit_type:ty, $bits:expr $(,)?) => {{
+                let bits: &[$bit_type] = &$bits;
+                let values = bits.iter().copied().map(<$element_type>::from_bits).collect::<Vec<_>>();
+                let r#type = array_type($data_type, &[values.len()]);
+                let expected_bytes = bits.iter().flat_map(|bits| bits.to_le_bytes()).collect::<Vec<_>>();
+                let array = Array::from_elements(r#type.clone(), &values).unwrap();
+                assert_eq!(array.storage_bytes(), expected_bytes);
+                assert_eq!(array.logical_bytes(), expected_bytes);
+                assert_eq!(
+                    array
+                        .elements::<$element_type>()
+                        .unwrap()
+                        .into_iter()
+                        .map(<$element_type>::to_bits)
+                        .collect::<Vec<_>>(),
+                    bits,
+                );
+                assert_eq!(Array::new(r#type.clone(), expected_bytes.clone()).unwrap().logical_bytes(), expected_bytes);
+                assert_eq!(Array::from_logical_bytes(r#type, &expected_bytes).unwrap().logical_bytes(), expected_bytes);
+            }};
+        }
+
+        check_float_round_trip!(DataType::BF16, bf16, u16, [0x0000, 0x8000, 0x7f80, 0xff80, 0x7fc1]);
+        check_float_round_trip!(DataType::F16, f16, u16, [0x0000, 0x8000, 0x7c00, 0xfc00, 0x7e01]);
+        check_float_round_trip!(
+            DataType::F32,
+            f32,
+            u32,
+            [0x0000_0000, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_1234]
+        );
+        check_float_round_trip!(
+            DataType::F64,
+            f64,
+            u64,
+            [
+                0x0000_0000_0000_0000,
+                0x8000_0000_0000_0000,
+                0x7ff0_0000_0000_0000,
+                0xfff0_0000_0000_0000,
+                0x7ff8_0000_0000_1234
+            ],
+        );
+
+        macro_rules! check_low_precision_round_trip {
+            ($data_type:expr, $element_type:ty, $bits:expr $(,)?) => {{
+                let bits: &[u8] = &$bits;
+                let r#type = array_type($data_type, &[bits.len()]);
+                let array = Array::from_logical_bytes(r#type.clone(), bits).unwrap();
+                let elements = array.elements::<$element_type>().unwrap();
+                assert_eq!(array.storage_bytes(), bits);
+                assert_eq!(array.logical_bytes(), bits);
+                assert_eq!(elements.iter().copied().map(<$element_type>::to_bits).collect::<Vec<_>>(), bits);
+                assert_eq!(Array::from_elements(r#type.clone(), &elements).unwrap().storage_bytes(), bits);
+                assert_eq!(Array::new(r#type, bits.to_vec()).unwrap().logical_bytes(), bits);
+            }};
+        }
+
+        check_low_precision_round_trip!(DataType::F4E2M1FN, f4e2m1fn, [0x00, 0x08, 0x07, 0x0f]);
+        check_low_precision_round_trip!(DataType::F6E2M3FN, f6e2m3fn, [0x00, 0x20, 0x1f, 0x3f]);
+        check_low_precision_round_trip!(DataType::F6E3M2FN, f6e3m2fn, [0x00, 0x20, 0x1f, 0x3f]);
+        check_low_precision_round_trip!(DataType::F8E3M4, f8e3m4, [0x00, 0x80, 0x70, 0xf0, 0x79]);
+        check_low_precision_round_trip!(DataType::F8E4M3, f8e4m3, [0x00, 0x80, 0x78, 0xf8, 0x7d]);
+        check_low_precision_round_trip!(DataType::F8E4M3FN, f8e4m3fn, [0x00, 0x80, 0x7e, 0xfe, 0x7f]);
+        check_low_precision_round_trip!(DataType::F8E4M3FNUZ, f8e4m3fnuz, [0x00, 0x01, 0x7f, 0x80]);
+        check_low_precision_round_trip!(DataType::F8E4M3B11FNUZ, f8e4m3b11fnuz, [0x00, 0x01, 0x7f, 0x80]);
+        check_low_precision_round_trip!(DataType::F8E5M2, f8e5m2, [0x00, 0x80, 0x7c, 0xfc, 0x7e]);
+        check_low_precision_round_trip!(DataType::F8E5M2FNUZ, f8e5m2fnuz, [0x00, 0x01, 0x7f, 0x80]);
+        check_low_precision_round_trip!(DataType::F8E8M0FNU, f8e8m0fnu, [0x00, 0x7f, 0xfe, 0xff]);
+    }
+
+    #[test]
+    fn test_array_complex_encoding_round_trips() {
+        let c64_components = [0x8000_0000_u32, 0x7fc0_1234, 0x7f80_0000, 0xff80_0000];
+        let c64_values = [
+            ComplexNumber::new(f32::from_bits(c64_components[0]), f32::from_bits(c64_components[1])),
+            ComplexNumber::new(f32::from_bits(c64_components[2]), f32::from_bits(c64_components[3])),
+        ];
+        let c64 = Array::from_elements(array_type(DataType::C64, &[2]), &c64_values).unwrap();
+        let expected_c64_bytes = c64_components.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        assert_eq!(c64.storage_bytes(), expected_c64_bytes);
+        let decoded_c64 = c64.elements::<ComplexNumber<f32>>().unwrap();
+        assert_eq!(
+            decoded_c64.iter().flat_map(|value| [value.re.to_bits(), value.im.to_bits()]).collect::<Vec<_>>(),
+            c64_components,
+        );
+
+        let c128_components =
+            [0x8000_0000_0000_0000_u64, 0x7ff8_0000_0000_1234, 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000];
+        let c128_values = [
+            ComplexNumber::new(f64::from_bits(c128_components[0]), f64::from_bits(c128_components[1])),
+            ComplexNumber::new(f64::from_bits(c128_components[2]), f64::from_bits(c128_components[3])),
+        ];
+        let c128_type = array_type(DataType::C128, &[2]);
+        let c128 = Array::from_elements(c128_type.clone(), &c128_values).unwrap();
+        let expected_c128_bytes = c128_components.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>();
+        assert_eq!(c128.storage_bytes(), expected_c128_bytes);
+        assert_eq!(
+            Array::new(c128_type.clone(), expected_c128_bytes.clone()).unwrap().logical_bytes(),
+            expected_c128_bytes
+        );
+        assert_eq!(
+            Array::from_logical_bytes(c128_type, &expected_c128_bytes).unwrap().storage_bytes(),
+            expected_c128_bytes
+        );
+        let decoded_c128 = c128.elements::<ComplexNumber<f64>>().unwrap();
+        assert_eq!(
+            decoded_c128.iter().flat_map(|value| [value.re.to_bits(), value.im.to_bits()]).collect::<Vec<_>>(),
+            c128_components,
+        );
+    }
+
+    #[test]
+    fn test_array_empty_and_payload_free_encoding_round_trips() {
+        let empty_type = array_type(DataType::F32, &[0, 3]);
+        let empty = Array::from_elements(empty_type.clone(), &[] as &[f32]).unwrap();
+        assert!(empty.storage_bytes().is_empty());
+        assert!(empty.logical_bytes().is_empty());
+        assert_eq!(empty.elements::<f32>(), Ok(Vec::new()));
+        assert_eq!(Array::new(empty_type.clone(), Vec::new()).unwrap().elements::<f32>(), Ok(Vec::new()));
+        assert_eq!(Array::from_logical_bytes(empty_type, &[]).unwrap().elements::<f32>(), Ok(Vec::new()));
+
+        for data_type in [DataType::Token, DataType::Zero] {
+            let r#type = array_type(data_type, &[3]);
+            let array = Array::new(r#type.clone(), Vec::new()).unwrap();
+            assert_eq!(array.r#type().as_ref(), &r#type);
+            assert_eq!(Array::element_count(&r#type), 3);
+            assert!(array.storage_bytes().is_empty());
+            assert!(array.logical_bytes().is_empty());
+            assert!(Array::from_logical_bytes(r#type, &[]).unwrap().storage_bytes().is_empty());
+        }
     }
 
     #[test]
