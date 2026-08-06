@@ -318,18 +318,11 @@ impl_select_differentiation! {
 /// ```rust
 /// # use ryft_core::operations::control_flow::Select;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::scalars::Scalar;
 /// # use ryft_core::backends::arrays::Array;
-/// # use ryft_core::types::{ArrayType, DataType, Shape, Dimension};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Scalar values use a Boolean scalar condition.
-/// assert_eq!(Scalar::select(&Scalar::from(true), &Scalar::from(2.0), &Scalar::from(3.0))?, Scalar::from(2.0));
-/// assert_eq!(Scalar::select(&Scalar::from(false), &Scalar::from(2.0), &Scalar::from(3.0))?, Scalar::from(3.0));
-///
 /// // Array values pair with a Boolean-typed condition array of the same shape.
-/// let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
-/// let condition = Array::from_f64s(condition_type, vec![1.0, 0.0, 1.0]);
+/// let condition = Array::vector(vec![true, false, true]);
 /// let on_true = Array::vector(vec![1.0, 2.0, 3.0]);
 /// let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
 /// let output = Array::select(&condition, &on_true, &on_false)?;
@@ -363,11 +356,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::forward::jvp;
     use crate::differentiation::reverse::value_and_gradient;
     use crate::macros::{
@@ -383,37 +374,11 @@ mod tests {
 
     #[test]
     fn test_select() {
-        let scalar_operation = SelectOperation::<DataType>::new();
         let array_operation = SelectOperation::<ArrayType>::new();
 
-        // Check operation identity in both supported type universes.
-        assert_eq!(scalar_operation.name(), SELECT_OPERATION_NAME);
+        // Check operation identity in the array type universe.
         assert_eq!(array_operation.name(), SELECT_OPERATION_NAME);
-        assert_eq!(format!("{scalar_operation}"), SELECT_OPERATION_NAME);
         assert_eq!(format!("{array_operation}"), SELECT_OPERATION_NAME);
-
-        // Check Boolean-condition validation and branch promotion in the scalar type universe.
-        check_operation_type_inference!(
-            operation = scalar_operation,
-            cases = [
-                {
-                    input_types = [DataType::Boolean, DataType::F64, DataType::F64],
-                    output_types = [DataType::F64],
-                },
-                {
-                    input_types = [DataType::F64, DataType::F64, DataType::F64],
-                    error = "'select' condition data type f64 is not bool",
-                },
-                {
-                    input_types = [DataType::Boolean, DataType::F32, DataType::F64],
-                    output_types = [DataType::F64],
-                },
-                {
-                    input_types = [DataType::Boolean, DataType::F8E3M4, DataType::F32],
-                    error = "'select' input types are not broadcast-compatible",
-                },
-            ],
-        );
 
         // Check ternary shape broadcasting and branch promotion in the array type universe.
         let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
@@ -473,16 +438,6 @@ mod tests {
         assert_eq!(output.r#type().into_owned(), branch_type);
         assert_eq!(output.to_f64s(), vec![7.0, 5.0, 7.0]);
 
-        // Check both scalar branches and their common promoted result type.
-        assert_eq!(
-            Scalar::select(&Scalar::from(true), &Scalar::from(2.0_f32), &Scalar::from(3.0_f64)),
-            Ok(Scalar::from(2.0_f64)),
-        );
-        assert_eq!(
-            Scalar::select(&Scalar::from(false), &Scalar::from(2.0_f32), &Scalar::from(3.0_f64)),
-            Ok(Scalar::from(3.0_f64)),
-        );
-
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
             operation = SelectOperation::<ArrayType>::new(),
@@ -517,31 +472,31 @@ mod tests {
 
         let (primal, tangent) = jvp(
             |(x, y)| piecewise(x, y),
-            (Scalar::from(3.0), Scalar::from(2.0)),
-            (Scalar::from(1.0), Scalar::from(0.0)),
+            (Array::scalar(3.0), Array::scalar(2.0)),
+            (Array::scalar(1.0), Array::scalar(0.0)),
         )
         .unwrap();
-        assert_abs_diff_eq!(primal, 6.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 2.0, epsilon = 1e-9);
+        assert_eq!(primal, Array::scalar(6.0));
+        assert_eq!(tangent, Array::scalar(2.0));
         let (value, gradient) =
-            value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(3.0), Scalar::from(2.0))).unwrap();
-        assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.0, 2.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.1, 0.0, epsilon = 1e-9);
+            value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Array::scalar(3.0), Array::scalar(2.0))).unwrap();
+        assert_eq!(value, Array::scalar(6.0));
+        assert_eq!(gradient.0, Array::scalar(2.0));
+        assert_eq!(gradient.1, Array::scalar(0.0));
 
         let (primal, tangent) = jvp(
             |(x, y)| piecewise(x, y),
-            (Scalar::from(1.0), Scalar::from(2.0)),
-            (Scalar::from(0.0), Scalar::from(1.0)),
+            (Array::scalar(1.0), Array::scalar(2.0)),
+            (Array::scalar(0.0), Array::scalar(1.0)),
         )
         .unwrap();
-        assert_abs_diff_eq!(primal, 6.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 3.0, epsilon = 1e-9);
+        assert_eq!(primal, Array::scalar(6.0));
+        assert_eq!(tangent, Array::scalar(3.0));
         let (value, gradient) =
-            value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(1.0), Scalar::from(2.0))).unwrap();
-        assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.0, 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.1, 3.0, epsilon = 1e-9);
+            value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Array::scalar(1.0), Array::scalar(2.0))).unwrap();
+        assert_eq!(value, Array::scalar(6.0));
+        assert_eq!(gradient.0, Array::scalar(0.0));
+        assert_eq!(gradient.1, Array::scalar(3.0));
 
         // Check that primitive transposition partitions the cotangent between the two linear branches.
         let condition = Array::vector(vec![true, false]);

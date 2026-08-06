@@ -2492,7 +2492,6 @@ mod tests {
 
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::batching::batch;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -4550,71 +4549,5 @@ mod tests {
                     while loops is not supported; eager differentiation executes concrete duals, and loops built \
                     with `with_iteration_bound` stage a transposable masked scan)",
         ));
-    }
-
-    #[test]
-    fn test_unbounded_while_staged_scalar_jvp_and_linearization_stage_the_fused_loop() {
-        // The scalar `DataType` family has no array-stack representation for the bounded rule's residuals, so every
-        // staged scalar loop takes the fused doubled-state rule, and the scalar partial-evaluation rule's
-        // closed-knownness split linearizes it. Same squaring loop as the array tests, over `Scalar` values:
-        // `f(x) = while (x < 16) { x = x * x }` at `x = 2` gives primal 16 and tangent 32.
-        use crate::backends::scalars::ScalarOperation;
-
-        let condition = {
-            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-            let state = builder.add_input(DataType::F64);
-            let threshold = builder.add_constant(Scalar::F64(16.0));
-            let predicate = builder
-                .add_instruction(
-                    CompareOperation::new(ComparisonDirection::LessThan),
-                    Vec::new(),
-                    vec![state, threshold],
-                )
-                .unwrap()[0];
-            builder
-                .build::<Vec<Scalar>, Vec<Scalar>>(vec![predicate], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let body = {
-            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-            let state = builder.add_input(DataType::F64);
-            let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
-            builder
-                .build::<Vec<Scalar>, Vec<Scalar>>(vec![squared], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let condition_region = builder.import_region(condition.entry_region_ref());
-        let body_region = builder.import_region(body.entry_region_ref());
-        let input = builder.add_input(DataType::F64);
-        let output = builder
-            .add_instruction(
-                ScalarOperation::While(WhileOperation::new()),
-                vec![condition_region, body_region],
-                vec![input],
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // The fused forward-mode program contains exactly one while loop over the doubled `[primal, tangent]` state.
-        let fused = program.jvp().unwrap();
-        let rendered = fused.to_string();
-        assert_eq!(rendered.matches("= while").count(), 1, "{rendered}");
-        let outputs = fused.interpret(vec![Scalar::F64(2.0), Scalar::F64(1.0)]).unwrap();
-        assert_eq!(outputs, vec![Scalar::F64(16.0), Scalar::F64(32.0)]);
-
-        // Linearization splits the fused loop through the scalar closed-knownness split: the primal program stages
-        // the recovered primal loop and the tangent program keeps the fused loop whole over `[tangent, residuals...]`.
-        let (primal_program, tangent_program, residual_count) = program.linearize().unwrap().into_parts();
-        let mut primal_outputs = primal_program.interpret(vec![Scalar::F64(2.0)]).unwrap();
-        let residuals = primal_outputs.split_off(1);
-        assert_eq!(primal_outputs, vec![Scalar::F64(16.0)]);
-        assert_eq!(residuals.len(), residual_count);
-        let mut tangent_inputs = vec![Scalar::F64(1.0)];
-        tangent_inputs.extend(residuals);
-        let tangent_outputs = tangent_program.interpret(tangent_inputs).unwrap();
-        assert_eq!(tangent_outputs, vec![Scalar::F64(32.0)]);
     }
 }

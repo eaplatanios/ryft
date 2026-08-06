@@ -2568,7 +2568,7 @@ Phase 9a4 — retire the scalar program universe:
       - [x] Migrate reverse-mode differentiation fixtures.
   - [ ] Migrate remaining operation-local scalar fixtures or delete coverage already covered by array tests.
     - [x] Migrate constants, comparison, logical, conversion, and stop-gradient fixtures.
-    - [ ] Migrate control-flow fixtures.
+    - [x] Migrate control-flow fixtures.
     - [ ] Migrate mathematical and complex-number fixtures.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
@@ -4896,3 +4896,16 @@ array construction explicit at the mathematical call sites. It removes 92 retire
 operation-local residual audit from 410 matches across 40 files to 318 matches across 28 files. All 53 focused partial-
 evaluation tests, all 37 macro integration tests, the complete 1,154-test core library suite, and all 54 runnable
 doctests (16 intentional ignores) pass. Control-flow fixtures are the next bounded operation-local slice.
+
+The control-flow slice removes the final scalar-backed fixtures from `operations::control_flow`. `select` retains its
+piecewise JVP and VJP scenarios over rank-zero arrays, while its duplicate `DataType` inference and scalar eager-value
+assertions are deleted. The scalar staged-`while` JVP/linearization fixture is also deleted because the adjacent array
+tests already pin the same numerical behavior, fused-loop structure, and closed-knownness linearization separately.
+The `Select` example now uses honestly Boolean array storage, and the repository testing guidelines now name arrays and
+the selector-free `check_gradient!` form as the canonical reference path.
+
+This review unit changes 148 lines across two Rust source files with 112 net deletions, plus a 16-line testing-guideline
+correction. It removes 26 retired scalar references and reduces the operation-local residual audit from 318 matches
+across 28 files to 292 matches across 26 files. All 76 focused control-flow tests, the complete 1,153-test core library
+suite, and all 54 runnable doctests (16 intentional ignores) pass. Mathematical and complex-number fixtures are the
+next bounded operation-local slice.

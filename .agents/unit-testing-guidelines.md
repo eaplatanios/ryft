@@ -23,20 +23,17 @@ Use this file as the single detailed reference for `ryft` testing conventions.
   is the behavior under test.
 - Run scoped verification for the crate or module touched, using a 300-second timeout for local test commands unless the
   user asks for a longer run.
-
-## Reference Backends
-
-- Use `ryft_core::backends::scalars::Scalar` as the concrete eager value for scalar-universe coverage (i.e., programs
-  typed by `DataType`) and `ryft_core::backends::arrays::Array` for array-universe coverage (i.e., programs typed by
-  `ArrayType`). Both store honestly typed payloads (`Array` owns checked physical bytes and exposes typed logical
-  decoding), so value-level tests can and should assert exact element data types, complex values, and exact
-  low-precision floating-point encodings, and not `f64` approximations of them.
+- Use `ryft_core::backends::arrays::Array` as the concrete eager value for operation, program, and transform coverage.
+  Use rank-zero arrays when testing scalar-shaped behavior. Introduce a narrower test-only value family only when a
+  test genuinely verifies universe-neutral machinery and using arrays would obscure that contract. `Array` owns checked
+  physical bytes and exposes typed logical decoding, so value-level tests can and should assert exact element data
+  types, complex values, and exact low-precision floating-point encodings rather than `f64` approximations.
 - In `ryft-xla`, import the reference array value as `use ryft_core::backends::arrays::Array as TestArray;` so that it
   does not collide with the XLA buffer-backed `Array`. When both backends implement an operation, keep them value-level
   consistent.
-- Use the `check_gradient!` macro from `ryft_core::macros` as the finite-difference oracle for gradient rules. You
-  must use `check_gradient!(@scalar, ...)` for `Scalar`-valued functions and `check_gradient!(@array, ...)` for
-  `Array`-valued functions, and `TestRegionOperation` for testing region-carrying program machinery.
+- Use the `check_gradient!` macro from `ryft_core::macros` as the finite-difference oracle for array-valued gradient
+  rules, including functions over rank-zero arrays.
+- Use `TestRegionOperation` for tests that specifically isolate region-carrying program machinery.
 
 ## Structure
 
