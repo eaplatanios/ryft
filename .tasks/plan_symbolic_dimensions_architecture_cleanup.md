@@ -2494,6 +2494,10 @@ Phase 9a2 — byte-backed reference kernels:
         Normalize mixed data types through the canonical conversion kernel, retain the one-output-buffer fast path for
         already-matching operands, preserve complete broadcasting, arbitrary layouts, integer wrapping and failure
         diagnostics, low-precision re-encoding, complex magnitude and stable division, and exact extremum selection.
+  - [x] P9a2m: migrate `Sin`, `Cos`, `Atan2`, `Exp`, `Log`, `Sqrt`, `Rsqrt`, `Tanh`, `Logistic`, `Erf`, `Pow`, `Sign`,
+        `Floor`, `Ceil`, and `Round` to direct typed codecs. Preserve each operation's exact real/complex dtype
+        contract, low-precision re-encoding, IEEE special values and ties-to-even rounding, mixed-type promotion and
+        complete broadcasting for binary operations, arbitrary physical layouts, and existing diagnostics.
 - [x] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
       gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
   - [x] P9a2c: migrate broadcast, transpose, reshape, static and dynamic slice/update, pad, and concatenate to direct
@@ -4692,3 +4696,25 @@ operations, integer error diagnostics, stable large-complex division, and exact 
 All 1,157 core library tests, 54 runnable core doctests (16 intentional ignores), and all 438 runnable XLA library tests
 (one intentional timing-sensitive ignore) pass. Formatting and diff hygiene pass. The Phase 9a2 elementwise parent
 remains open for transcendental/sign/rounding math, complex construction and accessors, and constructors.
+
+### Phase 9a2m direct floating-point math kernels (2026-08-06)
+
+`Sin`, `Cos`, `Atan2`, `Exp`, `Log`, `Sqrt`, `Rsqrt`, `Tanh`, `Logistic`, `Erf`, `Pow`, `Sign`, `Floor`, `Ceil`, and
+`Round` now decode and encode sealed element types directly. Three private element contracts group operations by their
+actual dtype families: real/complex floating-point math, real-only error and rounding math, and sign extraction. The
+real implementations retain each format's established working precision and checked low-precision re-encoding; the
+complex implementations retain the stable extreme-value sine/cosine and division formulas. `Erf` shares only the pure
+double-precision evaluator with the scalar backend, never a scalar value or payload representation.
+
+Unary kernels preserve arbitrary physical layouts with one result allocation. `Atan2` and `Pow` reuse the canonical
+promotion kernel and complete NumPy-style typed broadcasting, allocating promoted operands only when their data types
+differ. IEEE signed zeros and NaNs, ties-to-even rounding, complex analytic continuations, and existing invalid-type
+diagnostics remain intact. Direct sign extraction additionally makes the operation executable for I1/I2/I4 arrays,
+which the operation contract supported but the transitional scalar representation could not encode. The obsolete
+payload-materializing `unary`, `binary`, and scalar-broadcast helpers are deleted.
+
+Focused tests pin negative-stride unary traversal, mixed F32/F64 multidimensional `Atan2` and `Pow` broadcasting,
+low-precision re-encoding, real rounding/error behavior, exact signed-zero and NaN sign encodings, and signed sub-byte
+sign extraction. All 1,159 core library tests, 54 runnable core doctests (16 intentional ignores), and all 438 runnable
+XLA library tests (one intentional timing-sensitive ignore) pass. Formatting and diff hygiene pass. The Phase 9a2
+elementwise parent remains open only for complex construction/accessors and zero/one/fill/iota constructors.

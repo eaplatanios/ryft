@@ -27,6 +27,7 @@
 ///   - `@ordered`: Every partially ordered element type, namely every element type except the unordered complex ones.
 ///   - `@real`: Every integer and floating-point element type (no Booleans and no complex numbers).
 ///   - `@integer`: Every sub-byte and primitive integer element type.
+///   - `@signed`: Every signed sub-byte and primitive integer element type.
 ///   - `@float`: Every low-precision, half-precision, and primitive floating-point element type.
 ///   - `@complex`: Every complex element type.
 ///   - `@boolean_or_integer`: Boolean and every integer element type (i.e., the bitwise and logical family).
@@ -74,6 +75,7 @@ macro_rules! dispatch_on_array_element_type {
             (C128, $crate::arrays::encoding::Complex<f64>),
         ) $data_type, |$element| $body)
     };
+
     (@numeric $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
             (I1, $crate::arrays::encoding::i1),
@@ -109,6 +111,7 @@ macro_rules! dispatch_on_array_element_type {
             (C128, $crate::arrays::encoding::Complex<f64>),
         ) $data_type, |$element| $body)
     };
+
     (@ordered $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
             (Boolean, bool),
@@ -143,6 +146,7 @@ macro_rules! dispatch_on_array_element_type {
             (F64, f64),
         ) $data_type, |$element| $body)
     };
+
     (@real $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
             (I1, $crate::arrays::encoding::i1),
@@ -176,6 +180,7 @@ macro_rules! dispatch_on_array_element_type {
             (F64, f64),
         ) $data_type, |$element| $body)
     };
+
     (@integer $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
             (I1, $crate::arrays::encoding::i1),
@@ -194,6 +199,19 @@ macro_rules! dispatch_on_array_element_type {
             (U64, u64),
         ) $data_type, |$element| $body)
     };
+
+    (@signed $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
+            (I1, $crate::arrays::encoding::i1),
+            (I2, $crate::arrays::encoding::i2),
+            (I4, $crate::arrays::encoding::i4),
+            (I8, i8),
+            (I16, i16),
+            (I32, i32),
+            (I64, i64),
+        ) $data_type, |$element| $body)
+    };
+
     (@float $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
             (F4E2M1FN, $crate::arrays::encoding::f4e2m1fn),
@@ -213,12 +231,14 @@ macro_rules! dispatch_on_array_element_type {
             (F64, f64),
         ) $data_type, |$element| $body)
     };
+
     (@complex $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
             (C64, $crate::arrays::encoding::Complex<f32>),
             (C128, $crate::arrays::encoding::Complex<f64>),
         ) $data_type, |$element| $body)
     };
+
     (@boolean_or_integer $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
             (Boolean, bool),
@@ -238,6 +258,7 @@ macro_rules! dispatch_on_array_element_type {
             (U64, u64),
         ) $data_type, |$element| $body)
     };
+
     (@arms($(($variant:ident, $element_type:ty)),+ $(,)?) $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         match $data_type {
             $(
@@ -335,6 +356,13 @@ mod tests {
         all.iter().copied().filter(|data_type| data_type.is_integer()).for_each(|data_type| {
             assert_eq!(
                 dispatch_on_array_element_type!(@integer data_type, |Element| element_data_type::<Element>()),
+                data_type,
+            );
+        });
+
+        all.iter().copied().filter(|data_type| data_type.is_signed()).for_each(|data_type| {
+            assert_eq!(
+                dispatch_on_array_element_type!(@signed data_type, |Element| element_data_type::<Element>()),
                 data_type,
             );
         });

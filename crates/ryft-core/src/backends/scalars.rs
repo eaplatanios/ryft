@@ -1384,7 +1384,7 @@ fn evaluate_polynomial(x: f64, coefficients: &[f64]) -> f64 {
 /// NaN inputs propagate and the sign symmetry `erf(−x) = −erf(x)` is exact, including for signed zeros. All
 /// polynomial coefficient arrays below list the FDLIBM constants from the highest-degree term down to the constant
 /// term, matching the [`evaluate_polynomial`] contract.
-fn erf(x: f64) -> f64 {
+pub(crate) fn erf_f64(x: f64) -> f64 {
     /// `erf(1)` rounded toward zero, used as the base value of the `[0.84375, 1.25)` regime.
     const ERX: f64 = 8.45062911510467529297e-01;
 
@@ -1522,16 +1522,16 @@ fn erf(x: f64) -> f64 {
 impl Erf for Scalar {
     /// Computes the elementwise Gauss error function of this [`Scalar`]. Only the real floating-point variants
     /// support the error function; any other variant returns a [`TypeError`]. Every variant evaluates through the
-    /// double-precision [`erf`] approximation and rounds the result to its own precision.
+    /// double-precision [`erf_f64`] approximation and rounds the result to its own precision.
     fn erf(&self) -> Result<Self, ProgramError> {
         if let Some((r#type, bits)) = self.low_precision_float_parts() {
-            return Self::encode_low_precision_float(r#type, erf(Self::decode_low_precision_float(r#type, bits)));
+            return Self::encode_low_precision_float(r#type, erf_f64(Self::decode_low_precision_float(r#type, bits)));
         }
         Ok(match self {
-            Scalar::BF16(value) => Scalar::BF16(bf16::from_f64(erf(value.to_f64()))),
-            Scalar::F16(value) => Scalar::F16(f16::from_f64(erf(value.to_f64()))),
-            Scalar::F32(value) => Scalar::F32(erf(f64::from(*value)) as f32),
-            Scalar::F64(value) => Scalar::F64(erf(*value)),
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f64(erf_f64(value.to_f64()))),
+            Scalar::F16(value) => Scalar::F16(f16::from_f64(erf_f64(value.to_f64()))),
+            Scalar::F32(value) => Scalar::F32(erf_f64(f64::from(*value)) as f32),
+            Scalar::F64(value) => Scalar::F64(erf_f64(*value)),
             other => {
                 return Err(TypeError::invalid(format!(
                     "cannot compute the error function of a scalar of data type {}",

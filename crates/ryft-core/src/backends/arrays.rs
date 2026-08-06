@@ -37,11 +37,11 @@ use crate::arrays::{
     f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
 use crate::axes::{Axis, AxisIndexOperation};
-use crate::backends::scalars::Scalar;
+use crate::backends::scalars::{Scalar, erf_f64};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::differentiation::LinearCallOperation;
-use crate::macros::check_count;
+use crate::macros::{check_count, check_types};
 use crate::operations::attention::{
     AttentionMask, DotProductAttention, DotProductAttentionBackward, DotProductAttentionBackwardOperation,
     DotProductAttentionOperation, dot_product_attention_backward_composition, dot_product_attention_composition,
@@ -115,8 +115,9 @@ pub trait BroadcastKernel: Sized {
 // blanket-implemented for every `Value` by dispatching the corresponding operation, so coherence rejects concrete
 // implementations for element types, and their contract (including element type promotion) is the program-level
 // operation semantics that the kernels below implement rather than consume. The element-level analogues below
-// therefore mirror that vocabulary one trait per capability, so kernels bound exactly the operations they use, while
-// integer wrapping, low-precision re-encoding, and count conversion stay defined in one place per element family.
+// therefore mirror that vocabulary in narrow capability groups. Operations with the same supported element class and
+// conversion strategy share one trait, while integer wrapping, low-precision re-encoding, and count conversion stay
+// defined in one place per element family.
 
 /// Element-level analogue of the [`Zero`] capability: the additive identity of one array element type. The extraction
 /// is fallible because `f8e8m0fnu` has no zero.
@@ -170,6 +171,60 @@ trait ElementAbs: ArrayElement {
 
     /// Computes this element's absolute value or complex magnitude.
     fn abs(self) -> Result<Self::Output, ProgramError>;
+}
+
+/// Floating-point math operations shared by real floating-point and complex array elements.
+trait ElementFloatMath: ArrayElement {
+    /// Computes the sine of this element.
+    fn sin(self) -> Result<Self, ProgramError>;
+
+    /// Computes the cosine of this element.
+    fn cos(self) -> Result<Self, ProgramError>;
+
+    /// Computes `atan2(self, x)`.
+    fn atan2(self, x: Self) -> Result<Self, ProgramError>;
+
+    /// Computes the natural exponential of this element.
+    fn exp(self) -> Result<Self, ProgramError>;
+
+    /// Computes the natural logarithm of this element.
+    fn log(self) -> Result<Self, ProgramError>;
+
+    /// Computes the principal square root of this element.
+    fn sqrt(self) -> Result<Self, ProgramError>;
+
+    /// Computes the reciprocal of the principal square root of this element.
+    fn rsqrt(self) -> Result<Self, ProgramError>;
+
+    /// Computes the hyperbolic tangent of this element.
+    fn tanh(self) -> Result<Self, ProgramError>;
+
+    /// Computes `1 / (1 + exp(-self))`.
+    fn logistic(self) -> Result<Self, ProgramError>;
+
+    /// Raises this element to `exponent`.
+    fn pow(self, exponent: Self) -> Result<Self, ProgramError>;
+}
+
+/// Operations supported only by real floating-point array elements.
+trait ElementRealFloatMath: ArrayElement {
+    /// Computes the Gauss error function of this element.
+    fn erf(self) -> Result<Self, ProgramError>;
+
+    /// Rounds this element toward negative infinity.
+    fn floor(self) -> Result<Self, ProgramError>;
+
+    /// Rounds this element toward positive infinity.
+    fn ceil(self) -> Result<Self, ProgramError>;
+
+    /// Rounds this element to the nearest integer, resolving ties toward the nearest even integer.
+    fn round(self) -> Result<Self, ProgramError>;
+}
+
+/// Sign extraction for signed-integer, floating-point, and complex array elements.
+trait ElementSign: ArrayElement {
+    /// Computes this element's sign according to [`Sign`] semantics.
+    fn sign(self) -> Result<Self, ProgramError>;
 }
 
 /// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own because a
@@ -1228,6 +1283,263 @@ macro_rules! impl_array_arithmetic_for_complex {
 impl_array_arithmetic_for_complex!(f32);
 impl_array_arithmetic_for_complex!(f64);
 
+// Implements the real floating-point math families through the working precision and exact re-encoding contract of
+// each element family. Half precision uses `f32`, native primitive types use themselves, and low-precision formats
+// use `f64`, matching the scalar reference semantics.
+macro_rules! impl_array_math_for_real_float {
+    // Implements a low-precision format through its checked `f64` conversion contract.
+    (@low $type:ty) => {
+        impl_array_math_for_real_float!(@impl
+            $type,
+            f64,
+            |value: $type| value.to_f64(),
+            |value| Ok(<$type>::from_f64(value)?),
+            |value: $type| value.to_f64(),
+            |value| Ok(<$type>::from_f64(value)?),
+        );
+    };
+
+    // Implements a half-precision format through its native `f32` arithmetic and `f64` error-function path.
+    (@half $type:ty) => {
+        impl_array_math_for_real_float!(@impl
+            $type,
+            f32,
+            <$type>::to_f32,
+            |value| Ok(<$type>::from_f32(value)),
+            <$type>::to_f64,
+            |value| Ok(<$type>::from_f64(value)),
+        );
+    };
+
+    // Implements a native floating-point type without changing working precision.
+    (@native $type:ty) => {
+        impl_array_math_for_real_float!(@impl
+            $type,
+            $type,
+            |value| value,
+            Ok,
+            |value: $type| value as f64,
+            |value| Ok(value as $type),
+        );
+    };
+
+    // Generates the implementations after the element family's conversion functions have been selected.
+    (@impl $type:ty, $work:ty, $decode:expr, $encode:expr, $to_f64:expr, $from_f64:expr $(,)?) => {
+        impl ElementFloatMath for $type {
+            #[inline]
+            fn sin(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::sin(($decode)(self)))
+            }
+
+            #[inline]
+            fn cos(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::cos(($decode)(self)))
+            }
+
+            #[inline]
+            fn atan2(self, x: Self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::atan2(($decode)(self), ($decode)(x)))
+            }
+
+            #[inline]
+            fn exp(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::exp(($decode)(self)))
+            }
+
+            #[inline]
+            fn log(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::ln(($decode)(self)))
+            }
+
+            #[inline]
+            fn sqrt(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::sqrt(($decode)(self)))
+            }
+
+            #[inline]
+            fn rsqrt(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::recip(<$work>::sqrt(($decode)(self))))
+            }
+
+            #[inline]
+            fn tanh(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::tanh(($decode)(self)))
+            }
+
+            #[inline]
+            fn logistic(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::recip(<$work>::exp(-($decode)(self)) + 1.0))
+            }
+
+            #[inline]
+            fn pow(self, exponent: Self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::powf(($decode)(self), ($decode)(exponent)))
+            }
+        }
+
+        impl ElementRealFloatMath for $type {
+            #[inline]
+            fn erf(self) -> Result<Self, ProgramError> {
+                ($from_f64)(erf_f64(($to_f64)(self)))
+            }
+
+            #[inline]
+            fn floor(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::floor(($decode)(self)))
+            }
+
+            #[inline]
+            fn ceil(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::ceil(($decode)(self)))
+            }
+
+            #[inline]
+            fn round(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::round_ties_even(($decode)(self)))
+            }
+        }
+
+        impl ElementSign for $type {
+            fn sign(self) -> Result<Self, ProgramError> {
+                let value = ($to_f64)(self);
+                if value.is_nan() || value == 0.0 { Ok(self) } else { ($from_f64)(value.signum()) }
+            }
+        }
+    };
+}
+
+// Instantiates real math for low-precision formats through their checked f64 conversion contracts.
+macro_rules! impl_array_math_for_low_precision_float {
+    ($($type:ty),+ $(,)?) => {$(
+        impl_array_math_for_real_float!(@low $type);
+    )+};
+}
+
+impl_array_math_for_low_precision_float!(
+    f4e2m1fn,
+    f6e2m3fn,
+    f6e3m2fn,
+    f8e3m4,
+    f8e4m3,
+    f8e4m3fn,
+    f8e4m3fnuz,
+    f8e4m3b11fnuz,
+    f8e5m2,
+    f8e5m2fnuz,
+    f8e8m0fnu,
+);
+impl_array_math_for_real_float!(@half bf16);
+impl_array_math_for_real_float!(@half f16);
+impl_array_math_for_real_float!(@native f32);
+impl_array_math_for_real_float!(@native f64);
+
+// Implements the analytic continuations shared by complex element types. Sine and cosine use `expm1`-based
+// hyperbolic components so purely imaginary extreme inputs preserve their non-NaN real/imaginary zero component.
+macro_rules! impl_array_math_for_complex {
+    ($component:ty) => {
+        impl ElementFloatMath for Complex<$component> {
+            fn sin(self) -> Result<Self, ProgramError> {
+                let expm1_imaginary = self.im.exp_m1();
+                let expm1_negative_imaginary = (-self.im).exp_m1();
+                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
+                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
+                let imaginary = self.re.cos() * sinh_imaginary;
+                Ok(Complex::new(if self.re == 0.0 { 0.0 } else { self.re.sin() * cosh_imaginary }, imaginary))
+            }
+
+            fn cos(self) -> Result<Self, ProgramError> {
+                let expm1_imaginary = self.im.exp_m1();
+                let expm1_negative_imaginary = (-self.im).exp_m1();
+                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
+                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
+                Ok(Complex::new(
+                    self.re.cos() * cosh_imaginary,
+                    if self.re == 0.0 { 0.0 } else { -self.re.sin() * sinh_imaginary },
+                ))
+            }
+
+            fn atan2(self, x: Self) -> Result<Self, ProgramError> {
+                let imaginary_unit = Complex::new(0.0, 1.0);
+                let radius = (x * x + self * self).sqrt();
+                Ok(-imaginary_unit * divide_complex_array_element!(x + imaginary_unit * self, radius).ln())
+            }
+
+            #[inline]
+            fn exp(self) -> Result<Self, ProgramError> {
+                Ok(Complex::exp(self))
+            }
+
+            #[inline]
+            fn log(self) -> Result<Self, ProgramError> {
+                Ok(Complex::ln(self))
+            }
+
+            #[inline]
+            fn sqrt(self) -> Result<Self, ProgramError> {
+                Ok(Complex::sqrt(self))
+            }
+
+            #[inline]
+            fn rsqrt(self) -> Result<Self, ProgramError> {
+                Ok(Complex::inv(&Complex::sqrt(self)))
+            }
+
+            #[inline]
+            fn tanh(self) -> Result<Self, ProgramError> {
+                Ok(Complex::tanh(self))
+            }
+
+            #[inline]
+            fn logistic(self) -> Result<Self, ProgramError> {
+                Ok(Complex::inv(&(Complex::exp(-self) + 1.0)))
+            }
+
+            #[inline]
+            fn pow(self, exponent: Self) -> Result<Self, ProgramError> {
+                Ok(Complex::powc(self, exponent))
+            }
+        }
+
+        impl ElementSign for Complex<$component> {
+            fn sign(self) -> Result<Self, ProgramError> {
+                let norm = self.norm();
+                Ok(if norm == 0.0 { self } else { self / norm })
+            }
+        }
+    };
+}
+
+impl_array_math_for_complex!(f32);
+impl_array_math_for_complex!(f64);
+
+// Implements sign extraction for primitive signed integers.
+macro_rules! impl_array_sign_for_signed_integer {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementSign for $type {
+            #[inline]
+            fn sign(self) -> Result<Self, ProgramError> {
+                Ok(self.signum())
+            }
+        }
+    )+};
+}
+
+impl_array_sign_for_signed_integer!(i8, i16, i32, i64);
+
+// Implements sign extraction for checked signed sub-byte integers through their sign-extended values.
+macro_rules! impl_array_sign_for_signed_sub_byte_integer {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementSign for $type {
+            #[inline]
+            fn sign(self) -> Result<Self, ProgramError> {
+                Ok(Self::new(self.value().signum()).unwrap())
+            }
+        }
+    )+};
+}
+
+impl_array_sign_for_signed_sub_byte_integer!(i1, i2, i4);
+
 /// Element-level minimum and maximum contract shared by reduction and scatter. The identities and selection rules
 /// follow JAX's `lax` extrema: Booleans order `false < true`, floating-point extrema propagate NaNs and order `-0`
 /// below `+0`, and complex values compare lexicographically by `(real, imaginary)`.
@@ -2141,33 +2453,6 @@ impl Array {
         Self::from_scalar_values(r#type.clone(), vec![element; Self::materialized_element_count(r#type)?])
     }
 
-    /// Applies an elementwise unary function to the payload, preserving this array's type.
-    fn unary(&self, function: impl Fn(&Scalar) -> Result<Scalar, ProgramError>) -> Result<Self, ProgramError> {
-        let values = self.scalar_values();
-        Self::from_scalar_values(self.r#type.clone(), values.iter().map(function).collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// Applies an elementwise binary function using scalar broadcasting. The output type is the broadcast of the two
-    /// operand types (including element-type promotion), and the provided function is expected to promote its scalar
-    /// operands congruently (as all the [`Scalar`] arithmetic capabilities do).
-    fn binary(
-        &self,
-        rhs: &Self,
-        function: impl Fn(&Scalar, &Scalar) -> Result<Scalar, ProgramError>,
-    ) -> Result<Self, ProgramError> {
-        let output_type = Broadcastable::broadcast(&self.r#type, &rhs.r#type)
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        let output_len = Self::element_count(&output_type);
-        let left = self.broadcast_values(output_len);
-        let right = rhs.broadcast_values(output_len);
-        let values = left
-            .iter()
-            .zip(right.iter())
-            .map(|(left, right)| function(left, right))
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::from_scalar_values(output_type, values)
-    }
-
     /// Applies a typed binary element function with NumPy-style broadcasting directly over addressed storage. Inputs
     /// and outputs use their sealed codecs one element at a time, so the only payload allocation is the result buffer.
     fn binary_elements<Input: ArrayElement, Output: ArrayElement>(
@@ -2335,18 +2620,6 @@ impl Array {
             };
             index + coordinate * input_strides[input_axis]
         })
-    }
-
-    /// Broadcasts the payload to `output_len`.
-    fn broadcast_values(&self, output_len: usize) -> Vec<Scalar> {
-        let values = self.scalar_values();
-        if values.len() == output_len {
-            values
-        } else if values.len() == 1 {
-            vec![values[0]; output_len]
-        } else {
-            panic!("cannot broadcast {} values to {output_len}", values.len());
-        }
     }
 
     /// Decodes one real-valued element as `f64`, returning `None` for complex and payload-free element data types.
@@ -2889,95 +3162,159 @@ impl std::ops::Div for Array {
     }
 }
 
-impl Sin for Array {
-    fn sin(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.sin())
-    }
+macro_rules! impl_array_unary_math {
+    // Generates a unary operation supported by both real floating-point and complex elements.
+    (@float_math $trait:ident, $method:ident, $noun:literal) => {
+        impl $trait for Array {
+            fn $method(&self) -> Result<Self, ProgramError> {
+                if Self::element_count(&self.r#type) == 0 {
+                    let addressing = ArrayAddressing::new(self.r#type.clone())?;
+                    return Ok(Self {
+                        r#type: self.r#type.clone(),
+                        bytes: Arc::new(vec![0; addressing.storage_byte_len()]),
+                    });
+                }
+                let data_type = self.r#type.data_type();
+                if !data_type.is_floating_point() && !data_type.is_complex() {
+                    return Err(TypeError::invalid(format!(
+                        concat!("cannot compute the ", $noun, " of a scalar of data type {}"),
+                        data_type,
+                    ))
+                    .into());
+                }
+                if data_type.is_complex() {
+                    dispatch_on_array_element_type!(@complex data_type, |Element| {
+                        self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                            <Element as ElementFloatMath>::$method(value)
+                        })
+                    })
+                } else {
+                    dispatch_on_array_element_type!(@float data_type, |Element| {
+                        self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                            <Element as ElementFloatMath>::$method(value)
+                        })
+                    })
+                }
+            }
+        }
+    };
+
+    // Generates a unary operation supported only by real floating-point elements.
+    (@real_float $trait:ident, $method:ident, $error:literal) => {
+        impl $trait for Array {
+            fn $method(&self) -> Result<Self, ProgramError> {
+                if Self::element_count(&self.r#type) == 0 {
+                    let addressing = ArrayAddressing::new(self.r#type.clone())?;
+                    return Ok(Self {
+                        r#type: self.r#type.clone(),
+                        bytes: Arc::new(vec![0; addressing.storage_byte_len()]),
+                    });
+                }
+                let data_type = self.r#type.data_type();
+                if !data_type.is_floating_point() {
+                    return Err(TypeError::invalid(format!($error, data_type)).into());
+                }
+                dispatch_on_array_element_type!(@float data_type, |Element| {
+                    self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                        <Element as ElementRealFloatMath>::$method(value)
+                    })
+                })
+            }
+        }
+    };
+
+    // Generates sign extraction over its disjoint signed-integer, floating-point, and complex element classes.
+    (@sign) => {
+        impl Sign for Array {
+            fn sign(&self) -> Result<Self, ProgramError> {
+                if Self::element_count(&self.r#type) == 0 {
+                    let addressing = ArrayAddressing::new(self.r#type.clone())?;
+                    return Ok(Self {
+                        r#type: self.r#type.clone(),
+                        bytes: Arc::new(vec![0; addressing.storage_byte_len()]),
+                    });
+                }
+                let data_type = self.r#type.data_type();
+                if !data_type.is_signed() && !data_type.is_floating_point() && !data_type.is_complex() {
+                    return Err(TypeError::invalid(format!(
+                        "cannot compute the sign of a scalar of data type {}",
+                        data_type,
+                    ))
+                    .into());
+                }
+                if data_type.is_signed() {
+                    dispatch_on_array_element_type!(@signed data_type, |Element| {
+                        self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                            <Element as ElementSign>::sign(value)
+                        })
+                    })
+                } else if data_type.is_complex() {
+                    dispatch_on_array_element_type!(@complex data_type, |Element| {
+                        self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                            <Element as ElementSign>::sign(value)
+                        })
+                    })
+                } else {
+                    dispatch_on_array_element_type!(@float data_type, |Element| {
+                        self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                            <Element as ElementSign>::sign(value)
+                        })
+                    })
+                }
+            }
+        }
+    };
 }
 
-impl Cos for Array {
-    fn cos(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.cos())
-    }
+macro_rules! impl_array_binary_float_math {
+    ($trait:ident, $method:ident, $argument:ident) => {
+        impl $trait for Array {
+            fn $method(&self, $argument: &Self) -> Result<Self, ProgramError> {
+                let output_type = Broadcastable::broadcast(&self.r#type, &$argument.r#type)
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                if Self::element_count(&output_type) == 0 {
+                    let addressing = ArrayAddressing::new(output_type.clone())?;
+                    return Ok(Self { r#type: output_type, bytes: Arc::new(vec![0; addressing.storage_byte_len()]) });
+                }
+                let left_type = self.r#type.data_type();
+                let right_type = $argument.r#type.data_type();
+                check_types!(@float, stringify!($method), [left_type, right_type]);
+                let data_type = output_type.data_type();
+                let left = self.promoted_to(data_type)?;
+                let right = $argument.promoted_to(data_type)?;
+                if data_type.is_complex() {
+                    dispatch_on_array_element_type!(@complex data_type, |Element| {
+                        left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
+                            <Element as ElementFloatMath>::$method(left, right)
+                        })
+                    })
+                } else {
+                    dispatch_on_array_element_type!(@float data_type, |Element| {
+                        left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
+                            <Element as ElementFloatMath>::$method(left, right)
+                        })
+                    })
+                }
+            }
+        }
+    };
 }
 
-impl Atan2 for Array {
-    fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
-        self.binary(x, |y, x| y.atan2(x))
-    }
-}
-
-impl Exp for Array {
-    fn exp(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.exp())
-    }
-}
-
-impl Log for Array {
-    fn log(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.log())
-    }
-}
-
-impl Sqrt for Array {
-    fn sqrt(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.sqrt())
-    }
-}
-
-impl Rsqrt for Array {
-    fn rsqrt(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.rsqrt())
-    }
-}
-
-impl Tanh for Array {
-    fn tanh(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.tanh())
-    }
-}
-
-impl Logistic for Array {
-    fn logistic(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.logistic())
-    }
-}
-
-impl Erf for Array {
-    fn erf(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.erf())
-    }
-}
-
-impl Pow for Array {
-    fn pow(&self, exponent: &Self) -> Result<Self, ProgramError> {
-        self.binary(exponent, |base, exponent| base.pow(exponent))
-    }
-}
-
-impl Sign for Array {
-    fn sign(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.sign())
-    }
-}
-
-impl Floor for Array {
-    fn floor(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.floor())
-    }
-}
-
-impl Ceil for Array {
-    fn ceil(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.ceil())
-    }
-}
-
-impl Round for Array {
-    fn round(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.round())
-    }
-}
+impl_array_unary_math!(@float_math Sin, sin, "sine");
+impl_array_unary_math!(@float_math Cos, cos, "cosine");
+impl_array_binary_float_math!(Atan2, atan2, x);
+impl_array_unary_math!(@float_math Exp, exp, "exponential");
+impl_array_unary_math!(@float_math Log, log, "logarithm");
+impl_array_unary_math!(@float_math Sqrt, sqrt, "square root");
+impl_array_unary_math!(@float_math Rsqrt, rsqrt, "reciprocal square root");
+impl_array_unary_math!(@float_math Tanh, tanh, "hyperbolic tangent");
+impl_array_unary_math!(@float_math Logistic, logistic, "logistic");
+impl_array_unary_math!(@real_float Erf, erf, "cannot compute the error function of a scalar of data type {}");
+impl_array_binary_float_math!(Pow, pow, exponent);
+impl_array_unary_math!(@sign);
+impl_array_unary_math!(@real_float Floor, floor, "cannot compute the floor of a scalar of data type {}");
+impl_array_unary_math!(@real_float Ceil, ceil, "cannot compute the ceiling of a scalar of data type {}");
+impl_array_unary_math!(@real_float Round, round, "cannot round a scalar of data type {}");
 
 impl_array_binary_arithmetic!(@extremum Max, max, maximum, "maximum");
 impl_array_binary_arithmetic!(@extremum Min, min, minimum, "minimum");
@@ -4956,6 +5293,107 @@ mod tests {
             Array::scalar(-0.0f32).min(&Array::scalar(0.0f32)).unwrap().elements::<f32>().unwrap()[0].to_bits(),
             (-0.0f32).to_bits(),
         );
+    }
+
+    #[test]
+    fn test_array_transcendental_math_uses_typed_storage() {
+        // Unary kernels preserve arbitrary physical layouts while traversing elements in logical order.
+        let input_type = array_type(DataType::F64, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16])));
+        let input = Array::from_elements(input_type.clone(), &[0.0f64, 1.0]).unwrap();
+        let exponential = input.exp().unwrap();
+        assert_eq!(exponential.r#type().as_ref(), &input_type);
+        assert_eq!(exponential.elements::<f64>(), Ok(vec![1.0, 1.0f64.exp()]));
+
+        // Binary kernels perform complete broadcasting after promoting both physical inputs to their common type.
+        let left_type =
+            array_type(DataType::F32, &[2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
+        let left = Array::from_elements(left_type, &[0.0f32, 1.0]).unwrap();
+        let right_type =
+            array_type(DataType::F64, &[1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![24, -8])));
+        let right = Array::from_elements(right_type, &[1.0f64, 1.0, -1.0]).unwrap();
+        let angles = left.atan2(&right).unwrap();
+        assert_eq!(angles.r#type().into_owned(), array_type(DataType::F64, &[2, 3]));
+        assert_abs_diff_eq!(
+            angles,
+            Array::matrix(
+                2,
+                3,
+                vec![
+                    0.0,
+                    0.0,
+                    std::f64::consts::PI,
+                    std::f64::consts::FRAC_PI_4,
+                    std::f64::consts::FRAC_PI_4,
+                    3.0 * std::f64::consts::FRAC_PI_4
+                ],
+            ),
+            epsilon = 1e-12,
+        );
+        let bases = Array::matrix(2, 1, vec![2.0f32, 3.0]);
+        let exponents = Array::matrix(1, 3, vec![1.0f64, 2.0, 3.0]);
+        assert_eq!(bases.pow(&exponents).unwrap(), Array::matrix(2, 3, vec![2.0f64, 4.0, 8.0, 3.0, 9.0, 27.0]),);
+        assert!(matches!(
+            Array::scalar(1i32).atan2(&Array::scalar(1.0f64)),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "'atan2' does not support input data type i32",
+        ));
+        assert!(matches!(
+            Array::scalar(2.0f64).pow(&Array::scalar(3i32)),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "'pow' does not support input data type i32",
+        ));
+
+        // Low-precision formats decode, compute, and re-encode without constructing intermediary scalar values.
+        let low_precision = Array::from_elements(
+            array_type(DataType::F8E4M3FN, &[2]),
+            &[f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            low_precision.exp().unwrap().to_f64s(),
+            vec![1.0, f8e4m3fn::from_f64(1.0f64.exp()).unwrap().to_f64()]
+        );
+    }
+
+    #[test]
+    fn test_array_real_float_math_and_sign_use_typed_storage() {
+        let input = Array::vector(vec![-1.5f64, -0.0, 2.5, 3.5]);
+        assert_eq!(input.floor().unwrap(), Array::vector(vec![-2.0, -0.0, 2.0, 3.0]));
+        assert_eq!(input.ceil().unwrap(), Array::vector(vec![-1.0, -0.0, 3.0, 4.0]));
+        assert_eq!(input.round().unwrap(), Array::vector(vec![-2.0, -0.0, 2.0, 4.0]));
+        assert_eq!(Array::vector(vec![1.0f64, 4.0]).rsqrt().unwrap(), Array::vector(vec![1.0, 0.5]));
+        assert_abs_diff_eq!(
+            Array::vector(vec![-1.0f64, 0.0, 1.0]).erf().unwrap(),
+            Array::vector(vec![erf_f64(-1.0), 0.0, erf_f64(1.0)]),
+            epsilon = 1e-12,
+        );
+
+        // Sign preserves IEEE signed zero and NaN behavior and also covers signed sub-byte integers that have no
+        // representation in the transitional scalar backend.
+        let signs = Array::from_elements(
+            array_type(DataType::F64, &[4]),
+            &[-2.0f64, -0.0, 0.0, f64::from_bits(0x7ff8_0000_0000_1234)],
+        )
+        .unwrap()
+        .sign()
+        .unwrap()
+        .elements::<f64>()
+        .unwrap();
+        assert_eq!(signs[0], -1.0);
+        assert_eq!(signs[1].to_bits(), (-0.0f64).to_bits());
+        assert_eq!(signs[2].to_bits(), 0.0f64.to_bits());
+        assert_eq!(signs[3].to_bits(), 0x7ff8_0000_0000_1234);
+        let narrow =
+            Array::from_elements(array_type(DataType::I2, &[3]), &[i2::MIN, i2::new(0).unwrap(), i2::MAX]).unwrap();
+        assert_eq!(
+            narrow.sign().unwrap().elements::<i2>(),
+            Ok(vec![i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]),
+        );
+        assert!(matches!(
+            Array::scalar(1u8).sign(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute the sign of a scalar of data type u8",
+        ));
     }
 
     #[test]
