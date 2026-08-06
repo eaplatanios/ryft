@@ -27,10 +27,10 @@ use ryft_macros::Operation;
 
 // TODO(eaplatanios): Review from here onwards.
 
-use crate::arrays::{
-    ArrayAddressing, ArrayElement, ArraySliceAxis, decode_elements, decode_logical_bytes, encode_elements,
-    encode_logical_bytes, validate_storage_bytes,
+use crate::arrays::encoding::{
+    decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, validate_storage_bytes,
 };
+use crate::arrays::{ArrayAddressing, ArrayElement, ArraySliceAxis};
 use crate::axes::{Axis, AxisIndexOperation};
 use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
@@ -2209,7 +2209,7 @@ mod tests {
 
     use crate::arrays::{
         f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz,
-        f8e8m0fnu,
+        f8e8m0fnu, i1, i2, i4, u1, u2, u4,
     };
     use crate::operations::complex::Complex;
     use crate::operations::constants::Iota;
@@ -2285,6 +2285,69 @@ mod tests {
         check_integer_round_trip!(DataType::U16, u16, [0, 0x1234, 0xfedc, u16::MAX]);
         check_integer_round_trip!(DataType::U32, u32, [0, 0x1234_5678, 0xfedc_ba98, u32::MAX]);
         check_integer_round_trip!(DataType::U64, u64, [0, (1_u64 << 53) + 1, u64::MAX - 1, u64::MAX]);
+    }
+
+    #[test]
+    fn test_array_sub_byte_integer_construction_and_validation() {
+        macro_rules! check_sub_byte_integer {
+            ($data_type:expr, $element_type:ty, $values:expr, $expected_bytes:expr, $invalid_byte:expr $(,)?) => {{
+                let values: &[$element_type] = &$values;
+                let expected_bytes: &[u8] = &$expected_bytes;
+                let r#type = array_type($data_type, &[values.len()]);
+
+                // Typed construction must preserve native signedness while storing only each element's low bits.
+                let array = Array::from_elements(r#type.clone(), values).unwrap();
+                assert_eq!(array.storage_bytes(), expected_bytes);
+                assert_eq!(array.logical_bytes(), expected_bytes);
+                assert_eq!(array.elements::<$element_type>(), Ok(values.to_vec()));
+
+                // Both raw-byte construction paths accept the same valid encoding.
+                assert_eq!(Array::new(r#type.clone(), expected_bytes.to_vec()).unwrap().elements(), Ok(values.to_vec()));
+                assert_eq!(Array::from_logical_bytes(r#type, expected_bytes).unwrap().elements(), Ok(values.to_vec()));
+
+                // A set bit above the data type's width must be rejected at the array ownership boundary.
+                assert!(matches!(
+                    Array::new(array_type($data_type, &[1]), vec![$invalid_byte]),
+                    Err(ProgramError::Type(TypeError::Invalid { message }))
+                        if message == format!(
+                            "array element 0 has invalid {} byte encoding [{}]",
+                            $data_type,
+                            $invalid_byte,
+                        ),
+                ));
+            }};
+        }
+
+        check_sub_byte_integer!(DataType::I1, i1, [i1::MIN, i1::MAX], [0x01, 0x00], 0x02);
+        check_sub_byte_integer!(
+            DataType::I2,
+            i2,
+            [i2::MIN, i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::MAX],
+            [0x02, 0x03, 0x00, 0x01],
+            0x04,
+        );
+        check_sub_byte_integer!(
+            DataType::I4,
+            i4,
+            [i4::MIN, i4::new(-1).unwrap(), i4::new(0).unwrap(), i4::MAX],
+            [0x08, 0x0f, 0x00, 0x07],
+            0x10,
+        );
+        check_sub_byte_integer!(DataType::U1, u1, [u1::MIN, u1::MAX], [0x00, 0x01], 0x02);
+        check_sub_byte_integer!(
+            DataType::U2,
+            u2,
+            [u2::MIN, u2::new(1).unwrap(), u2::new(2).unwrap(), u2::MAX],
+            [0x00, 0x01, 0x02, 0x03],
+            0x04,
+        );
+        check_sub_byte_integer!(
+            DataType::U4,
+            u4,
+            [u4::MIN, u4::new(1).unwrap(), u4::new(14).unwrap(), u4::MAX],
+            [0x00, 0x01, 0x0e, 0x0f],
+            0x10,
+        );
     }
 
     #[test]

@@ -2469,7 +2469,7 @@ Phase 9a1 — layout-aware byte storage and construction:
       and the test-only malformed-type constructor in one complete slice.
 - [x] Add exact encoding round trips for all supported primitives, low-precision raw bits, signed zero, infinities,
       representative NaNs/payloads, complex values, empty arrays, `Token`, and `Zero`.
-- [ ] Add I1/I2/I4/U1/U2/U4 reference-array construction and validation, closing the current `Scalar` storage gap
+- [x] Add I1/I2/I4/U1/U2/U4 reference-array construction and validation, closing the current `Scalar` storage gap
       without adding scalar enum variants.
 - [ ] Extend allocation tests to prove large-array clone performs no payload-sized allocation, while borrowed and
       consuming projection remain fully allocation-free after setup.
@@ -4365,6 +4365,19 @@ component-level edge cases, including complex NaN payloads and infinities. Empty
 count `Token`/`Zero` arrays prove that zero-byte storage is valid without introducing an alternate representation. The
 dedicated following checklist item still owns construction and validation coverage for sub-byte integers.
 
-The public codec re-exports were restored because the byte-backed `Array` implementation already consumes those
-canonical entrypoints through `crate::arrays`; no compatibility alias or second API was added. Verification passes all
-1,150 core library tests, the focused 36-test reference-array suite, formatting, and diff hygiene.
+The codec entrypoints remain in their defining `arrays::encoding` module rather than broadening the parent module's
+public vocabulary for an internal consumer. Verification passes all 1,150 core library tests, the focused 36-test
+reference-array suite, formatting, and diff hygiene.
+
+### Phase 9a1 sub-byte reference-array construction (2026-08-05)
+
+The reference `Array` boundary now has one exact integration test covering every signed and unsigned sub-byte integer
+type: I1, I2, I4, U1, U2, and U4. Typed construction preserves sign-extended native values while emitting the specified
+low-bit physical encodings. Complete physical storage and logical-byte construction decode to the same typed values,
+and each data type rejects the first byte with a bit set above its declared width. This closes the former `Scalar`
+storage gap entirely through the sealed `ArrayElement` codecs without adding any `Scalar` variants or another stored
+representation.
+
+The byte-backed `Array` implementation imports codec functions directly from `arrays::encoding`; those implementation
+entrypoints are not re-exported from `arrays`. Verification passes the focused sub-byte integration test, all 1,151
+core library tests, formatting, and diff hygiene. The allocation-proof item remains the next isolated Phase 9a1 slice.
