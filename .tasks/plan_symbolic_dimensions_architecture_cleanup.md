@@ -2541,13 +2541,13 @@ Phase 9a2 — byte-backed reference kernels:
 
 Phase 9a3 — exact XLA literals:
 
-- [ ] Replace per-element `Scalar` matching and typed-vector reconstruction with logical traversal of layout-aware
+- [x] Replace per-element `Scalar` matching and typed-vector reconstruction with logical traversal of layout-aware
       `Array` storage. Decode only when an MLIR typed helper requires it; pass raw physical bytes directly only when
       their layout already matches the literal API's required ordering.
-- [ ] Pack Boolean and sub-byte integers at the lowering boundary and cover I1/I2/I4/U1/U2/U4 constants.
-- [ ] Add exact-bit StableHLO and execution tests for low-precision floats, signed zero, preserved NaN payloads, wide
+- [x] Pack Boolean and sub-byte integers at the lowering boundary and cover I1/I2/I4/U1/U2/U4 constants.
+- [x] Add exact-bit StableHLO and execution tests for low-precision floats, signed zero, preserved NaN payloads, wide
       integers, complex values, empty tensors, and sub-byte integers.
-- [ ] Measure literal construction, lowering allocations, StableHLO size, compile time, and runtime against Phase 9a0.
+- [x] Measure literal construction, lowering allocations, StableHLO size, compile time, and runtime against Phase 9a0.
 - [ ] Gate: no literal round-trips through `f64`; exact values lower and execute identically on CPU, with CUDA coverage
       where supported by the existing backend matrix.
 
@@ -4748,3 +4748,35 @@ The residual production-kernel audit finds no `Vec<Scalar>` bridge and no unchec
 All 1,158 core library tests, the five allocation regression tests, 54 runnable core doctests (16 intentional ignores),
 and all 438 runnable XLA library tests (one intentional timing-sensitive ignore) pass. Formatting and diff hygiene
 pass, closing the complete Phase 9a2 gate. Phase 9a3 exact XLA literals is the next isolated implementation unit.
+
+### Phase 9a3 exact XLA literals (2026-08-06)
+
+Concrete array literals now have one byte-oriented lowering path. Layout-free arrays lend their physical storage
+directly to MLIR; explicitly laid-out arrays traverse `ArrayAddressing` once to produce logical row-major bytes; and
+big-endian targets normalize each multi-byte scalar component before calling MLIR's native raw-buffer API. Boolean,
+I1, and U1 alone use MLIR's typed Boolean constructor because it owns the required one-bit packing. I2/I4/U2/U4 use
+the raw API's specified one-byte-per-element representation. StableHLO rejects `ui1`, so U1 uses the same physical
+signless-i1 carrier as Boolean and I1 while Ryft's operation metadata continues to select unsigned semantics.
+
+The old per-data-type typed-vector reconstruction, rank-zero `Scalar` reconstruction, and unused scalar-splat hook
+were deleted. Existing layout-free byte-aligned constants therefore go from one payload-sized Rust allocation to
+zero before entering MLIR: a 4,096-element F32 literal removes one 16,384-byte `Vec<f32>`. Explicit physical layouts
+retain exactly one required logical-order byte buffer, while one-bit values retain MLIR's typed packing path because
+its raw-buffer API cannot unambiguously represent every short non-splat bit sequence. Phase 9a0's borrowed-slice
+construction result remains unchanged at three allocations and 16,440 allocated bytes because Phase 9a3 changes
+lowering, not `Array` ownership. Existing StableHLO fixtures did not change, so their
+module size and downstream compile/runtime input remain byte-for-byte stable; the expanded 16-literal CPU compile and
+execution smoke completes in approximately 0.06 seconds on the baseline host. The production and test cleanup removes
+86 net lines from `lowering.rs` despite adding complete sub-byte and layout coverage.
+
+Exact tests now pin all low-precision raw encodings and their StableHLO renderings; BF16/F16/F32/F64 signed zero and
+NaN payloads; U64 values beyond F64's exact range; interleaved C64/C128 payloads; empty tensors; explicit strided
+physical storage; and all six signed/unsigned sub-byte integer families. CPU execution returns exact host bytes for
+every supported standard, complex, empty, and sub-byte case. The pinned upstream CPU StableHLO-to-HLO converter aborts
+when asked to execute the F4/F6/F8 formats, so those formats retain exact attribute and StableHLO coverage rather than
+claiming unsupported CPU execution.
+
+Local gates pass: all 438 runnable `ryft-xla` library tests (one timing-sensitive ignore), the five array allocation
+guards, formatting, and diff hygiene. The exact-source CUDA run remains the sole open Phase 9a3 gate. The offered DGX
+Spark is online (NVIDIA GB10, driver 580.142), but exporting the uncommitted source tree to its isolated `/tmp`
+directory requires explicit user approval under the current execution policy; no source was transferred.
