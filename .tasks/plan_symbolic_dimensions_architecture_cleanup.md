@@ -2481,6 +2481,8 @@ Phase 9a2 — byte-backed reference kernels:
       family by family, preserving integer wrapping and fallible errors.
   - [x] P9a2a: migrate `Not`, `And`, `Or`, and `Xor` directly over layout-aware Boolean and integer storage, including
         sub-byte masks and complete NumPy-style broadcasting, without temporary scalar or logical-byte payloads.
+  - [x] P9a2b: migrate ThreeFry and Philox random-bit generation to typed, layout-aware state decoding and result
+        construction for U8/U16/U32/U64 outputs, without routing state or generated bits through `Scalar`.
 - [ ] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
       gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
 - [ ] Route raw-buffer access through the Phase 9a1 addressing contract and reuse its rectangular traversal where it
@@ -4414,3 +4416,17 @@ and the exact unsupported-floating-point diagnostic. All 1,151 `ryft-core` libra
 `ryft-xla` library tests pass (one intentional timing-sensitive ignore); formatting and diff hygiene pass. The broader
 Phase 9a2 family checkbox remains open for the remaining arithmetic, comparison, complex, conversion, constructor, and
 random kernels.
+
+### Phase 9a2b random-bit reference kernel (2026-08-05)
+
+The reference `RngBitGenerator` implementation now decodes ThreeFry and Philox states as checked `u64` elements and
+constructs advanced states and U8/U16/U32/U64 bit arrays through the sealed typed codec. It no longer creates temporary
+`Scalar` state or result vectors. The operation's existing counter advancement, integer narrowing, and algorithm output
+remain unchanged, while direct backend calls now use the same canonical state-type diagnostic as operation inference.
+
+Focused storage coverage exercises a negative-stride state, a positive-stride U16 result with physical holes, exact
+logical values and physical bytes, U8 low-bit narrowing, and direct state-contract rejection. Existing ThreeFry and
+Philox tests continue to cover U32/U64 word expansion, odd output counts, state advancement, dynamic output
+materialization, and batching. All 1,152 `ryft-core` library tests and all 436 runnable `ryft-xla` library tests pass
+(one intentional timing-sensitive ignore); formatting and diff hygiene pass. The broader Phase 9a2 family checkbox
+remains open for the remaining arithmetic, comparison, complex, conversion, and constructor kernels.
