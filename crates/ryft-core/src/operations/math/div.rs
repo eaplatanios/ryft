@@ -112,8 +112,7 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::Array;
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiableOperation, DifferentiationDual, jvp};
     use crate::interpretation::InterpretableOperation;
@@ -131,16 +130,16 @@ mod tests {
 
     #[test]
     fn test_div() {
-        let operation = DivOperation::<DataType>::new();
+        let operation = DivOperation::<ArrayType>::new();
 
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(7.0f32), Scalar::from(2.0f64)],
+                &[Array::scalar(7.0f32), Array::scalar(2.0f64)],
             ),
-            Ok(vec![Scalar::from(3.5f64)]),
+            Ok(vec![Array::scalar(3.5f64)]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -159,16 +158,16 @@ mod tests {
             }),
         );
         assert_abs_diff_eq!(
-            match InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            match InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(Complex::new(1.0f64, 2.0)), Scalar::from(Complex::new(0.5f64, -1.0))],
+                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
             ) {
                 Ok(outputs) => outputs[0].clone(),
                 Err(error) => panic!("expected a complex quotient but got {error}"),
             },
-            Scalar::from(Complex::new(1.0f64, 2.0) / Complex::new(0.5f64, -1.0)),
+            Array::scalar(Complex::new(1.0f64, 2.0) / Complex::new(0.5f64, -1.0)),
             epsilon = 1e-12,
         );
     }
@@ -278,32 +277,33 @@ mod tests {
 
     #[test]
     fn test_div_differentiation_preserves_small_tangents() {
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let smallest_positive = f64::from_bits(1);
-        let outputs = DivOperation::<DataType>::new()
+        let outputs = DivOperation::<ArrayType>::new()
             .jvp(
                 &context,
                 &EmptyRegionDriver,
                 &[
-                    DifferentiationDual::new(Scalar::from(0.0), Scalar::from(smallest_positive)).unwrap(),
-                    DifferentiationDual::new_with_zero_tangent(Scalar::from(smallest_positive)),
+                    DifferentiationDual::new(Array::scalar(0.0), Array::scalar(smallest_positive)).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(smallest_positive)),
                 ],
             )
             .unwrap();
         match outputs[0].tangent() {
-            MaybeZero::Value(tangent) => assert_eq!(tangent, &Scalar::from(1.0)),
+            MaybeZero::Value(tangent) => assert_eq!(tangent, &Array::scalar(1.0)),
             MaybeZero::Zero(_) => panic!("expected a live division tangent"),
         }
     }
 
     #[test]
     fn test_div_low_precision_differentiation_uses_widened_tangents() {
-        let left = Scalar::from(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
-        let right = Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
-        let (primal, tangent): (Scalar, Scalar) =
-            jvp(|(left, right)| Ok(left / right), (left, right), (Scalar::from(1.0f32), Scalar::from(1.0f32))).unwrap();
-        assert_eq!(primal, Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap());
-        assert_eq!(tangent, Scalar::from(-0.5f32));
+        let left = Array::scalar(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let right = Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let (primal, tangent): (Array, Array) =
+            jvp(|(left, right)| Ok(left / right), (left, right), (Array::scalar(1.0f32), Array::scalar(1.0f32)))
+                .unwrap();
+        assert_eq!(primal, Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap());
+        assert_eq!(tangent, Array::scalar(-0.5f32));
     }
 
     #[test]

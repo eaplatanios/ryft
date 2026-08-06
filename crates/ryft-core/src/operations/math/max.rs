@@ -111,7 +111,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::Scalar;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -124,33 +123,25 @@ mod tests {
 
     #[test]
     fn test_max() {
-        assert_eq!(Scalar::from(2i32).max(&Scalar::from(5i32)).unwrap(), Scalar::from(5i32));
-        assert_eq!(Scalar::from(-2i64).max(&Scalar::from(-5i64)).unwrap(), Scalar::from(-2i64));
-        assert_eq!(Scalar::from(3u32).max(&Scalar::from(7u32)).unwrap(), Scalar::from(7u32));
-        assert_eq!(Scalar::from(2.5f32).max(&Scalar::from(1.5f32)).unwrap(), Scalar::from(2.5f32));
+        assert_eq!(Array::scalar(2i32).max(&Array::scalar(5i32)).unwrap(), Array::scalar(5i32));
+        assert_eq!(Array::scalar(-2i64).max(&Array::scalar(-5i64)).unwrap(), Array::scalar(-2i64));
+        assert_eq!(Array::scalar(3u32).max(&Array::scalar(7u32)).unwrap(), Array::scalar(7u32));
+        assert_eq!(Array::scalar(2.5f32).max(&Array::scalar(1.5f32)).unwrap(), Array::scalar(2.5f32));
         // Mixed-precision operands promote before comparing.
-        assert_eq!(Scalar::from(2.5f32).max(&Scalar::from(3.5f64)).unwrap(), Scalar::from(3.5f64));
+        assert_eq!(Array::scalar(2.5f32).max(&Array::scalar(3.5f64)).unwrap(), Array::scalar(3.5f64));
         assert_eq!(
-            Scalar::from(bf16::from_f32(2.0)).max(&Scalar::from(bf16::from_f32(3.0))).unwrap(),
-            Scalar::from(bf16::from_f32(3.0)),
+            Array::scalar(bf16::from_f32(2.0)).max(&Array::scalar(bf16::from_f32(3.0))).unwrap(),
+            Array::scalar(bf16::from_f32(3.0)),
         );
         assert_eq!(
-            Scalar::from(f16::from_f32(2.0)).max(&Scalar::from(f16::from_f32(3.0))).unwrap(),
-            Scalar::from(f16::from_f32(3.0)),
+            Array::scalar(f16::from_f32(2.0)).max(&Array::scalar(f16::from_f32(3.0))).unwrap(),
+            Array::scalar(f16::from_f32(3.0)),
         );
         // NaNs propagate and `-0.0` orders below `+0.0`.
-        assert!(match Scalar::from(f64::NAN).max(&Scalar::from(1.0f64)).unwrap() {
-            Scalar::F64(value) => value.is_nan(),
-            _ => false,
-        });
-        assert!(match Scalar::from(1.0f64).max(&Scalar::from(f64::NAN)).unwrap() {
-            Scalar::F64(value) => value.is_nan(),
-            _ => false,
-        });
-        assert!(match Scalar::from(-0.0f64).max(&Scalar::from(0.0f64)).unwrap() {
-            Scalar::F64(value) => value == 0.0 && value.is_sign_positive(),
-            _ => false,
-        });
+        assert!(Array::scalar(f64::NAN).max(&Array::scalar(1.0f64)).unwrap().to_f64s()[0].is_nan());
+        assert!(Array::scalar(1.0f64).max(&Array::scalar(f64::NAN)).unwrap().to_f64s()[0].is_nan());
+        let zero = Array::scalar(-0.0f64).max(&Array::scalar(0.0f64)).unwrap().to_f64s()[0];
+        assert!(zero == 0.0 && zero.is_sign_positive());
         assert_eq!(
             Array::vector(vec![0.7, -1.0]).max(&Array::vector(vec![0.3, 2.0])).unwrap(),
             Array::vector(vec![0.7, 2.0]),

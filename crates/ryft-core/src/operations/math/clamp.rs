@@ -32,7 +32,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::differentiation::value_and_gradient;
     use crate::operations::constants::OneLike;
 
@@ -48,12 +47,12 @@ mod tests {
 
     #[test]
     fn test_clamp() {
-        let lower = Scalar::from(-1.0f64);
-        let upper = Scalar::from(1.0f64);
-        assert_eq!(Scalar::from(0.5f64).clamp(&lower, &upper).unwrap(), Scalar::from(0.5f64));
-        assert_eq!(Scalar::from(-2.5f64).clamp(&lower, &upper).unwrap(), Scalar::from(-1.0f64));
-        assert_eq!(Scalar::from(2.5f64).clamp(&lower, &upper).unwrap(), Scalar::from(1.0f64));
-        assert_eq!(Scalar::from(7i32).clamp(&Scalar::from(0i32), &Scalar::from(5i32)).unwrap(), Scalar::from(5i32));
+        let lower = Array::scalar(-1.0f64);
+        let upper = Array::scalar(1.0f64);
+        assert_eq!(Array::scalar(0.5f64).clamp(&lower, &upper).unwrap(), Array::scalar(0.5f64));
+        assert_eq!(Array::scalar(-2.5f64).clamp(&lower, &upper).unwrap(), Array::scalar(-1.0f64));
+        assert_eq!(Array::scalar(2.5f64).clamp(&lower, &upper).unwrap(), Array::scalar(1.0f64));
+        assert_eq!(Array::scalar(7i32).clamp(&Array::scalar(0i32), &Array::scalar(5i32)).unwrap(), Array::scalar(5i32),);
 
         assert_eq!(
             Array::vector(vec![-2.0, 0.5, 3.0]).clamp(&Array::scalar(-1.0), &Array::scalar(1.0)).unwrap(),

@@ -83,7 +83,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_type_inference,
@@ -94,30 +93,27 @@ mod tests {
 
     #[test]
     fn test_sign() {
-        assert_eq!(Scalar::from(-3i32).sign().unwrap(), Scalar::from(-1i32));
-        assert_eq!(Scalar::from(0i32).sign().unwrap(), Scalar::from(0i32));
-        assert_eq!(Scalar::from(5i64).sign().unwrap(), Scalar::from(1i64));
-        assert_eq!(Scalar::from(-2.5f32).sign().unwrap(), Scalar::from(-1.0f32));
-        assert_eq!(Scalar::from(2.5f64).sign().unwrap(), Scalar::from(1.0f64));
-        assert_eq!(Scalar::from(bf16::from_f32(-4.0)).sign().unwrap(), Scalar::from(bf16::from_f32(-1.0)));
-        assert_eq!(Scalar::from(f16::from_f32(4.0)).sign().unwrap(), Scalar::from(f16::from_f32(1.0)));
+        assert_eq!(Array::scalar(-3i32).sign().unwrap(), Array::scalar(-1i32));
+        assert_eq!(Array::scalar(0i32).sign().unwrap(), Array::scalar(0i32));
+        assert_eq!(Array::scalar(5i64).sign().unwrap(), Array::scalar(1i64));
+        assert_eq!(Array::scalar(-2.5f32).sign().unwrap(), Array::scalar(-1.0f32));
+        assert_eq!(Array::scalar(2.5f64).sign().unwrap(), Array::scalar(1.0f64));
+        assert_eq!(Array::scalar(bf16::from_f32(-4.0)).sign().unwrap(), Array::scalar(bf16::from_f32(-1.0)));
+        assert_eq!(Array::scalar(f16::from_f32(4.0)).sign().unwrap(), Array::scalar(f16::from_f32(1.0)));
         // Signed zeros and NaNs pass through unchanged.
-        assert_eq!(Scalar::from(0.0f64).sign().unwrap(), Scalar::from(0.0f64));
-        assert_eq!(Scalar::from(-0.0f64).sign().unwrap().to_string(), Scalar::from(-0.0f64).to_string());
-        assert!(match Scalar::from(f64::NAN).sign().unwrap() {
-            Scalar::F64(value) => value.is_nan(),
-            _ => false,
-        });
+        assert_eq!(Array::scalar(0.0f64).sign().unwrap(), Array::scalar(0.0f64));
+        assert!(Array::scalar(-0.0f64).sign().unwrap().to_f64s()[0].is_sign_negative());
+        assert!(Array::scalar(f64::NAN).sign().unwrap().to_f64s()[0].is_nan());
         // Complex signs normalize to `z / |z|` and map the origin to itself.
         let input = ComplexNumber::new(3.0f64, -4.0f64);
         assert_abs_diff_eq!(
-            Scalar::from(input).sign().unwrap(),
-            Scalar::from(ComplexNumber::new(0.6, -0.8)),
+            Array::scalar(input).sign().unwrap(),
+            Array::scalar(ComplexNumber::new(0.6, -0.8)),
             epsilon = 1e-12,
         );
         assert_eq!(
-            Scalar::from(ComplexNumber::new(0.0f64, 0.0f64)).sign().unwrap(),
-            Scalar::from(ComplexNumber::new(0.0f64, 0.0f64)),
+            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).sign().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)),
         );
 
         assert_eq!(Array::vector(vec![-0.7, 0.0, 2.0]).sign().unwrap(), Array::vector(vec![-1.0, 0.0, 1.0]),);

@@ -52,7 +52,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_type_inference,
@@ -64,17 +63,14 @@ mod tests {
     #[test]
     fn test_round() {
         // Ties resolve toward the nearest even integer.
-        assert_eq!(Scalar::from(2.5f64).round().unwrap(), Scalar::from(2.0f64));
-        assert_eq!(Scalar::from(3.5f64).round().unwrap(), Scalar::from(4.0f64));
-        assert_eq!(Scalar::from(-2.5f32).round().unwrap(), Scalar::from(-2.0f32));
-        assert_eq!(Scalar::from(2.3f64).round().unwrap(), Scalar::from(2.0f64));
-        assert_eq!(Scalar::from(bf16::from_f32(2.5)).round().unwrap(), Scalar::from(bf16::from_f32(2.0)));
-        assert_eq!(Scalar::from(f16::from_f32(3.5)).round().unwrap(), Scalar::from(f16::from_f32(4.0)));
+        assert_eq!(Array::scalar(2.5f64).round().unwrap(), Array::scalar(2.0f64));
+        assert_eq!(Array::scalar(3.5f64).round().unwrap(), Array::scalar(4.0f64));
+        assert_eq!(Array::scalar(-2.5f32).round().unwrap(), Array::scalar(-2.0f32));
+        assert_eq!(Array::scalar(2.3f64).round().unwrap(), Array::scalar(2.0f64));
+        assert_eq!(Array::scalar(bf16::from_f32(2.5)).round().unwrap(), Array::scalar(bf16::from_f32(2.0)));
+        assert_eq!(Array::scalar(f16::from_f32(3.5)).round().unwrap(), Array::scalar(f16::from_f32(4.0)));
         // NaNs pass through unchanged.
-        assert!(match Scalar::from(f64::NAN).round().unwrap() {
-            Scalar::F64(value) => value.is_nan(),
-            _ => false,
-        });
+        assert!(Array::scalar(f64::NAN).round().unwrap().to_f64s()[0].is_nan());
 
         assert_eq!(Array::vector(vec![0.5, 1.5, -2.5]).round().unwrap(), Array::vector(vec![0.0, 2.0, -2.0]),);
     }

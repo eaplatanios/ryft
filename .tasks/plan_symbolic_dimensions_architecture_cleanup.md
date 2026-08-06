@@ -2570,6 +2570,9 @@ Phase 9a4 — retire the scalar program universe:
     - [x] Migrate constants, comparison, logical, conversion, and stop-gradient fixtures.
     - [x] Migrate control-flow fixtures.
     - [ ] Migrate mathematical and complex-number fixtures.
+      - [x] Migrate arithmetic, ordering, clamping, sign, and rounding fixtures.
+      - [ ] Migrate transcendental and special-function fixtures.
+      - [ ] Migrate complex construction and projection fixtures.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
       exports, scalar-only doctests, and the obsolete scalar-domain compile-fail fixture.
@@ -4909,3 +4912,15 @@ correction. It removes 26 retired scalar references and reduces the operation-lo
 across 28 files to 292 matches across 26 files. All 76 focused control-flow tests, the complete 1,153-test core library
 suite, and all 54 runnable doctests (16 intentional ignores) pass. Mathematical and complex-number fixtures are the
 next bounded operation-local slice.
+
+The arithmetic, ordering, clamping, sign, and rounding slice moves all remaining scalar-backed fixtures in `add`,
+`sub`, `mul`, `div`, `rem`, `neg`, `min`, `max`, `clamp`, `ceil`, `floor`, `round`, and `sign` to rank-zero arrays.
+Mixed-precision promotion, low-precision tangent widening, smallest-positive tangents, signed remainder and integer
+zero-divisor handling, NaN propagation, signed-zero ordering, ties-to-even rounding, and complex arithmetic retain
+operation-local coverage on the canonical reference backend.
+
+This review unit changes 292 lines across 13 Rust source files with 40 net deletions; the plan separately gains the
+checklist split that bounds the remaining review units and this review record. It removes 111 retired scalar references
+and reduces the operation-local residual audit from 292 matches across 26 files to 181 matches across 18 files.
+Formatting and diff hygiene pass, and the complete 1,153-test core library suite passes. Transcendental and special-
+function fixtures are the next bounded operation-local slice.

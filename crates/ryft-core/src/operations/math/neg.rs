@@ -87,7 +87,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
@@ -102,25 +101,25 @@ mod tests {
 
     #[test]
     fn test_neg() {
-        let operation = NegOperation::<DataType>::new();
+        let operation = NegOperation::<ArrayType>::new();
 
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(2.0)],
+                &[Array::scalar(2.0)],
             ),
-            Ok(vec![Scalar::from(-2.0)]),
+            Ok(vec![Array::scalar(-2.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(1u8)],
+                &[Array::scalar(1u8)],
             ),
-            Ok(vec![Scalar::from(u8::MAX)]),
+            Ok(vec![Array::scalar(u8::MAX)]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -132,13 +131,13 @@ mod tests {
             Ok(vec![Array::scalar(-2.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(Complex::new(1.0f64, -2.0))],
+                &[Array::scalar(Complex::new(1.0f64, -2.0))],
             ),
-            Ok(vec![Scalar::from(Complex::new(-1.0f64, 2.0))]),
+            Ok(vec![Array::scalar(Complex::new(-1.0f64, 2.0))]),
         );
     }
 

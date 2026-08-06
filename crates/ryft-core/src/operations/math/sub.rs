@@ -88,7 +88,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
@@ -103,16 +102,16 @@ mod tests {
 
     #[test]
     fn test_sub() {
-        let operation = SubOperation::<DataType>::new();
+        let operation = SubOperation::<ArrayType>::new();
 
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(2.0f32), Scalar::from(3.5f64)],
+                &[Array::scalar(2.0f32), Array::scalar(3.5f64)],
             ),
-            Ok(vec![Scalar::from(-1.5f64)])
+            Ok(vec![Array::scalar(-1.5f64)])
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -124,13 +123,13 @@ mod tests {
             Ok(vec![Array::scalar(-1.5)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(Complex::new(1.0f64, 2.0)), Scalar::from(Complex::new(0.5f64, -1.0))],
+                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
             ),
-            Ok(vec![Scalar::from(Complex::new(0.5f64, 3.0))]),
+            Ok(vec![Array::scalar(Complex::new(0.5f64, 3.0))]),
         );
     }
 

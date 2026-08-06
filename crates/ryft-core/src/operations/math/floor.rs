@@ -52,7 +52,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_type_inference,
@@ -63,15 +62,12 @@ mod tests {
 
     #[test]
     fn test_floor() {
-        assert_eq!(Scalar::from(2.7f32).floor().unwrap(), Scalar::from(2.0f32));
-        assert_eq!(Scalar::from(-2.3f64).floor().unwrap(), Scalar::from(-3.0f64));
-        assert_eq!(Scalar::from(bf16::from_f32(2.7)).floor().unwrap(), Scalar::from(bf16::from_f32(2.7f32.floor())));
-        assert_eq!(Scalar::from(f16::from_f32(2.7)).floor().unwrap(), Scalar::from(f16::from_f32(2.7f32.floor())));
+        assert_eq!(Array::scalar(2.7f32).floor().unwrap(), Array::scalar(2.0f32));
+        assert_eq!(Array::scalar(-2.3f64).floor().unwrap(), Array::scalar(-3.0f64));
+        assert_eq!(Array::scalar(bf16::from_f32(2.7)).floor().unwrap(), Array::scalar(bf16::from_f32(2.7f32.floor())),);
+        assert_eq!(Array::scalar(f16::from_f32(2.7)).floor().unwrap(), Array::scalar(f16::from_f32(2.7f32.floor())),);
         // NaNs pass through unchanged.
-        assert!(match Scalar::from(f64::NAN).floor().unwrap() {
-            Scalar::F64(value) => value.is_nan(),
-            _ => false,
-        });
+        assert!(Array::scalar(f64::NAN).floor().unwrap().to_f64s()[0].is_nan());
 
         assert_eq!(Array::vector(vec![-0.7, 0.0, 2.5]).floor().unwrap(), Array::vector(vec![-1.0, 0.0, 2.0]),);
     }

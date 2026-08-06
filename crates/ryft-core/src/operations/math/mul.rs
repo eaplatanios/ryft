@@ -188,7 +188,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{jvp, vjp};
     use crate::interpretation::InterpretableOperation;
@@ -205,16 +204,16 @@ mod tests {
 
     #[test]
     fn test_mul() {
-        let operation = MulOperation::<DataType>::new();
+        let operation = MulOperation::<ArrayType>::new();
 
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(2.0f32), Scalar::from(3.5f64)],
+                &[Array::scalar(2.0f32), Array::scalar(3.5f64)],
             ),
-            Ok(vec![Scalar::from(7.0f64)]),
+            Ok(vec![Array::scalar(7.0f64)]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -226,13 +225,13 @@ mod tests {
             Ok(vec![Array::scalar(7.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(Complex::new(1.0f64, 2.0)), Scalar::from(Complex::new(0.5f64, -1.0))],
+                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
             ),
-            Ok(vec![Scalar::from(Complex::new(1.0f64, 2.0) * Complex::new(0.5f64, -1.0))]),
+            Ok(vec![Array::scalar(Complex::new(1.0f64, 2.0) * Complex::new(0.5f64, -1.0))]),
         );
         assert_eq!(Mul::mul(&3_usize, &4), Ok(12));
         assert_eq!(
