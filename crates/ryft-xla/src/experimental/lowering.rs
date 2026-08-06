@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use ryft_core::arrays::encoding::Complex as ComplexNumber;
 use ryft_core::axes::AxisIndexOperation;
 use ryft_core::backends::arrays::Array as CpuArray;
 use ryft_core::backends::arrays::ArrayOperation;
@@ -7925,10 +7926,110 @@ fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
     Ok(coordinate.result(0).expect("stablehlo.remainder should return one result").as_ref())
 }
 
-/// Builds a single-instruction reduction-body region for [`stable_hlo::reduce`] over the given
-/// scalar `element_type`. The generated region has one block taking two scalar tensor arguments
-/// of `tensor<{element_type}>` and produces a single scalar result via the binary `combiner`
-/// matching the reduction kind. Returns the constructed [`DetachedRegion`].
+/// Lowers one JAX-compatible minimum or maximum. Integer and Boolean values use the corresponding StableHLO
+/// operation. Floating-point values use explicit total-order comparisons and NaN propagation so every XLA backend
+/// preserves IEEE signed-zero and NaN semantics. Complex values use JAX's lexicographic `(real, imaginary)`
+/// compare/select sequence.
+fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
+    maximum: bool,
+    element_type: DataType,
+    left: ValueRef<'b, 'c, 't>,
+    right: ValueRef<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    if !element_type.is_complex() && !element_type.is_floating_point() {
+        let result = if maximum {
+            block.append_operation(stable_hlo::maximum(left, right, location)?)?
+        } else {
+            block.append_operation(stable_hlo::minimum(left, right, location)?)?
+        };
+        return Ok(result.result(0).expect("stablehlo extremum should return one result").as_ref());
+    }
+    if element_type.is_floating_point() {
+        let direction = if maximum {
+            stable_hlo::ComparisonDirection::GreaterThan
+        } else {
+            stable_hlo::ComparisonDirection::LessThan
+        };
+        let ordered = block.append_operation(stable_hlo::compare(
+            left,
+            right,
+            direction,
+            stable_hlo::ComparisonType::TotalOrder,
+            location,
+        )?)?;
+        let ordered = ordered.result(0).expect("stablehlo.compare should return one result").as_ref();
+        let result = block.append_operation(stable_hlo::select(ordered, left, right, location)?)?;
+        let result = result.result(0).expect("stablehlo.select should return one result").as_ref();
+
+        // Some XLA backends implement native min/max using instructions that drop NaNs or do not distinguish signed
+        // zeros. StableHLO and JAX require IEEE maximum/minimum, so make both behaviors explicit and portable.
+        let left_is_nan = block.append_operation(stable_hlo::compare(
+            left,
+            left,
+            stable_hlo::ComparisonDirection::NotEqual,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?;
+        let left_is_nan = left_is_nan.result(0).expect("stablehlo.compare should return one result").as_ref();
+        let right_is_nan = block.append_operation(stable_hlo::compare(
+            right,
+            right,
+            stable_hlo::ComparisonDirection::NotEqual,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?;
+        let right_is_nan = right_is_nan.result(0).expect("stablehlo.compare should return one result").as_ref();
+        let right_or_result = block.append_operation(stable_hlo::select(right_is_nan, right, result, location)?)?;
+        let right_or_result = right_or_result.result(0).expect("stablehlo.select should return one result").as_ref();
+        let result = block.append_operation(stable_hlo::select(left_is_nan, left, right_or_result, location)?)?;
+        return Ok(result.result(0).expect("stablehlo.select should return one result").as_ref());
+    }
+
+    let left_real = block.append_operation(stable_hlo::real(left, location)?)?;
+    let left_real = left_real.result(0).expect("stablehlo.real should return one result").as_ref();
+    let right_real = block.append_operation(stable_hlo::real(right, location)?)?;
+    let right_real = right_real.result(0).expect("stablehlo.real should return one result").as_ref();
+    let left_imaginary = block.append_operation(stable_hlo::imag(left, location)?)?;
+    let left_imaginary = left_imaginary.result(0).expect("stablehlo.imag should return one result").as_ref();
+    let right_imaginary = block.append_operation(stable_hlo::imag(right, location)?)?;
+    let right_imaginary = right_imaginary.result(0).expect("stablehlo.imag should return one result").as_ref();
+    let real_equal = block.append_operation(stable_hlo::compare(
+        left_real,
+        right_real,
+        stable_hlo::ComparisonDirection::Equal,
+        stable_hlo::ComparisonType::Float,
+        location,
+    )?)?;
+    let real_equal = real_equal.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let direction =
+        if maximum { stable_hlo::ComparisonDirection::GreaterThan } else { stable_hlo::ComparisonDirection::LessThan };
+    let real_ordered = block.append_operation(stable_hlo::compare(
+        left_real,
+        right_real,
+        direction,
+        stable_hlo::ComparisonType::Float,
+        location,
+    )?)?;
+    let real_ordered = real_ordered.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let imaginary_ordered = block.append_operation(stable_hlo::compare(
+        left_imaginary,
+        right_imaginary,
+        direction,
+        stable_hlo::ComparisonType::Float,
+        location,
+    )?)?;
+    let imaginary_ordered = imaginary_ordered.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let ordered = block.append_operation(stable_hlo::select(real_equal, imaginary_ordered, real_ordered, location)?)?;
+    let ordered = ordered.result(0).expect("stablehlo.select should return one result").as_ref();
+    let result = block.append_operation(stable_hlo::select(ordered, left, right, location)?)?;
+    Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
+}
+
+/// Builds a reduction-body region for [`stable_hlo::reduce`] over the given scalar `element_type`. The generated
+/// region has one block taking two scalar tensor arguments of `tensor<{element_type}>` and produces one scalar result
+/// through the combiner matching the reduction kind.
 fn build_reduce_body_region<'c, 't>(
     kind: ReductionKind,
     element_type: DataType,
@@ -7942,14 +8043,26 @@ fn build_reduce_body_region<'c, 't>(
     let mut block_ref = region.append_block(block)?;
     let lhs = block_ref.argument(0)?.as_ref();
     let rhs = block_ref.argument(1)?.as_ref();
-    let body_result = match kind {
-        ReductionKind::Sum | ReductionKind::Mean => block_ref.append_operation(stable_hlo::add(lhs, rhs, location)?)?,
-        ReductionKind::Max => block_ref.append_operation(stable_hlo::maximum(lhs, rhs, location)?)?,
-        ReductionKind::Min => block_ref.append_operation(stable_hlo::minimum(lhs, rhs, location)?)?,
-        ReductionKind::Any => block_ref.append_operation(stable_hlo::or(lhs, rhs, location)?)?,
-        ReductionKind::All => block_ref.append_operation(stable_hlo::and(lhs, rhs, location)?)?,
+    let body_value = match kind {
+        ReductionKind::Sum | ReductionKind::Mean => block_ref
+            .append_operation(stable_hlo::add(lhs, rhs, location)?)?
+            .result(0)
+            .expect("stablehlo.add should return one result")
+            .as_ref(),
+        ReductionKind::Max | ReductionKind::Min => {
+            lower_extremum_to_mlir(kind == ReductionKind::Max, element_type, lhs, rhs, &mut block_ref, location)?
+        }
+        ReductionKind::Any => block_ref
+            .append_operation(stable_hlo::or(lhs, rhs, location)?)?
+            .result(0)
+            .expect("stablehlo.or should return one result")
+            .as_ref(),
+        ReductionKind::All => block_ref
+            .append_operation(stable_hlo::and(lhs, rhs, location)?)?
+            .result(0)
+            .expect("stablehlo.and should return one result")
+            .as_ref(),
     };
-    let body_value = body_result.result(0).expect("stablehlo body combiner should return one result").as_ref();
     block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
     Ok(region)
 }
@@ -8043,8 +8156,8 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
 
 /// Builds the scalar combiner region of a `stablehlo.scatter` for the given [`ScatterReductionKind`], modeled on
 /// [`build_reduce_body_region`]. The region's block takes the existing operand scalar and the update scalar and
-/// returns the combined value: `Overwrite` returns the update directly (no combine op), and the others apply the
-/// matching elementwise StableHLO op.
+/// returns the combined value: `Overwrite` returns the update directly (no combine op), arithmetic kinds apply the
+/// matching elementwise StableHLO operation, and extrema use [`lower_extremum_to_mlir`].
 fn build_scatter_combiner_region<'c, 't>(
     kind: ScatterReductionKind,
     element_type: DataType,
@@ -8069,16 +8182,9 @@ fn build_scatter_combiner_region<'c, 't>(
             .result(0)
             .expect("stablehlo.multiply should return one result")
             .as_ref(),
-        ScatterReductionKind::Min => block_ref
-            .append_operation(stable_hlo::minimum(lhs, rhs, location)?)?
-            .result(0)
-            .expect("stablehlo.minimum should return one result")
-            .as_ref(),
-        ScatterReductionKind::Max => block_ref
-            .append_operation(stable_hlo::maximum(lhs, rhs, location)?)?
-            .result(0)
-            .expect("stablehlo.maximum should return one result")
-            .as_ref(),
+        ScatterReductionKind::Min | ScatterReductionKind::Max => {
+            lower_extremum_to_mlir(kind == ScatterReductionKind::Max, element_type, lhs, rhs, &mut block_ref, location)?
+        }
     };
     block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
     Ok(region)
@@ -8142,28 +8248,46 @@ fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
     let scalar_array_type = ArrayType::scalar(element_type);
     let scalar_tensor_type = lower_tensor_type(&scalar_array_type, context, location)?;
+    if element_type.is_complex() {
+        let real = match kind {
+            ReductionKind::Sum | ReductionKind::Mean => 0.0,
+            ReductionKind::Max => f64::NEG_INFINITY,
+            ReductionKind::Min => f64::INFINITY,
+            ReductionKind::Any | ReductionKind::All => {
+                return Err(LoweringError::UnsupportedDataType { data_type: element_type });
+            }
+        };
+        let identity = if element_type == DataType::C64 {
+            Scalar::C64(ComplexNumber::new(real as f32, 0.0))
+        } else {
+            Scalar::C128(ComplexNumber::new(real, 0.0))
+        };
+        return lower_scalar_constant_splat(identity, &scalar_array_type, scalar_tensor_type, block, context, location);
+    }
     let attribute = build_reduction_identity_attribute(kind, element_type, scalar_tensor_type, context)?;
     let result = block.append_operation(stable_hlo::constant(attribute, location)?)?;
     Ok(result.result(0).expect("stablehlo.constant should return one result").as_ref())
 }
 
 /// Builds a dense-elements attribute holding the identity element of the given reduction kind at
-/// the given element type. `Sum` and `Mean` use zero; `Max` and `Min` use the bound returned by
-/// [`float_reduction_identity_bound`] (negated for `Max`) at float element types and the bounds returned by
-/// [`integer_reduction_identity_bounds`] at integer element types; Boolean `Any` and `All` use `false` and `true`.
-/// Every other combination — including all reductions over [`DataType::F8E8M0FNU`], whose unsigned, zero-free
-/// encoding has no representable identity — fails with [`LoweringError::UnsupportedDataType`].
+/// the given element type. `Sum` and `Mean` use zero; `Max` and `Min` use the bounds returned by
+/// [`float_reduction_identity_bounds`] at float element types and the bounds returned by
+/// [`integer_reduction_identity_bounds`] at integer element types. Boolean `Any`/`Max` use `false`, while Boolean
+/// `All`/`Min` use `true`. Every other combination fails with [`LoweringError::UnsupportedDataType`].
 fn build_reduction_identity_attribute<'c, 't>(
     kind: ReductionKind,
     element_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
     context: &'c MlirContext<'t>,
 ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-    if let Some(bound) = float_reduction_identity_bound(element_type) {
+    if let Some((minimum, maximum)) = float_reduction_identity_bounds(element_type) {
         let identity = match kind {
-            ReductionKind::Sum | ReductionKind::Mean => 0.0,
-            ReductionKind::Max => -bound,
-            ReductionKind::Min => bound,
+            ReductionKind::Sum | ReductionKind::Mean if element_type != DataType::F8E8M0FNU => 0.0,
+            ReductionKind::Max => minimum,
+            ReductionKind::Min => maximum,
+            ReductionKind::Sum | ReductionKind::Mean => {
+                return Err(LoweringError::UnsupportedDataType { data_type: element_type });
+            }
             ReductionKind::Any | ReductionKind::All => {
                 return Err(LoweringError::UnsupportedDataType { data_type: element_type });
             }
@@ -8182,12 +8306,12 @@ fn build_reduction_identity_attribute<'c, 't>(
         return lower_constant_elements_attribute(element_type, tensor_type, identity, context);
     }
     match (kind, element_type) {
-        (ReductionKind::Any, DataType::Boolean) => context
+        (ReductionKind::Any | ReductionKind::Max, DataType::Boolean) => context
             .dense_bool_elements_attribute(tensor_type, &[false])
             .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
             .cast::<DenseElementsAttributeRef>()
             .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
-        (ReductionKind::All, DataType::Boolean) => context
+        (ReductionKind::All | ReductionKind::Min, DataType::Boolean) => context
             .dense_bool_elements_attribute(tensor_type, &[true])
             .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
             .cast::<DenseElementsAttributeRef>()
@@ -8196,12 +8320,10 @@ fn build_reduction_identity_attribute<'c, 't>(
     }
 }
 
-/// Returns the `Min` reduction identity of the given float data type: positive infinity for formats with
-/// infinities and the greatest finite value for the finite-only `f8`/`f6`/`f4` formats (for example, `448` for
-/// [`DataType::F8E4M3FN`]). The `Max` identity is its negation, which every supported format represents because
-/// its value range is sign-symmetric. Returns `None` for non-float data types and for [`DataType::F8E8M0FNU`],
-/// whose unsigned, zero-free exponent-only encoding represents neither zero nor a sign-symmetric ordering bound.
-fn float_reduction_identity_bound(data_type: DataType) -> Option<f64> {
+/// Returns the `(maximum identity, minimum identity)` pair for the given floating-point data type. Formats with
+/// infinities use `(-inf, +inf)`, finite signed formats use their finite bounds, and [`DataType::F8E8M0FNU`] uses its
+/// smallest and largest positive powers of two. Returns `None` for non-floating-point data types.
+fn float_reduction_identity_bounds(data_type: DataType) -> Option<(f64, f64)> {
     match data_type {
         DataType::BF16
         | DataType::F16
@@ -8209,14 +8331,15 @@ fn float_reduction_identity_bound(data_type: DataType) -> Option<f64> {
         | DataType::F64
         | DataType::F8E3M4
         | DataType::F8E4M3
-        | DataType::F8E5M2 => Some(f64::INFINITY),
-        DataType::F4E2M1FN => Some(6.0),
-        DataType::F6E2M3FN => Some(7.5),
-        DataType::F6E3M2FN => Some(28.0),
-        DataType::F8E4M3FN => Some(448.0),
-        DataType::F8E4M3FNUZ => Some(240.0),
-        DataType::F8E4M3B11FNUZ => Some(30.0),
-        DataType::F8E5M2FNUZ => Some(57344.0),
+        | DataType::F8E5M2 => Some((f64::NEG_INFINITY, f64::INFINITY)),
+        DataType::F4E2M1FN => Some((-6.0, 6.0)),
+        DataType::F6E2M3FN => Some((-7.5, 7.5)),
+        DataType::F6E3M2FN => Some((-28.0, 28.0)),
+        DataType::F8E4M3FN => Some((-448.0, 448.0)),
+        DataType::F8E4M3FNUZ => Some((-240.0, 240.0)),
+        DataType::F8E4M3B11FNUZ => Some((-30.0, 30.0)),
+        DataType::F8E5M2FNUZ => Some((-57344.0, 57344.0)),
+        DataType::F8E8M0FNU => Some((2f64.powi(-127), 2f64.powi(127))),
         _ => None,
     }
 }
@@ -10281,12 +10404,47 @@ mod tests {
                 module {
                   func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<2xbf16> {
                     %cst = stablehlo.constant dense<0xFF80> : tensor<bf16>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.maximum across dimensions = [1] : (tensor<2x3xbf16>, tensor<bf16>) -> tensor<2xbf16>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [1] : (tensor<2x3xbf16>, tensor<bf16>) -> tensor<2xbf16>
+                     reducer(%arg1: tensor<bf16>, %arg2: tensor<bf16>)  {
+                      %1 = stablehlo.compare GT, %arg1, %arg2, TOTALORDER : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
+                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<bf16>
+                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
+                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<bf16>
+                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<bf16>
+                      stablehlo.return %6 : tensor<bf16>
+                    }
                     return %0 : tensor<2xbf16>
                   }
                 }
             "#}
         );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_boolean_and_complex_extrema() {
+        assert_eq!(
+            lowered_reduce_module(DataType::Boolean, ReductionKind::Max, vec![0], vec![0]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<0xi1>) -> tensor<i1> {
+                    %c = stablehlo.constant dense<false> : tensor<i1>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.maximum across dimensions = [0] : (tensor<0xi1>, tensor<i1>) -> tensor<i1>
+                    return %0 : tensor<i1>
+                  }
+                }
+            "#},
+        );
+
+        // StableHLO has no primitive with JAX's complex ordering contract, so the reduction body explicitly compares
+        // real components first and imaginary components only when the real components are equal.
+        let stablehlo = lowered_reduce_module(DataType::C64, ReductionKind::Max, vec![0], vec![0]).unwrap();
+        assert!(stablehlo.contains("tensor<complex<f32>>"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.reduce"), "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.real").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.imag").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.compare").count(), 3, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.select").count(), 2, "{stablehlo}");
     }
 
     #[test]
@@ -10395,7 +10553,16 @@ mod tests {
                 module {
                   func.func @main(%arg0: tensor<4xf16>) -> tensor<f16> {
                     %cst = stablehlo.constant dense<0x7C00> : tensor<f16>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.minimum across dimensions = [0] : (tensor<4xf16>, tensor<f16>) -> tensor<f16>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<4xf16>, tensor<f16>) -> tensor<f16>
+                     reducer(%arg1: tensor<f16>, %arg2: tensor<f16>)  {
+                      %1 = stablehlo.compare LT, %arg1, %arg2, TOTALORDER : (tensor<f16>, tensor<f16>) -> tensor<i1>
+                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f16>
+                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f16>, tensor<f16>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f16>, tensor<f16>) -> tensor<i1>
+                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f16>
+                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f16>
+                      stablehlo.return %6 : tensor<f16>
+                    }
                     return %0 : tensor<f16>
                   }
                 }
@@ -10411,7 +10578,16 @@ mod tests {
                 module {
                   func.func @main(%arg0: tensor<4xf8E5M2>) -> tensor<f8E5M2> {
                     %cst = stablehlo.constant dense<0xFC> : tensor<f8E5M2>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.maximum across dimensions = [0] : (tensor<4xf8E5M2>, tensor<f8E5M2>) -> tensor<f8E5M2>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<4xf8E5M2>, tensor<f8E5M2>) -> tensor<f8E5M2>
+                     reducer(%arg1: tensor<f8E5M2>, %arg2: tensor<f8E5M2>)  {
+                      %1 = stablehlo.compare GT, %arg1, %arg2, TOTALORDER : (tensor<f8E5M2>, tensor<f8E5M2>) -> tensor<i1>
+                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f8E5M2>
+                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f8E5M2>, tensor<f8E5M2>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f8E5M2>, tensor<f8E5M2>) -> tensor<i1>
+                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f8E5M2>
+                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f8E5M2>
+                      stablehlo.return %6 : tensor<f8E5M2>
+                    }
                     return %0 : tensor<f8E5M2>
                   }
                 }
@@ -10427,7 +10603,16 @@ mod tests {
                 module {
                   func.func @main(%arg0: tensor<4xf8E4M3FN>) -> tensor<f8E4M3FN> {
                     %cst = stablehlo.constant dense<-4.480000e+02> : tensor<f8E4M3FN>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.maximum across dimensions = [0] : (tensor<4xf8E4M3FN>, tensor<f8E4M3FN>) -> tensor<f8E4M3FN>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<4xf8E4M3FN>, tensor<f8E4M3FN>) -> tensor<f8E4M3FN>
+                     reducer(%arg1: tensor<f8E4M3FN>, %arg2: tensor<f8E4M3FN>)  {
+                      %1 = stablehlo.compare GT, %arg1, %arg2, TOTALORDER : (tensor<f8E4M3FN>, tensor<f8E4M3FN>) -> tensor<i1>
+                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f8E4M3FN>
+                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f8E4M3FN>, tensor<f8E4M3FN>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f8E4M3FN>, tensor<f8E4M3FN>) -> tensor<i1>
+                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f8E4M3FN>
+                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f8E4M3FN>
+                      stablehlo.return %6 : tensor<f8E4M3FN>
+                    }
                     return %0 : tensor<f8E4M3FN>
                   }
                 }
@@ -10459,7 +10644,16 @@ mod tests {
                 module {
                   func.func @main(%arg0: tensor<4xf4E2M1FN>) -> tensor<f4E2M1FN> {
                     %cst = stablehlo.constant dense<6.000000e+00> : tensor<f4E2M1FN>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.minimum across dimensions = [0] : (tensor<4xf4E2M1FN>, tensor<f4E2M1FN>) -> tensor<f4E2M1FN>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<4xf4E2M1FN>, tensor<f4E2M1FN>) -> tensor<f4E2M1FN>
+                     reducer(%arg1: tensor<f4E2M1FN>, %arg2: tensor<f4E2M1FN>)  {
+                      %1 = stablehlo.compare LT, %arg1, %arg2, TOTALORDER : (tensor<f4E2M1FN>, tensor<f4E2M1FN>) -> tensor<i1>
+                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f4E2M1FN>
+                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f4E2M1FN>, tensor<f4E2M1FN>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f4E2M1FN>, tensor<f4E2M1FN>) -> tensor<i1>
+                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f4E2M1FN>
+                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f4E2M1FN>
+                      stablehlo.return %6 : tensor<f4E2M1FN>
+                    }
                     return %0 : tensor<f4E2M1FN>
                   }
                 }
@@ -10551,11 +10745,13 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_rejects_f8e8m0fnu_reduce() {
+    fn test_to_mlir_module_for_plain_program_supports_f8e8m0fnu_extrema_but_rejects_sum() {
         assert_eq!(
             lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Sum, vec![0], vec![4]).unwrap_err(),
             LoweringError::UnsupportedDataType { data_type: DataType::F8E8M0FNU },
         );
+        assert!(lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Max, vec![0], vec![0]).is_ok());
+        assert!(lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Min, vec![0], vec![0]).is_ok());
     }
 
     #[test]
@@ -10888,6 +11084,32 @@ mod tests {
         assert!(stablehlo.contains("stablehlo.add"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
         assert!(stablehlo.contains("tensor<3x2xf32>"), "{stablehlo}");
+
+        // Complex scatter extrema share the explicit lexicographic combiner used by complex reductions.
+        let operand_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let updates_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Max);
+        let mut builder = XlaProgramBuilder::new();
+        let operand = builder.add_input(operand_type);
+        let indices = builder.add_input(indices_type);
+        let updates = builder.add_input(updates_type);
+        let output = builder
+            .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(stablehlo.matches("stablehlo.real").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.imag").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.compare").count(), 3, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.select").count(), 2, "{stablehlo}");
     }
 
     #[test]
@@ -12334,7 +12556,16 @@ mod tests {
                     %6 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<1x2x4x4xf32>
                     %7 = stablehlo.select %5, %2, %6 : tensor<1x2x4x4xi1>, tensor<1x2x4x4xf32>
                     %cst_1 = stablehlo.constant dense<0xFF800000> : tensor<f32>
-                    %8 = stablehlo.reduce(%7 init: %cst_1) applies stablehlo.maximum across dimensions = [3] : (tensor<1x2x4x4xf32>, tensor<f32>) -> tensor<1x2x4xf32>
+                    %8 = stablehlo.reduce(%7 init: %cst_1) across dimensions = [3] : (tensor<1x2x4x4xf32>, tensor<f32>) -> tensor<1x2x4xf32>
+                     reducer(%arg3: tensor<f32>, %arg4: tensor<f32>)  {
+                      %17 = stablehlo.compare GT, %arg3, %arg4, TOTALORDER : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %18 = stablehlo.select %17, %arg3, %arg4 : tensor<i1>, tensor<f32>
+                      %19 = stablehlo.compare NE, %arg3, %arg3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %20 = stablehlo.compare NE, %arg4, %arg4, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %21 = stablehlo.select %20, %arg4, %18 : tensor<i1>, tensor<f32>
+                      %22 = stablehlo.select %19, %arg3, %21 : tensor<i1>, tensor<f32>
+                      stablehlo.return %22 : tensor<f32>
+                    }
                     %9 = stablehlo.broadcast_in_dim %8, dims = [0, 1, 2] : (tensor<1x2x4xf32>) -> tensor<1x2x4x4xf32>
                     %10 = stablehlo.subtract %7, %9 : tensor<1x2x4x4xf32>
                     %11 = stablehlo.exponential %10 : tensor<1x2x4x4xf32>
@@ -12687,7 +12918,16 @@ mod tests {
                     %16 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<2x4x4x4xf32>
                     %17 = stablehlo.select %15, %8, %16 : tensor<2x4x4x4xi1>, tensor<2x4x4x4xf32>
                     %cst_1 = stablehlo.constant dense<0xFF800000> : tensor<f32>
-                    %18 = stablehlo.reduce(%17 init: %cst_1) applies stablehlo.maximum across dimensions = [3] : (tensor<2x4x4x4xf32>, tensor<f32>) -> tensor<2x4x4xf32>
+                    %18 = stablehlo.reduce(%17 init: %cst_1) across dimensions = [3] : (tensor<2x4x4x4xf32>, tensor<f32>) -> tensor<2x4x4xf32>
+                     reducer(%arg4: tensor<f32>, %arg5: tensor<f32>)  {
+                      %29 = stablehlo.compare GT, %arg4, %arg5, TOTALORDER : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %30 = stablehlo.select %29, %arg4, %arg5 : tensor<i1>, tensor<f32>
+                      %31 = stablehlo.compare NE, %arg4, %arg4, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %32 = stablehlo.compare NE, %arg5, %arg5, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %33 = stablehlo.select %32, %arg5, %30 : tensor<i1>, tensor<f32>
+                      %34 = stablehlo.select %31, %arg4, %33 : tensor<i1>, tensor<f32>
+                      stablehlo.return %34 : tensor<f32>
+                    }
                     %19 = stablehlo.broadcast_in_dim %18, dims = [0, 1, 2] : (tensor<2x4x4xf32>) -> tensor<2x4x4x4xf32>
                     %20 = stablehlo.subtract %17, %19 : tensor<2x4x4x4xf32>
                     %21 = stablehlo.exponential %20 : tensor<2x4x4x4xf32>

@@ -2486,7 +2486,7 @@ Phase 9a2 — byte-backed reference kernels:
   - [x] P9a2e: add exhaustive sealed-element dispatch and a zero-intermediate-allocation broadcasted binary loop, then
         migrate exact equality and comparison to direct typed codecs. Preserve signed-zero, NaN, complex-ordering,
         payload-free, promotion, arbitrary-layout, and complete NumPy-style broadcasting semantics.
-- [ ] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
+- [x] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
       gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
   - [x] P9a2c: migrate broadcast, transpose, reshape, static and dynamic slice/update, pad, and concatenate to direct
         layout-aware byte copies, retaining exact validation order and bulk-copying physically contiguous selections.
@@ -2502,11 +2502,17 @@ Phase 9a2 — byte-backed reference kernels:
         arithmetic-element capability across both families; support every numeric codec, sub-byte modular arithmetic,
         low-precision floating-point formats, complex sum/mean, Boolean reductions, arbitrary physical layouts, and
         structural-zero payloads without a payload-sized `Scalar` intermediate.
-  - [ ] P9a2i: close the existing JAX extremum-semantics gap before moving to dot/attention and collectives. Match
+  - [x] P9a2i: close the existing JAX extremum-semantics gap before moving to dot/attention and collectives. Match
         `lax.reduce_min`, `lax.reduce_max`, `lax.scatter_min`, and `lax.scatter_max` for Boolean extrema, IEEE-754 NaN
         and signed-zero behavior, lexicographic complex ordering, dtype-specific reduction identities, and empty-axis
         reductions. Keep reference and XLA execution identical, including complex identity lowering, and pin each
         behavior with exact type-rule, reference, StableHLO, and execution tests.
+  - [x] P9a2j: migrate generalized dot's same-element-type contraction to a direct typed, layout-aware kernel with no
+        operand-sized temporary payload. Preserve arbitrary batching and contracting dimensions, integer wrapping,
+        low-precision and complex arithmetic, empty contractions, and arbitrary physical input layouts. Preserve
+        preferred accumulation through its canonical operand-conversion composition followed by the same direct
+        kernel. Delete the superseded flat-`Vec` evaluator; verify attention through its existing composition and
+        record that collectives own no local reference-array payload kernel requiring migration.
 - [ ] Route raw-buffer access through the Phase 9a1 addressing contract and reuse its rectangular traversal where it
       removes today's duplicated row-major stride, odometer, block-copy, and block-replacement logic. Keep operation
       semantics in their kernels; the addressing layer owns only checked logical-index-to-byte-range mapping.
@@ -4574,3 +4580,49 @@ IEEE floating-point maximum/minimum details, lexicographic complex extrema, or d
 identities consistently across reference and XLA execution. All 1,157 core library tests and all 436 runnable XLA
 library tests pass (one intentional timing-sensitive ignore); formatting and diff hygiene pass. The structural parent
 remains open for P9a2i, dot/attention, and collectives.
+
+### Phase 9a2i JAX-compatible extrema (2026-08-05)
+
+Reduction and scatter minimum/maximum now accept every Boolean and numeric element type, including complex values.
+The reference backend shares one private typed extremum capability across both kernels: Booleans use conjunction and
+disjunction; integers use their exact bounds; floating-point values propagate NaNs and order negative zero below
+positive zero; and complex values compare `(real, imaginary)` lexicographically. Reduction initializes every output
+with the exact dtype-specific identity, so empty reductions work uniformly for integers, Boolean values, finite-only
+and infinite floating-point formats, and complex values without a first-element special case.
+
+XLA lowering uses native StableHLO extrema for integers and Boolean values, JAX's explicit lexicographic
+compare/select sequence for complex values, and explicit total-order comparison plus NaN propagation for real
+floating-point values. The latter is intentional: CPU execution demonstrated that delegating directly to a backend
+`maximum`/`minimum` instruction could lose NaNs and signed-zero ordering, while the explicit reducer preserves the
+specified semantics across PJRT implementations. Complex and zero-free floating-point identities lower directly in
+their declared dtype, and scatter reuses the same lowering helper as reduction.
+
+Type-rule tests, reference tests, exact and structural StableHLO tests, and CPU execution tests pin Boolean extrema,
+NaNs, signed zero, lexicographic complex values, dtype-specific identities, empty reductions, and both reduction and
+scatter combiners. All 1,157 core library tests and all 438 runnable XLA library tests pass (one intentional ignore),
+with XLA tests run serially to isolate the repository's concurrency-sensitive live-array telemetry assertion.
+Formatting and diff hygiene pass. The structural parent remains open for dot/attention and collectives.
+
+### Phase 9a2j direct generalized dot and structural closure (2026-08-05)
+
+After any requested preferred-type promotion, the reference generalized-dot implementation now decodes each operand
+element directly through its `ArrayAddressing` mapping and writes typed accumulators straight into one addressed
+result buffer. Its logical index construction implements the full `[batching..., lhs_result..., rhs_result...]` output
+order and arbitrary paired contracting axes. Arithmetic reuses the private typed zero/add/multiply capabilities
+introduced for reduction and scatter, retaining modular sub-byte and integer behavior, per-step low-precision
+rounding, complex accumulation, preferred accumulation-type semantics, and additive identities for empty
+contractions. The contraction itself uses only rank-bounded temporary state rather than operand-sized payloads;
+preferred accumulation continues to use the canonical element-conversion capability whose direct codec migration is
+owned by the pending elementwise-conversion slice.
+
+The obsolete public `dot_general_evaluate` flat-`Vec` helper and its private index walkers were deleted. Dot tests now
+pin ordinary and batched contraction, positive and negative physical strides, narrow integer wrapping, complex
+arithmetic, preferred accumulation types, and empty contracting dimensions. Attention requires no separate payload
+kernel: its forward and backward reference implementations are compositions over dot and the other typed array
+capabilities, and all attention composition tests pass through the new contraction. Collectives likewise have no
+single-device reference-array payload evaluator; their array work is expressed by staging, transformation, and XLA
+lowering, so there was no scalar payload bridge to replace.
+
+All 1,157 core library tests and all 438 runnable XLA library tests pass (one intentional ignore), with XLA tests run
+serially to isolate the concurrency-sensitive live-array telemetry assertion. Formatting and diff hygiene pass. The
+structural migration parent is complete; the next review unit is the cross-family addressing/traversal cleanup.

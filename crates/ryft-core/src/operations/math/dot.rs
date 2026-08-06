@@ -26,7 +26,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Dimension, Shape, StaticShape};
+use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -1834,132 +1834,6 @@ where
 pub trait DotOps: Dot + Transpose {}
 
 impl<T: Dot + Transpose> DotOps for T {}
-
-/// Generalized N-dimensional dot-product helper.
-///
-/// Implements StableHLO `dot_general` semantics over a flat row-major payload and an explicit
-/// shape. Used by value-level [`Dot`] implementations for `Vec`-backed array types.
-///
-/// # Parameters
-///
-///   - `lhs`: Flat row-major payload of the left operand.
-///   - `lhs_shape`: Shape of the left operand.
-///   - `rhs`: Flat row-major payload of the right operand.
-///   - `rhs_shape`: Shape of the right operand.
-///   - `dimensions`: Contracting and batching dimension numbers.
-///   - `accumulator_init`: Zero value of the accumulator type (called once per output element).
-///   - `multiply_accumulate`: Accumulator update — `accumulator + lhs_value * rhs_value`.
-pub fn dot_general_evaluate<T, FInit, FAcc>(
-    lhs: &[T],
-    lhs_shape: &StaticShape,
-    rhs: &[T],
-    rhs_shape: &StaticShape,
-    dimensions: &DotDimensionNumbers,
-    accumulator_init: FInit,
-    multiply_accumulate: FAcc,
-) -> (Vec<T>, StaticShape)
-where
-    T: Clone,
-    FInit: Fn() -> T,
-    FAcc: Fn(T, &T, &T) -> T,
-{
-    let lhs_batching = dimensions.lhs_batching_dimensions.as_slice();
-    let rhs_batching = dimensions.rhs_batching_dimensions.as_slice();
-    let lhs_contracting = dimensions.lhs_contracting_dimensions.as_slice();
-    let rhs_contracting = dimensions.rhs_contracting_dimensions.as_slice();
-
-    let lhs_result: Vec<usize> = (0..lhs_shape.rank())
-        .filter(|axis| !lhs_batching.contains(axis) && !lhs_contracting.contains(axis))
-        .collect();
-    let rhs_result: Vec<usize> = (0..rhs_shape.rank())
-        .filter(|axis| !rhs_batching.contains(axis) && !rhs_contracting.contains(axis))
-        .collect();
-
-    let batching_extents: Vec<usize> = lhs_batching.iter().map(|axis| lhs_shape[*axis]).collect();
-    let lhs_result_extents: Vec<usize> = lhs_result.iter().map(|axis| lhs_shape[*axis]).collect();
-    let rhs_result_extents: Vec<usize> = rhs_result.iter().map(|axis| rhs_shape[*axis]).collect();
-    let contracting_extents: Vec<usize> = lhs_contracting.iter().map(|axis| lhs_shape[*axis]).collect();
-
-    let output_shape = StaticShape::new(
-        batching_extents
-            .iter()
-            .copied()
-            .chain(lhs_result_extents.iter().copied())
-            .chain(rhs_result_extents.iter().copied())
-            .collect(),
-    );
-    let output_count: usize = output_shape.dimensions().iter().product();
-    let mut output = Vec::with_capacity(output_count);
-    if output_count == 0 {
-        return (output, output_shape);
-    }
-
-    let lhs_strides = lhs_shape.row_major_strides();
-    let rhs_strides = rhs_shape.row_major_strides();
-    let mut lhs_index = vec![0usize; lhs_shape.rank()];
-    let mut rhs_index = vec![0usize; rhs_shape.rank()];
-
-    for_each_multi_index(batching_extents.as_slice(), |batching_index| {
-        for (slot, axis) in lhs_batching.iter().enumerate() {
-            lhs_index[*axis] = batching_index[slot];
-        }
-        for (slot, axis) in rhs_batching.iter().enumerate() {
-            rhs_index[*axis] = batching_index[slot];
-        }
-        for_each_multi_index(lhs_result_extents.as_slice(), |lhs_result_index| {
-            for (slot, axis) in lhs_result.iter().enumerate() {
-                lhs_index[*axis] = lhs_result_index[slot];
-            }
-            for_each_multi_index(rhs_result_extents.as_slice(), |rhs_result_index| {
-                for (slot, axis) in rhs_result.iter().enumerate() {
-                    rhs_index[*axis] = rhs_result_index[slot];
-                }
-                let mut accumulator = accumulator_init();
-                for_each_multi_index(contracting_extents.as_slice(), |contracting_index| {
-                    for (slot, axis) in lhs_contracting.iter().enumerate() {
-                        lhs_index[*axis] = contracting_index[slot];
-                    }
-                    for (slot, axis) in rhs_contracting.iter().enumerate() {
-                        rhs_index[*axis] = contracting_index[slot];
-                    }
-                    let lhs_flat = flat_index(&lhs_index, &lhs_strides);
-                    let rhs_flat = flat_index(&rhs_index, &rhs_strides);
-                    accumulator = multiply_accumulate(accumulator.clone(), &lhs[lhs_flat], &rhs[rhs_flat]);
-                });
-                output.push(accumulator);
-            });
-        });
-    });
-
-    (output, output_shape)
-}
-
-fn flat_index(multi_index: &[usize], strides: &[usize]) -> usize {
-    multi_index.iter().zip(strides.iter()).map(|(index, stride)| index * stride).sum()
-}
-
-fn for_each_multi_index(extents: &[usize], mut action: impl FnMut(&[usize])) {
-    if extents.is_empty() {
-        action(&[]);
-        return;
-    }
-    let mut index = vec![0usize; extents.len()];
-    loop {
-        action(&index);
-        let mut axis = extents.len();
-        while axis > 0 {
-            axis -= 1;
-            index[axis] += 1;
-            if index[axis] < extents[axis] {
-                break;
-            }
-            index[axis] = 0;
-            if axis == 0 {
-                return;
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

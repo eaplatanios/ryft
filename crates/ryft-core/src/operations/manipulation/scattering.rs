@@ -52,10 +52,14 @@ pub enum ScatterReductionKind {
     /// The update is multiplied with the operand value (`scatter_mul`).
     Mul,
 
-    /// The operand value is replaced by the minimum of itself and the update (`scatter_min`).
+    /// The operand value is replaced by the minimum of itself and the update (`scatter_min`). Booleans use
+    /// conjunction, real numeric values propagate NaNs and order negative zero below positive zero, and complex values
+    /// compare lexicographically by `(real, imaginary)`.
     Min,
 
-    /// The operand value is replaced by the maximum of itself and the update (`scatter_max`).
+    /// The operand value is replaced by the maximum of itself and the update (`scatter_max`). Booleans use
+    /// disjunction, real numeric values propagate NaNs and order negative zero below positive zero, and complex values
+    /// compare lexicographically by `(real, imaginary)`.
     Max,
 }
 
@@ -644,10 +648,10 @@ impl Scatter for ArrayType {
                 .into());
             }
             ScatterReductionKind::Min | ScatterReductionKind::Max
-                if !data_type.is_boolean() && !data_type.is_real() && data_type != DataType::Zero =>
+                if !data_type.is_boolean() && !data_type.is_numeric() && data_type != DataType::Zero =>
             {
                 return Err(TypeError::invalid(format!(
-                    "'{SCATTER_OPERATION_NAME}' kind {} requires ordered operand and update elements but got \
+                    "'{SCATTER_OPERATION_NAME}' kind {} requires Boolean or numeric operand and update elements but got \
                      {data_type}",
                     operation.kind(),
                 ))
@@ -959,15 +963,14 @@ mod tests {
         );
         let complex_operand = ArrayType::new(DataType::C64, operand.shape().clone());
         let complex_updates = ArrayType::new(DataType::C64, updates.shape().clone());
-        assert!(matches!(
+        assert_eq!(
             complex_operand.scatter(
                 &indices,
                 &complex_updates,
                 &ScatterOperation::new(operation.dimensions().clone(), ScatterReductionKind::Max),
             ),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "'scatter' kind max requires ordered operand and update elements but got c64",
-        ));
+            Ok(complex_operand),
+        );
 
         assert_eq!(
             format!("{operation}"),

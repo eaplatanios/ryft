@@ -299,7 +299,8 @@ mod tests {
     use ryft_core::operations::constants::{OneLike, ZeroLike};
     use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradient};
     use ryft_core::operations::manipulation::{
-        Concatenate, ConvertElementType, Pad, Reshape, Slice, Transpose, UpdateSlice,
+        Concatenate, ConvertElementType, Pad, Reshape, Scatter, ScatterDimensionNumbers, ScatterOperation,
+        ScatterReductionKind, Slice, Transpose, UpdateSlice,
     };
     use ryft_core::operations::math::{
         Abs, Atan2, Ceil, Cos, Dot, Erf, Exp, Floor, Log, Logistic, Max, Min, Pow, Reduce, ReductionKind, Rem, Round,
@@ -593,6 +594,88 @@ mod tests {
             CpuArray::scalar(complex_left_value).mul(&CpuArray::scalar(complex_right_value)).unwrap();
         let reference_product = reference_product.elements::<num_complex::Complex<f32>>().unwrap()[0];
         assert!((device_product - reference_product).norm() < 1e-5);
+    }
+
+    #[test]
+    fn test_eager_extrema_match_jax_semantics() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        // Boolean extrema use false/true identities, including when the reduced axis is empty.
+        let empty_booleans =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::Boolean, &[0]), mesh.clone(), &[])
+                .unwrap();
+        assert_eq!(read_booleans(&empty_booleans.reduce(&[0], ReductionKind::Max)), vec![false]);
+        assert_eq!(read_booleans(&empty_booleans.reduce(&[0], ReductionKind::Min)), vec![true]);
+
+        // Floating-point extrema propagate NaNs and order negative zero below positive zero.
+        let nan_values = [1.0f32, f32::NAN];
+        let nan = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F32, &[nan_values.len()]),
+            mesh.clone(),
+            values_to_bytes(&nan_values).as_slice(),
+        )
+        .unwrap();
+        assert!(read_f32s(&nan.reduce(&[0], ReductionKind::Max))[0].is_nan());
+        let zero_values = [-0.0f32, 0.0];
+        let zeros = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F32, &[zero_values.len()]),
+            mesh.clone(),
+            values_to_bytes(&zero_values).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(read_f32s(&zeros.reduce(&[0], ReductionKind::Max))[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(read_f32s(&zeros.reduce(&[0], ReductionKind::Min))[0].to_bits(), (-0.0f32).to_bits());
+
+        // Complex extrema compare `(real, imaginary)` lexicographically in reductions and scatter combiners.
+        let complex_values = [
+            num_complex::Complex::new(1.0f32, 5.0),
+            num_complex::Complex::new(2.0, -3.0),
+            num_complex::Complex::new(2.0, 4.0),
+        ];
+        let complex = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[complex_values.len()]),
+            mesh.clone(),
+            values_to_bytes(&complex_values).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(read_c64s(&complex.reduce(&[0], ReductionKind::Max)), vec![num_complex::Complex::new(2.0, 4.0)]);
+        assert_eq!(read_c64s(&complex.reduce(&[0], ReductionKind::Min)), vec![num_complex::Complex::new(1.0, 5.0)]);
+        let empty_complex =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::C64, &[0]), mesh.clone(), &[]).unwrap();
+        assert_eq!(
+            read_c64s(&empty_complex.reduce(&[0], ReductionKind::Max)),
+            vec![num_complex::Complex::new(f32::NEG_INFINITY, 0.0)],
+        );
+
+        let indices = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I32, &[1, 1]),
+            mesh.clone(),
+            values_to_bytes(&[0i32]).as_slice(),
+        )
+        .unwrap();
+        let updates = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[1]),
+            mesh.clone(),
+            values_to_bytes(&[num_complex::Complex::new(1.0f32, 9.0)]).as_slice(),
+        )
+        .unwrap();
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Max);
+        assert_eq!(
+            read_c64s(&complex.scatter(&indices, &updates, &operation).unwrap()),
+            vec![
+                num_complex::Complex::new(1.0, 9.0),
+                num_complex::Complex::new(2.0, -3.0),
+                num_complex::Complex::new(2.0, 4.0),
+            ],
+        );
     }
 
     /// The error function agrees between the XLA-backed eager array backend (which lowers to `chlo.erf` and relies

@@ -50,10 +50,14 @@ pub enum ReductionKind {
     /// The numeric data type must support division.
     Mean,
 
-    /// Numeric maximum reduction. The identity is the data type's smallest representable value.
+    /// Maximum reduction. Boolean inputs use disjunction, real numeric inputs propagate NaNs and order negative zero
+    /// below positive zero, and complex inputs compare lexicographically by `(real, imaginary)`. The identity is the
+    /// data type's smallest value under that ordering.
     Max,
 
-    /// Numeric minimum reduction. The identity is the data type's largest representable value.
+    /// Minimum reduction. Boolean inputs use conjunction, real numeric inputs propagate NaNs and order negative zero
+    /// below positive zero, and complex inputs compare lexicographically by `(real, imaginary)`. The identity is the
+    /// data type's largest value under that ordering.
     Min,
 
     /// Boolean disjunction reduction (logical-OR). The identity is `false` and the combiner is OR.
@@ -94,7 +98,8 @@ impl Display for ReductionKind {
 ///
 /// Validates that:
 ///   - `axes` are unique and within `0..rank(input)`;
-///   - `kind` matches the input data type (Boolean for Any/All, numeric or structural-zero for the others).
+///   - `kind` matches the input data type (Boolean for Any/All, Boolean or numeric for Max/Min, and numeric for
+///     Sum/Mean; structural-zero supports every kind).
 ///
 /// The reduced axes are removed from the output shape; non-reduced axes keep their order. The output [`Sharding`]
 /// follows JAX's reduction sharding rule (`_reduce_op_sharding_rule` in `jax/_src/lax/lax.py`): the reduced axes'
@@ -123,16 +128,16 @@ pub fn reduce_abstract(
     }
 
     let data_type = input.data_type();
-    if kind.requires_boolean() && !data_type.is_boolean() {
-        return Err(TypeError::invalid(format!("'{op}' kind {kind} requires Boolean inputs but got {data_type}")));
-    }
-    if !kind.requires_boolean() && !data_type.is_numeric() && data_type != DataType::Zero {
-        return Err(TypeError::invalid(format!("'{op}' kind {kind} requires numeric inputs but got {data_type}")));
-    }
-    // Min/max reductions select elements by order, and complex element types are unordered.
-    if matches!(kind, ReductionKind::Max | ReductionKind::Min) && data_type.is_complex() {
+    let (requirement, supports_kind) = if kind.requires_boolean() {
+        ("Boolean", data_type.is_boolean())
+    } else if matches!(kind, ReductionKind::Max | ReductionKind::Min) {
+        ("Boolean or numeric", data_type.is_boolean() || data_type.is_numeric() || data_type == DataType::Zero)
+    } else {
+        ("numeric", data_type.is_numeric() || data_type == DataType::Zero)
+    };
+    if !supports_kind {
         return Err(TypeError::invalid(format!(
-            "'{op}' kind {kind} is not defined for the unordered complex element type {data_type}"
+            "'{op}' kind {kind} requires {requirement} inputs but got {data_type}"
         )));
     }
 
@@ -1096,6 +1101,10 @@ mod tests {
             reduce_abstract(&boolean, &[1], ReductionKind::Any, "reduce_any"),
             Ok(array_type(&[2], DataType::Boolean))
         );
+        assert_eq!(
+            reduce_abstract(&boolean, &[1], ReductionKind::Max, "reduce_max"),
+            Ok(array_type(&[2], DataType::Boolean)),
+        );
         let token = array_type(&[2, 3], DataType::Token);
         assert_eq!(
             reduce_abstract(&token, &[1], ReductionKind::Sum, "reduce_sum"),
@@ -1111,17 +1120,17 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_abstract_rejects_min_max_over_complex_element_types() {
-        // Min/max reductions select elements by order, and complex element types are unordered, so they are rejected
-        // while order-free reductions such as `sum` stay supported.
+    fn test_reduce_abstract_accepts_lexicographic_complex_extrema() {
+        // Complex minimum and maximum use JAX's lexicographic `(real, imaginary)` ordering.
         let complex = array_type(&[2, 3], DataType::C64);
         assert_eq!(
             reduce_abstract(&complex, &[1], ReductionKind::Max, "reduce_max"),
-            Err(TypeError::invalid(
-                "'reduce_max' kind max is not defined for the unordered complex element type c64".to_string()
-            )),
+            Ok(array_type(&[2], DataType::C64)),
         );
-        assert!(reduce_abstract(&complex, &[1], ReductionKind::Min, "reduce_min").is_err());
+        assert_eq!(
+            reduce_abstract(&complex, &[1], ReductionKind::Min, "reduce_min"),
+            Ok(array_type(&[2], DataType::C64)),
+        );
         assert_eq!(
             reduce_abstract(&complex, &[1], ReductionKind::Sum, "reduce_sum"),
             Ok(array_type(&[2], DataType::C64)),

@@ -71,7 +71,6 @@ use crate::operations::manipulation::{
     ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
-use crate::operations::math::dot::dot_general_evaluate;
 use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
@@ -463,6 +462,171 @@ macro_rules! impl_array_arithmetic_for_complex {
 impl_array_arithmetic_for_complex!(f32);
 impl_array_arithmetic_for_complex!(f64);
 
+/// Element-level minimum and maximum contract shared by reduction and scatter. The identities and selection rules
+/// follow JAX's `lax` extrema: Booleans order `false < true`, floating-point extrema propagate NaNs and order `-0`
+/// below `+0`, and complex values compare lexicographically by `(real, imaginary)`.
+trait ElementExtremum: ArrayElement {
+    /// Returns the identity for a maximum reduction.
+    fn maximum_identity() -> Self;
+
+    /// Returns the identity for a minimum reduction.
+    fn minimum_identity() -> Self;
+
+    /// Returns the maximum of `self` and `right`.
+    fn maximum(self, right: Self) -> Self;
+
+    /// Returns the minimum of `self` and `right`.
+    fn minimum(self, right: Self) -> Self;
+}
+
+// Implements extrema for totally ordered element types whose Rust bounds are also the JAX reduction identities.
+macro_rules! impl_array_extrema_for_ordered_element {
+    ($type:ty, $minimum:expr, $maximum:expr) => {
+        impl ElementExtremum for $type {
+            #[inline]
+            fn maximum_identity() -> Self {
+                $minimum
+            }
+
+            #[inline]
+            fn minimum_identity() -> Self {
+                $maximum
+            }
+
+            #[inline]
+            fn maximum(self, right: Self) -> Self {
+                self.max(right)
+            }
+
+            #[inline]
+            fn minimum(self, right: Self) -> Self {
+                self.min(right)
+            }
+        }
+    };
+}
+
+impl_array_extrema_for_ordered_element!(bool, false, true);
+impl_array_extrema_for_ordered_element!(i1, i1::MIN, i1::MAX);
+impl_array_extrema_for_ordered_element!(i2, i2::MIN, i2::MAX);
+impl_array_extrema_for_ordered_element!(i4, i4::MIN, i4::MAX);
+impl_array_extrema_for_ordered_element!(i8, i8::MIN, i8::MAX);
+impl_array_extrema_for_ordered_element!(i16, i16::MIN, i16::MAX);
+impl_array_extrema_for_ordered_element!(i32, i32::MIN, i32::MAX);
+impl_array_extrema_for_ordered_element!(i64, i64::MIN, i64::MAX);
+impl_array_extrema_for_ordered_element!(u1, u1::MIN, u1::MAX);
+impl_array_extrema_for_ordered_element!(u2, u2::MIN, u2::MAX);
+impl_array_extrema_for_ordered_element!(u4, u4::MIN, u4::MAX);
+impl_array_extrema_for_ordered_element!(u8, u8::MIN, u8::MAX);
+impl_array_extrema_for_ordered_element!(u16, u16::MIN, u16::MAX);
+impl_array_extrema_for_ordered_element!(u32, u32::MIN, u32::MAX);
+impl_array_extrema_for_ordered_element!(u64, u64::MIN, u64::MAX);
+
+/// Selects the larger floating-point element with NaN propagation and `-0` ordered below `+0`. Exact ties preserve
+/// `left`, including its original encoding.
+fn maximum_float_element<T: Copy>(left: T, right: T, to_f64: impl Fn(T) -> f64) -> T {
+    let left_value = to_f64(left);
+    let right_value = to_f64(right);
+    if left_value.is_nan() {
+        left
+    } else if right_value.is_nan() || left_value.total_cmp(&right_value) == Ordering::Less {
+        right
+    } else {
+        left
+    }
+}
+
+/// Selects the smaller floating-point element with NaN propagation and `-0` ordered below `+0`. Exact ties preserve
+/// `left`, including its original encoding.
+fn minimum_float_element<T: Copy>(left: T, right: T, to_f64: impl Fn(T) -> f64) -> T {
+    let left_value = to_f64(left);
+    let right_value = to_f64(right);
+    if left_value.is_nan() {
+        left
+    } else if right_value.is_nan() || left_value.total_cmp(&right_value) == Ordering::Greater {
+        right
+    } else {
+        left
+    }
+}
+
+// Implements floating-point extrema while retaining the selected operand's exact encoding.
+macro_rules! impl_array_extrema_for_float {
+    ($type:ty, $minimum:expr, $maximum:expr, $to_f64:expr $(,)?) => {
+        impl ElementExtremum for $type {
+            #[inline]
+            fn maximum_identity() -> Self {
+                $minimum
+            }
+
+            #[inline]
+            fn minimum_identity() -> Self {
+                $maximum
+            }
+
+            #[inline]
+            fn maximum(self, right: Self) -> Self {
+                maximum_float_element(self, right, $to_f64)
+            }
+
+            #[inline]
+            fn minimum(self, right: Self) -> Self {
+                minimum_float_element(self, right, $to_f64)
+            }
+        }
+    };
+}
+
+impl_array_extrema_for_float!(f4e2m1fn, f4e2m1fn::MIN, f4e2m1fn::MAX, f4e2m1fn::to_f64);
+impl_array_extrema_for_float!(f6e2m3fn, f6e2m3fn::MIN, f6e2m3fn::MAX, f6e2m3fn::to_f64);
+impl_array_extrema_for_float!(f6e3m2fn, f6e3m2fn::MIN, f6e3m2fn::MAX, f6e3m2fn::to_f64);
+impl_array_extrema_for_float!(f8e3m4, f8e3m4::NEG_INFINITY, f8e3m4::INFINITY, f8e3m4::to_f64);
+impl_array_extrema_for_float!(f8e4m3, f8e4m3::NEG_INFINITY, f8e4m3::INFINITY, f8e4m3::to_f64);
+impl_array_extrema_for_float!(f8e4m3fn, f8e4m3fn::MIN, f8e4m3fn::MAX, f8e4m3fn::to_f64);
+impl_array_extrema_for_float!(f8e4m3fnuz, f8e4m3fnuz::MIN, f8e4m3fnuz::MAX, f8e4m3fnuz::to_f64);
+impl_array_extrema_for_float!(f8e4m3b11fnuz, f8e4m3b11fnuz::MIN, f8e4m3b11fnuz::MAX, f8e4m3b11fnuz::to_f64,);
+impl_array_extrema_for_float!(f8e5m2, f8e5m2::NEG_INFINITY, f8e5m2::INFINITY, f8e5m2::to_f64);
+impl_array_extrema_for_float!(f8e5m2fnuz, f8e5m2fnuz::MIN, f8e5m2fnuz::MAX, f8e5m2fnuz::to_f64);
+impl_array_extrema_for_float!(f8e8m0fnu, f8e8m0fnu::MIN, f8e8m0fnu::MAX, f8e8m0fnu::to_f64);
+impl_array_extrema_for_float!(bf16, bf16::NEG_INFINITY, bf16::INFINITY, bf16::to_f64);
+impl_array_extrema_for_float!(f16, f16::NEG_INFINITY, f16::INFINITY, f16::to_f64);
+impl_array_extrema_for_float!(f32, f32::NEG_INFINITY, f32::INFINITY, f64::from);
+impl_array_extrema_for_float!(f64, f64::NEG_INFINITY, f64::INFINITY, |value| value);
+
+// Implements JAX's lexicographic complex extrema. Ordinary floating-point comparisons intentionally make every NaN
+// comparison false, so an unordered real or imaginary component selects `right`, exactly like JAX's compare/select
+// lowering.
+macro_rules! impl_array_extrema_for_complex {
+    ($component:ty) => {
+        impl ElementExtremum for Complex<$component> {
+            #[inline]
+            fn maximum_identity() -> Self {
+                Complex::new(<$component>::NEG_INFINITY, 0.0)
+            }
+
+            #[inline]
+            fn minimum_identity() -> Self {
+                Complex::new(<$component>::INFINITY, 0.0)
+            }
+
+            #[inline]
+            fn maximum(self, right: Self) -> Self {
+                let select_left = if self.re == right.re { self.im > right.im } else { self.re > right.re };
+                if select_left { self } else { right }
+            }
+
+            #[inline]
+            fn minimum(self, right: Self) -> Self {
+                let select_left = if self.re == right.re { self.im < right.im } else { self.re < right.re };
+                if select_left { self } else { right }
+            }
+        }
+    };
+}
+
+impl_array_extrema_for_complex!(f32);
+impl_array_extrema_for_complex!(f64);
+
 /// Reusable [`Operation`] enum for ordinary staged programs over arrays.
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`] the
@@ -754,13 +918,12 @@ impl Array {
     }
 
     /// Reduces typed elements directly from addressed input storage into one addressed output buffer. `identity`
-    /// initializes sum and Boolean reductions; `None` initializes each output from the first reduced element for
-    /// extrema, which have no universally representable identity.
+    /// initializes every output cell, including those whose reduced axes are empty.
     fn reduce_elements<T: ArrayElement>(
         &self,
         output_type: ArrayType,
         axes: &[usize],
-        identity: Option<T>,
+        identity: T,
         combine: impl Fn(T, T) -> Result<T, ProgramError>,
     ) -> Result<Self, ProgramError> {
         debug_assert_eq!(self.r#type.data_type(), T::data_type());
@@ -775,36 +938,23 @@ impl Array {
         axes.iter().for_each(|axis| reduce_mask[*axis] = true);
 
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
-        if let Some(identity) = identity {
-            for output in 0..output_addressing.element_count() {
-                identity.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output)]);
-            }
-        } else if output_addressing.element_count() > 0 && axes.iter().any(|axis| input_shape[*axis] == 0) {
-            return Err(
-                TypeError::invalid("cannot reduce an empty axis with a max or min reduction".to_string()).into()
-            );
+        for output in 0..output_addressing.element_count() {
+            identity.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output)]);
         }
 
         for input in 0..input_addressing.element_count() {
             let mut output = 0usize;
             let mut output_axis = 0usize;
-            let mut first = true;
             for axis in 0..input_shape.rank() {
                 let coordinate = (input / input_strides[axis]) % input_shape[axis];
-                if reduce_mask[axis] {
-                    first &= coordinate == 0;
-                } else {
+                if !reduce_mask[axis] {
                     output += coordinate * output_strides[output_axis];
                     output_axis += 1;
                 }
             }
             let input_value = T::decode(&self.bytes[input_addressing.byte_range_for_flat_index(input)]);
             let output_range = output_addressing.byte_range_for_flat_index(output);
-            let value = if identity.is_none() && first {
-                input_value
-            } else {
-                combine(T::decode(&bytes[output_range.clone()]), input_value)?
-            };
+            let value = combine(T::decode(&bytes[output_range.clone()]), input_value)?;
             value.encode(&mut bytes[output_range]);
         }
         Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
@@ -818,13 +968,94 @@ impl Array {
         axes: &[usize],
         mean: bool,
     ) -> Result<Self, ProgramError> {
-        let mut output = self.reduce_elements::<T>(output_type, axes, Some(T::zero()?), T::add)?;
+        let mut output = self.reduce_elements::<T>(output_type, axes, T::zero()?, T::add)?;
         if mean {
             let shape = self.r#type.static_shape().unwrap();
             let count = axes.iter().map(|axis| shape[*axis]).product::<usize>().max(1);
             output.map_elements_in_place::<T>(|value| value.divide_by_count(count))?;
         }
         Ok(output)
+    }
+
+    /// Computes one generalized dot directly over typed elements in each operand's physical storage. Logical index
+    /// construction follows the StableHLO output order `[batching..., lhs_result..., rhs_result...]`. No operand-sized
+    /// payload is materialized: the only payload allocation is the result, and temporary index state is bounded by
+    /// operand rank.
+    fn dot_elements<T: ElementZero + ElementAdd + ElementMul>(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+    ) -> Result<Self, ProgramError> {
+        debug_assert_eq!(self.r#type.data_type(), T::data_type());
+        debug_assert_eq!(rhs.r#type.data_type(), T::data_type());
+        let mut output_types = DotOperation::new(dimensions.clone())
+            .infer_output_types(&[self.r#type.clone(), rhs.r#type.clone()], &[])?;
+        let output_type = output_types.remove(0);
+        let lhs_shape = self.r#type.static_shape().unwrap();
+        let rhs_shape = rhs.r#type.static_shape().unwrap();
+        let output_shape = output_type.static_shape().unwrap();
+        let lhs_strides = lhs_shape.row_major_strides();
+        let rhs_strides = rhs_shape.row_major_strides();
+        let output_strides = output_shape.row_major_strides();
+        let lhs_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let rhs_addressing = ArrayAddressing::new(rhs.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+
+        let lhs_batching = dimensions.lhs_batching_dimensions();
+        let rhs_batching = dimensions.rhs_batching_dimensions();
+        let lhs_contracting = dimensions.lhs_contracting_dimensions();
+        let rhs_contracting = dimensions.rhs_contracting_dimensions();
+        let lhs_result = (0..lhs_shape.rank())
+            .filter(|axis| !lhs_batching.contains(axis) && !lhs_contracting.contains(axis))
+            .collect::<Vec<_>>();
+        let rhs_result = (0..rhs_shape.rank())
+            .filter(|axis| !rhs_batching.contains(axis) && !rhs_contracting.contains(axis))
+            .collect::<Vec<_>>();
+        let contracting_shape =
+            StaticShape::new(lhs_contracting.iter().map(|axis| lhs_shape[*axis]).collect::<Vec<_>>());
+        let contracting_strides = contracting_shape.row_major_strides();
+        let contracting_count = contracting_shape.dimensions().iter().product();
+
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        let mut lhs_index = vec![0usize; lhs_shape.rank()];
+        let mut rhs_index = vec![0usize; rhs_shape.rank()];
+        for output_flat in 0..output_addressing.element_count() {
+            // Decode the result coordinate directly into the corresponding batch and non-contracting operand axes.
+            let mut output_axis = 0usize;
+            for (&lhs_axis, &rhs_axis) in lhs_batching.iter().zip(rhs_batching) {
+                let coordinate = (output_flat / output_strides[output_axis]) % output_shape[output_axis];
+                lhs_index[lhs_axis] = coordinate;
+                rhs_index[rhs_axis] = coordinate;
+                output_axis += 1;
+            }
+            for &lhs_axis in &lhs_result {
+                lhs_index[lhs_axis] = (output_flat / output_strides[output_axis]) % output_shape[output_axis];
+                output_axis += 1;
+            }
+            for &rhs_axis in &rhs_result {
+                rhs_index[rhs_axis] = (output_flat / output_strides[output_axis]) % output_shape[output_axis];
+                output_axis += 1;
+            }
+
+            let mut accumulator = T::zero()?;
+            for contracting_flat in 0..contracting_count {
+                for (contracting_axis, (&lhs_axis, &rhs_axis)) in
+                    lhs_contracting.iter().zip(rhs_contracting).enumerate()
+                {
+                    let coordinate = (contracting_flat / contracting_strides[contracting_axis])
+                        % contracting_shape[contracting_axis];
+                    lhs_index[lhs_axis] = coordinate;
+                    rhs_index[rhs_axis] = coordinate;
+                }
+                let lhs_flat = lhs_index.iter().zip(&lhs_strides).map(|(index, stride)| index * stride).sum();
+                let rhs_flat = rhs_index.iter().zip(&rhs_strides).map(|(index, stride)| index * stride).sum();
+                let lhs_value = T::decode(&self.bytes[lhs_addressing.byte_range_for_flat_index(lhs_flat)]);
+                let rhs_value = T::decode(&rhs.bytes[rhs_addressing.byte_range_for_flat_index(rhs_flat)]);
+                accumulator = accumulator.add(lhs_value.mul(rhs_value)?)?;
+            }
+            accumulator.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output_flat)]);
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
     }
 
     /// Converts this array to the provided element data type, borrowing it unchanged when it already has that data
@@ -2404,22 +2635,12 @@ impl Dot for Array {
     }
 
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
-        let lhs_shape = self.r#type.static_shape().unwrap();
-        let rhs_shape = rhs.r#type.static_shape().unwrap();
-        let lhs_values = self.scalar_values();
-        let rhs_values = rhs.scalar_values();
-        let zero = Self::zero_element(self.r#type.data_type()).unwrap_or_else(|error| panic!("{error}"));
-        let (values, output_shape) = dot_general_evaluate(
-            lhs_values.as_slice(),
-            &lhs_shape,
-            rhs_values.as_slice(),
-            &rhs_shape,
-            dimensions,
-            || zero,
-            |accumulator, lhs_value, rhs_value| accumulator + *lhs_value * *rhs_value,
-        );
-        let output_type = ArrayType::new(self.r#type.data_type(), Shape::from(&output_shape));
-        Self::from_scalar_values(output_type, values).unwrap()
+        // TODO(eaplatanios): What about the accumulation type?
+        let data_type = self.r#type.data_type();
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            self.dot_elements::<Element>(rhs, dimensions)
+        })
+        .unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -2446,28 +2667,25 @@ impl Reduce for Array {
                 })
             }
             ReductionKind::Max | ReductionKind::Min => {
-                let direction = if kind == ReductionKind::Max {
-                    ComparisonDirection::GreaterThan
-                } else {
-                    ComparisonDirection::LessThan
-                };
-                dispatch_on_array_element_type!(@ordered data_type, |Element| {
-                    self.reduce_elements::<Element>(output_type, axes, None, |left, right| {
-                        let keep_left = match direction {
-                            ComparisonDirection::GreaterThan => left.partial_cmp(&right) == Some(Ordering::Greater),
-                            ComparisonDirection::LessThan => left.partial_cmp(&right) == Some(Ordering::Less),
-                            _ => unreachable!(),
-                        };
-                        Ok(if keep_left { left } else { right })
+                dispatch_on_array_element_type!(data_type, |Element| {
+                    let identity = if kind == ReductionKind::Max {
+                        <Element as ElementExtremum>::maximum_identity()
+                    } else {
+                        <Element as ElementExtremum>::minimum_identity()
+                    };
+                    self.reduce_elements::<Element>(output_type, axes, identity, |left, right| {
+                        Ok(if kind == ReductionKind::Max {
+                            <Element as ElementExtremum>::maximum(left, right)
+                        } else {
+                            <Element as ElementExtremum>::minimum(left, right)
+                        })
                     })
                 })
             }
             ReductionKind::Any => {
-                self.reduce_elements::<bool>(output_type, axes, Some(false), |left, right| Ok(left | right))
+                self.reduce_elements::<bool>(output_type, axes, false, |left, right| Ok(left | right))
             }
-            ReductionKind::All => {
-                self.reduce_elements::<bool>(output_type, axes, Some(true), |left, right| Ok(left & right))
-            }
+            ReductionKind::All => self.reduce_elements::<bool>(output_type, axes, true, |left, right| Ok(left & right)),
         };
         output.unwrap_or_else(|error| panic!("{error}"))
     }
@@ -3036,16 +3254,16 @@ impl Scatter for Array {
                 })
             }
             ScatterReductionKind::Min | ScatterReductionKind::Max => {
-                dispatch_on_array_element_type!(@ordered data_type, |Element| {
+                dispatch_on_array_element_type!(data_type, |Element| {
                     self.scatter_with_combiner(indices, updates, output_type, operation, |current, update| {
                         let current_value = Element::decode(current);
                         let update_value = Element::decode(update);
-                        let keep_current = if operation.kind() == ScatterReductionKind::Min {
-                            current_value.partial_cmp(&update_value) == Some(Ordering::Less)
+                        let result = if operation.kind() == ScatterReductionKind::Min {
+                            <Element as ElementExtremum>::minimum(current_value, update_value)
                         } else {
-                            current_value.partial_cmp(&update_value) == Some(Ordering::Greater)
+                            <Element as ElementExtremum>::maximum(current_value, update_value)
                         };
-                        (if keep_current { current_value } else { update_value }).encode(current);
+                        result.encode(current);
                         Ok(())
                     })
                 })
@@ -4398,6 +4616,32 @@ mod tests {
             operand.scatter(&indices, &updates, &operation),
             Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![0x81, 0x80]),
         );
+
+        // Extrema follow JAX for floating-point NaNs and signed zero and for lexicographically ordered complex values.
+        let indices = Array::matrix(2, 1, vec![0i32, 1]);
+        let operand = Array::vector(vec![f32::NAN, -0.0]);
+        let updates = Array::vector(vec![1.0f32, 0.0]);
+        let maximum =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Max);
+        let minimum =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Min);
+        let maximum_values = operand.scatter(&indices, &updates, &maximum).unwrap().elements::<f32>().unwrap();
+        assert!(maximum_values[0].is_nan());
+        assert_eq!(maximum_values[1].to_bits(), 0.0f32.to_bits());
+        let minimum_values = operand.scatter(&indices, &updates, &minimum).unwrap().elements::<f32>().unwrap();
+        assert!(minimum_values[0].is_nan());
+        assert_eq!(minimum_values[1].to_bits(), (-0.0f32).to_bits());
+
+        let operand = Array::vector(vec![ComplexNumber::new(1.0f32, 9.0), ComplexNumber::new(2.0, -1.0)]);
+        let updates = Array::vector(vec![ComplexNumber::new(1.0f32, 10.0), ComplexNumber::new(1.0, 100.0)]);
+        assert_eq!(
+            operand.scatter(&indices, &updates, &maximum).unwrap().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(1.0, 10.0), ComplexNumber::new(2.0, -1.0)]),
+        );
+        assert_eq!(
+            operand.scatter(&indices, &updates, &minimum).unwrap().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(1.0, 9.0), ComplexNumber::new(1.0, 100.0)]),
+        );
     }
 
     #[test]
@@ -4410,7 +4654,7 @@ mod tests {
             Array::from_f64s(array_type(DataType::F64, &[]), vec![21.0])
         );
         assert_eq!(matrix.reduce(&[], ReductionKind::Sum), matrix);
-        // Max and min work for element data types without infinities because they do not materialize an identity.
+        // Max and min use the data type's reduction identities and ordinary ordering.
         let integers = Array::vector(vec![3i32, -1, 2]);
         assert_eq!(integers.reduce(&[0], ReductionKind::Max).elements::<i32>(), Ok(vec![3]));
         assert_eq!(integers.reduce(&[0], ReductionKind::Min).elements::<i32>(), Ok(vec![-1]));
@@ -4418,6 +4662,8 @@ mod tests {
         let booleans = Array::vector(vec![true, false, true]);
         assert_eq!(booleans.reduce(&[0], ReductionKind::Any).elements::<bool>(), Ok(vec![true]));
         assert_eq!(booleans.reduce(&[0], ReductionKind::All).elements::<bool>(), Ok(vec![false]));
+        assert_eq!(booleans.reduce(&[0], ReductionKind::Max).elements::<bool>(), Ok(vec![true]));
+        assert_eq!(booleans.reduce(&[0], ReductionKind::Min).elements::<bool>(), Ok(vec![false]));
 
         // Numeric and Boolean reductions traverse arbitrary layouts and produce the abstract rule's dense result.
         let r#type = array_type(DataType::U16, &[2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 2])));
@@ -4455,16 +4701,95 @@ mod tests {
         );
         let empty = Array::from_elements::<i32>(array_type(DataType::I32, &[2, 0]), &[]).unwrap();
         assert_eq!(empty.reduce(&[1], ReductionKind::Sum).elements::<i32>(), Ok(vec![0, 0]));
+
+        // Floating-point extrema propagate NaNs and order negative zero below positive zero.
+        let nan = Array::vector(vec![1.0f32, f32::NAN]);
+        assert!(nan.reduce(&[0], ReductionKind::Max).elements::<f32>().unwrap()[0].is_nan());
+        let zeros = Array::vector(vec![-0.0f32, 0.0]);
+        assert_eq!(zeros.reduce(&[0], ReductionKind::Max).elements::<f32>().unwrap()[0].to_bits(), 0.0f32.to_bits(),);
+        assert_eq!(zeros.reduce(&[0], ReductionKind::Min).elements::<f32>().unwrap()[0].to_bits(), (-0.0f32).to_bits(),);
+
+        // Complex extrema compare `(real, imaginary)` lexicographically, including their JAX-compatible identities.
+        let complex = Array::vector(vec![
+            ComplexNumber::new(1.0f32, 5.0),
+            ComplexNumber::new(2.0, -3.0),
+            ComplexNumber::new(2.0, 4.0),
+        ]);
+        assert_eq!(
+            complex.reduce(&[0], ReductionKind::Max).elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(2.0, 4.0)]),
+        );
+        assert_eq!(
+            complex.reduce(&[0], ReductionKind::Min).elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(1.0, 5.0)]),
+        );
+        let empty = Array::from_elements::<ComplexNumber<f32>>(array_type(DataType::C64, &[2, 0]), &[]).unwrap();
+        assert_eq!(
+            empty.reduce(&[1], ReductionKind::Max).elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(f32::NEG_INFINITY, 0.0), ComplexNumber::new(f32::NEG_INFINITY, 0.0),]),
+        );
+        let empty = Array::from_elements::<f8e8m0fnu>(array_type(DataType::F8E8M0FNU, &[2, 0]), &[]).unwrap();
+        assert_eq!(
+            empty.reduce(&[1], ReductionKind::Max).elements::<f8e8m0fnu>(),
+            Ok(vec![f8e8m0fnu::MIN, f8e8m0fnu::MIN]),
+        );
+        assert_eq!(
+            empty.reduce(&[1], ReductionKind::Min).elements::<f8e8m0fnu>(),
+            Ok(vec![f8e8m0fnu::MAX, f8e8m0fnu::MAX]),
+        );
     }
 
     #[test]
     fn test_array_dot() {
+        // Ordinary matrix multiplication uses the generalized contraction order.
         let lhs = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let rhs = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
         let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
         let product = lhs.dot(&rhs, &dimensions);
         assert_eq!(product.r#type().into_owned(), array_type(DataType::F64, &[2, 2]));
         assert_eq!(product.to_f64s(), vec![58.0, 64.0, 139.0, 154.0]);
+
+        // Both operands are decoded through their physical layouts rather than through dense logical payload copies.
+        let lhs_type = array_type(DataType::U16, &[2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
+        let rhs_type = array_type(DataType::U16, &[3, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![4, -2])));
+        let lhs = Array::from_elements(lhs_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
+        let rhs = Array::from_elements(rhs_type, &[7u16, 8, 9, 10, 11, 12]).unwrap();
+        assert_eq!(lhs.dot(&rhs, &dimensions).elements::<u16>(), Ok(vec![58, 64, 139, 154]));
+
+        // Batched generalized contraction places batch axes before both operands' non-contracting axes.
+        let lhs = Array::from_elements(array_type(DataType::I32, &[2, 2, 2]), &[1i32, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let rhs = Array::from_elements(array_type(DataType::I32, &[2, 2, 1]), &[2i32, 3, 4, 5]).unwrap();
+        let batched = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
+        let product = lhs.dot(&rhs, &batched);
+        assert_eq!(product.r#type().into_owned(), array_type(DataType::I32, &[2, 2, 1]));
+        assert_eq!(product.elements::<i32>(), Ok(vec![8, 18, 50, 68]));
+
+        // Narrow integer products and sums wrap at the declared element width, and complex accumulation retains both
+        // components.
+        let lhs = Array::from_elements(array_type(DataType::I4, &[1, 2]), &[i4::new(7).unwrap(), i4::new(7).unwrap()])
+            .unwrap();
+        let rhs = Array::from_elements(array_type(DataType::I4, &[2, 1]), &[i4::new(2).unwrap(), i4::new(2).unwrap()])
+            .unwrap();
+        assert_eq!(lhs.dot(&rhs, &dimensions).elements::<i4>(), Ok(vec![i4::new(-4).unwrap()]));
+        let lhs = Array::matrix(1, 2, vec![ComplexNumber::new(1.0f32, 2.0), ComplexNumber::new(3.0, -1.0)]);
+        let rhs = Array::matrix(2, 1, vec![ComplexNumber::new(2.0f32, -1.0), ComplexNumber::new(0.5, 4.0)]);
+        assert_eq!(
+            lhs.dot(&rhs, &dimensions).elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(9.5, 14.5)]),
+        );
+
+        // Preferred accumulation first promotes both inputs and then runs the same typed contraction at the wider
+        // element data type.
+        let lhs = Array::matrix(1, 2, vec![f16::from_f32(1.5), f16::from_f32(2.0)]);
+        let rhs = Array::matrix(2, 1, vec![f16::from_f32(2.0), f16::from_f32(3.0)]);
+        let product = lhs.dot_with_accumulation_type(&rhs, &dimensions, DataType::F32);
+        assert_eq!(product.r#type().data_type(), DataType::F32);
+        assert_eq!(product.elements::<f32>(), Ok(vec![9.0]));
+
+        // An empty contracting dimension materializes one additive identity for every result coordinate.
+        let lhs = Array::from_elements::<f32>(array_type(DataType::F32, &[2, 0]), &[]).unwrap();
+        let rhs = Array::from_elements::<f32>(array_type(DataType::F32, &[0, 3]), &[]).unwrap();
+        assert_eq!(lhs.dot(&rhs, &dimensions).elements::<f32>(), Ok(vec![0.0; 6]));
     }
 
     #[test]
