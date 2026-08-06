@@ -373,13 +373,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unsupported element data type c64 for this kernel dispatch")]
+    #[should_panic(expected = "unsupported element data type c64 for this dispatch")]
     fn test_dispatch_on_array_element_type_rejects_out_of_class_data_types() {
         dispatch_on_array_element_type!(@real DataType::C64, |Element| element_data_type::<Element>());
     }
 
     #[test]
-    #[should_panic(expected = "unsupported element data type token for this kernel dispatch")]
+    #[should_panic(expected = "unsupported element data type token for this dispatch")]
     fn test_dispatch_on_array_element_type_rejects_payload_free_data_types() {
         dispatch_on_array_element_type!(DataType::Token, |Element| element_data_type::<Element>());
     }

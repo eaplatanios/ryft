@@ -15,6 +15,7 @@
 //! reference-semantics checks.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use ryft_macros::Operation;
 use crate::arrays::encoding::{
     decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, validate_storage_bytes,
 };
+use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::{ArrayAddressing, ArrayElement, ArraySliceAxis};
 use crate::axes::{Axis, AxisIndexOperation};
 use crate::backends::scalars::Scalar;
@@ -324,6 +326,201 @@ impl Array {
         decode_logical_bytes(&self.r#type, self.bytes.as_slice()).unwrap()
     }
 
+    /// Applies a typed elementwise function to this array in logical row-major order, producing a new array of
+    /// `output_type`. Both arrays use their sealed codecs one element at a time, so the only payload allocation is the
+    /// result buffer, and the output layout may differ from the input layout.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output_type`: static array type of the result. Its [`DataType`] must be represented by `Output` and its
+    ///     logical element count must equal this array's (elementwise kernels typically preserve the shape).
+    ///   - `function`: elementwise function applied to each decoded `Input` element.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either array type cannot describe materialized storage, if `Input` or `Output` represents
+    /// a different [`DataType`] than the corresponding array type, if the logical element counts differ, or if
+    /// `function` fails.
+    pub fn map_elements<Input: ArrayElement, Output: ArrayElement>(
+        &self,
+        output_type: ArrayType,
+        function: impl Fn(Input) -> Result<Output, ProgramError>,
+    ) -> Result<Self, ProgramError> {
+        if self.r#type.data_type() != Input::DATA_TYPE {
+            return Err(TypeError::invalid(format!(
+                "cannot map elements of data type {} as {} values",
+                self.r#type.data_type(),
+                Input::DATA_TYPE,
+            ))
+            .into());
+        }
+        if output_type.data_type() != Output::DATA_TYPE {
+            return Err(TypeError::invalid(format!(
+                "cannot store mapped {} values in an array of element data type {}",
+                Output::DATA_TYPE,
+                output_type.data_type(),
+            ))
+            .into());
+        }
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        if input_addressing.element_count() != output_addressing.element_count() {
+            return Err(TypeError::invalid(format!(
+                "cannot map {} logical elements onto array type {} with {} logical elements",
+                input_addressing.element_count(),
+                output_type,
+                output_addressing.element_count(),
+            ))
+            .into());
+        }
+        let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
+        for element in 0..output_addressing.element_count() {
+            let input = Input::decode(&self.bytes[input_addressing.byte_range_for_flat_index(element)]);
+            let output = function(input)?;
+            output.encode(&mut output_bytes[output_addressing.byte_range_for_flat_index(element)]);
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
+    }
+
+    /// Converts this array to the provided element data type, borrowing it unchanged when it already has that data
+    /// type so that already-promoted operands keep their exact physical storage and layout. Kernels that promote
+    /// mixed-type operands to a common element data type (which each kernel computes from its own type-inference
+    /// contract) use this to convert only the mismatched operands.
+    pub fn promoted_to(&self, data_type: DataType) -> Result<Cow<'_, Self>, ProgramError> {
+        if self.r#type.data_type() == data_type {
+            Ok(Cow::Borrowed(self))
+        } else {
+            Ok(Cow::Owned(self.convert_element_type(data_type)?))
+        }
+    }
+
+    /// Broadcasts the types of the provided arrays together (including element data type promotion) and promotes
+    /// every array to the broadcast element data type, borrowing the ones that already have it. This is the shared
+    /// entry step of broadcasting elementwise kernels: the returned operands all have the broadcast element data
+    /// type, while their shapes may still differ from the returned broadcast type, which the shared elementwise
+    /// loops bridge by indexing the operands with NumPy-style broadcasting.
+    pub fn broadcast_promoted<'a>(arrays: &[&'a Self]) -> Result<(ArrayType, Vec<Cow<'a, Self>>), ProgramError> {
+        let types = arrays.iter().map(|array| &array.r#type).collect::<Vec<_>>();
+        let output_type = ArrayType::broadcasted(&types).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let operands = arrays
+            .iter()
+            .map(|array| array.promoted_to(output_type.data_type()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((output_type, operands))
+    }
+
+    /// Creates an array of `type` by evaluating a typed function at every flat logical row-major element index. This
+    /// is the constructor form of [`Array::map_elements`], serving iota-style and coordinate-dependent kernels.
+    ///
+    /// # Parameters
+    ///
+    ///   - `r#type`: static array type of the result, whose [`DataType`] must be represented by `T`.
+    ///   - `function`: function producing the element at each flat logical row-major index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `r#type` cannot describe materialized storage, if `T` represents a different [`DataType`],
+    /// or if `function` fails.
+    pub fn from_fn_elements<T: ArrayElement>(
+        r#type: ArrayType,
+        function: impl Fn(usize) -> Result<T, ProgramError>,
+    ) -> Result<Self, ProgramError> {
+        if r#type.data_type() != T::DATA_TYPE {
+            return Err(TypeError::invalid(format!(
+                "cannot store {} values in an array of element data type {}",
+                T::DATA_TYPE,
+                r#type.data_type(),
+            ))
+            .into());
+        }
+        let addressing = ArrayAddressing::new(r#type.clone())?;
+        let mut bytes = vec![0; addressing.storage_byte_len()];
+        for element in 0..addressing.element_count() {
+            function(element)?.encode(&mut bytes[addressing.byte_range_for_flat_index(element)]);
+        }
+        Ok(Self { r#type, bytes: Arc::new(bytes) })
+    }
+
+    /// Folds this array's typed elements in logical row-major order into one accumulated value, serving full
+    /// reductions and accumulation-style kernels such as dot products.
+    ///
+    /// # Parameters
+    ///
+    ///   - `initial`: initial accumulator value.
+    ///   - `function`: fold step combining the accumulator with each decoded element.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this array's type cannot describe materialized storage, if `T` represents a different
+    /// [`DataType`], or if `function` fails.
+    pub fn fold_elements<T: ArrayElement, Accumulator>(
+        &self,
+        initial: Accumulator,
+        function: impl Fn(Accumulator, T) -> Result<Accumulator, ProgramError>,
+    ) -> Result<Accumulator, ProgramError> {
+        if self.r#type.data_type() != T::DATA_TYPE {
+            return Err(TypeError::invalid(format!(
+                "cannot fold elements of data type {} as {} values",
+                self.r#type.data_type(),
+                T::DATA_TYPE,
+            ))
+            .into());
+        }
+        let addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let mut accumulator = initial;
+        for element in 0..addressing.element_count() {
+            accumulator = function(accumulator, T::decode(&self.bytes[addressing.byte_range_for_flat_index(element)]))?;
+        }
+        Ok(accumulator)
+    }
+
+    /// Creates an array of `output_type` whose every element is copied from this array through an
+    /// output-index-to-input-index mapping over flat logical row-major indices. The copy moves whole element
+    /// encodings without decoding them, so this is the element-data-type-agnostic workhorse behind structural kernels
+    /// such as transpose, broadcast, slice, reverse, and gather, which never need element-type dispatch.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output_type`: static array type of the result, which must have the same [`DataType`] as this array.
+    ///   - `index`: mapping from each flat logical output element index to the flat logical input element index whose
+    ///     element it copies. Input indices may repeat or be skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either array type cannot describe materialized storage, if the element data types differ,
+    /// or if `index` produces an out-of-bounds input index.
+    pub fn gather_elements(
+        &self,
+        output_type: ArrayType,
+        index: impl Fn(usize) -> usize,
+    ) -> Result<Self, ProgramError> {
+        if output_type.data_type() != self.r#type.data_type() {
+            return Err(TypeError::invalid(format!(
+                "cannot gather elements of data type {} into an array of element data type {}",
+                self.r#type.data_type(),
+                output_type.data_type(),
+            ))
+            .into());
+        }
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
+        for output_element in 0..output_addressing.element_count() {
+            let input_element = index(output_element);
+            if input_element >= input_addressing.element_count() {
+                return Err(TypeError::invalid(format!(
+                    "gather index {input_element} is out of bounds for {} elements",
+                    input_addressing.element_count(),
+                ))
+                .into());
+            }
+            let input_range = input_addressing.byte_range_for_flat_index(input_element);
+            output_bytes[output_addressing.byte_range_for_flat_index(output_element)]
+                .copy_from_slice(&self.bytes[input_range]);
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
+    }
+
     /// Returns the row-major payload of this array converted elementwise to `f64`. This is a test-assertion view for
     /// real-valued arrays (Booleans convert to `0.0`/`1.0` and integers to their exact values where representable),
     /// and it panics for arrays whose elements cannot be viewed as real numbers (complex, token, and structural-zero
@@ -523,6 +720,95 @@ impl Array {
         Self::from_scalar_values(output_type, values)
     }
 
+    /// Applies a typed binary element function with NumPy-style broadcasting directly over addressed storage. Inputs
+    /// and outputs use their sealed codecs one element at a time, so the only payload allocation is the result buffer.
+    fn binary_elements<Input: ArrayElement, Output: ArrayElement>(
+        &self,
+        rhs: &Self,
+        output_type: ArrayType,
+        function: impl Fn(Input, Input) -> Result<Output, ProgramError>,
+    ) -> Result<Self, ProgramError> {
+        debug_assert_eq!(self.r#type.data_type(), Input::data_type());
+        debug_assert_eq!(rhs.r#type.data_type(), Input::data_type());
+        debug_assert_eq!(output_type.data_type(), Output::data_type());
+        let output_shape = output_type.static_shape().unwrap();
+        let left_shape = self.r#type.static_shape().unwrap();
+        let right_shape = rhs.r#type.static_shape().unwrap();
+        let output_strides = output_shape.row_major_strides();
+        let left_strides = left_shape.row_major_strides();
+        let right_strides = right_shape.row_major_strides();
+        let left_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let right_addressing = ArrayAddressing::new(rhs.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
+        for output_index in 0..output_addressing.element_count() {
+            let left_index =
+                Self::broadcast_index(output_index, &output_shape, &output_strides, &left_shape, &left_strides);
+            let right_index =
+                Self::broadcast_index(output_index, &output_shape, &output_strides, &right_shape, &right_strides);
+            let left = Input::decode(&self.bytes[left_addressing.byte_range_for_flat_index(left_index)]);
+            let right = Input::decode(&rhs.bytes[right_addressing.byte_range_for_flat_index(right_index)]);
+            let output = function(left, right)?;
+            output.encode(&mut output_bytes[output_addressing.byte_range_for_flat_index(output_index)]);
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
+    }
+
+    /// Compares two arrays of the same type elementwise using their typed value semantics rather than their physical
+    /// byte patterns. In particular, signed floating-point zeros compare equal and NaNs compare unequal.
+    fn elements_equal<T: ArrayElement + PartialEq>(&self, other: &Self) -> bool {
+        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
+        (0..addressing.element_count()).all(|index| {
+            let range = addressing.byte_range_for_flat_index(index);
+            T::decode(&self.bytes[range.clone()]) == T::decode(&other.bytes[range])
+        })
+    }
+
+    /// Compares two same-type arrays elementwise using their typed value semantics rather than their physical byte
+    /// patterns. The equality directions apply to every element type, while the ordered directions apply to the
+    /// partially ordered element types and are rejected with an error for the unordered complex ones.
+    fn compare_elements(
+        &self,
+        rhs: &Self,
+        output_type: ArrayType,
+        direction: ComparisonDirection,
+    ) -> Result<Self, ProgramError> {
+        let data_type = self.r#type.data_type();
+        if data_type.is_complex() {
+            // The unordered complex element types define only the equality comparison directions. The compare
+            // operation's type inference already rejects ordered complex comparisons, but the direct `Array`
+            // comparison API reaches this kernel without it.
+            if !matches!(direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual) {
+                return Err(TypeError::invalid(format!(
+                    "cannot apply an ordered comparison to unordered complex scalars of data type {data_type}",
+                ))
+                .into());
+            }
+            let equal = matches!(direction, ComparisonDirection::Equal);
+            return dispatch_on_array_element_type!(@complex data_type, |Element| {
+                self.binary_elements::<Element, bool>(rhs, output_type, |left, right| {
+                    Ok(if equal { left == right } else { left != right })
+                })
+            });
+        }
+        dispatch_on_array_element_type!(@ordered data_type, |Element| {
+            self.binary_elements::<Element, bool>(rhs, output_type, |left, right| {
+                // An unordered pair (a comparison involving a floating-point NaN) satisfies only `NotEqual`.
+                let ordering = left.partial_cmp(&right);
+                Ok(match direction {
+                    ComparisonDirection::Equal => ordering == Some(Ordering::Equal),
+                    ComparisonDirection::NotEqual => ordering != Some(Ordering::Equal),
+                    ComparisonDirection::LessThan => ordering == Some(Ordering::Less),
+                    ComparisonDirection::LessThanOrEqual => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+                    ComparisonDirection::GreaterThan => ordering == Some(Ordering::Greater),
+                    ComparisonDirection::GreaterThanOrEqual => {
+                        matches!(ordering, Some(Ordering::Greater | Ordering::Equal))
+                    }
+                })
+            })
+        })
+    }
+
     /// Applies a binary logical or bitwise operation directly to validated Boolean or integer element bytes. Since
     /// bitwise operations act independently on every bit, their result is independent of integer signedness and host
     /// endianness. Logical Boolean encodings use the same `0` and `1` bitwise truth tables.
@@ -649,7 +935,14 @@ impl Debug for Array {
 
 impl PartialEq for Array {
     fn eq(&self, other: &Self) -> bool {
-        self.r#type == other.r#type && self.scalar_values() == other.scalar_values()
+        if self.r#type != other.r#type {
+            return false;
+        }
+        let data_type = self.r#type.data_type();
+        if matches!(data_type, DataType::Token | DataType::Zero) {
+            return true;
+        }
+        dispatch_on_array_element_type!(data_type, |Element| Self::elements_equal::<Element>(self, other))
     }
 }
 
@@ -2187,20 +2480,26 @@ impl Compare for Array {
         // Broadcast the operand types together (including element-type promotion) so mixed-precision comparisons
         // mirror the `CompareOperation` type-inference contract, then compare the promoted elements pairwise. The
         // output type is the Boolean-typed counterpart of the broadcast type.
-        let broadcast_type = Broadcastable::broadcast(&self.r#type, &rhs.r#type)
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        let (broadcast_type, operands) = Self::broadcast_promoted(&[self, rhs])?;
         let target = broadcast_type.data_type();
-        let output_len = Self::element_count(&broadcast_type);
-        let left = self.broadcast_values(output_len);
-        let right = rhs.broadcast_values(output_len);
-        let values = left
-            .iter()
-            .zip(right.iter())
-            .map(|(left, right)| {
-                left.convert_element_type(target)?.compare(&right.convert_element_type(target)?, direction)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::from_scalar_values(broadcast_type.with_element_type(DataType::Boolean), values)
+        let output_type = broadcast_type.with_element_type(DataType::Boolean);
+        // Empty comparisons perform no element operation, so even payload-free data types retain the vacuous success
+        // behavior of the former scalar loop.
+        if Self::element_count(&output_type) == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self { r#type: output_type, bytes: Arc::new(vec![0; addressing.storage_byte_len()]) });
+        }
+        if target == DataType::Token {
+            return Err(TypeError::invalid("cannot compare token scalars".to_string()).into());
+        }
+        if target == DataType::Zero {
+            return Err(TypeError::invalid("cannot compare scalars of data types zero and zero".to_string()).into());
+        }
+
+        // `broadcast_promoted` converts only mismatched inputs, so equal-typed inputs retain their exact physical
+        // storage and are decoded one addressed element at a time by the shared binary loop.
+        let [left, right] = <[_; 2]>::try_from(operands).unwrap();
+        left.compare_elements(&right, output_type, direction)
     }
 }
 
@@ -2211,29 +2510,18 @@ impl Select for Array {
         // data type. The condition is retyped to a branch data type before broadcasting so its Boolean data type
         // acts as a mask rather than promoting into the output.
         assert_eq!(condition.r#type.data_type(), DataType::Boolean, "select condition must have a Boolean data type",);
-        let output_type = Broadcastable::broadcast(
-            &Broadcastable::broadcast(
-                &condition.r#type.clone().with_data_type(on_true.r#type.data_type()),
-                &on_true.r#type,
-            )
-            .map_err(|error| TypeError::invalid(error.to_string()))?,
-            &on_false.r#type,
-        )
+        let output_type = ArrayType::broadcasted(&[
+            condition.r#type.clone().with_data_type(on_true.r#type.data_type()),
+            on_true.r#type.clone(),
+            on_false.r#type.clone(),
+        ])
         .map_err(|error| TypeError::invalid(error.to_string()))?;
 
         // Convert only when promotion requires it. Equal-typed branches retain their original physical storage and
         // arbitrary layouts; conversion remains responsible for the element semantics until its own typed-byte slice.
         let output_data_type = output_type.data_type();
-        let on_true = if on_true.r#type.data_type() == output_data_type {
-            Cow::Borrowed(on_true)
-        } else {
-            Cow::Owned(on_true.convert_element_type(output_data_type)?)
-        };
-        let on_false = if on_false.r#type.data_type() == output_data_type {
-            Cow::Borrowed(on_false)
-        } else {
-            Cow::Owned(on_false.convert_element_type(output_data_type)?)
-        };
+        let on_true = on_true.promoted_to(output_data_type)?;
+        let on_false = on_false.promoted_to(output_data_type)?;
 
         let output_shape = output_type.static_shape().unwrap();
         let condition_shape = condition.r#type.static_shape().unwrap();
@@ -2489,7 +2777,10 @@ mod tests {
                 assert_eq!(array.elements::<$element_type>(), Ok(values.to_vec()));
 
                 // Both raw-byte construction paths accept the same valid encoding.
-                assert_eq!(Array::new(r#type.clone(), expected_bytes.to_vec()).unwrap().elements(), Ok(values.to_vec()));
+                assert_eq!(
+                    Array::new(r#type.clone(), expected_bytes.to_vec()).unwrap().elements(),
+                    Ok(values.to_vec()),
+                );
                 assert_eq!(Array::from_logical_bytes(r#type, expected_bytes).unwrap().elements(), Ok(values.to_vec()));
 
                 // A set bit above the data type's width must be rejected at the array ownership boundary.
@@ -2708,6 +2999,67 @@ mod tests {
     }
 
     #[test]
+    fn test_array_element_combinators() {
+        // `map_elements` applies a typed elementwise function, allowing input and output element types to differ.
+        let integers = Array::vector(vec![1i32, -2, 3]);
+        let doubled = integers.map_elements::<i32, i32>(integers.r#type().into_owned(), |value| Ok(value * 2)).unwrap();
+        assert_eq!(doubled.elements::<i32>(), Ok(vec![2, -4, 6]));
+        let negative = integers
+            .map_elements::<i32, bool>(array_type(DataType::Boolean, &[3]), |value| Ok(value < 0))
+            .unwrap();
+        assert_eq!(negative.storage_bytes(), [0, 1, 0]);
+        assert!(matches!(
+            integers.map_elements::<i64, i64>(array_type(DataType::I64, &[3]), Ok),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot map elements of data type i32 as i64 values",
+        ));
+        assert!(matches!(
+            integers.map_elements::<i32, i32>(array_type(DataType::I32, &[2]), Ok),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot map 3 logical elements onto array type i32[2] with 2 logical elements",
+        ));
+
+        // `from_fn_elements` constructs an array from its flat logical row-major element indices.
+        let iota = Array::from_fn_elements(array_type(DataType::U16, &[2, 2]), |index| Ok(index as u16)).unwrap();
+        assert_eq!(iota.elements::<u16>(), Ok(vec![0, 1, 2, 3]));
+        assert!(matches!(
+            Array::from_fn_elements(array_type(DataType::U16, &[1]), |_| Ok(0u32)),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot store u32 values in an array of element data type u16",
+        ));
+
+        // `fold_elements` accumulates typed elements in logical row-major order.
+        assert_eq!(integers.fold_elements(0i64, |sum, value: i32| Ok(sum + i64::from(value))), Ok(2));
+        assert!(matches!(
+            integers.fold_elements(0i64, |sum, _: i64| Ok(sum)),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot fold elements of data type i32 as i64 values",
+        ));
+
+        // `gather_elements` copies whole element encodings through a flat index mapping without decoding them, so it
+        // serves reversal, repetition, and selection over any element data type, including sub-byte ones.
+        let reversed =
+            integers.gather_elements(integers.r#type().into_owned(), |output_index| 2 - output_index).unwrap();
+        assert_eq!(reversed.elements::<i32>(), Ok(vec![3, -2, 1]));
+        let repeated = integers.gather_elements(array_type(DataType::I32, &[4]), |_| 1).unwrap();
+        assert_eq!(repeated.elements::<i32>(), Ok(vec![-2, -2, -2, -2]));
+        let narrow =
+            Array::from_elements(array_type(DataType::I4, &[2]), &[i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap();
+        let swapped = narrow.gather_elements(narrow.r#type().into_owned(), |output_index| 1 - output_index).unwrap();
+        assert_eq!(swapped.storage_bytes(), [0x07, 0x08]);
+        assert!(matches!(
+            integers.gather_elements(array_type(DataType::I64, &[3]), |output_index| output_index),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot gather elements of data type i32 into an array of element data type i64",
+        ));
+        assert!(matches!(
+            integers.gather_elements(array_type(DataType::I32, &[3]), |_| 3),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "gather index 3 is out of bounds for 3 elements",
+        ));
+    }
+
+    #[test]
     fn test_array_display() {
         // Real floating-point payloads keep a decimal point (matching how `Vec<f64>` debug-formats), while other
         // payloads use the scalar rendering.
@@ -2729,6 +3081,13 @@ mod tests {
         let positive_zero = Array::from_f64s(array_type(DataType::F8E4M3FN, &[1]), vec![0.0]);
         let negative_zero = Array::from_f64s(array_type(DataType::F8E4M3FN, &[1]), vec![-0.0]);
         assert_eq!(positive_zero, negative_zero);
+        // Equality decodes typed values directly, retaining IEEE NaN and signed-zero semantics without depending on
+        // either physical byte equality or the transitional scalar bridge.
+        let positive_zero = Array::vector(vec![0.0f32]);
+        let negative_zero = Array::vector(vec![-0.0f32]);
+        assert_eq!(positive_zero, negative_zero);
+        let nan = Array::vector(vec![f32::from_bits(0x7fc0_1234)]);
+        assert_ne!(nan, nan.clone());
         // Approximate equality delegates to the elementwise scalar approximation.
         assert_abs_diff_eq!(Array::vector(vec![1.0, 2.0]), Array::vector(vec![1.0 + 1e-10, 2.0]), epsilon = 1e-9);
         let left = Array::vector(vec![1.0]).complex(&Array::vector(vec![2.0])).unwrap();
@@ -2987,6 +3346,47 @@ mod tests {
         // Operands broadcast and promote before comparing.
         let mixed = Array::vector(vec![1.0f32, 3.0]).compare(&Array::scalar(2.0f64), ComparisonDirection::GreaterThan);
         assert_eq!(mixed.unwrap(), Array::vector(vec![false, true]));
+
+        // Sealed sub-byte elements use their signed value ordering and participate in full NumPy-style broadcasting.
+        let left = Array::matrix(2, 1, vec![i2::new(-1).unwrap(), i2::new(1).unwrap()]);
+        let right = Array::matrix(1, 3, vec![i2::new(-2).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]);
+        assert_eq!(
+            left.compare(&right, ComparisonDirection::LessThan).unwrap().elements::<bool>(),
+            Ok(vec![false, true, true, false, false, false]),
+        );
+
+        // Addressed input and output layouts remain physical contracts; comparison writes only the Boolean element
+        // ranges and leaves output holes zero.
+        let strided_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let left = Array::from_elements(strided_type.clone(), &[1u16, 3]).unwrap();
+        let right = Array::from_elements(strided_type, &[2u16, 2]).unwrap();
+        let compared = left.compare(&right, ComparisonDirection::LessThan).unwrap();
+        assert_eq!(compared.elements::<bool>(), Ok(vec![true, false]));
+        assert_eq!(compared.storage_bytes(), [1, 0, 0, 0, 0]);
+
+        // Floating-point NaNs are unordered, while complex arrays expose only equality comparisons.
+        let nan = Array::vector(vec![f8e5m2::NAN]);
+        assert_eq!(nan.compare(&nan, ComparisonDirection::NotEqual).unwrap().elements::<bool>(), Ok(vec![true]));
+        let complex = Array::vector(vec![ComplexNumber::new(1.0f32, 2.0)]);
+        assert_eq!(complex.compare(&complex, ComparisonDirection::Equal).unwrap().elements::<bool>(), Ok(vec![true]),);
+        assert!(matches!(
+            complex.compare(&complex, ComparisonDirection::LessThan),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot apply an ordered comparison to unordered complex scalars of data type c64",
+        ));
+
+        // Empty payload-free comparisons are vacuous because they evaluate no unsupported element comparison; a
+        // nonempty token array retains the established scalar-backend error.
+        let empty_token = Array::from_logical_bytes(array_type(DataType::Token, &[0]), &[]).unwrap();
+        assert_eq!(
+            empty_token.compare(&empty_token, ComparisonDirection::Equal).unwrap().elements::<bool>(),
+            Ok(vec![]),
+        );
+        let token = Array::from_logical_bytes(array_type(DataType::Token, &[1]), &[]).unwrap();
+        assert!(matches!(
+            token.compare(&token, ComparisonDirection::Equal),
+            Err(ProgramError::Type(TypeError::Invalid { message })) if message == "cannot compare token scalars",
+        ));
     }
 
     #[test]

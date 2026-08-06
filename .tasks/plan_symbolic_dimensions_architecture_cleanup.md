@@ -2483,6 +2483,9 @@ Phase 9a2 — byte-backed reference kernels:
         sub-byte masks and complete NumPy-style broadcasting, without temporary scalar or logical-byte payloads.
   - [x] P9a2b: migrate ThreeFry and Philox random-bit generation to typed, layout-aware state decoding and result
         construction for U8/U16/U32/U64 outputs, without routing state or generated bits through `Scalar`.
+  - [x] P9a2e: add exhaustive sealed-element dispatch and a zero-intermediate-allocation broadcasted binary loop, then
+        migrate exact equality and comparison to direct typed codecs. Preserve signed-zero, NaN, complex-ordering,
+        payload-free, promotion, arbitrary-layout, and complete NumPy-style broadcasting semantics.
 - [ ] Migrate structural operations, including broadcast, reshape, transpose, slice/update, pad, concatenate,
       gather/scatter, reduce, sort, dot/attention, collectives, and control flow.
   - [x] P9a2c: migrate broadcast, transpose, reshape, static and dynamic slice/update, pad, and concatenate to direct
@@ -4471,3 +4474,25 @@ reference-array tests, all 1,152 core library tests, and all 436 runnable XLA li
 timing-sensitive ignore); formatting and diff hygiene pass. The structural parent remains open for gather/scatter,
 reduce, sort, dot/attention, and collectives; the elementwise parent remains open for comparison, conversion,
 arithmetic, complex, and constructor kernels.
+
+### Phase 9a2e typed element dispatch, equality, and comparison (2026-08-05)
+
+The reference backend now has one exhaustive runtime `DataType` dispatcher over the sealed Rust element codecs, plus
+checked one-element encode/decode methods on the sealed `ArrayElement` contract and one generic broadcasted binary
+loop. The loop decodes each addressed input element, applies a statically monomorphized typed function, and encodes
+directly into the single output buffer; it allocates no input-sized temporary vectors or dynamic element
+representation. A small private comparison capability records the only family distinction: real, integer, Boolean,
+and low-precision values use partial ordering, while complex values support equality directions only.
+
+Exact `Array` equality and `Compare` no longer decode through `Scalar`. Equality retains value rather than byte
+semantics, so signed zeros compare equal and NaNs compare unequal. Comparison now supports signed and unsigned
+sub-byte integers, arbitrary right-aligned broadcasting, layout-aware input reads and output writes, NaN unorderedness,
+complex equality diagnostics, and the established vacuous behavior for empty payload-free arrays. Mixed-data-type
+comparisons still delegate only their required promotion step to `ConvertElementType`; that dependency disappears with
+the dedicated conversion slice rather than being duplicated here.
+
+Focused tests pin F32 signed-zero and NaN equality, I2 `(2, 1)` by `(1, 3)` broadcasting, holed strided U16 inputs and
+Boolean output bytes, low-precision NaN comparison, complex equality and ordered-comparison rejection, and empty versus
+nonempty token behavior. All 38 focused reference-array tests, all 1,152 core library tests, and all 436 runnable XLA
+library tests pass (one intentional timing-sensitive ignore); formatting and diff hygiene pass. The elementwise parent
+remains open for conversion, arithmetic, complex, and constructor kernels.
