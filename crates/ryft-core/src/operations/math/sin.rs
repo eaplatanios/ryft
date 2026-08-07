@@ -3,9 +3,8 @@ use std::ops::Mul as StandardMul;
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
+use crate::operations::math::cos::Cos;
 use crate::programs::ProgramError;
-
-use super::Cos;
 
 // TODO(eaplatanios): Review this module.
 
@@ -65,15 +64,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::differentiation::{gradient_holomorphic, jvp};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::types::Typed;
+    use crate::programs::{ProgramBuilder, Typed};
 
     use super::*;
 

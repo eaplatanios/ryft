@@ -4,7 +4,9 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
+use crate::arrays::sharding::ShardingError;
+use crate::arrays::sharding::meshes::DeviceMesh;
+use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionVariable, Shape, StaticShape};
 use crate::arrays::types::layouts::Layout;
@@ -13,9 +15,8 @@ use crate::axes::Axis;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
-use crate::programs::Value;
-use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
-use crate::programs::types::{Type, TypeError, TypeRefinements, Typed, visit_type_signature_pairs};
+use crate::programs::types::visit_type_signature_pairs;
+use crate::programs::{Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value};
 
 // Shared empty batch axis set returned by `ArrayType::unreduced_axes` and `ArrayType::reduced_axes` for array types
 // that carry no `Sharding`, so that both accessors can hand back a borrow without allocating.
@@ -739,9 +740,9 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::sharding::{
-        Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
-    };
+    use crate::arrays::sharding::ShardingError;
+    use crate::arrays::sharding::meshes::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
     use crate::arrays::types::data::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
     use crate::arrays::types::dimensions::{DimensionBounds, DimensionType, DimensionVariable};
     use crate::arrays::types::ir::ArrayIrType;

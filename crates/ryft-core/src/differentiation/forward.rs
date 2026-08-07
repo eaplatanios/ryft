@@ -13,24 +13,17 @@ use crate::differentiation::linear::{
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
-use crate::operations::constants::Zero;
-use crate::operations::math::AddOperation;
+use crate::operations::{AddOperation, Zero};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
     PartialValue, PartiallyEvaluatableOperation,
 };
-use crate::programs::ProgramError;
-use crate::programs::atoms::{Atom, AtomId, MaybeZero};
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::identities::TypeIdentityPosition;
-use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::programs::Program;
-use crate::programs::regions::{
-    BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+use crate::programs::{
+    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
+    ProgramBuilder, ProgramError, ProjectedValue, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+    Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{ProjectedValue, Value, ValueProjection};
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
 /// Represents a differentiation _dual_ value which is a _primal_ value paired with a _tangent_ value. In the
@@ -2196,19 +2189,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
         ProjectedProgramType, ProjectedProgramValue,
     };
     use crate::contexts::{Context, EagerContext};
-    use crate::operations::collectives::{CollectiveKind, CollectiveOperation};
-    use crate::operations::differentiation::{StopGradient, StopGradientOperation};
-    use crate::operations::math::{Dot, DotDimensionNumbers, MulOperation, Sin, SinOperation};
+    use crate::operations::{
+        CollectiveKind, CollectiveOperation, Dot, DotDimensionNumbers, MulOperation, Sin, SinOperation, StopGradient,
+        StopGradientOperation,
+    };
     use crate::parameters::{ParameterError, Placeholder};
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::operations::Operation;
-    use crate::programs::values::Concretizable;
+    use crate::programs::{Concretizable, Operation, ProgramBuilder};
     use crate::tracing::{NestedTracingContext, Trace};
 
     use super::*;

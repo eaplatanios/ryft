@@ -1,38 +1,44 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrOperation, ArrayIrValue};
 use crate::arrays::{
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable,
-    Shape, ShardingDimension,
+    ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionOperation, DimensionType,
+    DimensionValue, DimensionVariable, Shape, ShardingDimension,
 };
 use crate::axes::Axis;
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
+use crate::batching::array_ir::align_array_batch;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
+    BatchingContext, BatchingDriver, BatchingError,
 };
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation};
-use crate::operations::constants::{Fill, ZeroLike};
-use crate::operations::control_flow::ScanOperation;
-use crate::operations::dimensions::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::{
-    BroadcastOperation, Concatenate, ConvertElementType, Slice, Transpose, TransposeOperation,
-};
-use crate::operations::math::{Add, Cos, Div, Log, Mul, Neg, Sqrt, Sub};
+use crate::operations::constants::fill::Fill;
+use crate::operations::constants::zero_like::ZeroLike;
+use crate::operations::control_flow::scan::ScanOperation;
+use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
+use crate::operations::manipulation::broadcasting::BroadcastOperation;
+use crate::operations::manipulation::concatenation::Concatenate;
+use crate::operations::manipulation::conversion::ConvertElementType;
+use crate::operations::manipulation::slicing::Slice;
+use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
+use crate::operations::math::add::Add;
+use crate::operations::math::cos::Cos;
+use crate::operations::math::div::Div;
+use crate::operations::math::log::Log;
+use crate::operations::math::mul::Mul;
+use crate::operations::math::neg::Neg;
+use crate::operations::math::sqrt::Sqrt;
+use crate::operations::math::sub::Sub;
 use crate::operations::sort::ArgMax;
 use crate::parameters::Placeholder;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
-use crate::programs::{MaybeZero, ProgramError};
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type,
+    TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -806,18 +812,18 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
-    use crate::arrays::{DimensionBounds, DimensionType, DimensionValue, DimensionVariable, ShardingDimension};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::arrays::{
+        ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+        ShardingDimension,
+    };
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{
         BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::macros::check_operation_type_inference;
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::Typed;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed};
 
     use super::*;
 

@@ -41,13 +41,11 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{LegacyBroadcast, LegacyBroadcastOperation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+};
 
 /// Canonical operation name for [`ReshardOperation`].
 pub const RESHARD_OPERATION_NAME: &str = "reshard";
@@ -505,11 +503,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::jacobian::jacobian_reverse;
-    use crate::differentiation::{LinearizationTracer, vjp};
+    use crate::differentiation::{LinearizationTracer, jacobian_reverse, vjp};
     use crate::tracing::Trace;
 
     use super::*;

@@ -10,13 +10,10 @@ use crate::parameters::Parameter;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
-use crate::programs::ProgramError;
-use crate::programs::effects::{Effect, Effects};
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Concretizable, Value};
+use crate::programs::{
+    Concretizable, Effect, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value,
+};
 
 /// Canonical operation name for an equality [`DimensionRequirementOperation`].
 pub const DIMENSION_REQUIRE_EQUAL_OPERATION_NAME: &str = "dimension_require_equal";

@@ -4446,7 +4446,7 @@ mod tests {
         DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
         Sharding, ShardingDimension, ShardingError,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{
         ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, BatchingError, BatchingTracer,
     };
@@ -4456,24 +4456,19 @@ mod tests {
         DifferentiationTracer, TransposableOperation,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::constants::ZeroOperation;
-    use crate::operations::manipulation::{LegacyBroadcastOperation, TransposeOperation};
-    use crate::operations::math::{
-        Abs, AbsOperation, Add, AddOperation, DivOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce,
-        ReductionKind, SinOperation, Sub, SubOperation,
+    use crate::operations::{
+        Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, DivOperation, ElementwiseOperation,
+        ExpOperation, LegacyBroadcastOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation,
+        Sub, SubOperation, TransposeOperation, ZeroOperation,
     };
-    use crate::operations::{ArithmeticDimensionOperation, ElementwiseOperation};
     use crate::parameters::Parameter;
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationValue, PartialTracer, PartialValue, PartiallyEvaluatableOperation,
     };
-    use crate::programs::ProgramError;
-    use crate::programs::atoms::MaybeZero;
-    use crate::programs::identities::TypeIdentityRenaming;
-    use crate::programs::operations::{Operation, OperationProvider};
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::{Type, TypeError, Typed};
-    use crate::programs::values::ValueProjection;
+    use crate::programs::{
+        EmptyRegionDriver, MaybeZero, Operation, OperationProvider, ProgramError, Type, TypeError,
+        TypeIdentityRenaming, Typed, ValueProjection,
+    };
     use crate::tracing::{Tracer, TracingContext};
 
     const TEST_UNARY_OPERATION_NAME: &str = "test_unary";

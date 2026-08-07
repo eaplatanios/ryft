@@ -1,36 +1,37 @@
 use std::fmt::Display;
 use std::ops::{Div, Mul};
 
-use crate::arrays::LinearResiduals;
 use crate::arrays::{
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape, Sharding,
-    StaticShape,
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals,
+    Shape, Sharding, StaticShape,
 };
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
-use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::forward::jvp_projected_operation;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation, MemberDifferentiableOperation, TransposableOperation, TranspositionDriver,
+    ElementwiseDerivativeAlignment, LinearCallOperation, MemberDifferentiableOperation, TransposableOperation,
+    TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
-use crate::operations::constants::{ConstantOperation, Fill};
-use crate::operations::dimensions::{DimensionMulOperation, DimensionSizeOperation, DimensionToScalarOperation};
-use crate::operations::manipulation::{
-    BroadcastOperation, ConvertElementTypeOperation, LegacyBroadcast, LegacyBroadcastOperation,
-};
-use crate::operations::math::{DivOperation, MulOperation};
+use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::fill::Fill;
+use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
+use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
+use crate::operations::math::div::DivOperation;
+use crate::operations::math::mul::MulOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::{MaybeZero, ProgramError, Value, ValueProjection};
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
+    Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -1003,11 +1004,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::StagingContext;
     use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::check_operation_batching;
-    use crate::programs::types::Typed;
+    use crate::programs::Typed;
 
     use super::*;
 
@@ -1153,7 +1154,7 @@ mod tests {
     #[test]
     fn test_reduce_sum_output_sharding_requests_unreduced_output() {
         use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-        use crate::programs::operations::Operation;
+        use crate::programs::Operation;
 
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -1416,9 +1417,7 @@ mod tests {
     fn test_reduce_mean_transpose_checks_reduced_element_count() {
         use crate::differentiation::DifferentiationError;
         use crate::partial::PartialValue;
-        use crate::programs::ProgramError;
-        use crate::programs::atoms::MaybeZero;
-        use crate::programs::types::TypeError;
+        use crate::programs::{MaybeZero, ProgramError, TypeError};
         use crate::tracing::TracingContext;
 
         let input_shape = Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]);
@@ -1446,7 +1445,7 @@ mod tests {
     #[test]
     fn test_reduce_mean_transpose_accepts_zero_reduced_element_count_without_overflow() {
         use crate::partial::PartialValue;
-        use crate::programs::atoms::MaybeZero;
+        use crate::programs::MaybeZero;
         use crate::tracing::TracingContext;
 
         let input_type = ArrayType::new(

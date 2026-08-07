@@ -4,20 +4,16 @@ use std::marker::PhantomData;
 use crate::arrays::{ArrayType, DataType};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::DifferentiableType;
-use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::forward::DifferentiationDual;
+use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::ElementwiseOperation;
-use crate::operations::constants::{Zero, ZeroLikeOperation, ZeroOperationProvider};
+use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
+use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
@@ -357,16 +353,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Dimension, Shape};
-    use crate::backends::arrays::Array;
-    use crate::differentiation::forward::jvp;
-    use crate::differentiation::reverse::value_and_gradient;
+    use crate::backends::Array;
+    use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
     use crate::operations::compare::{Compare, ComparisonDirection};
-    use crate::programs::ProgramError;
-    use crate::programs::types::Typed;
+    use crate::programs::{ProgramError, Typed};
 
     use super::*;
 

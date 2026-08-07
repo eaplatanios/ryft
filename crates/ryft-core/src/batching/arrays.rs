@@ -22,15 +22,13 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
-use crate::operations::ElementwiseOperation;
-use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::{
+    ElementwiseOperation, LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation,
+};
 use crate::parameters::{Parameter, Placeholder};
-use crate::programs::ProgramError;
-use crate::programs::operations::Operation;
-use crate::programs::programs::Program;
-use crate::programs::regions::{RegionRef, RegionReplayMappings, ReplayRegionDriver};
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::{
+    Operation, Program, ProgramError, RegionRef, RegionReplayMappings, ReplayRegionDriver, TypeError, Typed, Value,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Value with [`ArrayType`] type that represents a _packed_ batch of arrays. [`ArrayBatch`] is the batching
@@ -1325,15 +1323,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DataType, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{Batch, BatchingTracer, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::forward::{ForwardModeDifferentiate, LinearizationTracer};
-    use crate::differentiation::reverse::ReverseModeDifferentiate;
-    use crate::operations::constants::OneLike;
-    use crate::operations::math::{AddOperation, NegOperation, Reduce, ReductionKind};
+    use crate::differentiation::{ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate};
+    use crate::operations::{AddOperation, NegOperation, OneLike, Reduce, ReductionKind};
     use crate::parameters::Placeholder;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::EmptyRegionDriver;
     use crate::tracing::{DomainTracingContext, Trace};
 
     use super::*;

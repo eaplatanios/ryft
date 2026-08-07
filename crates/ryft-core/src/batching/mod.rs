@@ -82,12 +82,10 @@ use crate::contexts::{Context, Domain, ProjectedContext, StagingContext, ValueRe
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::ProgramError;
-use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::programs::Program;
-use crate::programs::regions::{BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef};
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    BindingRegionDriver, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, RegionDriver,
+    RegionRef, Type, TypeError, Typed, Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 pub mod array_ir;
@@ -1466,16 +1464,15 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType, Dimension, Shape, ShardingDimension};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
         ProjectedProgramType, ProjectedProgramValue,
     };
-    use crate::operations::math::{AddOperation, Reduce, ReductionKind};
+    use crate::operations::{AddOperation, Reduce, ReductionKind};
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::types::Typed;
+    use crate::programs::{ProgramBuilder, Typed};
     use crate::tracing::Trace;
 
     use super::*;

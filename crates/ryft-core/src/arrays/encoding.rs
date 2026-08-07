@@ -8,9 +8,9 @@ pub use half::{bf16, f16};
 pub use num_complex::Complex;
 
 use crate::arrays::addressing::ArrayAddressing;
-use crate::arrays::{ArrayType, DataType};
-use crate::programs::ProgramError;
-use crate::programs::types::TypeError;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::data::DataType;
+use crate::programs::{ProgramError, TypeError};
 
 /// Value type with exactly one portable array-element byte encoding. [`ArrayElement`] pairs each supported Rust type
 /// with the one [`DataType`] it represents (e.g., [`f32`] with [`DataType::F32`]) and pins the exact bytes that one
@@ -73,7 +73,7 @@ impl<T: private::Codec> ArrayElement for T {
 }
 
 mod private {
-    use crate::arrays::DataType;
+    use crate::arrays::types::data::DataType;
 
     /// Private implementation contract that seals and implements [`super::ArrayElement`].
     pub trait Codec: Copy {

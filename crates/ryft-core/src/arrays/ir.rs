@@ -10,10 +10,9 @@ use crate::arrays::types::dimensions::DimensionType;
 use crate::arrays::types::ir::ArrayIrType;
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
-use crate::programs::ProgramError;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Concretizable, Value, ValueProjection};
+use crate::programs::{
+    Concretizable, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+};
 
 /// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
 /// both [`ArrayType`]-typed [`Value`]s and [`DimensionValue`]. `A` is the concrete array representation selected by the
@@ -174,10 +173,10 @@ mod tests {
 
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{DimensionBounds, DimensionVariable};
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::contexts::StagingContext;
     use crate::differentiation::DifferentiationTracer;
-    use crate::operations::constants::ConstantOperation;
+    use crate::operations::ConstantOperation;
     use crate::partial::PartialTracer;
     use crate::tracing::{Tracer, TracingContext};
 

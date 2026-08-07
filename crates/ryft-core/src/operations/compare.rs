@@ -2,8 +2,9 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::arrays::{ArrayIrType, ArrayType, DataType, DimensionType};
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{
+    ArrayIrBatch, ArrayIrBatching, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -11,11 +12,9 @@ use crate::macros::check_count;
 use crate::operations::ElementwiseOperation;
 use crate::operations::manipulation::conversion::ElementType;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
-use crate::programs::values::{ProjectedValue, Value};
+use crate::programs::{
+    Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError, Value,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -321,21 +320,16 @@ mod tests {
         ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
         DimensionValue, DimensionVariable, Layout, Memory, Shape, StridedLayout,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::DifferentiationError;
-    use crate::differentiation::forward::{DifferentiationTracer, jvp};
-    use crate::differentiation::reverse::TransposableOperation;
+    use crate::differentiation::{DifferentiationError, DifferentiationTracer, TransposableOperation, jvp};
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
-    use crate::operations::constants::ZeroLike;
-    use crate::operations::control_flow::Select;
+    use crate::operations::constants::zero_like::ZeroLike;
+    use crate::operations::control_flow::select::Select;
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::Effects;
-    use crate::programs::regions::{EmptyRegionDriver, RegionInterface};
-    use crate::programs::types::Typed;
-    use crate::programs::values::ValueProjection;
+    use crate::programs::{
+        Effects, EmptyRegionDriver, ProgramBuilder, ProgramError, RegionInterface, Typed, ValueProjection,
+    };
     use crate::tracing::{Tracer, TracingContext};
 
     use super::*;

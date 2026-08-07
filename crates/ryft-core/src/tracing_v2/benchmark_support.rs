@@ -1,12 +1,10 @@
 use std::ops::{Add, Mul, Neg};
 
-use crate::backends::arrays::{Array, ArrayOperation};
+use crate::backends::{Array, ArrayOperation};
 use crate::contexts::{Context, EagerContext};
-use crate::differentiation::DifferentiationError;
-use crate::differentiation::ReverseModeDifferentiate;
-use crate::operations::math::{Cos, Sin};
-use crate::programs::types::Type;
-use crate::programs::{Program, ProgramError, Value};
+use crate::differentiation::{DifferentiationError, ReverseModeDifferentiate};
+use crate::operations::{Cos, Sin};
+use crate::programs::{Program, ProgramError, Type, Value};
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };

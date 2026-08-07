@@ -9,12 +9,10 @@ use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_rev
 use crate::differentiation::linear::ResidualZeroProvider;
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DenseDifferentiableType;
-use crate::operations::math::AddOperation;
+use crate::operations::AddOperation;
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::types::{Type, Typed};
-use crate::programs::values::Value;
+use crate::programs::{ProgramError, Type, Typed, Value};
 use crate::tracing::TracingContext;
 
 /// Hessian of a function, represented as the Cartesian product of its output, first input, and second input
@@ -629,11 +627,11 @@ mod tests {
 
     use crate::arrays::DataType::{F32, F64};
     use crate::arrays::{ArrayType, DataType, Dimension, Shape};
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::differentiation::jacobian::jacobian_forward;
-    use crate::operations::math::Sin;
+    use crate::operations::Sin;
     use crate::parameters::{ParameterPath, Parameterized};
-    use crate::programs::types::Typed;
+    use crate::programs::Typed;
 
     use super::*;
 

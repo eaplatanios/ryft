@@ -8,8 +8,7 @@ mod tests {
     };
     use ryft_core::operations::manipulation::Reshape;
 
-    use crate::experimental::shard_map::{ShardMapTracer, TracedShardMap, TracedXlaProgram, reshard, shard_map};
-    use crate::experimental::trace;
+    use crate::experimental::shard_map::{ShardMapTracer, TracedShardMap, TracedXlaProgram, reshard, shard_map, trace};
 
     fn manual_mesh(axis_size: usize) -> LogicalMesh {
         LogicalMesh::new(vec![MeshAxis::new("x", axis_size, MeshAxisType::Manual).unwrap()]).unwrap()

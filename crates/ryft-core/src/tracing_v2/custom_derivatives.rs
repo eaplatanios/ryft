@@ -13,14 +13,10 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_non_transposable_operation};
-use crate::operations::constants::Zero;
-use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation, Zero};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::operations::Operation;
-use crate::programs::regions::{RegionInterface, RegionSlot};
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::{ProgramError, Value};
+use crate::programs::{Operation, ProgramError, RegionInterface, RegionSlot, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, Trace};
 
 /// Canonical operation name for [`CustomJvpOperation`].
@@ -961,22 +957,21 @@ mod tests {
 
     use crate::arrays::{DataType, Dimension, Shape, ShardingDimension};
     use crate::axes::AxisIndexOperation;
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{
         ArrayBatch, ArrayBatching, Batch, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy,
         RecursiveBatchingDriver,
     };
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::jacobian::jacobian_reverse;
-    use crate::differentiation::{ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate};
-    use crate::operations::math::{
+    use crate::differentiation::{
+        ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, jacobian_reverse,
+    };
+    use crate::operations::{
         Cos, CosOperation, Dot, DotDimensionNumbers, MulOperation, Reduce, ReductionKind, Sin, SinOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::effects::Effects;
-    use crate::programs::regions::RegionRole;
-    use crate::programs::{Program, ProgramBuilder};
+    use crate::programs::{Effects, Program, ProgramBuilder, RegionRole};
 
     use super::*;
 

@@ -1,16 +1,15 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrOperation, ArrayIrValue, LinearResiduals};
 use crate::arrays::{
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
-    Shape, Sharding,
+    ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation,
+    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
 };
 use crate::axes::Axis;
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch, array_dimension};
+use crate::batching::array_ir::{align_array_batch, array_dimension};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
+    BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -20,22 +19,23 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::constants::{ConstantOperation, One, OneOperation, Zero, ZeroOperation};
-use crate::operations::control_flow::{Select, SelectOperation};
-use crate::operations::dimensions::{
-    DimensionAddOperation, DimensionMulOperation, DimensionSaturatingSubOperation, DimensionSize,
-    DimensionSizeOperation,
-};
-use crate::operations::manipulation::{
-    BroadcastOperation, DynamicShapeSliceOperation, LegacyBroadcast, SliceOperation, Transpose,
-};
-use crate::operations::math::{ReduceOperation, ReductionKind};
+use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::one::{One, OneOperation};
+use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::control_flow::select::{Select, SelectOperation};
+use crate::operations::dimensions::dimension_add::DimensionAddOperation;
+use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
+use crate::operations::dimensions::dimension_saturating_sub::DimensionSaturatingSubOperation;
+use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast};
+use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
+use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::reduce::{ReduceOperation, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
-use crate::programs::{MaybeZero, ProgramError};
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
+    Typed, Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
@@ -1519,12 +1519,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
     use crate::arrays::{
-        ArrayIrType, DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+        ArrayIrOperation, ArrayIrType, ArrayIrValue, DataType, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        StridedLayout,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::macros::{
@@ -1532,10 +1532,7 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::Typed;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
 
     use super::*;
 

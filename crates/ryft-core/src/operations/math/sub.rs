@@ -90,14 +90,14 @@ mod tests {
     use crate::arrays::{
         ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::EmptyRegionDriver;
 
     use super::*;
 

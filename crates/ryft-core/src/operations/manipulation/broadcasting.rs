@@ -1,44 +1,39 @@
 use std::fmt::Display;
 
-use crate::arrays::LinearResiduals;
 use crate::arrays::{
-    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape, Sharding,
-    ShardingDimension,
+    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape,
+    Sharding, ShardingDimension,
 };
 use crate::backends::arrays::BroadcastKernel;
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
+    BatchingContext, BatchingDriver, BatchingError,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::elementwise::BroadcastDerivativeAlignment;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation, TransposableOperation, TranspositionDriver, transpose_projected_operation,
+    BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, LinearCallOperation, TransposableOperation, TranspositionDriver,
+    transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::constants::ZeroOperation;
-use crate::operations::dimensions::{DimensionSize, DimensionSizeOperation};
+use crate::operations::constants::zero::ZeroOperation;
+use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
 use crate::operations::manipulation::reshaping::{
     LegacyReshapeOperation, ReshapeOperation, lift_output_sharding_for_leading_batch_axis,
 };
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
-use crate::operations::math::{Reduce, ReduceOperation, ReductionKind};
+use crate::operations::math::reduce::{Reduce, ReduceOperation, ReductionKind};
 use crate::operations::sharding::ReshardOperation;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
+    TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
+};
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -1069,24 +1064,19 @@ mod tests {
         DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
         MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::forward::jvp;
-    use crate::differentiation::reverse::TransposableOperation;
+    use crate::differentiation::{TransposableOperation, jvp};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::Typed;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::TracingContext;
 
-    use super::LegacyBroadcastOperation as HomogeneousBroadcastOperation;
-    use super::*;
+    use super::{LegacyBroadcastOperation as HomogeneousBroadcastOperation, *};
 
     #[test]
     fn test_explicit_broadcast() {

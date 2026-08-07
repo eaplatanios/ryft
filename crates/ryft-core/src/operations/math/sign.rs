@@ -2,8 +2,7 @@ use crate::arrays::DataType;
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
-use crate::programs::ProgramError;
-use crate::programs::types::TypeError;
+use crate::programs::{ProgramError, TypeError};
 
 // TODO(eaplatanios): Review this module.
 
@@ -83,7 +82,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_type_inference,

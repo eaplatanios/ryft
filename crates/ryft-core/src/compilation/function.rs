@@ -13,12 +13,9 @@ use lru::LruCache;
 use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
-use crate::operations::constants::Constant;
+use crate::operations::Constant;
 use crate::parameters::{ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
-use crate::programs::operations::Operation;
-use crate::programs::regions::CalleeRegionDriver;
-use crate::programs::types::Typed;
-use crate::programs::{Program, ProgramError, Value};
+use crate::programs::{CalleeRegionDriver, Operation, Program, ProgramError, Typed, Value};
 use crate::tracing::{DomainTracingContext, Tracer};
 
 use super::contexts::CompilationDomain;
@@ -1541,11 +1538,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::Array;
-    use crate::compilation::{CompilationCacheDomain, CompilationContext};
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::RegionInterface;
-    use crate::programs::types::{Type, TypeError};
+    use crate::backends::Array;
+    use crate::compilation::contexts::{CompilationCacheDomain, CompilationContext};
+    use crate::programs::{Operation, RegionInterface, Type, TypeError};
 
     use super::*;
 

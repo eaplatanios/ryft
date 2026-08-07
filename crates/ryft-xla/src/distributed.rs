@@ -449,8 +449,10 @@ mod tests {
     use ryft_pjrt::{ClientOptions, CpuClientOptions, KeyValueStore, load_cpu_plugin};
     use sha2::{Digest, Sha256};
 
-    use super::{ARTIFACT_EXCHANGE_SCHEMA_VERSION, CompilationArtifactManifest};
-    use super::{DistributedCompilationArtifactExchange, DistributedRuntime};
+    use super::{
+        ARTIFACT_EXCHANGE_SCHEMA_VERSION, CompilationArtifactManifest, DistributedCompilationArtifactExchange,
+        DistributedRuntime,
+    };
 
     const PROCESS_TEST_ROLE: &str = "RYFT_DISTRIBUTED_EXCHANGE_TEST_ROLE";
     const PROCESS_TEST_ADDRESS: &str = "RYFT_DISTRIBUTED_EXCHANGE_TEST_ADDRESS";

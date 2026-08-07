@@ -4,7 +4,7 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::contexts::Context;
-use crate::operations::constants::Zero;
+use crate::operations::Zero;
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::types::Typed;
@@ -170,7 +170,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
 
     use super::*;
 

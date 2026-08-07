@@ -1,8 +1,10 @@
 use std::ops::Range;
 
-use crate::arrays::{ArrayType, DataType, Dimension, Layout, Tile, TileDimension, TiledLayout};
-use crate::programs::ProgramError;
-use crate::programs::types::TypeError;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::data::DataType;
+use crate::arrays::types::dimensions::Dimension;
+use crate::arrays::types::layouts::{Layout, Tile, TileDimension, TiledLayout};
+use crate::programs::{ProgramError, TypeError};
 
 /// Checked mapping from a static [`ArrayType`]'s logical indices to its storage addresses. Addressing includes both
 /// logical element offsets and physical byte ranges, and so it is broader than indexing alone. An array without an
@@ -763,8 +765,7 @@ mod tests {
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::arrays::types::layouts::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
-    use crate::programs::ProgramError;
-    use crate::programs::types::TypeError;
+    use crate::programs::{ProgramError, TypeError};
 
     use super::*;
 

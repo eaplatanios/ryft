@@ -5,9 +5,10 @@ use ryft_core::arrays::{ArrayType, DeviceMesh, MeshAxisType, Sharding, ShardingD
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
 
+use crate::arrays_v0::error::ArrayError;
 use crate::arrays_v0::transfers::{cross_host_global_device_id, exact_shard_transfer_key};
-use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
-use crate::{Array, ArrayError, Error as XlaError, ToPjrt};
+use crate::experimental::XlaDomainError;
+use crate::{Array, Error as XlaError, ToPjrt, XlaDomain, XlaOptions};
 
 /// Performs the compiled-XLA resharding path for [`Array::to_placement`](crate::Array::to_placement).
 ///

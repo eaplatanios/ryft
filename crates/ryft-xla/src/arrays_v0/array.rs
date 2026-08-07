@@ -5,12 +5,13 @@ use ryft_core::arrays::{ArrayType, DeviceMesh, Dimension, Shape, Sharding};
 use ryft_core::{Typed, check_sharding};
 use ryft_pjrt::{Buffer, DeviceId};
 
+use crate::arrays_v0::compiled_reshard;
+use crate::arrays_v0::error::ArrayError;
+use crate::arrays_v0::execution::ExecuteArguments;
 use crate::arrays_v0::host::materialize_dense_array_bytes;
-use crate::arrays_v0::{
-    DevicePutTarget, ExecuteArguments, compiled_reshard, copy_addressable_destination_shards_from_exact_source_shards,
-};
-use crate::experimental::domains::XlaDomain;
-use crate::{Array, ArrayError, ToMlir};
+use crate::arrays_v0::placement::DevicePutTarget;
+use crate::arrays_v0::transfers::copy_addressable_destination_shards_from_exact_source_shards;
+use crate::{Array, ToMlir, XlaDomain};
 
 impl<'o> Array<'o> {
     /// Moves or copies this array to the provided placement, **without** donating the source

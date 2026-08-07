@@ -1,7 +1,6 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
-use crate::macros::check_count;
-use crate::macros::define_arithmetic_dimension_operation;
-use crate::operations::math::{Mul, MulOperation};
+use crate::macros::{check_count, define_arithmetic_dimension_operation};
+use crate::operations::math::mul::{Mul, MulOperation};
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError};
 
@@ -50,7 +49,7 @@ mod tests {
 
     use crate::arrays::{DimensionBounds, DimensionValue};
     use crate::operations::dimensions::test_dimension_type;
-    use crate::operations::math::Mul;
+    use crate::operations::math::mul::Mul;
 
     use super::*;
 

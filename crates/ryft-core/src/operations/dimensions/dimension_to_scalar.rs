@@ -3,18 +3,17 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::arrays::{ArrayIrType, ArrayType, DataType, DimensionType};
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{
+    ArrayIrBatch, ArrayIrBatching, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::{ProjectedValue, Value};
+use crate::programs::{
+    Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
+};
 
 /// Canonical element type used when first-class dimensions become ordinary array data.
 ///
@@ -175,16 +174,15 @@ impl_non_transposable_operation!(DimensionToScalarOperation);
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
-    use crate::arrays::{DimensionBounds, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT};
-    use crate::backends::arrays::Array;
+    use crate::arrays::{
+        ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
+    };
+    use crate::backends::Array;
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::TransposableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::Effects;
-    use crate::programs::regions::{EmptyRegionDriver, RegionInterface};
+    use crate::programs::{Effects, EmptyRegionDriver, ProgramBuilder, RegionInterface};
     use crate::tracing::TracingContext;
 
     use super::*;

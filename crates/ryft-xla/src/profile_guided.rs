@@ -8,19 +8,16 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use ryft_core::arrays::ArrayIrValue;
-use ryft_core::arrays::{ArrayIrType, ArrayType};
+use ryft_core::arrays::{ArrayIrType, ArrayIrValue, ArrayType};
 use ryft_core::compilation::CompilationCacheDomain;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile;
 use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 
-use crate::Array;
-use crate::experimental::domains::{
-    XlaDomain, XlaDomainError, XlaFeedbackDirectedProfile, XlaLoweredProgram, XlaOptions,
-};
+use crate::experimental::XlaDomainError;
+use crate::experimental::domains::XlaLoweredProgram;
 use crate::experimental::ops::XlaConstant;
-use crate::jit::ExecutableXlaProgram;
+use crate::{Array, ExecutableXlaProgram, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions};
 
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
 

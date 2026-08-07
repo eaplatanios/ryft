@@ -9,15 +9,15 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::impl_differentiable_operation;
-use crate::operations::constants::IotaOperation;
-use crate::operations::manipulation::{LegacyBroadcast, Reshape, Slice, Transpose};
+use crate::operations::constants::iota::IotaOperation;
+use crate::operations::manipulation::broadcasting::LegacyBroadcast;
+use crate::operations::manipulation::reshaping::Reshape;
+use crate::operations::manipulation::slicing::Slice;
+use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -583,15 +583,14 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
     use crate::tracing::{DomainTracer, Trace};
 
     use super::*;

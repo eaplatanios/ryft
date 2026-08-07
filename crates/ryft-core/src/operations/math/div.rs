@@ -1,7 +1,6 @@
 use std::ops::{Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
 
-use crate::differentiation::DifferentiableType;
-use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
+use crate::differentiation::{DifferentiableType, ElementwiseDerivativeAlignment};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
@@ -115,7 +114,7 @@ mod tests {
     use crate::arrays::{
         ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiableOperation, DifferentiationDual, jvp};
     use crate::interpretation::InterpretableOperation;
@@ -123,9 +122,8 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::manipulation::ConvertElementType;
-    use crate::programs::atoms::MaybeZero;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::operations::manipulation::conversion::ConvertElementType;
+    use crate::programs::{EmptyRegionDriver, MaybeZero};
 
     use super::*;
 

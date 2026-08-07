@@ -9,12 +9,10 @@ use crate::differentiation::reverse::{ReverseModeDifferentiate, TransposableOper
 use crate::differentiation::types::{DenseDifferentiableType, DifferentiableType};
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
-use crate::operations::math::AddOperation;
+use crate::operations::AddOperation;
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::types::{Type, Typed};
-use crate::programs::values::Value;
+use crate::programs::{ProgramError, Type, Typed, Value};
 use crate::tracing::TracingContext;
 
 /// Jacobian of a function, represented as the Cartesian product of its output and input [`Parameter`] leaves. `I` and
@@ -1203,17 +1201,13 @@ mod tests {
 
     use crate::arrays::DataType::{F32, F64};
     use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
-    use crate::operations::compare::{Compare, ComparisonDirection};
-    use crate::operations::constants::ZeroLike;
-    use crate::operations::control_flow::Select;
-    use crate::operations::math::{Add, Sin};
+    use crate::operations::{Add, Compare, ComparisonDirection, Select, Sin, ZeroLike};
     use crate::parameters::{ParameterPath, Parameterized};
-    use crate::programs::types::Typed;
-    use crate::programs::values::Value;
+    use crate::programs::{Typed, Value};
 
     use super::*;
 

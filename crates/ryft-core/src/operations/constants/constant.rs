@@ -7,17 +7,14 @@ use crate::batching::{
     BatchingError, BatchingTracer,
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
-use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
-use crate::differentiation::types::DifferentiableType;
+use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueProjection,
+};
 use crate::tracing::Tracer;
 
 /// Canonical operation name for [`ConstantOperation`].
@@ -214,14 +211,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::atoms::{Atom, AtomId};
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{Atom, AtomId, EmptyRegionDriver, Operation, ProgramBuilder};
     use crate::tracing::DomainTracingContext;
 
     use super::*;

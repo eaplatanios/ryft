@@ -3,7 +3,7 @@ use std::fmt::Display;
 use crate::arrays::{ArrayIrType, ArrayType};
 use crate::batching::{ArrayBatch, ArrayBatching, ArrayIrBatching, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
-use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
@@ -11,12 +11,10 @@ use crate::macros::{
 };
 use crate::operations::constants::check_constructor_type_has_no_identity_references;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -225,14 +223,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder, ProgramError};
 
     use super::*;
 

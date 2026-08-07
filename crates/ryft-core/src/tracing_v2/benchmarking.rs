@@ -4,12 +4,9 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::differentiation::DifferentiationError;
-use crate::operations::math::{ADD_OPERATION_NAME, MUL_OPERATION_NAME};
+use crate::operations::{ADD_OPERATION_NAME, MUL_OPERATION_NAME};
 use crate::parameters::Parameterized;
-use crate::programs::operations::Operation;
-use crate::programs::regions::RegionRef;
-use crate::programs::types::Type;
-use crate::programs::{Atom, AtomId, Program, ProgramError, Value};
+use crate::programs::{Atom, AtomId, Operation, Program, ProgramError, RegionRef, Type, Value};
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]
@@ -536,9 +533,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::{Context, EagerContext, StagingContext};
-    use crate::operations::math::Sin;
+    use crate::operations::Sin;
     use crate::programs::Program;
 
     use super::*;

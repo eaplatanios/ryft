@@ -1,13 +1,12 @@
 use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
 
-use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{
+    DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
+};
 use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
 };
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::types::{Type, Typed};
+use crate::programs::{MaybeZero, ProgramError, Type, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -129,13 +128,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::differentiation::{jvp, value_and_gradient_holomorphic};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::manipulation::ConvertElementType;
+    use crate::operations::manipulation::conversion::ConvertElementType;
 
     use super::*;
 

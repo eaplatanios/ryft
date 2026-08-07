@@ -5,8 +5,7 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::parameters::Parameter;
-use crate::programs::identities::NoIdentity;
-use crate::programs::types::Type;
+use crate::programs::{NoIdentity, Type};
 
 /// Represents [`DataType`]-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]

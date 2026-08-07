@@ -49,30 +49,22 @@ use crate::batching::{
     BatchingDriver, BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::linear::ResidualZeroProvider;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallBatchingPolicy, TransposableOperation,
+    LinearCallBatchingPolicy, ResidualZeroProvider, TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::Zero;
-use crate::operations::manipulation::{LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation};
-use crate::operations::math::AddOperation;
-use crate::operations::math::DotOperation;
-use crate::operations::memory::TransferToMemoryOperation;
-use crate::operations::tag::TagOperation;
+use crate::operations::{
+    AddOperation, DotOperation, LegacyBroadcast, LegacyBroadcastOperation, TagOperation, TransferToMemoryOperation,
+    Transpose, TransposeOperation, Zero,
+};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::{Atom, AtomId};
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::instructions::InstructionId;
-use crate::programs::operations::Operation;
-use crate::programs::programs::Program;
-use crate::programs::regions::{Region, RegionId, RegionInterface, RegionSlot};
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueId};
+use crate::programs::{
+    Atom, AtomId, InstructionId, Operation, Program, ProgramBuilder, ProgramError, Region, RegionId, RegionInterface,
+    RegionSlot, Type, TypeError, Typed, Value, ValueId,
+};
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
 /// Higher-order operation used by checkpointing/rematerialization.
@@ -2147,15 +2139,13 @@ mod tests {
     use std::rc::Rc;
 
     use crate::arrays::{ArrayType, DataType, Dimension, Memory, Shape, ShardingDimension};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-    use crate::operations::control_flow::ScanOperation;
-    use crate::operations::math::{Cos, Dot, DotDimensionNumbers, Sin};
-    use crate::operations::tag::Tag;
+    use crate::operations::{Cos, Dot, DotDimensionNumbers, ScanOperation, Sin, Tag};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::regions::RegionRole;
+    use crate::programs::RegionRole;
 
     use super::*;
 
@@ -2349,8 +2339,7 @@ mod tests {
 
     #[test]
     fn test_condition_outputs_expose_all_possible_branch_producers() {
-        use crate::operations::control_flow::ConditionOperation;
-        use crate::operations::math::DotOperation;
+        use crate::operations::{ConditionOperation, DotOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 
@@ -2495,8 +2484,7 @@ mod tests {
 
     #[test]
     fn test_dots_saveable_saves_conditional_dot_residuals_for_both_predicates() {
-        use crate::operations::control_flow::ConditionOperation;
-        use crate::operations::math::{CosOperation, MulOperation, SinOperation};
+        use crate::operations::{ConditionOperation, CosOperation, MulOperation, SinOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 
@@ -2667,7 +2655,7 @@ mod tests {
 
     #[test]
     fn test_rematerialization_preserves_custom_vjp_semantics_and_keeps_the_boundary_opaque() {
-        use crate::tracing_v2::custom_vjp;
+        use crate::tracing_v2::custom_derivatives::custom_vjp;
 
         // The custom backward rule triples the true gradient (expressed through addition to avoid constant lifting),
         // so a matching gradient proves the user-authored rule — not the true derivative — governs reverse mode
@@ -2990,7 +2978,7 @@ mod tests {
     fn test_rematerialized_gradients_are_correct_through_batching() {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
-        use crate::operations::math::{Reduce, ReductionKind};
+        use crate::operations::{Reduce, ReductionKind};
 
         // `grad(vmap(rematerialize(f)))`: the gradient flows through the preserved batched call's derived backward
         // program and matches the analytic per-item gradients.
@@ -3192,7 +3180,7 @@ mod tests {
 
     #[test]
     fn test_second_order_reverse_through_rematerialization_matches_the_analytic_second_derivative() {
-        use crate::differentiation::hessian::HessianDifferentiate;
+        use crate::differentiation::HessianDifferentiate;
 
         // Second-order differentiation through a rematerialized call: the inner reverse pass replays the derived
         // backward program over tracers (inlining it into the gradient program), and the outer pass differentiates
@@ -3258,7 +3246,7 @@ mod tests {
 
     #[test]
     fn test_jacobian_reverse_through_rematerialization_uses_the_rematerializing_backward_program() {
-        use crate::differentiation::jacobian::jacobian_reverse;
+        use crate::differentiation::jacobian_reverse;
 
         // The Jacobian of elementwise `sin(x * x)` is the diagonal matrix `diag(cos(x²) * 2x)`;
         // `jacobian_reverse` exercises the batched replay of the derived backward program.
@@ -3433,7 +3421,7 @@ mod tests {
     fn test_offloaded_rematerialization_survives_batching_with_host_parked_saved_types() {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
-        use crate::operations::math::{Reduce, ReductionKind};
+        use crate::operations::{Reduce, ReductionKind};
 
         // `vmap` preserves the rematerialized call around batched programs, and the offloaded saved residual keeps
         // its host placement with the batch axis prepended to its shape.
@@ -3520,7 +3508,7 @@ mod tests {
 
     #[test]
     fn test_candidate_output_indices_are_producer_local_through_scan_provenance() {
-        use crate::operations::control_flow::ScanOperation;
+        use crate::operations::ScanOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 
@@ -3807,7 +3795,7 @@ mod tests {
     fn test_invalid_storage_operations_return_structured_errors() {
         use std::fmt::Display;
 
-        use crate::programs::effects::{Effect, Effects};
+        use crate::programs::{Effect, Effects};
 
         /// Malformed storage operation shape exercised by this test.
         #[derive(Copy, Clone, Debug)]
@@ -3928,7 +3916,7 @@ mod tests {
 
     #[test]
     fn test_effectful_residuals_are_force_saved_and_never_recomputed() {
-        use crate::operations::debugging::Print;
+        use crate::operations::Print;
 
         // The body prints its intermediate, so the linearized primal contains one ordered-I/O instruction whose
         // output is a residual. Recompute slices may only copy pure instructions, so the classification pass
@@ -3961,7 +3949,7 @@ mod tests {
 
     #[test]
     fn test_effect_force_saving_is_topological_so_later_residuals_recompute_from_upgraded_cuts() {
-        use crate::operations::debugging::Print;
+        use crate::operations::Print;
 
         // `p = print(x · x)` is force-saved (its slice is the non-pure print). `y = p * p` depends on `p`, but once
         // `p` is upgraded to a saved cut, `y`'s recompute slice terminates there and stays pure, so `y` is
@@ -3992,7 +3980,7 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_residual_candidates_expose_the_replayed_forward_producer() {
-        use crate::tracing_v2::custom_vjp;
+        use crate::tracing_v2::custom_derivatives::custom_vjp;
 
         // Phase 0 boundary pin: the custom-VJP *forward* program is replayed through the linearization, so the
         // declared residual's producing instruction is the replayed internal `cos` — not the opaque call — while the
@@ -4022,8 +4010,7 @@ mod tests {
 
     #[test]
     fn test_bounded_while_residual_candidates_classify_through_the_staged_loop() {
-        use crate::operations::compare::ComparisonDirection;
-        use crate::operations::control_flow::WhileOperation;
+        use crate::operations::{ComparisonDirection, WhileOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 

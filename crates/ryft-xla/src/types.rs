@@ -6,7 +6,7 @@ use ryft_pjrt::{
     TileDimension as PjrtTileDimension, TiledLayout as PjrtTiledLayout,
 };
 
-use crate::pjrt::{FromPjrt, ToPjrt};
+use crate::{FromPjrt, ToPjrt};
 
 impl ToPjrt for TileDimension {
     type Output = PjrtTileDimension;

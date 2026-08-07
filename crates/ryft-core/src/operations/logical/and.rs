@@ -68,13 +68,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::DataType;
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::forward::{DifferentiationTracer, jvp};
+    use crate::differentiation::{DifferentiationTracer, jvp};
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::compare::{Compare, ComparisonDirection};
-    use crate::operations::constants::{OneLike, ZeroLike};
-    use crate::operations::control_flow::Select;
+    use crate::operations::constants::one_like::OneLike;
+    use crate::operations::constants::zero_like::ZeroLike;
+    use crate::operations::control_flow::select::Select;
     use crate::programs::ProgramError;
 
     use super::*;

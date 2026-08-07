@@ -1,15 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
-use crate::arrays::LinearResiduals;
 use crate::arrays::{
-    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape, Sharding,
-    ShardingDimension,
+    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape,
+    Sharding, ShardingDimension,
 };
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
+    BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -19,20 +17,17 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::dimensions::DimensionSizeOperation;
+use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::gathering::references_auto_axis;
-use crate::operations::manipulation::{Permutation, Transpose, TransposeOperation};
+use crate::operations::manipulation::transposition::{Permutation, Transpose, TransposeOperation};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
@@ -1565,17 +1560,14 @@ mod tests {
         DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
         StridedLayout,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::Typed;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
 
     use super::*;
 

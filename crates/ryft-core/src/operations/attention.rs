@@ -10,16 +10,25 @@ use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::compare::{Compare, ComparisonDirection};
-use crate::operations::constants::{Fill, Iota, Zero, ZeroOperation};
-use crate::operations::control_flow::Select;
-use crate::operations::logical::And;
-use crate::operations::manipulation::{ConvertElementType, LegacyBroadcast, Reshape, Transpose};
-use crate::operations::math::{Add, Div, Dot, DotDimensionNumbers, Exp, Log, Mul, Reduce, ReductionKind, Sub};
+use crate::operations::constants::fill::Fill;
+use crate::operations::constants::iota::Iota;
+use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::control_flow::select::Select;
+use crate::operations::logical::and::And;
+use crate::operations::manipulation::broadcasting::LegacyBroadcast;
+use crate::operations::manipulation::conversion::ConvertElementType;
+use crate::operations::manipulation::reshaping::Reshape;
+use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::Add;
+use crate::operations::math::div::Div;
+use crate::operations::math::dot::{Dot, DotDimensionNumbers};
+use crate::operations::math::exp::Exp;
+use crate::operations::math::log::Log;
+use crate::operations::math::mul::Mul;
+use crate::operations::math::reduce::{Reduce, ReductionKind};
+use crate::operations::math::sub::Sub;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::{ProgramError, Value};
+use crate::programs::{Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value};
 use crate::tracing::DomainTracer;
 use crate::tracing_v2::{CustomVjp, custom_vjp};
 
@@ -2180,14 +2189,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DimensionBounds, DimensionVariable, ShardingDimension};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{BatchedProgram, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
     use crate::differentiation::value_and_gradient;
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
 
     use super::*;
 

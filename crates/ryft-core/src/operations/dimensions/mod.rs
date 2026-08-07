@@ -7,9 +7,7 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::Operation;
-use crate::programs::types::{Type, TypeError};
+use crate::programs::{Operation, Type, TypeError, TypeIdentityRenaming};
 
 // TODO(eaplatanios): Review this module.
 
@@ -224,10 +222,7 @@ fn test_dimension_type(name: &'static str, lower: usize, upper: usize) -> Dimens
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::programs::effects::{Effect, Effects};
-    use crate::programs::identities::TypeIdentityRenaming;
-    use crate::programs::operations::Operation;
-    use crate::programs::types::TypeError;
+    use crate::programs::{Effect, Effects, Operation, TypeError, TypeIdentityRenaming};
 
     use super::*;
 

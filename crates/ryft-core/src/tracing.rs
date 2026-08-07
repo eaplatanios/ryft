@@ -96,14 +96,10 @@ use crate::axes::NamedAxis;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::check_builders;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::ProgramError;
-use crate::programs::atoms::AtomId;
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::operations::Operation;
-use crate::programs::programs::Program;
-use crate::programs::regions::BindingRegionDriver;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{ProjectedValue, Value, ValueProjection};
+use crate::programs::{
+    AtomId, BindingRegionDriver, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Type, TypeError,
+    Typed, Value, ValueProjection,
+};
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
 /// [`Atom`](crate::Atom) or _poisoned_, meaning that it corresponds to an error.
@@ -877,18 +873,13 @@ mod tests {
 
     use crate::arrays::{ArrayType, DataType};
     use crate::axes::NamedAxes;
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::constants::{OneLike, OneOperation, ZeroLike, ZeroOperation};
-    use crate::operations::math::{AddOperation, NegOperation, Sin};
+    use crate::operations::{AddOperation, NegOperation, OneLike, OneOperation, Sin, ZeroLike, ZeroOperation};
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::atoms::AtomId;
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::RegionInterface;
-    use crate::programs::types::{TypeError, Typed};
+    use crate::programs::{AtomId, Operation, ProgramError, RegionInterface, TypeError, Typed};
 
     use super::*;
 

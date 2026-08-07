@@ -1,17 +1,14 @@
 use crate::arrays::DataType;
-use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::forward::DifferentiationDual;
-use crate::differentiation::types::DifferentiableType;
+use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
 };
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
-use crate::operations::constants::{OneLike, ZeroLike};
-use crate::operations::control_flow::Select;
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::types::{Type, TypeError, Typed};
+use crate::operations::constants::one_like::OneLike;
+use crate::operations::constants::zero_like::ZeroLike;
+use crate::operations::control_flow::select::Select;
+use crate::programs::{MaybeZero, ProgramError, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -188,7 +185,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::ArrayType;
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, jvp, value_and_gradient};
     use crate::interpretation::InterpretableOperation;
@@ -196,8 +193,8 @@ mod tests {
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::math::{Reduce, ReductionKind};
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::programs::EmptyRegionDriver;
 
     use super::*;
 

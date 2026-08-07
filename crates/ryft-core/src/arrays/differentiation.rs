@@ -1,18 +1,16 @@
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::operations::DimensionOperation;
-use crate::arrays::types::{ArrayIrType, ArrayType, Dimension, DimensionType, DimensionVariable, Shape};
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable, Shape};
+use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::Axis;
 use crate::batching::{ArrayBatching, ArrayBatchingPolicy, ArrayIrBatching, BatchingError};
 use crate::contexts::Context;
 use crate::differentiation::LinearCallBatchingPolicy;
-use crate::operations::constants::ConstantOperation;
-use crate::operations::dimensions::DimensionSizeOperation;
-use crate::operations::manipulation::Permutation;
-use crate::operations::math::{Reduce, ReduceOperation, ReductionKind};
-use crate::programs::ProgramError;
-use crate::programs::operations::OperationProjection;
-use crate::programs::types::Typed;
-use crate::programs::values::{Value, ValueProjection};
+use crate::operations::{
+    ConstantOperation, DimensionSizeOperation, Permutation, Reduce, ReduceOperation, ReductionKind,
+};
+use crate::programs::{OperationProjection, ProgramError, Typed, Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Ordered residual list accumulated by an extent-sensitive linearization rule (e.g., for slice, reshape, pad, reduce
@@ -330,9 +328,9 @@ mod tests {
     use crate::arrays::operations::ArrayIrOperation;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::DimensionBounds;
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::programs::types::TypeError;
+    use crate::programs::TypeError;
 
     use super::*;
 

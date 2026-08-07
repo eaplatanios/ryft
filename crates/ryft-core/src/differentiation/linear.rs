@@ -13,16 +13,12 @@ use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{Zero, ZeroOperation, ZeroOperationProvider};
+use crate::operations::{Zero, ZeroOperation, ZeroOperationProvider};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::{AtomId, MaybeZero};
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionSlot};
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::{
+    AtomId, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramBuilder, ProgramError,
+    RegionInterface, RegionSlot, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+};
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
 /// Differentiation-owned protocol through which an operation family materializes zeros whose runtime geometry must
@@ -1096,12 +1092,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
     use crate::arrays::{
-        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension,
+        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::tests::{
         ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue,
@@ -1109,16 +1104,12 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::DifferentiationError;
     use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
-    use crate::operations::constants::zero_like::ZeroLikeOperation;
-    use crate::operations::math::{AddOperation, MulOperation};
+    use crate::operations::{AddOperation, MulOperation, ZeroLikeOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::ProgramError;
-    use crate::programs::atoms::MaybeZero;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::Effects;
-    use crate::programs::programs::Program;
-    use crate::programs::regions::{RegionDriver, RegionRef, RegionSlot};
+    use crate::programs::{
+        Effects, MaybeZero, Program, ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionSlot,
+    };
     use crate::tracing::TracingContext;
 
     use super::*;

@@ -10,14 +10,15 @@ use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::operations::compare::{Compare, ComparisonDirection};
-use crate::operations::constants::{Fill, Iota, One, Zero};
-use crate::operations::control_flow::Select;
+use crate::operations::constants::fill::Fill;
+use crate::operations::constants::iota::Iota;
+use crate::operations::constants::one::One;
+use crate::operations::constants::zero::Zero;
+use crate::operations::control_flow::select::Select;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
+use crate::programs::{
+    Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming,
+};
 
 // TODO(eaplatanios): Review this.
 
@@ -277,13 +278,12 @@ mod tests {
 
     use crate::arrays::DataType::{Boolean, F6E2M3FN, F6E3M2FN, F8E8M0FNU, F32, I32};
     use crate::arrays::{ArrayType, Dimension, DimensionBounds, DimensionVariable, Shape, f6e2m3fn, f6e3m2fn};
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::contexts::EagerContext;
     use crate::differentiation::{jacobian_forward, jacobian_reverse};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_type_inference;
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, Operation};
 
     use super::*;
 

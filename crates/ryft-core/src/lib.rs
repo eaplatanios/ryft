@@ -81,12 +81,9 @@ pub(crate) mod tests {
     };
     use crate::contexts::Context;
     use crate::macros::check_count;
-    use crate::programs::effects::{Effect, Effects};
-    use crate::programs::operations::Operation;
-    use crate::programs::programs::Program;
-    use crate::programs::regions::{RegionDriver, RegionInterface, RegionRef, RegionSlot};
-    use crate::programs::types::TypeError;
-    use crate::programs::values::Value;
+    use crate::programs::{
+        Effect, Effects, Operation, Program, RegionDriver, RegionInterface, RegionRef, RegionSlot, TypeError, Value,
+    };
 
     /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`](crate::Region) machinery
     /// (i.e., construction, interning and sharing, interface derivation, validation, effects propagation, rendering,

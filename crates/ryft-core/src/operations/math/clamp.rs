@@ -1,4 +1,5 @@
-use crate::operations::math::{Max, Min};
+use crate::operations::math::max::Max;
+use crate::operations::math::min::Min;
 use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
@@ -31,9 +32,9 @@ impl<V: Max + Min> Clamp for V {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::differentiation::value_and_gradient;
-    use crate::operations::constants::OneLike;
+    use crate::operations::constants::one_like::OneLike;
 
     use super::*;
 

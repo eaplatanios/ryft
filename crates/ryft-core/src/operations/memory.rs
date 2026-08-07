@@ -19,10 +19,9 @@ use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+};
 
 // TODO(eaplatanios): Review this.
 
@@ -232,12 +231,12 @@ mod tests {
     use approx::assert_abs_diff_eq;
 
     use crate::arrays::{DataType, Dimension, Shape};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{jvp, value_and_gradient, vjp};
-    use crate::operations::math::{Dot, DotDimensionNumbers};
-    use crate::programs::types::Typed;
+    use crate::operations::math::dot::{Dot, DotDimensionNumbers};
+    use crate::programs::Typed;
     use crate::tracing::Trace;
 
     use super::*;

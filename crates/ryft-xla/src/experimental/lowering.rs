@@ -11,8 +11,7 @@ use ryft_core::arrays::{
     LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
 };
 use ryft_core::axes::AxisIndexOperation;
-use ryft_core::backends::arrays::Array as CpuArray;
-use ryft_core::backends::arrays::ArrayOperation;
+use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
 use ryft_core::captures::CaptureReference;
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{
@@ -59,6 +58,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
+use crate::ToMlir;
 use crate::experimental::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_ADD_KIND, ASSERT_BOUNDS_KIND, ASSERT_CONCATENATE_KIND, ASSERT_CUSTOM_CALL_TARGET,
     ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_FLOOR_KIND, ASSERT_DIVISIBLE_BY_KIND, ASSERT_EQUAL_KIND, ASSERT_KIND_ATTRIBUTE,
@@ -67,7 +67,6 @@ use crate::experimental::assertions::{
 };
 use crate::experimental::debugging::{PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE};
 use crate::experimental::ops::{FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};
-use crate::mlir::ToMlir;
 
 use super::shard_map::{ShardMap, ShardMapError};
 
@@ -8516,13 +8515,11 @@ mod tests {
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
 
-    use ryft_core::arrays::DimensionOperation;
     use ryft_core::arrays::{
-        Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension, i1, i2, i4, u1, u2, u4,
+        Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension, i1, i2, i4, u1, u2, u4,
     };
-    use ryft_core::backends::arrays::Array as CpuArray;
-    use ryft_core::backends::arrays::ArrayOperation;
+    use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
     use ryft_core::contexts::Context;
     use ryft_core::differentiation::ReverseModeDifferentiate;
     use ryft_core::operations::compare::CompareOperation;

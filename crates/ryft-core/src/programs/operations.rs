@@ -1,10 +1,11 @@
 use crate::parameters::Parameterized;
+use crate::programs::ProgramError;
 use crate::programs::effects::Effects;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot};
 use crate::programs::types::{Type, TypeError};
-use crate::programs::{ProgramError, Value};
+use crate::programs::values::Value;
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
 /// If the length exceeds this value, then the section contents will be rendered over multiple lines.
@@ -822,8 +823,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayIrType, ArrayType, DataType};
-    use crate::backends::arrays::Array;
-    use crate::operations::differentiation::StopGradientOperation;
+    use crate::backends::Array;
+    use crate::operations::StopGradientOperation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::Effect;

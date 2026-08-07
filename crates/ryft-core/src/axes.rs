@@ -10,22 +10,20 @@ use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
-use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
-use crate::differentiation::linear::ResidualZeroProvider;
-use crate::differentiation::types::DifferentiableType;
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, ResidualZeroProvider,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::constants::IotaOperation;
-use crate::operations::manipulation::{LegacyBroadcastOperation, TransposeOperation};
+use crate::operations::{IotaOperation, LegacyBroadcastOperation, TransposeOperation};
 use crate::parameters::Parameter;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
-use crate::programs::ProgramError;
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError, Value,
+    ValueProjection,
+};
 use crate::tracing::{NestedTracingContext, TracingContext};
 
 /// Represents axis-related errors.
@@ -549,10 +547,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType, Dimension, Shape};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{Batch, BatchAxis, BatchAxisSpecification, BatchingError, batch};
     use crate::contexts::EagerContext;
-    use crate::programs::types::Typed;
+    use crate::programs::Typed;
     use crate::tracing::DomainTracingContext;
 
     use super::*;

@@ -43,60 +43,44 @@ use crate::operations::attention::{
     AttentionMask, DotProductAttention, DotProductAttentionBackward, DotProductAttentionBackwardOperation,
     DotProductAttentionOperation, dot_product_attention_backward_composition, dot_product_attention_composition,
 };
-use crate::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, CollectiveOperation, PSumScatterOperation, PpermuteOperation,
-};
-use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
+use crate::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation, PpermuteOperation};
 use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
 };
-use crate::operations::constants::{
-    ConstantOperation, IOTA_OPERATION_NAME, IotaOperation, One, OneLike, OneLikeOperation, OneOperation, Zero,
-    ZeroLike, ZeroLikeOperation, ZeroOperation,
-};
-use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
-use crate::operations::debugging::PrintOperation;
-use crate::operations::differentiation::{CoordinateBasisOperation, StopGradient, StopGradientOperation};
-use crate::operations::dimensions::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize};
-use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
-use crate::operations::manipulation::conversion::ElementType;
-use crate::operations::manipulation::{
-    Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation, DynamicSlice,
-    DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Gather, GatherOperation, GatherScatterMode,
-    LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Pad, PadOperation, Permutation, Reshape,
-    ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation, Transpose,
-    TransposeOperation, UpdateSlice, UpdateSliceOperation,
-};
 use crate::operations::math::erf::erf_f64;
 use crate::operations::math::reduce::reduce_abstract;
-use crate::operations::math::{
-    Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
-    DivOperation, Dot, DotDimensionNumbers, DotOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation,
-    Log, LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
-    NegOperation, Pow, PowOperation, Reduce, ReduceOperation, ReductionKind, Rem, RemOperation, Round, RoundOperation,
-    Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, Sign, SignOperation, Sin, SinOperation, Sqrt, SqrtOperation,
-    Sub, SubOperation, Tanh, TanhOperation, scaled_dot_composition,
-};
-use crate::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::operations::random::{
     RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation, philox_u32_words, philox_u64_words, threefry_u32_words,
     threefry_u64_words,
 };
-use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use crate::operations::sort::{
     ArgMax, ArgMin, Sort, SortDirection, SortOperation, TopK, extremal_index_from_index_passenger, sort_permutation,
     top_k_from_index_passenger, top_k_via_squeezed_view,
 };
-use crate::operations::tag::{Tag, TagOperation};
+use crate::operations::{
+    Abs, AbsOperation, Add, AddOperation, And, AndOperation, Atan2, Atan2Operation, Ceil, CeilOperation,
+    CollectiveOperation, Compare, CompareOperation, ComparisonDirection, Concatenate, ConcatenateOperation,
+    ConditionOperation, ConstantOperation, ConvertElementType, ConvertElementTypeOperation, CoordinateBasisOperation,
+    Cos, CosOperation, DIMENSION_SIZE_OPERATION_NAME, DimensionSize, Div, DivOperation, Dot, DotDimensionNumbers,
+    DotOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType,
+    Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, GatherScatterMode,
+    IOTA_OPERATION_NAME, IotaOperation, LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Log,
+    LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
+    NegOperation, Not, NotOperation, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation,
+    Permutation, Pow, PowOperation, PrintOperation, Reduce, ReduceOperation, ReductionKind, Rem, RemOperation, Reshape,
+    ReshapeParameters, ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation,
+    ScanOperation, Scatter, ScatterOperation, ScatterReductionKind, Select, SelectOperation,
+    ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation,
+    StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation, Tanh, TanhOperation, TransferToMemory,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
+    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, scaled_dot_composition,
+};
 use crate::parameters::Parameter;
-use crate::programs::ProgramError;
-use crate::programs::operations::Operation;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::{Concretizable, Value};
+use crate::programs::{Concretizable, Operation, ProgramError, TypeError, Typed, Value};
 use crate::tracing::TracingContext;
+use crate::tracing_v2::RematerializeOperation;
 use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
-use crate::tracing_v2::rematerialization::RematerializeOperation;
 
 /// Backend execution contract for broadcasting to an already-concrete [`ArrayType`].
 ///
@@ -4512,9 +4496,7 @@ mod tests {
         f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
     };
     use crate::operations::complex::Complex;
-    use crate::operations::constants::{Fill, Iota};
-    use crate::operations::manipulation::{GatherDimensionNumbers, ScatterDimensionNumbers};
-    use crate::operations::sharding::{ConstrainSharding, Reshard};
+    use crate::operations::{ConstrainSharding, Fill, GatherDimensionNumbers, Iota, Reshard, ScatterDimensionNumbers};
 
     use super::*;
 
@@ -5598,7 +5580,7 @@ mod tests {
 
     #[test]
     fn test_array_while_predicate() {
-        use crate::operations::control_flow::WhilePredicate;
+        use crate::operations::WhilePredicate;
 
         let predicate = Array::vector(vec![false, true]);
         assert_eq!(predicate.any_true(), Ok(true));

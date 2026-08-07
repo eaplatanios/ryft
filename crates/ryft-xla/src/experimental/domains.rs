@@ -9,17 +9,11 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use prost::Message;
-use ryft_pjrt::protos::CompilationOptions;
-use ryft_pjrt::{Buffer, Client, Execution, LoadOptions, LoadedExecutable, Program as PjrtProgram, Value as PjrtValue};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
 use ryft_core::InterpretationDriver;
-use ryft_core::arrays::ArrayIrValue;
 use ryft_core::arrays::{
-    ArrayIrType, ArrayType, DataType, Device, DeviceId, DeviceMesh, Dimension, DimensionBounds, DimensionOperation,
-    DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape,
-    Sharding, ShardingDimension, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
+    ArrayIrType, ArrayIrValue, ArrayType, DataType, Device, DeviceId, DeviceMesh, Dimension, DimensionBounds,
+    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+    MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
 };
 #[cfg(test)]
 use ryft_core::backends::arrays::Array as ReferenceArray;
@@ -44,18 +38,22 @@ use ryft_core::programs::regions::BindingRegionDriver;
 use ryft_core::programs::types::{Type, TypeError, TypeRefinements, Typed};
 use ryft_core::programs::{ProgramError, ValueProjection};
 use ryft_core::tracing::DomainTracer;
+use ryft_pjrt::protos::CompilationOptions;
+use ryft_pjrt::{Buffer, Client, Execution, LoadOptions, LoadedExecutable, Program as PjrtProgram, Value as PjrtValue};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::lowering::XlaExecutableSignature;
-use super::operations::ShardMapOperation;
 use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
 use super::shard_map::ShardMapTraceError;
 use crate::arrays::ArrayTypeExtension;
 use crate::arrays_v0::host::{DenseArrayHostCopy, begin_materialize_dense_array_bytes, materialize_dense_array_bytes};
 use crate::arrays_v0::{
-    ArrayError, BoundedMaterializationKey, BoundedMaterializationProbe, BoundedMaterializationProducer,
-    BoundedMaterializationWaiter, ShardDescriptor, ShardLayout,
+    BoundedMaterializationKey, BoundedMaterializationProbe, BoundedMaterializationProducer,
+    BoundedMaterializationWaiter,
 };
-use crate::{Array, Error, FromPjrt, ToPjrt};
+use crate::experimental::operations::ShardMapOperation;
+use crate::{Array, ArrayError, Error, FromPjrt, ShardDescriptor, ShardLayout, ToPjrt};
 
 /// Error type returned by [`XlaDomain`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]

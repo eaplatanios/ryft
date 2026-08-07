@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
+use crate::arrays::sharding::ShardingError;
+use crate::arrays::sharding::meshes::DeviceId;
+use crate::arrays::sharding::shardings::Sharding;
 use crate::utilities::colors::Color;
-
-use super::{DeviceId, Sharding, ShardingError};
 
 /// Minimum width in characters for each cell in a rendered [`Sharding`] visualization grid. Cells expand beyond this
 /// minimum when device labels (e.g., `"0,1,2"`) plus padding exceed it.
@@ -267,7 +268,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::sharding::shardings::ShardingDimension;
 
     use super::*;
 

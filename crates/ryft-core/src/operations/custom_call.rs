@@ -8,15 +8,12 @@ use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, Batch
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::dimensions::DimensionSize;
+use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::effects::{Effect, Effects};
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    Effect, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueProjection,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -644,16 +641,13 @@ mod tests {
         DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
         ShardingDimension,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::array_ir::ArrayIrBatching;
-    use crate::batching::{BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy};
+    use crate::backends::{Array, ArrayOperation};
+    use crate::batching::{ArrayIrBatching, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
-    use crate::differentiation::DifferentiationError;
-    use crate::differentiation::reverse::TransposableOperation;
+    use crate::differentiation::{DifferentiationError, TransposableOperation};
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
     use crate::tracing::{DomainTracer, Trace, TracingContext};
 
     use super::*;

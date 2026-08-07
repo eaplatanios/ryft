@@ -553,12 +553,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::operations::math::{AddOperation, NegOperation};
+    use crate::backends::{Array, ArrayOperation};
+    use crate::operations::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
-    use crate::programs::TypeError;
     use crate::programs::instructions::InstructionId;
     use crate::programs::regions::RegionSlot;
+    use crate::programs::types::TypeError;
     use crate::programs::values::ValueId;
     use crate::tests::TestRegionOperation;
 

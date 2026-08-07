@@ -1,9 +1,8 @@
 use std::ops::Range;
 
-use ryft_pjrt::Event;
-
 use ryft_core::Typed;
 use ryft_core::arrays::ArrayType;
+use ryft_pjrt::Event;
 
 use crate::arrays::ArrayTypeExtension;
 use crate::{Array, Error as XlaError, ToPjrt};

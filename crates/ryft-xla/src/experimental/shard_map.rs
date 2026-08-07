@@ -2,15 +2,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 
-#[cfg(test)]
-use ryft_mlir::Block;
-use ryft_mlir::Context as MlirContext;
-use ryft_mlir::dialects::shardy::{
-    DimensionShardingAttributeRef, ManualAxesAttributeRef, ReductionOperation, TensorShardingAttributeRef,
-    TensorShardingPerValueAttributeRef,
-};
-use thiserror::Error;
-
 use ryft_core::arrays::{
     ArrayIrType, ArrayType, Dimension, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
 };
@@ -25,6 +16,14 @@ use ryft_core::programs::operations::Operation;
 use ryft_core::programs::types::Typed;
 use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError, ProjectedValue, Value, ValueProjection};
 use ryft_core::tracing::DomainTracingContext;
+#[cfg(test)]
+use ryft_mlir::Block;
+use ryft_mlir::Context as MlirContext;
+use ryft_mlir::dialects::shardy::{
+    DimensionShardingAttributeRef, ManualAxesAttributeRef, ReductionOperation, TensorShardingAttributeRef,
+    TensorShardingPerValueAttributeRef,
+};
+use thiserror::Error;
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::operations::ShardMapOperation;
@@ -2072,9 +2071,8 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
-    use crate::mlir::ToMlir;
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, FromPjrt};
+    use crate::{Array, FromPjrt, ToMlir};
     use ryft_core::arrays::{
         DataType, Device, DeviceMesh, DimensionBounds, DimensionVariable, MeshAxis, MeshAxisType, Sharding,
         ShardingDimension,

@@ -114,16 +114,12 @@ use std::rc::Rc;
 
 use crate::interpretation::{EagerInterpretationDriver, InterpretableOperation};
 use crate::macros::check_builders;
-use crate::operations::constants::ConstantOperation;
+use crate::operations::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::ProgramError;
-use crate::programs::atoms::AtomId;
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::programs::Program;
-use crate::programs::regions::BindingRegionDriver;
-use crate::programs::types::{Type, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    AtomId, BindingRegionDriver, Operation, OperationProjection, Program, ProgramBuilder, ProgramError, Type, Typed,
+    Value, ValueProjection,
+};
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
 /// Type/value universe at the core of Ryft that is used by program interpretation, tracing, and transformations like
@@ -728,28 +724,22 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::differentiation::forward::{
-        DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,
+    use crate::backends::{Array, ArrayOperation};
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+        DifferentiationTracer, TransposableOperation, TranspositionDriver,
     };
-    use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
-    use crate::differentiation::{DifferentiableType, DifferentiationError};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::constants::{OneOperation, ZeroOperation};
-    use crate::operations::control_flow::WhileOperation;
-    use crate::operations::math::{AddOperation, NegOperation};
+    use crate::operations::{
+        AddOperation, CompareOperation, ComparisonDirection, NegOperation, OneOperation, WhileOperation, ZeroOperation,
+    };
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::{PartialTracer, PartialValue};
-    use crate::programs::ProgramError;
-    use crate::programs::atoms::{Atom, AtomId, MaybeZero};
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::identities::NoIdentity;
-    use crate::programs::operations::OperationProjection;
-    use crate::programs::regions::{CalleeRegionDriver, RegionInterface};
-    use crate::programs::types::{Type, TypeError, Typed};
-    use crate::programs::values::{ProjectedValue, ValueProjection};
+    use crate::programs::{
+        Atom, AtomId, CalleeRegionDriver, MaybeZero, NoIdentity, OperationProjection, ProgramBuilder, ProgramError,
+        ProjectedValue, RegionInterface, Type, TypeError, Typed, ValueProjection,
+    };
     use crate::tracing::{DomainTracingContext, Tracer, TracerState, TracingContext};
 
     use super::*;

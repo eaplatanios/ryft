@@ -13,16 +13,16 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::constants::{Zero, ZeroOperation};
-use crate::operations::manipulation::{LegacyBroadcast, Reshape, Slice, Transpose, UpdateSlice};
+use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::manipulation::broadcasting::LegacyBroadcast;
+use crate::operations::manipulation::reshaping::Reshape;
+use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
+use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
@@ -884,9 +884,9 @@ mod tests {
         DataType, Dimension, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
         StridedLayout,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::Context;
-    use crate::differentiation::jacobian::jacobian_forward;
+    use crate::differentiation::jacobian_forward;
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,

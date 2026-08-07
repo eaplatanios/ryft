@@ -6,11 +6,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::operations::Operation;
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
-use crate::programs::values::Value;
+use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Value};
 
 /// Canonical operation name for [`ZeroLikeOperation`].
 pub const ZERO_LIKE_OPERATION_NAME: &str = "zero_like";
@@ -112,14 +108,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::contexts::EagerContext;
-    use crate::differentiation::jacobian::jacobian_reverse;
+    use crate::differentiation::jacobian_reverse;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder};
 
     use super::*;
 

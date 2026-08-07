@@ -1,7 +1,6 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
-use crate::macros::check_count;
-use crate::macros::define_arithmetic_dimension_operation;
-use crate::operations::math::{Add, AddOperation};
+use crate::macros::{check_count, define_arithmetic_dimension_operation};
+use crate::operations::math::add::{Add, AddOperation};
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError};
 

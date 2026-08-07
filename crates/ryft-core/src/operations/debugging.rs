@@ -6,12 +6,9 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::effects::{Effect, Effects};
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
-use crate::programs::values::Value;
+use crate::programs::{
+    Effect, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Value,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -161,10 +158,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::value_and_gradient;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::EmptyRegionDriver;
     use crate::tracing::{DomainTracer, Trace};
 
     use super::*;

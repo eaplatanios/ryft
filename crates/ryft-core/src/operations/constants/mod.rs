@@ -15,9 +15,7 @@ pub use zero::{ZERO_OPERATION_NAME, Zero, ZeroOperation, ZeroOperationProvider};
 pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 
 use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
-use crate::programs::identities::TypeIdentityPosition;
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
+use crate::programs::{RegionInterface, Type, TypeError, TypeIdentityPosition};
 
 /// Rejects a nullary constructor output [`Type`] that carries an ungrounded [`TypeIdentity`](crate::TypeIdentity)
 /// reference. A reference-position identity in a constructed-from-nothing type names a runtime quantity that no operand
@@ -89,7 +87,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DataType, DimensionBounds, DimensionVariable, Shape};
-    use crate::programs::types::TypeError;
+    use crate::programs::TypeError;
 
     use super::*;
 

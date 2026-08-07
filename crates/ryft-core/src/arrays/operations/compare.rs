@@ -4,11 +4,13 @@
 //! data, so the array universe answers the comparison contract at both the dimension member level and the composite
 //! level.
 
-use crate::arrays::{ArrayIrValue, ArrayType, DimensionType, DimensionValue};
-use crate::backends::arrays::Array;
-use crate::operations::compare::{Compare, ComparisonDirection};
-use crate::programs::ProgramError;
-use crate::programs::values::{Value, ValueProjection};
+use crate::arrays::dimensions::DimensionValue;
+use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::dimensions::DimensionType;
+use crate::backends::Array;
+use crate::operations::{Compare, ComparisonDirection};
+use crate::programs::{ProgramError, Value, ValueProjection};
 
 impl Compare<Array> for DimensionValue {
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Array, ProgramError> {

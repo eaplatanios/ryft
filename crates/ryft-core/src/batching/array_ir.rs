@@ -12,24 +12,26 @@ use ryft_macros::Parameter;
 
 use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Sharding};
 use crate::axes::{Axis, NamedAxes, NamedAxis};
-use crate::batching::arrays::{batch_axis_sharding, normalized_batch_axis_type};
+use crate::batching::arrays::{
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, DimensionSource, batch_axis_sharding, normalized_batch_axis_type,
+};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchAxisSpecification, BatchableOperation,
-    BatchableType, BatchedProgram, BatchingContext, BatchingEntrypointPolicy, BatchingError, BatchingPolicy,
-    BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DimensionSource,
-    ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
+    BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedProgram, BatchingContext,
+    BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BatchingPolicyProjection, BatchingTracer,
+    BoundaryPreservingBatchedProgram, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver,
+    RecursiveBatchingPolicy,
 };
 use crate::contexts::{Context, ProjectedContext, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
-use crate::operations::constants::ConstantOperation;
-use crate::operations::dimensions::{DimensionRequirementOperation, DimensionSizeOperation};
-use crate::operations::manipulation::{BroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::{
+    BroadcastOperation, ConstantOperation, DimensionRequirementOperation, DimensionSizeOperation, Transpose,
+    TransposeOperation,
+};
 use crate::parameters::{Parameter, Placeholder};
-use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::regions::{RegionRef, RegionReplayMappings, ReplayRegionDriver};
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{ProjectedValue, Value, ValueProjection};
-use crate::programs::{Program, ProgramError};
+use crate::programs::{
+    Operation, OperationProjection, Program, ProgramError, ProjectedValue, RegionRef, RegionReplayMappings,
+    ReplayRegionDriver, Type, TypeError, Typed, Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -1010,11 +1012,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::ArrayIrValue;
     use crate::arrays::{
-        DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Shape, ShardingDimension,
+        ArrayIrOperation, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Shape,
+        ShardingDimension,
     };
-    use crate::backends::arrays::Array;
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{
         Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, InterpretableBatchableOperation,
         RecursiveBatchingPolicy, batch,
@@ -1024,22 +1026,16 @@ mod tests {
     use crate::operations::collectives::{
         AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions, PSumScatterOperation,
     };
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::constants::{IotaOperation, OneOperation, ZeroOperation};
-    use crate::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
-    use crate::operations::dimensions::{
-        DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionToScalar,
-        DimensionToScalarOperation,
-    };
-    use crate::operations::manipulation::{ConcatenateOperation, PadOperation, ReshapeOperation};
-    use crate::operations::math::{AddOperation, NegOperation};
     use crate::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
-    use crate::operations::{CollectiveKind, CollectiveOperation};
+    use crate::operations::{
+        AddOperation, CollectiveKind, CollectiveOperation, CompareOperation, ComparisonDirection, ConcatenateOperation,
+        ConditionOperation, DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
+        DimensionToScalar, DimensionToScalarOperation, IotaOperation, NegOperation, OneOperation, PadOperation,
+        ReshapeOperation, ScanOperation, SelectOperation, WhileOperation, ZeroOperation,
+    };
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramBuilder;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
     use crate::tracing::TracingContext;
-    use crate::{ArrayIrOperation, ArrayOperation};
 
     use super::*;
 

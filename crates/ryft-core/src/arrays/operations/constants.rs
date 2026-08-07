@@ -7,25 +7,24 @@
 //! the residual-aware zero construction that differentiation uses to rebuild a disconnected cotangent.
 
 use crate::arrays::differentiation::ExactShape;
-use crate::arrays::{
-    ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionError, DimensionType, DimensionValue,
-    DimensionVariable, Shape,
-};
-use crate::backends::arrays::ArrayOperation;
+use crate::arrays::dimensions::DimensionValue;
+use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::operations::ArrayIrOperation;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
+use crate::arrays::types::ir::ArrayIrType;
+use crate::backends::ArrayOperation;
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::differentiation::ResidualZeroProvider;
 use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
-use crate::operations::constants::{
-    Iota, IotaOperation, One, OneOperation, ZERO_OPERATION_NAME, Zero, ZeroOperation, ZeroOperationProvider,
-    check_constructor_type_has_no_identity_references, infer_dynamic_constructor_output_types,
+use crate::operations::{
+    DimensionSizeOperation, Iota, IotaOperation, One, OneOperation, ZERO_OPERATION_NAME, Zero, ZeroOperation,
+    ZeroOperationProvider, check_constructor_type_has_no_identity_references, infer_dynamic_constructor_output_types,
 };
-use crate::operations::dimensions::DimensionSizeOperation;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{MemberOperation, Operation};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
-use crate::programs::{AtomId, ProgramBuilder, ProgramError};
+use crate::programs::{
+    AtomId, MemberOperation, Operation, ProgramBuilder, ProgramError, RegionInterface, TypeError, TypeIdentityRenaming,
+    Typed, Value, ValueProjection,
+};
 
 macro_rules! impl_dynamic_constructor_member_operation {
     // Implements the shared mixed array IR boundary for one canonical homogeneous constructor payload.
@@ -392,16 +391,16 @@ where
 
 #[cfg(test)]
 mod tests {
-
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{
-        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable, Shape,
-    };
-
-    use crate::backends::arrays::{Array, ArrayOperation};
-
+    use crate::arrays::dimensions::DimensionValue;
+    use crate::arrays::ir::ArrayIrValue;
+    use crate::arrays::operations::ArrayIrOperation;
+    use crate::arrays::types::arrays::ArrayType;
+    use crate::arrays::types::data::DataType;
+    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
+    use crate::arrays::types::ir::ArrayIrType;
+    use crate::backends::{Array, ArrayOperation};
     use crate::compilation::{
         CallRequest, CompilationDomain, CompilationTracer, CompileRequest, CompiledFunction, FlatCompilationProgram,
         JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, try_jit,
@@ -412,21 +411,10 @@ mod tests {
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
-
-    use crate::operations::constants::ZeroOperation;
-
-    use crate::operations::differentiation::StopGradientOperation;
-
-    use crate::operations::manipulation::BroadcastOperation;
-
+    use crate::operations::{BroadcastOperation, StopGradientOperation, ZeroOperation};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::builders::ProgramBuilder;
-
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::Typed;
-
-    use crate::programs::{AtomId, MaybeZero, ProgramError};
+    use crate::programs::{AtomId, EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -454,7 +442,7 @@ mod tests {
         }
     }
 
-    impl crate::contexts::Domain for RetainedJitDomain {
+    impl Domain for RetainedJitDomain {
         type Type = ArrayIrType;
         type Value = ArrayIrValue<Array>;
         type Constant = crate::captures::CaptureReference<ArrayIrType>;

@@ -11,19 +11,18 @@ use crate::arrays::{
     ArrayIrType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
 };
 use crate::axes::Axis;
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{
+    ArrayIrBatch, ArrayIrBatching, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{ProjectedValue, Value};
+use crate::programs::{
+    Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -297,16 +296,12 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
-    use crate::arrays::{DataType, DimensionBounds, Shape};
-    use crate::backends::arrays::Array;
+    use crate::arrays::{ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, Shape};
+    use crate::backends::Array;
     use crate::contexts::{Context, EagerContext};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::effects::Effects;
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::RegionInterface;
-    use crate::programs::{ProgramBuilder, TypeIdentityRenaming};
+    use crate::programs::{Effects, Operation, ProgramBuilder, RegionInterface, TypeIdentityRenaming};
     use crate::tracing::TracingContext;
 
     use super::*;

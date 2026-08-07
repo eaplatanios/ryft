@@ -16,8 +16,7 @@ use crate::compilation::exchange::{
 };
 use crate::contexts::Domain;
 use crate::parameters::Parameterized;
-use crate::programs::ProgramError;
-use crate::programs::types::Type;
+use crate::programs::{ProgramError, Type};
 
 use super::function::{
     CallRequest, CompileRequest, CompiledFunction, ExecutableProgram, LoweredFunction, LoweringRequest, StageRequest,
@@ -1223,15 +1222,13 @@ impl<D: CompilationCacheDomain> Default for CompilationContext<D> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use std::sync::mpsc;
-    use std::sync::{Condvar, Mutex};
+    use std::sync::{Barrier, Condvar, Mutex, mpsc};
     use std::thread;
     use std::time::Duration;
 
     use crate::arrays::ArrayType;
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
 

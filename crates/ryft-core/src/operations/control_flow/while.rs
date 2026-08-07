@@ -14,10 +14,10 @@ use std::marker::PhantomData;
 
 use crate::arrays::{ArrayIrType, ArrayType, DataType, DimensionOperation, DimensionType, DimensionValue};
 use crate::axes::Axis;
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
+use crate::batching::array_ir::align_array_batch;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
-    BatchingDriver, BatchingError, BatchingTracer, ProgramBatchingOutputAxesPolicy,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
+    BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingTracer, ProgramBatchingOutputAxesPolicy,
 };
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain};
@@ -28,31 +28,29 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 #[cfg(test)]
-use crate::operations::constants::One;
-use crate::operations::constants::{OneOperation, Zero, ZeroOperation, ZeroOperationProvider};
-use crate::operations::control_flow::scan::stacked_scan_type;
-use crate::operations::control_flow::{
-    ConditionOperation, ScanOperation, SelectOperation, TemporalResidualOperation, TemporalResidualType,
-};
-use crate::operations::dimensions::DimensionSizeOperation;
-use crate::operations::logical::AndOperation;
-use crate::operations::manipulation::{
-    BroadcastOperation, DynamicUpdateSliceOperation, LegacyBroadcast, LegacyBroadcastOperation, Transpose,
-    TransposeOperation,
-};
-use crate::operations::math::{AddOperation, ReduceOperation, ReductionKind};
+use crate::operations::constants::one::One;
+use crate::operations::constants::one::OneOperation;
+use crate::operations::constants::zero::{Zero, ZeroOperation, ZeroOperationProvider};
+use crate::operations::control_flow::condition::ConditionOperation;
+use crate::operations::control_flow::scan::{ScanOperation, stacked_scan_type};
+use crate::operations::control_flow::select::SelectOperation;
+use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
+use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::logical::and::AndOperation;
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::slicing::DynamicUpdateSliceOperation;
+use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
+use crate::operations::math::add::AddOperation;
+use crate::operations::math::reduce::{ReduceOperation, ReductionKind};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
 };
-use crate::programs::atoms::AtomId;
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::{RegionInterface, RegionRef, RegionSlot};
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Concretizable, Value, ValueProjection};
-use crate::programs::{MaybeZero, Program, ProgramError};
+use crate::programs::{
+    AtomId, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection, Program, ProgramBuilder,
+    ProgramError, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
@@ -2433,19 +2431,26 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
-    use crate::arrays::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::arrays::{
+        ArrayIrOperation, ArrayIrValue, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+    };
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::batch;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-    use crate::differentiation::{LinearizationTracer, jvp, linearize, value_and_gradient, vjp};
+    use crate::differentiation::{
+        ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, jvp, linearize, value_and_gradient,
+        vjp,
+    };
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
+    use crate::operations::constants::one_like::{OneLike, OneLikeOperation};
+    use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
     use crate::operations::debugging::PrintOperation;
-    use crate::operations::math::{AddOperation, DivOperation, MulOperation, SUB_OPERATION_NAME, SubOperation};
+    use crate::operations::math::add::AddOperation;
+    use crate::operations::math::div::DivOperation;
+    use crate::operations::math::mul::MulOperation;
+    use crate::operations::math::sub::{SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::Parameter;
-    use crate::programs::effects::Effects;
+    use crate::programs::Effects;
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
 
@@ -3736,7 +3741,7 @@ mod tests {
         // `while (sum(x) < 20, iteration_bound = 4) { x = x * x }` at `x = [1.5, 2]` squares twice (sums visit 3.5
         // and 6.25 before reaching 21.0625), so `f(x) = sum(x⁴)` locally: value `1.5⁴ + 2⁴ = 21.0625` and gradient
         // `4 x³ = [13.5, 32]`, with trip count 2 strictly below the bound 4.
-        use crate::operations::math::ReductionKind;
+        use crate::operations::math::reduce::ReductionKind;
 
         let vector_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();

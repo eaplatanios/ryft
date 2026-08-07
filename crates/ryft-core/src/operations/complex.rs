@@ -3,10 +3,10 @@ use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
 };
-use crate::operations::constants::{Zero, ZeroLikeOperation};
-use crate::operations::math::NegOperation;
-use crate::programs::MaybeZero;
-use crate::programs::types::{Type, TypeError, Typed};
+use crate::operations::constants::zero::Zero;
+use crate::operations::constants::zero_like::ZeroLikeOperation;
+use crate::operations::math::neg::NegOperation;
+use crate::programs::{MaybeZero, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -364,12 +364,12 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::jvp;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_type_inference;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::EmptyRegionDriver;
 
     use super::*;
 

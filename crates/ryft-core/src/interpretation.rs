@@ -47,14 +47,10 @@ use std::fmt::Debug;
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::macros::check_count;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
-use crate::programs::ProgramError;
-use crate::programs::atoms::{Atom, AtomId};
-use crate::programs::instructions::Instruction;
-use crate::programs::operations::Operation;
-use crate::programs::programs::Program;
-use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver};
-use crate::programs::types::{Type, TypeError, TypeRefinements, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    Atom, AtomId, EmptyRegionDriver, Instruction, Operation, Program, ProgramError, RegionDriver, RegionRef,
+    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeRefinements, Typed, Value, ValueProjection,
+};
 
 /// Provides access to attached [`Region`](crate::Region)s during interpretation, scoped to one [`Operation`]
 /// application. During [`Program`] replay that application is exactly one [`Instruction`]. Direct rule invocation
@@ -654,15 +650,11 @@ mod tests {
         ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionError,
         DimensionVariable, Shape,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::math::{AddOperation, NegOperation};
+    use crate::operations::{AddOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
-    use crate::programs::ProgramError;
-    use crate::programs::atoms::AtomId;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::RegionInterface;
-    use crate::programs::types::TypeError;
+    use crate::programs::{AtomId, ProgramBuilder, ProgramError, RegionInterface, TypeError};
     use crate::tests::TestRegionOperation;
     use crate::tracing::TracingContext;
 

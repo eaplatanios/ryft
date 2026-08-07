@@ -3,8 +3,7 @@ use ryft_mlir::Location;
 use ryft_mlir::dialects::shardy;
 use ryft_pjrt::Device as PjrtDevice;
 
-use crate::mlir::ToMlir;
-use crate::pjrt::FromPjrt;
+use crate::{FromPjrt, ToMlir};
 
 impl FromPjrt<PjrtDevice<'_>> for Device {
     type Output = Result<Self, ryft_pjrt::Error>;

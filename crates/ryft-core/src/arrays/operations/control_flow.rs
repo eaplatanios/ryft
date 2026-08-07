@@ -5,31 +5,25 @@
 //! supplies the array universe's answers to those questions, where a value is either ordinary array data or a
 //! first-class runtime dimension.
 
-use crate::arrays::{ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionType, Shape};
-use crate::backends::arrays::ArrayOperation;
+use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::operations::ArrayIrOperation;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape};
+use crate::arrays::types::ir::ArrayIrType;
+use crate::backends::ArrayOperation;
 use crate::contexts::EagerContext;
 use crate::interpretation::InterpretationDriver;
 use crate::macros::check_count;
-use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::scan::{
     ScanInterpretation, read_scan_iteration, stacked_scan_type, write_scan_iteration,
 };
-use crate::operations::control_flow::{
-    SelectOperation, TemporalResidualOperation, TemporalResidualType, WhilePredicate, WhileResidualStackOperation,
-    WhileResidualStackType,
+use crate::operations::{
+    AddOperation, AndOperation, DimensionFromScalarOperation, DimensionToScalarOperation, DynamicUpdateSliceOperation,
+    LegacyBroadcastOperation, OneOperation, RUNTIME_DIMENSION_DATA_TYPE, ReduceOperation, ReductionKind, Reshape,
+    SelectOperation, Slice, TemporalResidualOperation, TemporalResidualType, UpdateSlice, WhilePredicate,
+    WhileResidualStackOperation, WhileResidualStackType, Zero, ZeroOperation,
 };
-use crate::operations::dimensions::{
-    DimensionFromScalarOperation, DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,
-};
-use crate::operations::logical::AndOperation;
-use crate::operations::manipulation::{
-    DynamicUpdateSliceOperation, LegacyBroadcastOperation, Reshape, Slice, UpdateSlice,
-};
-use crate::operations::math::{AddOperation, ReduceOperation, ReductionKind};
-use crate::programs::ProgramError;
-use crate::programs::operations::Operation;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{Operation, ProgramError, TypeError, Typed, Value, ValueProjection};
 
 impl TemporalResidualType for ArrayIrType {
     #[inline]
@@ -271,24 +265,24 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
-    use crate::arrays::{
-        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
-        Shape,
-    };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::arrays::dimensions::DimensionValue;
+    use crate::arrays::ir::ArrayIrValue;
+    use crate::arrays::operations::ArrayIrOperation;
+    use crate::arrays::types::arrays::ArrayType;
+    use crate::arrays::types::data::DataType;
+    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
+    use crate::arrays::types::ir::ArrayIrType;
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::ForwardModeDifferentiate;
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::constants::ZeroOperation;
-    use crate::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
-    use crate::operations::dimensions::DimensionFromScalarOperation;
-    use crate::operations::manipulation::{BroadcastOperation, ReshapeOperation};
-    use crate::operations::math::{AddOperation, MulOperation, ReduceOperation, ReductionKind};
+    use crate::operations::{
+        AddOperation, BroadcastOperation, CompareOperation, ComparisonDirection, ConditionOperation,
+        DimensionFromScalarOperation, MulOperation, ReduceOperation, ReductionKind, ReshapeOperation, ScanOperation,
+        WhileOperation, ZeroOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::types::Typed;
-    use crate::programs::{Program, ProgramBuilder};
+    use crate::programs::{Program, ProgramBuilder, Typed};
     use crate::tracing::TracingContext;
 
     type TestValue = ArrayIrValue<Array>;

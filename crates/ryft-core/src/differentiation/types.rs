@@ -3,15 +3,11 @@ use crate::batching::{ArrayBatch, ArrayBatching, BatchableOperation, BatchingCon
 use crate::contexts::Context;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
-use crate::operations::differentiation::CoordinateBasisOperation;
-use crate::operations::manipulation::{
-    LegacyBroadcast, LegacyBroadcastOperation, Reshape, Slice, Transpose, TransposeOperation,
+use crate::operations::{
+    CoordinateBasisOperation, LegacyBroadcast, LegacyBroadcastOperation, Reshape, Slice, Transpose, TransposeOperation,
 };
 use crate::parameters::ParameterPath;
-use crate::programs::ProgramError;
-use crate::programs::regions::RegionRef;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::{ProgramError, RegionRef, Type, TypeError, Typed, Value};
 use crate::tracing::TracingContext;
 
 /// A [`Type`] whose forward perturbations and reverse adjoints carry well-defined differential representations.
@@ -656,7 +652,7 @@ mod tests {
         ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
         Shape, Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis};
     use crate::contexts::EagerContext;
 

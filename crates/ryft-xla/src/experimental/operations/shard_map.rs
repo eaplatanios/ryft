@@ -4,8 +4,8 @@ use std::marker::PhantomData;
 use ryft_core::arrays::{ArrayIrType, ArrayType, LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::Zero;
@@ -16,11 +16,9 @@ use ryft_core::partial::{
 };
 use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::{RegionInterface, RegionRef, RegionSlot};
+use ryft_core::programs::types::{Type, TypeError, Typed};
 use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramError, ProjectedValue, Value, ValueProjection};
 use ryft_core::tracing::{Tracer, TracingContext};
-
-use ryft_core::differentiation::DifferentiationDual;
-use ryft_core::programs::types::{Type, TypeError, Typed};
 
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, materialize_transpose_cotangent};
 use crate::experimental::shard_map::{
@@ -1050,12 +1048,11 @@ mod tests {
     use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
-    use ryft_core::programs::MaybeZero;
-    use ryft_core::programs::Program;
     use ryft_core::programs::effects::Effects;
     use ryft_core::programs::operations::Operation;
     use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionInterface, RegionRef};
     use ryft_core::programs::types::{TypeError, Typed};
+    use ryft_core::programs::{MaybeZero, Program};
     use ryft_core::tracing::{DomainTracingContext, TracingContext};
 
     use crate::experimental::domains::XlaDomain;

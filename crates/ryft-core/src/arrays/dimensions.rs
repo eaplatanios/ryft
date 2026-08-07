@@ -9,10 +9,7 @@ use crate::arrays::types::dimensions::{
 };
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
-use crate::programs::ProgramError;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Concretizable, Value};
+use crate::programs::{Concretizable, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed, Value};
 
 /// Checked host representation of a first-class runtime [`Dimension`](crate::Dimension) value. Its eager domain
 /// performs checked host integer arithmetic without allocating an array or dispatching to a device backend. Fallible
@@ -117,8 +114,7 @@ impl Concretizable<usize> for DimensionValue {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::operations::dimensions::DimensionRequirement;
-    use crate::operations::math::{Add, Div, Rem, Sub};
+    use crate::operations::{Add, DimensionRequirement, Div, Rem, Sub};
 
     use super::*;
 

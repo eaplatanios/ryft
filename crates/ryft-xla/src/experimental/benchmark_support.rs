@@ -2,8 +2,7 @@ use ryft_core::arrays::{
     ArrayIrType, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     ShardingDimension,
 };
-use ryft_core::backends::arrays::Array as CpuArray;
-use ryft_core::backends::arrays::ArrayOperation;
+use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
 use ryft_core::contexts::{Context, EagerContext};
 use ryft_core::differentiation::ForwardModeDifferentiate;
 use ryft_core::operations::math::{Dot, DotDimensionNumbers, Sin};

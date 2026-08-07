@@ -10,11 +10,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::operations::Operation;
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value};
 
 // TODO(eaplatanios): Review this.
 
@@ -187,7 +183,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{LinearizationTracer, gradient, jvp, value_and_gradient};
@@ -195,10 +191,9 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
-    use crate::operations::math::{Reduce, ReductionKind};
+    use crate::operations::math::reduce::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
 
     use super::*;
 

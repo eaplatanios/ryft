@@ -1,17 +1,14 @@
 use crate::arrays::{ArrayElement, ArrayType};
-use crate::backends::arrays::Array;
+use crate::backends::Array;
 use crate::batching::{ArrayBatch, ArrayBatching, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
-use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
-use crate::differentiation::types::DifferentiableType;
-use crate::operations::constants::ConstantOperation;
-use crate::operations::manipulation::{ConvertElementType, LegacyBroadcast, LegacyBroadcastOperation};
+use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::manipulation::broadcasting::{LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::conversion::ConvertElementType;
 use crate::operations::memory::TransferToMemory;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{Operation, OperationProjection, ProgramError, Type, TypeError, Typed, Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -121,7 +118,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType, Dimension, Memory, Shape};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::parameters::Placeholder;
     use crate::tracing::TracingContext;
 

@@ -4,10 +4,11 @@
 //! into its array member family. The mixed collective variants whose trailing operands are first-class dimensions are
 //! declared directly by [`ArrayIrOperation`](crate::ArrayIrOperation) instead.
 
-use crate::arrays::{ArrayIrOperation, ArrayType};
-use crate::backends::arrays::ArrayOperation;
+use crate::arrays::operations::ArrayIrOperation;
+use crate::arrays::types::arrays::ArrayType;
+use crate::backends::ArrayOperation;
 use crate::operations::collectives::PpermuteOperation;
-use crate::programs::values::Value;
+use crate::programs::Value;
 
 impl<A: Value<Type = ArrayType>> From<PpermuteOperation> for ArrayIrOperation<A> {
     #[inline]
@@ -21,13 +22,15 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{
-        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Shape,
-    };
+    use crate::arrays::dimensions::DimensionValue;
+    use crate::arrays::ir::ArrayIrValue;
+    use crate::arrays::operations::{ArrayIrOperation, DimensionOperation};
+    use crate::arrays::types::arrays::ArrayType;
+    use crate::arrays::types::data::DataType;
+    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
+    use crate::arrays::types::ir::ArrayIrType;
     use crate::axes::NamedAxis;
-    use crate::backends::arrays::Array;
-
+    use crate::backends::Array;
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::DifferentiationError;
     use crate::macros::check_operation_partial_evaluation;
@@ -35,14 +38,8 @@ mod tests {
         AllGather, AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions, PSumScatter,
         PSumScatterOperation,
     };
-
     use crate::parameters::Placeholder;
-
-    use crate::programs::builders::ProgramBuilder;
-
-    use crate::programs::types::{TypeError, Typed};
-
-    use crate::programs::ProgramError;
+    use crate::programs::{ProgramBuilder, ProgramError, TypeError, Typed};
     use crate::tracing::TracingContext;
 
     #[test]

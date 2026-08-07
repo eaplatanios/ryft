@@ -66,7 +66,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::DataType;
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
 
     use super::*;

@@ -10,16 +10,12 @@
 //! operand types and the common type inferred for an implicitly broadcasting result.
 
 use crate::arrays::{ArrayType, DataType, Dimension};
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
+use crate::differentiation::DifferentiationError;
+use crate::differentiation::forward::DifferentiationDual;
+use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
-use crate::operations::manipulation::{ConvertElementType, LegacyBroadcast, Reshape, Transpose};
-use crate::operations::math::{Reduce, ReductionKind};
-use crate::operations::sharding::Reshard;
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::Operation;
-use crate::programs::types::TypeError;
-use crate::programs::values::Value;
+use crate::operations::{ConvertElementType, LegacyBroadcast, Reduce, ReductionKind, Reshape, Reshard, Transpose};
+use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Value};
 
 /// [`Value`] whose derivative contributions can be _aligned_ with the common [`Type`](crate::Type) inferred for an
 /// implicitly broadcasting elementwise result and _unaligned_ back to an operand type. The two methods form an adjoint
@@ -422,14 +418,11 @@ mod tests {
     use crate::arrays::{
         ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::reverse::ReverseModeDifferentiate;
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::manipulation::ConvertElementType;
-    use crate::operations::math::{AddOperation, SinOperation};
-    use crate::programs::atoms::MaybeZero;
-    use crate::programs::types::Typed;
+    use crate::operations::{AddOperation, CompareOperation, ComparisonDirection, ConvertElementType, SinOperation};
+    use crate::programs::{MaybeZero, Typed};
 
     use super::*;
 

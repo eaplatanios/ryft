@@ -9,22 +9,14 @@ use crate::differentiation::linear::{ResidualZeroProvider, ZeroSpaceBoundaryReco
 use crate::differentiation::types::DifferentiableType;
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
-use crate::operations::constants::{OneOperation, Zero};
-use crate::operations::math::AddOperation;
+use crate::operations::{AddOperation, OneOperation, Zero};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::{Atom, AtomId, MaybeZero};
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::effects::Effect;
-use crate::programs::identities::TypeIdentityPosition;
-use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::programs::Program;
-use crate::programs::regions::{
-    BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+use crate::programs::{
+    Atom, AtomId, BindingRegionDriver, Effect, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
+    ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
+    TypeIdentityPosition, Typed, Value, ValueProjection,
 };
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Pullback of a function `f` at a linearization point `x` (i.e., the transposed linear map `ȳ ↦ x̄ = (∂f/∂x)(x)ᵀ · ȳ`),
@@ -1912,28 +1904,21 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedProgramOperation, ProjectedProgramType,
         ProjectedProgramValue,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::jvp;
+    use crate::differentiation::forward::jvp;
     use crate::macros::{check_count, check_types};
-    use crate::operations::constants::{Constant, ZeroOperation};
-    use crate::operations::math::{AddOperation, MulOperation, Sin};
+    use crate::operations::{AddOperation, Constant, MulOperation, Sin, ZeroOperation};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::ProgramError;
-    use crate::programs::atoms::{Atom, AtomId, MaybeZero};
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::{Effect, Effects};
-    use crate::programs::instructions::Instruction;
-    use crate::programs::operations::Operation;
-    use crate::programs::programs::Program;
-    use crate::programs::regions::{Region, RegionId, RegionInterface, RegionSlot};
-    use crate::programs::types::{TypeError, Typed};
-    use crate::programs::values::{Concretizable, Value};
+    use crate::programs::{
+        Atom, AtomId, Concretizable, Effect, Effects, Instruction, MaybeZero, Operation, Program, ProgramBuilder,
+        ProgramError, Region, RegionId, RegionInterface, RegionSlot, TypeError, Typed, Value,
+    };
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
 
     use super::*;

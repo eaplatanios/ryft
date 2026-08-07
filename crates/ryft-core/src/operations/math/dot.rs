@@ -13,17 +13,25 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::constants::Fill;
-use crate::operations::manipulation::{
-    ConvertElementType, ConvertElementTypeOperation, LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation,
-    Reshape, Transpose,
-};
-use crate::operations::math::{Abs, Clamp, Div, Exp, Floor, Log, Max, Mul, MulOperation, Reduce, ReductionKind, Sub};
+use crate::operations::constants::fill::Fill;
+use crate::operations::manipulation::broadcasting::{LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::conversion::{ConvertElementType, ConvertElementTypeOperation};
+use crate::operations::manipulation::reshaping::{LegacyReshapeOperation, Reshape};
+use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::abs::Abs;
+use crate::operations::math::clamp::Clamp;
+use crate::operations::math::div::Div;
+use crate::operations::math::exp::Exp;
+use crate::operations::math::floor::Floor;
+use crate::operations::math::log::Log;
+use crate::operations::math::max::Max;
+use crate::operations::math::mul::{Mul, MulOperation};
+use crate::operations::math::reduce::{Reduce, ReductionKind};
+use crate::operations::math::sub::Sub;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -1846,13 +1854,12 @@ mod tests {
         ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
         Sharding, ShardingDimension,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::jacobian::{JacobianDifferentiate, jacobian_reverse};
+    use crate::differentiation::{JacobianDifferentiate, jacobian_reverse};
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
-    use crate::programs::operations::Operation;
-    use crate::programs::types::TypeError;
+    use crate::programs::{Operation, TypeError};
 
     use super::*;
 
@@ -2125,7 +2132,7 @@ mod tests {
     #[test]
     fn test_scaled_dot_batching() {
         use crate::batching::BatchingContext;
-        use crate::programs::regions::EmptyRegionDriver;
+        use crate::programs::EmptyRegionDriver;
 
         // Two batch items built from the `test_scaled_dot` NVFP4 fixture: item 0 is the fixture itself and item 1
         // swaps its operand sides, so the per-item expectations come from unbatched `scaled_dot` calls.
@@ -3180,7 +3187,7 @@ mod tests {
     fn test_dot_batching_preserves_materialized_batch_placement() {
         use std::rc::Rc;
 
-        use crate::backends::arrays::{Array, ArrayOperation};
+        use crate::backends::{Array, ArrayOperation};
         use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
         use crate::parameters::Placeholder;
         use crate::tracing::TracingContext;

@@ -86,17 +86,11 @@ use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolu
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::parameters::{Parameter, Placeholder};
-use crate::programs::ProgramError;
-use crate::programs::atoms::AtomId;
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::identities::TypeIdentityPosition;
-use crate::programs::operations::Operation;
-use crate::programs::programs::{FlatProgram, Program};
-use crate::programs::regions::{
-    BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+use crate::programs::{
+    AtomId, BindingRegionDriver, EmptyRegionDriver, FlatProgram, Operation, Program, ProgramBuilder, ProgramError,
+    ProjectedValue, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
+    TypeIdentityPosition, Typed, Value, ValueProjection,
 };
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{ProjectedValue, Value, ValueProjection};
 use crate::tracing::TracingContext;
 
 /// State of a [`Value`] during partial evaluation. A [`PartialValue`] is the value domain the partial context
@@ -1743,16 +1737,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::{Array, ArrayOperation, ArrayTracingContext};
+    use crate::backends::{Array, ArrayOperation, ArrayTracingContext};
     use crate::contexts::{Context, StagingContext};
-    use crate::operations::constants::{ConstantOperation, Zero};
-    use crate::operations::debugging::PrintOperation;
-    use crate::operations::math::{AddOperation, MulOperation, NegOperation, SinOperation};
+    use crate::operations::{
+        AddOperation, ConstantOperation, MulOperation, NegOperation, PrintOperation, SinOperation, Zero,
+    };
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::atoms::AtomId;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::values::Concretizable;
+    use crate::programs::{AtomId, Concretizable, ProgramBuilder, ProgramError};
 
     use super::*;
 

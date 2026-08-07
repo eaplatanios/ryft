@@ -4,11 +4,11 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
 use crate::operations::compare::{Compare, ComparisonDirection};
-use crate::operations::constants::{OneLike, ZeroLike};
-use crate::operations::control_flow::Select;
+use crate::operations::constants::one_like::OneLike;
+use crate::operations::constants::zero_like::ZeroLike;
+use crate::operations::control_flow::select::Select;
+use crate::operations::math::log::Log;
 use crate::programs::ProgramError;
-
-use super::Log;
 
 // TODO(eaplatanios): Review this module.
 
@@ -92,15 +92,15 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::differentiation::gradient_holomorphic;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::constants::OneLike;
+    use crate::operations::constants::one_like::OneLike;
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::ProgramBuilder;
 
     use super::*;
 

@@ -6,11 +6,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::operations::Operation;
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
-use crate::programs::values::Value;
+use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Value};
 
 /// Canonical operation name for [`TagOperation`].
 pub const TAG_OPERATION_NAME: &str = "tag";

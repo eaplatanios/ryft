@@ -10,8 +10,7 @@
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
 
 use ryft_core::Typed;
-use ryft_core::arrays::ArrayIrValue;
-use ryft_core::arrays::{ArrayIrType, ArrayType, DeviceMesh};
+use ryft_core::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DeviceMesh};
 use ryft_core::captures::{CapturingContext, ClosedProgram};
 use ryft_core::compilation::{
     CompilationDomain, CompilationStagingRequest, CompiledFunction, ExecutableProgram, JitCacheStatistics,
@@ -26,10 +25,10 @@ use ryft_core::programs::{ProgramError, ProjectedValue, Value, ValueProjection};
 use ryft_core::tracing::{DomainTracingContext, Tracer};
 use ryft_pjrt::Execution;
 
-use crate::Array;
-use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError, XlaOptions};
+use crate::experimental::XlaDomainError;
+use crate::experimental::domains::XlaCompiledProgram;
 use crate::experimental::ops::{XlaConstant, XlaOperation};
-use crate::profile_guided::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction};
+use crate::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, Array, XlaDomain, XlaOptions};
 
 /// Composite tracer retained by the production XLA program.
 type XlaProgramTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, ArrayIrValue<Array<'c>>>>;
@@ -1264,10 +1263,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::arrays::ArrayIrValue;
     use ryft_core::arrays::{
-        ArrayIrType, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension,
+        ArrayIrType, ArrayIrValue, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
     use ryft_core::contexts::{Context, EagerContext};
@@ -1291,14 +1289,14 @@ mod tests {
     use ryft_core::tracing::DomainTracingContext;
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
+    use crate::experimental::XlaDomainError;
     use crate::experimental::ops::XlaOperation;
-    use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{
-        AdaptiveProfileGuidedOptions, Array, CompiledXlaFunction, ExecutableXlaProgram, FromPjrt, JittedXlaFunction,
-        StagedXlaFunction, XlaCompileTracer, compile, compile_with_captures, compile_with_options, infer_output_types,
-        jitted, stage, stage_with_captures,
+    use crate::jit::{
+        CompiledXlaFunction, ExecutableXlaProgram, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer, compile,
+        compile_with_captures, compile_with_options, infer_output_types, jitted, stage, stage_with_captures,
     };
+    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::{AdaptiveProfileGuidedOptions, Array, FromPjrt, XlaDomain, XlaOptions};
 
     use super::XlaProgramTracer;
 

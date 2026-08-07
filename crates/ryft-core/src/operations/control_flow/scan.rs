@@ -12,10 +12,10 @@ use crate::arrays::{
     ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape,
 };
 use crate::axes::Axis;
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
+use crate::batching::array_ir::align_array_batch;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
-    BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
+    BatchedProgram, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
@@ -24,27 +24,23 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{Zero, ZeroOperationProvider};
+use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
-use crate::operations::dimensions::DimensionSizeOperation;
-use crate::operations::manipulation::{
-    BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Reshape, Slice,
-    SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
-};
+use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::reshaping::{LegacyReshapeOperation, Reshape};
+use crate::operations::manipulation::slicing::{Slice, SliceOperation, UpdateSlice, UpdateSliceOperation};
+use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput,
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
-use crate::programs::ProgramError;
-use crate::programs::atoms::{AtomId, MaybeZero};
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::programs::Program;
-use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRef, RegionSlot};
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    AtomId, MaybeZero, Operation, OperationFormatter, OperationProjection, OutputRegionProvenance, Program,
+    ProgramBuilder, ProgramError, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition,
+    TypeIdentityRenaming, Typed, Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
@@ -2726,22 +2722,22 @@ mod tests {
         ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh,
         Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::hessian::HessianDifferentiate;
-    use crate::differentiation::jacobian::JacobianDifferentiate;
-    use crate::differentiation::{LinearizationTracer, ReverseModeDifferentiate, jvp, linearize, vjp};
+    use crate::differentiation::{
+        HessianDifferentiate, JacobianDifferentiate, LinearizationTracer, ReverseModeDifferentiate, jvp, linearize, vjp,
+    };
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::constants::ZeroLikeOperation;
-    use crate::operations::math::{AddOperation, DivOperation, MulOperation};
+    use crate::operations::constants::zero_like::ZeroLikeOperation;
+    use crate::operations::math::add::AddOperation;
+    use crate::operations::math::div::DivOperation;
+    use crate::operations::math::mul::MulOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::effects::Effects;
-    use crate::programs::{Program, ProgramBuilder};
+    use crate::programs::{Effects, Program, ProgramBuilder};
     use crate::tests::CountingBatchingDriver;
-    use crate::tracing::DomainTracingContext;
-    use crate::tracing::Trace;
+    use crate::tracing::{DomainTracingContext, Trace};
 
     use super::*;
 

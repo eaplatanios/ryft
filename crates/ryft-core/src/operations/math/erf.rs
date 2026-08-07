@@ -4,14 +4,12 @@ use std::ops::{Mul as StandardMul, Neg as StandardNeg};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
-use crate::operations::constants::Fill;
+use crate::operations::constants::fill::Fill;
 use crate::operations::manipulation::conversion::ElementType;
-use crate::programs::types::Typed;
-use crate::programs::values::Value;
+use crate::operations::math::exp::Exp;
+use crate::programs::{Typed, Value};
 
 // TODO(eaplatanios): Review this module.
-
-use super::Exp;
 
 /// Canonical operation name for [`ErfOperation`].
 pub const ERF_OPERATION_NAME: &str = "erf";
@@ -216,12 +214,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType};
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::math::{Reduce, ReductionKind};
+    use crate::operations::math::reduce::{Reduce, ReductionKind};
 
     use super::*;
 

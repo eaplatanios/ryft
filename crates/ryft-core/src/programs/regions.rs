@@ -1160,7 +1160,7 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::arrays::Array;
+    use crate::backends::Array;
     use crate::contexts::EagerContext;
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;

@@ -1612,14 +1612,14 @@ mod tests {
         ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
         DimensionVariable, Shape,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::macros::check_count;
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
-    use crate::operations::debugging::PrintOperation;
-    use crate::operations::math::{AddOperation, MulOperation, NegOperation};
+    use crate::operations::{
+        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, MulOperation, NegOperation,
+        PrintOperation, ScanOperation, WhileOperation,
+    };
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramBuilder;
+    use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::operations::OperationFormatter;
     use crate::programs::regions::RegionSlot;

@@ -15,21 +15,16 @@ use ryft_macros::Parameter;
 
 use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::{Context, EagerContext, ProjectedContext};
-use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
-use crate::differentiation::linear::ResidualZeroProvider;
-use crate::differentiation::types::DifferentiableType;
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, ResidualZeroProvider,
+};
 use crate::macros::check_count;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::{Atom, AtomId};
-use crate::programs::builders::ProgramBuilder;
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::programs::Program;
-use crate::programs::regions::RegionArena;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{ProjectedValue, Value, ValueProjection};
+use crate::programs::{
+    Atom, AtomId, Operation, OperationProjection, Program, ProgramBuilder, ProgramError, ProjectedValue, RegionArena,
+    Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+};
 use crate::tracing::{NestedTracingContext, TracingContext};
 
 /// Reference to a value captured outside a staged [`Program`]. A program stores only this lifetime-free reference
@@ -513,12 +508,10 @@ mod tests {
         ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
         DimensionVariable, Shape,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::control_flow::WhileOperation;
-    use crate::operations::math::AddOperation;
+    use crate::operations::{AddOperation, CompareOperation, ComparisonDirection, WhileOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{
         EmptyRegionDriver, ProgramBuilder, ProgramError, RegionId, RegionSlot, TypeIdentityRenaming, ValueProjection,

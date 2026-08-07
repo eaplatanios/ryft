@@ -18,10 +18,10 @@ use crate::arrays::{
     LinearResiduals, Shape, Sharding,
 };
 use crate::axes::{AxisError, AxisIndexOperation, NamedAxes, NamedAxis};
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, DynamicArrayBatchingPolicy, broadcast_array};
+use crate::batching::array_ir::{DynamicArrayBatchingPolicy, broadcast_array};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, MemberBatchableOperation, StaticArrayBatchingPolicy,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
+    BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation, StaticArrayBatchingPolicy,
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
@@ -30,24 +30,28 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::constants::{ConstantOperation, Fill, ZeroLike};
-use crate::operations::dimensions::{
-    DimensionFromScalarOperation, DimensionMulOperation, DimensionRequirement, DimensionSize, DimensionSizeOperation,
+use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::fill::Fill;
+use crate::operations::constants::zero_like::ZeroLike;
+use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
+use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
+use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
+use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast};
+use crate::operations::manipulation::concatenation::Concatenate;
+use crate::operations::manipulation::reshaping::{
+    Reshape, ReshapeOperation, ReshapeParameters, lift_output_sharding_for_leading_batch_axis,
 };
-use crate::operations::manipulation::reshaping::lift_output_sharding_for_leading_batch_axis;
-use crate::operations::manipulation::slicing::resized_output_sharding;
-use crate::operations::manipulation::{
-    BroadcastOperation, Concatenate, DynamicShapeSliceOperation, LegacyBroadcast, Reshape, ReshapeOperation,
-    ReshapeParameters, Slice, Transpose,
-};
-use crate::operations::math::{Div, Mul, Reduce, ReductionKind};
+use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, Slice, resized_output_sharding};
+use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::div::Div;
+use crate::operations::math::mul::Mul;
+use crate::operations::math::reduce::{Reduce, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{MemberOperation, Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::{ProjectedValue, ValueProjection};
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::{
+    MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
+    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -3728,11 +3732,10 @@ mod tests {
         ArrayIrOperation, ArrayIrType, ArrayIrValue, Dimension, DimensionBounds, DimensionType, DimensionValue,
         DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
+    use crate::backends::{Array, ArrayOperation};
     use crate::batching::{
-        ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError,
-        BatchingTracer, batch,
+        ArrayBatch, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchAxisSpecification, BatchableOperation,
+        BatchingContext, BatchingError, BatchingTracer, batch,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{transpose_mixed_operation, value_and_gradient};
@@ -3817,7 +3820,7 @@ mod tests {
     #[test]
     fn test_collective_over_unbound_axis_is_rejected() {
         use crate::axes::AxisError;
-        use crate::backends::arrays::{Array, ArrayOperation};
+        use crate::backends::{Array, ArrayOperation};
         use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer};
         use crate::contexts::EagerContext;
 
@@ -3840,7 +3843,7 @@ mod tests {
 
     #[test]
     fn test_collective_psum_value_and_grad_through_vmap_re_sums_the_cotangent() {
-        use crate::backends::arrays::{Array, ArrayOperation};
+        use crate::backends::{Array, ArrayOperation};
         use crate::batching::BatchAxisSpecification;
         use crate::contexts::EagerContext;
         use crate::differentiation::LinearizationTracer;
@@ -3870,7 +3873,7 @@ mod tests {
 
     #[test]
     fn test_collective_pmean_value_and_grad_through_vmap_carries_the_inverse_batch_size() {
-        use crate::backends::arrays::{Array, ArrayOperation};
+        use crate::backends::{Array, ArrayOperation};
         use crate::batching::BatchAxisSpecification;
         use crate::contexts::EagerContext;
         use crate::differentiation::LinearizationTracer;

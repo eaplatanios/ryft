@@ -4,13 +4,14 @@
 //! dynamic output shape consumes one first-class dimension operand per output axis. This module supplies the array
 //! universe's answers to those contracts.
 
-use crate::arrays::{ArrayIrValue, ArrayType, Dimension, DimensionType, Shape, Sharding};
+use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::sharding::shardings::Sharding;
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape};
 use crate::backends::arrays::BroadcastKernel;
-use crate::operations::dimensions::DimensionSize;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
-use crate::operations::manipulation::{Broadcast, BroadcastOperation};
-use crate::programs::ProgramError;
-use crate::programs::values::{Value, ValueProjection};
+use crate::operations::{Broadcast, BroadcastOperation, DimensionSize};
+use crate::programs::{ProgramError, Value, ValueProjection};
 
 impl<A: BroadcastKernel + DimensionSize<usize> + Value<Type = ArrayType>> Broadcast for ArrayIrValue<A> {
     fn broadcast_with_output_sharding(
@@ -38,36 +39,29 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{
-        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType,
-        Shape, ShardingDimension,
-    };
-
-    use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
-    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
+    use crate::arrays::dimensions::DimensionValue;
+    use crate::arrays::ir::ArrayIrValue;
+    use crate::arrays::operations::{ArrayIrOperation, DimensionOperation};
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::sharding::shardings::ShardingDimension;
+    use crate::arrays::types::arrays::ArrayType;
+    use crate::arrays::types::data::DataType;
+    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
+    use crate::arrays::types::ir::ArrayIrType;
+    use crate::backends::{Array, ArrayOperation};
+    use crate::batching::{ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableType, DifferentiationError};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
-
-    use crate::operations::dimensions::{DimensionAddOperation, DimensionMulOperation, DimensionSizeOperation};
-    use crate::operations::manipulation::concatenation::CONCATENATE_OPERATION_NAME;
-    use crate::operations::manipulation::{
-        Broadcast, BroadcastOperation, ConcatenateOperation, DynamicShapeSliceOperation, DynamicSliceOperation,
+    use crate::operations::{
+        Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, DimensionAddOperation,
+        DimensionMulOperation, DimensionSizeOperation, DynamicShapeSliceOperation, DynamicSliceOperation,
         DynamicUpdateSliceOperation, GatherDimensionNumbers, GatherOperation, PadOperation, ReshapeOperation,
         ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, SliceOperation, UpdateSliceOperation,
     };
-
     use crate::parameters::Placeholder;
-
-    use crate::programs::builders::ProgramBuilder;
-
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::Typed;
-
-    use crate::programs::ProgramError;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::TracingContext;
 
     use super::*;

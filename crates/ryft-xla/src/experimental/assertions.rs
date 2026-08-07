@@ -312,8 +312,7 @@ fn scalar_i64(buffer: &FfiBuffer<'_>) -> Result<i64, FfiError> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::arrays::DimensionValue;
-    use ryft_core::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
+    use ryft_core::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable};
     use ryft_core::operations::dimensions::DimensionPow;
     use ryft_core::{Div, ProgramError, Rem, Sub};
 

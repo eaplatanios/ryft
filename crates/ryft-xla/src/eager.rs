@@ -1567,7 +1567,8 @@ mod tests {
     /// replays the staged backward operation).
     #[test]
     fn test_eager_differentiable_dot_product_attention_gradient() {
-        use ryft_core::contexts::ProjectedContext;
+        use ryft_core::backends::arrays::ArrayOperation;
+        use ryft_core::contexts::{EagerContext, ProjectedContext};
         use ryft_core::operations::attention::{AttentionMask, differentiable_dot_product_attention};
 
         use crate::XlaDomain;
@@ -1608,8 +1609,6 @@ mod tests {
             )
             .unwrap();
 
-        use ryft_core::backends::arrays::ArrayOperation;
-        use ryft_core::contexts::EagerContext;
         let reference_function = differentiable_dot_product_attention::<EagerContext<CpuArray, ArrayOperation<CpuArray>>>(
             scale, mask, None, None,
         );

@@ -2,39 +2,36 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::LinearResiduals;
 use crate::arrays::{
-    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape, Sharding,
+    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape,
+    Sharding,
 };
 use crate::axes::Axis;
-use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
+use crate::batching::array_ir::align_array_batch;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, InterpretableBatchableOperation,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
+    BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
-use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::forward::DifferentiationDual;
-use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver, transpose_projected_operation};
-use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationError, LinearCallOperation,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    ElementwiseDerivativeAlignment, LinearCallOperation, TransposableOperation, TranspositionDriver,
+    transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::constants::{ConstantOperation, Zero, ZeroOperation};
-use crate::operations::dimensions::{DimensionAddOperation, DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::{
-    BroadcastOperation, DynamicShapeSliceOperation, LegacyBroadcast, SliceOperation, Transpose,
-};
+use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::dimensions::dimension_add::DimensionAddOperation;
+use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast};
+use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
+use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::effects::{Effect, Effects};
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{
+    Effect, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface,
+    Type, TypeError, Typed, Value, ValueProjection,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
@@ -1041,18 +1038,14 @@ mod tests {
         DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
         MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::{Effect, Effects};
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::Typed;
+    use crate::programs::{Effect, Effects, EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
 
     use super::*;
 

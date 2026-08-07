@@ -6,8 +6,8 @@ use ryft_macros::Parameter;
 use crate::arrays::types::arrays::{ArrayType, ArrayTypeRefinements};
 use crate::arrays::types::dimensions::{DimensionType, DimensionVariable};
 use crate::parameters::Parameter;
-use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
-use crate::programs::types::{Type, TypeError, TypeRefinements, visit_type_signature_pairs};
+use crate::programs::types::visit_type_signature_pairs;
+use crate::programs::{Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements};
 
 /// [`Type`] vocabulary of Ryft's array Intermediate Representation (IR), whose values may be ordinary arrays or
 /// first-class runtime dimensions. It is the type-level counterpart of [`ArrayIrValue`](crate::ArrayIrValue), with

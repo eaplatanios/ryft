@@ -1,23 +1,24 @@
 use crate::arrays::dimensions::DimensionValue;
+use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::operations::DimensionOperation;
-use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType};
-use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionVariable};
-use crate::backends::arrays::Array;
-use crate::batching::array_ir::ReplicatedDimensionBatchingPolicy;
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::data::DataType;
+use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
+use crate::arrays::types::ir::ArrayIrType;
+use crate::backends::Array;
+use crate::batching::{
+    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, ReplicatedDimensionBatchingPolicy,
+};
 use crate::contexts::{Context, ProjectedContext};
-use crate::operations::dimensions::{
-    DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
-    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
+use crate::operations::dimensions::checked_power;
+use crate::operations::{
+    Add, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalar, DimensionFromScalarOperation,
+    DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
     DimensionPowOperation, DimensionRemOperation, DimensionRequirement, DimensionRequirementOperation,
     DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation,
-    DimensionSubOperation, DimensionToScalar, checked_power,
+    DimensionSubOperation, DimensionToScalar, Div, Mul, Rem, Sub,
 };
-use crate::operations::math::{Add, Div, Mul, Rem, Sub};
-use crate::programs::ProgramError;
-use crate::programs::operations::{Operation, OperationProjection};
-use crate::programs::types::Typed;
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::{Operation, OperationProjection, ProgramError, Typed, Value, ValueProjection};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -348,7 +349,7 @@ impl<A: DimensionFromScalar<DimensionValue> + Value<Type = ArrayType>> Dimension
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DimensionBounds, DimensionVariable};
+    use crate::arrays::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::contexts::EagerContext;
     use crate::tracing::Trace;
 

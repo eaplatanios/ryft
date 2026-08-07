@@ -1,5 +1,4 @@
-use crate::experimental::domains::XlaDomain;
-use crate::{Array, FromPjrt};
+use crate::{Array, FromPjrt, XlaDomain};
 
 use ryft_core::arrays::{ArrayType, Dimension, Shape};
 

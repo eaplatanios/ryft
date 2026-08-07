@@ -8,18 +8,13 @@ use crate::batching::{
     BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::forward::DifferentiationDual;
-use crate::differentiation::types::DifferentiableType;
+use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`TransposeOperation`].
@@ -455,20 +450,16 @@ mod tests {
         DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
         Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
     };
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::forward::DifferentiableOperation;
-    use crate::differentiation::reverse::TransposableOperation;
+    use crate::differentiation::{DifferentiableOperation, TransposableOperation};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::Typed;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
 
     use super::*;
 

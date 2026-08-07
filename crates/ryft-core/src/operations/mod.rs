@@ -3,8 +3,7 @@ use std::collections::BTreeSet;
 use crate::arrays::ArrayType;
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
-use crate::programs::operations::Operation;
-use crate::programs::types::TypeError;
+use crate::programs::{Operation, TypeError};
 
 pub mod attention;
 pub mod collectives;
@@ -117,7 +116,7 @@ mod tests {
         ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, MeshAxis,
         MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::programs::regions::RegionInterface;
+    use crate::programs::RegionInterface;
 
     use super::*;
 

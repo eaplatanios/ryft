@@ -98,8 +98,7 @@ use std::fmt::{Display, Formatter};
 use thiserror::Error;
 
 use crate::parameters::ParameterError;
-use crate::programs::ProgramError;
-use crate::programs::types::TypeError;
+use crate::programs::{ProgramError, TypeError};
 
 pub use elementwise::{
     BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, ElementwiseDerivativeAlignment,
