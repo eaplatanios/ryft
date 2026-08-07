@@ -11,14 +11,15 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{ArrayType, Dimension, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError};
+use crate::arrays::{
+    ArrayType, Broadcastable, Dimension, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
+};
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedProgram, BatchingContext,
     BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BoundaryPreservingBatchedProgram,
     InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
 };
-use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};

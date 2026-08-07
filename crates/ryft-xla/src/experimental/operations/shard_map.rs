@@ -8,16 +8,16 @@ use ryft_core::differentiation::{
     TransposableOperation, TranspositionDriver,
 };
 use ryft_core::macros::check_count;
-use ryft_core::operations::constants::Zero;
+use ryft_core::operations::Zero;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use ryft_core::programs::operations::Operation;
-use ryft_core::programs::regions::{RegionInterface, RegionRef, RegionSlot};
-use ryft_core::programs::types::{Type, TypeError, Typed};
-use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramError, ProjectedValue, Value, ValueProjection};
+use ryft_core::programs::{
+    Concretizable, MaybeZero, Operation, Program, ProgramError, ProjectedValue, RegionInterface, RegionRef, RegionSlot,
+    Type, TypeError, Typed, Value, ValueProjection,
+};
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, materialize_transpose_cotangent};
@@ -1045,14 +1045,13 @@ mod tests {
     use ryft_core::differentiation::{
         DifferentiableType, DifferentiationError, TransposableOperation, TranspositionDriver,
     };
-    use ryft_core::operations::math::{AddOperation, MulOperation};
+    use ryft_core::operations::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
-    use ryft_core::programs::effects::Effects;
-    use ryft_core::programs::operations::Operation;
-    use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionInterface, RegionRef};
-    use ryft_core::programs::types::{TypeError, Typed};
-    use ryft_core::programs::{MaybeZero, Program};
+    use ryft_core::programs::{
+        Effects, EmptyRegionDriver, MaybeZero, Operation, Program, RegionDriver, RegionInterface, RegionRef, TypeError,
+        Typed,
+    };
     use ryft_core::tracing::{DomainTracingContext, TracingContext};
 
     use crate::experimental::domains::XlaDomain;

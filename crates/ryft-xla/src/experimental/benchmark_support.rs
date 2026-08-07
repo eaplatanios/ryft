@@ -2,10 +2,10 @@ use ryft_core::arrays::{
     ArrayIrType, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     ShardingDimension,
 };
-use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
+use ryft_core::backends::{Array as CpuArray, ArrayOperation};
 use ryft_core::contexts::{Context, EagerContext};
 use ryft_core::differentiation::ForwardModeDifferentiate;
-use ryft_core::operations::math::{Dot, DotDimensionNumbers, Sin};
+use ryft_core::operations::{Dot, DotDimensionNumbers, Sin};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::programs::ProgramError;
 use ryft_core::tracing_v2::benchmarking::{

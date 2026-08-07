@@ -9,12 +9,11 @@ use ryft_core::axes::NamedAxis;
 #[cfg(test)]
 use ryft_core::contexts::StagingContext;
 use ryft_core::contexts::{Context, Domain};
-use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
+use ryft_core::operations::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use ryft_core::programs::operations::Operation;
 #[cfg(test)]
-use ryft_core::programs::types::Typed;
-use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError, ProjectedValue, Value, ValueProjection};
+use ryft_core::programs::Typed;
+use ryft_core::programs::{Atom, AtomId, Instruction, Operation, ProgramError, ProjectedValue, Value, ValueProjection};
 use ryft_core::tracing::DomainTracingContext;
 #[cfg(test)]
 use ryft_mlir::Block;
@@ -2077,7 +2076,7 @@ mod tests {
         DataType, Device, DeviceMesh, DimensionBounds, DimensionVariable, MeshAxis, MeshAxisType, Sharding,
         ShardingDimension,
     };
-    use ryft_core::operations::math::{Dot, DotDimensionNumbers, Sin};
+    use ryft_core::operations::{Dot, DotDimensionNumbers, Sin};
 
     use super::*;
 
@@ -3318,7 +3317,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_psum_lowers_to_all_reduce_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::{Collective, CollectiveKind};
+        use ryft_core::operations::{Collective, CollectiveKind};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -3546,7 +3545,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_pmean_lowers_to_all_reduce_with_axis_size_division() {
-        use ryft_core::operations::collectives::{Collective, CollectiveKind};
+        use ryft_core::operations::{Collective, CollectiveKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -3597,7 +3596,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_grouped_pmean_preserves_group_order_and_uses_group_divisor() {
-        use ryft_core::operations::collectives::{Collective, CollectiveKind};
+        use ryft_core::operations::{Collective, CollectiveKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -3636,7 +3635,7 @@ mod tests {
     fn test_batch_inside_shard_map_forwards_mesh_collective_to_all_reduce() {
         use ryft_core::Batch;
         use ryft_core::batching::{BatchAxis, BatchAxisSpecification};
-        use ryft_core::operations::collectives::{Collective, CollectiveKind};
+        use ryft_core::operations::{Collective, CollectiveKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -3701,9 +3700,7 @@ mod tests {
 
     #[test]
     fn test_collective_inside_condition_inside_shard_map_lowers_to_all_reduce() {
-        use ryft_core::operations::collectives::{CollectiveKind, CollectiveOperation};
-        use ryft_core::operations::control_flow::ConditionOperation;
-        use ryft_core::operations::math::{Reduce, ReductionKind};
+        use ryft_core::operations::{CollectiveKind, CollectiveOperation, ConditionOperation, Reduce, ReductionKind};
         use ryft_core::{Compare, ComparisonDirection};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -3796,7 +3793,7 @@ mod tests {
 
     #[test]
     fn test_two_shard_maps_with_collectives_receive_unique_channel_ids() {
-        use ryft_core::operations::collectives::{Collective, CollectiveKind};
+        use ryft_core::operations::{Collective, CollectiveKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -3863,7 +3860,7 @@ mod tests {
     #[test]
     fn test_shard_map_axis_index_lowers_to_partition_id_coordinate_and_executes_on_cpu() {
         use ryft_core::axes::AxisIndex;
-        use ryft_core::operations::manipulation::LegacyBroadcast;
+        use ryft_core::operations::LegacyBroadcast;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -3978,7 +3975,7 @@ mod tests {
     #[test]
     fn test_shard_map_axis_index_of_major_mesh_axis_lowers_to_divide_and_remainder() {
         use ryft_core::axes::AxisIndex;
-        use ryft_core::operations::manipulation::LegacyBroadcast;
+        use ryft_core::operations::LegacyBroadcast;
 
         // A 2x2 mesh: `axis_index("x")` addresses the major axis (row-major stride 2, size 2), so the device
         // coordinate is `(partition_id / 2) % 2` — exercising both the divide and the remainder that a single-axis
@@ -4041,7 +4038,7 @@ mod tests {
     fn test_shard_map_collective_over_unbound_axis_is_rejected_at_trace_time() {
         use ryft_core::axes::AxisError;
         use ryft_core::batching::BatchingError;
-        use ryft_core::operations::collectives::{Collective, CollectiveKind};
+        use ryft_core::operations::{Collective, CollectiveKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();

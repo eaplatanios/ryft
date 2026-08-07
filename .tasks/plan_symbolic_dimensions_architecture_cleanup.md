@@ -2429,7 +2429,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         visualizations, and `ShardingError`) after auditing that no non-array value universe uses it independently.
         Update all paths directly without a `ryft_core::sharding` compatibility module; named-axis transform machinery
         remains outside this hierarchy where it is genuinely universe-neutral.
-  - [ ] Move the top-level `broadcasting` module to `arrays::broadcasting` (including `Broadcastable` and
+  - [x] Move the top-level `broadcasting` module to `arrays::broadcasting` (including `Broadcastable` and
         `BroadcastingError`): its implementations (`DataType`, `Shape`, `ArrayType`, and sharding propagation) and
         its dependencies (only the array vocabulary plus `parameters`) are array-shape vocabulary, so the move keeps
         `arrays` upstream of the operation/transform machinery. Re-export `Broadcastable` and `BroadcastingError`
@@ -5343,3 +5343,21 @@ Gates after both waves: `ryft-core` passes 1,130 library tests; the serialized C
 touched file; and residual searches find no `operations::array_ir`, no `arrays::operations::differentiation`, and no
 non-test `crate::arrays` import in `differentiation/linear.rs`. Session plan:
 `.tasks/plan_array_operations_family_split.md`.
+
+### Phase 9 hierarchy broadcasting (2026-08-07)
+
+Moved the complete array-shape broadcasting vocabulary from the top-level `broadcasting` module to
+`arrays::broadcasting` without changing its implementation or tests. `arrays` now owns and flat-re-exports
+`Broadcastable` and `BroadcastingError`; the former top-level module declaration and explicit crate-root re-export
+were deleted without a compatibility path. Same-owner imports inside `arrays` use the defining submodules, while
+operation, batching, backend, error, and XLA consumers use the shortest owning `arrays` facade. The declarative-macro
+hygiene path now names `$crate::arrays::Broadcastable`, and the public rustdoc example uses the canonical
+`ryft_core::arrays` path.
+
+Verification passes nightly formatting, `git diff --check`, `cargo check -p ryft-core --all-targets`, and
+`cargo check -p ryft-xla --all-targets`. All 1,139 core unit tests, five projection/allocation integration tests, six
+region-prototype integration tests, and 53 runnable doctests pass with 16 intentional ignores. The macro integration
+crate passes all 20 operation tests, 17 parameter tests, and every compile-fail fixture, and the XLA unit-test target
+compiles and links. A direct comparison of the former module with the moved file confirms that only the imports and
+canonical rustdoc paths changed. Residual searches find no retired `crate::broadcasting`, `ryft_core::broadcasting`,
+top-level module declaration, explicit root re-export, or old macro hygiene path.

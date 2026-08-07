@@ -3,9 +3,12 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
-use crate::arrays::{
-    ArrayType, DataType, DataTypeError, Dimension, Memory, Shape, Sharding, ShardingDimension, ShardingError,
-};
+use crate::arrays::sharding::ShardingError;
+use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
+use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::data::{DataType, DataTypeError};
+use crate::arrays::types::dimensions::{Dimension, Shape};
+use crate::arrays::types::memories::Memory;
 use crate::parameters::{ParameterError, Parameterized};
 
 /// Represents broadcasting-related errors.
@@ -44,7 +47,7 @@ pub enum BroadcastingError {
 ///     [`Parameter`](crate::parameters::Parameter)s. For example, [`DataType`] uses data-type promotion, [`Shape`]
 ///     follows the standard [NumPy broadcasting rules](https://numpy.org/doc/stable/user/basics.broadcasting.html),
 ///     and [`ArrayType`] combines both by broadcasting its [`DataType`] and [`Shape`]. [`Layout`](crate::Layout)
-///     metadata is only preserved when both operands already agree on the same unchanged layout; otherwise the result
+///     metadata is only preserved when both operands already agree on the same unchanged layout. Otherwise, the result
 ///     leaves its layout unspecified.
 ///   - **Structural Broadcasting:** For [`Parameterized`] values whose leaves are [`ArrayType`]s, Ryft first aligns
 ///     the left-hand side to the target parameter structure using [`Parameterized::broadcast_to_parameter_structure`].
@@ -79,7 +82,7 @@ pub enum BroadcastingError {
 /// ## Examples
 ///
 /// ```rust
-/// # use ryft_core::broadcasting::{Broadcastable, BroadcastingError};
+/// # use ryft_core::arrays::{Broadcastable, BroadcastingError};
 /// # use ryft_core::arrays::DataType::{Boolean, F32, F64};
 /// # use ryft_core::arrays::{ArrayType, Shape};
 ///
@@ -484,7 +487,6 @@ fn is_sharding_broadcastable_to(
 
 /// Returns the [`ShardingDimension`] visible at `index` after left-padding lower-rank shardings
 /// with [`ShardingDimension::Replicated`] axes.
-#[inline]
 fn padded_sharding_dimension(sharding: Option<&Sharding>, offset: usize, index: usize) -> &ShardingDimension {
     (index < offset)
         .then_some(&ShardingDimension::Replicated)
@@ -493,7 +495,6 @@ fn padded_sharding_dimension(sharding: Option<&Sharding>, offset: usize, index: 
 }
 
 /// Combines two aligned [`ShardingDimension`]s using the rules described in [`broadcast_sharding`].
-#[inline]
 fn broadcast_sharding_dimension<'d>(
     lhs_dimension: Dimension,
     lhs_sharding: &'d ShardingDimension,

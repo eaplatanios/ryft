@@ -826,7 +826,7 @@ macro_rules! define_elementwise_operation {
 
     // This internal branch supplies the default broadcasting inference for binary data types.
     (@infer_data_types [] @binary $input_types:expr, $name:ident $(,)?) => {
-        $crate::Broadcastable::broadcast(&$input_types[0], &$input_types[1])
+        $crate::arrays::Broadcastable::broadcast(&$input_types[0], &$input_types[1])
             .map(|output| vec![output])
             .map_err(|_| $crate::TypeError::invalid(format!("'{}' input types are not broadcast-compatible", $name)))
     };

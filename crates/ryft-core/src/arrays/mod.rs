@@ -1,4 +1,5 @@
 pub mod addressing;
+pub mod broadcasting;
 pub mod differentiation;
 pub mod dimensions;
 pub mod encoding;
@@ -9,6 +10,7 @@ pub mod sharding;
 pub mod types;
 
 pub use addressing::{ArrayAddressing, ArrayIndexRange, ArrayIndexRanges, ArraySliceAxis};
+pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use differentiation::{ExactShape, ExactShapeDimension, LinearResiduals};
 pub use dimensions::DimensionValue;
 pub use encoding::{

@@ -11,44 +11,36 @@ use ryft_core::arrays::{
     LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
 };
 use ryft_core::axes::AxisIndexOperation;
-use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
+use ryft_core::backends::{Array as CpuArray, ArrayOperation};
 use ryft_core::captures::CaptureReference;
 use ryft_core::macros::check_count;
+#[cfg(test)]
+use ryft_core::operations::ReshapeParameters;
 use ryft_core::operations::attention::{
     AttentionMask, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
 };
 use ryft_core::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, CollectiveKind, CollectiveMode, CollectiveOperation, PSumScatterOperation,
-    PpermuteOperation,
+    AllGatherOperation, AllToAllOperation, CollectiveMode, PSumScatterOperation, PpermuteOperation,
 };
-use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
-use ryft_core::operations::constants::{ConstantOperation, IotaOperation};
-use ryft_core::operations::control_flow::{ScanOperation, WhileOperation};
 use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
-use ryft_core::operations::differentiation::CoordinateBasisOperation;
-use ryft_core::operations::dimensions::{DimensionRequirementOperation, DimensionRequirementPredicate};
-#[cfg(test)]
-use ryft_core::operations::manipulation::ReshapeParameters;
-use ryft_core::operations::manipulation::{
-    ConvertElementTypeOperation, GatherOperation, GatherScatterMode, LegacyBroadcastOperation, LegacyReshapeOperation,
-    PadOperation, ReshapeDimensionExpression, ScatterOperation, ScatterReductionKind, SliceOperation,
-    TransposeOperation,
-};
-use ryft_core::operations::math::{
-    AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
-    ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaxOperation, MinOperation, MulOperation,
-    NegOperation, PowOperation, ReductionKind, RemOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
-};
 use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
 use ryft_core::operations::sort::{SortDirection, SortOperation};
+use ryft_core::operations::{
+    AbsOperation, AddOperation, Atan2Operation, CeilOperation, CollectiveKind, CollectiveOperation,
+    ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation,
+    DimensionRequirementOperation, DimensionRequirementPredicate, DivOperation, DotOperation, ErfOperation,
+    ExpOperation, FloorOperation, GatherOperation, GatherScatterMode, IotaOperation, LegacyBroadcastOperation,
+    LegacyReshapeOperation, LogOperation, LogisticOperation, MaxOperation, MinOperation, MulOperation, NegOperation,
+    PadOperation, PowOperation, ReductionKind, RemOperation, ReshapeDimensionExpression, RoundOperation,
+    RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, ScatterReductionKind, SignOperation,
+    SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, WhileOperation,
+};
 use ryft_core::parameters::Parameterized;
-use ryft_core::programs::effects::{Effect, Effects};
-use ryft_core::programs::operations::Operation;
-use ryft_core::programs::regions::{RegionId, RegionRef};
-use ryft_core::programs::types::{Type as RyftType, Typed};
-use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
+use ryft_core::programs::{
+    AtomId, Effect, Effects, Instruction, Operation, Program, ProgramError, RegionId, RegionRef, Type as RyftType,
+    Typed, Value,
+};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
 use ryft_mlir::{
@@ -8519,27 +8511,20 @@ mod tests {
         Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionVariable, LogicalMesh, MeshAxis,
         MeshAxisType, Shape, Sharding, ShardingDimension, i1, i2, i4, u1, u2, u4,
     };
-    use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
+    use ryft_core::backends::{Array as CpuArray, ArrayOperation};
     use ryft_core::contexts::Context;
     use ryft_core::differentiation::ReverseModeDifferentiate;
-    use ryft_core::operations::compare::CompareOperation;
-    use ryft_core::operations::constants::{
-        ConstantOperation, Fill, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroOperation,
-    };
-    use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
-    use ryft_core::operations::dimensions::{DimensionAddOperation, DimensionSizeOperation};
-    use ryft_core::operations::logical::{AndOperation, OrOperation, XorOperation};
-    use ryft_core::operations::manipulation::{
-        BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-        LegacyBroadcastOperation, LegacyReshapeOperation, PadOperation, SliceOperation, Transpose,
-        UpdateSliceOperation,
-    };
-    use ryft_core::operations::math::{
-        Atan2Operation, Cos, DivOperation, Dot, DotDimensionNumbers, ReduceOperation, Sin,
-    };
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
+    use ryft_core::operations::{
+        AndOperation, Atan2Operation, BroadcastOperation, CompareOperation, ConcatenateOperation, ConditionOperation,
+        ConstantOperation, Cos, DimensionAddOperation, DimensionSizeOperation, DivOperation, Dot, DotDimensionNumbers,
+        DynamicSliceOperation, DynamicUpdateSliceOperation, Fill, LegacyBroadcastOperation, LegacyReshapeOperation,
+        OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation, ReduceOperation, ScanOperation,
+        SelectOperation, Sin, SliceOperation, Transpose, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike,
+        ZeroOperation,
+    };
     use ryft_core::parameters::Placeholder;
-    use ryft_core::programs::builders::ProgramBuilder;
+    use ryft_core::programs::ProgramBuilder;
     use ryft_core::{EagerContext, TypeError};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -9702,7 +9687,7 @@ mod tests {
 
     #[test]
     fn test_effectful_shard_map_body_is_rejected() {
-        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::operations::PrintOperation;
 
         // Shardy manual-computation boundaries cannot carry StableHLO effect tokens. Reject an effectful body instead
         // of silently creating a private chain that is unordered with respect to effects outside the shard map.
@@ -9724,7 +9709,7 @@ mod tests {
 
     #[test]
     fn test_custom_jvp_lowering_inlines_only_the_primal_program() {
-        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::operations::PrintOperation;
         use ryft_core::tracing_v2::custom_derivatives::CustomJvpOperation;
 
         // A retained `custom_jvp` call lowers only its primal program and threads its effects onto the enclosing
@@ -9788,7 +9773,7 @@ mod tests {
 
     #[test]
     fn test_rematerialize_lowering_inlines_primal_effects_on_the_enclosing_token_chain() {
-        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::operations::PrintOperation;
         use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 
         // Rematerialization is a transform boundary, not an execution boundary. Lowering inlines its primal region,
@@ -10748,7 +10733,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_gather() {
         use ryft_core::arrays::{Dimension, DimensionBounds, DimensionVariable, Shape};
-        use ryft_core::operations::manipulation::{GatherDimensionNumbers, GatherOperation};
+        use ryft_core::operations::{GatherDimensionNumbers, GatherOperation};
 
         // Take whole rows of a [3, 2] matrix at the row indices in a [2, 1] index array: offset axis 1 carries the
         // row (slice sizes [1, 2]); axis 0 is collapsed (start-index driven). Output is [2, 2].
@@ -10806,7 +10791,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_clip_mode_gather_to_bare_op() {
         use ryft_core::arrays::{Dimension, Shape};
-        use ryft_core::operations::manipulation::{GatherDimensionNumbers, GatherOperation, GatherScatterMode};
+        use ryft_core::operations::{GatherDimensionNumbers, GatherOperation, GatherScatterMode};
 
         // `Clip` is StableHLO `gather`'s default out-of-bounds behavior, so a `Clip`-mode gather lowers to the bare
         // `stablehlo.gather` (no extra clamp ops) just like the in-bounds default rather than erroring.
@@ -10836,7 +10821,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_scatter() {
         use ryft_core::arrays::{Dimension, Shape};
-        use ryft_core::operations::manipulation::{ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
+        use ryft_core::operations::{ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 
         // Scatter-add row updates into a [3, 2] operand at the row indices in a [2, 1] index array. Output is [3, 2],
         // and the Add combiner lowers to a `stablehlo.add` inside the scatter region.
@@ -11022,7 +11007,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_threads_effectful_while_condition_once_per_evaluation() {
-        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::operations::PrintOperation;
 
         // StableHLO condition regions cannot return tokens. The lowering therefore evaluates an effectful scalar
         // condition once before the loop and once after each body execution, carrying its predicate through the loop
@@ -11168,8 +11153,7 @@ mod tests {
         // reduction, and the body region recomputes the per-item predicate on the incoming state and selects per
         // state element between the body's candidate update and the carried state, freezing finished items. The
         // predicate shape equals the state shape here, so no broadcast is needed for the mask.
-        use ryft_core::operations::compare::CompareOperation;
-        use ryft_core::operations::constants::{OneLikeOperation, ZeroLikeOperation};
+        use ryft_core::operations::{CompareOperation, OneLikeOperation, ZeroLikeOperation};
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
@@ -11227,8 +11211,7 @@ mod tests {
         // contract requires to be loop-invariant. Masking a loop-invariant carry is the identity, so the lowering
         // threads the body's dimension result on directly: only the array carry gets a `stablehlo.select`, while the
         // condition region still `or`-reduces the per-item predicate into the scalar continuation decision.
-        use ryft_core::operations::compare::CompareOperation;
-        use ryft_core::operations::constants::{OneLikeOperation, ZeroLikeOperation};
+        use ryft_core::operations::{CompareOperation, OneLikeOperation, ZeroLikeOperation};
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::new(extent.clone());
         let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
@@ -11342,7 +11325,7 @@ mod tests {
         // reads one slice of the stacked inputs with `stablehlo.dynamic_slice`, inlines the body, and writes the
         // per-iteration outputs into preallocated zero accumulators with `stablehlo.dynamic_update_slice` (the
         // strategy JAX uses for `lax.scan`, which is not an XLA primitive).
-        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
+        use ryft_core::operations::ScanOperation as CoreScanOperation;
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let mut body_builder = CompositeXlaProgramBuilder::new();
@@ -11555,7 +11538,7 @@ mod tests {
     fn test_to_mlir_module_for_program_lowers_fully_unrolled_scan_without_while() {
         // A scan whose unroll factor equals its length lowers to straight-line operations: no `stablehlo.while` is
         // emitted at all and the body inlines once per iteration (three `stablehlo.multiply` copies for `length = 3`).
-        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
+        use ryft_core::operations::ScanOperation as CoreScanOperation;
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let mut body_builder = CompositeXlaProgramBuilder::new();
@@ -11603,7 +11586,7 @@ mod tests {
         // A scan with `unroll = 2` over `length = 4` keeps the `stablehlo.while` skeleton but runs two body copies
         // per loop trip: the body region contains two `stablehlo.multiply` copies (and one iteration read/write pair
         // per copy) while the counter advances by the unroll factor.
-        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
+        use ryft_core::operations::ScanOperation as CoreScanOperation;
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let mut body_builder = CompositeXlaProgramBuilder::new();
@@ -11652,7 +11635,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_two_prints_through_one_token_chain() {
-        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::operations::PrintOperation;
 
         // Two prints in one flat program: the token chain is created lazily by one zero-operand
         // `stablehlo.after_all` at the first print, the second print consumes the first print's token result, and
@@ -11694,8 +11677,8 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_lowers_custom_call() {
         use ryft_core::arrays::{StridedLayout, Tile, TileDimension, TiledLayout};
+        use ryft_core::operations::PrintOperation;
         use ryft_core::operations::custom_call::CustomCallOperation;
-        use ryft_core::operations::debugging::PrintOperation;
 
         // A side-effecting custom call lowers its typed attributes, complete memory-layout lists, buffer alias,
         // and one hidden ordered-I/O token. A second side-effecting call consumes that token even though the first
@@ -11950,7 +11933,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_accumulation_typed_dot() {
-        use ryft_core::operations::math::{DotDimensionNumbers, DotOperation};
+        use ryft_core::operations::{DotDimensionNumbers, DotOperation};
 
         // An accumulation-typed dot lowers to a `stablehlo.dot_general` whose result type is the accumulation type
         // (XLA's `preferred_element_type` contract), with the operands kept at their narrow element type.
@@ -11992,7 +11975,7 @@ mod tests {
     /// `f4e2m1fn [2, 16]` operands with `f8e4m3fn [2, 1]` scales over blocks of 16.
     fn scaled_dot_fixture_program() -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>)
     {
-        use ryft_core::operations::math::ScaledDotOperation;
+        use ryft_core::operations::ScaledDotOperation;
 
         let element_type =
             ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
@@ -12075,7 +12058,7 @@ mod tests {
     /// `f8e4m3fn [2, 2, 1]` scales over blocks of 16 and an `f32` global scale.
     fn scaled_dot_rank_3_global_scale_fixture_program()
     -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
-        use ryft_core::operations::math::ScaledDotOperation;
+        use ryft_core::operations::ScaledDotOperation;
 
         let element_type = ArrayType::new(
             DataType::F4E2M1FN,
@@ -12169,7 +12152,7 @@ mod tests {
     fn test_lower_mlir_module_for_program_emits_block_scaled_dot_in_shared_jit_call_callee() {
         // The module's target platform reaches deduplicated `jit_call` callee functions, so a qualifying NVFP4
         // scaled dot inside a shared callee still lowers to the `__op$block_scaled_dot` custom call on CUDA.
-        use ryft_core::operations::math::ScaledDotOperation;
+        use ryft_core::operations::ScaledDotOperation;
 
         let element_type =
             ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
@@ -12903,8 +12886,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_scan_body_print_with_token_loop_state() {
-        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
-        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::operations::{PrintOperation, ScanOperation as CoreScanOperation};
 
         // A print inside a scan body makes the lowered `stablehlo.while` carry the effect token as one extra
         // trailing state element: the entry token is created before the loop, both regions receive it as an extra
@@ -12972,9 +12954,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_threads_both_ordered_effect_classes_through_scan() {
-        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
-        use ryft_core::operations::debugging::PrintOperation;
-        use ryft_core::operations::dimensions::DimensionFromScalarOperation;
+        use ryft_core::operations::{DimensionFromScalarOperation, PrintOperation, ScanOperation as CoreScanOperation};
 
         // The scan body uses both ordered classes: the checked gateway contributes an assertion and the print
         // contributes ordered I/O. The loop state carries two independent trailing tokens in canonical class order.
@@ -13033,7 +13013,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_condition_branch_print_with_token_result() {
-        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::operations::PrintOperation;
 
         // A print inside one condition branch makes the lowered `stablehlo.if` return the branch's final effect
         // token as one extra trailing result: both branches capture the entry token implicitly, the effectful branch
@@ -13095,8 +13075,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_threads_branch_effect_class_union_independently() {
-        use ryft_core::operations::debugging::PrintOperation;
-        use ryft_core::operations::dimensions::DimensionFromScalarOperation;
+        use ryft_core::operations::{DimensionFromScalarOperation, PrintOperation};
 
         // Each branch uses a different ordered class. StableHLO requires identical branch result signatures, so both
         // branches return the union's two tokens while forwarding the untouched entry token for the unused class.
@@ -13166,8 +13145,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_separates_assertion_and_io_token_chains() {
-        use ryft_core::operations::debugging::PrintOperation;
-        use ryft_core::operations::dimensions::{DimensionFromScalarOperation, DimensionRequirementOperation};
+        use ryft_core::operations::{DimensionFromScalarOperation, DimensionRequirementOperation, PrintOperation};
 
         let scalar_type = ArrayType::scalar(DataType::I64);
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
@@ -13238,9 +13216,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_clamps_unproven_dimension_arithmetic_data_paths() {
         use ryft_core::arrays::DimensionOperation;
-        use ryft_core::operations::dimensions::{
-            DimensionFromScalarOperation, DimensionSubOperation, DimensionToScalarOperation,
-        };
+        use ryft_core::operations::{DimensionFromScalarOperation, DimensionSubOperation, DimensionToScalarOperation};
 
         let scalar_type = ArrayType::scalar(DataType::I64);
         let build = |left_bounds: DimensionBounds, right_bounds: DimensionBounds| {
@@ -13302,7 +13278,7 @@ mod tests {
 
     #[test]
     fn test_repeated_effectful_jit_call_callees_inline_and_chain_prints() {
-        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::operations::PrintOperation;
 
         // A repeated `jit_call` callee that prints is excluded from function deduplication and inlines at every
         // call site, so both inlined prints chain onto the caller's ordered-I/O token in program order (a shared
@@ -13341,7 +13317,7 @@ mod tests {
     #[test]
     fn test_jit_two_prints_execute_in_order_on_cpu() {
         use ryft_core::arrays::{Device, DeviceMesh};
-        use ryft_core::operations::debugging::Print;
+        use ryft_core::operations::Print;
         use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
         use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
@@ -13402,8 +13378,7 @@ mod tests {
     fn test_scan_body_print_with_token_loop_state_executes_on_cpu() {
         use std::sync::Arc;
 
-        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
-        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::operations::{PrintOperation, ScanOperation as CoreScanOperation};
         use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
         use ryft_pjrt::{
             BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
@@ -13512,8 +13487,7 @@ mod tests {
     fn test_batched_predicate_while_executes_with_masked_semantics_on_cpu() {
         use std::sync::Arc;
 
-        use ryft_core::operations::compare::CompareOperation;
-        use ryft_core::operations::constants::{OneLikeOperation, ZeroLikeOperation};
+        use ryft_core::operations::{CompareOperation, OneLikeOperation, ZeroLikeOperation};
         use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
         use ryft_pjrt::{
             BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
@@ -14042,7 +14016,7 @@ mod tests {
 
     #[test]
     fn test_slicing_vjp_pullbacks_lower_to_stablehlo() {
-        use ryft_core::operations::manipulation::{DynamicSlice, Slice};
+        use ryft_core::operations::{DynamicSlice, Slice};
 
         // The static slice pullback writes the cotangent into a zero array at the static offsets via the
         // statically indexed update-slice, which lowers to `stablehlo.dynamic_update_slice` with constant indices.
@@ -14096,7 +14070,7 @@ mod tests {
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .vjp(
                 |(x, padding_value)| {
-                    use ryft_core::operations::manipulation::Pad;
+                    use ryft_core::operations::Pad;
                     Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap())
                 },
                 (CpuArray::vector(vec![1.0, 2.0, 3.0]), CpuArray::scalar(9.0)),
@@ -14251,7 +14225,7 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_lowers_to_device_placement_annotations() {
-        use ryft_core::operations::memory::TransferToMemory;
+        use ryft_core::operations::TransferToMemory;
 
         // A compute-flanked host-and-back round trip lowers to one `annotate_device_placement` custom call per
         // transfer, carrying the destination kind in the `_xla_buffer_placement` frontend attribute — including the
@@ -14398,7 +14372,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_preserves_effects_that_produce_an_erased_output() {
-        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_core::operations::PrintOperation;
 
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = CompositeXlaProgramBuilder::new();
@@ -14864,7 +14838,7 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_vjp_pullback_lowers_with_a_placement_annotation() {
-        use ryft_core::operations::memory::TransferToMemory;
+        use ryft_core::operations::TransferToMemory;
 
         // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
         // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.

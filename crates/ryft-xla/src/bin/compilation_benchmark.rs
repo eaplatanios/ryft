@@ -12,7 +12,7 @@ use ryft_core::arrays::{
 use ryft_core::compilation::{
     CompilationDomain, CompiledFunction, DiskCache, JitCacheStatistics, StagedFunction, stage_function,
 };
-use ryft_core::operations::math::Sin;
+use ryft_core::operations::Sin;
 use ryft_core::{ArrayIrValue, ValueProjection};
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, jitted};

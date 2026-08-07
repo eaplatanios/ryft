@@ -5,13 +5,13 @@ use ryft_core::arrays::{
     ArrayIrOperation, ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue,
 };
 use ryft_core::axes::AxisIndexOperation;
-use ryft_core::backends::arrays::{Array as ReferenceArray, ArrayOperation};
+use ryft_core::backends::{Array as ReferenceArray, ArrayOperation};
 use ryft_core::batching::{
     ArrayBatch, ArrayBatching, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver,
     BatchingError, ProgramBatchingOutputAxesPolicy,
 };
 use ryft_core::captures::CaptureReference;
-use ryft_core::compilation::function::CompiledCallOperation;
+use ryft_core::compilation::CompiledCallOperation;
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
@@ -20,47 +20,34 @@ use ryft_core::differentiation::{
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, CollectiveOperation, PSumScatterOperation, PpermuteOperation,
+    AllGatherOperation, AllToAllOperation, PSumScatterOperation, PpermuteOperation,
 };
-use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
-use ryft_core::operations::constants::{
-    ConstantOperation, IotaOperation, OneLikeOperation, OneOperation, Zero, ZeroLikeOperation, ZeroOperation,
-    ZeroOperationProvider,
-};
-use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
 use ryft_core::operations::custom_call::CustomCallOperation;
-use ryft_core::operations::debugging::PrintOperation;
-use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
-use ryft_core::operations::dimensions::{
-    DimensionFromScalarOperation, DimensionRequirementOperation, DimensionSizeOperation, DimensionToScalarOperation,
-};
-use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
-use ryft_core::operations::manipulation::{
-    BroadcastOperation, ConcatenateOperation, ConvertElementTypeOperation, DynamicShapeSliceOperation,
-    DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation, LegacyBroadcastOperation,
-    LegacyReshapeOperation, PadOperation, ReshapeOperation, ScatterOperation, SliceOperation, TransposeOperation,
-    UpdateSliceOperation,
-};
-use ryft_core::operations::math::{
-    AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
-    ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaxOperation, MinOperation, MulOperation,
-    NegOperation, PowOperation, ReduceOperation, RemOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
-};
-use ryft_core::operations::memory::TransferToMemoryOperation;
 use ryft_core::operations::random::RngBitGeneratorOperation;
-use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::operations::sort::SortOperation;
-use ryft_core::operations::tag::TagOperation;
+use ryft_core::operations::{
+    AbsOperation, AddOperation, AndOperation, Atan2Operation, BroadcastOperation, CeilOperation, CollectiveOperation,
+    CompareOperation, ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
+    CoordinateBasisOperation, CosOperation, DimensionFromScalarOperation, DimensionRequirementOperation,
+    DimensionSizeOperation, DimensionToScalarOperation, DivOperation, DotOperation, DynamicShapeSliceOperation,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, ErfOperation, ExpOperation, FloorOperation, GatherOperation,
+    IotaOperation, LegacyBroadcastOperation, LegacyReshapeOperation, LogOperation, LogisticOperation, MaxOperation,
+    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation,
+    PowOperation, PrintOperation, ReduceOperation, RemOperation, ReshapeOperation, ReshardOperation, RoundOperation,
+    RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation,
+    SignOperation, SinOperation, SliceOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation,
+    TanhOperation, TransferToMemoryOperation, TransposeOperation, UpdateSliceOperation, WhileOperation, XorOperation,
+    Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+};
 use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use ryft_core::programs::operations::Operation;
-use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface, RegionSlot};
-use ryft_core::programs::types::{Type, TypeError, Typed};
-use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, ProgramError, Value, ValueProjection};
+use ryft_core::programs::{
+    CalleeRegionDriver, Concretizable, MaybeZero, Operation, Program, ProgramBuilder, ProgramError, RegionInterface,
+    RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
+};
 use ryft_core::tracing::{Tracer, TracingContext};
 use ryft_core::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
@@ -981,21 +968,19 @@ mod tests {
         ArrayIrOperation, ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
         DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use ryft_core::backends::arrays::ArrayOperation;
+    use ryft_core::backends::ArrayOperation;
     use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};
-    use ryft_core::operations::constants::ZeroOperation;
-    use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
-    use ryft_core::operations::dimensions::DimensionFromScalarOperation;
-    use ryft_core::operations::manipulation::BroadcastOperation;
-    use ryft_core::operations::math::{AddOperation, MulOperation};
+    use ryft_core::operations::{
+        AddOperation, BroadcastOperation, ConditionOperation, DimensionFromScalarOperation, MulOperation,
+        ScanOperation, WhileOperation, ZeroOperation,
+    };
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
-    use ryft_core::programs::effects::Effects;
-    use ryft_core::programs::operations::Operation;
-    use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionInterface, RegionRef};
-    use ryft_core::programs::types::Typed;
-    use ryft_core::programs::{MaybeZero, ProgramBuilder};
+    use ryft_core::programs::{
+        Effects, EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, RegionDriver, RegionInterface, RegionRef,
+        Typed,
+    };
     use ryft_core::tracing::TracingContext;
 
     use super::{

@@ -3,10 +3,8 @@
 use ryft_core::arrays::{
     ArrayIrOperation, ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, Shape,
 };
-use ryft_core::operations::compare::ComparisonDirection;
-use ryft_core::operations::dimensions::DimensionRequirementOperation;
-use ryft_core::programs::effects::Effect;
-use ryft_core::programs::{Operation, ProgramError};
+use ryft_core::operations::{ComparisonDirection, DimensionRequirementOperation};
+use ryft_core::programs::{Effect, Operation, ProgramError};
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
     Block, Context as MlirContext, Location, Operation as MlirOperation, Size as MlirSize, Type as MlirType,

@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::arrays::ArrayType;
-use crate::broadcasting::Broadcastable;
+use crate::arrays::{ArrayType, Broadcastable};
 use crate::macros::check_count;
 use crate::programs::{Operation, TypeError};
 

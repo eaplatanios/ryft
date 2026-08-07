@@ -29,13 +29,12 @@ use ryft_macros::{Operation, Parameter};
 // TODO(eaplatanios): Review from here onwards.
 
 use crate::arrays::{
-    ArrayAddressing, ArrayElement, ArraySliceAxis, ArrayType, DataType, Dimension, Shape, StaticShape, decode_elements,
-    decode_logical_bytes, dispatch_on_array_element_type, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn,
-    f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2,
-    u4, validate_storage_bytes,
+    ArrayAddressing, ArrayElement, ArraySliceAxis, ArrayType, Broadcastable, DataType, Dimension, Shape, StaticShape,
+    decode_elements, decode_logical_bytes, dispatch_on_array_element_type, encode_elements, encode_logical_bytes,
+    f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
+    i1, i2, i4, u1, u2, u4, validate_storage_bytes,
 };
 use crate::axes::{Axis, AxisIndexOperation};
-use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::differentiation::LinearCallOperation;
 use crate::macros::{check_count, check_types};

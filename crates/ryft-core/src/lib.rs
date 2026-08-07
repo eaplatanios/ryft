@@ -6,7 +6,6 @@ pub mod arrays;
 pub mod axes;
 pub mod backends;
 pub mod batching;
-pub mod broadcasting;
 pub mod captures;
 pub mod compilation;
 pub mod contexts;
@@ -42,7 +41,6 @@ pub use batching::{
     ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy, ReplicatedDimensionBatchingPolicy,
     StaticArrayBatchingPolicy, batch, batch_projected_operation,
 };
-pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::*;
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};

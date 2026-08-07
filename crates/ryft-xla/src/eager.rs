@@ -1,17 +1,12 @@
 use ryft_core::arrays::{ArrayIrType, DataType, DimensionType, DimensionValue, DimensionVariable};
-use ryft_core::backends::arrays::ArrayOperation;
+use ryft_core::backends::ArrayOperation;
 use ryft_core::contexts::Context;
 use ryft_core::macros::check_count;
-use ryft_core::operations::control_flow::{Select, WhilePredicate};
-use ryft_core::operations::dimensions::{
-    DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation,
+use ryft_core::operations::{
+    Add, AndOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, Div,
+    ElementType, LegacyBroadcast, Mul, Neg, NotOperation, OrOperation, Select, Sub, WhilePredicate, XorOperation,
 };
-use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
-use ryft_core::operations::manipulation::LegacyBroadcast;
-use ryft_core::operations::manipulation::conversion::ElementType;
-use ryft_core::operations::math::{Add, Div, Mul, Neg, Sub};
-use ryft_core::programs::types::Typed;
-use ryft_core::programs::{Concretizable, Operation, ProgramError, Value};
+use ryft_core::programs::{Concretizable, Operation, ProgramError, Typed, Value};
 
 use crate::experimental::ops::XlaArrayConstant;
 use crate::{Array, ArrayShard};
@@ -293,24 +288,19 @@ mod tests {
         ArrayType, Device, DeviceMesh, Dimension, DimensionBounds, LogicalMesh, MeshAxis, MeshAxisType, Shape,
         Sharding, ShardingDimension, StaticShape,
     };
-    use ryft_core::backends::arrays::Array as CpuArray;
+    use ryft_core::backends::Array as CpuArray;
     use ryft_core::batching::{BatchAxis, batch};
     use ryft_core::contexts::ProjectedContext;
-    use ryft_core::differentiation::hessian::HessianDifferentiate;
-    use ryft_core::differentiation::jacobian::{JacobianDifferentiate, jacobian_reverse};
-    use ryft_core::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-    use ryft_core::operations::compare::{Compare, ComparisonDirection};
-    use ryft_core::operations::constants::{OneLike, ZeroLike};
-    use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradient};
-    use ryft_core::operations::manipulation::{
-        Concatenate, ConvertElementType, Pad, Reshape, Scatter, ScatterDimensionNumbers, ScatterOperation,
-        ScatterReductionKind, Slice, Transpose, UpdateSlice,
+    use ryft_core::differentiation::{
+        ForwardModeDifferentiate, HessianDifferentiate, JacobianDifferentiate, ReverseModeDifferentiate,
+        jacobian_reverse,
     };
-    use ryft_core::operations::math::{
-        Abs, Atan2, Ceil, Cos, Dot, Erf, Exp, Floor, Log, Logistic, Max, Min, Pow, Reduce, ReductionKind, Rem, Round,
-        Rsqrt, Sign, Sin, Sqrt, Tanh,
+    use ryft_core::operations::{
+        Abs, Atan2, Ceil, Compare, ComparisonDirection, Concatenate, ConvertElementType, CoordinateBasisOperation, Cos,
+        Dot, Erf, Exp, Floor, Log, Logistic, Max, Min, OneLike, Pad, Pow, Reduce, ReductionKind, Rem, Reshape, Round,
+        Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Sign, Sin, Slice, Sqrt,
+        StopGradient, Tag, Tanh, Transpose, UpdateSlice, ZeroLike,
     };
-    use ryft_core::operations::tag::Tag;
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::tests::{
@@ -1119,7 +1109,7 @@ mod tests {
     /// accumulates at `f32`. Every value used is exactly representable in `f8e4m3fn`, so both backends are exact.
     #[test]
     fn test_eager_accumulation_typed_dot_parity_with_reference_backend() {
-        use ryft_core::operations::math::DotDimensionNumbers;
+        use ryft_core::operations::DotDimensionNumbers;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1152,7 +1142,7 @@ mod tests {
     /// so both backends are exact.
     #[test]
     fn test_eager_scaled_dot_parity_with_reference_backend() {
-        use ryft_core::operations::math::ScaledDot;
+        use ryft_core::operations::ScaledDot;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1567,7 +1557,7 @@ mod tests {
     /// replays the staged backward operation).
     #[test]
     fn test_eager_differentiable_dot_product_attention_gradient() {
-        use ryft_core::backends::arrays::ArrayOperation;
+        use ryft_core::backends::ArrayOperation;
         use ryft_core::contexts::{EagerContext, ProjectedContext};
         use ryft_core::operations::attention::{AttentionMask, differentiable_dot_product_attention};
 

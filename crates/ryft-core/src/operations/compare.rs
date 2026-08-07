@@ -1,11 +1,10 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrType, ArrayType, DataType, DimensionType};
+use crate::arrays::{ArrayIrType, ArrayType, Broadcastable, DataType, DimensionType};
 use crate::batching::{
     ArrayIrBatch, ArrayIrBatching, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
-use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;

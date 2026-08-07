@@ -6,7 +6,7 @@ mod tests {
     use ryft_core::arrays::{
         ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use ryft_core::operations::manipulation::Reshape;
+    use ryft_core::operations::Reshape;
 
     use crate::experimental::shard_map::{ShardMapTracer, TracedShardMap, TracedXlaProgram, reshard, shard_map, trace};
 

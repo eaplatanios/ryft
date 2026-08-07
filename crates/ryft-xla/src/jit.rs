@@ -19,7 +19,7 @@ use ryft_core::compilation::{
 };
 use ryft_core::contexts::{Context, ProjectedContext};
 use ryft_core::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};
-use ryft_core::operations::constants::Constant;
+use ryft_core::operations::Constant;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::programs::{ProgramError, ProjectedValue, Value, ValueProjection};
 use ryft_core::tracing::{DomainTracingContext, Tracer};
@@ -1267,25 +1267,20 @@ mod tests {
         ArrayIrType, ArrayIrValue, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis,
         MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
+    use ryft_core::backends::{Array as CpuArray, ArrayOperation};
     use ryft_core::contexts::{Context, EagerContext};
-    use ryft_core::differentiation::hessian::{Hessian, HessianDifferentiate};
-    use ryft_core::differentiation::jacobian::{Jacobian, JacobianDifferentiate};
-    use ryft_core::differentiation::{DifferentiableType, ForwardModeDifferentiate};
-    use ryft_core::operations::compare::{Compare, ComparisonDirection};
-    use ryft_core::operations::constants::{Fill, Iota, OneLike, ZeroLike};
-    use ryft_core::operations::control_flow::{Select, WhileOperation};
-    use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
-    use ryft_core::operations::differentiation::StopGradient;
-    use ryft_core::operations::manipulation::{DynamicSlice, DynamicUpdateSlice, LegacyBroadcast, Reshape};
-    use ryft_core::operations::math::{
-        Add, Atan2, Cos, Div, Dot, DotDimensionNumbers, Exp, Logistic, Mul, Reduce, ReductionKind, Sin, Sub, Tanh,
+    use ryft_core::differentiation::{
+        DifferentiableType, ForwardModeDifferentiate, Hessian, HessianDifferentiate, Jacobian, JacobianDifferentiate,
     };
+    use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
     use ryft_core::operations::random::Random;
     use ryft_core::operations::sort::{ArgMax, TopK};
-    use ryft_core::programs::regions::CalleeRegionDriver;
-    use ryft_core::programs::types::Typed;
-    use ryft_core::programs::{ProgramError, ProjectedValue, Value, ValueProjection};
+    use ryft_core::operations::{
+        Add, Atan2, Compare, ComparisonDirection, Cos, Div, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice,
+        Exp, Fill, Iota, LegacyBroadcast, Logistic, Mul, OneLike, Reduce, ReductionKind, Reshape, Select, Sin,
+        StopGradient, Sub, Tanh, WhileOperation, ZeroLike,
+    };
+    use ryft_core::programs::{CalleeRegionDriver, ProgramError, ProjectedValue, Typed, Value, ValueProjection};
     use ryft_core::tracing::DomainTracingContext;
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1723,7 +1718,7 @@ mod tests {
     #[test]
     fn test_jit_transfer_to_memory_round_trip_runs_end_to_end() {
         use ryft_core::arrays::Memory;
-        use ryft_core::operations::memory::TransferToMemory;
+        use ryft_core::operations::TransferToMemory;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1836,7 +1831,7 @@ mod tests {
     /// `jit_call` boundary in the active outer trace.
     #[test]
     fn test_compiled_function_staged_inside_compile() {
-        use ryft_core::operations::math::Cos;
+        use ryft_core::operations::Cos;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();

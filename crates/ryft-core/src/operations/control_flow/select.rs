@@ -1,8 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayType, DataType};
-use crate::broadcasting::Broadcastable;
+use crate::arrays::{ArrayType, Broadcastable, DataType};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};

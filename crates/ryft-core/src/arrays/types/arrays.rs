@@ -4,6 +4,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::sharding::ShardingError;
 use crate::arrays::sharding::meshes::DeviceMesh;
 use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
@@ -12,7 +13,6 @@ use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionVaria
 use crate::arrays::types::layouts::Layout;
 use crate::arrays::types::memories::Memory;
 use crate::axes::Axis;
-use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::types::visit_type_signature_pairs;
