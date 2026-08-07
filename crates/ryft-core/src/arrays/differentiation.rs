@@ -7,6 +7,7 @@ use crate::contexts::Context;
 use crate::differentiation::LinearCallBatchingPolicy;
 use crate::operations::constants::ConstantOperation;
 use crate::operations::dimensions::DimensionSizeOperation;
+use crate::operations::manipulation::Permutation;
 use crate::operations::math::{Reduce, ReduceOperation, ReductionKind};
 use crate::programs::ProgramError;
 use crate::programs::operations::OperationProjection;
@@ -259,26 +260,27 @@ impl ExactShape {
             .collect()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns this exact shape viewed through an axis selection, so that output axis `i` is copied from source axis
-    /// `axes[i]`. Rules whose transpose sees a permuted, repeated, or reduced view of a retained shape (e.g., an axis
-    /// transposition) use this to derive the viewed plan without retaining any additional residuals. Residual slot
-    /// indices are preserved, so the result addresses the same [`LinearResiduals`] list as `self`.
+    /// Returns this exact shape transposed by `permutation`, so that output axis `i` is copied from source axis
+    /// `permutation[i]`. Rules whose transpose sees a permuted view of a retained shape (e.g., a reshape with a
+    /// `dimensions` permutation) use this to derive that view without retaining any additional residuals. Residual
+    /// slot indices are preserved, so the result addresses the same [`LinearResiduals`] list as `self`.
     #[inline]
-    pub fn reordered(&self, axes: &[usize]) -> Self {
-        Self(axes.iter().map(|axis| self.0[*axis]).collect())
+    pub fn transposed(&self, permutation: &Permutation) -> Self {
+        Self(permutation.iter().map(|axis| self.0[*axis]).collect())
     }
 }
 
-/// One axis of an [`ExactShape`]: where the runtime extent of that axis lives, from the point of view of a linear
-/// call's attached region.
+// TODO(eaplatanios): Review from here onwards.
+
+/// One dimension of an [`ExactShape`] that describes where the runtime extent of the corresponding axis lives, from
+/// the point of view of a [`LinearCallOperation`](crate::LinearCallOperation)'s attached [`Region`](crate::Region).
+/// This is the [`ExactShape`] counterpart of [`Dimension`], which is the per-axis entry of a [`Shape`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExactShapeDimension {
     /// Compile-time extent that can be reconstructed as a dimension constant in either attached region.
     Static(usize),
 
-    /// Index of the ordinary SSA residual that carries this dynamic extent.
+    /// Index of the ordinary Single Static Assignment (SSA) residual that carries this dynamic extent.
     Residual(usize),
 }
 
@@ -466,12 +468,14 @@ mod tests {
         // Dynamic-constructor operand expansion is in axis order and intentionally repeats shared slots.
         assert_eq!(plan.dynamic_dimensions(&["n", "m"]), vec!["n", "n", "m"]);
 
-        // Reordering copies output axis `i` from source axis `axes[i]`, preserving residual slot indices.
+        // Transposing copies output axis `i` from source axis `permutation[i]`, preserving residual slot indices.
         assert_eq!(
-            plan.reordered(&[4, 0, 1]),
+            plan.transposed(&Permutation::from(vec![4, 0, 1, 2, 3])),
             ExactShape(vec![
                 ExactShapeDimension::Residual(1),
                 ExactShapeDimension::Static(2),
+                ExactShapeDimension::Residual(0),
+                ExactShapeDimension::Static(3),
                 ExactShapeDimension::Residual(0),
             ]),
         );
