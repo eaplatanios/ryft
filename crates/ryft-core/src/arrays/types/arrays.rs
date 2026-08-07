@@ -6,9 +6,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
 use crate::arrays::types::data::DataType;
-use crate::arrays::types::dimensions::{
-    Dimension, DimensionError, DimensionType, DimensionVariable, Shape, StaticShape,
-};
+use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionVariable, Shape, StaticShape};
 use crate::arrays::types::layouts::Layout;
 use crate::arrays::types::memories::Memory;
 use crate::axes::Axis;
@@ -356,33 +354,16 @@ impl ArrayType {
         self.clone().with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), self.shape.rank()))
     }
 
-    /// Returns whether `other` has the same element [`DataType`] and [`Memory`] placement as this [`ArrayType`] and
-    /// refines this type's optional [`Layout`] and [`Sharding`] constraints. [`Shape`] refinement is deliberately
-    /// excluded because ordinary type refinement, identity-renaming derivation, and cross-signature refinement
-    /// validation have different requirements.
-    fn non_shape_components_are_refined_by(&self, other: &Self) -> bool {
-        let layout_is_refined = match (&self.layout, &other.layout) {
-            (None, _) => true,
-            (Some(_), None) => false,
-            (Some(declared), Some(actual)) => declared == actual,
-        };
-        let sharding_is_refined = match (&self.sharding, &other.sharding) {
-            (None, _) => true,
-            (Some(_), None) => false,
-            (Some(declared), Some(actual)) => declared == actual,
-        };
-        self.data_type == other.data_type && layout_is_refined && sharding_is_refined && self.memory == other.memory
-    }
-
     /// Checks that `actual` can instantiate `declared` and records what that instantiation implies for the declared
     /// [`DimensionVariable`]s (variable renamings in `renaming` and static extent bindings in `refinements`) for
     /// one declared/actual [`ArrayType`] pair.
     ///
-    /// This is the single-pair step used by the [`Type::derive_identity_renaming`] implementations that fold over an
-    /// entire declared/actual signature like [`ArrayType`]'s own, and [`ArrayIrType`]'s, which encounters array types
-    /// as individual elements of a mixed signature. It is a separate function so that those callers can thread the same
-    /// two accumulators through every pair of the signature, which is what makes a declared [`DimensionVariable`]
-    /// that appears in several signature positions get checked consistently rather than pair-by-pair.
+    /// This is the single-pair step used by the [`Type::derive_identity_renaming`] implementations that fold over
+    /// an entire declared/actual signature like [`ArrayType`]'s own, and [`ArrayIrType`](crate::ArrayIrType)'s, which
+    /// encounters array types as individual elements of a mixed signature. It is a separate function so that those
+    /// callers can thread the same two accumulators through every pair of the signature, which is what makes a declared
+    /// [`DimensionVariable`] that appears in several signature positions get checked consistently rather than
+    /// pair-by-pair.
     ///
     /// The `actual` type must have the `declared` type's element [`DataType`] and [`Memory`] placement, refine its
     /// optional [`Layout`] and [`Sharding`], and have the same rank. Each pair of corresponding dimensions then
@@ -411,7 +392,7 @@ impl ArrayType {
     ///   - `(f32[m, 2], f32[3])`: The extension itself succeeds, recording the renaming `n -> m` and the static binding
     ///     `n = 3`. The caller's subsequent [`ArrayTypeRefinements::require_disjoint_from`] check then rejects the
     ///     signature.
-    fn extend_identity_renaming(
+    pub fn extend_identity_renaming(
         declared: &Self,
         actual: &Self,
         renaming: &mut TypeIdentityRenaming<DimensionVariable>,
@@ -436,6 +417,24 @@ impl ArrayType {
                 ))),
             },
         )
+    }
+
+    /// Returns whether `other` has the same element [`DataType`] and [`Memory`] placement as this [`ArrayType`] and
+    /// refines this type's optional [`Layout`] and [`Sharding`] constraints. [`Shape`] refinement is deliberately
+    /// excluded because ordinary type refinement, identity-renaming derivation, and cross-signature refinement
+    /// validation have different requirements.
+    fn non_shape_components_are_refined_by(&self, other: &Self) -> bool {
+        let layout_is_refined = match (&self.layout, &other.layout) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(declared), Some(actual)) => declared == actual,
+        };
+        let sharding_is_refined = match (&self.sharding, &other.sharding) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(declared), Some(actual)) => declared == actual,
+        };
+        self.data_type == other.data_type && layout_is_refined && sharding_is_refined && self.memory == other.memory
     }
 }
 
@@ -568,7 +567,7 @@ pub struct ArrayTypeRefinements {
 
 impl ArrayTypeRefinements {
     /// Records one concrete extent for `variable`, rejecting a conflicting observation.
-    fn bind(&mut self, variable: &DimensionVariable, extent: usize) -> Result<(), TypeError> {
+    pub fn bind(&mut self, variable: &DimensionVariable, extent: usize) -> Result<(), TypeError> {
         match self.bindings.iter().find_map(|(candidate, expected)| (candidate == variable).then_some(*expected)) {
             Some(expected) if expected != extent => Err(DimensionError::InputDimensionMismatch {
                 dimension: variable.to_string(),
@@ -602,7 +601,7 @@ impl ArrayTypeRefinements {
     /// observations *create* facts, and use this function where observations must be *justified* against the boundary's
     /// identity set, as [`TypeRefinements::validate`] does when checking an output signature against the facts
     /// established from its input boundary.
-    fn validate_or_bind(
+    pub fn validate_or_bind(
         &mut self,
         variable: &DimensionVariable,
         extent: usize,
@@ -623,8 +622,32 @@ impl ArrayTypeRefinements {
         }
     }
 
-    /// Validates one [`ArrayType`] while visiting each dynamic-to-static refinement.
-    fn visit_dynamic_to_static_refinements(
+    /// Validates that `actual` refines `declared` while visiting each axis where a declared dynamic dimension is met
+    /// by a concrete static extent (i.e., each *dynamic-to-static refinement*). This is the shared per-type validation
+    /// engine behind both [`TypeRefinements::establish`] and [`TypeRefinements::validate`]. The structural refinement
+    /// rules live here exactly once, while the provided `visitor` decides what an observed concrete extent *means*
+    /// (e.g., [`Self::bind`] when establishing facts from an input signature versus [`Self::validate_or_bind`] when
+    /// justifying an output signature against them). It first requires that `actual` refines every non-shape component
+    /// of `declared` and matches its rank, and then walks the two shapes axis by axis:
+    ///
+    ///   - Equal static extents, or dynamic dimensions with the same [`DimensionVariable`], refine trivially and
+    ///     contribute no visit, because no new concrete fact is observed.
+    ///   - A declared dynamic dimension met by a static extent inside its declared bounds is the refinement this
+    ///     function exists to surface: `visitor` is invoked with the declared variable and the observed extent, and
+    ///     any error it returns aborts the walk and propagates to the caller.
+    ///   - A declared dynamic dimension met by a static extent outside its declared bounds fails with
+    ///     [`DimensionError::BindingOutOfBounds`], and every remaining combination (mismatched static extents, distinct
+    ///     dynamic variables, or a static dimension met by a dynamic one) fails as not refining the declared type.
+    ///
+    /// # Parameters
+    ///
+    ///   - `declared`: [`ArrayType`] declared by the boundary signature, whose dynamic dimensions may legitimately be
+    ///     met by concrete extents.
+    ///   - `actual`: Observed [`ArrayType`] that must refine `declared`.
+    ///   - `visitor`: Callback invoked once per in-bounds dynamic-to-static axis, in axis order, with the declared
+    ///     [`DimensionVariable`] and the observed static extent. A repeated variable is visited once per axis that
+    ///     observes it, so visitors are responsible for requiring that repeated observations agree.
+    pub fn visit_dynamic_to_static_refinements(
         declared: &ArrayType,
         actual: &ArrayType,
         mut visitor: impl FnMut(&DimensionVariable, usize) -> Result<(), TypeError>,
@@ -659,7 +682,7 @@ impl ArrayTypeRefinements {
     /// it to a live [`DimensionVariable`], since no instantiation can satisfy both observations. Complete signature
     /// renaming derivations call this after folding over every member, so the check is independent of the order in
     /// which the two conflicting observations were recorded.
-    fn require_disjoint_from(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<(), TypeError> {
+    pub fn require_disjoint_from(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<(), TypeError> {
         for (variable, extent) in &self.bindings {
             if let Some((_, target)) = renaming.replacements().iter().find(|(source, _)| source == variable) {
                 return Err(TypeError::invalid(format!(
@@ -710,243 +733,6 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
     }
 }
 
-/// [`Type`] vocabulary of Ryft's array Intermediate Representation (IR), whose values may be ordinary arrays or
-/// first-class runtime dimensions. It is the type-level counterpart of [`ArrayIrValue`](crate::ArrayIrValue), with
-/// one member per value kind.
-///
-/// The sum is a storage boundary rather than the contract ordinary primitives are written against: array-only
-/// [`Operation`](crate::Operation)s and transform rules keep consuming [`ArrayType`], dimension-only operations keep
-/// consuming [`DimensionType`], and only genuinely mixed operations (i.e., shape-carrying operations whose dynamic
-/// output extents are explicit dimension operands) consume this type directly. [`From`] lifts each member type into
-/// the sum, and the borrowing [`TryFrom`] implementations project it back out with a checked kind diagnostic.
-/// The same bridge backs the value-level [`ValueProjection`](crate::programs::ValueProjection) implementations.
-///
-/// Both members carry [`DimensionVariable`] identities, so one renaming and refinement vocabulary spans a complete
-/// signature: an [`ArrayType`] member *references* the variables named by its dynamic axes, while a [`DimensionType`]
-/// member *defines* its variable. [`Type::derive_identity_renaming`] therefore checks a variable repeated across
-/// array and dimension members for consistency, exactly as it does within one member kind.
-///
-/// Refer to the documentation of [`DimensionType`] for why runtime dimensions can be first-class typed values in the
-/// first place, the input-derived provenance restriction they encode, and how it enables shape-polymorphic programs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub enum ArrayIrType {
-    /// An ordinary array type.
-    Array(ArrayType),
-
-    /// A first-class runtime dimension type.
-    Dimension(DimensionType),
-}
-
-impl Display for ArrayIrType {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Array(r#type) => r#type.fmt(formatter),
-            Self::Dimension(r#type) => r#type.fmt(formatter),
-        }
-    }
-}
-
-impl From<ArrayType> for ArrayIrType {
-    #[inline]
-    fn from(r#type: ArrayType) -> Self {
-        Self::Array(r#type)
-    }
-}
-
-impl From<DimensionType> for ArrayIrType {
-    #[inline]
-    fn from(r#type: DimensionType) -> Self {
-        Self::Dimension(r#type)
-    }
-}
-
-impl<'t> TryFrom<&'t ArrayIrType> for &'t ArrayType {
-    type Error = TypeError;
-
-    #[inline]
-    fn try_from(r#type: &'t ArrayIrType) -> Result<Self, Self::Error> {
-        match r#type {
-            ArrayIrType::Array(r#type) => Ok(r#type),
-            ArrayIrType::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
-        }
-    }
-}
-
-impl<'t> TryFrom<&'t ArrayIrType> for &'t DimensionType {
-    type Error = TypeError;
-
-    #[inline]
-    fn try_from(r#type: &'t ArrayIrType) -> Result<Self, Self::Error> {
-        match r#type {
-            ArrayIrType::Array(_) => Err(TypeError::invalid("expected dimension type but got array type")),
-            ArrayIrType::Dimension(r#type) => Ok(r#type),
-        }
-    }
-}
-
-impl Type for ArrayIrType {
-    type Identity = DimensionVariable;
-    type Refinements = ArrayIrTypeRefinements;
-
-    fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
-        let array = match self {
-            Self::Array(r#type) => Some(r#type),
-            Self::Dimension(_) => None,
-        };
-        let dimension = match self {
-            Self::Array(_) => None,
-            Self::Dimension(r#type) => Some(r#type),
-        };
-        array
-            .into_iter()
-            .flat_map(ArrayType::identities)
-            .chain(dimension.into_iter().flat_map(DimensionType::identities))
-    }
-
-    fn derive_identity_renaming(
-        declared: &[Self],
-        actual: &[Self],
-    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-        let mut renaming = TypeIdentityRenaming::new();
-        let mut refinements = ArrayTypeRefinements::default();
-        visit_type_signature_pairs(declared, actual, |declared, actual| match (declared, actual) {
-            (Self::Array(declared), Self::Array(actual)) => {
-                ArrayType::extend_identity_renaming(declared, actual, &mut renaming, &mut refinements)
-            }
-            (Self::Dimension(declared), Self::Dimension(actual)) => {
-                DimensionType::extend_identity_renaming(declared, actual, &mut renaming)
-            }
-            (Self::Array(_), Self::Dimension(_)) => {
-                Err(TypeError::invalid("expected array type but got dimension type"))
-            }
-            (Self::Dimension(_), Self::Array(_)) => {
-                Err(TypeError::invalid("expected dimension type but got array type"))
-            }
-        })?;
-        refinements.require_disjoint_from(&renaming)?;
-        Ok(renaming)
-    }
-
-    #[inline]
-    fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
-        match self {
-            Self::Array(r#type) => Ok(Self::Array(r#type.rename_identities(renaming)?)),
-            Self::Dimension(r#type) => Ok(Self::Dimension(r#type.rename_identities(renaming)?)),
-        }
-    }
-
-    #[inline]
-    fn is_compatible_with(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Array(left), Self::Array(right)) => left.is_compatible_with(right),
-            (Self::Dimension(left), Self::Dimension(right)) => left.is_compatible_with(right),
-            _ => false,
-        }
-    }
-
-    #[inline]
-    fn is_refined_by(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Array(left), Self::Array(right)) => left.is_refined_by(right),
-            (Self::Dimension(left), Self::Dimension(right)) => left.is_refined_by(right),
-            _ => false,
-        }
-    }
-
-    #[inline]
-    fn is_scalar(&self) -> bool {
-        match self {
-            Self::Array(r#type) => r#type.is_scalar(),
-            Self::Dimension(r#type) => r#type.is_scalar(),
-        }
-    }
-
-    #[inline]
-    fn is_complex(&self) -> bool {
-        match self {
-            Self::Array(r#type) => r#type.is_complex(),
-            Self::Dimension(r#type) => r#type.is_complex(),
-        }
-    }
-}
-
-/// [`TypeRefinements`] established while refining one complete [`ArrayIrType`] signature. A declared dynamic array
-/// axis met by a static extent contributes a dynamic-to-static binding following the [`ArrayTypeRefinements`] rules
-/// unchanged. A dimension member contributes no concrete fact, because a [`DimensionType`] is strictly identity plus
-/// bounds: its variable belongs to the boundary's closed identity set (see
-/// [`TypeIdentitySignature`](crate::TypeIdentitySignature)), which lets output validation establish the concrete extent
-/// on first observation (e.g., relating an eagerly materialized static array output back to the dimension input that
-/// supplied its shape) while still rejecting inconsistent repeated observations.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ArrayIrTypeRefinements {
-    /// [`ArrayTypeRefinements`] shared by all array members of the signature.
-    arrays: ArrayTypeRefinements,
-}
-
-impl ArrayIrTypeRefinements {
-    /// Validates a pair of [`ArrayIrType`]s and visits any concrete identity refinement it contributes.
-    fn visit_pair(
-        declared: &ArrayIrType,
-        actual: &ArrayIrType,
-        visit: impl FnMut(&DimensionVariable, usize) -> Result<(), TypeError>,
-    ) -> Result<(), TypeError> {
-        match (declared, actual) {
-            (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) => {
-                ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared, actual, visit)
-            }
-            (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) if declared.is_refined_by(actual) => {
-                Ok(())
-            }
-            (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) => {
-                Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")))
-            }
-            (ArrayIrType::Array(_), ArrayIrType::Dimension(_)) => {
-                Err(TypeError::invalid("expected array type but got dimension type"))
-            }
-            (ArrayIrType::Dimension(_), ArrayIrType::Array(_)) => {
-                Err(TypeError::invalid("expected dimension type but got array type"))
-            }
-        }
-    }
-}
-
-impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
-    fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
-    where
-        D::IntoIter: ExactSizeIterator,
-        A::IntoIter: ExactSizeIterator,
-        D::Item: Borrow<ArrayIrType>,
-        A::Item: Borrow<ArrayIrType>,
-    {
-        let mut refinements = Self::default();
-        visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::visit_pair(declared, actual, |variable, extent| refinements.arrays.bind(variable, extent))
-        })?;
-        Ok(refinements)
-    }
-
-    fn validate<D: IntoIterator, A: IntoIterator>(
-        &self,
-        declared: D,
-        actual: A,
-        closed_identities: &[DimensionVariable],
-    ) -> Result<(), TypeError>
-    where
-        D::IntoIter: ExactSizeIterator,
-        A::IntoIter: ExactSizeIterator,
-        D::Item: Borrow<ArrayIrType>,
-        A::Item: Borrow<ArrayIrType>,
-    {
-        let mut refinements = self.clone();
-        visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::visit_pair(declared, actual, |variable, extent| {
-                refinements.arrays.validate_or_bind(variable, extent, closed_identities)
-            })
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -957,7 +743,8 @@ mod tests {
         Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
     use crate::arrays::types::data::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
-    use crate::arrays::types::dimensions::{DimensionBounds, DimensionVariable};
+    use crate::arrays::types::dimensions::{DimensionBounds, DimensionType, DimensionVariable};
+    use crate::arrays::types::ir::ArrayIrType;
     use crate::arrays::types::layouts::{StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
@@ -1434,122 +1221,6 @@ mod tests {
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_type() {
-        let declared_variable = DimensionVariable::new("declared", DimensionBounds::non_negative(Some(8)).unwrap());
-        let actual_variable = DimensionVariable::new("actual", DimensionBounds::non_negative(Some(4)).unwrap());
-        let declared = [
-            ArrayIrType::Dimension(DimensionType::new(declared_variable.clone())),
-            ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(declared_variable.clone())]))),
-        ];
-        let actual = [
-            ArrayIrType::Dimension(DimensionType::new(actual_variable.clone())),
-            ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(actual_variable.clone())]))),
-        ];
-        assert_eq!(
-            declared
-                .iter()
-                .flat_map(ArrayIrType::identities)
-                .map(|(position, identity)| (position, identity.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                (TypeIdentityPosition::Definition, declared_variable.clone()),
-                (TypeIdentityPosition::Reference, declared_variable.clone()),
-            ],
-        );
-
-        let renaming = ArrayIrType::derive_identity_renaming(&declared, &actual).unwrap();
-        assert_eq!(renaming.rename(&declared_variable), actual_variable);
-        assert_eq!(
-            ArrayIrType::derive_identity_renaming(&declared, &actual[..1]),
-            Err(TypeError::invalid("declared type count 2 does not match actual type count 1")),
-        );
-        assert_eq!(
-            ArrayIrType::derive_identity_renaming(&declared[..1], &[ArrayIrType::Array(ArrayType::scalar(F32))],),
-            Err(TypeError::invalid("expected dimension type but got array type")),
-        );
-
-        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap());
-        let declared_array =
-            ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(batch.clone())])));
-        let actual_two = ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])));
-        let actual_three = ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)])));
-        let refinements = ArrayIrTypeRefinements::establish(
-            [declared_array.clone(), declared_array.clone()],
-            [actual_two.clone(), actual_two.clone()],
-        )
-        .unwrap();
-        assert_eq!(refinements.validate([declared_array.clone()], [actual_two], &[],), Ok(()),);
-        let error = ArrayIrTypeRefinements::establish(
-            [declared_array.clone(), declared_array.clone()],
-            [ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))), actual_three],
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
-        );
-
-        // A dimension member contributes no concrete fact (its type is strictly identity plus bounds). Its variable
-        // instead belongs to the boundary's closed identity signature, so output validation may establish the concrete
-        // extent for it on first observation and must reject an inconsistent repeated observation within the same
-        // validated signature.
-        let declared_dimension = ArrayIrType::Dimension(DimensionType::new(batch.clone()));
-        let refinements = ArrayIrTypeRefinements::establish(
-            std::slice::from_ref(&declared_dimension),
-            std::slice::from_ref(&declared_dimension),
-        )
-        .unwrap();
-        let closed_identities = [batch.clone()];
-        assert_eq!(
-            refinements.validate(
-                [declared_array.clone(), declared_array.clone()],
-                [
-                    ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
-                    ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
-                ],
-                &closed_identities,
-            ),
-            Ok(()),
-        );
-        let error = refinements
-            .validate(
-                [declared_array.clone(), declared_array.clone()],
-                [
-                    ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))),
-                    ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]))),
-                ],
-                &closed_identities,
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
-        );
-
-        // An identity outside the boundary's closed signature stays rejected, and an internally defined identity may
-        // establish its first fact exactly like an input-signature identity.
-        let unrelated = DimensionVariable::new("unrelated", DimensionBounds::non_negative(Some(8)).unwrap());
-        let unrelated_array =
-            ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(unrelated.clone())])));
-        assert_eq!(
-            refinements.validate(
-                std::slice::from_ref(&unrelated_array),
-                [ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])))],
-                &closed_identities,
-            ),
-            Err(TypeError::invalid("dimension identity unrelated does not belong to the validated boundary signature")),
-        );
-        assert_eq!(
-            refinements.validate(
-                std::slice::from_ref(&unrelated_array),
-                [ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])))],
-                std::slice::from_ref(&unrelated),
-            ),
-            Ok(()),
         );
     }
 }
