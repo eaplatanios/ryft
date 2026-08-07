@@ -1610,7 +1610,6 @@ mod tests {
 
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::macros::check_count;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
@@ -1639,7 +1638,7 @@ mod tests {
     }
 
     impl Operation for LongMetadataOperation {
-        type Type = DataType;
+        type Type = ArrayType;
 
         #[inline]
         fn name(&self) -> &'static str {
@@ -1648,9 +1647,9 @@ mod tests {
 
         fn infer_output_types(
             &self,
-            input_types: &[DataType],
-            _region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
+            input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
             check_count!("input", input_types, 1, TypeError);
             Ok(vec![input_types[0].clone()])
         }
@@ -1666,7 +1665,7 @@ mod tests {
     struct ZeroOutputEffectOperation;
 
     impl Operation for ZeroOutputEffectOperation {
-        type Type = DataType;
+        type Type = ArrayType;
 
         fn name(&self) -> &'static str {
             "zero_output_effect"
@@ -1674,9 +1673,9 @@ mod tests {
 
         fn infer_output_types(
             &self,
-            input_types: &[DataType],
-            _region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
+            input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
             check_count!("input", input_types, 1, TypeError);
             Ok(Vec::new())
         }
@@ -1694,7 +1693,7 @@ mod tests {
     }
 
     impl Operation for DormantRegionOperation {
-        type Type = DataType;
+        type Type = ArrayType;
 
         fn name(&self) -> &'static str {
             match self {
@@ -1712,9 +1711,9 @@ mod tests {
 
         fn infer_output_types(
             &self,
-            input_types: &[DataType],
-            _region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
+            input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
             check_count!("input", input_types, 1, TypeError);
             Ok(input_types.to_vec())
         }
@@ -1727,69 +1726,68 @@ mod tests {
     #[test]
     fn test_program() {
         // Test simple program with one argument.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let c0 = builder.add_constant(Scalar::from(3.0f64));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(Array::scalar(3.0f64));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.input_types(), vec![DataType::F64]);
-        assert_eq!(program.output_types(), vec![DataType::F64]);
+        let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.input_types(), vec![ArrayType::scalar(DataType::F64)]);
+        assert_eq!(program.output_types(), vec![ArrayType::scalar(DataType::F64)]);
         let input = program.input().unwrap();
         let output = program.output().unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = const
-                    %2:f64 = add %0 %1
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                    %2:f64[] = add %0 %1
                 in (%2)
             "}
             .trim_end(),
         );
-        assert!(matches!(input, Atom::Variable(r#type) if r#type == DataType::F64));
-        assert!(matches!(output, Atom::Variable(r#type) if r#type == DataType::F64));
+        assert!(matches!(input, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(output, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
 
         // Test simple program with two arguments.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let i1 = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
         let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1]).unwrap()[0];
-        let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![o0], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        assert_eq!(program.input_types(), vec![DataType::F64, DataType::F64]);
-        assert_eq!(program.output_types(), vec![DataType::F64]);
+        let program =
+            builder.build::<(Array, Array), Array>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
+        assert_eq!(program.input_types(), vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],);
+        assert_eq!(program.output_types(), vec![ArrayType::scalar(DataType::F64)]);
         let input = program.input().unwrap();
         let output = program.output().unwrap();
-        assert_eq!(program.interpret((Scalar::from(2.0), Scalar::from(3.0))), Ok(Scalar::from(1.0)));
+        assert_eq!(program.interpret((Array::scalar(2.0), Array::scalar(3.0))), Ok(Array::scalar(1.0)));
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = neg %0
-                    %3:f64 = add %2 %1
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = neg %0
+                    %3:f64[] = add %2 %1
                 in (%3)
             "}
             .trim_end(),
         );
-        assert!(matches!(input.0, Atom::Variable(r#type) if r#type == DataType::F64));
-        assert!(matches!(input.1, Atom::Variable(r#type) if r#type == DataType::F64));
-        assert!(matches!(output, Atom::Variable(r#type) if r#type == DataType::F64));
+        assert!(matches!(input.0, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(input.1, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(output, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
 
         // Test a program that contains an operation with long metadata that should be rendered on multiple lines.
-        let mut builder = ProgramBuilder::<Scalar, LongMetadataOperation>::new();
-        let i0 = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, LongMetadataOperation>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let o0 = builder.add_instruction(LongMetadataOperation, Vec::new(), vec![i0]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         let input = program.input().unwrap();
         let output = program.output().unwrap();
         assert_eq!(
             program.to_string(),
             format!(
                 indoc! {"
-                    lambda %0:f64 .
-                    let %1:f64 = long_metadata [
+                    lambda %0:f64[] .
+                    let %1:f64[] = long_metadata [
                         value={metadata_value},
                     ] %0
                     in (%1)
@@ -1798,60 +1796,60 @@ mod tests {
             )
             .trim_end()
         );
-        assert!(matches!(input, Atom::Variable(r#type) if r#type == DataType::F64));
-        assert!(matches!(output, Atom::Variable(r#type) if r#type == DataType::F64));
+        assert!(matches!(input, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(output, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
 
         // Test a program with two outputs that are copies of the same value.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F32);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F32));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder
-            .build::<Scalar, (Scalar, Scalar)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder))
+            .build::<Array, (Array, Array)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder))
             .unwrap();
         let input = program.input().unwrap();
         let output = program.output().unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32 .
-                let %1:f32 = add %0 %0
+                lambda %0:f32[] .
+                let %1:f32[] = add %0 %0
                 in (%1, %1)
             "}
             .trim_end(),
         );
-        assert!(matches!(input, Atom::Variable(r#type) if r#type == DataType::F32));
-        assert!(matches!(output.0, Atom::Variable(r#type) if r#type == DataType::F32));
-        assert!(matches!(output.1, Atom::Variable(r#type) if r#type == DataType::F32));
+        assert!(matches!(input, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F32)));
+        assert!(matches!(output.0, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F32)));
+        assert!(matches!(output.1, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F32)));
 
         // Test a case where we have an output atom with no parent instruction.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        builder.add_input(DataType::F64);
-        let o0 = builder.add_variable(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let o0 = builder.add_variable(ArrayType::scalar(DataType::F64));
         assert!(matches!(
-            builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder),
+            builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder),
             Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
         ));
 
         // Test a case where we have an instruction input atom with no parent instruction.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let v0 = builder.add_variable(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let v0 = builder.add_variable(ArrayType::scalar(DataType::F64));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, v0]).unwrap()[0];
         assert!(matches!(
-            builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder),
+            builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder),
             Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
         ));
     }
 
     #[test]
     fn test_program_instruction_by_output() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let constant = builder.add_constant(Scalar::from(3.0f64));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant = builder.add_constant(Array::scalar(3.0f64));
         let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, constant]).unwrap()[0];
         let dead_output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
 
         assert_eq!(
             program.instruction_by_output(),
@@ -1868,17 +1866,17 @@ mod tests {
 
     #[test]
     fn test_program_live_sets() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let live_input = builder.add_input(DataType::F64);
-        let dead_input = builder.add_input(DataType::F64);
-        let live_constant = builder.add_constant(Scalar::from(3.0f64));
-        let dead_constant = builder.add_constant(Scalar::from(5.0f64));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let live_input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let dead_input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let live_constant = builder.add_constant(Array::scalar(3.0f64));
+        let dead_constant = builder.add_constant(Array::scalar(5.0f64));
         let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![live_input]).unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, live_constant]).unwrap()[0];
         let dead_output =
             builder.add_instruction(AddOperation::new(), Vec::new(), vec![dead_input, dead_constant]).unwrap()[0];
         let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let live_sets = program.live_sets();
         assert_eq!(
@@ -1982,15 +1980,15 @@ mod tests {
 
     #[test]
     fn test_program_map_operations() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let constant = builder.add_constant(Scalar::from(3.0f64));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant = builder.add_constant(Array::scalar(3.0f64));
         let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         let combined = builder.add_instruction(AddOperation::new(), Vec::new(), vec![negated, constant]).unwrap()[0];
         let output = builder
             .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![combined, constant])
             .unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
 
         // `map_operations` rebuilds the value graph while rewriting operations: the binary `add` is replaced by a
         // different operation (`mul`), the `compare` payload field is rewritten in place (its direction is flipped),
@@ -1998,30 +1996,30 @@ mod tests {
         let mapped = program
             .map_operations(|operation| {
                 Ok::<_, ProgramError>(match operation {
-                    ScalarOperation::Compare(operation) => {
+                    ArrayOperation::Compare(operation) => {
                         assert_eq!(operation.direction(), ComparisonDirection::LessThan);
-                        ScalarOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan))
+                        ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan))
                     }
-                    ScalarOperation::Add(_) => ScalarOperation::Mul(MulOperation::new()),
+                    ArrayOperation::Add(_) => ArrayOperation::Mul(MulOperation::new()),
                     operation => operation.clone(),
                 })
             })
             .unwrap();
 
         // Original: `(-input + 3) < 3`, so for `input = 2` this is `1 < 3 = true`.
-        assert_eq!(program.interpret(Scalar::from(2.0f64)), Ok(Scalar::from(true)));
+        assert_eq!(program.interpret(Array::scalar(2.0f64)), Ok(Array::scalar(true)));
         // Mapped: `(-input * 3) > 3`, so for `input = 2` this is `-6 > 3 = false`.
 
-        assert_eq!(mapped.interpret(Scalar::from(2.0f64)), Ok(Scalar::from(false)));
+        assert_eq!(mapped.interpret(Array::scalar(2.0f64)), Ok(Array::scalar(false)));
 
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = const
-                    %2:f64 = neg %0
-                    %3:f64 = add %2 %1
-                    %4:bool = compare [direction=LessThan] %3 %1
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                    %2:f64[] = neg %0
+                    %3:f64[] = add %2 %1
+                    %4:bool[] = compare [direction=LessThan] %3 %1
                 in (%4)
             "}
             .trim_end(),
@@ -2030,11 +2028,11 @@ mod tests {
         assert_eq!(
             mapped.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = const
-                    %2:f64 = neg %0
-                    %3:f64 = mul %2 %1
-                    %4:bool = compare [direction=GreaterThan] %3 %1
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                    %2:f64[] = neg %0
+                    %3:f64[] = mul %2 %1
+                    %4:bool[] = compare [direction=GreaterThan] %3 %1
                 in (%4)
             "}
             .trim_end(),
@@ -2043,36 +2041,35 @@ mod tests {
 
     #[test]
     fn test_program_to_flat_program_and_into_flat_program() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let i1 = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
         let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1]).unwrap()[0];
-        let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![o0], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
+        let program =
+            builder.build::<(Array, Array), Array>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
 
         let flat_program = program.to_flat_program();
         assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
         assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
-        assert_eq!(flat_program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]), Ok(vec![Scalar::from(1.0)]));
+        assert_eq!(flat_program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]), Ok(vec![Array::scalar(1.0)]));
 
         let flat_program = program.into_flat_program();
         assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
         assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
-        assert_eq!(flat_program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]), Ok(vec![Scalar::from(1.0)]));
+        assert_eq!(flat_program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]), Ok(vec![Array::scalar(1.0)]));
     }
 
     #[test]
     fn test_program_construction_and_restructuring_validate_boundaries() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let program = builder.build::<Scalar, Scalar>(vec![input], Placeholder, Placeholder).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<Array, Array>(vec![input], Placeholder, Placeholder).unwrap();
         let entry = program.entry();
         let regions = program.regions.clone().into_regions();
 
         assert!(matches!(
-            Program::<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>::new(
+            Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
                 Vec::new(),
                 vec![Placeholder],
                 regions.clone(),
@@ -2081,14 +2078,14 @@ mod tests {
             Err(ProgramError::InvalidInputCount { actual: 1, expected: 0 }),
         ));
         assert!(matches!(
-            program.to_flat_program().restructured::<Vec<Scalar>, Vec<Scalar>>(Vec::new(), vec![Placeholder]),
+            program.to_flat_program().restructured::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder]),
             Err(ProgramError::InvalidInputCount { actual: 1, expected: 0 }),
         ));
 
         let mut unreachable_regions = regions;
         unreachable_regions.push(unreachable_regions[0].clone());
         assert!(matches!(
-            Program::<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>::new(
+            Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
                 vec![Placeholder],
                 vec![Placeholder],
                 unreachable_regions.clone(),
@@ -2098,7 +2095,7 @@ mod tests {
                 if message == "entry region ^0 must be the final region in the arena",
         ));
         assert!(matches!(
-            Program::<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>::new(
+            Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
                 vec![Placeholder],
                 vec![Placeholder],
                 unreachable_regions,
@@ -2285,25 +2282,25 @@ mod tests {
 
     #[test]
     fn test_program_simplified() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let c0 = builder.add_constant(Scalar::from(2.0f64));
-        let c1 = builder.add_constant(Scalar::from(3.0f64));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(Array::scalar(2.0f64));
+        let c1 = builder.add_constant(Array::scalar(3.0f64));
         let _ = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0]).unwrap()[0];
         let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1]).unwrap()[0];
         let program = builder
-            .build::<Scalar, (Scalar, Scalar)>(vec![v1, v1], Placeholder, (Placeholder, Placeholder))
+            .build::<Array, (Array, Array)>(vec![v1, v1], Placeholder, (Placeholder, Placeholder))
             .unwrap();
         let simplified = program.simplified().unwrap();
 
         assert_eq!(c0, AtomId::new(1));
-        assert_eq!(simplified.interpret(Scalar::from(2.0f64)), Ok((Scalar::from(5.0f64), Scalar::from(5.0f64))));
+        assert_eq!(simplified.interpret(Array::scalar(2.0f64)), Ok((Array::scalar(5.0f64), Array::scalar(5.0f64))));
         assert_eq!(
             simplified.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = const
-                    %2:f64 = add %0 %1
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                    %2:f64[] = add %0 %1
                 in (%2, %2)
             "}
             .trim_end(),
@@ -2311,11 +2308,11 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = const
-                    %2:f64 = const
-                    %3:f64 = add %0 %1
-                    %4:f64 = add %0 %2
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                    %2:f64[] = const
+                    %3:f64[] = add %0 %1
+                    %4:f64[] = add %0 %2
                 in (%4, %4)
             "}
             .trim_end(),
@@ -2326,18 +2323,18 @@ mod tests {
         // the print's output below, so only its effect keeps it in the simplified program.
         assert_eq!(program.effects(), Effects::PURE);
         let build = || {
-            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-            let input = builder.add_input(DataType::F64);
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
             let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
             let _printed = builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input]).unwrap()[0];
-            builder.build::<Scalar, Scalar>(vec![doubled], Placeholder, Placeholder).unwrap()
+            builder.build::<Array, Array>(vec![doubled], Placeholder, Placeholder).unwrap()
         };
         let effectful = build();
         assert_eq!(effectful.effects(), Effects::single(Effect::OrderedIo));
         let expected = indoc! {"
-            lambda %0:f64 .
-            let %1:f64 = print [label=x] %0
-                %2:f64 = add %0 %0
+            lambda %0:f64[] .
+            let %1:f64[] = print [label=x] %0
+                %2:f64[] = add %0 %0
             in (%2)
         "}
         .trim_end();
@@ -2347,10 +2344,10 @@ mod tests {
         // An effectful instruction with no outputs must itself be rooted: there is no result atom from which either
         // simplification implementation could otherwise discover it.
         let build_zero_output_effect = || {
-            let mut builder = ProgramBuilder::<Scalar, ZeroOutputEffectOperation>::new();
-            let input = builder.add_input(DataType::F64);
+            let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
             assert!(builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input]).unwrap().is_empty());
-            builder.build::<Scalar, Vec<Scalar>>(Vec::new(), Placeholder, Vec::new()).unwrap()
+            builder.build::<Array, Vec<Array>>(Vec::new(), Placeholder, Vec::new()).unwrap()
         };
         let zero_output_effect = build_zero_output_effect();
         assert_eq!(zero_output_effect.simplified().unwrap().instructions().len(), 1);
@@ -2406,7 +2403,7 @@ mod tests {
         }
 
         let value_clone_count = Rc::new(Cell::new(0));
-        let mut builder = ProgramBuilder::<_, ScalarOperation<CloneCountingValue>>::new();
+        let mut builder = ProgramBuilder::<_, AddOperation<DataType>>::new();
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(CloneCountingValue::new(2.0, Rc::clone(&value_clone_count)));
         let c1 = builder.add_constant(CloneCountingValue::new(3.0, Rc::clone(&value_clone_count)));
@@ -2459,35 +2456,34 @@ mod tests {
 
     #[test]
     fn test_program_filtered() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let i1 = builder.add_input(DataType::F64);
-        let c0 = builder.add_constant(Scalar::from(2.0f64));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(Array::scalar(2.0f64));
         let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
         let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, c0]).unwrap()[0];
-        let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![v1], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
+        let program =
+            builder.build::<(Array, Array), Array>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
 
         // Dead inputs are pruned and constants are lifted: `i1` is dead for `v1`, so it is dropped,
         // and `c0` is rebuilt into the projected program.
         let (pruned, pruned_live) = program.filtered(&[i0, i1], &[v1], &[]).unwrap();
         assert_eq!(pruned_live, vec![0]);
         assert_eq!(pruned.input_ids().len(), 1);
-        assert_eq!(pruned.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(-2.0)]));
+        assert_eq!(pruned.interpret(vec![Array::scalar(4.0)]), Ok(vec![Array::scalar(-2.0)]));
 
         // Selecting an intermediate atom (i.e., `v0`) as the output drops the downstream `add`
         // and the now-dead constant.
         let (intermediate, intermediate_live) = program.filtered(&[i0], &[v0], &[]).unwrap();
         assert_eq!(intermediate_live, vec![0]);
         assert_eq!(intermediate.instructions().len(), 1);
-        assert_eq!(intermediate.interpret(vec![Scalar::from(5.0)]), Ok(vec![Scalar::from(-5.0)]));
+        assert_eq!(intermediate.interpret(vec![Array::scalar(5.0)]), Ok(vec![Array::scalar(-5.0)]));
 
         // Forwarding an input directly as an output yields an instruction-free program over only that input.
         let (forwarded, forwarded_live) = program.filtered(&[i0, i1], &[i0], &[]).unwrap();
         assert_eq!(forwarded_live, vec![0]);
         assert_eq!(forwarded.instructions().len(), 0);
-        assert_eq!(forwarded.interpret(vec![Scalar::from(7.0)]), Ok(vec![Scalar::from(7.0)]));
+        assert_eq!(forwarded.interpret(vec![Array::scalar(7.0)]), Ok(vec![Array::scalar(7.0)]));
 
         // Reaching a variable that is neither a selected input nor produced by an instruction is rejected:
         // `v1` depends on `i0`, which is omitted from the selected inputs here.
@@ -2503,31 +2499,31 @@ mod tests {
         assert_eq!(kept_live, vec![0]);
         assert_eq!(kept.instructions().len(), 2);
         assert_eq!(kept.output_ids().len(), 1);
-        assert_eq!(kept.interpret(vec![Scalar::from(5.0)]), Ok(vec![Scalar::from(-5.0)]));
+        assert_eq!(kept.interpret(vec![Array::scalar(5.0)]), Ok(vec![Array::scalar(-5.0)]));
 
         // A keep-alive entry naming a dead input pins it as a live public input instead of pruning it.
         let (pinned, pinned_live) = program.filtered(&[i0, i1], &[v1], &[i1]).unwrap();
         assert_eq!(pinned_live, vec![0, 1]);
         assert_eq!(pinned.input_ids().len(), 2);
-        assert_eq!(pinned.interpret(vec![Scalar::from(4.0), Scalar::from(9.0)]), Ok(vec![Scalar::from(-2.0)]));
+        assert_eq!(pinned.interpret(vec![Array::scalar(4.0), Array::scalar(9.0)]), Ok(vec![Array::scalar(-2.0)]),);
 
         // Observable effects are implicit roots even when neither their results nor their operands are explicitly
         // kept alive.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
         builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input]).unwrap();
-        let effectful = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let effectful = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let (filtered, live) = effectful.filtered(&[input], &[output], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 2);
         assert_eq!(filtered.effects(), Effects::single(Effect::OrderedIo));
 
         // Zero-output effects are preserved explicitly because they have no result atom that can serve as a root.
-        let mut builder = ProgramBuilder::<Scalar, ZeroOutputEffectOperation>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input]).unwrap();
-        let effectful = builder.build::<Scalar, Vec<Scalar>>(Vec::new(), Placeholder, Vec::new()).unwrap();
+        let effectful = builder.build::<Array, Vec<Array>>(Vec::new(), Placeholder, Vec::new()).unwrap();
         let (filtered, live) = effectful.filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 1);
@@ -2538,15 +2534,14 @@ mod tests {
         // Build the same program twice, so that the consuming `into_filtered` can be compared
         // against the borrowing `filter`.
         let build = || {
-            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-            let i0 = builder.add_input(DataType::F64);
-            let i1 = builder.add_input(DataType::F64);
-            let c0 = builder.add_constant(Scalar::from(2.0f64));
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+            let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
+            let c0 = builder.add_constant(Array::scalar(2.0f64));
             let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
             let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, c0]).unwrap()[0];
-            let program = builder
-                .build::<(Scalar, Scalar), Scalar>(vec![v1], (Placeholder, Placeholder), Placeholder)
-                .unwrap();
+            let program =
+                builder.build::<(Array, Array), Array>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
             (program, i0, i1, v0, v1)
         };
 
@@ -2559,7 +2554,7 @@ mod tests {
         assert_eq!(owned_live, vec![0]);
         assert_eq!(owned_live, borrowed_live);
         assert_eq!(owned.input_ids().len(), 1);
-        assert_eq!(owned.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(-2.0)]));
+        assert_eq!(owned.interpret(vec![Array::scalar(4.0)]), Ok(vec![Array::scalar(-2.0)]));
         assert_eq!(owned.to_string(), borrowed.to_string());
 
         // Keep-alive entries follow the same contract as the borrowing `filtered`: keeping `v1` alive moves its
@@ -2569,12 +2564,12 @@ mod tests {
         assert_eq!(kept_live, vec![0]);
         assert_eq!(kept.instructions().len(), 2);
         assert_eq!(kept.output_ids().len(), 1);
-        assert_eq!(kept.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(-4.0)]));
+        assert_eq!(kept.interpret(vec![Array::scalar(4.0)]), Ok(vec![Array::scalar(-4.0)]));
 
-        let mut builder = ProgramBuilder::<Scalar, ZeroOutputEffectOperation>::new();
-        let input = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input]).unwrap();
-        let effectful = builder.build::<Scalar, Vec<Scalar>>(Vec::new(), Placeholder, Vec::new()).unwrap();
+        let effectful = builder.build::<Array, Vec<Array>>(Vec::new(), Placeholder, Vec::new()).unwrap();
         let (filtered, live) = effectful.into_filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 1);
@@ -2671,17 +2666,17 @@ mod tests {
 
         // Effects in transform-only rule regions are dormant during ordinary execution and therefore do not make the
         // containing instruction or program effectful.
-        let mut rule_builder = ProgramBuilder::<Scalar, DormantRegionOperation>::new();
-        let rule_input = rule_builder.add_input(DataType::F64);
+        let mut rule_builder = ProgramBuilder::<Array, DormantRegionOperation>::new();
+        let rule_input = rule_builder.add_input(ArrayType::scalar(DataType::F64));
         let rule_output = rule_builder
             .add_instruction(DormantRegionOperation::Effectful, Vec::new(), vec![rule_input])
             .unwrap()[0];
-        let rule_program = rule_builder.build::<Scalar, Scalar>(vec![rule_output], Placeholder, Placeholder).unwrap();
-        let mut builder = ProgramBuilder::<Scalar, DormantRegionOperation>::new();
+        let rule_program = rule_builder.build::<Array, Array>(vec![rule_output], Placeholder, Placeholder).unwrap();
+        let mut builder = ProgramBuilder::<Array, DormantRegionOperation>::new();
         let dormant = builder.import_region(rule_program.entry_region_ref());
-        let input = builder.add_input(DataType::F64);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(DormantRegionOperation::Dormant, vec![dormant], vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(program.instruction_effects(InstructionId::new(program.entry(), 0)).unwrap(), Effects::PURE);
         assert_eq!(program.effects(), Effects::PURE);
     }

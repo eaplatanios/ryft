@@ -2553,7 +2553,7 @@ Phase 9a3 — exact XLA literals:
 
 Phase 9a4 — retire the scalar program universe:
 
-- [ ] Migrate useful `DataType`-universe transform tests to rank-zero arrays. Use a narrow test-only fixture only where
+- [x] Migrate useful `DataType`-universe transform tests to rank-zero arrays. Use a narrow test-only fixture only where
       a test genuinely verifies universe-neutral machinery and an array would obscure that contract.
   - [x] Migrate the foundational atom, builder, operation-formatting, program, region-graph, capture-region, and
         interpretation-replay fixtures. Make the shared test-only region operation use `ArrayType` so its complete
@@ -2577,7 +2577,7 @@ Phase 9a4 — retire the scalar program universe:
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
       exports, scalar-only doctests, and the obsolete scalar-domain compile-fail fixture.
   - [x] Migrate or delete the final scalar-backed capture and interpretation fixtures.
-  - [ ] Migrate or delete the final scalar-backed program fixtures.
+  - [x] Migrate or delete the final scalar-backed program fixtures.
   - [ ] Migrate or delete the final scalar-backed macro, compilation, and benchmark fixtures, then remove the obsolete
         scalar-domain compile-fail fixture.
   - [ ] Delete the scalar backend module, exports, scalar-only doctests, production specializations, and stale
@@ -4967,3 +4967,17 @@ dependency-removal checklist. It removes all 18 retired scalar-backend reference
 exact backend-identifier audit from 117 matches across 13 files to 99 matches across 11 files. All 18 focused tests,
 formatting, diff hygiene, and the complete 1,153-test core library suite pass. Program fixtures are the next dependency-
 removal unit.
+
+The program-fixture slice moves the final scalar-backed `Program` construction, rendering, interpretation, liveness,
+operation mapping, flattening, restructuring, simplification, filtering, and effect-propagation scenarios to rank-zero
+arrays. The three local operations that isolate metadata rendering, zero-output effects, and dormant rule regions now
+use `ArrayType`. The clone-counting simplification fixture remains intentionally universe-neutral over `DataType`, but
+uses its sole `AddOperation<DataType>` directly instead of depending on the scalar operation family.
+
+This review unit changes 327 lines in `programs.rs` with five net deletions. It removes all 23 retired scalar-backend
+references from that module. Re-running the audit against the current committed baseline revealed 101 rather than the
+99 recorded by the preceding slice; after this unit, 78 exact `backends::scalars`, `ScalarOperation`, or
+`ScalarTracingContext` matches remain across 11 files. All 14 focused program tests, formatting, diff hygiene, the
+complete 1,153-test core library suite, all five allocation tests, all seven integration tests, the compile-fail test,
+and all 54 runnable doctests (16 intentional ignores) pass. This closes useful `DataType`-universe fixture migration;
+macro, compilation, and benchmark fixtures are the next dependency-removal unit.
