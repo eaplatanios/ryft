@@ -44,10 +44,8 @@ pub struct LinearResiduals<V: Value<Type = ArrayIrType>> {
     values: Vec<V>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
-    /// Creates an empty residual list.
+    /// Creates a new empty [`LinearResiduals`] instance.
     #[inline]
     pub fn new() -> Self {
         Self { values: Vec::new() }
@@ -60,20 +58,19 @@ impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
     }
 
     /// Consumes this residual list and returns its values, in residual-slot order. The result is what a rule passes
-    /// as the residual operand list when staging its [`LinearCallOperation`](crate::differentiation::LinearCallOperation).
+    /// as the residual operand list when staging its [`LinearCallOperation`](crate::LinearCallOperation).
     #[inline]
     pub fn into_values(self) -> Vec<V> {
         self.values
     }
 
-    /// Retains `value` and returns the residual slot index that will address it inside the attached regions.
-    ///
-    /// When `value` is a dynamic dimension definition (i.e., its type is [`ArrayIrType::Dimension`] and that
-    /// [`DimensionType`] has no concrete extent), retention deduplicates by identity: if a residual with the same
-    /// [`DimensionVariable`] was already retained, its existing slot index is returned and `value` is dropped, since
-    /// both values denote the same runtime extent. Every other value—ordinary arrays, and dimensions whose types pin
-    /// a concrete extent and therefore carry no identity worth sharing—is appended to a fresh slot unconditionally,
-    /// even when it compares equal to an already-retained value.
+    /// Retains `value` and returns the residual slot index that will address it inside the attached
+    /// [`Region`](crate::Region)s. When `value` is a dynamic dimension definition (i.e., its type is
+    /// [`ArrayIrType::Dimension`] and that [`DimensionType`] has no concrete extent), retention deduplicates by
+    /// identity: if a residual with the same [`DimensionVariable`] was already retained, its existing slot index is
+    /// returned and `value` is dropped, since both values denote the same runtime extent. Every other value (i.e.,
+    /// ordinary arrays, and dimensions whose types pin a concrete extent and therefore carry no identity worth sharing)
+    /// is appended to a fresh slot unconditionally, even when it compares equal to an already-retained value.
     pub fn retain(&mut self, value: V) -> usize {
         if let ArrayIrType::Dimension(r#type) = value.r#type().as_ref()
             && r#type.extent().is_none()
@@ -93,28 +90,29 @@ impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
 
     /// Retains an ordered value list and returns the residual slot index corresponding to each source value, applying
     /// the [`Self::retain`] deduplication rule value by value (so two source values may map to one shared slot).
-    pub fn retain_all(&mut self, values: impl IntoIterator<Item = V>) -> Vec<usize> {
+    #[inline]
+    pub fn retain_all<I: IntoIterator<Item = V>>(&mut self, values: I) -> Vec<usize> {
         values.into_iter().map(|value| self.retain(value)).collect()
     }
 
     /// Retains the exact runtime shape of `array` and returns the [`ExactShape`] plan that lets an attached region
-    /// reconstruct it from this list's residuals.
-    ///
-    /// Static axes contribute plan entries only and retain nothing. Each dynamic axis first looks for an
-    /// already-retained dimension residual with the same [`DimensionVariable`] and reuses its slot; only identities
-    /// not yet represented bind a [`DimensionSizeOperation`] read of `array` in `context` (the primal trace) and
-    /// retain its result. Repeated identities within the shape therefore share one residual and one read.
+    /// reconstruct it from the residual values in this [`LinearResiduals`] instance. Static axes contribute plan
+    /// entries only and retain nothing. Each dynamic axis first looks for an already-retained dimension residual
+    /// with the same [`DimensionVariable`] and reuses its slot. Only identities not yet represented bind a
+    /// [`DimensionSizeOperation`] read of `array` in `context` (i.e., the primal trace) and retain its result.
+    /// Repeated identities within the shape therefore share one residual and one read.
     ///
     /// # Parameters
     ///
     ///   - `context`: [`Context`] that owns the primal trace being linearized, in which any required
     ///     [`DimensionSizeOperation`] reads are bound.
-    ///   - `array`: [`ArrayType`]-typed value owned by `context` whose exact runtime shape must become available
-    ///     inside the attached regions. Passing a non-array value fails with a kind-mismatch [`TypeError`](crate::programs::types::TypeError).
-    pub fn retain_shape<C>(&mut self, context: &C, array: &V) -> Result<ExactShape, ProgramError>
-    where
-        C: Context<Type = ArrayIrType, Value = V, Operation: From<DimensionSizeOperation>>,
-    {
+    ///   - `array`: [`ArrayType`]-typed value owned by `context` whose exact runtime shape must become available inside
+    ///     the attached regions. Passing a non-array value fails with a kind-mismatch [`TypeError`](crate::TypeError).
+    pub fn retain_shape<C: Context<Type = ArrayIrType, Value = V, Operation: From<DimensionSizeOperation>>>(
+        &mut self,
+        context: &C,
+        array: &V,
+    ) -> Result<ExactShape, ProgramError> {
         let array_type = array.r#type();
         let array_type = <&ArrayType>::try_from(array_type.as_ref())?;
         array_type
@@ -131,18 +129,35 @@ impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
                             ArrayIrType::Dimension(r#type) if r#type.variable() == variable
                         )
                     }) {
-                        return Ok(ExactShapeDimension::Residual(index));
+                        Ok(ExactShapeDimension::Residual(index))
+                    } else {
+                        Ok(ExactShapeDimension::Residual(
+                            self.retain(
+                                context
+                                    .bind(
+                                        DimensionSizeOperation::new(array_type, axis)?,
+                                        Vec::new(),
+                                        std::slice::from_ref(array),
+                                    )?
+                                    .remove(0),
+                            ),
+                        ))
                     }
-                    let extent = context
-                        .bind(DimensionSizeOperation::new(array_type, axis)?, Vec::new(), std::slice::from_ref(array))?
-                        .remove(0);
-                    Ok(ExactShapeDimension::Residual(self.retain(extent)))
                 }
             })
             .collect::<Result<Vec<_>, _>>()
             .map(ExactShape)
     }
 }
+
+impl<V: Value<Type = ArrayIrType>> Default for LinearResiduals<V> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Exact runtime shape expressed in the coordinate system of a [`LinearResiduals`] list, so it can be reconstructed
 /// inside a linear call's attached regions.
