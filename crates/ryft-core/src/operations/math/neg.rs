@@ -1,10 +1,10 @@
+use crate::arrays::DataType;
 use crate::macros::{
     check_types, define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
 use crate::programs::ProgramError;
 use crate::programs::types::TypeError;
-use crate::types::DataType;
 
 // TODO(eaplatanios): Review this module.
 
@@ -86,6 +86,9 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
     use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -94,8 +97,6 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, Dimension, Shape};
 
     use super::*;
 

@@ -128,6 +128,7 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::Array;
     use crate::differentiation::{jvp, value_and_gradient_holomorphic};
     use crate::macros::{
@@ -135,7 +136,6 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::operations::manipulation::ConvertElementType;
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

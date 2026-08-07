@@ -7,6 +7,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::arrays::{ArrayIrType, ArrayType, DimensionType};
 use crate::backends::array_programs::ArrayIrValue;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, require_equal_dimensions};
@@ -40,7 +41,6 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, DimensionType};
 
 // TODO(eaplatanios): Review this.
 
@@ -1344,6 +1344,10 @@ mod tests {
 
     use std::borrow::Cow;
 
+    use crate::arrays::{
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType,
+        Shape, Sharding, ShardingDimension,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::CaptureReference;
@@ -1358,11 +1362,9 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::programs::effects::Effects;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
     use crate::tracing::Trace;
-    use crate::types::{DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
 
     use super::*;
 

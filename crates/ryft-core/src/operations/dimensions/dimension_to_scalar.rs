@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::{ArrayIrType, ArrayType, DataType, DimensionType};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -14,14 +15,13 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{ProjectedValue, Value};
-use crate::types::{ArrayIrType, ArrayType, DataType, DimensionType};
 
 /// Canonical element type used when first-class dimensions become ordinary array data.
 ///
 /// Although dimensions are nonnegative, Ryft represents compiled dimension SSA as signed 64-bit integers and caps
-/// [`MAX_DIMENSION_EXTENT`](crate::MAX_DIMENSION_EXTENT) accordingly. Therefore, unsigned 64-bit data would admit no
-/// additional dimension values, would require a conversion instead of letting this gateway lower to an identity, and
-/// would interact poorly with ordinary signed index and offset arithmetic.
+/// [`MAX_DIMENSION_EXTENT`](crate::arrays::MAX_DIMENSION_EXTENT) accordingly. Therefore, unsigned 64-bit data would
+/// admit no additional dimension values, would require a conversion instead of letting this gateway lower to an
+/// identity, and would interact poorly with ordinary signed index and offset arithmetic.
 pub const RUNTIME_DIMENSION_DATA_TYPE: DataType = DataType::I64;
 
 /// Canonical operation name for [`DimensionToScalarOperation`].
@@ -175,6 +175,7 @@ impl_non_transposable_operation!(DimensionToScalarOperation);
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DimensionBounds, DimensionVariable, MAX_DIMENSION_EXTENT};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
@@ -186,7 +187,6 @@ mod tests {
     use crate::programs::effects::Effects;
     use crate::programs::regions::{EmptyRegionDriver, RegionInterface};
     use crate::tracing::TracingContext;
-    use crate::types::dimensions::{DimensionBounds, DimensionVariable, MAX_DIMENSION_EXTENT};
 
     use super::*;
 

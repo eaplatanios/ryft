@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::ops::Mul as StandardMul;
 
+use crate::arrays::ArrayType;
 use crate::differentiation::DifferentiableType;
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 use crate::macros::{
@@ -11,7 +12,6 @@ use crate::operations::ElementwiseOperation;
 use crate::programs::ProgramError;
 use crate::programs::types::TypeError;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this module.
 
@@ -187,6 +187,9 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
     use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::differentiation::{jvp, vjp};
@@ -197,8 +200,6 @@ mod tests {
     };
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 

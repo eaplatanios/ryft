@@ -1,36 +1,38 @@
 //! Sharding-control operations: [`ReshardOperation`] and [`ShardingConstraintOperation`].
 //!
 //! Both operations are unary, leave the array value and its shape/data type untouched, and carry a target
-//! [`Sharding`](crate::sharding::Sharding). They differ in *how that sharding relates to the type system* and *which mesh axis types they
-//! govern* — a distinction mirroring JAX's split between
+//! [`Sharding`](crate::arrays::Sharding). They differ in *how that sharding relates to the type system* and *which mesh
+//! axis types they govern* — a distinction mirroring JAX's split between
 //! [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html) and
 //! [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):
 //!
 //! - [`ReshardOperation`] performs a **type-level sharding transition** over
-//!   [`Explicit`](crate::sharding::MeshAxisType::Explicit) and [`Manual`](crate::sharding::MeshAxisType::Manual)
-//!   mesh axes. Type inference *replaces* the output's [`Sharding`](crate::sharding::Sharding) with the requested one, so the new sharding is
-//!   tracked by the type system, dualized under transposition (the cotangent is resharded to the cotangent dual of
-//!   the input's sharding), and validated against the operand. It rejects requests that name
-//!   [`Auto`](crate::sharding::MeshAxisType::Auto) axes (those are the compiler's to place — use a
+//!   [`Explicit`](crate::arrays::MeshAxisType::Explicit) and [`Manual`](crate::arrays::MeshAxisType::Manual)
+//!   mesh axes. Type inference *replaces* the output's [`Sharding`](crate::arrays::Sharding) with the requested one, so
+//!   the new sharding is tracked by the type system, dualized under transposition (the cotangent is resharded to the
+//!   cotangent dual of the input's sharding), and validated against the operand. It rejects requests that name
+//!   [`Auto`](crate::arrays::MeshAxisType::Auto) axes (those are the compiler's to place — use a
 //!   [`ShardingConstraintOperation`] instead).
 //!
 //! - [`ShardingConstraintOperation`] is an **untracked propagation hint** over
-//!   [`Auto`](crate::sharding::MeshAxisType::Auto) mesh axes. Type inference is the *identity* (the output type — its
+//!   [`Auto`](crate::arrays::MeshAxisType::Auto) mesh axes. Type inference is the *identity* (the output type — its
 //!   sharding included — equals the input type), so the hint never becomes type-level state; it is self-adjoint under
 //!   transposition (the same hint is applied to the cotangent) and is materialized only at lowering, where it steers
 //!   the compiler's (e.g. [GSPMD](https://arxiv.org/abs/2105.04663) / [Shardy](https://openxla.org/shardy))
-//!   sharding propagation. It rejects requests whose [`Sharded`](crate::sharding::ShardingDimension::Sharded) entries
-//!   name non-[`Auto`](crate::sharding::MeshAxisType::Auto) axes (use a [`ReshardOperation`] for those).
+//!   sharding propagation. It rejects requests whose [`Sharded`](crate::arrays::ShardingDimension::Sharded) entries
+//!   name non-[`Auto`](crate::arrays::MeshAxisType::Auto) axes (use a [`ReshardOperation`] for those).
 //!
 //! Both lower to the same backend sharding-constraint operation (the [`Shardy`](https://openxla.org/shardy)
 //! `sdy.sharding_constraint` in the XLA backend); the only difference at the boundary is whether the type system
-//! tracked the result. The operations themselves are backend-agnostic — they carry a [`Sharding`](crate::sharding::Sharding) and have purely
-//! type-level and autodiff semantics — and each backend decides how to lower them.
+//! tracked the result. The operations themselves are backend-agnostic — they carry a
+//! [`Sharding`](crate::arrays::Sharding) and have purely type-level and autodiff semantics — and each backend decides
+//! how to lower them.
 
 // TODO(eaplatanios): Review this module.
 
 use std::fmt::Display;
 
+use crate::arrays::{ArrayType, Sharding, ShardingDimension};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
@@ -46,8 +48,6 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::programs::{MaybeZero, ProgramError};
-use crate::sharding::{Sharding, ShardingDimension};
-use crate::types::ArrayType;
 
 /// Canonical operation name for [`ReshardOperation`].
 pub const RESHARD_OPERATION_NAME: &str = "reshard";
@@ -78,14 +78,14 @@ fn referenced_axes(sharding: &Sharding) -> impl Iterator<Item = &str> {
 ///
 /// # Differs from [`ShardingConstraintOperation`]
 ///
-/// [`ReshardOperation`] is a *tracked* sharding transition over [`Explicit`](crate::sharding::MeshAxisType::Explicit)
-/// and [`Manual`](crate::sharding::MeshAxisType::Manual) axes: the requested sharding becomes the output type's
+/// [`ReshardOperation`] is a *tracked* sharding transition over [`Explicit`](crate::arrays::MeshAxisType::Explicit)
+/// and [`Manual`](crate::arrays::MeshAxisType::Manual) axes: the requested sharding becomes the output type's
 /// sharding and is dualized under transposition. [`ShardingConstraintOperation`] is instead an *untracked* hint over
-/// [`Auto`](crate::sharding::MeshAxisType::Auto) axes whose type inference is the identity. Refer to the
+/// [`Auto`](crate::arrays::MeshAxisType::Auto) axes whose type inference is the identity. Refer to the
 /// [module documentation](self) for the full contrast.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReshardOperation {
-    /// Target [`Sharding`](crate::sharding::Sharding) the input is resharded to.
+    /// Target [`Sharding`](crate::arrays::Sharding) the input is resharded to.
     sharding: Sharding,
 }
 
@@ -132,7 +132,7 @@ impl Operation for ReshardOperation {
             )));
         }
         if referenced_axes(&self.sharding)
-            .any(|axis| self.sharding.mesh().axis_type(axis) == Some(crate::sharding::MeshAxisType::Auto))
+            .any(|axis| self.sharding.mesh().axis_type(axis) == Some(crate::arrays::MeshAxisType::Auto))
         {
             return Err(TypeError::invalid(format!(
                 "{RESHARD_OPERATION_NAME} cannot target auto mesh axes; use a sharding constraint to hint \
@@ -295,7 +295,7 @@ where
 /// Unary [`Operation`] that records a sharding-propagation hint, the analogue of JAX's
 /// [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html).
 /// It leaves the array value, type, and sharding untouched at the type level and only steers the backend compiler's
-/// sharding propagation over [`Auto`](crate::sharding::MeshAxisType::Auto) mesh axes at lowering time.
+/// sharding propagation over [`Auto`](crate::arrays::MeshAxisType::Auto) mesh axes at lowering time.
 ///
 /// # Differs from [`ReshardOperation`]
 ///
@@ -356,7 +356,7 @@ impl Operation for ShardingConstraintOperation {
         for dimension in self.sharding.dimensions() {
             if let ShardingDimension::Sharded(axis_names) = dimension {
                 for axis_name in axis_names {
-                    if self.sharding.mesh().axis_type(axis_name) != Some(crate::sharding::MeshAxisType::Auto) {
+                    if self.sharding.mesh().axis_type(axis_name) != Some(crate::arrays::MeshAxisType::Auto) {
                         return Err(TypeError::invalid(format!(
                             "{SHARDING_CONSTRAINT_OPERATION_NAME} can only hint placement over auto mesh axes, \
                                  but '{axis_name}' is not auto; use reshard for explicit or manual axes"
@@ -504,14 +504,13 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::jacobian::jacobian_reverse;
     use crate::differentiation::{LinearizationTracer, vjp};
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
-    use crate::types::{DataType, Dimension, Shape};
 
     use super::*;
 

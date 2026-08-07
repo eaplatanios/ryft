@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension};
 use crate::backends::array_programs::LinearResiduals;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -25,9 +26,7 @@ use crate::programs::operations::{Operation, OperationFormatter, OperationProjec
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
-use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -659,16 +658,17 @@ where
 /// # use ryft_core::operations::manipulation::{Gather, GatherDimensionNumbers, GatherOperation};
 /// # use ryft_core::programs::ProgramError;
 /// # use ryft_core::backends::arrays::Array;
-/// # use ryft_core::types::{ArrayType, DataType};
+/// # use ryft_core::arrays::DataType;
+/// # use ryft_core::arrays::ArrayType;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Take rows 0 and 2 of a 3x2 matrix: each query is a scalar row index, so the indices have shape [2, 1]
 /// // (two queries, one index component each) and the gathered window is a full row (slice sizes [1, 2]).
 /// let operand = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
 /// let indices = Array::from_f64s(
-///     ArrayType::new(DataType::I32, ryft_core::types::Shape::new(vec![
-///         ryft_core::types::Dimension::Static(2),
-///         ryft_core::types::Dimension::Static(1),
+///     ArrayType::new(DataType::I32, ryft_core::arrays::Shape::new(vec![
+///         ryft_core::arrays::Dimension::Static(2),
+///         ryft_core::arrays::Dimension::Static(1),
 ///     ])),
 ///     vec![0.0, 2.0],
 /// );
@@ -1003,6 +1003,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        DataType, DimensionBounds, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::Context;
     use crate::differentiation::jacobian::jacobian_forward;
@@ -1010,8 +1014,6 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DataType, DimensionBounds, DimensionVariable, Memory};
 
     use super::*;
 

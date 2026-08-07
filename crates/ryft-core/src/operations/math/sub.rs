@@ -87,6 +87,9 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
     use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -95,8 +98,6 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 

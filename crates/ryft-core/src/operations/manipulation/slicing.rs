@@ -1,5 +1,8 @@
 use std::fmt::Display;
 
+use crate::arrays::{
+    ArrayIrType, ArrayType, Dimension, DimensionType, Memory, MeshAxisType, Shape, Sharding, ShardingDimension,
+};
 use crate::axes::Axis;
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
@@ -28,9 +31,7 @@ use crate::programs::operations::{Operation, OperationFormatter, OperationProjec
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
-use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Memory, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -1587,7 +1588,8 @@ where
 /// # use ryft_core::operations::manipulation::DynamicSlice;
 /// # use ryft_core::programs::ProgramError;
 /// # use ryft_core::backends::arrays::Array;
-/// # use ryft_core::types::{ArrayType, DataType};
+/// # use ryft_core::arrays::DataType;
+/// # use ryft_core::arrays::ArrayType;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Extract a 1x2 block starting at row 1, column 1 of a 2x3 matrix.
@@ -2048,7 +2050,8 @@ where
 /// # use ryft_core::operations::manipulation::DynamicUpdateSlice;
 /// # use ryft_core::programs::ProgramError;
 /// # use ryft_core::backends::arrays::Array;
-/// # use ryft_core::types::{ArrayType, DataType};
+/// # use ryft_core::arrays::DataType;
+/// # use ryft_core::arrays::ArrayType;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Overwrite the last two elements of the first row of a 2x3 matrix.
@@ -2486,6 +2489,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension, StridedLayout,
+    };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
@@ -2504,9 +2511,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
-    use crate::types::{DataType, DimensionBounds, DimensionVariable, Layout, Memory, StridedLayout};
 
     use super::*;
 
@@ -3582,7 +3587,7 @@ mod tests {
     fn test_array_type_slicing() {
         use std::collections::BTreeSet;
 
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+        use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
         // Every slicing operation preserves the operand's memory placement, and operations with update or dynamic
         // index operands reject combinations that would require an implicit transfer.
@@ -3807,8 +3812,8 @@ mod tests {
 
     #[test]
     fn test_slice_batching_sharding() {
+        use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
         use crate::operations::manipulation::Slice;
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         // The full input is [2 (batch), 4]: the batch axis is replicated and the data axis is sharded over `x`.

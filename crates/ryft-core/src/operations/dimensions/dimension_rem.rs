@@ -1,9 +1,9 @@
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
 use crate::macros::check_count;
 use crate::macros::define_arithmetic_dimension_operation;
 use crate::operations::math::{Rem, RemOperation};
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError};
-use crate::types::{DimensionBounds, DimensionError, DimensionType};
 
 use super::{positive_divisor_lower_bound, representable_extent_range};
 
@@ -42,8 +42,8 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(Dimensio
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::DimensionBounds;
     use crate::backends::dimensions::DimensionValue;
-    use crate::types::DimensionBounds;
 
     use super::super::test_dimension_type;
     use super::*;

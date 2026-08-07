@@ -7,6 +7,9 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::{
+    ArrayIrType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
+};
 use crate::axes::Axis;
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
@@ -21,9 +24,6 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValue, Value};
-use crate::types::{
-    ArrayIrType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
-};
 
 // TODO(eaplatanios): Review this module.
 
@@ -297,6 +297,7 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DataType, DimensionBounds, Shape};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::Array;
     use crate::contexts::{Context, EagerContext};
@@ -307,7 +308,6 @@ mod tests {
     use crate::programs::regions::RegionInterface;
     use crate::programs::{ProgramBuilder, TypeIdentityRenaming};
     use crate::tracing::TracingContext;
-    use crate::types::{DataType, DimensionBounds, Shape};
 
     use super::*;
 

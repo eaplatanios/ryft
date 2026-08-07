@@ -91,6 +91,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::differentiation::gradient_holomorphic;
     use crate::macros::{
@@ -100,7 +101,6 @@ mod tests {
     use crate::operations::constants::OneLike;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

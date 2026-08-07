@@ -67,6 +67,7 @@ impl_capability_for_primitive!(usize);
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::DataType;
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::{DifferentiationTracer, jvp};
@@ -75,7 +76,6 @@ mod tests {
     use crate::operations::constants::{OneLike, ZeroLike};
     use crate::operations::control_flow::Select;
     use crate::programs::ProgramError;
-    use crate::types::DataType;
 
     use super::*;
 

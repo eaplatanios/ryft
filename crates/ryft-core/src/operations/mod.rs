@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 
+use crate::arrays::ArrayType;
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
 use crate::programs::operations::Operation;
 use crate::programs::types::TypeError;
-use crate::types::ArrayType;
 
 pub mod attention;
 pub mod collectives;
@@ -113,11 +113,11 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::programs::regions::RegionInterface;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{
-        ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Shape, StridedLayout,
+    use crate::arrays::{
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
     };
+    use crate::programs::regions::RegionInterface;
 
     use super::*;
 

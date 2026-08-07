@@ -95,7 +95,7 @@ impl<T: Type> Operation for PrintOperation<T> {
     }
 }
 
-impl ElementwiseOperation for PrintOperation<crate::types::ArrayType> {
+impl ElementwiseOperation for PrintOperation<crate::arrays::ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         1
@@ -160,12 +160,12 @@ impl_differentiable_elementwise_operation! {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::value_and_gradient;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::tracing::{DomainTracer, Trace};
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

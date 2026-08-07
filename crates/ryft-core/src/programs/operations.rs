@@ -345,7 +345,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// ```rust
 /// # use ryft_core as ryft;
-/// # use ryft_core::{Array, ArrayType, ConstantOperation, DataType, Operation, Value, ZeroOperation};
+/// # use ryft_core::arrays::{ArrayType, DataType};
+/// # use ryft_core::{Array, ConstantOperation, Operation, Value, ZeroOperation};
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
@@ -365,10 +366,10 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// ```rust
 /// # use ryft_core as ryft;
-/// # use ryft_core::{ArrayIrType, ArrayType, DataType, Dimension, Operation, Shape, Value, ZeroOperation};
+/// # use ryft_core::arrays::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape};
+/// # use ryft_core::{Operation, Value, ZeroOperation};
 /// # use ryft_core::backends::{Array, ArrayOperation, ArrayIrValue, DimensionOperation, DimensionValue};
 /// # use ryft_core::operations::dimensions::DimensionSizeOperation;
-/// # use ryft_core::types::DimensionType;
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
@@ -819,12 +820,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayIrType, ArrayType, DataType};
     use crate::backends::arrays::Array;
     use crate::operations::differentiation::StopGradientOperation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::Effect;
-    use crate::types::{ArrayIrType, ArrayType, DataType};
 
     use super::*;
 

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape, Sharding, ShardingDimension};
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
@@ -30,9 +31,7 @@ use crate::programs::operations::{Operation, OperationFormatter, OperationProjec
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
-use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -1163,7 +1162,7 @@ fn remap_reshape_dimension_expression(
 /// # use ryft_core::operations::manipulation::Reshape;
 /// # use ryft_core::programs::ProgramError;
 /// # use ryft_core::backends::arrays::Array;
-/// # use ryft_core::types::{Shape, Dimension};
+/// # use ryft_core::arrays::{Shape, Dimension};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Reshape a length-6 vector to a `[2, 3]` matrix while keeping the row-major payload unchanged.
@@ -1560,6 +1559,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
+        StridedLayout,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::macros::{
@@ -1571,8 +1574,6 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use crate::types::{DataType, DimensionBounds, DimensionVariable, Layout, Memory, StridedLayout};
 
     use super::*;
 

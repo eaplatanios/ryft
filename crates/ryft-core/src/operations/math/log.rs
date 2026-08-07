@@ -62,6 +62,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::differentiation::{gradient_holomorphic, jvp};
     use crate::macros::{
@@ -71,7 +72,6 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::types::Typed;
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

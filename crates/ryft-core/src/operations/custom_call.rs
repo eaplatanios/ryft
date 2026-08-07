@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, DimensionVariable};
 use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain, EagerContext};
@@ -15,7 +16,6 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
-use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, DimensionVariable};
 
 // TODO(eaplatanios): Review this module.
 
@@ -446,7 +446,7 @@ impl Operation for CustomCallOperation<ArrayIrType> {
             input_types[..array_input_count].iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
         self.validate_input_output_aliases(array_input_types.as_slice())?;
         for (input_type, expected_variable) in input_types[array_input_count..].iter().zip(dynamic_output_dimensions) {
-            let actual_variable = <&crate::DimensionType>::try_from(input_type)?.variable();
+            let actual_variable = <&crate::arrays::DimensionType>::try_from(input_type)?.variable();
             if actual_variable != expected_variable {
                 return Err(TypeError::invalid(format!(
                     "'{CUSTOM_CALL_OPERATION_NAME}' output-extent operand defines dimension variable \
@@ -639,6 +639,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape, ShardingDimension,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::batching::array_ir::ArrayIrBatching;
@@ -650,9 +653,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::ShardingDimension;
     use crate::tracing::{DomainTracer, Trace, TracingContext};
-    use crate::types::{DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
 
     use super::*;
 

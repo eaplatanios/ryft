@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::{ArrayType, DataType};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
@@ -14,7 +15,6 @@ use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this.
 
@@ -186,6 +186,7 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
@@ -198,8 +199,6 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{Dimension, Shape};
 
     use super::*;
 

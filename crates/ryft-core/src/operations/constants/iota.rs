@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use crate::arrays::{ArrayIrType, ArrayType};
 use crate::batching::{ArrayBatch, ArrayBatching, ArrayIrBatching, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
@@ -17,7 +18,6 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -224,6 +224,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -232,7 +233,6 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 

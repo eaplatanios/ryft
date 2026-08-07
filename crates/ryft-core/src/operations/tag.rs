@@ -71,7 +71,7 @@ impl<T: Type> Operation for TagOperation<T> {
     }
 }
 
-impl ElementwiseOperation for TagOperation<crate::types::ArrayType> {
+impl ElementwiseOperation for TagOperation<crate::arrays::ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         1

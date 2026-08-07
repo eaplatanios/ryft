@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use crate::arrays::{ArrayType, DataType, Dimension, Shape, Sharding};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
@@ -19,10 +20,8 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::{ProgramError, Value};
-use crate::sharding::Sharding;
 use crate::tracing::DomainTracer;
 use crate::tracing_v2::{CustomVjp, custom_vjp};
-use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -2180,6 +2179,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DimensionBounds, DimensionVariable, ShardingDimension};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchedProgram, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
@@ -2188,8 +2188,6 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::ShardingDimension;
-    use crate::types::{DimensionBounds, DimensionVariable};
 
     use super::*;
 

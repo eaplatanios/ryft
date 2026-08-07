@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
 
+use crate::arrays::{ArrayType, Shape, Sharding};
 use crate::axes::{Axes, Axis};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -19,9 +20,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Shape};
 
 /// Canonical operation name for [`TransposeOperation`].
 pub const TRANSPOSE_OPERATION_NAME: &str = "transpose";
@@ -452,7 +451,10 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::f8e8m0fnu;
+    use crate::arrays::{
+        DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::forward::DifferentiableOperation;
@@ -467,8 +469,6 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Memory, StridedLayout};
 
     use super::*;
 

@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, Shape, Sharding};
 use crate::axes::Axis;
 use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue, LinearResiduals};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
@@ -33,9 +34,7 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError};
-use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -1518,6 +1517,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayIrType, DataType, DimensionBounds, DimensionType, DimensionVariable, Layout, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+    };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
@@ -1532,10 +1535,6 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{
-        ArrayIrType, DataType, DimensionBounds, DimensionType, DimensionVariable, Layout, Memory, StridedLayout,
-    };
 
     use super::*;
 
@@ -2169,7 +2168,7 @@ mod tests {
 
     #[test]
     fn test_array_type_pad() {
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+        use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),

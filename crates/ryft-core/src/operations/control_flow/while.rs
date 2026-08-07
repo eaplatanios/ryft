@@ -12,6 +12,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::arrays::{ArrayIrType, ArrayType, DataType, DimensionType};
 use crate::axes::Axis;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
@@ -54,7 +55,6 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::programs::{MaybeZero, Program, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, DataType, DimensionType};
 
 // TODO(eaplatanios): Review this.
 
@@ -2434,6 +2434,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::arrays::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::batch;
@@ -2448,7 +2449,6 @@ mod tests {
     use crate::programs::effects::Effects;
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
-    use crate::types::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
 
     use super::*;
 

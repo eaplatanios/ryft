@@ -14,10 +14,10 @@ pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation};
 pub use zero::{ZERO_OPERATION_NAME, Zero, ZeroOperation, ZeroOperationProvider};
 pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
 use crate::programs::identities::TypeIdentityPosition;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
-use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType};
 
 /// Rejects a nullary constructor output [`Type`] that carries an ungrounded [`TypeIdentity`](crate::TypeIdentity)
 /// reference. A reference-position identity in a constructed-from-nothing type names a runtime quantity that no operand
@@ -88,8 +88,8 @@ pub(crate) fn infer_dynamic_constructor_output_types(
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DataType, DimensionBounds, DimensionVariable, Shape};
     use crate::programs::types::TypeError;
-    use crate::types::{DataType, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 

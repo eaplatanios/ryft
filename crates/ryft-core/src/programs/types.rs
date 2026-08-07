@@ -134,12 +134,12 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// while array-like types may account for broadcasting and nested structure.
     ///
     /// This relation describes *implicit convertibility*: a value of the receiver's type is not itself a value of
-    /// `other`, but it can be turned into one (e.g., by promoting its [`DataType`](crate::types::DataType) or
-    /// broadcasting its [`Shape`](crate::types::Shape)), possibly losing information along the way. Contrast this with
-    /// [`Self::is_refined_by`], which holds only when a value already *is* a value of the other type, with no conversion
-    /// involved. For example, `f16` is compatible with (i.e., promotable to) `f32` but does not refine it, while a
-    /// dynamically shaped `f32` array type of shape `[?, 3]` is refined by an `f32` array type of shape `[2, 3]` with no
-    /// conversion involved at all.
+    /// `other`, but it can be turned into one (e.g., by promoting its [`DataType`](crate::DataType) or broadcasting its
+    /// [`Shape`](crate::Shape)), possibly losing information along the way. Contrast this with [`Self::is_refined_by`],
+    /// which holds only when a value already *is* a value of the other type, with no conversion involved. For example,
+    /// `f16` is compatible with (i.e., promotable to) `f32` but does not refine it, while a dynamically shaped `f32`
+    /// array type of shape `[?, 3]` is refined by an `f32` array type of shape `[2, 3]` with no conversion involved
+    /// at all.
     fn is_compatible_with(&self, other: &Self) -> bool;
 
     /// Returns `true` if every value described by `other` is also described by this [`Type`]. The receiver is the
@@ -148,12 +148,11 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// Interpretation entry points such as [`Program::interpret`](crate::Program::interpret) use this relation to
     /// validate runtime input values against declared program input types.
     ///
-    /// For fully static types this is type equality (e.g., [`DataType`](crate::types::DataType) requires equal data
-    /// types). Types that can carry unknown components additionally admit every more precise instantiation of those
-    /// components. For example, [`ArrayType`](crate::types::ArrayType)s with
-    /// [`Dimension::Dynamic`](crate::Dimension::Dynamic) dimensions are refined by otherwise-equal
-    /// [`ArrayType`](crate::ArrayType)s whose corresponding dimensions are static,
-    /// per [`Dimension::is_refined_by`](crate::Dimension::is_refined_by).
+    /// For fully static types this is type equality (e.g., [`DataType`](crate::DataType) requires equal data types).
+    /// Types that can carry unknown components additionally admit every more precise instantiation of those components.
+    /// For example, [`ArrayType`](crate::ArrayType)s with [`Dimension::Dynamic`](crate::Dimension::Dynamic) dimensions
+    /// are refined by otherwise-equal [`ArrayType`](crate::ArrayType)s whose corresponding dimensions are static, per
+    /// [`Dimension::is_refined_by`](crate::Dimension::is_refined_by).
     ///
     /// Reading each [`Type`] as the set of values it describes, this relation is equivalent to set inclusion
     /// (i.e., argument ⊆ receiver) and forms a partial ordering (i.e., semantic subtyping where `other` is a subtype of
@@ -170,13 +169,13 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// is a scalar for simple gradients (i.e., not Jacobians).
     fn is_scalar(&self) -> bool;
 
-    /// Returns `true` if this [`Type`] describes complex-valued (e.g.,
-    /// [`DataType::C64`](crate::types::DataType::C64) or [`DataType::C128`](crate::types::DataType::C128)) numeric
-    /// values. Like [`Self::is_scalar`], this predicate primarily exists to serve reverse-mode differentiation. A single
-    /// reverse-mode seed recovers the derivative of a complex-output function only when the function is _holomorphic_
-    /// (i.e., complex-differentiable), so the gradient entry points route complex scalar outputs through their
-    /// `*_holomorphic` variants. The plain entry points reject output types for which this returns `true`, and the
-    /// holomorphic ones reject output types for which it returns `false`.
+    /// Returns `true` if this [`Type`] describes complex-valued (e.g., [`DataType::C64`](crate::DataType::C64) or
+    /// [`DataType::C128`](crate::DataType::C128)) numeric values. Like [`Self::is_scalar`], this predicate primarily
+    /// exists to serve reverse-mode differentiation. A single reverse-mode seed recovers the derivative of a
+    /// complex-output function only when the function is _holomorphic_ (i.e., complex-differentiable), so the gradient
+    /// entry points route complex scalar outputs through their `*_holomorphic` variants. The plain entry points reject
+    /// output types for which this returns `true`, and the holomorphic ones reject output types for which it returns
+    /// `false`.
     fn is_complex(&self) -> bool;
 }
 
@@ -322,7 +321,7 @@ pub(crate) fn visit_type_signature_pairs<
 mod tests {
     use std::collections::HashSet;
 
-    use crate::types::{ArrayType, DataType};
+    use crate::arrays::{ArrayType, DataType};
 
     use super::*;
 

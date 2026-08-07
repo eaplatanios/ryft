@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
+use crate::arrays::ArrayType;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, BatchingTracer,
@@ -18,7 +19,6 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::Tracer;
-use crate::types::ArrayType;
 
 /// Canonical operation name for [`ConstantOperation`].
 pub const CONSTANT_OPERATION_NAME: &str = "constant";
@@ -213,6 +213,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -222,7 +223,6 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::tracing::DomainTracingContext;
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

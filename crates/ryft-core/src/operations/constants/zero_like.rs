@@ -61,7 +61,7 @@ impl<T: Type> Operation for ZeroLikeOperation<T> {
     }
 }
 
-impl ElementwiseOperation for ZeroLikeOperation<crate::types::ArrayType> {
+impl ElementwiseOperation for ZeroLikeOperation<crate::arrays::ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         1
@@ -111,6 +111,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::differentiation::jacobian::jacobian_reverse;
@@ -119,7 +120,6 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

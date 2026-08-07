@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::{ArrayType, DataType};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::DifferentiableType;
@@ -18,7 +19,6 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this.
 
@@ -356,6 +356,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{Dimension, Shape};
     use crate::backends::arrays::Array;
     use crate::differentiation::forward::jvp;
     use crate::differentiation::reverse::value_and_gradient;
@@ -366,7 +367,6 @@ mod tests {
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::programs::ProgramError;
     use crate::programs::types::Typed;
-    use crate::types::{Dimension, Shape};
 
     use super::*;
 

@@ -3,6 +3,7 @@ use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
 
+use crate::arrays::ArrayType;
 use crate::batching::{ArrayBatch, BatchingPolicy, BatchingTracer};
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain, ProjectedContext};
@@ -16,7 +17,6 @@ use crate::programs::operations::OperationProjection;
 use crate::programs::regions::RegionId;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::Tracer;
-use crate::types::ArrayType;
 
 /// Location of one Single Static Assignment (SSA) value in a multi-region [`Program`](crate::Program), identified by
 /// its containing [`Region`](crate::Region) and its region-local [`AtomId`].
@@ -330,8 +330,8 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::contexts::EagerContext;
-    use crate::types::{DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 

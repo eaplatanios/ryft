@@ -56,7 +56,7 @@ impl<T: Type> Operation for OneLikeOperation<T> {
     }
 }
 
-impl ElementwiseOperation for OneLikeOperation<crate::types::ArrayType> {
+impl ElementwiseOperation for OneLikeOperation<crate::arrays::ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         1
@@ -106,6 +106,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::jacobian::JacobianDifferentiate;
@@ -113,7 +114,6 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

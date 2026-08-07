@@ -13,6 +13,7 @@
 use std::fmt::{Debug, Display};
 use std::ops::Mul as StdMul;
 
+use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape, Sharding};
 use crate::axes::{AxisError, AxisIndexOperation, NamedAxes, NamedAxis};
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
@@ -46,9 +47,7 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{ProjectedValue, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -91,8 +90,8 @@ pub enum CollectiveMode {
 /// Named-axis variance carried by an all-gather result.
 ///
 /// This is an operation option rather than parallel type metadata. Type inference maps it onto the canonical
-/// [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes) and
-/// [`Sharding::reduced_axes`](crate::Sharding::reduced_axes) sets.
+/// [`Sharding::varying_manual_axes`](crate::arrays::Sharding::varying_manual_axes) and
+/// [`Sharding::reduced_axes`](crate::arrays::Sharding::reduced_axes) sets.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AllGatherOutputVariance {
     /// The result continues to vary across the gathered manual mesh axis.
@@ -2883,7 +2882,7 @@ where
                             .remove(0);
                         let axis_index_variable = DimensionVariable::new(
                             format!("{}_index", transpose_operation.axis_name()),
-                            crate::types::DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,
+                            crate::arrays::DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,
                         );
                         let axis_index = transpose_context
                             .bind(
@@ -3724,6 +3723,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayIrType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType,
+        Shape, Sharding,
+    };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
@@ -3734,8 +3737,6 @@ mod tests {
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{transpose_mixed_operation, value_and_gradient};
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use crate::types::{ArrayIrType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
 
     use super::*;
 

@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::{ArrayType, DataType};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::forward::DifferentiationDual;
 use crate::differentiation::{DifferentiableType, ElementwiseDerivativeAlignment};
@@ -15,7 +16,6 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this.
 
@@ -248,6 +248,7 @@ impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<Convert
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout};
     use crate::backends::arrays::Array;
     use crate::differentiation::jvp;
     use crate::macros::{
@@ -255,7 +256,6 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::programs::types::Typed;
-    use crate::types::{ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout};
 
     use super::*;
 

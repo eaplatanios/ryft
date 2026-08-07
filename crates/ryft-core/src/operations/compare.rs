@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::{ArrayIrType, ArrayType, DataType, DimensionType};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::broadcasting::Broadcastable;
@@ -15,7 +16,6 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::{ProjectedValue, Value};
-use crate::types::{ArrayIrType, ArrayType, DataType, DimensionType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -224,8 +224,8 @@ where
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing
 /// the `i`-th elements of `left` and `right` according to `direction`. The input arrays must have broadcast-compatible
-/// shapes and promotable [`DataType`](crate::DataType)s. The result has [`DataType::Boolean`](crate::DataType::Boolean)
-/// and the broadcasted shape of the two input arrays.
+/// shapes and promotable [`DataType`](crate::arrays::DataType)s. The result has
+/// [`DataType::Boolean`](crate::arrays::DataType::Boolean) and the broadcasted shape of the two input arrays.
 ///
 /// First-class dimensions use the same comparison operation but return ordinary rank-zero Boolean array data. This
 /// keeps the predicate available to selection and control-flow operations without making the result a dimension:
@@ -317,6 +317,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Layout, Memory,
+        Shape, StridedLayout,
+    };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
@@ -335,10 +339,6 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::programs::values::ValueProjection;
     use crate::tracing::{Tracer, TracingContext};
-    use crate::types::{
-        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Layout, Memory,
-        Shape, StridedLayout,
-    };
 
     use super::*;
 

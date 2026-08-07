@@ -109,6 +109,7 @@ mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -116,7 +117,6 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

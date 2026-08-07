@@ -4,12 +4,12 @@
 //! program operations over [`DimensionType`], not integer array operations and not a parallel symbolic-expression
 //! language.
 
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::Operation;
 use crate::programs::types::{Type, TypeError};
-use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
 
 // TODO(eaplatanios): Review this module.
 

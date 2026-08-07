@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use crate::arrays::{ArrayType, DataType, Dimension, LogicalMesh, Sharding};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
@@ -22,9 +23,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::sharding::{LogicalMesh, Sharding};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Dimension};
 
 // TODO(eaplatanios): Review this.
 
@@ -570,7 +569,8 @@ fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), T
 /// # use ryft_core::operations::manipulation::{Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 /// # use ryft_core::programs::ProgramError;
 /// # use ryft_core::backends::arrays::Array;
-/// # use ryft_core::types::{ArrayType, DataType, Shape, Dimension};
+/// # use ryft_core::arrays::DataType;
+/// # use ryft_core::arrays::{ArrayType, Dimension, Shape};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Add two row updates into rows 0 and 2 of a 3x2 zero matrix. Each query is a scalar row index, so the indices
@@ -880,6 +880,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        DataType, Dimension, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        StridedLayout,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::Context;
     use crate::differentiation::jacobian::jacobian_forward;
@@ -887,8 +891,6 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DataType, Dimension, Layout, Memory, Shape, StridedLayout};
 
     use super::*;
 

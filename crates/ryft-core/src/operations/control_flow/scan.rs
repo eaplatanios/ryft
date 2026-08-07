@@ -8,6 +8,7 @@
 
 use std::fmt::{Debug, Display};
 
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 use crate::axes::Axis;
 use crate::backends::array_programs::ArrayIrValue;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
@@ -45,7 +46,6 @@ use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRe
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -271,7 +271,7 @@ pub(crate) fn stacked_scan_type<L: Into<Dimension>>(slice_type: &ArrayType, leng
 /// The expected input types are declared types derived from the body signature (with stacked types built by
 /// [`stacked_scan_type`], which carries no optional layout or sharding metadata), while the provided `input_types` may
 /// be actual runtime value types carrying more precise optional metadata, such as the normalized
-/// [`Sharding`](crate::Sharding)s that every concrete backend array type carries. Validation therefore uses the
+/// [`Sharding`](crate::arrays::Sharding)s that every concrete backend array type carries. Validation therefore uses the
 /// directional declared-vs-actual [`Type::is_refined_by`] relation instead of strict type equality. The returned output
 /// types are declared types built the same way and thus leave optional metadata unspecified for downstream consumers
 /// (e.g., sharding propagation) to resolve.
@@ -2722,6 +2722,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        DataType, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        Sharding, ShardingDimension,
+    };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchingTracer, batch};
@@ -2736,11 +2740,9 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::effects::Effects;
     use crate::programs::{Program, ProgramBuilder};
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
     use crate::tracing::Trace;
-    use crate::types::{DataType, DimensionBounds, DimensionType, DimensionVariable, Memory};
 
     use super::*;
 
@@ -3279,7 +3281,7 @@ mod tests {
     /// data type and shape mismatches are still rejected.
     #[test]
     fn test_scan_input_type_refinement() {
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+        use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
@@ -3838,8 +3840,8 @@ mod tests {
     /// known→unknown edges), which the trailing assertion pins.
     #[test]
     fn test_scan_jvp_stages_one_fused_scan_with_no_residual_stacks() {
+        use crate::arrays::{Dimension, Shape};
         use crate::tracing::DomainTracer;
-        use crate::types::{Dimension, Shape};
 
         let (scan, scan_body) = product_scan();
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
@@ -3885,7 +3887,7 @@ mod tests {
 
     #[test]
     fn test_scan_differentiation_with_zero_space_key_carry() {
-        use crate::types::{Dimension, Shape};
+        use crate::arrays::{Dimension, Shape};
 
         // A scan whose carries mix a differentiable accumulator with a zero-differential-space element — here a
         // `u64` key, the shape of every keyed training loop. The compact fused-JVP contract omits the key's tangent

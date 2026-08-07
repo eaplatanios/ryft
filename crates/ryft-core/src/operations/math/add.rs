@@ -11,10 +11,11 @@ pub const ADD_OPERATION_NAME: &str = "add";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that adds two numeric values elementwise, promoting their element [`DataType`](crate::DataType)s
-    /// and broadcasting their [`Shape`](crate::Shape)s. Array operands that carry partial sums must both be unreduced
-    /// over exactly the same mesh axes. Mixing an unreduced operand with an already reduced operand would duplicate the
-    /// reduced contribution when the result is subsequently reduced. Their reduced-axis markers must likewise agree.
+    /// [`Operation`] that adds two numeric values elementwise, promoting their element
+    /// [`DataType`](crate::arrays::DataType)s and broadcasting their [`Shape`](crate::arrays::Shape)s. Array operands
+    /// that carry partial sums must both be unreduced over exactly the same mesh axes. Mixing an unreduced operand with
+    /// an already reduced operand would duplicate the reduced contribution when the result is subsequently reduced.
+    /// Their reduced-axis markers must likewise agree.
     AddOperation,
     ADD_OPERATION_NAME,
     Add,
@@ -88,6 +89,9 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
     use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -96,8 +100,6 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 

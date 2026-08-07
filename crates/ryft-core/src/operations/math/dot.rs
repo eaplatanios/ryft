@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
+use crate::arrays::{ArrayType, DataType, Dimension, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
@@ -23,9 +24,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -1843,6 +1842,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Sharding, ShardingDimension,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
     use crate::contexts::EagerContext;
@@ -1850,8 +1853,6 @@ mod tests {
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 

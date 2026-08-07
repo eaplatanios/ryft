@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::contexts::{Context, Domain, ValueResolution};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -16,7 +17,6 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
-use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 
 /// Canonical operation name for an equality [`DimensionRequirementOperation`].
 pub const DIMENSION_REQUIRE_EQUAL_OPERATION_NAME: &str = "dimension_require_equal";

@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::ops::{Div, Mul};
 
+use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape, Sharding, StaticShape};
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
@@ -28,9 +29,7 @@ use crate::programs::operations::{Operation, OperationFormatter, OperationProjec
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value, ValueProjection};
-use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape, StaticShape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -102,11 +101,11 @@ impl Display for ReductionKind {
 ///
 /// The reduced axes are removed from the output shape; non-reduced axes keep their order. The output [`Sharding`]
 /// follows JAX's reduction sharding rule (`_reduce_op_sharding_rule` in `jax/_src/lax/lax.py`): the reduced axes'
-/// per-dimension [`ShardingDimension`](crate::sharding::ShardingDimension) entries are deleted while the remaining
+/// per-dimension [`ShardingDimension`](crate::arrays::ShardingDimension) entries are deleted while the remaining
 /// entries keep their order, and the reduction-state and manual-axis sets pass through unchanged. A reduced axis that
 /// is sharded is *not* an error here — the backend partitioner owns the cross-shard reduction; use
 /// [`ReduceOperation::with_output_sharding`] to request an unreduced output that defers it. The
-/// [`Layout`](crate::types::Layout) is dropped (it is rank-specific) and the [`Memory`](crate::types::Memory)
+/// [`Layout`](crate::arrays::Layout) is dropped (it is rank-specific) and the [`Memory`](crate::arrays::Memory)
 /// placement is preserved.
 pub fn reduce_abstract(
     input: &ArrayType,
@@ -300,7 +299,7 @@ fn validate_reduce_output_sharding(
     output_sharding: &Sharding,
     reduced_output: &ArrayType,
 ) -> Result<(), TypeError> {
-    use crate::sharding::{MeshAxisType, ShardingDimension};
+    use crate::arrays::{MeshAxisType, ShardingDimension};
 
     if kind != ReductionKind::Sum {
         return Err(TypeError::invalid(format!(
@@ -1001,12 +1000,12 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::StagingContext;
     use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::check_operation_batching;
     use crate::programs::types::Typed;
-    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -1029,7 +1028,7 @@ mod tests {
 
     #[test]
     fn test_reduce_abstract_drops_sharded_reduced_axis_entries() {
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+        use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
         // Reducing over a sharded dimension deletes its entry without error (the partitioner owns the collective);
         // the surviving dimension keeps its sharding and the reduced manual axis set passes through.
@@ -1151,8 +1150,8 @@ mod tests {
 
     #[test]
     fn test_reduce_sum_output_sharding_requests_unreduced_output() {
+        use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
         use crate::programs::operations::Operation;
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -1210,8 +1209,9 @@ mod tests {
 
     #[test]
     fn test_reduce_operation_interprets_sum_over_axis() {
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-        use crate::types::{Layout, Memory, StridedLayout};
+        use crate::arrays::{
+            Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+        };
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1243,8 +1243,8 @@ mod tests {
     fn test_reduce_with_output_sharding_stages_through_the_capability() {
         use std::rc::Rc;
 
+        use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
         use crate::parameters::Placeholder;
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
         use crate::tracing::TracingContext;
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();

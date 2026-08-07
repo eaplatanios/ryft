@@ -1,3 +1,4 @@
+use crate::arrays::DataType;
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 use crate::differentiation::forward::DifferentiationDual;
 use crate::differentiation::types::DifferentiableType;
@@ -11,7 +12,6 @@ use crate::operations::control_flow::Select;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::types::DataType;
 
 // TODO(eaplatanios): Review this module.
 
@@ -187,6 +187,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::ArrayType;
     use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, jvp, value_and_gradient};
@@ -197,7 +198,6 @@ mod tests {
     };
     use crate::operations::math::{Reduce, ReductionKind};
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::ArrayType;
 
     use super::*;
 

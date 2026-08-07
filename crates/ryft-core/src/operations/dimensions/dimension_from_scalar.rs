@@ -7,6 +7,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::{ArrayIrType, ArrayType, DimensionType, DimensionVariable};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -21,7 +22,6 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValue, Value};
-use crate::types::{ArrayIrType, ArrayType, DimensionType, DimensionVariable};
 
 /// Canonical operation name for [`DimensionFromScalarOperation`].
 pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
@@ -39,10 +39,8 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 /// # Example
 ///
 /// ```rust
-/// # use ryft_core::{
-/// #     ArrayIrValue, DimensionBounds, DimensionFromScalar, DimensionValue, DimensionVariable, Mul,
-/// #     ProgramError,
-/// # };
+/// # use ryft_core::arrays::{DimensionBounds, DimensionVariable};
+/// # use ryft_core::{ArrayIrValue, DimensionFromScalar, DimensionValue, Mul, ProgramError};
 /// # use ryft_core::backends::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
 /// let scalar = ArrayIrValue::Array(Array::scalar(5_i32));
@@ -62,9 +60,8 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 /// array concern and makes this operation the only numerical-data-to-dimension boundary:
 ///
 /// ```rust
-/// # use ryft_core::{
-/// #     DimensionBounds, DimensionFromScalar, DimensionVariable, ProgramError, Reshape, Shape, Slice,
-/// # };
+/// # use ryft_core::arrays::{DimensionBounds, DimensionVariable, Shape};
+/// # use ryft_core::{DimensionFromScalar, ProgramError, Reshape, Slice};
 /// # use ryft_core::backends::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
 /// let extents = Array::vector(vec![3_i32, 5_i32]);
@@ -247,6 +244,7 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DataType, DimensionBounds, DimensionError, MAX_DIMENSION_EXTENT, Shape};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
@@ -258,8 +256,6 @@ mod tests {
     use crate::programs::effects::Effects;
     use crate::programs::regions::{EmptyRegionDriver, RegionInterface};
     use crate::tracing::TracingContext;
-    use crate::types::dimensions::{DimensionBounds, DimensionError, MAX_DIMENSION_EXTENT};
-    use crate::types::{DataType, Shape};
 
     use super::*;
 
@@ -295,7 +291,7 @@ mod tests {
         }
         assert_eq!(
             operation.infer_output_types(
-                &[ArrayType::new(DataType::I32, Shape::new(vec![crate::Dimension::Static(1)])).into()],
+                &[ArrayType::new(DataType::I32, Shape::new(vec![crate::arrays::Dimension::Static(1)])).into()],
                 &[],
             ),
             Err(

@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use crate::arrays::{ArrayType, DataType, Dimension, Shape, ShardingDimension};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,
@@ -17,8 +18,6 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::sharding::ShardingDimension;
-use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.
 

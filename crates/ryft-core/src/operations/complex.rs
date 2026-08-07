@@ -1,3 +1,4 @@
+use crate::arrays::{ArrayType, DataType};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
@@ -6,7 +7,6 @@ use crate::operations::constants::{Zero, ZeroLikeOperation};
 use crate::operations::math::NegOperation;
 use crate::programs::MaybeZero;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
 

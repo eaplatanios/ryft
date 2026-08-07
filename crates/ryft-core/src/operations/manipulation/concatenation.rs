@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape, Sharding};
 use crate::axes::Axis;
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
@@ -33,9 +34,7 @@ use crate::programs::operations::{Operation, OperationFormatter, OperationProjec
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
-use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -734,7 +733,8 @@ pub trait Concatenate: Sized {
     /// # Parameters
     ///
     ///   - `inputs`: Values to join, in order. There must be at least one input, and, for [`ArrayType`]d values, all
-    ///     inputs must share one [`DataType`](crate::DataType) and rank and agree on every axis other than `axis`.
+    ///     inputs must share one [`DataType`](crate::arrays::DataType) and rank and agree on every axis other than
+    ///     `axis`.
     ///   - `axis`: [`Axis`] along which the inputs are joined. Negative axes index from the final axis.
     fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
         inputs: I,
@@ -1036,6 +1036,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension, StridedLayout,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::contexts::EagerContext;
@@ -1049,8 +1053,6 @@ mod tests {
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DataType, DimensionBounds, DimensionVariable, Layout, Memory, StridedLayout};
 
     use super::*;
 

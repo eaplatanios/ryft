@@ -69,13 +69,13 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::Array;
     use crate::differentiation::gradient_holomorphic;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

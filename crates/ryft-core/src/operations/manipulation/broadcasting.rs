@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape, Sharding, ShardingDimension};
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::arrays::BroadcastKernel;
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
@@ -36,9 +37,7 @@ use crate::programs::operations::{Operation, OperationFormatter, OperationProjec
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
-use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -920,11 +919,10 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 ///
 /// ```rust
 /// use ryft_core::operations::manipulation::Broadcast;
-/// use ryft_core::{
-///     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType,
-///     DimensionBounds, DimensionType, DimensionVariable, TracingContext, Typed,
-///     StagingContext,
+/// use ryft_core::arrays::{
+///     ArrayIrType, ArrayType, DataType, DimensionBounds, DimensionType, DimensionVariable,
 /// };
+/// use ryft_core::{Array, ArrayIrOperation, ArrayIrValue, StagingContext, TracingContext, Typed};
 ///
 /// type C = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 ///
@@ -1065,6 +1063,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension, StridedLayout,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
     use crate::contexts::EagerContext;
@@ -1080,9 +1082,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::TracingContext;
-    use crate::types::{DataType, DimensionBounds, DimensionVariable, Layout, Memory, StridedLayout};
 
     use super::LegacyBroadcastOperation as HomogeneousBroadcastOperation;
     use super::*;

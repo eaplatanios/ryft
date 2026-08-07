@@ -112,6 +112,9 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiableOperation, DifferentiationDual, jvp};
@@ -123,8 +126,6 @@ mod tests {
     use crate::operations::manipulation::ConvertElementType;
     use crate::programs::atoms::MaybeZero;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 

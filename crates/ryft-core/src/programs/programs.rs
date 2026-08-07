@@ -1608,6 +1608,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::macros::check_count;
@@ -1622,7 +1623,6 @@ mod tests {
     use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
     use crate::tests::TestRegionOperation;
-    use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 

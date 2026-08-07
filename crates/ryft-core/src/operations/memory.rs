@@ -1,6 +1,6 @@
 //! Contains the memory-placement operation: [`TransferToMemoryOperation`], which moves a value into a destination
-//! [`Memory`](crate::types::Memory) space, together with its interpretation, partial-evaluation, batching, forward-mode differentiation,
-//! and transposition rules. This is the analogue of placing a value with
+//! [`Memory`](crate::arrays::Memory) space, together with its interpretation, partial-evaluation, batching,
+//! forward-mode differentiation, and transposition rules. This is the analogue of placing a value with
 //! [JAX's `jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html) and a
 //! memory-kind-bearing sharding. Like the sharding-control operations (see
 //! [`operations::sharding`](crate::operations::sharding)), memory placement is metadata about *where* a value
@@ -10,6 +10,7 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::arrays::{ArrayType, Memory};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
@@ -22,7 +23,6 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::types::{ArrayType, Memory};
 
 // TODO(eaplatanios): Review this.
 
@@ -231,6 +231,7 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
+    use crate::arrays::{DataType, Dimension, Shape};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
@@ -238,7 +239,6 @@ mod tests {
     use crate::operations::math::{Dot, DotDimensionNumbers};
     use crate::programs::types::Typed;
     use crate::tracing::Trace;
-    use crate::types::{DataType, Dimension, Shape};
 
     use super::*;
 

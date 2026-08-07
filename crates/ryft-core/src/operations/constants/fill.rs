@@ -1,4 +1,4 @@
-use crate::arrays::ArrayElement;
+use crate::arrays::{ArrayElement, ArrayType};
 use crate::backends::arrays::Array;
 use crate::batching::{ArrayBatch, ArrayBatching, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
@@ -13,7 +13,6 @@ use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this module.
 
@@ -121,10 +120,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType, Dimension, Memory, Shape};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::parameters::Placeholder;
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayType, DataType, Dimension, Memory, Shape};
 
     use super::*;
 

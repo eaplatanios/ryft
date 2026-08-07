@@ -1,6 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::ops::{Add, Mul};
 
+use crate::arrays::{ArrayType, DataType, Dimension};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
@@ -17,7 +18,6 @@ use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
-use crate::types::{ArrayType, DataType, Dimension};
 
 // TODO(eaplatanios): Review this.
 
@@ -275,7 +275,8 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Coordina
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{f6e2m3fn, f6e3m2fn};
+    use crate::arrays::DataType::{Boolean, F6E2M3FN, F6E3M2FN, F8E8M0FNU, F32, I32};
+    use crate::arrays::{ArrayType, Dimension, DimensionBounds, DimensionVariable, Shape, f6e2m3fn, f6e3m2fn};
     use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::differentiation::{jacobian_forward, jacobian_reverse};
@@ -283,8 +284,6 @@ mod tests {
     use crate::macros::check_operation_type_inference;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::DataType::{Boolean, F6E2M3FN, F6E3M2FN, F8E8M0FNU, F32, I32};
-    use crate::types::{ArrayType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 

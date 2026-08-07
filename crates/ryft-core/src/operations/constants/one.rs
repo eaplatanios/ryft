@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use crate::arrays::{ArrayIrType, ArrayType};
 use crate::batching::{ArrayBatch, ArrayBatching, ArrayIrBatching, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
@@ -18,7 +19,6 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType};
 
 /// Canonical operation name for [`OneOperation`].
 pub const ONE_OPERATION_NAME: &str = "one";
@@ -175,6 +175,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DataType, Dimension, DimensionBounds, DimensionType, Shape};
     use crate::backends::arrays::Array;
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
@@ -184,7 +185,6 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::{DataType, Dimension, DimensionBounds, DimensionType, Shape};
 
     use super::*;
 
@@ -242,7 +242,7 @@ mod tests {
 
         // Nullary construction rejects output types with ungrounded identity references, while a definition-position
         // identity remains valid because the constructed value establishes it itself.
-        let rows = crate::types::DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let rows = crate::arrays::DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
         let dynamic_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]));
         assert_eq!(

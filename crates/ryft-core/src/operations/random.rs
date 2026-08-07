@@ -1,6 +1,9 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::{
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape, ShardingDimension,
+};
 use crate::axes::Axis;
 use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
@@ -30,9 +33,7 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError};
-use crate::sharding::ShardingDimension;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -805,6 +806,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DimensionBounds, DimensionType, DimensionVariable, ShardingDimension};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
@@ -817,8 +819,6 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::sharding::ShardingDimension;
-    use crate::types::{DimensionBounds, DimensionType, DimensionVariable};
 
     use super::*;
 

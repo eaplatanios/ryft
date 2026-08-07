@@ -552,6 +552,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
@@ -560,7 +561,6 @@ mod tests {
     use crate::programs::regions::RegionSlot;
     use crate::programs::values::ValueId;
     use crate::tests::TestRegionOperation;
-    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
