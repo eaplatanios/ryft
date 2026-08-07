@@ -393,4 +393,23 @@ mod tests {
             Ok(()),
         );
     }
+
+    #[test]
+    fn test_array_ir_type_projection() {
+        let array = ArrayType::new(F32, Shape::scalar());
+        let stored = ArrayIrType::from(array.clone());
+        assert_eq!(<&ArrayType>::try_from(&stored), Ok(&array));
+        assert_eq!(
+            <&DimensionType>::try_from(&stored),
+            Err(TypeError::invalid("expected dimension type but got array type")),
+        );
+        let dimension =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap()));
+        let stored = ArrayIrType::from(dimension.clone());
+        assert_eq!(<&DimensionType>::try_from(&stored), Ok(&dimension));
+        assert_eq!(
+            <&ArrayType>::try_from(&stored),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+    }
 }
