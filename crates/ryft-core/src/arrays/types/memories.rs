@@ -1,21 +1,21 @@
 use std::fmt::Display;
 
-/// Represents the memory space in which the values described by an [`ArrayType`](crate::ArrayType) reside. [`Memory`]
-/// represents the abstract *placement* information carried by staged types: it names the memory *tier* that holds the
-/// underlying data within its owning device's memory hierarchy. Host memories are not a placement target separate from
-/// the devices. For example, in the PJRT runtime model every device exposes its own set of addressable memories (i.e.,
-/// its default device-resident memory plus pinned and unpinned host memories), and a host-placed buffer remains owned
-/// by its device (i.e., it is allocated against that device, resides on the physical machine that hosts it, and moves
-/// back through that device's copy engines).
+/// Represents the memory space in which the values described by an [`ArrayType`](crate::arrays::ArrayType) reside.
+/// [`Memory`] represents the abstract *placement* information carried by staged types: it names the memory *tier* that
+/// holds the underlying data within its owning device's memory hierarchy. Host memories are not a placement target
+/// separate from the devices. For example, in the PJRT runtime model every device exposes its own set of addressable
+/// memories (i.e., its default device-resident memory plus pinned and unpinned host memories), and a host-placed buffer
+/// remains owned by its device (i.e., it is allocated against that device, resides on the physical machine that hosts
+/// it, and moves back through that device's copy engines).
 ///
-/// Placement therefore composes with, rather than competes with, any [`Sharding`](crate::Sharding) carried by the same
-/// type. The sharding information determines how the array is partitioned and which device *owns* each shard, while the
-/// memory names the tier of the owner's hierarchy that holds the shard's bytes, uniformly for every shard. For a mesh
-/// spanning several processes, offloading a sharded array to host memory scatters the shards across the participating
-/// machines. Each shard lands in the host memory of its owner device's machine, so the sharding is what decides which
-/// machine holds which shard. Host placement parks each shard's bytes off its device between uses without changing
-/// which device owns it. Running on CPU *devices* (i.e., a different platform rather than a different tier) is
-/// unrelated to [`Memory`] spaces and flows through device meshes and shardings instead.
+/// Placement therefore composes with, rather than competes with, any [`Sharding`](crate::arrays::Sharding) carried by
+/// the same type. The sharding information determines how the array is partitioned and which device *owns* each shard,
+/// while the memory names the tier of the owner's hierarchy that holds the shard's bytes, uniformly for every shard.
+/// For a mesh spanning several processes, offloading a sharded array to host memory scatters the shards across the
+/// participating machines. Each shard lands in the host memory of its owner device's machine, so the sharding is what
+/// decides which machine holds which shard. Host placement parks each shard's bytes off its device between uses
+/// without changing which device owns it. Running on CPU *devices* (i.e., a different platform rather than a different
+/// tier) is unrelated to [`Memory`] spaces and flows through device meshes and shardings instead.
 ///
 /// Note that *placement* information is metadata about *where* values live, not about their contents. It never affects
 /// shapes, data types, or the numerical semantics of operations. Values residing in different memory spaces never

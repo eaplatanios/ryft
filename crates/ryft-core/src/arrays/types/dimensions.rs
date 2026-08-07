@@ -371,8 +371,8 @@ impl DimensionType {
     /// and records the renaming of `declared`'s [`DimensionVariable`] to `actual`'s in `renaming`, failing when that
     /// variable is already renamed to a different target.
     ///
-    /// This is the single-pair step used by the [`Type::derive_identity_renaming`] implementations that fold over an
-    /// entire declared/actual signature like [`DimensionType`]'s own, and [`ArrayIrType`](crate::ArrayIrType)'s, which
+    /// This is the single-pair step used by the [`Type::derive_identity_renaming`] implementations that fold over
+    /// an entire signature like [`DimensionType`]'s own, and [`ArrayIrType`](crate::arrays::ArrayIrType)'s, which
     /// encounters dimension types as individual elements of a mixed signature. It is a separate function so that
     /// those callers can thread one shared [`TypeIdentityRenaming`] through every pair of the signature. Sharing the
     /// accumulator is what makes a declared [`DimensionVariable`] that appears in several signature positions rename
@@ -618,8 +618,7 @@ impl Shape {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::{Shape, Dimension};
-    /// # use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
+    /// # use ryft_core::arrays::{Dimension, DimensionBounds, DimensionVariable, Shape};
     ///
     /// // Scalar.
     /// assert_eq!(Shape::scalar().rank(), 0);
@@ -679,8 +678,7 @@ impl Shape {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::{Shape, Dimension};
-    /// # use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
+    /// # use ryft_core::arrays::{Dimension, DimensionBounds, DimensionVariable, Shape};
     ///
     /// let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
     /// let declared = Shape::new(vec![rows.into(), Dimension::Static(3)]);
@@ -1053,10 +1051,7 @@ mod tests {
         let s1 = Shape::new(vec![Dimension::Static(42)]);
         let s2 = Shape::new(vec![
             Dimension::Static(4),
-            Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
-                "dynamic",
-                crate::types::dimensions::DimensionBounds::unbounded(),
-            )),
+            Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
         ]);
 
         assert_eq!(s0.rank(), 0);
@@ -1103,10 +1098,7 @@ mod tests {
         assert_eq!(
             Shape::new(vec![
                 Dimension::Static(42),
-                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
-                    "dynamic",
-                    crate::types::dimensions::DimensionBounds::unbounded()
-                ))
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
             ])
             .element_count(),
             Ok(None)
@@ -1114,10 +1106,7 @@ mod tests {
         assert_eq!(
             Shape::new(vec![
                 Dimension::Static(42),
-                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
-                    "dynamic",
-                    crate::types::dimensions::DimensionBounds::non_negative(Some(8)).unwrap()
-                ))
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::non_negative(Some(8)).unwrap())),
             ])
             .element_count(),
             Ok(None)
@@ -1125,10 +1114,7 @@ mod tests {
         assert_eq!(
             Shape::new(vec![
                 Dimension::Static(0),
-                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
-                    "dynamic",
-                    crate::types::dimensions::DimensionBounds::unbounded()
-                ))
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
             ])
             .element_count(),
             Ok(Some(0))

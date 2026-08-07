@@ -1428,7 +1428,8 @@ impl DataType {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::DataType;
+    /// # use ryft_core::arrays::DataType;
+    ///
     /// assert_eq!(DataType::promoted(&[DataType::Boolean]), Ok(DataType::Boolean));
     /// assert_eq!(DataType::promoted(&[DataType::Boolean, DataType::U16]), Ok(DataType::U16));
     /// assert_eq!(DataType::promoted(&[DataType::Boolean, DataType::F32]), Ok(DataType::F32));
@@ -1473,7 +1474,8 @@ impl DataType {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::DataType;
+    /// # use ryft_core::arrays::DataType;
+    ///
     /// assert!(DataType::I32.is_promotable_to(DataType::F64));
     /// assert!(DataType::F32.is_promotable_to(DataType::C64));
     /// assert!(!DataType::F64.is_promotable_to(DataType::I32));

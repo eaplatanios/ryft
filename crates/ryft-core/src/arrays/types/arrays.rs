@@ -4,6 +4,13 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
+use crate::arrays::types::data::DataType;
+use crate::arrays::types::dimensions::{
+    Dimension, DimensionError, DimensionType, DimensionVariable, Shape, StaticShape,
+};
+use crate::arrays::types::layouts::Layout;
+use crate::arrays::types::memories::Memory;
 use crate::axes::Axis;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
@@ -11,11 +18,6 @@ use crate::parameters::Parameter;
 use crate::programs::Value;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::types::{Type, TypeError, TypeRefinements, Typed, visit_type_signature_pairs};
-use crate::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
-use crate::types::data::DataType;
-use crate::types::dimensions::{Dimension, DimensionError, DimensionType, DimensionVariable, Shape, StaticShape};
-use crate::types::layouts::Layout;
-use crate::types::memories::Memory;
 
 // Shared empty batch axis set returned by `ArrayType::unreduced_axes` and `ArrayType::reduced_axes` for array types
 // that carry no `Sharding`, so that both accessors can hand back a borrow without allocating.
@@ -30,8 +32,7 @@ static EMPTY_BATCH_AXES: BTreeSet<String> = BTreeSet::new();
 /// # Examples
 ///
 /// ```rust
-/// # use ryft_core::{ArrayType, DataType, Memory, Shape, Dimension};
-/// # use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
+/// # use ryft_core::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Memory, Shape};
 ///
 /// // Boolean scalar.
 /// assert_eq!(
@@ -182,9 +183,7 @@ impl ArrayType {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::DataType;
-    /// # use ryft_core::types::{ArrayType, Shape, Dimension};
-    /// # use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
+    /// # use ryft_core::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     ///
     /// // Boolean scalar.
     /// assert_eq!(ArrayType::new(DataType::Boolean, Shape::scalar()).rank(), 0);
@@ -954,12 +953,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::sharding::{
+    use crate::arrays::sharding::{
         Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
-    use crate::types::data::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
-    use crate::types::dimensions::{DimensionBounds, DimensionVariable};
-    use crate::types::layouts::{StridedLayout, Tile, TileDimension, TiledLayout};
+    use crate::arrays::types::data::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
+    use crate::arrays::types::dimensions::{DimensionBounds, DimensionVariable};
+    use crate::arrays::types::layouts::{StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
 
