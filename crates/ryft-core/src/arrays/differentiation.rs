@@ -270,8 +270,6 @@ impl ExactShape {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// One dimension of an [`ExactShape`] that describes where the runtime extent of the corresponding axis lives, from
 /// the point of view of a [`LinearCallOperation`](crate::LinearCallOperation)'s attached [`Region`](crate::Region).
 /// This is the [`ExactShape`] counterpart of [`Dimension`], which is the per-axis entry of a [`Shape`].
@@ -328,22 +326,20 @@ impl<
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds};
+    use crate::arrays::ir::ArrayIrValue;
+    use crate::arrays::operations::ArrayIrOperation;
+    use crate::arrays::types::data::DataType;
+    use crate::arrays::types::dimensions::DimensionBounds;
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::programs::types::TypeError;
 
     use super::*;
 
-    /// Returns a fresh dynamic [`DimensionType`] (i.e., identity plus bounds, no concrete extent) named `name`.
-    fn dimension_type(name: &str) -> DimensionType {
-        DimensionType::new(DimensionVariable::new(name, DimensionBounds::new(1, Some(9)).unwrap()))
-    }
-
     #[test]
     fn test_linear_residuals() {
-        let n = dimension_type("n");
-        let m = dimension_type("m");
+        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
+        let m = DimensionType::new(DimensionVariable::new("m", DimensionBounds::new(1, Some(9)).unwrap()));
         let mut residuals = LinearResiduals::<ArrayIrValue<Array>>::new();
         assert!(residuals.values().is_empty());
 
@@ -378,7 +374,7 @@ mod tests {
     fn test_linear_residuals_retain_shape() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        let n = dimension_type("n");
+        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
         let array_type = ArrayType::new(
             DataType::F64,
             Shape::new(vec![
@@ -430,7 +426,8 @@ mod tests {
 
         // Non-array values are rejected with a kind mismatch.
         let context = TestContext::new();
-        let dimension = context.input(dimension_type("k").into());
+        let dimension = context
+            .input(DimensionType::new(DimensionVariable::new("k", DimensionBounds::new(1, Some(9)).unwrap())).into());
         let mut residuals = LinearResiduals::new();
         assert_eq!(
             residuals.retain_shape(&context, &dimension),
@@ -440,8 +437,8 @@ mod tests {
 
     #[test]
     fn test_exact_shape_for_residual_zero() {
-        let n = dimension_type("n");
-        let m = dimension_type("m");
+        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
+        let m = DimensionType::new(DimensionVariable::new("m", DimensionBounds::new(1, Some(9)).unwrap()));
         let shape = Shape::new(vec![
             Dimension::Static(2),
             Dimension::Dynamic(n.variable().clone()),
@@ -485,7 +482,7 @@ mod tests {
     fn test_exact_shape_dimensions() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        let n = dimension_type("n");
+        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
         let shape = Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(n.variable().clone())]);
         let (plan, _) = ExactShape::for_residual_zero(&shape);
 
@@ -571,7 +568,8 @@ mod tests {
         drop(builder);
 
         // Dimension-typed cotangents cannot be projected to the array member.
-        let dimension = context.input(dimension_type("k").into());
+        let dimension = context
+            .input(DimensionType::new(DimensionVariable::new("k", DimensionBounds::new(1, Some(9)).unwrap())).into());
         assert!(matches!(
             <ArrayIrBatching as LinearCallBatchingPolicy<TestContext>>::sum_mapped_cotangents(
                 &context,
