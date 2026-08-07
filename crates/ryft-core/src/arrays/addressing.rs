@@ -1,8 +1,8 @@
 use std::ops::Range;
 
+use crate::arrays::{ArrayType, DataType, Dimension, Layout, Tile, TileDimension, TiledLayout};
 use crate::programs::ProgramError;
 use crate::programs::types::TypeError;
-use crate::types::{ArrayType, DataType, Dimension, Layout, Tile, TileDimension, TiledLayout};
 
 /// Checked mapping from a static [`ArrayType`]'s logical indices to its storage addresses. Addressing includes both
 /// logical element offsets and physical byte ranges, and so it is broader than indexing alone. An array without an
@@ -759,12 +759,12 @@ impl Iterator for ArrayIndexRanges<'_> {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::types::arrays::ArrayType;
+    use crate::arrays::types::data::DataType;
+    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::arrays::types::layouts::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
     use crate::programs::ProgramError;
     use crate::programs::types::TypeError;
-    use crate::types::{
-        ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Shape, StridedLayout, Tile,
-        TileDimension, TiledLayout,
-    };
 
     use super::*;
 

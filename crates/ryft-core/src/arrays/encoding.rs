@@ -8,9 +8,9 @@ pub use half::{bf16, f16};
 pub use num_complex::Complex;
 
 use crate::arrays::addressing::ArrayAddressing;
+use crate::arrays::{ArrayType, DataType};
 use crate::programs::ProgramError;
 use crate::programs::types::TypeError;
-use crate::types::{ArrayType, DataType};
 
 /// Value type with exactly one portable array-element byte encoding. [`ArrayElement`] pairs each supported Rust type
 /// with the one [`DataType`] it represents (e.g., [`f32`] with [`DataType::F32`]) and pins the exact bytes that one
@@ -73,7 +73,7 @@ impl<T: private::Codec> ArrayElement for T {
 }
 
 mod private {
-    use crate::types::DataType;
+    use crate::arrays::DataType;
 
     /// Private implementation contract that seals and implements [`super::ArrayElement`].
     pub trait Codec: Copy {
@@ -1017,14 +1017,14 @@ impl private::Codec for Complex<f64> {
 }
 
 /// Encodes `elements`, provided in logical row-major order, into a new physical storage buffer for `r#type`. A missing
-/// [`Layout`](crate::Layout) means dense row-major storage, while explicit strided and tiled layouts determine where
-/// each element is written. Bytes that no logical element occupies, namely layout holes and tile padding, are
+/// [`Layout`](crate::arrays::Layout) means dense row-major storage, while explicit strided and tiled layouts determine
+/// where each element is written. Bytes that no logical element occupies, namely layout holes and tile padding, are
 /// initialized to zero.
 ///
 /// # Parameters
 ///
-///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
-///     and [`Layout`](crate::Layout).
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::arrays::Shape),
+///     and [`Layout`](crate::arrays::Layout).
 ///   - `elements`: Elements of the array provided in row-major order. Their type must represent `r#type`'s
 ///     [`DataType`], and their count must equal the array's logical element count.
 pub fn encode_elements<T: ArrayElement>(r#type: &ArrayType, elements: &[T]) -> Result<Vec<u8>, ProgramError> {
@@ -1068,13 +1068,13 @@ pub fn encode_elements<T: ArrayElement>(r#type: &ArrayType, elements: &[T]) -> R
 
 /// Validates the provided logical element bytes and places them into a new physical storage buffer for `r#type`. The
 /// input is the row-major concatenation of the element encodings alone, without layout holes or tile padding. The
-/// [`Layout`](crate::Layout) of the provided [`ArrayType`] determines where each element is written, and all unoccupied
-/// storage bytes are initialized to zero.
+/// [`Layout`](crate::arrays::Layout) of the provided [`ArrayType`] determines where each element is written, and all
+/// unoccupied storage bytes are initialized to zero.
 ///
 /// # Parameters
 ///
-///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
-///     and [`Layout`](crate::Layout).
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::arrays::Shape),
+///     and [`Layout`](crate::arrays::Layout).
 ///   - `bytes`: Concatenated logical element byte encodings provided in row-major order.
 pub fn encode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>, ProgramError> {
     let addressing = ArrayAddressing::new(r#type.clone())?;
@@ -1111,8 +1111,8 @@ pub fn encode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
 ///
 /// # Parameters
 ///
-///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
-///     and [`Layout`](crate::Layout).
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::arrays::Shape),
+///     and [`Layout`](crate::arrays::Layout).
 ///   - `bytes`: Physical storage bytes, including any holes or tile padding required by `r#type`.
 pub fn decode_elements<T: ArrayElement>(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<T>, ProgramError> {
     if r#type.data_type() != T::DATA_TYPE {
@@ -1144,8 +1144,8 @@ pub fn decode_elements<T: ArrayElement>(r#type: &ArrayType, bytes: &[u8]) -> Res
 ///
 /// # Parameters
 ///
-///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
-///     and [`Layout`](crate::Layout).
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::arrays::Shape),
+///     and [`Layout`](crate::arrays::Layout).
 ///   - `bytes`: Physical storage bytes, including any holes or tile padding required by `r#type`.
 pub fn decode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>, ProgramError> {
     let addressing = ArrayAddressing::new(r#type.clone())?;
@@ -1173,8 +1173,8 @@ pub fn decode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
 ///
 /// # Parameters
 ///
-///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
-///     and [`Layout`](crate::Layout).
+///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::arrays::Shape),
+///     and [`Layout`](crate::arrays::Layout).
 ///   - `bytes`: Physical storage bytes, including any holes or tile padding required by `r#type`.
 #[inline]
 pub fn validate_storage_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<(), ProgramError> {
@@ -1253,7 +1253,8 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::types::{Dimension, Layout, Shape, StridedLayout, Tile, TileDimension, TiledLayout};
+    use crate::arrays::types::dimensions::{Dimension, Shape};
+    use crate::arrays::types::layouts::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
 

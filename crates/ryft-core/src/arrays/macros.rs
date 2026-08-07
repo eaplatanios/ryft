@@ -1,15 +1,14 @@
-/// Dispatches one runtime [`DataType`](crate::types::DataType) to its sealed Rust array element type, so that array
+/// Dispatches one runtime [`DataType`](crate::arrays::DataType) to its sealed Rust array element type, so that array
 /// kernels can run generic element code without storing or allocating another dynamic element representation.
 ///
-/// The macro takes a class selector, a [`DataType`](crate::types::DataType) expression, and an `|Element| body`
+/// The macro takes a class selector, a [`DataType`](crate::arrays::DataType) expression, and an `|Element| body`
 /// closure-like form, and expands to a `match` that binds the type alias `Element` to the matching element type from
 /// [`arrays::encoding`](crate::arrays::encoding) in every selected arm. The body is instantiated once per selected
 /// element type and may therefore use `Element` in any type position, including calls to generic functions bounded
 /// by [`ArrayElement`](crate::arrays::encoding::ArrayElement) or by kernel capability traits:
 ///
 /// ```
-/// # use ryft_core::arrays::macros::dispatch_on_array_element_type;
-/// # use ryft_core::types::DataType;
+/// # use ryft_core::arrays::{DataType, dispatch_on_array_element_type};
 ///
 /// fn element_byte_count(data_type: DataType) -> usize {
 ///     dispatch_on_array_element_type!(data_type, |Element| size_of::<Element>())
@@ -33,10 +32,10 @@
 ///   - `@boolean_or_integer`: Boolean and every integer element type (i.e., the bitwise and logical family).
 ///
 /// Kernels dispatch after type inference has already validated the operand element class,
-/// so a [`DataType`](crate::DataType) outside the selected class (including the payload-free
-/// [`Token`](crate::DataType::Token) and [`Zero`](crate::DataType::Zero) types, which no selector includes) is an
-/// internal invariant violation and panics with a descriptive message rather than forcing every body to return a
-/// [`Result`].
+/// so a [`DataType`](crate::arrays::DataType) outside the selected class (including the payload-free
+/// [`Token`](crate::arrays::DataType::Token) and [`Zero`](crate::arrays::DataType::Zero) types, which no selector
+/// includes) is an internal invariant violation and panics with a descriptive message rather than forcing every body
+/// to return a [`Result`].
 #[macro_export]
 macro_rules! dispatch_on_array_element_type {
     ($data_type:expr, |$element:ident| $body:expr $(,)?) => {
@@ -262,7 +261,7 @@ macro_rules! dispatch_on_array_element_type {
     (@arms($(($variant:ident, $element_type:ty)),+ $(,)?) $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         match $data_type {
             $(
-                $crate::types::DataType::$variant => {
+                $crate::arrays::DataType::$variant => {
                     type $element = $element_type;
                     $body
                 }
@@ -279,7 +278,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::encoding::ArrayElement;
-    use crate::types::DataType;
+    use crate::arrays::types::data::DataType;
 
     /// Returns the [`DataType`] represented by one array-element type.
     fn element_data_type<T: ArrayElement>() -> DataType {
