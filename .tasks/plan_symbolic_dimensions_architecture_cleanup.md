@@ -2576,6 +2576,12 @@ Phase 9a4 — retire the scalar program universe:
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
 - [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
       exports, scalar-only doctests, and the obsolete scalar-domain compile-fail fixture.
+  - [x] Migrate or delete the final scalar-backed capture and interpretation fixtures.
+  - [ ] Migrate or delete the final scalar-backed program fixtures.
+  - [ ] Migrate or delete the final scalar-backed macro, compilation, and benchmark fixtures, then remove the obsolete
+        scalar-domain compile-fail fixture.
+  - [ ] Delete the scalar backend module, exports, scalar-only doctests, production specializations, and stale
+        documentation references.
 - [ ] Delete or privatize-and-rename any surviving transient element helper according to the prototype decision. No
       item named `Scalar` and no standalone scalar `Value`/domain may remain in production code.
 - [ ] Update testing guidance to name rank-zero `Array` as the scalar-semantics reference.
@@ -4949,3 +4955,15 @@ across five files. Those seven references are production documentation for scala
 `WhileOperation` specialization rather than test fixtures, so this closes the operation-local fixture checklist; the
 following scalar-universe deletion item owns their removal or rewording. Formatting and diff hygiene pass, and the
 complete 1,153-test core library suite passes.
+
+The first scalar-backend dependency-removal slice moves the final capture and interpretation fixtures to rank-zero
+arrays. Capture validation, pruning, lifting, nested-region discovery, duplicate output materialization, live-constant
+lifting, mismatched parameter structures, and malformed operation arity all retain their previous coverage through
+`ArrayType`, `ArrayOperation`, and `Array`. Rendered capture programs change only by making rank-zero shapes explicit,
+and closures that previously copied `Scalar` values now clone the byte-sharing reference `Array` value.
+
+This review unit changes 165 lines across `captures.rs` and `interpretation.rs` with one net deletion, plus the nested
+dependency-removal checklist. It removes all 18 retired scalar-backend references from those modules and reduces the
+exact backend-identifier audit from 117 matches across 13 files to 99 matches across 11 files. All 18 focused tests,
+formatting, diff hygiene, and the complete 1,153-test core library suite pass. Program fixtures are the next dependency-
+removal unit.

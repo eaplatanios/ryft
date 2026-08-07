@@ -510,8 +510,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
-    use crate::backends::arrays::Array;
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
@@ -593,54 +592,54 @@ mod tests {
     #[test]
     fn test_closed_program_without_unused_captures() {
         // Construction rejects references to missing captures.
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
-        let capture = builder.add_constant(CaptureReference::new(1, DataType::F64));
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
+        let capture = builder.add_constant(CaptureReference::new(1, ArrayType::scalar(DataType::F64)));
         let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![capture],
                 Vec::<Placeholder>::new(),
                 vec![Placeholder],
             )
             .unwrap();
         assert!(matches!(
-            ClosedProgram::new(program, vec![Scalar::from(3.0)]),
+            ClosedProgram::new(program, vec![Array::scalar(3.0)]),
             Err(ProgramError::MalformedProgram(message))
                 if message == "captured constant atom %0 references missing capture #1",
         ));
 
         // Construction rejects references whose declared type differs from their capture's runtime type.
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
-        let capture = builder.add_constant(CaptureReference::new(0, DataType::I64));
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
+        let capture = builder.add_constant(CaptureReference::new(0, ArrayType::scalar(DataType::I64)));
         let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![capture],
                 Vec::<Placeholder>::new(),
                 vec![Placeholder],
             )
             .unwrap();
         assert!(matches!(
-            ClosedProgram::new(program, vec![Scalar::from(3.0)]),
+            ClosedProgram::new(program, vec![Array::scalar(3.0)]),
             Err(ProgramError::MalformedProgram(message))
                 if message
-                    == "captured constant atom %0 references capture #0 with type f64, but the atom has type i64",
+                    == "captured constant atom %0 references capture #0 with type f64[], but the atom has type i64[]",
         ));
 
         // Pruning drops the dead capture #0 and re-indexes the surviving capture #1 into a contiguous table
         // while preserving the program structure.
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let capture = builder.add_constant(CaptureReference::new(1, DataType::F64));
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let capture = builder.add_constant(CaptureReference::new(1, ArrayType::scalar(DataType::F64)));
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
         let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![output],
                 vec![Placeholder],
                 vec![Placeholder],
             )
             .unwrap();
-        let program = ClosedProgram::new(program, vec![Scalar::from(3.0), Scalar::from(99.0)]).unwrap();
+        let program = ClosedProgram::new(program, vec![Array::scalar(3.0), Array::scalar(99.0)]).unwrap();
         let pruned = program.without_unused_captures().unwrap();
-        assert_eq!(pruned.captures(), &[Scalar::from(99.0)]);
+        assert_eq!(pruned.captures(), &[Array::scalar(99.0)]);
         let capture_indices = pruned
             .program()
             .atoms()
@@ -651,9 +650,9 @@ mod tests {
         assert_eq!(
             pruned.program().to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = const
-                    %2:f64 = add %0 %1
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                    %2:f64[] = add %0 %1
                 in (%2)
             "}
             .trim_end(),
@@ -668,18 +667,18 @@ mod tests {
         let output = pruned
             .program()
             .interpret_with(
-                vec![Scalar::from(2.0)],
-                |_, reference| Ok::<_, ProgramError>(pruned.captures()[reference.index()]),
+                vec![Array::scalar(2.0)],
+                |_, reference| Ok::<_, ProgramError>(pruned.captures()[reference.index()].clone()),
                 |instruction, inputs| {
                     instruction.operation().interpret(
-                        &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                        &EagerContext::<Array, ArrayOperation<Array>>::new(),
                         &EmptyRegionDriver,
                         inputs,
                     )
                 },
             )
             .unwrap();
-        assert_eq!(output, vec![Scalar::from(101.0)]);
+        assert_eq!(output, vec![Array::scalar(101.0)]);
     }
 
     #[test]
@@ -736,19 +735,19 @@ mod tests {
     fn test_closed_program_to_program_with_lifted_captures() {
         // The program computes `(input + capture#0) + capture#0` through one shared constant atom, and capture #1 is
         // never referenced, so the lift covers shared references and dead captures at once.
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let capture = builder.add_constant(CaptureReference::new(0, DataType::F64));
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let capture = builder.add_constant(CaptureReference::new(0, ArrayType::scalar(DataType::F64)));
         let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, capture]).unwrap()[0];
         let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![output],
                 vec![Placeholder],
                 vec![Placeholder],
             )
             .unwrap();
-        let program = ClosedProgram::new(program, vec![Scalar::from(3.0), Scalar::from(7.0)]).unwrap();
+        let program = ClosedProgram::new(program, vec![Array::scalar(3.0), Array::scalar(7.0)]).unwrap();
 
         // Captures become leading inputs in capture-table order (one per capture, dead ones included), followed by
         // the original program input, and no captured-constant atoms remain. The shared constant atom maps to a
@@ -759,9 +758,9 @@ mod tests {
         assert_eq!(
             lifted.to_string(),
             indoc! {"
-                lambda %0:f64, %1:f64, %2:f64 .
-                let %3:f64 = add %2 %0
-                    %4:f64 = add %3 %0
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = add %2 %0
+                    %4:f64[] = add %3 %0
                 in (%4)
             "}
             .trim_end(),
@@ -773,19 +772,19 @@ mod tests {
 
         // The lifted program interprets with arguments supplied in `[captures..., public inputs...]` order.
         let output = lifted
-            .interpret_with::<Scalar, ProgramError, _, _>(
-                vec![Scalar::from(3.0), Scalar::from(7.0), Scalar::from(2.0)],
+            .interpret_with::<Array, ProgramError, _, _>(
+                vec![Array::scalar(3.0), Array::scalar(7.0), Array::scalar(2.0)],
                 |_, _| unreachable!("the lifted program contains no captured-constant atoms"),
                 |instruction, inputs| {
                     instruction.operation().interpret(
-                        &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                        &EagerContext::<Array, ArrayOperation<Array>>::new(),
                         &EmptyRegionDriver,
                         inputs,
                     )
                 },
             )
             .unwrap();
-        assert_eq!(output, vec![Scalar::from(8.0)]);
+        assert_eq!(output, vec![Array::scalar(8.0)]);
     }
 
     #[test]
@@ -864,8 +863,8 @@ mod tests {
         // A capture registered through a nested trace is referenced only by a constant inside an attached region.
         // Region-aware capture discovery must still keep it when pruning unused captures.
         let root =
-            TracingContext::<CaptureReference<DataType>, ScalarOperation<CaptureReference<DataType>>, Scalar>::new();
-        let state = root.input(DataType::F64);
+            TracingContext::<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>, Array>::new();
+        let state = root.input(ArrayType::scalar(DataType::F64));
 
         // The condition is set to `state < state` (always false) and it is traced as a nested payload program.
         let (_, condition) = NestedTracingContext::trace(
@@ -877,7 +876,7 @@ mod tests {
                     &[inputs[0].clone(), inputs[0].clone()],
                 )
             },
-            vec![DataType::F64],
+            vec![ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
 
@@ -887,16 +886,16 @@ mod tests {
             root.clone(),
             |inputs: Vec<Tracer<_>>| {
                 let context = inputs[0].context().clone();
-                let reference = context.capture(Scalar::from(3.0))?;
+                let reference = context.capture(Array::scalar(3.0))?;
                 let captured = StagingContext::constant(&context, reference);
                 context.bind(AddOperation::new(), Vec::new(), &[inputs[0].clone(), captured])
             },
-            vec![DataType::F64],
+            vec![ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
         let operation = WhileOperation::new();
         let outputs = root
-            .bind(ScalarOperation::While(operation), vec![condition, body], std::slice::from_ref(&state))
+            .bind(ArrayOperation::While(operation), vec![condition, body], std::slice::from_ref(&state))
             .unwrap();
 
         // The top-level program holds no capture-reference atoms. The only reference lives in the while body.
@@ -904,7 +903,7 @@ mod tests {
         let builder = root.builder().borrow().clone();
         let captures = root.captures().borrow().clone();
         let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 output_ids,
                 vec![Placeholder],
                 vec![Placeholder],
@@ -912,11 +911,11 @@ mod tests {
             .unwrap();
         let closed = ClosedProgram::new(program, captures).unwrap();
         assert!(closed.program().atoms().iter().all(|atom| !atom.is_constant()));
-        assert_eq!(closed.captures(), &[Scalar::from(3.0)]);
+        assert_eq!(closed.captures(), &[Array::scalar(3.0)]);
 
         // The while body is an attached region, so capture-use discovery walks into it and pruning keeps the
         // nested-only capture.
         let pruned = closed.clone().without_unused_captures().unwrap();
-        assert_eq!(pruned.captures(), &[Scalar::from(3.0)]);
+        assert_eq!(pruned.captures(), &[Array::scalar(3.0)]);
     }
 }

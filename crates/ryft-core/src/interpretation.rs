@@ -652,7 +652,6 @@ mod tests {
 
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
@@ -669,28 +668,28 @@ mod tests {
 
     #[test]
     fn test_empty_region_driver_interpret_region() {
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let expected = ProgramError::MalformedProgram("empty region driver cannot interpret a region".to_string());
         let expected_region = ProgramError::MalformedProgram("region index 0 is out of range".to_string());
-        assert_eq!(RegionDriver::<Scalar, ScalarOperation<Scalar>>::regions(&EmptyRegionDriver).count(), 0);
-        assert_eq!(RegionDriver::<Scalar, ScalarOperation<Scalar>>::region_count(&EmptyRegionDriver), 0);
+        assert_eq!(RegionDriver::<Array, ArrayOperation<Array>>::regions(&EmptyRegionDriver).count(), 0);
+        assert_eq!(RegionDriver::<Array, ArrayOperation<Array>>::region_count(&EmptyRegionDriver), 0);
         assert!(matches!(
-            RegionDriver::<Scalar, ScalarOperation<Scalar>>::region(&EmptyRegionDriver, 0),
+            RegionDriver::<Array, ArrayOperation<Array>>::region(&EmptyRegionDriver, 0),
             Err(error) if error == expected_region,
         ));
-        assert_eq!(EmptyRegionDriver.interpret_region(&context, 0, Vec::<Scalar>::new()), Err(expected));
+        assert_eq!(EmptyRegionDriver.interpret_region(&context, 0, Vec::<Array>::new()), Err(expected));
     }
 
     #[test]
     fn test_program_interpret_materializes_duplicate_outputs() {
         // A program whose two outputs are the same atom materializes that value into both output positions.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F32);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F32));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder
-            .build::<Scalar, (Scalar, Scalar)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder))
+            .build::<Array, (Array, Array)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder))
             .unwrap();
-        assert_eq!(program.interpret(Scalar::from(2.0f32)), Ok((Scalar::from(4.0f32), Scalar::from(4.0f32))));
+        assert_eq!(program.interpret(Array::scalar(2.0f32)), Ok((Array::scalar(4.0f32), Array::scalar(4.0f32))));
     }
 
     #[test]
@@ -737,44 +736,45 @@ mod tests {
 
     #[test]
     fn test_program_interpret_lifts_live_constants_once() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let c0 = builder.add_constant(Scalar::from(7.0f64));
-        let c1 = builder.add_constant(Scalar::from(3.0f64));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(Array::scalar(7.0f64));
+        let c1 = builder.add_constant(Array::scalar(3.0f64));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         let mut lifted_constants = Vec::new();
         assert_eq!(
             program.interpret_with(
-                vec![Scalar::from(2.0f64)],
+                vec![Array::scalar(2.0f64)],
                 |atom_id, value| {
-                    lifted_constants.push((atom_id, *value));
-                    Ok(*value)
+                    lifted_constants.push((atom_id, value.clone()));
+                    Ok(value.clone())
                 },
                 |instruction, inputs| instruction.operation().interpret(
-                    &EagerContext::<Scalar>::new(),
+                    &EagerContext::<Array, ArrayOperation<Array>>::new(),
                     &EmptyRegionDriver,
                     inputs,
                 ),
             ),
-            Ok(vec![Scalar::from(5.0f64)]),
+            Ok(vec![Array::scalar(5.0f64)]),
         );
-        assert_eq!(lifted_constants, vec![(c1, Scalar::from(3.0f64))]);
+        assert_eq!(lifted_constants, vec![(c1, Array::scalar(3.0f64))]);
         assert_eq!(c0, AtomId::new(1));
     }
 
     #[test]
     fn test_program_interpret_with_mismatched_parameter_structures() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let program = builder.build::<Vec<Scalar>, Scalar>(vec![i0], vec![Placeholder], Placeholder).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<Vec<Array>, Array>(vec![i0], vec![Placeholder], Placeholder).unwrap();
         assert!(matches!(
-            program.interpret(vec![Scalar::from(1.0f64), Scalar::from(2.0f64)]),
+            program.interpret(vec![Array::scalar(1.0f64), Array::scalar(2.0f64)]),
             Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
                 left_structure,
                 right_structure,
             })) if left_structure == format!("{:?}", vec![Placeholder])
-                && right_structure == format!("{:?}", vec![1.0f64, 2.0f64].parameter_structure())
+                && right_structure
+                    == format!("{:?}", vec![Array::scalar(1.0f64), Array::scalar(2.0f64)].parameter_structure())
         ));
     }
 
@@ -929,15 +929,15 @@ mod tests {
 
     #[test]
     fn test_program_interpret_with_wrong_number_of_operation_inputs() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let program = builder.build::<Scalar, Scalar>(vec![i0], Placeholder, Placeholder).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<Array, Array>(vec![i0], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.interpret_with(
-                Vec::<Scalar>::new(),
-                |_, value| Ok(*value),
+                Vec::<Array>::new(),
+                |_, value| Ok(value.clone()),
                 |instruction, inputs| instruction.operation().interpret(
-                    &EagerContext::<Scalar>::new(),
+                    &EagerContext::<Array, ArrayOperation<Array>>::new(),
                     &EmptyRegionDriver,
                     inputs,
                 ),
@@ -948,15 +948,15 @@ mod tests {
 
     #[test]
     fn test_program_interpret_with_wrong_number_of_operation_outputs() {
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let o0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.interpret_with(
-                vec![Scalar::from(2.0f64)],
-                |_, value| Ok(*value),
-                |_, _| Ok::<Vec<Scalar>, ProgramError>(Vec::new()),
+                vec![Array::scalar(2.0f64)],
+                |_, value| Ok(value.clone()),
+                |_, _| Ok::<Vec<Array>, ProgramError>(Vec::new()),
             ),
             Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
         ));
