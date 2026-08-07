@@ -9,20 +9,14 @@
 //! register runtime captures in their retained capture table instead of embedding runtime arrays in the IR, and every
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
 
-use ryft_core::Typed;
-use ryft_core::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DeviceMesh};
-use ryft_core::captures::{CapturingContext, ClosedProgram};
-use ryft_core::compilation::{
-    CompilationDomain, CompilationStagingRequest, CompiledFunction, ExecutableProgram, JitCacheStatistics,
-    JittedFunction as CoreJittedFunction, Specialization, StagedFunction, call_function,
-    try_jit_with_options as core_try_jit_with_options,
+use ryft_core::{
+    ArrayIrType, ArrayIrValue, ArrayType, CapturingContext, ClosedProgram, CompilationDomain,
+    CompilationStagingRequest, CompiledFunction, Constant, Context, DeviceMesh, DifferentiableType,
+    DomainTracingContext, ExecutableProgram, ForwardModeDifferentiate, JitCacheStatistics,
+    JittedFunction as CoreJittedFunction, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext,
+    ProjectedValue, ReverseModeDifferentiate, Specialization, StagedFunction, Tracer, Typed, Value, ValueProjection,
+    call_function, try_jit_with_options as core_try_jit_with_options,
 };
-use ryft_core::contexts::{Context, ProjectedContext};
-use ryft_core::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};
-use ryft_core::operations::Constant;
-use ryft_core::parameters::{Parameterized, ParameterizedFamily};
-use ryft_core::programs::{ProgramError, ProjectedValue, Value, ValueProjection};
-use ryft_core::tracing::{DomainTracingContext, Tracer};
 use ryft_pjrt::Execution;
 
 use crate::experimental::XlaDomainError;
@@ -1263,25 +1257,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::arrays::{
-        ArrayIrType, ArrayIrValue, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension,
-    };
-    use ryft_core::backends::{Array as CpuArray, ArrayOperation};
-    use ryft_core::contexts::{Context, EagerContext};
-    use ryft_core::differentiation::{
-        DifferentiableType, ForwardModeDifferentiate, Hessian, HessianDifferentiate, Jacobian, JacobianDifferentiate,
-    };
     use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
     use ryft_core::operations::random::Random;
     use ryft_core::operations::sort::{ArgMax, TopK};
-    use ryft_core::operations::{
-        Add, Atan2, Compare, ComparisonDirection, Cos, Div, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice,
-        Exp, Fill, Iota, LegacyBroadcast, Logistic, Mul, OneLike, Reduce, ReductionKind, Reshape, Select, Sin,
-        StopGradient, Sub, Tanh, WhileOperation, ZeroLike,
+    use ryft_core::{
+        Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Atan2, CalleeRegionDriver,
+        Compare, ComparisonDirection, Context, Cos, DataType, Device, DeviceMesh, DifferentiableType, Dimension, Div,
+        DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill,
+        ForwardModeDifferentiate, Hessian, HessianDifferentiate, Iota, Jacobian, JacobianDifferentiate,
+        LegacyBroadcast, LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError, ProjectedValue,
+        Reduce, ReductionKind, Reshape, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient, Sub, Tanh,
+        Typed, Value, ValueProjection, WhileOperation, ZeroLike,
     };
-    use ryft_core::programs::{CalleeRegionDriver, ProgramError, ProjectedValue, Typed, Value, ValueProjection};
-    use ryft_core::tracing::DomainTracingContext;
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::experimental::XlaDomainError;
@@ -1717,8 +1704,7 @@ mod tests {
 
     #[test]
     fn test_jit_transfer_to_memory_round_trip_runs_end_to_end() {
-        use ryft_core::arrays::Memory;
-        use ryft_core::operations::TransferToMemory;
+        use ryft_core::{Memory, TransferToMemory};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1831,7 +1817,7 @@ mod tests {
     /// `jit_call` boundary in the active outer trace.
     #[test]
     fn test_compiled_function_staged_inside_compile() {
-        use ryft_core::operations::Cos;
+        use ryft_core::Cos;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -2356,7 +2342,7 @@ mod tests {
     fn test_jvp_of_jit_call_preserves_boundary_and_matches_legacy_jvp() {
         use std::rc::Rc;
 
-        use ryft_core::contexts::StagingContext;
+        use ryft_core::StagingContext;
 
         use crate::experimental::ops::{FlatXlaProgram, JitCallOperation};
 
@@ -2673,7 +2659,7 @@ mod tests {
     /// Unused non-parameter input metadata does not partition compilation when the complete lowering is identical.
     #[test]
     fn test_compile_reuses_lowering_when_unused_input_metadata_differs() {
-        use ryft_core::parameters::Parameter;
+        use ryft_core::Parameter;
         use ryft_macros::Parameterized;
 
         #[derive(Parameterized, Debug, Clone, PartialEq, Eq, Hash)]

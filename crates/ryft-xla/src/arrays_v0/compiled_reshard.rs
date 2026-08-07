@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
-use ryft_core::Typed;
-use ryft_core::arrays::{ArrayType, DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
+use ryft_core::{ArrayType, DeviceMesh, MeshAxisType, Sharding, ShardingDimension, Typed};
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
 

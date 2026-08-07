@@ -1,12 +1,10 @@
-use ryft_core::arrays::{ArrayIrType, DataType, DimensionType, DimensionValue, DimensionVariable};
-use ryft_core::backends::ArrayOperation;
-use ryft_core::contexts::Context;
 use ryft_core::macros::check_count;
-use ryft_core::operations::{
-    Add, AndOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, Div,
-    ElementType, LegacyBroadcast, Mul, Neg, NotOperation, OrOperation, Select, Sub, WhilePredicate, XorOperation,
+use ryft_core::{
+    Add, AndOperation, ArrayIrType, ArrayOperation, Concretizable, Context, DataType, DimensionFromScalar,
+    DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType, DimensionValue,
+    DimensionVariable, Div, ElementType, LegacyBroadcast, Mul, Neg, NotOperation, Operation, OrOperation, ProgramError,
+    Select, Sub, Typed, Value, WhilePredicate, XorOperation,
 };
-use ryft_core::programs::{Concretizable, Operation, ProgramError, Typed, Value};
 
 use crate::experimental::ops::XlaArrayConstant;
 use crate::{Array, ArrayShard};
@@ -283,23 +281,14 @@ mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
-    use ryft_core::TypeError;
-    use ryft_core::arrays::{
-        ArrayType, Device, DeviceMesh, Dimension, DimensionBounds, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension, StaticShape,
-    };
-    use ryft_core::backends::Array as CpuArray;
-    use ryft_core::batching::{BatchAxis, batch};
-    use ryft_core::contexts::ProjectedContext;
-    use ryft_core::differentiation::{
-        ForwardModeDifferentiate, HessianDifferentiate, JacobianDifferentiate, ReverseModeDifferentiate,
-        jacobian_reverse,
-    };
-    use ryft_core::operations::{
-        Abs, Atan2, Ceil, Compare, ComparisonDirection, Concatenate, ConvertElementType, CoordinateBasisOperation, Cos,
-        Dot, Erf, Exp, Floor, Log, Logistic, Max, Min, OneLike, Pad, Pow, Reduce, ReductionKind, Rem, Reshape, Round,
-        Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Sign, Sin, Slice, Sqrt,
-        StopGradient, Tag, Tanh, Transpose, UpdateSlice, ZeroLike,
+    use ryft_core::{
+        Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Compare, ComparisonDirection, Concatenate,
+        ConvertElementType, CoordinateBasisOperation, Cos, Device, DeviceMesh, Dimension, DimensionBounds, Dot, Erf,
+        Exp, Floor, ForwardModeDifferentiate, HessianDifferentiate, JacobianDifferentiate, Log, LogicalMesh, Logistic,
+        Max, MeshAxis, MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape,
+        ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation,
+        ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient,
+        Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, jacobian_reverse,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -713,7 +702,7 @@ mod tests {
     /// `ryft.test.add_one` handler at execution time.
     #[test]
     fn test_eager_custom_call_executes_registered_ffi_handler() {
-        use ryft_core::arrays::TiledLayout;
+        use ryft_core::TiledLayout;
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
 
         let plugin = load_cpu_plugin().unwrap();
@@ -758,8 +747,8 @@ mod tests {
     /// (the bare operation rejects differentiation).
     #[test]
     fn test_eager_custom_call_differentiates_through_custom_vjp() {
+        use ryft_core::DomainTracer;
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
-        use ryft_core::tracing::DomainTracer;
         use ryft_core::tracing_v2::custom_vjp;
 
         use crate::XlaDomain;
@@ -1109,7 +1098,7 @@ mod tests {
     /// accumulates at `f32`. Every value used is exactly representable in `f8e4m3fn`, so both backends are exact.
     #[test]
     fn test_eager_accumulation_typed_dot_parity_with_reference_backend() {
-        use ryft_core::operations::DotDimensionNumbers;
+        use ryft_core::DotDimensionNumbers;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1142,7 +1131,7 @@ mod tests {
     /// so both backends are exact.
     #[test]
     fn test_eager_scaled_dot_parity_with_reference_backend() {
-        use ryft_core::operations::ScaledDot;
+        use ryft_core::ScaledDot;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1557,9 +1546,8 @@ mod tests {
     /// replays the staged backward operation).
     #[test]
     fn test_eager_differentiable_dot_product_attention_gradient() {
-        use ryft_core::backends::ArrayOperation;
-        use ryft_core::contexts::{EagerContext, ProjectedContext};
         use ryft_core::operations::attention::{AttentionMask, differentiable_dot_product_attention};
+        use ryft_core::{ArrayOperation, EagerContext, ProjectedContext};
 
         use crate::XlaDomain;
 

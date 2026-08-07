@@ -1,6 +1,6 @@
 use crate::{Array, FromPjrt, XlaDomain};
 
-use ryft_core::arrays::{ArrayType, Dimension, Shape};
+use ryft_core::{ArrayType, Dimension, Shape};
 
 use super::*;
 

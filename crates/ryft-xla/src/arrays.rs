@@ -4,12 +4,10 @@ use std::fmt::{Debug, Display};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use ryft_core::arrays::{
-    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Sharding, ShardingDimension, ShardingError, StaticShape,
+use ryft_core::{
+    ArrayType, CompilationContext, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Parameterized,
+    ProjectedContext, Sharding, ShardingDimension, ShardingError, StaticShape, Typed, Value, check_sharding,
 };
-use ryft_core::compilation::CompilationContext;
-use ryft_core::programs::Value;
-use ryft_core::{Parameter, Parameterized, ProjectedContext, Typed, check_sharding};
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
 
@@ -1208,11 +1206,11 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::arrays::{
-        ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StaticShape, TiledLayout,
+    use ryft_core::{
+        ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, Error as CoreError,
+        Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StaticShape,
+        TiledLayout, Typed,
     };
-    use ryft_core::{Error as CoreError, Typed};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, load_cpu_plugin};
 
     use crate::tests::{device_mesh_2x2, logical_mesh_2x2, values_from_bytes, values_to_bytes};

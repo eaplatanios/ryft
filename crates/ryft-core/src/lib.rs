@@ -34,12 +34,10 @@ pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, Axis
 #[allow(ambiguous_glob_reexports)]
 pub use backends::*;
 pub use batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, Batch, BatchAxis,
-    BatchAxisSpecification, BatchableOperation, BatchableType, BatchedProgram, BatchingContext, BatchingDriver,
-    BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BatchingPolicyProjection, BatchingTracer,
-    BoundaryPreservingBatchedProgram, DimensionSource, InterpretableBatchableOperation, MemberBatchableOperation,
-    ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy, ReplicatedDimensionBatchingPolicy,
-    StaticArrayBatchingPolicy, batch, batch_projected_operation,
+    Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedProgram, BatchingContext,
+    BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BatchingPolicyProjection, BatchingTracer,
+    BoundaryPreservingBatchedProgram, InterpretableBatchableOperation, MemberBatchableOperation,
+    ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy, batch, batch_projected_operation,
 };
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::*;

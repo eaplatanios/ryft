@@ -1,7 +1,6 @@
 use super::*;
 
-use ryft_core::ParameterError;
-use ryft_core::arrays::DataTypeError;
+use ryft_core::{DataTypeError, ParameterError};
 
 /// Error type for [`Array`](crate::Array) construction and execution-input preparation.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]

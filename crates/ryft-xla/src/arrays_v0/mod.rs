@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use half::{bf16, f16};
-use ryft_core::arrays::{
-    DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingError, StaticShape,
+use ryft_core::{
+    DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Parameter, Parameterized, ParameterizedFamily,
+    Sharding, ShardingError, StaticShape,
 };
-use ryft_core::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use ryft_macros::Parameter;
 #[cfg(test)]
 use ryft_mlir::Block;

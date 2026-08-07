@@ -5,15 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ryft_core::arrays::{
-    ArrayIrType, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-    Sharding,
+use ryft_core::{
+    ArrayIrType, ArrayIrValue, ArrayType, CompilationDomain, CompiledFunction, DataType, Device, DeviceMesh, Dimension,
+    DiskCache, JitCacheStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction,
+    ValueProjection, stage_function,
 };
-use ryft_core::compilation::{
-    CompilationDomain, CompiledFunction, DiskCache, JitCacheStatistics, StagedFunction, stage_function,
-};
-use ryft_core::operations::Sin;
-use ryft_core::{ArrayIrValue, ValueProjection};
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, jitted};
 use serde_json::{Value, json};

@@ -1,7 +1,6 @@
 use std::ops::Range;
 
-use ryft_core::Typed;
-use ryft_core::arrays::ArrayType;
+use ryft_core::{ArrayType, Typed};
 use ryft_pjrt::Event;
 
 use crate::arrays::ArrayTypeExtension;

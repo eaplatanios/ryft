@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ryft_core::compilation::{CompilationArtifactExchange, CompilationExchangeError};
+use ryft_core::{CompilationArtifactExchange, CompilationExchangeError};
 use ryft_pjrt::{
     Client, ClientOptions, DistributedKeyValueStore, DistributedRuntimeClientOptions, DistributedRuntimeService,
     DistributedRuntimeServiceOptions, KeyValueStore, Plugin,
@@ -445,7 +445,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use ryft_core::compilation::CompilationArtifactExchange;
+    use ryft_core::CompilationArtifactExchange;
     use ryft_pjrt::{ClientOptions, CpuClientOptions, KeyValueStore, load_cpu_plugin};
     use sha2::{Digest, Sha256};
 

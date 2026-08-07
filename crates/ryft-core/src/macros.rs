@@ -3801,7 +3801,7 @@ macro_rules! check_operation_batching {
         let axis_size = $axis_size;
         let axis_sharding = $axis_sharding;
         let context =
-            $crate::batching::BatchingContext::<_, $crate::batching::ArrayBatching>::new($context, axis_size)
+            $crate::batching::BatchingContext::<_, $crate::ArrayBatching>::new($context, axis_size)
             .with_axis_sharding(axis_sharding);
         $(
             let inputs = vec![$($crate::check_operation_batching!(@batch_value $input)),*];
@@ -3821,12 +3821,12 @@ macro_rules! check_operation_batching {
     (@batch_value (@mapped(axis = $axis:expr), $value:expr)) => {{
         let value = $value;
         let r#type = $crate::programs::types::Typed::r#type(&value).into_owned();
-        $crate::batching::ArrayBatch::new(r#type, value, $crate::batching::BatchAxis::new($axis)).unwrap()
+        $crate::ArrayBatch::new(r#type, value, $crate::batching::BatchAxis::new($axis)).unwrap()
     }};
 
     // This internal branch converts a replicated value declaration into a replicated `ArrayBatch`.
     (@batch_value (@replicated, $value:expr)) => {
-        $crate::batching::ArrayBatch::replicated($value)
+        $crate::ArrayBatch::replicated($value)
     };
 
     // This internal branch compares complete batched values exactly.
@@ -4442,14 +4442,12 @@ mod tests {
     use num_complex::Complex;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds,
-        DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension, ShardingError,
+        ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Device, DeviceMesh, Dimension,
+        DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
     };
     use crate::backends::{Array, ArrayOperation};
-    use crate::batching::{
-        ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, BatchingError, BatchingTracer,
-    };
+    use crate::batching::{BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,

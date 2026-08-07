@@ -1,10 +1,9 @@
 //! StableHLO lowering for programs that mix arrays with first-class dimensions.
 
-use ryft_core::arrays::{
-    ArrayIrOperation, ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, Shape,
+use ryft_core::{
+    ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DataType, Dimension, DimensionOperation,
+    DimensionRequirementOperation, DimensionType, Effect, Operation, ProgramError, Shape,
 };
-use ryft_core::operations::{ComparisonDirection, DimensionRequirementOperation};
-use ryft_core::programs::{Effect, Operation, ProgramError};
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
     Block, Context as MlirContext, Location, Operation as MlirOperation, Size as MlirSize, Type as MlirType,

@@ -5,10 +5,8 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{ArrayType, DataType, Dimension, Shape};
-use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-};
+use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, Shape};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, ResidualZeroProvider,

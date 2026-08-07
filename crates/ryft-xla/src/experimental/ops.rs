@@ -1,22 +1,6 @@
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use ryft_core::arrays::{
-    ArrayIrOperation, ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue,
-};
-use ryft_core::axes::AxisIndexOperation;
-use ryft_core::backends::{Array as ReferenceArray, ArrayOperation};
-use ryft_core::batching::{
-    ArrayBatch, ArrayBatching, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver,
-    BatchingError, ProgramBatchingOutputAxesPolicy,
-};
-use ryft_core::captures::CaptureReference;
-use ryft_core::compilation::CompiledCallOperation;
-use ryft_core::contexts::{Context, StagingContext};
-use ryft_core::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation, ResidualZeroProvider, TransposableOperation, TranspositionDriver,
-};
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::operations::collectives::{
@@ -26,31 +10,31 @@ use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, Imagi
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::operations::random::RngBitGeneratorOperation;
 use ryft_core::operations::sort::SortOperation;
-use ryft_core::operations::{
-    AbsOperation, AddOperation, AndOperation, Atan2Operation, BroadcastOperation, CeilOperation, CollectiveOperation,
-    CompareOperation, ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
-    CoordinateBasisOperation, CosOperation, DimensionFromScalarOperation, DimensionRequirementOperation,
-    DimensionSizeOperation, DimensionToScalarOperation, DivOperation, DotOperation, DynamicShapeSliceOperation,
-    DynamicSliceOperation, DynamicUpdateSliceOperation, ErfOperation, ExpOperation, FloorOperation, GatherOperation,
-    IotaOperation, LegacyBroadcastOperation, LegacyReshapeOperation, LogOperation, LogisticOperation, MaxOperation,
-    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation,
-    PowOperation, PrintOperation, ReduceOperation, RemOperation, ReshapeOperation, ReshardOperation, RoundOperation,
-    RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation,
-    SignOperation, SinOperation, SliceOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation,
-    TanhOperation, TransferToMemoryOperation, TransposeOperation, UpdateSliceOperation, WhileOperation, XorOperation,
-    Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
-};
-use ryft_core::partial::{
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation,
-};
-use ryft_core::programs::{
-    CalleeRegionDriver, Concretizable, MaybeZero, Operation, Program, ProgramBuilder, ProgramError, RegionInterface,
-    RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
-};
-use ryft_core::tracing::{Tracer, TracingContext};
 use ryft_core::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
+use ryft_core::{
+    AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatching, ArrayIrOperation,
+    ArrayIrType, ArrayOperation, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation,
+    BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver,
+    CaptureReference, CeilOperation, CollectiveOperation, CompareOperation, CompiledCallOperation,
+    ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context, ConvertElementTypeOperation,
+    CoordinateBasisOperation, CosOperation, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, Dimension, DimensionFromScalarOperation, DimensionOperation,
+    DimensionRequirementOperation, DimensionSizeOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
+    DivOperation, DotOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+    ErfOperation, ExpOperation, FloorOperation, GatherOperation, IotaOperation, LegacyBroadcastOperation,
+    LegacyReshapeOperation, LinearCallOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero,
+    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation,
+    PadOperation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
+    ProgramBuilder, ProgramError, ReduceOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
+    ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation,
+    SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer,
+    TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type,
+    TypeError, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
+    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+};
 
 use crate::experimental::operations::ShardMapOperation;
 
@@ -964,24 +948,14 @@ where
 mod tests {
     use std::rc::Rc;
 
-    use ryft_core::arrays::{
-        ArrayIrOperation, ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    use ryft_core::{
+        AddOperation, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, BroadcastOperation, ConditionOperation,
+        DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
+        DimensionType, DimensionVariable, Effects, EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
+        MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder, RegionDriver, RegionInterface, RegionRef,
+        ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, TracingContext, TranspositionDriver, Typed,
+        WhileOperation, ZeroOperation,
     };
-    use ryft_core::backends::ArrayOperation;
-    use ryft_core::contexts::StagingContext;
-    use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};
-    use ryft_core::operations::{
-        AddOperation, BroadcastOperation, ConditionOperation, DimensionFromScalarOperation, MulOperation,
-        ScanOperation, WhileOperation, ZeroOperation,
-    };
-    use ryft_core::parameters::Placeholder;
-    use ryft_core::partial::PartialValue;
-    use ryft_core::programs::{
-        Effects, EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, RegionDriver, RegionInterface, RegionRef,
-        Typed,
-    };
-    use ryft_core::tracing::TracingContext;
 
     use super::{
         JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder,
@@ -1368,9 +1342,7 @@ mod tests {
     /// known→unknown residual edge flows from the known-side call's outputs into the residual call's inputs.
     #[test]
     fn test_jit_call_online_partial_evaluation_splits_callee_against_a_live_outer_trace() {
-        use ryft_core::contexts::StagingContext;
-        use ryft_core::partial::{PartialEvaluationInput, PartialEvaluationOutput};
-        use ryft_core::tracing::TracingContext;
+        use ryft_core::{PartialEvaluationInput, PartialEvaluationOutput, StagingContext, TracingContext};
 
         let r#type = ArrayIrType::Array(vector_type());
 
@@ -1459,7 +1431,7 @@ mod tests {
 
     #[test]
     fn test_rematerialization_policies_are_available_for_the_xla_operation_family() {
-        use ryft_core::arrays::Memory;
+        use ryft_core::Memory;
         use ryft_core::tracing_v2::{
             DotsSaveable, DotsWithNoBatchDimsSaveable, EverythingSaveable, NothingSaveable, OffloadDotsWithNoBatchDims,
             RematerializationPolicy, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,

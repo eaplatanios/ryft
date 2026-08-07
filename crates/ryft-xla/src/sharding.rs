@@ -1,4 +1,4 @@
-use ryft_core::arrays::{Device, DeviceMesh, LogicalMesh, Sharding, ShardingDimension};
+use ryft_core::{Device, DeviceMesh, LogicalMesh, Sharding, ShardingDimension};
 use ryft_mlir::Location;
 use ryft_mlir::dialects::shardy;
 use ryft_pjrt::Device as PjrtDevice;
@@ -107,7 +107,7 @@ impl ToMlir for Sharding {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::arrays::{LogicalMesh, MeshAxis, MeshAxisType};
+    use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType};
     use ryft_mlir::{Block, Context as MlirContext};
 
     use crate::tests::{device_mesh_2x2, logical_mesh_3x2x1};

@@ -9,34 +9,20 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use prost::Message;
-use ryft_core::InterpretationDriver;
-use ryft_core::arrays::{
-    ArrayIrType, ArrayIrValue, ArrayType, DataType, Device, DeviceId, DeviceMesh, Dimension, DimensionBounds,
-    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-    MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
-};
-#[cfg(test)]
-use ryft_core::backends::Array as ReferenceArray;
-use ryft_core::batching::BatchingError;
-use ryft_core::compilation::{
-    AnalyzableCompilationDomain, CallRequest, CompilationCacheDomain, CompilationContext, CompilationDomain,
-    CompileRequest, DiskCache, LoweringRequest, StageRequest, StagedFunction,
-};
-#[cfg(test)]
-use ryft_core::contexts::ProjectedContext;
-use ryft_core::contexts::{Context, Domain, EagerContext};
-use ryft_core::differentiation::DifferentiationError;
-use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
-use ryft_core::operations::{
-    Constant, ConstantOperation, DimensionFromScalar, DimensionSize, ONE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero,
+use ryft_core::{
+    AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayType, BatchingError, BindingRegionDriver, CallRequest,
+    CompilationCacheDomain, CompilationContext, CompilationDomain, CompileRequest, Constant, ConstantOperation,
+    Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError, Dimension, DimensionBounds,
+    DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue, DimensionVariable,
+    DiskCache, Domain, DomainTracer, EagerContext, InterpretableOperation, InterpretationDriver, Layout, LogicalMesh,
+    LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, Parameterized, Placeholder,
+    ProgramError, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StaticShape, StridedLayout, Tile,
+    TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero,
     ZeroOperationProvider,
 };
-use ryft_core::parameters::{Parameterized, Placeholder};
-use ryft_core::programs::{
-    BindingRegionDriver, Operation, ProgramError, Type, TypeError, TypeRefinements, Typed, ValueProjection,
-};
-use ryft_core::tracing::DomainTracer;
+#[cfg(test)]
+use ryft_core::{Array as ReferenceArray, ProjectedContext};
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, Execution, LoadOptions, LoadedExecutable, Program as PjrtProgram, Value as PjrtValue};
 use serde::{Deserialize, Serialize};
@@ -3515,16 +3501,14 @@ fn execute_pjrt_buffers<'c>(
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::arrays::{Dimension, Sharding, ShardingDimension, StaticShape};
-    use ryft_core::backends::ArrayOperation;
-    use ryft_core::operations::{
-        AddOperation, AndOperation, Atan2Operation, BroadcastOperation, CompareOperation, ComparisonDirection,
-        ConditionOperation, ConstantOperation, DimensionAddOperation, DimensionDivFloorOperation,
-        DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation, DimensionSizeOperation,
-        DimensionSubOperation, DimensionToScalarOperation, DivOperation, DynamicShapeSliceOperation, Fill,
-        MulOperation, NegOperation, OneOperation, PrintOperation, ReshapeOperation, SelectOperation, WhileOperation,
+    use ryft_core::{
+        AddOperation, AndOperation, ArrayOperation, Atan2Operation, BroadcastOperation, CalleeRegionDriver,
+        CompareOperation, ComparisonDirection, ConditionOperation, ConstantOperation, Dimension, DimensionAddOperation,
+        DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
+        DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
+        DynamicShapeSliceOperation, Fill, MulOperation, NegOperation, OneOperation, PrintOperation, ReshapeOperation,
+        SelectOperation, Sharding, ShardingDimension, StaticShape, WhileOperation,
     };
-    use ryft_core::programs::CalleeRegionDriver;
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
@@ -3800,7 +3784,7 @@ mod tests {
 
     #[test]
     fn test_domain_identity_synthesis_rejects_unsupported_constant_type() {
-        use ryft_core::operations::OneOperation;
+        use ryft_core::OneOperation;
         let array_type = ArrayType::scalar(DataType::Token);
 
         assert!(matches!(
@@ -4454,7 +4438,7 @@ mod tests {
     #[test]
     fn test_compilation_domain_impl_round_trips_through_core_pipeline() {
         use crate::tests::{values_from_bytes, values_to_bytes};
-        use ryft_core::operations::Sin;
+        use ryft_core::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -5111,7 +5095,7 @@ mod tests {
 
     #[test]
     fn test_xla_compilation_key_is_canonical_and_stable() {
-        use ryft_core::operations::Sin;
+        use ryft_core::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -5148,7 +5132,7 @@ mod tests {
 
     #[test]
     fn test_xla_persistent_executable_round_trip_preserves_invocation_and_analysis() {
-        use ryft_core::compilation::StagedFunction;
+        use ryft_core::StagedFunction;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -5243,8 +5227,7 @@ mod tests {
 
     #[test]
     fn test_xla_disk_cache_restores_into_a_fresh_compilation_context() {
-        use ryft_core::compilation::DiskCache;
-        use ryft_core::operations::Sin;
+        use ryft_core::{DiskCache, Sin};
         use tempfile::tempdir;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -5693,7 +5676,7 @@ mod tests {
 
     #[test]
     fn test_eager_bind_executes_scan_with_per_step_outputs() {
-        use ryft_core::operations::ScanOperation;
+        use ryft_core::ScanOperation;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -5729,7 +5712,7 @@ mod tests {
 
     #[test]
     fn test_eager_bind_executes_scan_with_dynamic_scalar_ssa_length() {
-        use ryft_core::operations::ScanOperation;
+        use ryft_core::ScanOperation;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -5766,7 +5749,7 @@ mod tests {
 
     #[test]
     fn test_eager_bind_executes_scan_with_stacked_inputs() {
-        use ryft_core::operations::ScanOperation;
+        use ryft_core::ScanOperation;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -5802,7 +5785,7 @@ mod tests {
 
     #[test]
     fn test_eager_bind_executes_scan_with_sharded_stacked_inputs() {
-        use ryft_core::operations::ScanOperation;
+        use ryft_core::ScanOperation;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
@@ -5957,7 +5940,7 @@ mod tests {
 
     #[test]
     fn test_eager_bind_rejects_collective_outside_a_mapping_context() {
-        use ryft_core::operations::{CollectiveKind, CollectiveOperation};
+        use ryft_core::{CollectiveKind, CollectiveOperation};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -5978,7 +5961,7 @@ mod tests {
 
     #[test]
     fn test_eager_bind_executes_print_effect() {
-        use ryft_core::operations::PrintOperation;
+        use ryft_core::PrintOperation;
 
         use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
 

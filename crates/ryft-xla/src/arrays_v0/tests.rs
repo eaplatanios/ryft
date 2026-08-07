@@ -2,10 +2,9 @@ use std::collections::HashMap;
 
 use indoc::indoc;
 use pretty_assertions::assert_eq;
-use ryft_core::Typed;
-use ryft_core::arrays::{
+use ryft_core::{
     ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh,
-    Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape, TiledLayout,
+    Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape, TiledLayout, Typed,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};

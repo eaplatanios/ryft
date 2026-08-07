@@ -1,24 +1,15 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use ryft_core::arrays::{ArrayIrType, ArrayType, LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::contexts::{Context, StagingContext};
-use ryft_core::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
-};
 use ryft_core::macros::check_count;
-use ryft_core::operations::Zero;
-use ryft_core::parameters::{Parameterized, ParameterizedFamily};
-use ryft_core::partial::{
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation,
+use ryft_core::{
+    ArrayIrType, ArrayType, Concretizable, Context, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, LogicalMesh, MaybeZero, MeshAxisType, Operation, Parameterized,
+    ParameterizedFamily, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Program, ProgramError, ProjectedValue,
+    RegionInterface, RegionRef, RegionSlot, Sharding, ShardingDimension, StagingContext, Tracer, TracingContext,
+    TransposableOperation, TranspositionDriver, Type, TypeError, Typed, Value, ValueProjection, Zero,
 };
-use ryft_core::programs::{
-    Concretizable, MaybeZero, Operation, Program, ProgramError, ProjectedValue, RegionInterface, RegionRef, RegionSlot,
-    Type, TypeError, Typed, Value, ValueProjection,
-};
-use ryft_core::tracing::{Tracer, TracingContext};
 
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, materialize_transpose_cotangent};
 use crate::experimental::shard_map::{
@@ -1037,22 +1028,13 @@ where
 mod tests {
     use std::ops::{Deref, DerefMut};
 
-    use ryft_core::arrays::{
-        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    use ryft_core::{
+        AddOperation, ArrayIrType, ArrayType, Context, DataType, DifferentiableType, DifferentiationError, Dimension,
+        DimensionBounds, DimensionType, DimensionVariable, DomainTracingContext, Effects, EmptyRegionDriver,
+        LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, Program,
+        RegionDriver, RegionInterface, RegionRef, Shape, Sharding, ShardingDimension, StagingContext, TracingContext,
+        TransposableOperation, TranspositionDriver, TypeError, Typed,
     };
-    use ryft_core::contexts::{Context, StagingContext};
-    use ryft_core::differentiation::{
-        DifferentiableType, DifferentiationError, TransposableOperation, TranspositionDriver,
-    };
-    use ryft_core::operations::{AddOperation, MulOperation};
-    use ryft_core::parameters::Placeholder;
-    use ryft_core::partial::PartialValue;
-    use ryft_core::programs::{
-        Effects, EmptyRegionDriver, MaybeZero, Operation, Program, RegionDriver, RegionInterface, RegionRef, TypeError,
-        Typed,
-    };
-    use ryft_core::tracing::{DomainTracingContext, TracingContext};
 
     use crate::experimental::domains::XlaDomain;
     use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};
@@ -1537,8 +1519,7 @@ mod tests {
     /// mesh and shardings are threaded onto both boundaries.
     #[test]
     fn test_shard_map_online_partial_evaluation_splits_body_against_a_live_outer_trace() {
-        use ryft_core::partial::{PartialEvaluationInput, PartialEvaluationOutput};
-        use ryft_core::tracing::TracingContext;
+        use ryft_core::{PartialEvaluationInput, PartialEvaluationOutput, TracingContext};
 
         let array_type = test_array_type();
         let (operation, body_program) =
