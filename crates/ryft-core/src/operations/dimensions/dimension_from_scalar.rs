@@ -244,10 +244,9 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DataType, DimensionBounds, DimensionError, MAX_DIMENSION_EXTENT, Shape};
+    use crate::arrays::{DataType, DimensionBounds, DimensionError, DimensionValue, MAX_DIMENSION_EXTENT, Shape};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::Array;
-    use crate::backends::dimensions::DimensionValue;
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::TransposableOperation;
     use crate::macros::check_operation_partial_evaluation;

@@ -4,10 +4,10 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::arrays::{
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape, Sharding,
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionError, DimensionOperation, DimensionType, DimensionValue,
+    DimensionVariable, Shape, Sharding,
 };
 use crate::backends::arrays::{Array, ArrayOperation, BroadcastKernel};
-use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,

@@ -4443,11 +4443,11 @@ mod tests {
 
     use crate::arrays::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionType,
-        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
+        DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        ShardingError,
     };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::dimensions::DimensionValue;
     use crate::batching::{
         ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, BatchingError, BatchingTracer,
     };

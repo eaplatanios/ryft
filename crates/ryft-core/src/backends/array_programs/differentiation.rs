@@ -195,11 +195,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+        Shape,
     };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::dimensions::DimensionValue;
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};

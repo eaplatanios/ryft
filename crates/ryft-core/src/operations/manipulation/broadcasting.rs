@@ -1,9 +1,11 @@
 use std::fmt::Display;
 
-use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape, Sharding, ShardingDimension};
+use crate::arrays::{
+    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape, Sharding,
+    ShardingDimension,
+};
 use crate::backends::array_programs::LinearResiduals;
 use crate::backends::arrays::BroadcastKernel;
-use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -1064,11 +1066,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
-        ShardingDimension, StridedLayout,
+        DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::dimensions::DimensionValue;
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::jvp;
     use crate::differentiation::reverse::TransposableOperation;

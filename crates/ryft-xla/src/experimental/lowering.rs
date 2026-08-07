@@ -7,13 +7,12 @@ use std::sync::Arc;
 #[cfg(test)]
 use ryft_core::arrays::Complex as ComplexNumber;
 use ryft_core::arrays::{
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory,
-    MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, Layout,
+    LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
 };
 use ryft_core::axes::AxisIndexOperation;
 use ryft_core::backends::arrays::Array as CpuArray;
 use ryft_core::backends::arrays::ArrayOperation;
-use ryft_core::backends::dimensions::{DimensionOperation, DimensionValue};
 use ryft_core::captures::CaptureReference;
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{
@@ -8517,13 +8516,13 @@ mod tests {
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
 
+    use ryft_core::arrays::DimensionOperation;
     use ryft_core::arrays::{
         Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
         Sharding, ShardingDimension, i1, i2, i4, u1, u2, u4,
     };
     use ryft_core::backends::arrays::Array as CpuArray;
     use ryft_core::backends::arrays::ArrayOperation;
-    use ryft_core::backends::dimensions::DimensionOperation;
     use ryft_core::contexts::Context;
     use ryft_core::differentiation::ReverseModeDifferentiate;
     use ryft_core::operations::compare::CompareOperation;
@@ -13241,7 +13240,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_clamps_unproven_dimension_arithmetic_data_paths() {
-        use ryft_core::backends::dimensions::DimensionOperation;
+        use ryft_core::arrays::DimensionOperation;
         use ryft_core::operations::dimensions::{
             DimensionFromScalarOperation, DimensionSubOperation, DimensionToScalarOperation,
         };

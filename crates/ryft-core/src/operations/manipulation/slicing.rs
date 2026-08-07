@@ -1,11 +1,11 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayIrType, ArrayType, Dimension, DimensionType, Memory, MeshAxisType, Shape, Sharding, ShardingDimension,
+    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Memory, MeshAxisType, Shape,
+    Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -2490,12 +2490,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
-        ShardingDimension, StridedLayout,
+        DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::dimensions::DimensionValue;
     use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;

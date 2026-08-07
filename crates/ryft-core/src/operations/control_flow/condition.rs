@@ -7,9 +7,8 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrType, ArrayType, DimensionType};
+use crate::arrays::{ArrayIrType, ArrayType, DimensionOperation, DimensionType, DimensionValue};
 use crate::backends::array_programs::ArrayIrValue;
-use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, require_equal_dimensions};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,

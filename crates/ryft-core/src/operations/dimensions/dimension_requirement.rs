@@ -623,7 +623,7 @@ impl AbstractDimensionValue {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::dimensions::{DimensionOperation, DimensionValue};
+    use crate::arrays::{DimensionOperation, DimensionValue};
     use crate::contexts::{Context, EagerContext};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;

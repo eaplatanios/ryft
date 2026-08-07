@@ -2,10 +2,11 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape, Sharding};
+use crate::arrays::{
+    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape, Sharding,
+};
 use crate::axes::Axis;
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -1037,11 +1038,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
-        ShardingDimension, StridedLayout,
+        DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::dimensions::DimensionValue;
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,

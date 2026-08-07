@@ -52,11 +52,10 @@ use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface, RegionSl
 use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, ProgramError, Value, ValueProjection};
 use ryft_core::tracing::{Tracer, TracingContext};
 
-use ryft_core::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
+use ryft_core::arrays::{ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue};
 use ryft_core::axes::AxisIndexOperation;
 use ryft_core::backends::array_programs::ArrayIrOperation;
 use ryft_core::backends::arrays::{Array as ReferenceArray, ArrayOperation};
-use ryft_core::backends::dimensions::{DimensionOperation, DimensionValue};
 use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation};
 use ryft_core::operations::collectives::{CollectiveOperation, PpermuteOperation};

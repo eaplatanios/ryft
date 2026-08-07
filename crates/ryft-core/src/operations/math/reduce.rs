@@ -1,9 +1,11 @@
 use std::fmt::Display;
 use std::ops::{Div, Mul};
 
-use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape, Sharding, StaticShape};
+use crate::arrays::{
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape, Sharding,
+    StaticShape,
+};
 use crate::backends::array_programs::LinearResiduals;
-use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,

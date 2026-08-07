@@ -12,9 +12,8 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrType, ArrayType, DataType, DimensionType};
+use crate::arrays::{ArrayIrType, ArrayType, DataType, DimensionOperation, DimensionType, DimensionValue};
 use crate::axes::Axis;
-use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,

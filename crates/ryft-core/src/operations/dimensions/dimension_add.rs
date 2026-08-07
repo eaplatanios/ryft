@@ -50,15 +50,14 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(Dimensio
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::DimensionBounds;
-    use crate::backends::dimensions::{DimensionOperation, DimensionValue};
+    use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
     use crate::contexts::{Context, EagerContext};
+    use crate::operations::dimensions::test_dimension_type;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::ProgramBuilder;
     use crate::tracing::Trace;
 
-    use super::super::test_dimension_type;
     use super::*;
 
     #[test]

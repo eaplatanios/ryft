@@ -1,6 +1,5 @@
-use ryft_core::arrays::{ArrayIrType, DataType, DimensionType, DimensionVariable};
+use ryft_core::arrays::{ArrayIrType, DataType, DimensionType, DimensionValue, DimensionVariable};
 use ryft_core::backends::arrays::ArrayOperation;
-use ryft_core::backends::dimensions::DimensionValue;
 use ryft_core::contexts::Context;
 use ryft_core::macros::check_count;
 use ryft_core::operations::control_flow::{Select, WhilePredicate};

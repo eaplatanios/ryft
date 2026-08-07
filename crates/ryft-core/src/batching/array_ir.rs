@@ -10,9 +10,8 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, Sharding};
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Sharding};
 use crate::axes::{Axis, NamedAxes, NamedAxis};
-use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::arrays::{batch_axis_sharding, normalized_batch_axis_type};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchAxisSpecification, BatchableOperation,
@@ -1011,10 +1010,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DataType, Dimension, DimensionBounds, DimensionVariable, Shape, ShardingDimension};
+    use crate::arrays::{
+        DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Shape, ShardingDimension,
+    };
     use crate::backends::array_programs::ArrayIrValue;
     use crate::backends::arrays::Array;
-    use crate::backends::dimensions::DimensionValue;
     use crate::batching::{
         Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, InterpretableBatchableOperation,
         RecursiveBatchingPolicy, batch,

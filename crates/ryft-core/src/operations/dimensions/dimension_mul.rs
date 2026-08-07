@@ -48,11 +48,10 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(Dimensio
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::DimensionBounds;
-    use crate::backends::dimensions::DimensionValue;
+    use crate::arrays::{DimensionBounds, DimensionValue};
+    use crate::operations::dimensions::test_dimension_type;
     use crate::operations::math::Mul;
 
-    use super::super::test_dimension_type;
     use super::*;
 
     #[test]

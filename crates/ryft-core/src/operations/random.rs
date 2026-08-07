@@ -2,11 +2,11 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::arrays::{
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape, ShardingDimension,
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable,
+    Shape, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
-use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -806,10 +806,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DimensionBounds, DimensionType, DimensionVariable, ShardingDimension};
+    use crate::arrays::{DimensionBounds, DimensionType, DimensionValue, DimensionVariable, ShardingDimension};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::dimensions::DimensionValue;
     use crate::batching::{
         BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
     };
