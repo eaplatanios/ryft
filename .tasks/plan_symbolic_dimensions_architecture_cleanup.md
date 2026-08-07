@@ -2584,8 +2584,8 @@ Phase 9a4 — retire the scalar program universe:
         documentation references.
 - [x] Delete or privatize-and-rename any surviving transient element helper according to the prototype decision. No
       item named `Scalar` and no standalone scalar `Value`/domain may remain in production code.
-- [ ] Update testing guidance to name rank-zero `Array` as the scalar-semantics reference.
-- [ ] Gate: targeted searches find no retired scalar identifier or path outside historical plans, and production/test
+- [x] Update testing guidance to name rank-zero `Array` as the scalar-semantics reference.
+- [x] Gate: targeted searches find no retired scalar identifier or path outside historical plans, and production/test
       line counts materially decrease.
 
 Phase 9a5 — closure:
@@ -4807,7 +4807,7 @@ CUDA 13 feature. All six focused literal tests pass, including exact CPU executi
 CUDA-feature library suite passes with 439 tests and one timing-sensitive ignore. This closes the Phase 9a3 gate;
 Phase 9a4 scalar-program-universe retirement is the next isolated implementation unit.
 
-### Phase 9a4 scalar program universe retirement (in progress, 2026-08-06)
+### Phase 9a4 scalar program universe retirement (completed, 2026-08-06)
 
 The gradient-checking macro now has one array-valued implementation instead of parallel scalar and array selectors.
 Rank-zero F64 and C128 arrays pin scalar-function coverage through the same reverse-mode and finite-difference path as
@@ -5016,3 +5016,35 @@ unit tests, five allocation tests, six region integration tests, and 53 runnable
 all 37 `ryft-macros-tests` runtime and compile-fail tests, and the focused XLA Boolean/complex-extrema lowering test.
 Formatting and diff hygiene pass. Updating the testing guidance and closing the Phase 9a4 line-count/search gate are
 the next review unit.
+
+The Phase 9a4 closure audit confirms that the testing guidance had already moved to the intended end state during the
+control-flow fixture migration: `ryft_core::backends::arrays::Array` is the canonical eager test value, rank-zero arrays
+cover scalar-shaped semantics, and narrower test-only value families are reserved for cases where arrays would obscure
+a universe-neutral contract. No further guidance edit was necessary, so this unit only corrects the stale checklist.
+
+The residual gate is clean. Repository-wide searches under `crates` find no `ScalarOperation`,
+`ScalarTracingContext`, `backends::scalars`, `scalars.rs`, scalar backend module or re-export, stored `Vec<Scalar>`,
+standalone `Scalar` `Value`, or retired `check_gradient!` selector. Remaining uses of the English word “scalar” describe
+rank-zero values, scalar fields or axes, dimension-to-scalar gateways, and PJRT's unrelated upstream
+`FfiAttribute::Scalar` variant; none is a retired backend dependency.
+
+Physical Rust line counts were recomputed over every tracked `.rs` file under `crates` from the committed Phase 9a3
+boundary `65bc37eafcdf46822c47eee0ca51a28bfecb46d4` to the completed Phase 9a4 revision `bbe50252a`. Standalone test
+trees and `ryft-macros-tests` count as tests; inline tests begin at the canonical `#[cfg(test)] mod tests` boundary.
+Production source falls from 262,473 to 259,913 lines (`−2,560`), test source falls from 164,575 to 163,737 lines
+(`−838`), and the combined total falls from 427,048 to 423,650 lines (`−3,398`). This materially satisfies both halves
+of the gate and closes Phase 9a4. Phase 9a5 verification, measurement, and complete-diff simplification are next.
+
+### Phase 9a5 closure (in progress, 2026-08-06)
+
+The local verification portion of the closure gate passes on revision `bbe50252a`. The complete `ryft-core` suite with
+benchmarking enabled passes 1,133 unit tests, five allocation tests, six region-prototype integration tests, and 53
+runnable doctests with 16 intentional ignores. `ryft-macros-tests` passes all 20 operation tests and 17 parameter tests,
+including every compile-fail fixture. The complete serialized CPU `ryft-xla` library suite passes 438 tests with its
+single timing-sensitive test ignored. Every command completed within its 300-second bound.
+
+CUDA verification remains open rather than being inferred from the earlier Phase 9a3 result. The exact Phase 9a4
+revision is pushed, but `spark-9460.local` currently does not resolve through mDNS, its last recorded address
+`192.168.68.66` times out on port 22, and a direct mDNS query returns no address. Resume the first Phase 9a5 checkbox by
+cloning `bbe50252a` into an isolated Spark checkout and running the complete serialized `cuda-13` `ryft-xla` library
+suite once the host is reachable.
