@@ -2574,15 +2574,15 @@ Phase 9a4 — retire the scalar program universe:
       - [x] Migrate transcendental and special-function fixtures.
       - [x] Migrate complex construction and projection fixtures.
 - [x] Replace scalar-mode gradient macro coverage with rank-zero array coverage and delete scalar-only macro branches.
-- [ ] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
+- [x] Delete `ScalarOperation`, `ScalarTracingContext`, scalar-domain capabilities/transforms, the backend module and
       exports, scalar-only doctests, and the obsolete scalar-domain compile-fail fixture.
   - [x] Migrate or delete the final scalar-backed capture and interpretation fixtures.
   - [x] Migrate or delete the final scalar-backed program fixtures.
   - [x] Migrate or delete the final scalar-backed macro, compilation, and benchmark fixtures, then remove the obsolete
         scalar-domain compile-fail fixture.
-  - [ ] Delete the scalar backend module, exports, scalar-only doctests, production specializations, and stale
+  - [x] Delete the scalar backend module, exports, scalar-only doctests, production specializations, and stale
         documentation references.
-- [ ] Delete or privatize-and-rename any surviving transient element helper according to the prototype decision. No
+- [x] Delete or privatize-and-rename any surviving transient element helper according to the prototype decision. No
       item named `Scalar` and no standalone scalar `Value`/domain may remain in production code.
 - [ ] Update testing guidance to name rank-zero `Array` as the scalar-semantics reference.
 - [ ] Gate: targeted searches find no retired scalar identifier or path outside historical plans, and production/test
@@ -4998,3 +4998,21 @@ core suite with benchmarking enabled, all five allocation tests, all six region-
 diff hygiene, and all 54 runnable doctests (16 intentional ignores) pass. Deleting the scalar backend, its exports,
 remaining production specializations, scalar-only doctest, and stale documentation is the final dependency-removal
 unit.
+
+The final Phase 9a4 dependency-removal unit deletes `backends::scalars`, its public exports, all standalone
+`DataType` control-flow specializations, and the remaining backend-specific documentation. The FDLIBM `erf`
+approximation survives as private operation-owned reference semantics in `operations::math::erf`; it is no longer
+coupled to a value backend. The sole downstream production dependency was XLA complex-reduction identity lowering.
+That path now constructs its rank-zero real and imaginary constants directly and composes them with
+`stablehlo.complex`, deleting the general scalar-conversion splat helper rather than replacing the retired value type.
+The macro integration fixture's last public `ryft::Scalar` dependency moved to `ryft::Array`, and its unrelated local
+operation enum was renamed so repository-wide retired-identifier searches are unambiguous.
+
+The code diff changes 3,672 lines across eleven files, with 239 insertions and 3,433 deletions. Targeted searches find
+no `ScalarOperation`, `ScalarTracingContext`, `backends::scalars`, scalar backend module, or scalar re-export anywhere
+under `crates`; the remaining capitalized `Scalar` references are ordinary mathematical prose or PJRT's unrelated
+upstream FFI attribute variant. Verification passes the complete `ryft-core` suite with benchmarking enabled (1,133
+unit tests, five allocation tests, six region integration tests, and 53 runnable doctests with 16 intentional ignores),
+all 37 `ryft-macros-tests` runtime and compile-fail tests, and the focused XLA Boolean/complex-extrema lowering test.
+Formatting and diff hygiene pass. Updating the testing guidance and closing the Phase 9a4 line-count/search gate are
+the next review unit.

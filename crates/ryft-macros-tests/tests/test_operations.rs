@@ -704,8 +704,8 @@ impl Value for Factor {
     type Type = ArrayType;
 }
 
-/// Scalar-universe counterpart of [`Factor`]. A value type pins exactly one type descriptor through the associated
-/// `Type`, so the scalar test enums flow this type instead of reusing [`Factor`] across universes.
+/// Data-type-universe counterpart of [`Factor`]. A value type pins exactly one type descriptor through the associated
+/// `Type`, so the data-type test enums flow this type instead of reusing [`Factor`] across universes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ScalarFactor(i64);
 
@@ -1280,7 +1280,7 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(crate = "crate")]
-enum ScalarOperation<V: Value<Type = DataType>> {
+enum DataOperation<V: Value<Type = DataType>> {
     Zero(ZeroOperation<DataType>),
     Add(AddOperation),
     Print(PrintOperation),
@@ -1309,12 +1309,11 @@ enum LinearScalarOperation<V: Value<Type = DataType>, C: Value<Type = DataType> 
 }
 
 #[test]
-fn test_scalar_operation() {
-    let zero = ScalarOperation::<ScalarFactor>::from(ZeroOperation { r#type: DataType });
-    let add = ScalarOperation::<ScalarFactor>::from(AddOperation);
-    let factor =
-        ScalarOperation::<ScalarFactor>::from(FactorOperation { factor: ScalarFactor(7), marker: PhantomData });
-    let custom_jvp = ScalarOperation::<ScalarFactor>::from(CustomJvpOperation { tag: "tag", marker: PhantomData });
+fn test_data_operation() {
+    let zero = DataOperation::<ScalarFactor>::from(ZeroOperation { r#type: DataType });
+    let add = DataOperation::<ScalarFactor>::from(AddOperation);
+    let factor = DataOperation::<ScalarFactor>::from(FactorOperation { factor: ScalarFactor(7), marker: PhantomData });
+    let custom_jvp = DataOperation::<ScalarFactor>::from(CustomJvpOperation { tag: "tag", marker: PhantomData });
 
     assert_eq!(zero.name(), "zero");
     assert_eq!(add.name(), "add");
@@ -1343,8 +1342,8 @@ fn test_scalar_operation() {
 
 #[test]
 fn test_operation_generates_operation_forwarding() {
-    let add = ScalarOperation::<ScalarFactor>::from(AddOperation);
-    let print = ScalarOperation::<ScalarFactor>::from(PrintOperation);
+    let add = DataOperation::<ScalarFactor>::from(AddOperation);
+    let print = DataOperation::<ScalarFactor>::from(PrintOperation);
 
     assert_eq!(add.effects(), Effects::Pure);
     assert_eq!(print.effects(), Effects::Ordered);
@@ -1368,23 +1367,23 @@ fn test_operation_infers_value_type_from_where_clause() {
 }
 
 #[derive(Clone, Debug, ryft::Operation)]
-enum DefaultPathOperation<V: ryft::Value<Type = ryft::DataType>> {
-    Zero(ryft::ZeroOperation<ryft::DataType>),
+enum DefaultPathOperation<V: ryft::Value<Type = ryft::ArrayType>> {
+    Zero(ryft::ZeroOperation<ryft::ArrayType>),
     Constant(ryft::ConstantOperation<V>),
 }
 
 #[derive(Clone, Debug, ryft::Operation)]
 #[ryft(dispatch(transposition))]
-enum DefaultPathLinearOperation<V: ryft::Value<Type = ryft::DataType>> {
-    Zero(ryft::ZeroOperation<ryft::DataType>),
+enum DefaultPathLinearOperation<V: ryft::Value<Type = ryft::ArrayType>> {
+    Zero(ryft::ZeroOperation<ryft::ArrayType>),
     Constant(ryft::ConstantOperation<V>),
 }
 
 #[test]
 fn test_operation_default_crate_path_is_ryft() {
-    let operation = DefaultPathOperation::<ryft::Scalar>::from(ryft::ZeroOperation::new(ryft::DataType::F64));
-    let linear_operation =
-        DefaultPathLinearOperation::<ryft::Scalar>::from(ryft::ZeroOperation::new(ryft::DataType::F64));
+    let r#type = ryft::ArrayType::scalar(ryft::DataType::F64);
+    let operation = DefaultPathOperation::<ryft::Array>::from(ryft::ZeroOperation::new(r#type.clone()));
+    let linear_operation = DefaultPathLinearOperation::<ryft::Array>::from(ryft::ZeroOperation::new(r#type));
     assert_eq!(ryft::Operation::name(&operation), "zero");
     assert_eq!(ryft::Operation::name(&linear_operation), "zero");
 }
@@ -2244,7 +2243,7 @@ fn test_transposable_operation_dispatches_to_payloads() {
 #[test]
 fn test_operation_generates_interpretation_forwarding() {
     let context = TestContext::<InterpretedScalarFactor> { marker: PhantomData };
-    let operation = ScalarOperation::<ScalarFactor>::from(AddOperation);
+    let operation = DataOperation::<ScalarFactor>::from(AddOperation);
 
     assert_eq!(
         operation.interpret(&context, &EmptyRegionDriver, &[InterpretedScalarFactor(1), InterpretedScalarFactor(2)],),
@@ -2321,10 +2320,8 @@ fn test_operation_generates_partial_evaluation_dispatch() {
     // partial-evaluation trait at any known-side context pinned to its program-constant value type and to itself as
     // the residual operation family. This covers leaf payloads, the generic `Backend` payload, and the boxed
     // nested-program payloads.
-    assert_partially_evaluatable::<
-        TestContext<ScalarFactor, ScalarOperation<ScalarFactor>>,
-        ScalarOperation<ScalarFactor>,
-    >();
+    assert_partially_evaluatable::<TestContext<ScalarFactor, DataOperation<ScalarFactor>>, DataOperation<ScalarFactor>>(
+    );
     assert_partially_evaluatable::<
         TestContext<ScalarFactor, LinearScalarOperation<ScalarFactor>>,
         LinearScalarOperation<ScalarFactor>,

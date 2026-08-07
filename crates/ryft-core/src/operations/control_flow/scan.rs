@@ -45,7 +45,7 @@ use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRe
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape};
+use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -73,8 +73,8 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// the linear form simply flips [`reverse`](Self::reverse), so no array-reversal operation is ever needed.
 ///
 /// The `length` is stored explicitly so that scans without stacked inputs (pure carry loops with stacked outputs)
-/// remain well-defined. Homogeneous [`ArrayType`] and [`DataType`] scans require a static length. Composite
-/// [`ArrayIrType`] scans may instead use one dynamic dimension identity and then
+/// remain well-defined. Homogeneous [`ArrayType`] scans require a static length. Composite [`ArrayIrType`] scans may
+/// instead use one dynamic dimension identity and then
 /// consume its matching first-class dimension value as a trailing runtime operand; this is the scalar-SSA trip-count
 /// contract used by structurally batched scans.
 ///
@@ -130,8 +130,8 @@ impl<Capture: Value> ScanOperation<Capture> {
     pub fn new<L: Into<Dimension>>(carry_count: usize, length: L) -> Self {
         Self { captures: Vec::new(), carry_count, length: length.into(), reverse: false, unroll: 1 }
     }
-    /// Returns this [`ScanOperation`] with the slice visit order set to `reverse`. For carry-only scalar scans this
-    /// only preserves lowering metadata because all iterations consume and produce loop-carried state.
+    /// Returns this [`ScanOperation`] with the slice visit order set to `reverse`. For carry-only scans this only
+    /// preserves lowering metadata because all iterations consume and produce loop-carried state.
     #[inline]
     pub fn with_reverse(mut self, reverse: bool) -> Self {
         self.reverse = reverse;
@@ -299,45 +299,13 @@ pub(crate) fn scan_output_types(
     Ok(output_types)
 }
 
-/// Validates a carry-only scalar scan and returns the final carry types.
-///
-/// `DataType` has no length-indexed stack metadata, so scalar scans can only represent loop-carried state. Scanned
-/// scalar inputs and stacked scalar outputs require a separate stack value representation and are rejected here.
-pub(crate) fn scalar_scan_output_types(
-    body_input_types: &[DataType],
-    body_output_types: &[DataType],
-    carry_count: usize,
-    input_types: &[DataType],
-) -> Result<Vec<DataType>, TypeError> {
-    if carry_count != body_input_types.len() {
-        return Err(TypeError::invalid(format!(
-            "scalar scan requires every body input to be loop-carried, but carry count {carry_count} is smaller \
-                 than the body input count {}",
-            body_input_types.len(),
-        )));
-    }
-    if carry_count != body_output_types.len() {
-        return Err(TypeError::invalid(format!(
-            "scalar scan requires every body output to be loop-carried, but carry count {carry_count} is smaller \
-                 than the body output count {}",
-            body_output_types.len(),
-        )));
-    }
-    check_types!(@same, "scan body carry", [body_input_types, body_output_types]);
-    check_count!("input", input_types, carry_count, TypeError);
-    check_types!(@same, "scan input", [body_input_types, input_types]);
-    Ok(body_output_types.to_vec())
-}
-
 /// Type-family semantics for [`ScanOperation`].
 ///
 /// [`ArrayType`] can represent scanned values by prepending a static leading axis to each per-iteration value type,
-/// while [`DataType`] currently has no stack metadata and therefore supports only carry-only scalar scans. Both
-/// homogeneous families require a static trip count. [`ArrayIrType`] permits arrays and first-class dimensions
-/// in carry positions and a dynamic trip count backed by one trailing dimension operand, but requires every stacked
-/// input, output, and capture to be an array because the composite domain has no ragged or stacked dimension value.
-/// This trait keeps those type rules local to the scan operation so the operation dispatcher itself can be generic
-/// over `T`.
+/// and requires a static trip count. [`ArrayIrType`] permits arrays and first-class dimensions in carry positions and
+/// a dynamic trip count backed by one trailing dimension operand, but requires every stacked input, output, and
+/// capture to be an array because the composite domain has no ragged or stacked dimension value. This trait keeps
+/// those type rules local to the scan operation so the operation dispatcher itself can be generic over `T`.
 pub trait ScanTypeSemantics: Type {
     /// Renames any dynamic identity referenced by a scan length.
     fn rename_scan_length(length: &Dimension, _renaming: &TypeIdentityRenaming<Self::Identity>) -> Dimension {
@@ -482,80 +450,6 @@ impl ScanTypeSemantics for ArrayType {
             )));
         }
         Ok(())
-    }
-}
-
-impl ScanTypeSemantics for DataType {
-    fn validate_scan_body(
-        body_input_types: &[Self],
-        body_output_types: &[Self],
-        carry_count: usize,
-        length: &Dimension,
-    ) -> Result<(), TypeError> {
-        if length.variable().is_some() {
-            return Err(TypeError::invalid(format!(
-                "scalar scan requires a static length but got {length}; use a composite scan with a trailing \
-                 first-class dimension operand for a dynamic trip count",
-            )));
-        }
-        scalar_scan_output_types(body_input_types, body_output_types, carry_count, body_input_types)?;
-        Ok(())
-    }
-
-    fn scan_body_input_types(
-        input_types: &[Self],
-        body_input_count: usize,
-        carry_count: usize,
-        _length: &Dimension,
-    ) -> Result<Vec<Self>, TypeError> {
-        if carry_count != body_input_count {
-            return Err(TypeError::invalid(format!(
-                "scalar scan requires every body input to be loop-carried, but carry count {carry_count} is smaller \
-                 than the body input count {body_input_count}",
-            )));
-        }
-        check_count!("input", input_types, body_input_count, TypeError);
-        Ok(input_types.to_vec())
-    }
-
-    fn infer_scan_output_types(
-        body_input_types: &[Self],
-        body_output_types: &[Self],
-        carry_count: usize,
-        _length: &Dimension,
-        input_types: &[Self],
-    ) -> Result<Vec<Self>, TypeError> {
-        scalar_scan_output_types(body_input_types, body_output_types, carry_count, input_types)
-    }
-
-    fn stacked_scan_type(r#type: &Self, _length: &Dimension) -> Result<Self, TypeError> {
-        Err(TypeError::invalid(format!("scalar scan cannot stack per-iteration type {}", r#type)))
-    }
-
-    fn validate_scan_capture<C: Value<Type = Self>>(
-        _capture: &C,
-        _index: usize,
-        _length: &Dimension,
-    ) -> Result<(), TypeError> {
-        Err(TypeError::invalid("scalar scan captures require a scalar stack representation".to_string()))
-    }
-}
-
-impl TemporalResidualType for DataType {
-    fn temporal_storage_type(&self) -> Result<Self, TypeError> {
-        Err(TypeError::invalid(format!("scalar scan cannot stack the time-varying residual type {}", self,)))
-    }
-}
-
-impl<O: Operation<Type = DataType>> TemporalResidualOperation<DataType> for O {
-    #[inline]
-    fn residual_to_storage(_residual_type: &DataType) -> Result<Option<Self>, TypeError> {
-        Ok(None)
-    }
-
-    #[inline]
-    fn residual_from_storage(_residual_type: &DataType) -> Result<Option<Self>, TypeError> {
-        Ok(None)
     }
 }
 
@@ -725,9 +619,9 @@ impl ScanTypeSemantics for ArrayIrType {
 }
 
 /// Validates the scan contract over the single attached body region interface (the `["body"]` slot) and returns
-/// it: the body's first `carry_count` input and output types must agree, every body type must satisfy the type
-/// family's scan rules (fully static for [`ArrayType`], carry-only for [`DataType`], and mixed carries with array-only
-/// stacks for [`ArrayIrType`]), and the interface is what the scan's boundary types derive from.
+/// it: the body's first `carry_count` input and output types must agree, every body type must satisfy the type family's
+/// scan rules (fully static for [`ArrayType`] and mixed carries with array-only stacks for [`ArrayIrType`]), and the
+/// interface is what the scan's boundary types derive from.
 fn validated_scan_interface<'i, T: ScanTypeSemantics>(
     region_interfaces: &'i [RegionInterface<T>],
     carry_count: usize,
@@ -858,10 +752,9 @@ where
     }
 }
 
-/// Type-family interpretation semantics for [`ScanOperation`], mirroring the `while` module's type-family dispatch:
-/// [`ArrayType`] scans drive the stacked-slice loop of [`interpret_scan_iterations`] (allocating the output stacks
-/// from the body interface's slice types, so zero-trip scans still shape their outputs), while [`DataType`] scans are
-/// carry-only loops that thread the state through the body `length` times.
+/// Type-family interpretation semantics for [`ScanOperation`], mirroring the `while` module's type-family dispatch.
+/// Array-backed scans drive the stacked-slice loop of [`interpret_scan_iterations`], allocating output stacks from the
+/// body interface's slice types so zero-trip scans still shape their outputs.
 pub(crate) trait ScanInterpretation<C: Domain<Type = Self>>: ScanTypeSemantics {
     /// Interprets one scan over the attached body region; refer to the documentation of
     /// [`InterpretableOperation::interpret`] for the contract.
@@ -905,27 +798,6 @@ where
             inputs,
             |_, iteration_inputs| driver.interpret_region(context, 0, iteration_inputs),
         )
-    }
-}
-
-impl<C: Domain<Type = DataType>> ScanInterpretation<C> for DataType {
-    fn interpret_scan<D: InterpretationDriver<C>>(
-        carry_count: usize,
-        length: &Dimension,
-        _reverse: bool,
-        context: &C,
-        driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        let length = length.value().ok_or_else(|| ProgramError::UnsupportedOperation {
-            message: format!("cannot eagerly interpret scalar scan with dynamic length {length}"),
-        })?;
-        let mut state = inputs.to_vec();
-        for _ in 0..length {
-            state = driver.interpret_region(context, 0, state)?;
-            check_count!("output", state, carry_count, ProgramError);
-        }
-        Ok(state)
     }
 }
 
@@ -2434,9 +2306,8 @@ where
 }
 
 /// Transpose rule for [`ScanOperation`], dispatching to the scan's type family through the crate-private
-/// `ScanTransposition` trait: array
-/// scans transpose captured linear scans whole and forward operand-form primal scans to [`transpose_primal_scan`],
-/// and scalar scans transpose capture-free carry-only linear scans.
+/// `ScanTransposition` trait: array scans transpose captured linear scans whole and forward operand-form primal scans
+/// to [`transpose_primal_scan`].
 impl<V, F, Target> TransposableOperation<V, Target> for ScanOperation<F>
 where
     V: Value,
@@ -2457,10 +2328,8 @@ where
 
 /// Type-family transposition semantics for [`ScanOperation`], with the scan's value, body-operation, capture,
 /// payload, and staging-target parameters riding as trait inputs and the type family as the implementing type
-/// (mirroring [`ScanPayload`](crate::operations::control_flow::scan::ScanPayload)) so that the [`ArrayType`] and
-/// [`DataType`] rules stay coherent without the operation struct naming its type family as a parameter. The
-/// [`ArrayType`] rule pins the staging target to the scan's own body operation family `O`, while the [`DataType`]
-/// rule keeps an independent `Target` because a scalar linear scan never inlines its body into the pullback.
+/// (mirroring [`ScanPayload`](crate::operations::control_flow::scan::ScanPayload)) so that each family implementation
+/// carries only the bounds its rule needs.
 pub(crate) trait ScanTransposition<V, F, Target>: Type
 where
     V: Value<Type = Self>,
@@ -2570,54 +2439,6 @@ where
     let mut cotangents = cotangents.into_iter().map(MaybeZero::Value).collect::<Vec<_>>();
     cotangents.extend(runtime_length_inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())));
     Ok(cotangents)
-}
-
-impl<V, F, Target> ScanTransposition<V, F, Target> for DataType
-where
-    V: Value<Type = DataType>,
-    F: Value<Type = DataType>,
-    Target: Operation<Type = DataType> + ZeroOperationProvider<DataType> + From<ScanOperation<F>>,
-{
-    fn transpose_scan<D: TranspositionDriver<V, Target>>(
-        operation: &ScanOperation<F>,
-        context: &mut TracingContext<V, Target>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
-        if outputs.iter().all(MaybeZero::is_zero) {
-            return Ok(inputs
-                .iter()
-                .map(|input| {
-                    let input_type = input.r#type();
-                    MaybeZero::Zero(input_type.cotangent())
-                })
-                .collect());
-        }
-        if !operation.captures().is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "scalar linear scan transposition with residual stacks requires a scalar stack representation"
-                    .to_string(),
-            }
-            .into());
-        }
-        let body = driver.region(0)?;
-        let output_types = body.output_types();
-        check_count!("output", outputs, output_types.len(), ProgramError);
-        let transposed_body = driver.transpose_program(body, &vec![true; body.input_ids().len()])?;
-        let transposed = ScanOperation::<F>::new(operation.carry_count(), operation.length())
-            .with_reverse(!operation.reverse())
-            .with_unroll(operation.unroll())?
-            .with_captures(operation.captures().to_vec());
-        let materialized = outputs
-            .iter()
-            .map(|cotangent| cotangent.clone().materialize(context))
-            .collect::<Result<Vec<_>, _>>()?;
-        let cotangents =
-            context.stage_operation(Target::from(transposed), vec![transposed_body], materialized.as_slice())?;
-        check_count!("output", cotangents, inputs.len(), ProgramError);
-        Ok(cotangents.into_iter().map(MaybeZero::Value).collect())
-    }
 }
 
 /// Partition-aware transpose rule for a *primal* [`ScanOperation`], used when the direct reverse transposes a

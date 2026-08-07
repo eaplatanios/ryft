@@ -245,9 +245,9 @@ where
 /// ```
 ///
 /// The `Output` type parameter lets the comparison result use a different value carrier when the input carrier cannot
-/// represent Boolean data. Scalar and array backends use the default `Output = Self` and return honestly
-/// Boolean-typed values. [`DimensionValue`](crate::DimensionValue), by contrast, uses an array output because a
-/// first-class dimension describes an array extent rather than serving as a general scalar-data carrier.
+/// represent Boolean data. Array values use the default `Output = Self` and return honestly Boolean-typed values.
+/// [`DimensionValue`](crate::DimensionValue), by contrast, uses an array output because a first-class dimension
+/// describes an array extent rather than serving as a general scalar-data carrier.
 pub trait Compare<Output = Self>: Sized {
     /// Compares `self` and `rhs` using a predicate determined by the provided `direction`.
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Output, ProgramError>;

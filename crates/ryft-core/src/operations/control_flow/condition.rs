@@ -40,7 +40,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, DataType, DimensionType};
+use crate::types::{ArrayIrType, ArrayType, DimensionType};
 
 // TODO(eaplatanios): Review this.
 
@@ -100,10 +100,9 @@ impl<F: Value<Type: ConditionTypeSemantics>> Display for ConditionOperation<F> {
 
 /// Type-family predicate semantics for [`ConditionOperation`].
 ///
-/// Conditions always branch on ordinary Boolean data. Programs over scalar data and arrays therefore accept
-/// [`DataType::Boolean`] and rank-zero Boolean [`ArrayType`] predicates respectively, while a composite
-/// [`ArrayIrType`] accepts only its rank-zero Boolean array member. A first-class dimension describes an array
-/// extent rather than Boolean data, even when its runtime representation is scalar.
+/// Conditions always branch on ordinary Boolean data. [`ArrayType`] accepts rank-zero Boolean predicates, while a
+/// composite [`ArrayIrType`] accepts only its rank-zero Boolean array member. A first-class dimension describes an
+/// array extent rather than Boolean data, even though its runtime representation is scalar.
 pub trait ConditionTypeSemantics: Type {
     /// Returns whether this type is a valid condition predicate.
     fn is_condition_predicate(&self) -> bool;
@@ -113,13 +112,6 @@ impl ConditionTypeSemantics for ArrayType {
     #[inline]
     fn is_condition_predicate(&self) -> bool {
         self.is_scalar() && self.data_type().is_boolean()
-    }
-}
-
-impl ConditionTypeSemantics for DataType {
-    #[inline]
-    fn is_condition_predicate(&self) -> bool {
-        self.is_boolean()
     }
 }
 

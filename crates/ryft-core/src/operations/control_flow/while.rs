@@ -100,8 +100,8 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 ///     rejects transposition, exactly like JAX's `while_loop`.
 ///
 /// The `T` parameter fixes the loop's type universe in the payload itself. Consequently, one concrete
-/// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<Type = T>`](Operation) contract even though the shared
-/// implementation supports scalar, array, and composite array IR loops.
+/// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<Type = T>`](Operation) contract even though the
+/// shared implementation supports homogeneous array and composite array IR loops.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhileOperation<T: Type> {
     /// Optional semantic iteration bound: when present, the loop runs at most this many iterations by definition,
@@ -174,12 +174,12 @@ impl<T: WhileTypeSemantics> Display for WhileOperation<T> {
 /// along its leading axes. This mirrors JAX's batched `while_p` contract, where the batching transform emits a loop
 /// whose condition returns a batched predicate and the loop's consumers implement the masked semantics.
 ///
-/// [`DataType`] conditions must produce a scalar Boolean data type. [`ArrayIrType`] conditions must produce a
-/// Boolean array member and may carry mixed array/dimension state. Under a batched predicate the prefix requirement
-/// applies to the array members only, since a first-class dimension carries no shape, and such a dimension carry must
-/// additionally be *loop-invariant*: one dimension value cannot represent independently masked per-item extents, but
-/// masking a carry that the body forwards unchanged is the identity. Eager interpretation enforces that invariance
-/// dynamically through [`ArrayIrValue`](crate::backends::array_programs::ArrayIrValue)'s
+/// [`ArrayIrType`] conditions must produce a Boolean array member and may carry mixed array/dimension state. Under a
+/// batched predicate the prefix requirement applies to the array members only, since a first-class dimension carries
+/// no shape, and such a dimension carry must additionally be *loop-invariant*: one dimension value cannot represent
+/// independently masked per-item extents, but masking a carry that the body forwards unchanged is the identity. Eager
+/// interpretation enforces that invariance dynamically through
+/// [`ArrayIrValue`](crate::backends::array_programs::ArrayIrValue)'s
 /// [`mask_select`](WhilePredicate::mask_select), which returns equal dimension carries unchanged and falls back to
 /// scalar-predicate concretization — an error under a batched predicate — for distinct ones. Structural composite
 /// batching relies on this relaxation to thread its loop-invariant mapped extent through batch-varying loops.
@@ -196,8 +196,7 @@ pub trait WhileTypeSemantics: Type {
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError>;
 
     /// Returns whether `condition_output` is a *batched* (per-item) predicate carrying one termination decision per
-    /// leading-axes item, rather than a whole-loop scalar predicate. This is `false` for scalar
-    /// [`DataType`] predicates and `true` for a non-scalar Boolean
+    /// leading-axes item, rather than a whole-loop scalar predicate. This is `true` for a non-scalar Boolean
     /// [`ArrayType`] predicate. It gates the purity requirement on batched-predicate loops:
     /// a batched-predicate loop keeps running for still-active items after others have finished, so it re-evaluates
     /// the condition and body over *every* item each iteration, and observable effects cannot be masked back out for
@@ -229,21 +228,6 @@ impl WhileTypeSemantics for ArrayType {
 
     fn is_batched_predicate(condition_output: &Self) -> bool {
         condition_output.rank() > 0
-    }
-}
-
-impl WhileTypeSemantics for DataType {
-    fn validate_while_condition_output(condition_output: &Self, _state_types: &[Self]) -> Result<(), TypeError> {
-        if !condition_output.is_boolean() {
-            return Err(TypeError::invalid(format!(
-                "'while' condition output type must be bool, but got {condition_output}"
-            )));
-        }
-        Ok(())
-    }
-
-    fn is_batched_predicate(_condition_output: &Self) -> bool {
-        false
     }
 }
 
@@ -424,8 +408,8 @@ where
 }
 
 /// Partial-evaluation override for [`WhileOperation`], dispatching to the loop's type family through
-/// `WhilePartialEvaluation` type family: array loops fold loop-invariant-known state, and scalar loops defer to the default
-/// fold-or-residualize behavior.
+/// [`WhilePartialEvaluation`]. Homogeneous array loops fold loop-invariant-known state, while composite array IR loops
+/// use the closed-knownness split when applicable.
 impl<C: Context> PartiallyEvaluatableOperation<C> for WhileOperation<C::Type>
 where
     C::Type: WhilePartialEvaluation<C>,
@@ -442,9 +426,8 @@ where
 }
 
 /// Type-family partial-evaluation semantics for [`WhileOperation`]s. The known-side context parameter rides as a
-/// trait input (with the type family as the implementing type, mirroring [`ScanPayload`](super::scan::ScanPayload))
-/// so that the [`ArrayType`] and [`DataType`] implementations stay coherent and each family implementation can carry
-/// exactly the capability bounds its rule needs.
+/// trait input (with the type family as the implementing type, mirroring [`ScanPayload`](super::scan::ScanPayload)) so
+/// that each family implementation can carry exactly the capability bounds its rule needs.
 pub(crate) trait WhilePartialEvaluation<C: Context>: WhileTypeSemantics {
     /// Partially evaluates the provided [`WhileOperation`]; refer to the documentation of
     /// [`PartiallyEvaluatableOperation::partially_evaluate`] for the contract.
@@ -660,25 +643,6 @@ where
         // The residual while's inputs are exactly the original while's inputs: each state element's init value (now a
         // known residual for the folded elements) in state order.
         context.fold_or_residualize(O::from(while_operation), vec![residual_condition, residual_body], inputs)
-    }
-}
-
-/// Partial evaluation of a scalar [`WhileOperation`] over [`DataType`]. Scalar `DataType` has no array-stack
-/// metadata for the loop-invariant folding rewrite to rebuild residual state with, so a scalar while folds entirely
-/// when its inputs are all known and otherwise attempts the closed-knownness split (see
-/// `split_while_by_closed_knownness`) for pure mixed-knownness loops — this is what linearizes the fused
-/// doubled-state loops the scalar forward-mode rule stages — before residualizing unchanged.
-impl<C: Context<Type = DataType>> WhilePartialEvaluation<C> for DataType
-where
-    C::Operation: From<WhileOperation<DataType>>,
-{
-    fn partially_evaluate_while<D: PartialEvaluationDriver<C>>(
-        operation: &WhileOperation<DataType>,
-        context: &PartialEvaluationContext<C>,
-        driver: &D,
-        inputs: &[PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        partially_evaluate_while_by_closed_knownness(operation, context, driver, inputs)
     }
 }
 
@@ -1305,8 +1269,8 @@ where
 /// total over data-dependent `while` loops with no iteration bound. Staging contexts — and eager contexts whose loop
 /// predicate is batched and therefore has no single trip decision — dispatch to the loop's type family through the
 /// `WhileJvp` trait: bounded array loops stage the reverse-capable hybrid rule documented on that trait's
-/// [`ArrayType`] implementation, while unbounded array loops and scalar loops stage the forward-only fused
-/// doubled-state loop (see the crate-private `jvp_while_fused`).
+/// [`ArrayType`] implementation, while unbounded loops stage the forward-only fused doubled-state loop (see the
+/// crate-private `jvp_while_fused`).
 impl<C> DifferentiableOperation<C> for WhileOperation<C::Type>
 where
     C: Context + Zero<C::Value>,
@@ -1896,25 +1860,6 @@ where
         .map_err(Into::into)
 }
 
-/// Forward-mode (JVP) rule for the scalar [`WhileOperation`]: scalar `DataType` has no array-stack representation
-/// for the bounded array rule's stored residuals, so every staged scalar loop — bounded or not — stages the fused
-/// doubled-state loop (see [`jvp_while_fused`]), which is forward-total but not transposable.
-impl<C: Context<Type = DataType> + Zero<C::Value>> WhileJvp<C> for DataType
-where
-    C::Operation: ZeroOperationProvider<DataType> + From<WhileOperation<DataType>>,
-{
-    fn jvp_while<D: DifferentiationDriver<C>>(
-        operation: &WhileOperation<DataType>,
-        condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        _body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        context: &C,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        jvp_while_fused(operation, condition, context, driver, inputs)
-    }
-}
-
 impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> WhileJvp<C> for ArrayIrType
 where
     C::Constant: ValueProjection<ArrayType>,
@@ -1948,8 +1893,7 @@ where
 /// inputs, so the trip decision reads the primal state alone and the fused loop runs exactly as long as the primal
 /// loop. The fused state is compact: state elements whose tangent type is a zero differential space carry no
 /// tangent boundary input or output, and their output duals are restored as structural zeros. Because no residuals
-/// are stored, the rule applies to loops with *no* [`WhileOperation::iteration_bound`], and a semantic bound (the
-/// scalar `DataType` family routes bounded loops here too) is simply preserved on the fused loop.
+/// are stored, the rule applies to loops with *no* [`WhileOperation::iteration_bound`].
 ///
 /// The primal/tangent separation that linearization needs is recovered by partial evaluation rather than by this
 /// rule: the fused loop's primal half is *closed* (its next state and the predicate fold from primal state alone),

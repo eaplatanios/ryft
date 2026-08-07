@@ -155,10 +155,9 @@ where
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Interpretation selects through the value-level `Select` capability. The condition is an ordinary value in the
-        // active domain. Eager scalar values decode their in-band Boolean payload, eager array values use themselves as
-        // the Boolean mask, and context-carrying values (e.g., staged `Tracer`s) bind a `SelectOperation` through their
-        // own context.
+        // Interpretation selects through the value-level `Select` capability. The condition is an ordinary value in
+        // the active domain: concrete arrays use themselves as the Boolean mask, and context-carrying values such as
+        // staged `Tracer`s bind a `SelectOperation` through their own context.
         check_count!("input", inputs, 3, ProgramError);
         Ok(vec![C::Value::select(&inputs[0], &inputs[1], &inputs[2])?])
     }
@@ -244,8 +243,7 @@ impl_select_differentiation! {
             // operand's value. The condition receives a structural zero, and a zero output cotangent stays a structural
             // zero. The rule is generic over the primary type `V::Type` because it only reaches the branch type (i.e.,
             // `input_types[1]`), the known condition operand value, and the primal `select`; it carries no rank- or
-            // shape-specific logic. It therefore applies to both `ArrayOperation::Select` and
-            // `ScalarOperation::Select`.
+            // shape-specific logic, so it applies uniformly to every operation family that contains `SelectOperation`.
             check_count!("input", inputs, 3, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             match &outputs[0] {
@@ -308,8 +306,8 @@ impl_select_differentiation! {
 /// `i`-th element when the corresponding element of `condition` is true, and `on_false`'s otherwise. The three operand
 /// shapes broadcast together and the two branch data types promote together, so `condition`, `on_true`, and `on_false`
 /// need not share a shape and the branches need not share a data type. The condition is represented by the same value
-/// type as the branches. Scalar values decode their condition through [`Concretizable<bool>`](crate::Concretizable),
-/// while arrays use Boolean-typed condition arrays and staged [`Tracer`]s use Boolean-typed tracer values.
+/// type as the branches: concrete arrays use Boolean-typed condition arrays, and staged [`Tracer`]s use Boolean-typed
+/// tracer values.
 ///
 /// # Example
 ///

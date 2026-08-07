@@ -4,12 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+#[cfg(test)]
 use ryft_core::arrays::encoding::Complex as ComplexNumber;
 use ryft_core::axes::AxisIndexOperation;
 use ryft_core::backends::arrays::Array as CpuArray;
 use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::dimensions::{DimensionOperation, DimensionValue};
-use ryft_core::backends::scalars::Scalar;
 use ryft_core::captures::CaptureReference;
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{
@@ -29,9 +29,9 @@ use ryft_core::operations::dimensions::{DimensionRequirementOperation, Dimension
 #[cfg(test)]
 use ryft_core::operations::manipulation::ReshapeParameters;
 use ryft_core::operations::manipulation::{
-    ConvertElementType, ConvertElementTypeOperation, GatherOperation, GatherScatterMode, LegacyBroadcastOperation,
-    LegacyReshapeOperation, PadOperation, ReshapeDimensionExpression, ScatterOperation, ScatterReductionKind,
-    SliceOperation, TransposeOperation,
+    ConvertElementTypeOperation, GatherOperation, GatherScatterMode, LegacyBroadcastOperation, LegacyReshapeOperation,
+    PadOperation, ReshapeDimensionExpression, ScatterOperation, ScatterReductionKind, SliceOperation,
+    TransposeOperation,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
@@ -8156,12 +8156,13 @@ fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
                 return Err(LoweringError::UnsupportedDataType { data_type: element_type });
             }
         };
-        let identity = if element_type == DataType::C64 {
-            Scalar::C64(ComplexNumber::new(real as f32, 0.0))
-        } else {
-            Scalar::C128(ComplexNumber::new(real, 0.0))
-        };
-        return lower_scalar_constant_splat(identity, &scalar_array_type, scalar_tensor_type, block, context, location);
+        let part_data_type = if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
+        let part_type = ArrayType::scalar(part_data_type);
+        let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+        let real_value = lower_f64_constant_splat(real, &part_type, part_tensor_type, block, context, location)?;
+        let imaginary_value = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
+        let complex = block.append_operation(stable_hlo::complex(real_value, imaginary_value, location)?)?;
+        return Ok(complex.result(0).expect("stablehlo.complex should return one result").as_ref());
     }
     let attribute = build_reduction_identity_attribute(kind, element_type, scalar_tensor_type, context)?;
     let result = block.append_operation(stable_hlo::constant(attribute, location)?)?;
@@ -8374,75 +8375,6 @@ where
         location,
     )?)?;
     Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
-}
-
-/// Lowers a [`Scalar`] literal after ordinary conversion to `output_type`'s element type. Integer values use exact
-/// integer attributes, floating-point and Boolean values route through [`lower_f64_constant_splat`], and complex
-/// values compose two real scalar constants through `stablehlo.complex` because MLIR has no complex scalar attribute
-/// to splat.
-fn lower_scalar_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
-    value: Scalar,
-    output_type: &ArrayType,
-    output_tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    L: Copy + Location<'c, 't>,
-{
-    let data_type = output_type.data_type();
-    let value = value.convert_element_type(data_type)?;
-    if data_type.is_zero() {
-        if value != Scalar::Zero {
-            return Err(LoweringError::UnsupportedDataType { data_type });
-        }
-        return lower_f64_constant_splat(0.0, output_type, output_tensor_type, block, context, location);
-    }
-    if data_type.is_complex() {
-        let (real, imaginary) = match (data_type, value) {
-            (DataType::C64, Scalar::C64(value)) => (value.re as f64, value.im as f64),
-            (DataType::C128, Scalar::C128(value)) => (value.re, value.im),
-            _ => unreachable!("conversion to a complex data type yields its matching complex scalar"),
-        };
-        let part_data_type = if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
-        let part_type = ArrayType::scalar(part_data_type);
-        let part_tensor_type = context
-            .tensor_type(lower_element_type(part_data_type, context)?, &[], None, location)
-            .map_err(|_| LoweringError::InvalidTensorType { array_type: part_type.clone() })?;
-        let real_value = lower_f64_constant_splat(real, &part_type, part_tensor_type, block, context, location)?;
-        let imaginary_value =
-            lower_f64_constant_splat(imaginary, &part_type, part_tensor_type, block, context, location)?;
-        let complex = block.append_operation(stable_hlo::complex(real_value, imaginary_value, location)?)?;
-        return Ok(complex.result(0).expect("stablehlo.complex should return one result").as_ref());
-    }
-    let integer_value = match value {
-        Scalar::I8(value) => Some(i64::from(value)),
-        Scalar::I16(value) => Some(i64::from(value)),
-        Scalar::I32(value) => Some(i64::from(value)),
-        Scalar::I64(value) => Some(value),
-        Scalar::U8(value) => Some(i64::from(value)),
-        Scalar::U16(value) => Some(i64::from(value)),
-        Scalar::U32(value) => Some(i64::from(value)),
-        Scalar::U64(value) => {
-            let elements = context
-                .dense_u64_elements_attribute(output_tensor_type, &[value])
-                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?;
-            let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-            return Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref());
-        }
-        _ => None,
-    };
-    if let Some(integer_value) = integer_value {
-        let elements = lower_constant_elements_attribute(data_type, output_tensor_type, integer_value, context)?;
-        let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-        return Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref());
-    }
-    let Scalar::F64(value) = value.promote_element_type(DataType::F64)? else {
-        unreachable!("promotion to f64 yields an f64 scalar")
-    };
-    lower_f64_constant_splat(value, output_type, output_tensor_type, block, context, location)
 }
 
 /// Builds a splatted dense-elements attribute holding `factor` converted to the given `data_type`. Boolean splats

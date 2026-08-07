@@ -37,7 +37,6 @@ use crate::arrays::{
     f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
 use crate::axes::{Axis, AxisIndexOperation};
-use crate::backends::scalars::erf_f64;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::differentiation::LinearCallOperation;
@@ -71,6 +70,7 @@ use crate::operations::manipulation::{
     ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
+use crate::operations::math::erf::erf_f64;
 use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
@@ -1707,9 +1707,8 @@ impl_array_extrema_for_complex!(f64);
 
 /// Reusable [`Operation`] enum for ordinary staged programs over arrays.
 ///
-/// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`] the
-/// same way [`ScalarOperation`](crate::backends::scalars::ScalarOperation) pairs with [`Scalar`]. Most variants are
-/// thin tags around one semantic primitive defined in [`crate::operations`] or
+/// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`]. Most
+/// variants are thin tags around one semantic primitive defined in [`crate::operations`] or
 /// [`crate::tracing_v2::custom_derivatives`].
 ///
 /// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
@@ -2586,8 +2585,7 @@ impl Array {
 
 impl Debug for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The payload renders through `Display`, which supports every element data type, including the sub-byte ones
-        // that have no `Scalar` representation.
+        // The payload renders through `Display`, which supports every element data type, including sub-byte types.
         struct Values<'a>(&'a Array);
         impl Debug for Values<'_> {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -4974,8 +4972,8 @@ mod tests {
         let positive_zero = Array::from_f64s(array_type(DataType::F8E4M3FN, &[1]), vec![0.0]);
         let negative_zero = Array::from_f64s(array_type(DataType::F8E4M3FN, &[1]), vec![-0.0]);
         assert_eq!(positive_zero, negative_zero);
-        // Equality decodes typed values directly, retaining IEEE NaN and signed-zero semantics without depending on
-        // either physical byte equality or the transitional scalar bridge.
+        // Equality decodes typed values directly, retaining IEEE NaN and signed-zero semantics rather than relying on
+        // physical byte equality.
         let positive_zero = Array::vector(vec![0.0f32]);
         let negative_zero = Array::vector(vec![-0.0f32]);
         assert_eq!(positive_zero, negative_zero);
@@ -5272,8 +5270,7 @@ mod tests {
             epsilon = 1e-12,
         );
 
-        // Sign preserves IEEE signed zero and NaN behavior and also covers signed sub-byte integers that have no
-        // representation in the transitional scalar backend.
+        // Sign preserves IEEE signed zero and NaN behavior and also covers signed sub-byte integers.
         let signs = Array::from_elements(
             array_type(DataType::F64, &[4]),
             &[-2.0f64, -0.0, 0.0, f64::from_bits(0x7ff8_0000_0000_1234)],
