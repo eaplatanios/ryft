@@ -36,9 +36,10 @@
 //!
 //! # Core Abstractions
 //!
-//! [`ArrayBatch`] pairs an underlying array value with its batch-axis position. Its alignment helpers can broadcast a
-//! replicated value, move an existing axis, or align several operands to a common position. The wrapper's type is the
-//! unbatched per-item type (the packed value retains its batch dimension).
+//! The array specialization [`ArrayBatch`](crate::ArrayBatch) pairs an underlying array value with its batch-axis
+//! position. Its alignment helpers can broadcast a replicated value, move an existing axis, or align several operands
+//! to a common position. The wrapper's type is the unbatched per-item type (the packed value retains its batch
+//! dimension).
 //!
 //! [`BatchingContext`] wraps a parent [`Context`] and records the active axis extent and optional axis name.
 //! [`BatchingTracer`] is the value flowing through a batched closure. It carries the representation selected by a
@@ -87,12 +88,6 @@ use crate::programs::{
     RegionRef, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-
-pub mod array_ir;
-pub mod arrays;
-
-pub use array_ir::{ArrayIrBatch, ArrayIrBatching, ReplicatedDimensionBatchingPolicy};
-pub use arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, DimensionSource, StaticArrayBatchingPolicy};
 
 /// Represents batching-related errors.
 ///
@@ -177,9 +172,9 @@ impl From<BatchingError> for ProgramError {
 /// predicate would need a dedicated batching rule. Note that replication is not limited to rank-0 (i.e., scalar)
 /// values. Any shaped constant or input is replicated when none of its dimensions indexes the batch.
 ///
-/// This is the batch axis carried by an [`ArrayBatch`] and, during the batching transform, by the [`Tracer`] metadata.
-/// Carrying it on the value itself lets the per-operation batching rules route the mapped batch axis straight from the
-/// value in hand.
+/// This is the batch axis carried by an [`ArrayBatch`](crate::ArrayBatch) and, during the batching transform, by the
+/// [`Tracer`] metadata. Carrying it on the value itself lets the per-operation batching rules route the mapped batch
+/// axis straight from the value in hand.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
 pub struct BatchAxis(Option<Axis>);
 
@@ -508,9 +503,10 @@ pub trait BatchableType: Type {
 ///
 ///   - **The Batch Carrier (i.e., [`Self::Batch`]):** A batched value maintains a split between its unbatched per-item
 ///     type and the parent-owned packed value that stores the whole batch. How that split is represented is specific
-///     to each value kind: an ordinary array gains a mapped axis in its packed shape (i.e., [`ArrayBatch`]), while a
-///     first-class dimension has no mapped representation at all (as a per-item extent would be a ragged shape), and so
-///     a composite carrier must keep dimension members replicated and reject mapped non-array members.
+///     to each value kind: an ordinary array gains a mapped axis in its packed shape (i.e.,
+///     [`ArrayBatch`](crate::ArrayBatch)), while a first-class dimension has no mapped representation at all (as a
+///     per-item extent would be a ragged shape), and so a composite carrier must keep dimension members replicated and
+///     reject mapped non-array members.
 ///   - **The Mapped-Axis Extent (i.e., [`Self::Extent`]):** Homogeneous array batching uses a static `usize`, while a
 ///     composite universe may carry an ordinary parent-owned first-class dimension value so that a dynamic batch extent
 ///     remains a Single Static Assignment (SSA) value flowing through operand edges rather than being treated as static
@@ -522,10 +518,10 @@ pub trait BatchableType: Type {
 ///     [`Self::adapt_batched_program`] let consumers complete or shed policy-specific widening.
 ///
 /// The policy is deliberately limited to carrier selection, construction, and access. Array-specific alignment and
-/// broadcasting are represented as functions on [`ArrayBatch`] (a composite policy may project an array member into
-/// that carrier to reuse an existing array rule), and recursion into nested regions is the separate
-/// [`RecursiveBatchingPolicy`] capability so that a carrier can exist before its universe supports
-/// structural region rewriting.
+/// broadcasting are represented as functions on [`ArrayBatch`](crate::ArrayBatch) (a composite policy may project an
+/// array member into that carrier to reuse an existing array rule), and recursion into nested regions is the separate
+/// [`RecursiveBatchingPolicy`] capability so that a carrier can exist before its universe supports structural region
+/// rewriting.
 pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// Batch-carrying representation for values owned by `C`.
     type Batch: Clone + Debug + Display + Parameter;
@@ -565,9 +561,9 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     ///
     ///   - Homogeneous array policies return no values (the default), because their mapped-axis extent
     ///     is static transform metadata and their batched programs carry exactly the source boundary.
-    ///   - [`ArrayIrBatching`] returns its first-class mapped-extent dimension value, because
-    ///     every dynamic batch dimension inserted into one of its batched programs references the
-    ///     [`DimensionVariable`](crate::arrays::DimensionVariable) defined by that program's leading extent input.
+    ///   - [`ArrayIrBatching`](crate::ArrayIrBatching) returns its first-class mapped-extent dimension value,
+    ///     because every dynamic batch dimension inserted into one of its batched programs references the
+    ///     [`DimensionVariable`](crate::DimensionVariable) defined by that program's leading extent input.
     ///
     /// Refer to the documentation of [`Self::adapt_batched_program`] for the output-side counterpart of this contract,
     /// along with a complete boundary example.
@@ -640,11 +636,11 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
 /// Selects the [`BatchingPolicy`] used when an outer policy `Self` projects one member type `T` from composite
 /// [`Context`] `C`. A [`BatchingPolicy`] determines one context's batch carrier, mapped-extent representation, and
 /// structurally batched program boundary. It cannot by itself determine how each member type of a composite context
-/// should represent those concepts. For example, an array member needs an [`ArrayBatch`] carrier that may hold a mapped
-/// axis, whereas a first-class dimension member must remain replicated because a different dimension per batch item
-/// would require a ragged value model. Both projected policies must nevertheless preserve the outer policy's exact
-/// mapped-extent representation. This type-indexed relation records that choice independently for every supported
-/// `(C, T)` pair.
+/// should represent those concepts. For example, an array member needs an [`ArrayBatch`](crate::ArrayBatch) carrier
+/// that may hold a mapped axis, whereas a first-class dimension member must remain replicated because a different
+/// dimension per batch item would require a ragged value model. Both projected policies must nevertheless preserve
+/// the outer policy's exact mapped-extent representation. This type-indexed relation records that choice independently
+/// for every supported `(C, T)` pair.
 ///
 /// Note that this trait carries no runtime state. Implementing it only establishes the associated
 /// [`Projected`](Self::Projected) policy used by [`batch_projected_operation`]. Unsupported member projections simply
@@ -830,9 +826,10 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
 /// `#[ryft(dispatch(batching))]`. It follows the operation derivation's enum-shape and type-inference rules
 /// and generates:
 ///
-///   - A dispatcher at `BatchableOperation<C, ArrayBatching>`, generic over the parent [`Context`] `C`, that
-///     forwards the active [`BatchingContext`] to every variant's own rule. One dispatcher covers eager and staging
-///     parents alike, because the parent/active distinction lives in each rule's body rather than in dispatch.
+///   - A dispatcher at `BatchableOperation<C, ArrayBatching>`, where [`ArrayBatching`](crate::ArrayBatching) is the
+///     array-domain policy and `C` is the parent [`Context`], that forwards the active [`BatchingContext`] to every
+///     variant's own rule. One dispatcher covers eager and staging parents alike, because the parent/active distinction
+///     lives in each rule's body rather than in dispatch.
 ///   - Per-variant `Payload: BatchableOperation<C, ArrayBatching>` predicates that transport each rule's own
 ///     capability requirements to the use site. Nested programs batch structurally through [`Program::batched`],
 ///     requested by higher-order rules through their active [`BatchingDriver`], whose concrete implementation
@@ -858,9 +855,9 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation {
     ///     user repositions one of them with [`Transpose`] (i.e., the N-D axis permutation primitive) before invoking
     ///     the operation. Operations with explicit axis arguments (e.g., `Dot`, `Transpose`, `Reshape`, etc.) rewrite
     ///     those arguments to thread the mapped axis through correctly.
-    ///   - **Output Axes:** For elementwise operations, the output [`ArrayBatch::batch_axis`] matches the common input
-    ///     batch axis. For operations with explicit axis arguments, the output axis follows from the lifted axis
-    ///     arguments.
+    ///   - **Output Axes:** For elementwise operations, the output
+    ///     [`ArrayBatch::batch_axis`](crate::ArrayBatch::batch_axis) matches the common input batch axis.
+    ///     For operations with explicit axis arguments, the output axis follows from the lifted axis arguments.
     ///   - **Zero Propagation:** Linear batching rules preserve zero tangent payloads through their operation-specific
     ///     semantics. Canonical staged zeros are handled before batching reaches concrete value-level interpretation.
     ///   - **Parent-Owned Work:** Ordinary rules must execute or stage lifted work through `context.parent()` and
@@ -1463,7 +1460,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType, Dimension, Shape, ShardingDimension};
+    use crate::arrays::{ArrayBatch, ArrayBatching, ArrayType, DataType, Dimension, Shape, ShardingDimension};
     use crate::backends::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::contexts::tests::{
