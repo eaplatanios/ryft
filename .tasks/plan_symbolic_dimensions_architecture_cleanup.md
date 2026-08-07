@@ -2309,21 +2309,39 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [x] Gate the representation/retirement sequence with exact-bit, allocation, core, macro, XLA CPU, available CUDA,
           and before/after size and performance evidence.
   - [x] Define and document the final public hierarchy before moving files. The canonical public layout is
-        `arrays::{data, dimensions, ir, layouts, memories, sharding}` with common array types re-exported from
-        `arrays`; remove ambiguous glob exports and duplicate canonical paths rather than preserving the former
+        `arrays::{data, dimensions, ir, layouts, memories, operations, sharding}` with common array types re-exported
+        from `arrays`; remove ambiguous glob exports and duplicate canonical paths rather than preserving the former
         `backends`, `types`, and `sharding` facades.
     - `arrays::addressing` and `arrays::encoding` remain public physical-representation modules, and
       `arrays::macros` remains public because exported declarative macros recurse through its hygienic `$crate` path.
       The complete public child-module set is therefore `addressing`, `data`, `dimensions`, `encoding`, `ir`,
-      `layouts`, `macros`, `memories`, and `sharding`.
+      `layouts`, `macros`, `memories`, `operations`, and `sharding`.
     - `arrays` directly re-exports the common reference, type, dimension, IR, layout, memory, encoding, and sharding
-      vocabulary. Private `arrays::reference` and `arrays::types` implementation modules own the reference
-      `Array`/`ArrayOperation` family and `ArrayType`, respectively; users do not acquire redundant
+      vocabulary. Private `arrays::reference` and `arrays::types` implementation modules own the reference `Array`
+      value and `ArrayType`, respectively; users do not acquire redundant
       `arrays::reference::Array` or `arrays::types::ArrayType` paths.
     - `arrays::dimensions` publicly owns both dimension descriptors and the concrete `DimensionValue`/
       `DimensionOperation` reference family, with private `types` and `values` implementation modules.
-      `arrays::ir` similarly owns `ArrayIrType`, `ArrayIrTypeRefinements`, `ArrayIrValue`, and `ArrayIrOperation`, with
-      private `types` and `values` implementation modules plus its existing private differentiation implementation.
+      `arrays::ir` owns `ArrayIrType`, `ArrayIrTypeRefinements`, and `ArrayIrValue`, with private `types` and `values`
+      implementation modules.
+    - `arrays::operations::mod.rs` defines the closed `ArrayOperation` and `ArrayIrOperation` dispatch enums and their
+      family-level normalization/conversion contract. The public `arrays::operations` module uses private family
+      submodules for concrete reference-value capability implementations, mixed array-IR interpretation and provider
+      glue, and the tests that exercise those implementations. `arrays` re-exports both operation enums and
+      `ArrayTracingContext`; users may also name the enums through `arrays::operations`, but family implementation
+      submodules do not create additional public API paths.
+    - Mirror the backend-neutral `operations` hierarchy where array-owned implementation code exists, using
+      `attention`, `compare`, `complex`, `constants`, `control_flow`, `custom_call`, `debugging`, `differentiation`,
+      `dimensions`, `logical`, `manipulation`, `math`, `memory`, `random`, `sharding`, `sort`, and `tag` family
+      submodules. Do not create empty files merely because an enum has a variant: collectives and any other operations
+      whose complete implementation remains with their generic payload need only their enum variants in `mod.rs`.
+      Begin with one file per meaningful top-level family, and split a dense family such as `math` or `manipulation`
+      into a matching directory only when the moved implementation is large enough to make that split clearer.
+    - Keep generic operation payload structs, type inference, effects, and operation-specific batching,
+      differentiation, transposition, partial-evaluation, and lowering contracts beside their owners in
+      `ryft_core::operations`. The array-owned family modules implement capabilities for `Array`/`ArrayIrValue` and
+      composite dispatch glue; they must not copy semantic rules or reintroduce the backend dispatchers that Phase 8
+      deleted.
     - `programs::types` remains the sole backend-neutral program-type module. `operations::dimensions` and
       `operations::sharding` remain operation-semantic modules; moving the owned types and reference values does not
       move those generic operation definitions.
@@ -2332,15 +2350,34 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       names at its root as its intentional ergonomic facade, but neither crate preserves the retired module paths.
       Declarative macro hygiene and rustdoc links use `ryft_core::arrays` paths rather than depending on flat core
       re-exports.
-    - Execute the move in four buildable review units: leaf data/layout/memory and sharding modules; dimension types
-      and values; array-IR types and values; then `ArrayType` plus the reference backend, old-module deletion, facade
-      cleanup, rustdoc/path residual searches, and the complete hierarchy gate. Each unit updates all affected paths
-      directly and adds no temporary compatibility re-export.
-  - [ ] Move the current `backends::arrays` reference backend to `ryft_core::arrays`, and place the current dimension
-        backend and heterogeneous array IR beneath the same hierarchy (expected submodules: `arrays::dimensions` and
-        `arrays::ir`). Keep generic operation semantics in `operations`, generic program machinery in `programs`, and
-        transform policy machinery in its transform modules; this hierarchy owns the complete array-language type
-        vocabulary, concrete reference values, and their closed operation families.
+    - Execute the move in five buildable review units: leaf data/layout/memory and sharding modules; dimension types
+      and values; array-IR types and values; `ArrayType` plus the reference value; then the concrete operation enums and
+      family implementations, old-module deletion, facade cleanup, rustdoc/path residual searches, and the complete
+      hierarchy gate. Each unit updates all affected paths directly and adds no temporary compatibility re-export.
+  - [ ] Move the current `backends::arrays` reference backend to `ryft_core::arrays`, place the current dimension
+        backend and heterogeneous array IR beneath `arrays::dimensions` and `arrays::ir`, and place `ArrayOperation`,
+        `ArrayIrOperation`, and their array-owned implementations beneath `arrays::operations`. Keep generic operation
+        semantics in `operations`, generic program machinery in `programs`, and transform policy machinery in its
+        transform modules; this hierarchy owns the complete array-language type vocabulary, concrete reference values,
+        and their closed operation families.
+    - [ ] Create `arrays::operations::mod.rs` with `ArrayOperation`, `ArrayIrOperation`, `ArrayTracingContext`, and only
+          the imports, derives, family conversions, and shared dispatcher/provider logic that genuinely spans operation
+          families. Re-export the public family names from `arrays` without retaining a `backends` alias.
+    - [ ] Relocate reference `Array` capability implementations and mixed `ArrayIrValue` interpretation/provider glue
+          into the private family submodules specified above. Keep family-local typed traversal helpers in the same
+          submodule as their sole consumers; keep only representation-wide construction, addressing, projection, and
+          value contracts with the value types.
+    - [ ] Move the existing `backends/array_programs/differentiation.rs` implementation into
+          `arrays::operations::differentiation`, separating differentiation-specific residual helpers from generic IR
+          value/projection machinery while preserving the operation-owned transform rules already under
+          `ryft_core::operations`.
+    - [ ] Split the two backend catch-all test modules beside their new owners: enum normalization and generated
+          dispatcher tests in `operations::tests`, reference storage/value tests with `Array`, IR value/projection tests
+          with `ArrayIrValue`, and operation behavior tests in the corresponding family submodule. Preserve test names,
+          ordering within each owner, comments, and exact fixtures unless ownership makes a focused rename necessary.
+    - [ ] Gate: neither former backend catch-all file remains; every array-owned operation implementation has exactly
+          one family home; no generic semantic or transform rule was copied; no family submodule exists solely to hold
+          an enum variant; and targeted core/macro/XLA tests plus residual path searches pass.
   - [ ] Move every array-language-specific type out of the top-level `types` hierarchy and give it one canonical home
         under `ryft_core::arrays`:
     - [ ] Move `DataType`/`DataTypeError` under `arrays::data`; after the scalar backend is deleted, these describe array
@@ -2350,8 +2387,8 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [ ] Move `Dimension`, `DimensionBounds`, `DimensionType`, `DimensionVariable`, `Shape`, `StaticShape`, their
           errors/constants, and the concrete `DimensionValue`/`DimensionOperation` backend into
           `arrays::dimensions`, with the commonly used type vocabulary re-exported from `arrays`.
-    - [ ] Move `ArrayIrType`/`ArrayIrTypeRefinements` beside `ArrayIrValue`/`ArrayIrOperation` in `arrays::ir`, while
-          re-exporting the four canonical IR names from `arrays` for concise public signatures.
+    - [ ] Move `ArrayIrType`/`ArrayIrTypeRefinements` beside `ArrayIrValue` in `arrays::ir`, move `ArrayIrOperation` to
+          `arrays::operations`, and re-export all four canonical IR names from `arrays` for concise public signatures.
     - [ ] Move `Layout`, `StridedLayout`, `Tile`, `TileDimension`, `TiledLayout`, and `LayoutError` under
           `arrays::layouts`, and move `Memory` under `arrays::memories`; both are metadata of `ArrayType`, not generic
           program-type machinery.
@@ -4133,10 +4170,11 @@ live code definitions; they remain plan-history names only.
 
 The eventual top-level `ryft_core::arrays` hierarchy now owns not only the reference `Array`, dimension backend, and
 array IR, but also their complete domain-specific type vocabulary: element data types, array and dimension types,
-shapes, layouts, memories, and sharding. `ArrayIrType` moves beside `ArrayIrValue` and `ArrayIrOperation` in
-`arrays::ir`; commonly used names are re-exported through `arrays` so public signatures do not require deep module
-paths. The existing top-level `types` and `sharding` facades are deleted without compatibility modules once all
-consumers have moved.
+shapes, layouts, memories, and sharding. `ArrayIrType` moves beside `ArrayIrValue` in `arrays::ir`; the subsequently
+specified operation-family refinement places `ArrayIrOperation` beside `ArrayOperation` in `arrays::operations`.
+Commonly used names are re-exported through `arrays` so public signatures do not require deep module paths. The
+existing top-level `types` and `sharding` facades are deleted without compatibility modules once all consumers have
+moved.
 
 The generic type layer does not absorb these concrete types. `programs::types` already contains the correct
 backend-neutral abstractions (`Type`, `Typed`, `TypeError`, `TypeRefinements`, and signature traversal), whereas moving
@@ -5112,16 +5150,30 @@ isolated review unit.
 
 The pre-move ownership audit pins the final hierarchy before any path changes. The three temporary owners currently
 span 291 `crate::types` references, 210 `crate::backends` references, and 101 `crate::sharding` references inside Rust
-sources, so this is sequenced as four buildable direct-path migrations rather than one unreviewable mechanical sweep.
+sources, so this is sequenced as five buildable direct-path migrations rather than one unreviewable mechanical sweep.
 The sharding audit found only array types, array operations/transforms, and XLA consumers; no independent value
 universe needs the top-level sharding module. Universe-neutral named-axis and program machinery remain in their
 existing modules.
 
-The public end state is `arrays::{addressing, data, dimensions, encoding, ir, layouts, macros, memories, sharding}`.
-Private `reference` and `types` modules keep implementation organization from creating duplicate public paths.
-Dimension and array-IR public modules each colocate their descriptor, value, and closed operation family while keeping
-their internal type/value files private. Generic `programs::types`, `operations::dimensions`, and
-`operations::sharding` retain their current semantic ownership. `ryft-core` loses the old `backends`, `types`, and
-top-level `sharding` modules and flat glob exports; the `ryft` facade explicitly preserves its concise root-level common
-array vocabulary without preserving any retired module path. This contract closes the hierarchy-definition checkbox;
-the leaf data/layout/memory and sharding move is the next implementation unit.
+The public end state is
+`arrays::{addressing, data, dimensions, encoding, ir, layouts, macros, memories, operations, sharding}`. Private
+`reference` and `types` modules keep implementation organization from creating duplicate public paths. Dimensions
+colocate their descriptor, value, and small homogeneous operation family; array IR colocates its descriptor and value.
+The closed `ArrayOperation` and `ArrayIrOperation` dispatchers live together in `arrays::operations::mod.rs`, while
+private family submodules own the concrete reference-value capabilities, mixed-family glue, and colocated tests now
+embedded in the two backend catch-all files. Those submodules mirror the backend-neutral operation hierarchy only when
+array-owned code exists, avoiding both empty modules and a second copy of generic inference or transform rules.
+
+Generic `programs::types`, operation payloads under `operations`, and transform-owned policy machinery retain their
+current semantic ownership. `ryft-core` loses the old `backends`, `types`, and top-level `sharding` modules and flat
+glob exports; the `ryft` facade explicitly preserves its concise root-level common array vocabulary without preserving
+any retired module path. This contract closes the hierarchy-definition checkbox; the leaf data/layout/memory and
+sharding move is the next implementation unit, and the concrete operation-family redistribution is the fifth and final
+move unit after its types and values have canonical homes.
+
+A follow-up ownership refinement adds `arrays::operations` rather than carrying the two backend catch-all files into
+the new hierarchy. Its `mod.rs` owns `ArrayOperation` and `ArrayIrOperation`; private family modules own only
+array-specific capability implementations, mixed interpretation/provider glue, and their tests. This keeps the source
+layout recognizable beside `ryft_core::operations` without duplicating the generic payload definitions or the
+operation-owned transform rules established in Phase 8. `Array` remains a value owned by private `arrays::reference`,
+`ArrayIrValue` remains under `arrays::ir`, and both public operation enums are re-exported from `arrays`.
