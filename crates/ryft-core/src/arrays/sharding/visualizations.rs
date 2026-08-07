@@ -47,7 +47,8 @@ impl Sharding {
     /// [`ShardingVisualization::render`]. This function groups devices that own the same logical partition and arranges
     /// them into a one-dimensional or two-dimensional grid (higher rank [`Sharding`]s cannot be visualized and will
     /// result in a [`ShardingError::UnsupportedVisualizationRank`] error instead). Devices are labeled with sequential
-    /// indices (i.e., `0..device_count`) based on their row-major position in the [`LogicalMesh`](crate::LogicalMesh).
+    /// indices (i.e., `0..device_count`) based on their row-major position in the
+    /// [`LogicalMesh`](crate::arrays::LogicalMesh).
     ///
     /// This function is heavily inspired by [JAX's `jax.debug.visualize_array_sharding`](
     /// https://docs.jax.dev/en/latest/_autosummary/jax.debug.visualize_array_sharding.html).
@@ -58,7 +59,7 @@ impl Sharding {
     ///
     /// ```
     /// # use indoc::indoc;
-    /// # use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    /// # use ryft_core::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     ///
     /// // A rank-1 sharding over a `2×2` mesh with dimension `0` sharded along axis `"x"` produces a single-row
     /// // grid where devices sharing the same partition are grouped together (devices `0` and `1` share one `"x"`
@@ -266,7 +267,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
+    use crate::arrays::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
 
     use super::*;
 

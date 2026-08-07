@@ -3,9 +3,9 @@ use std::fmt::{Display, Formatter};
 
 use ryft_macros::Parameter;
 
+use crate::arrays::sharding::ShardingError;
+use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxisType};
 use crate::parameters::Parameter;
-use crate::sharding::ShardingError;
-use crate::sharding::meshes::{LogicalMesh, MeshAxisType};
 
 /// Describes how a single dimension of an array/tensor is distributed across [`LogicalMesh`] axes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -83,9 +83,9 @@ impl Display for ShardingDimension {
 /// };
 /// ```
 ///
-/// In this case, the `"data"` [`MeshAxis`] shards array dimension `0`, while `"model"` does not shard any ranked
-/// dimension and instead marks the value as still unreduced along the mesh axis `"model"`. Without `unreduced_axes`,
-/// that unused mesh axis would be indistinguishable from a truly replicated axis.
+/// In this case, the `"data"` [`MeshAxis`](crate::arrays::MeshAxis) shards array dimension `0`, while `"model"` does
+/// not shard any ranked dimension and instead marks the value as still unreduced along the mesh axis `"model"`. Without
+/// `unreduced_axes`, that unused mesh axis would be indistinguishable from a truly replicated axis.
 ///
 /// # References
 ///
@@ -166,9 +166,9 @@ impl Sharding {
     }
 
     /// Returns the [`LogicalMesh`] that describes the device topology underlying this [`Sharding`] and gives meaning
-    /// to every [`MeshAxis`] name stored in it. This is effectively the coordinate system for the rest of this struct.
-    /// Every axis name mentioned in [`Self::dimensions`], [`Self::unreduced_axes`], [`Self::reduced_axes`], and
-    /// [`Self::varying_manual_axes`] is resolved against this mesh.
+    /// to every [`MeshAxis`](crate::arrays::MeshAxis) name stored in it. This is effectively the coordinate system for
+    /// the rest of this struct. Every axis name mentioned in [`Self::dimensions`], [`Self::unreduced_axes`],
+    /// [`Self::reduced_axes`], and [`Self::varying_manual_axes`] is resolved against this mesh.
     #[inline]
     pub fn mesh(&self) -> &LogicalMesh {
         &self.mesh
@@ -506,8 +506,8 @@ impl Sharding {
 
     /// Returns a copy of this [`Sharding`] with its `index`-th dimension removed, shifting
     /// subsequent dimensions one position to the left. This is the sharding-level analogue of
-    /// [`ArrayType::without_dimension`](crate::ArrayType::without_dimension). The reduction axis sets are unchanged,
-    /// but the removed entry's placement is reconciled with the manual-axis model. A dimension sharded over
+    /// [`ArrayType::without_dimension`](crate::arrays::ArrayType::without_dimension). The reduction axis sets are
+    /// unchanged, but the removed entry's placement is reconciled with the manual-axis model. A dimension sharded over
     /// [`MeshAxisType::Manual`] axes moves those axes into the varying set (i.e., the value now varies across them
     /// rather than being placed along a ranked dimension), while a dimension sharded over a non-manual (e.g., a
     /// [`MeshAxisType::Explicit`]) axis cannot be dropped structurally (that would silently discard an explicit
@@ -649,7 +649,7 @@ impl Display for Sharding {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::sharding::meshes::MeshAxis;
+    use crate::arrays::sharding::meshes::MeshAxis;
 
     use super::*;
 
