@@ -135,6 +135,33 @@ update this file so that they do not need to remind you again in the future.
   - third-party crate imports
   - `crate::...` imports
   - `super::...` imports
+- For imports from the current crate, use the first module segment after `crate` as the ownership boundary:
+  - Import items owned by a different top-level module through the shortest path that re-exports them, measured in
+    path segments. Both named and glob `pub use` re-exports in module `mod.rs` files count as intentional facades:
+    prefer `crate::arrays::ArrayType` and `crate::programs::Typed` to their deeper defining paths, and fall back to
+    the defining path only when no facade re-exports the item (e.g.,
+    `crate::programs::types::visit_type_signature_pairs`). The one exclusion is crate-root re-exports: in
+    `ryft-core`, never import through `crate::<Item>` (the `lib.rs` re-exports exist for downstream crates); in
+    crates whose root re-exports are the intentional named public API, such as `ryft-xla`, `use crate::{...}` root
+    imports are the shortest facade and are correct.
+  - Import items owned by the same top-level module through their full accessible defining submodule paths, even when
+    an ancestor re-exports them through a shorter facade path. For example, `crate::arrays::addressing` must import
+    `ArrayType` from `crate::arrays::types::arrays::ArrayType`, not from `crate::arrays::ArrayType`. Items defined
+    directly in the shared top-level module remain imported from that module. When the defining module is private to
+    a sibling, use its nearest accessible intentional facade instead of widening module visibility solely for imports.
+  - Group compatible leaf imports from the same exact module path into one brace group (aliased items such as
+    `Complex as ComplexNumber` participate in the group). Keep imports that descend into nested module paths in
+    separate `use` statements, and never merge imports across different `#[cfg]`, visibility, or other attribute
+    boundaries.
+  - Facade `pub use` statements refer to their own child modules by relative path (e.g., `pub use types::{...}`
+    inside `arrays/mod.rs`), matching the existing facade files; the rules above govern item *imports*, not the
+    re-export statements that define the facades.
+  - Test modules follow the same rules for their `crate::...` imports; `use super::*` remains the standard way to
+    bring in the owning module's items.
+  - `rustfmt.toml` sets `imports_granularity = "Module"`, which enforces the grouping rule under nightly `rustfmt`
+    but is inert on stable; it cannot choose the semantically correct facade or defining descendant path, so treat it
+    as grouping assistance only. Do not add `group_imports = "StdExternalCrate"`: it merges `crate` and `super`
+    imports into one group, which conflicts with the import group order above.
 - At in-crate declarative macro call sites, import macros from `crate::macros` (grouping related macros where useful)
   and invoke them unqualified. Reserve `$crate::...` paths for hygienic references inside macro definitions.
 - Use full words for variable names and avoid abbreviations or shortened versions of words. Canonical mathematical

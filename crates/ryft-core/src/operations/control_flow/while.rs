@@ -27,8 +27,6 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-#[cfg(test)]
-use crate::operations::constants::one::One;
 use crate::operations::constants::one::OneOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation, ZeroOperationProvider};
 use crate::operations::control_flow::condition::ConditionOperation;
@@ -2442,6 +2440,7 @@ mod tests {
         vjp,
     };
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::constants::one::One;
     use crate::operations::constants::one_like::{OneLike, OneLikeOperation};
     use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
     use crate::operations::debugging::PrintOperation;
