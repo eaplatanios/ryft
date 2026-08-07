@@ -1,11 +1,10 @@
 use std::fmt::Display;
 use std::ops::Range;
 
-use crate::arrays::{ArrayIrType, ArrayType};
 use crate::axes::Axis;
 use crate::batching::{
-    ArrayBatching, ArrayBatchingPolicy, ArrayIrBatching, BatchAxis, BatchableOperation, BatchedProgram,
-    BatchingContext, BatchingDriver, BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationError;
@@ -15,16 +14,15 @@ use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation, ZeroOperationProvider};
-use crate::operations::math::{Reduce, ReduceOperation, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{AtomId, MaybeZero};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
+use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::{Value, ValueProjection};
+use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
 /// Differentiation-owned protocol through which an operation family materializes zeros whose runtime geometry must
@@ -1091,46 +1089,6 @@ pub trait LinearCallBatchingPolicy<C: Context<Type: DifferentiableType>>: Batchi
     ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>;
 }
 
-impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>, P: ArrayBatchingPolicy<C>>
-    LinearCallBatchingPolicy<C> for ArrayBatching<P>
-{
-    fn sum_mapped_cotangents(
-        _context: &TracingContext<C::Constant, C::Operation>,
-        cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
-        axis: Axis,
-    ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError> {
-        let axis = axis.normalize(cotangent.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
-            r#type: Box::new(cotangent.r#type().into_owned()),
-            axis,
-        })?;
-        Ok(cotangent.reduce(&[axis], ReductionKind::Sum))
-    }
-}
-
-impl<
-    C: Context<
-            Type = ArrayIrType,
-            Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-            Operation: OperationProjection<ArrayType, Projected: From<ReduceOperation>>,
-        >,
-> LinearCallBatchingPolicy<C> for ArrayIrBatching
-{
-    fn sum_mapped_cotangents(
-        _context: &TracingContext<C::Constant, C::Operation>,
-        cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
-        axis: Axis,
-    ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError> {
-        // Projecting the replayed array cotangent gives it the ordinary `Reduce` capability,
-        // whose staged operation lifts back through the composite operation family.
-        let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
-        let axis = axis.normalize(cotangent.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
-            r#type: Box::new(cotangent.r#type().into_owned()),
-            axis,
-        })?;
-        Ok(ValueProjection::from_projected(cotangent.reduce(&[axis], ReductionKind::Sum)))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
@@ -1138,11 +1096,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
     use crate::arrays::{
         ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis,
         MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::tests::{
