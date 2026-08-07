@@ -2294,24 +2294,48 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         compatibility re-exports.
 - [ ] After the batching hierarchy and operation ownership have settled, consolidate the reference array stack under
       one top-level `ryft_core::arrays` hierarchy as a separate, measured API and representation change:
-  - [ ] Execute the Phase 9a representation and scalar-retirement sequence specified below. Storage must migrate
+  - [x] Execute the Phase 9a representation and scalar-retirement sequence specified below. Storage must migrate
         before scalar deletion because the current `Array` uses `Vec<Scalar>` in production; keep existing public
         backend and type paths fixed throughout this sequence, apart from the private `arrays::addressing` module, so
         storage, literal lowering, and scalar retirement remain separate from the later hierarchy move.
-    - [ ] Replace the reference `Array`'s element-wise `Vec<Scalar>` payload with validated immutable contiguous bytes,
+    - [x] Replace the reference `Array`'s element-wise `Vec<Scalar>` payload with validated immutable contiguous bytes,
           with payload-copy-free cloning and checked exact encodings for every `DataType`.
-    - [ ] Route exact array literals and XLA constant lowering through logical traversal of the layout-aware byte
+    - [x] Route exact array literals and XLA constant lowering through logical traversal of the layout-aware byte
           representation without an `f64` round trip, including the sub-byte integer families.
-    - [ ] Prove that the remaining standalone scalar program universe has no unique production role. Move useful
+    - [x] Prove that the remaining standalone scalar program universe has no unique production role. Move useful
           `DataType`-universe tests to rank-zero arrays or narrowly scoped test fixtures, then delete `Scalar`,
           `ScalarOperation`, `ScalarTracingContext`, `backends::scalars`, and their public exports without a
           compatibility layer.
-    - [ ] Gate the representation/retirement sequence with exact-bit, allocation, core, macro, XLA CPU, available CUDA,
+    - [x] Gate the representation/retirement sequence with exact-bit, allocation, core, macro, XLA CPU, available CUDA,
           and before/after size and performance evidence.
-  - [ ] Define and document the final public hierarchy before moving files. The expected canonical layout is
+  - [x] Define and document the final public hierarchy before moving files. The canonical public layout is
         `arrays::{data, dimensions, ir, layouts, memories, sharding}` with common array types re-exported from
         `arrays`; remove ambiguous glob exports and duplicate canonical paths rather than preserving the former
         `backends`, `types`, and `sharding` facades.
+    - `arrays::addressing` and `arrays::encoding` remain public physical-representation modules, and
+      `arrays::macros` remains public because exported declarative macros recurse through its hygienic `$crate` path.
+      The complete public child-module set is therefore `addressing`, `data`, `dimensions`, `encoding`, `ir`,
+      `layouts`, `macros`, `memories`, and `sharding`.
+    - `arrays` directly re-exports the common reference, type, dimension, IR, layout, memory, encoding, and sharding
+      vocabulary. Private `arrays::reference` and `arrays::types` implementation modules own the reference
+      `Array`/`ArrayOperation` family and `ArrayType`, respectively; users do not acquire redundant
+      `arrays::reference::Array` or `arrays::types::ArrayType` paths.
+    - `arrays::dimensions` publicly owns both dimension descriptors and the concrete `DimensionValue`/
+      `DimensionOperation` reference family, with private `types` and `values` implementation modules.
+      `arrays::ir` similarly owns `ArrayIrType`, `ArrayIrTypeRefinements`, `ArrayIrValue`, and `ArrayIrOperation`, with
+      private `types` and `values` implementation modules plus its existing private differentiation implementation.
+    - `programs::types` remains the sole backend-neutral program-type module. `operations::dimensions` and
+      `operations::sharding` remain operation-semantic modules; moving the owned types and reference values does not
+      move those generic operation definitions.
+    - `ryft-core` removes the flat `backends::*`, `types::*`, and `sharding::*` exports, and its internal code uses the
+      canonical `crate::arrays::...` paths directly. The user-facing `ryft` crate explicitly re-exports common array
+      names at its root as its intentional ergonomic facade, but neither crate preserves the retired module paths.
+      Declarative macro hygiene and rustdoc links use `ryft_core::arrays` paths rather than depending on flat core
+      re-exports.
+    - Execute the move in four buildable review units: leaf data/layout/memory and sharding modules; dimension types
+      and values; array-IR types and values; then `ArrayType` plus the reference backend, old-module deletion, facade
+      cleanup, rustdoc/path residual searches, and the complete hierarchy gate. Each unit updates all affected paths
+      directly and adds no temporary compatibility re-export.
   - [ ] Move the current `backends::arrays` reference backend to `ryft_core::arrays`, and place the current dimension
         backend and heterogeneous array IR beneath the same hierarchy (expected submodules: `arrays::dimensions` and
         `arrays::ir`). Keep generic operation semantics in `operations`, generic program machinery in `programs`, and
@@ -2590,13 +2614,13 @@ Phase 9a4 — retire the scalar program universe:
 
 Phase 9a5 — closure:
 
-- [ ] Run full core, macro integration/compile-fail, XLA, affected doctest, allocation, CPU, and available CUDA suites
+- [x] Run full core, macro integration/compile-fail, XLA, affected doctest, allocation, CPU, and available CUDA suites
       with 300-second command timeouts.
-- [ ] Re-run Phase 9a0 measurements. Clone remains payload-copy-free and constant-time in array size, and other
+- [x] Re-run Phase 9a0 measurements. Clone remains payload-copy-free and constant-time in array size, and other
       regressions remain within the master plan's evidence-based thresholds or receive explicit approval.
-- [ ] Review the complete diff for redundant codecs, duplicate conversions, compatibility residue, unnecessary trait
+- [x] Review the complete diff for redundant codecs, duplicate conversions, compatibility residue, unnecessary trait
       surface, and avoidable allocation; simplify before closing the review unit.
-- [ ] Record the completed review here and leave the module/type/sharding hierarchy move as the next isolated unit.
+- [x] Record the completed review here and leave the module/type/sharding hierarchy move as the next isolated unit.
 
 Abort if the representation requires unsafe unaligned typed views, per-element boxing, two authoritative payloads, or
 cannot round-trip exact bits. Also stop if scalar-test migration reveals a genuinely independent non-array production
@@ -5035,7 +5059,7 @@ Production source falls from 262,473 to 259,913 lines (`−2,560`), test source 
 (`−838`), and the combined total falls from 427,048 to 423,650 lines (`−3,398`). This materially satisfies both halves
 of the gate and closes Phase 9a4. Phase 9a5 verification, measurement, and complete-diff simplification are next.
 
-### Phase 9a5 closure (in progress, 2026-08-06)
+### Phase 9a5 closure (completed, 2026-08-06)
 
 The local verification portion of the closure gate passes on revision `bbe50252a`. The complete `ryft-core` suite with
 benchmarking enabled passes 1,133 unit tests, five allocation tests, six region-prototype integration tests, and 53
@@ -5043,8 +5067,61 @@ runnable doctests with 16 intentional ignores. `ryft-macros-tests` passes all 20
 including every compile-fail fixture. The complete serialized CPU `ryft-xla` library suite passes 438 tests with its
 single timing-sensitive test ignored. Every command completed within its 300-second bound.
 
-CUDA verification remains open rather than being inferred from the earlier Phase 9a3 result. The exact Phase 9a4
-revision is pushed, but `spark-9460.local` currently does not resolve through mDNS, its last recorded address
-`192.168.68.66` times out on port 22, and a direct mDNS query returns no address. Resume the first Phase 9a5 checkbox by
-cloning `bbe50252a` into an isolated Spark checkout and running the complete serialized `cuda-13` `ryft-xla` library
-suite once the host is reachable.
+No CUDA target was available for this closure run. Two checks on 2026-08-06 found that `spark-9460.local` did not
+resolve through mDNS and its last recorded address, `192.168.68.66`, timed out on port 22. No CUDA result is inferred
+from the earlier Phase 9a3 run. This satisfies the explicitly availability-qualified gate without claiming that the
+exact Phase 9a5 tree passed on a GPU; an opportunistic exact-tree CUDA rerun may be recorded later without reopening
+the representation review.
+
+The Phase 9a0 ownership measurements were repeated with temporary counting-allocator instrumentation and then removed.
+`size_of::<Array>()` is 192 bytes, down from the original 208-byte `Vec<Scalar>` representation and equal to the
+accepted byte-storage prototype. Constructing a 4,096-element F32 array from an already-built typed slice remains at
+three allocations and 16,440 allocated bytes, of which exactly one 16,384-byte allocation is retained payload. Cloning
+either a one-element or 4,096-element F32 array performs exactly one 16-byte metadata allocation, retains the source
+storage pointer, and copies no payload bytes. The allocation count and byte count are therefore constant in array size.
+The permanent allocation regression suite and exact 16-literal CPU execution test pass, and the temporary measurement
+file leaves no source or test residue.
+
+The complete Phase 9a diff audit found one unused public combinator and three avoidable eager allocations. The
+test-only `Array::fold_elements` API had no kernel consumer because reductions and dot require their own shape-aware
+loops, so it and its self-test were deleted. `ArrayIndexRanges::new` is now private: validated construction remains
+available through `ArrayAddressing::ranges`, leaving one canonical entry point instead of two equivalent public ones.
+Array display now decodes addressed elements directly into the formatter instead of materializing a payload-sized
+typed vector. Multiplication by an `f64` constructs its one typed factor directly rather than routing through a
+singleton `Vec<f64>`. U8/U16 random-bit generation writes narrowed U32 words directly into addressed output storage
+instead of allocating a second narrowed element vector.
+
+The random-constructor allocation guard now proves that a 4,096-element U16 ThreeFry result grows by exactly the
+generated U32-word payload plus the U16 output payload, with no third payload-sized narrowing buffer. The landed audit
+changes contain 56 insertions and 75 deletions: production source shrinks by 36 lines and the new allocation assertion
+adds 17 test lines, for 19 net deletions overall. Targeted searches find no removed fold helper, narrowing collect,
+former-scalar commentary, stored `Vec<Scalar>`, scalar backend compatibility path, or duplicate codec consumer.
+The five encoding functions remain the one checked arbitrary-byte boundary; `ArrayElement` remains the one sealed
+typed codec; `from_f64s` and `to_f64s` remain deliberately lossy test conveniences; and one-bit packing remains only
+at the MLIR boundary where that representation change is required.
+
+Verification passes the 42 focused reference-array tests, 107 array/addressing/encoding tests, 17 random-operation
+tests, all five allocation tests, the complete 1,133-test core suite with five allocation and six integration tests,
+53 runnable doctests with 16 intentional ignores, and the complete serialized CPU XLA suite with 438 passes and one
+timing-sensitive ignore. The exact working tree also passes all 20 operation-macro tests, all 17 parameter-macro tests,
+and every associated compile-fail fixture. Formatting, diff hygiene, and focused Clippy output for every changed
+representation file are clean. Phase 9a is complete; the public module/type/sharding hierarchy move is the next
+isolated review unit.
+
+### Phase 9 hierarchy contract (2026-08-06)
+
+The pre-move ownership audit pins the final hierarchy before any path changes. The three temporary owners currently
+span 291 `crate::types` references, 210 `crate::backends` references, and 101 `crate::sharding` references inside Rust
+sources, so this is sequenced as four buildable direct-path migrations rather than one unreviewable mechanical sweep.
+The sharding audit found only array types, array operations/transforms, and XLA consumers; no independent value
+universe needs the top-level sharding module. Universe-neutral named-axis and program machinery remain in their
+existing modules.
+
+The public end state is `arrays::{addressing, data, dimensions, encoding, ir, layouts, macros, memories, sharding}`.
+Private `reference` and `types` modules keep implementation organization from creating duplicate public paths.
+Dimension and array-IR public modules each colocate their descriptor, value, and closed operation family while keeping
+their internal type/value files private. Generic `programs::types`, `operations::dimensions`, and
+`operations::sharding` retain their current semantic ownership. `ryft-core` loses the old `backends`, `types`, and
+top-level `sharding` modules and flat glob exports; the `ryft` facade explicitly preserves its concise root-level common
+array vocabulary without preserving any retired module path. This contract closes the hierarchy-definition checkbox;
+the leaf data/layout/memory and sharding move is the next implementation unit.

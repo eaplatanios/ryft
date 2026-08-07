@@ -656,7 +656,7 @@ pub struct ArrayIndexRanges<'a> {
 
 impl<'a> ArrayIndexRanges<'a> {
     /// Creates a new [`ArrayIndexRanges`] [`Iterator`].
-    pub fn new(addressing: &'a ArrayAddressing, axes: &'a [ArraySliceAxis]) -> Result<Self, ProgramError> {
+    fn new(addressing: &'a ArrayAddressing, axes: &'a [ArraySliceAxis]) -> Result<Self, ProgramError> {
         let rank = addressing.r#type.rank();
         if axes.len() != rank {
             return Err(TypeError::invalid(format!(

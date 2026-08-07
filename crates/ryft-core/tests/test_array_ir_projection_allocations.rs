@@ -16,6 +16,7 @@ use ryft_core::backends::arrays::Array;
 use ryft_core::contexts::EagerContext;
 use ryft_core::operations::constants::{Fill, Iota};
 use ryft_core::operations::math::{Add, Sin};
+use ryft_core::operations::random::{RandomAlgorithm, RngBitGenerator};
 use ryft_core::{ArrayIrValue, ArrayType, DataType, Dimension, Shape, ValueProjection};
 
 /// Allocator that counts allocations made by this integration-test binary.
@@ -183,6 +184,22 @@ fn test_reference_constructor_kernels_allocate_only_one_payload_buffer() {
     );
     assert_eq!(large_iota.allocation_count, small_iota.allocation_count);
     assert_eq!(large_iota.allocated_byte_count - small_iota.allocated_byte_count, (4096 - 1) * size_of::<u32>());
+
+    // Narrow random outputs retain the generated U32 words and construct their output storage directly, without a
+    // third payload-sized narrowing buffer.
+    let small_random = measure_allocations(
+        || (Array::vector(vec![42u64, 7]), ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(1)]))),
+        |(state, r#type)| state.rng_bit_generator(RandomAlgorithm::ThreeFry, &r#type).unwrap(),
+    );
+    let large_random = measure_allocations(
+        || (Array::vector(vec![42u64, 7]), ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(4096)]))),
+        |(state, r#type)| state.rng_bit_generator(RandomAlgorithm::ThreeFry, &r#type).unwrap(),
+    );
+    assert_eq!(large_random.allocation_count, small_random.allocation_count);
+    assert_eq!(
+        large_random.allocated_byte_count - small_random.allocated_byte_count,
+        (4096 - 1) * (size_of::<u32>() + size_of::<u16>()),
+    );
 }
 
 #[test]

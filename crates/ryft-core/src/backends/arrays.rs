@@ -2194,39 +2194,6 @@ impl Array {
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
 
-    /// Folds this array's typed elements in logical row-major order into one accumulated value, serving full
-    /// reductions and accumulation-style kernels such as dot products.
-    ///
-    /// # Parameters
-    ///
-    ///   - `initial`: initial accumulator value.
-    ///   - `function`: fold step combining the accumulator with each decoded element.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if this array's type cannot describe materialized storage, if `T` represents a different
-    /// [`DataType`], or if `function` fails.
-    pub fn fold_elements<T: ArrayElement, Accumulator>(
-        &self,
-        initial: Accumulator,
-        function: impl Fn(Accumulator, T) -> Result<Accumulator, ProgramError>,
-    ) -> Result<Accumulator, ProgramError> {
-        if self.r#type.data_type() != T::data_type() {
-            return Err(TypeError::invalid(format!(
-                "cannot fold elements of data type {} as {} values",
-                self.r#type.data_type(),
-                T::data_type(),
-            ))
-            .into());
-        }
-        let addressing = ArrayAddressing::new(self.r#type.clone())?;
-        let mut accumulator = initial;
-        for element in 0..addressing.element_count() {
-            accumulator = function(accumulator, T::decode(&self.bytes[addressing.byte_range_for_flat_index(element)]))?;
-        }
-        Ok(accumulator)
-    }
-
     /// Creates an array of `output_type` whose every element is copied from this array through an
     /// output-index-to-input-index mapping over flat logical row-major indices. The copy moves whole element
     /// encodings without decoding them, so this is the element-data-type-agnostic workhorse behind structural kernels
@@ -2477,7 +2444,7 @@ impl Array {
     }
 
     /// Decodes one real-valued element as `f64`, returning `None` for complex and payload-free element data types.
-    /// Integer conversions use Rust's ordinary `as f64` semantics, matching the former scalar conversion path.
+    /// Integer conversions use Rust's ordinary `as f64` semantics.
     fn element_as_f64(data_type: DataType, bytes: &[u8]) -> Option<f64> {
         Some(match data_type {
             DataType::Boolean => f64::from(u8::from(bool::decode(bytes))),
@@ -2548,9 +2515,8 @@ impl Array {
     }
 
     /// Decodes the logical integer element at `index` as the signed representation used by reference indexing
-    /// kernels. Unsigned `u64` values narrow with Rust's two's-complement `as i64` semantics, matching the former
-    /// scalar conversion path. The type-level validation performed by every caller rules out non-integer element
-    /// types and invalid indices.
+    /// kernels. Unsigned `u64` values narrow with Rust's two's-complement `as i64` semantics. The type-level validation
+    /// performed by every caller rules out non-integer element types and invalid indices.
     fn index_value(&self, addressing: &ArrayAddressing, index: &[usize]) -> i64 {
         let bytes = &self.bytes[addressing.byte_range_unchecked(index)];
         match self.r#type.data_type() {
@@ -2630,25 +2596,34 @@ impl Display for Array {
             formatter.write_str("]")
         }
         let data_type = self.r#type.data_type();
+        if matches!(data_type, DataType::Token | DataType::Zero) {
+            return write_elements(formatter, 0..Self::element_count(&self.r#type), |formatter, _| {
+                formatter.write_str(if data_type == DataType::Token { "token" } else { "zero" })
+            });
+        }
+        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
         match data_type {
-            // The payload-free element data types have no element encoding to decode.
-            DataType::Token | DataType::Zero => {
-                write_elements(formatter, 0..Self::element_count(&self.r#type), |formatter, _| {
-                    formatter.write_str(if data_type == DataType::Token { "token" } else { "zero" })
-                })
-            }
             // `f32` and `f64` payloads keep a decimal point through debug formatting, per the rendering contract
             // stated above this implementation.
-            DataType::F32 => write_elements(formatter, self.elements::<f32>().unwrap(), |formatter, value| {
-                write!(formatter, "{value:?}")
-            }),
-            DataType::F64 => write_elements(formatter, self.elements::<f64>().unwrap(), |formatter, value| {
-                write!(formatter, "{value:?}")
-            }),
+            DataType::F32 => write_elements(
+                formatter,
+                (0..addressing.element_count())
+                    .map(|element| f32::decode(&self.bytes[addressing.byte_range_for_flat_index(element)])),
+                |formatter, value| write!(formatter, "{value:?}"),
+            ),
+            DataType::F64 => write_elements(
+                formatter,
+                (0..addressing.element_count())
+                    .map(|element| f64::decode(&self.bytes[addressing.byte_range_for_flat_index(element)])),
+                |formatter, value| write!(formatter, "{value:?}"),
+            ),
             _ => dispatch_on_array_element_type!(data_type, |Element| {
-                write_elements(formatter, self.elements::<Element>().unwrap(), |formatter, value| {
-                    Display::fmt(&value, formatter)
-                })
+                write_elements(
+                    formatter,
+                    (0..addressing.element_count())
+                        .map(|element| Element::decode(&self.bytes[addressing.byte_range_for_flat_index(element)])),
+                    |formatter, value| Display::fmt(&value, formatter),
+                )
             }),
         }
     }
@@ -2877,7 +2852,7 @@ impl Neg for Array {
             return Err(TypeError::invalid(format!("cannot negate a scalar of data type {data_type}")).into());
         }
         dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            self.map_elements::<Element, Element>(self.r#type.clone(), |value| <Element as ElementNeg>::neg(value))
+            self.map_elements::<Element, Element>(self.r#type.clone(), <Element as ElementNeg>::neg)
         })
     }
 }
@@ -3018,7 +2993,10 @@ impl std::ops::Mul<f64> for Array {
     /// Scales every element by `rhs`, converting `rhs` into this array's element data type first so that scaling
     /// preserves the array's type (e.g., scaling an `f32` array does not promote it to `f64`).
     fn mul(self, rhs: f64) -> Self::Output {
-        let factor = Self::from_f64s(ArrayType::scalar(self.r#type.data_type()), vec![rhs]);
+        let data_type = self.r#type.data_type();
+        let factor = dispatch_on_array_element_type!(data_type, |Element| {
+            Self::scalar(<Element as ElementConversionTarget>::from_real(rhs).unwrap_or_else(|error| panic!("{error}")))
+        });
         Mul::mul(&self, &factor).unwrap_or_else(|error| panic!("{error}"))
     }
 }
@@ -3454,13 +3432,8 @@ impl RngBitGenerator for Array {
         // Narrower-than-32-bit outputs retain the low bits of each generated `u32` word.
         let bits_from_u32_words = |words: Vec<u32>| match data_type {
             DataType::U32 => Array::from_elements(output_type.clone(), &words),
-            DataType::U16 => Array::from_elements(
-                output_type.clone(),
-                &words.into_iter().map(|word| word as u16).collect::<Vec<_>>(),
-            ),
-            DataType::U8 => {
-                Array::from_elements(output_type.clone(), &words.into_iter().map(|word| word as u8).collect::<Vec<_>>())
-            }
+            DataType::U16 => Array::from_fn_elements(output_type.clone(), |index| Ok(words[index] as u16)),
+            DataType::U8 => Array::from_fn_elements(output_type.clone(), |index| Ok(words[index] as u8)),
             _ => unreachable!(),
         };
         match algorithm {
@@ -4331,8 +4304,7 @@ impl Compare for Array {
         let (broadcast_type, operands) = Self::broadcast_promoted(&[self, rhs])?;
         let target = broadcast_type.data_type();
         let output_type = broadcast_type.with_element_type(DataType::Boolean);
-        // Empty comparisons perform no element operation, so even payload-free data types retain the vacuous success
-        // behavior of the former scalar loop.
+        // Empty comparisons inspect no elements, so they succeed vacuously even for payload-free data types.
         if Self::element_count(&output_type) == 0 {
             let addressing = ArrayAddressing::new(output_type.clone())?;
             return Ok(Self { r#type: output_type, bytes: Arc::new(vec![0; addressing.storage_byte_len()]) });
@@ -4609,8 +4581,8 @@ mod tests {
 
         check_integer_round_trip!(DataType::I8, i8, [i8::MIN, -1, 0, i8::MAX]);
         check_integer_round_trip!(DataType::I16, i16, [i16::MIN, -0x1234, 0x2345, i16::MAX]);
-        check_integer_round_trip!(DataType::I32, i32, [i32::MIN, -0x1234_567, 0x2345_678, i32::MAX]);
-        check_integer_round_trip!(DataType::I64, i64, [i64::MIN, -0x1234_5678_9abc_def, i64::MAX]);
+        check_integer_round_trip!(DataType::I32, i32, [i32::MIN, -0x0123_4567, 0x0234_5678, i32::MAX]);
+        check_integer_round_trip!(DataType::I64, i64, [i64::MIN, -0x0123_4567_89ab_cdef, i64::MAX]);
         check_integer_round_trip!(DataType::U8, u8, [0, 0x12, 0xfe, u8::MAX]);
         check_integer_round_trip!(DataType::U16, u16, [0, 0x1234, 0xfedc, u16::MAX]);
         check_integer_round_trip!(DataType::U32, u32, [0, 0x1234_5678, 0xfedc_ba98, u32::MAX]);
@@ -4887,14 +4859,6 @@ mod tests {
             Array::from_fn_elements(array_type(DataType::U16, &[1]), |_| Ok(0u32)),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot store u32 values in an array of element data type u16",
-        ));
-
-        // `fold_elements` accumulates typed elements in logical row-major order.
-        assert_eq!(integers.fold_elements(0i64, |sum, value: i32| Ok(sum + i64::from(value))), Ok(2));
-        assert!(matches!(
-            integers.fold_elements(0i64, |sum, _: i64| Ok(sum)),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot fold elements of data type i32 as i64 values",
         ));
 
         // `gather_elements` copies whole element encodings through a flat index mapping without decoding them, so it

@@ -1025,8 +1025,8 @@ impl private::Codec for Complex<f64> {
 ///
 ///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::Shape),
 ///     and [`Layout`](crate::Layout).
-///   - `elements`: Elements of the array provided in row-major order.Their type must represent `r#type`'s [`DataType`],
-///     and their count must equal the array's logical element count.
+///   - `elements`: Elements of the array provided in row-major order. Their type must represent `r#type`'s
+///     [`DataType`], and their count must equal the array's logical element count.
 pub fn encode_elements<T: ArrayElement>(r#type: &ArrayType, elements: &[T]) -> Result<Vec<u8>, ProgramError> {
     if r#type.data_type() != T::DATA_TYPE {
         return Err(TypeError::invalid(format!(
