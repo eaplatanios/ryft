@@ -2195,6 +2195,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
@@ -2209,7 +2210,6 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::values::Concretizable;
     use crate::tracing::{NestedTracingContext, Trace};
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

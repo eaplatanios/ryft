@@ -398,7 +398,8 @@ impl<
 ///
 /// ```rust
 /// # use ryft_core as ryft;
-/// # use ryft_core::{ArrayType, ConstantOperation, Value, ZeroOperation};
+/// # use ryft_core::arrays::ArrayType;
+/// # use ryft_core::{ConstantOperation, Value, ZeroOperation};
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
@@ -1910,6 +1911,7 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedProgramOperation, ProjectedProgramType,
@@ -1933,7 +1935,6 @@ mod tests {
     use crate::programs::types::{TypeError, Typed};
     use crate::programs::values::{Concretizable, Value};
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

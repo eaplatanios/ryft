@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::ops::Range;
 
+use crate::arrays::{ArrayIrType, ArrayType};
 use crate::axes::Axis;
 use crate::batching::{
     ArrayBatching, ArrayBatchingPolicy, ArrayIrBatching, BatchAxis, BatchableOperation, BatchedProgram,
@@ -25,7 +26,6 @@ use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionSl
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType};
 
 /// Differentiation-owned protocol through which an operation family materializes zeros whose runtime geometry must
 /// be supplied by explicitly captured _residual_ values, because it is not derivable from the zero's [`Type`] alone.
@@ -1138,6 +1138,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
@@ -1157,9 +1161,7 @@ mod tests {
     use crate::programs::effects::Effects;
     use crate::programs::programs::Program;
     use crate::programs::regions::{RegionDriver, RegionRef, RegionSlot};
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 

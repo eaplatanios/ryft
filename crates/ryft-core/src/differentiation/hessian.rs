@@ -627,14 +627,13 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::DataType::{F32, F64};
+    use crate::arrays::{ArrayType, DataType, Dimension, Shape};
     use crate::backends::arrays::Array;
     use crate::differentiation::jacobian::jacobian_forward;
     use crate::operations::math::Sin;
     use crate::parameters::{ParameterPath, Parameterized};
     use crate::programs::types::Typed;
-    use crate::types::DataType;
-    use crate::types::DataType::{F32, F64};
-    use crate::types::{ArrayType, Dimension, Shape};
 
     use super::*;
 

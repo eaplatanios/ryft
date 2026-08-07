@@ -9,6 +9,7 @@
 //! those rules (and the broadcasting, selection, and reduction rules) use to align derivative contributions between
 //! operand types and the common type inferred for an implicitly broadcasting result.
 
+use crate::arrays::{ArrayType, DataType, Dimension};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::macros::check_count;
 use crate::operations::manipulation::{ConvertElementType, LegacyBroadcast, Reshape, Transpose};
@@ -19,7 +20,6 @@ use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::types::TypeError;
 use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType, Dimension};
 
 /// [`Value`] whose derivative contributions can be _aligned_ with the common [`Type`](crate::Type) inferred for an
 /// implicitly broadcasting elementwise result and _unaligned_ back to an operand type. The two methods form an adjoint
@@ -419,6 +419,9 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::reverse::ReverseModeDifferentiate;
@@ -427,8 +430,6 @@ mod tests {
     use crate::operations::math::{AddOperation, SinOperation};
     use crate::programs::atoms::MaybeZero;
     use crate::programs::types::Typed;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 

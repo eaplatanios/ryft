@@ -17,8 +17,8 @@ use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
-/// Jacobian of a function, represented as the Cartesian product of its output and input [`Parameter`] leaves. `I`
-/// and `O` retain the input and output [`Type`] trees. Derivative values are stored in deterministic output-major /
+/// Jacobian of a function, represented as the Cartesian product of its output and input [`Parameter`] leaves. `I` and
+/// `O` retain the input and output [`Type`] trees. Derivative values are stored in deterministic output-major /
 /// input-minor order and remain [`Parameter`]s so that the complete Jacobian can cross tracing and compilation
 /// boundaries as well as participate in higher-order transforms. The physical representation of a block is defined by
 /// [`DenseDifferentiableType`]. For [`ArrayType`](crate::ArrayType), the block for an output leaf with shape `O` and
@@ -1201,6 +1201,8 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::DataType::{F32, F64};
+    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext};
@@ -1212,8 +1214,6 @@ mod tests {
     use crate::parameters::{ParameterPath, Parameterized};
     use crate::programs::types::Typed;
     use crate::programs::values::Value;
-    use crate::types::DataType::{F32, F64};
-    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 

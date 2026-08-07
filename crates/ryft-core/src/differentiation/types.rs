@@ -1,3 +1,4 @@
+use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, Shape, Sharding, ShardingDimension};
 use crate::batching::{ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::Context;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
@@ -11,9 +12,7 @@ use crate::programs::ProgramError;
 use crate::programs::regions::RegionRef;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
-use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::TracingContext;
-use crate::types::{ArrayIrType, ArrayType, DataType, Dimension, Shape};
 
 /// A [`Type`] whose forward perturbations and reverse adjoints carry well-defined differential representations.
 /// Differential values need not use the primal representation. A compact primal storage format may require a wider
@@ -652,14 +651,14 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::DataType::*;
+    use crate::arrays::{
+        ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        Shape, Sharding, ShardingDimension, StridedLayout,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis};
     use crate::contexts::EagerContext;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::DataType::*;
-    use crate::types::{
-        ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout, Memory, Shape, StridedLayout,
-    };
 
     use super::*;
 
