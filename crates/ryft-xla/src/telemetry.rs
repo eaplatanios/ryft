@@ -44,7 +44,7 @@ pub(crate) fn array_dropped() {
 mod tests {
     use super::*;
     use crate::Array;
-    use ryft_core::{
+    use ryft_core::arrays::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
 

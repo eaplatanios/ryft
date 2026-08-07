@@ -1,3 +1,4 @@
+use ryft_core::arrays::{ArrayIrType, DataType, DimensionType, DimensionVariable};
 use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::dimensions::DimensionValue;
 use ryft_core::contexts::Context;
@@ -12,7 +13,6 @@ use ryft_core::operations::manipulation::conversion::ElementType;
 use ryft_core::operations::math::{Add, Div, Mul, Neg, Sub};
 use ryft_core::programs::types::Typed;
 use ryft_core::programs::{Concretizable, Operation, ProgramError, Value};
-use ryft_core::types::{ArrayIrType, DataType, DimensionType, DimensionVariable};
 
 use crate::experimental::ops::XlaArrayConstant;
 use crate::{Array, ArrayShard};
@@ -289,6 +289,11 @@ mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
+    use ryft_core::TypeError;
+    use ryft_core::arrays::{
+        ArrayType, Device, DeviceMesh, Dimension, DimensionBounds, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Sharding, ShardingDimension, StaticShape,
+    };
     use ryft_core::backends::arrays::Array as CpuArray;
     use ryft_core::batching::{BatchAxis, batch};
     use ryft_core::contexts::ProjectedContext;
@@ -307,9 +312,6 @@ mod tests {
         Rsqrt, Sign, Sin, Sqrt, Tanh,
     };
     use ryft_core::operations::tag::Tag;
-    use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
-    use ryft_core::types::{ArrayType, Dimension, DimensionBounds, Shape, StaticShape};
-    use ryft_core::{Sharding, TypeError};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::tests::{
@@ -722,8 +724,8 @@ mod tests {
     /// `ryft.test.add_one` handler at execution time.
     #[test]
     fn test_eager_custom_call_executes_registered_ffi_handler() {
+        use ryft_core::arrays::TiledLayout;
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
-        use ryft_core::types::TiledLayout;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();

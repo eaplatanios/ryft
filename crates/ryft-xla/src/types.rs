@@ -1,5 +1,6 @@
-use ryft_core::types::data::{DataType, DataTypeError};
-use ryft_core::types::layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
+use ryft_core::arrays::{
+    DataType, DataTypeError, Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout,
+};
 use ryft_pjrt::{
     BufferType, Layout as PjrtLayout, StridedLayout as PjrtStridedLayout, Tile as PjrtTile,
     TileDimension as PjrtTileDimension, TiledLayout as PjrtTiledLayout,
@@ -259,8 +260,7 @@ mod tests {
         TileDimension as PjrtTileDimension, TiledLayout as PjrtTiledLayout,
     };
 
-    use ryft_core::types::data::{DataType, DataTypeError};
-    use ryft_core::types::layouts::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
+    use ryft_core::arrays::{DataType, DataTypeError, Layout, StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
 

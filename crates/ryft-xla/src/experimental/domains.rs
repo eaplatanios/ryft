@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use ryft_core::InterpretationDriver;
+use ryft_core::arrays::{
+    ArrayIrType, ArrayType, DataType, Device, DeviceId, DeviceMesh, Dimension, DimensionBounds, DimensionType,
+    DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
+};
 use ryft_core::backends::array_programs::ArrayIrValue;
 #[cfg(test)]
 use ryft_core::backends::arrays::Array as ReferenceArray;
@@ -39,17 +44,7 @@ use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::BindingRegionDriver;
 use ryft_core::programs::types::{Type, TypeError, TypeRefinements, Typed};
 use ryft_core::programs::{ProgramError, ValueProjection};
-use ryft_core::sharding::{
-    Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
-};
 use ryft_core::tracing::DomainTracer;
-#[cfg(test)]
-use ryft_core::types::DimensionType;
-use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
-use ryft_core::types::{
-    ArrayIrType, ArrayType, DataType, Dimension, Layout, Memory, Shape, StaticShape, StridedLayout, Tile,
-    TileDimension, TiledLayout,
-};
 
 use super::lowering::XlaExecutableSignature;
 use super::operations::ShardMapOperation;
@@ -544,8 +539,7 @@ impl<'c> XlaDomain<'c> {
             let inputs = inputs
                 .iter()
                 .map(|input| {
-                    <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<ryft_core::DimensionType>>::projected(input)
-                        .cloned()
+                    <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<DimensionType>>::projected(input).cloned()
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let outputs = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().bind(
@@ -589,9 +583,7 @@ impl<'c> XlaDomain<'c> {
             }
             check_count!("input", inputs, 1, ProgramError);
             let dimension =
-                <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<ryft_core::DimensionType>>::projected(
-                    &inputs[0],
-                )?;
+                <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<DimensionType>>::projected(&inputs[0])?;
             let extent = i64::try_from(dimension.extent()).unwrap();
             let output_type = ArrayType::scalar(DataType::I64);
             let mesh = self.eager_mesh(client, &[], std::slice::from_ref(&output_type))?;
@@ -3527,7 +3519,7 @@ fn execute_pjrt_buffers<'c>(
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::Sharding;
+    use ryft_core::arrays::{Dimension, Sharding, ShardingDimension, StaticShape};
     use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::operations::compare::{CompareOperation, ComparisonDirection};
     use ryft_core::operations::constants::{ConstantOperation, Fill, OneOperation};
@@ -3541,8 +3533,6 @@ mod tests {
     use ryft_core::operations::manipulation::{BroadcastOperation, DynamicShapeSliceOperation, ReshapeOperation};
     use ryft_core::operations::math::{AddOperation, Atan2Operation, DivOperation, MulOperation, NegOperation};
     use ryft_core::programs::regions::CalleeRegionDriver;
-    use ryft_core::sharding::ShardingDimension;
-    use ryft_core::types::{Dimension, StaticShape};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};

@@ -727,6 +727,7 @@ pub(crate) mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::differentiation::forward::{
         DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,
@@ -750,7 +751,6 @@ pub(crate) mod tests {
     use crate::programs::types::{Type, TypeError, Typed};
     use crate::programs::values::{ProjectedValue, ValueProjection};
     use crate::tracing::{DomainTracingContext, Tracer, TracerState, TracingContext};
-    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 

@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Parameterized::broadcast_to_parameter_structure`.
 - Added an internal program representation (i.e., an intermediate representation or IR) in `ryft_core::programs`. This
   includes a type system in `ryft_core::programs::types`, that supports modeling data types, array types, layouts,
-  memory spaces, and sharding information (along with a new `ryft_core::sharding` module), and an effect system in
-  `ryft_core::programs::effects`.
+  memory spaces, and sharding information (along with a new `ryft_core::arrays::sharding` module), and an effect
+  system in `ryft_core::programs::effects`.
 - Added core abstractions for performing program tracing and transforming program traces in `ryft_core::contexts` and
   `ryft_core::tracing`.
 - Added program interpretation (i.e., execution or evaluation) machinery in `ryft_core::interpretation`.

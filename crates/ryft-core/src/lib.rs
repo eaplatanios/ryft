@@ -18,16 +18,20 @@ pub mod operations;
 pub mod parameters;
 pub mod partial;
 pub mod programs;
-pub mod sharding;
 pub mod tracing;
 pub mod tracing_v2;
-pub mod types;
 pub mod utilities;
 
 // TODO(eaplatanios): Make all of the following more specific.
+// `arrays` shares its public `sharding` and `types` submodule names with `operations` and `programs` respectively, so
+// these glob exports make those crate-level names ambiguous. P9 replaces these temporary glob exports with an explicit
+// facade; suppress the known ambiguity until that dedicated API increment.
+#[allow(ambiguous_glob_reexports)]
+pub use arrays::*;
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
-// Both `backends` and `types` currently expose public `arrays` and `dimensions` modules. P9 replaces these temporary
-// glob exports with an explicit facade; suppress the known ambiguity until that dedicated API increment.
+// Both `backends` and `operations` expose a public `dimensions` module, so these glob exports make the crate-level
+// `dimensions` name ambiguous. P9 replaces these temporary glob exports with an explicit facade; suppress the known
+// ambiguity until that dedicated API increment.
 #[allow(ambiguous_glob_reexports)]
 pub use backends::*;
 pub use batching::{
@@ -42,6 +46,10 @@ pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::*;
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
+// Both `differentiation` and `programs` expose a public `types` module, so these glob exports make the crate-level
+// `types` name ambiguous. P9 replaces these temporary glob exports with an explicit facade; suppress the known
+// ambiguity until that dedicated API increment.
+#[allow(ambiguous_glob_reexports)]
 pub use differentiation::*;
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
@@ -59,19 +67,18 @@ pub use partial::{
     PartiallyEvaluatableOperation, PartitionedProgram,
 };
 pub use programs::*;
-pub use sharding::*;
 pub use tracing::{
     DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,
     infer_output_type, trace,
 };
 pub use tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 pub use tracing_v2::rematerialization::RematerializeOperation;
-pub use types::*;
 
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::Cell;
 
+    use crate::arrays::ArrayType;
     use crate::batching::{
         BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
         RecursiveBatchingDriver, RecursiveBatchingPolicy,
@@ -84,7 +91,6 @@ pub(crate) mod tests {
     use crate::programs::regions::{RegionDriver, RegionInterface, RegionRef, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::programs::values::Value;
-    use crate::types::ArrayType;
 
     /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`](crate::Region) machinery
     /// (i.e., construction, interning and sharing, interface derivation, validation, effects propagation, rendering,

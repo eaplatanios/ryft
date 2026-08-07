@@ -10,10 +10,10 @@ use ryft_mlir::Block;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 
+use ryft_core::arrays::{
+    DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingError, StaticShape,
+};
 use ryft_core::parameters::{Parameter, Parameterized, ParameterizedFamily};
-use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingError};
-use ryft_core::types::StaticShape;
-use ryft_core::types::data::DataType;
 
 pub mod array;
 pub mod compiled_reshard;

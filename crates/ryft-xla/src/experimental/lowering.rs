@@ -5,7 +5,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 #[cfg(test)]
-use ryft_core::arrays::encoding::Complex as ComplexNumber;
+use ryft_core::arrays::Complex as ComplexNumber;
+use ryft_core::arrays::{
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory,
+    MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
+};
 use ryft_core::axes::AxisIndexOperation;
 use ryft_core::backends::arrays::Array as CpuArray;
 use ryft_core::backends::arrays::ArrayOperation;
@@ -47,10 +51,6 @@ use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::{RegionId, RegionRef};
 use ryft_core::programs::types::{Type as RyftType, Typed};
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
-use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::types::{
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Layout, MAX_DIMENSION_EXTENT, Memory, Shape,
-};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
 use ryft_mlir::{
@@ -5804,7 +5804,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     let stacked = |slice_type: &ArrayType| -> Result<ArrayType, LoweringError> {
         let mut dimensions = vec![length.clone()];
         dimensions.extend(slice_type.shape().dimensions().iter().cloned());
-        Ok(ArrayType::new(slice_type.data_type(), ryft_core::types::Shape::new(dimensions)))
+        Ok(ArrayType::new(slice_type.data_type(), ryft_core::arrays::Shape::new(dimensions)))
     };
 
     let initialize_accumulator = |slice_type: &ArrayType,
@@ -8517,7 +8517,10 @@ mod tests {
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
 
-    use ryft_core::arrays::encoding::{i1, i2, i4, u1, u2, u4};
+    use ryft_core::arrays::{
+        Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Sharding, ShardingDimension, i1, i2, i4, u1, u2, u4,
+    };
     use ryft_core::backends::arrays::Array as CpuArray;
     use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::backends::dimensions::DimensionOperation;
@@ -8541,9 +8544,6 @@ mod tests {
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::builders::ProgramBuilder;
-    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::types::dimensions::{DimensionBounds, DimensionType, DimensionVariable};
-    use ryft_core::types::{Dimension, Shape};
     use ryft_core::{EagerContext, TypeError};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -9245,7 +9245,7 @@ mod tests {
     fn test_broadcast_explicit_sharding_transition_executes_on_cpu() {
         use std::collections::HashMap;
 
-        use ryft_core::sharding::{Device, DeviceMesh};
+        use ryft_core::arrays::{Device, DeviceMesh};
         use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
         use ryft_pjrt::{ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
 
@@ -10751,8 +10751,8 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_gather() {
+        use ryft_core::arrays::{Dimension, DimensionBounds, DimensionVariable, Shape};
         use ryft_core::operations::manipulation::{GatherDimensionNumbers, GatherOperation};
-        use ryft_core::types::{Dimension, DimensionBounds, DimensionVariable, Shape};
 
         // Take whole rows of a [3, 2] matrix at the row indices in a [2, 1] index array: offset axis 1 carries the
         // row (slice sizes [1, 2]); axis 0 is collapsed (start-index driven). Output is [2, 2].
@@ -10809,8 +10809,8 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_clip_mode_gather_to_bare_op() {
+        use ryft_core::arrays::{Dimension, Shape};
         use ryft_core::operations::manipulation::{GatherDimensionNumbers, GatherOperation, GatherScatterMode};
-        use ryft_core::types::{Dimension, Shape};
 
         // `Clip` is StableHLO `gather`'s default out-of-bounds behavior, so a `Clip`-mode gather lowers to the bare
         // `stablehlo.gather` (no extra clamp ops) just like the in-bounds default rather than erroring.
@@ -10839,8 +10839,8 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_scatter() {
+        use ryft_core::arrays::{Dimension, Shape};
         use ryft_core::operations::manipulation::{ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
-        use ryft_core::types::{Dimension, Shape};
 
         // Scatter-add row updates into a [3, 2] operand at the row indices in a [2, 1] index array. Output is [3, 2],
         // and the Add combiner lowers to a `stablehlo.add` inside the scatter region.
@@ -11697,9 +11697,9 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_custom_call() {
+        use ryft_core::arrays::{StridedLayout, Tile, TileDimension, TiledLayout};
         use ryft_core::operations::custom_call::CustomCallOperation;
         use ryft_core::operations::debugging::PrintOperation;
-        use ryft_core::types::{StridedLayout, Tile, TileDimension, TiledLayout};
 
         // A side-effecting custom call lowers its typed attributes, complete memory-layout lists, buffer alias,
         // and one hidden ordered-I/O token. A second side-effecting call consumes that token even though the first
@@ -13344,8 +13344,8 @@ mod tests {
 
     #[test]
     fn test_jit_two_prints_execute_in_order_on_cpu() {
+        use ryft_core::arrays::{Device, DeviceMesh};
         use ryft_core::operations::debugging::Print;
-        use ryft_core::sharding::{Device, DeviceMesh};
         use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
         use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
@@ -14693,7 +14693,7 @@ mod tests {
 
         // Explicit physical layouts are traversed in logical row-major order before constructing the literal.
         let layout_type = ArrayType::new(DataType::I16, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
-            .with_layout(Some(ryft_core::types::StridedLayout::new(vec![2, 4]).into()));
+            .with_layout(Some(ryft_core::arrays::StridedLayout::new(vec![2, 4]).into()));
         let layout_literal = CpuArray::from_elements(layout_type, &[1_i16, 2, 3, 4]).unwrap();
         assert_eq!(layout_literal.storage_bytes(), values_to_bytes(&[1_i16, 3, 2, 4]));
         assert_eq!(test_literal_dense_bytes(&layout_literal, 8), values_to_bytes(&[1_i16, 2, 3, 4]));

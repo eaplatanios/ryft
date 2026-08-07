@@ -1,6 +1,7 @@
 use super::*;
 
-use ryft_core::{DataTypeError, ParameterError};
+use ryft_core::ParameterError;
+use ryft_core::arrays::DataTypeError;
 
 /// Error type for [`Array`](crate::Array) construction and execution-input preparation.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -74,7 +75,7 @@ pub enum ArrayError {
     /// [`shard_map`](mod@crate::experimental::shard_map)); the compiled reshard path uses the SPMD
     /// partitioner from the top level and can only plan `Auto` and `Explicit` axes.
     #[error("compiled reshard does not support `Manual` mesh axis {axis_name} (type {axis_type:?})")]
-    UnsupportedMeshAxisType { axis_name: String, axis_type: ryft_core::sharding::MeshAxisType },
+    UnsupportedMeshAxisType { axis_name: String, axis_type: ryft_core::arrays::sharding::MeshAxisType },
 
     /// Error returned when a destination device of a compiled reshard is not addressable from the
     /// current process. Cross-host destinations are not yet supported.

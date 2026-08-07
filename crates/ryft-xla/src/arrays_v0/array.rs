@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ryft_core::{ArrayType, DeviceMesh, Dimension, Shape, Sharding, Typed, check_sharding};
+use ryft_core::arrays::{ArrayType, DeviceMesh, Dimension, Shape, Sharding};
+use ryft_core::{Typed, check_sharding};
 use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays_v0::host::materialize_dense_array_bytes;

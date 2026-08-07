@@ -10,6 +10,7 @@
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
 
 use ryft_core::Typed;
+use ryft_core::arrays::{ArrayIrType, ArrayType, DeviceMesh};
 use ryft_core::backends::array_programs::ArrayIrValue;
 use ryft_core::captures::{CapturingContext, ClosedProgram};
 use ryft_core::compilation::{
@@ -22,9 +23,7 @@ use ryft_core::differentiation::{DifferentiableType, ForwardModeDifferentiate, R
 use ryft_core::operations::constants::Constant;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::programs::{ProgramError, ProjectedValue, Value, ValueProjection};
-use ryft_core::sharding::DeviceMesh;
 use ryft_core::tracing::{DomainTracingContext, Tracer};
-use ryft_core::types::{ArrayIrType, ArrayType};
 use ryft_pjrt::Execution;
 
 use crate::Array;
@@ -1265,6 +1264,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use ryft_core::arrays::{
+        ArrayIrType, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Sharding, ShardingDimension,
+    };
     use ryft_core::backends::array_programs::ArrayIrValue;
     use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
     use ryft_core::contexts::{Context, EagerContext};
@@ -1285,10 +1288,7 @@ mod tests {
     use ryft_core::programs::regions::CalleeRegionDriver;
     use ryft_core::programs::types::Typed;
     use ryft_core::programs::{ProgramError, ProjectedValue, Value, ValueProjection};
-    use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::DomainTracingContext;
-    use ryft_core::types::data::DataType;
-    use ryft_core::types::{ArrayIrType, ArrayType, Dimension, Shape};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
@@ -1724,8 +1724,8 @@ mod tests {
 
     #[test]
     fn test_jit_transfer_to_memory_round_trip_runs_end_to_end() {
+        use ryft_core::arrays::Memory;
         use ryft_core::operations::memory::TransferToMemory;
-        use ryft_core::types::Memory;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -2720,9 +2720,7 @@ mod tests {
         let abstract_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let abstract_input_type =
             ArrayType::new(DataType::F32, shape.clone()).with_sharding(abstract_sharding).unwrap();
-        let sharded =
-            Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
-                .unwrap();
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let xla_options = XlaOptions::new(mesh.clone()).with_in_shardings(vec![sharded.clone()]);
         let options = xla_options;
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
@@ -2783,9 +2781,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let shape = Shape::new(vec![Dimension::Static(4)]);
-        let sharded =
-            Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
-                .unwrap();
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         // Override the output sharding to the same 2-way shard along "x" so the partitioner
         // emits a fully-sharded output and `Array`'s sharding metadata matches.
@@ -2833,9 +2829,7 @@ mod tests {
         // The executable expects a 2-way shard along "x", but the caller will pass a fully
         // replicated array. `CompiledXlaFunction::interpret` should silently reshard before executing.
         let shape = Shape::new(vec![Dimension::Static(4)]);
-        let sharded =
-            Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
-                .unwrap();
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -2919,9 +2913,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let shape = Shape::new(vec![Dimension::Static(4)]);
-        let sharded =
-            Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
-                .unwrap();
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         let target_sharding = sharded.clone();
 
@@ -2989,9 +2981,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let shape = Shape::new(vec![Dimension::Static(4)]);
-        let sharded =
-            Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
-                .unwrap();
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         let constraint_a = replicated.clone();

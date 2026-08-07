@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::arrays::ArrayType;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchedProgram, BatchingContext,
     BatchingDriver, BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
@@ -21,7 +22,6 @@ use crate::programs::regions::{RegionInterface, RegionSlot};
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{DomainTracer, Trace};
-use crate::types::ArrayType;
 
 /// Canonical operation name for [`CustomJvpOperation`].
 pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
@@ -959,6 +959,7 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DataType, Dimension, Shape, ShardingDimension};
     use crate::axes::AxisIndexOperation;
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{
@@ -976,8 +977,6 @@ mod tests {
     use crate::programs::effects::Effects;
     use crate::programs::regions::RegionRole;
     use crate::programs::{Program, ProgramBuilder};
-    use crate::sharding::ShardingDimension;
-    use crate::types::{DataType, Dimension, Shape};
 
     use super::*;
 

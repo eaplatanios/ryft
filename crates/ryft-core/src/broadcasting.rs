@@ -3,9 +3,10 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
+use crate::arrays::{
+    ArrayType, DataType, DataTypeError, Dimension, Memory, Shape, Sharding, ShardingDimension, ShardingError,
+};
 use crate::parameters::{ParameterError, Parameterized};
-use crate::sharding::{Sharding, ShardingDimension, ShardingError};
-use crate::types::{ArrayType, DataType, DataTypeError, Dimension, Memory, Shape};
 
 /// Represents broadcasting-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -42,9 +43,9 @@ pub enum BroadcastingError {
 ///   - **Parameter Broadcasting:** Each concrete implementer defines what it means to combine two
 ///     [`Parameter`](crate::parameters::Parameter)s. For example, [`DataType`] uses data-type promotion, [`Shape`]
 ///     follows the standard [NumPy broadcasting rules](https://numpy.org/doc/stable/user/basics.broadcasting.html),
-///     and [`ArrayType`] combines both by broadcasting its [`DataType`] and [`Shape`].
-///     [`Layout`](crate::types::layouts::Layout) metadata is only preserved when both operands already agree on the
-///     same unchanged layout; otherwise the result leaves its layout unspecified.
+///     and [`ArrayType`] combines both by broadcasting its [`DataType`] and [`Shape`]. [`Layout`](crate::Layout)
+///     metadata is only preserved when both operands already agree on the same unchanged layout; otherwise the result
+///     leaves its layout unspecified.
 ///   - **Structural Broadcasting:** For [`Parameterized`] values whose leaves are [`ArrayType`]s, Ryft first aligns
 ///     the left-hand side to the target parameter structure using [`Parameterized::broadcast_to_parameter_structure`].
 ///     That alignment uses path-prefix broadcasting on named parameters, so a value with a smaller compatible parameter
@@ -79,8 +80,9 @@ pub enum BroadcastingError {
 ///
 /// ```rust
 /// # use ryft_core::broadcasting::{Broadcastable, BroadcastingError};
-/// # use ryft_core::types::data::DataType::{Boolean, F32, F64};
-/// # use ryft_core::types::{ArrayType, Shape};
+/// # use ryft_core::arrays::DataType::{Boolean, F32, F64};
+/// # use ryft_core::arrays::{ArrayType, Shape};
+///
 /// let x = Shape::new(vec![4.into(), 3.into()]);
 /// let y = Shape::new(vec![3.into()]);
 /// let z = Shape::new(vec![4.into(), 1.into()]);
@@ -317,9 +319,9 @@ impl<T: Parameterized<ArrayType>> Broadcastable for T {
 ///     incompatible and this function will return a [`BroadcastingError`].
 ///   - Rank promotion and outer-product style broadcasts preserve the contributing operand's [`Sharding`] on axes that
 ///     only one operand meaningfully contributes to.
-///   - Both operands must use the same [`LogicalMesh`](crate::sharding::LogicalMesh) when they are both sharded. After
-///     the per-axis dimensions are combined, reusing the same mesh axis across multiple result dimensions is treated as
-///     an incompatible broadcast, and for those cases, this function will return a [`BroadcastingError`].
+///   - Both operands must use the same [`LogicalMesh`](crate::LogicalMesh) when they are both sharded. After the
+///     per-axis dimensions are combined, reusing the same mesh axis across multiple result dimensions is treated as an
+///     incompatible broadcast, and for those cases, this function will return a [`BroadcastingError`].
 ///   - The [`Sharding::unreduced_axes`], [`Sharding::reduced_axes`], and [`Sharding::varying_manual_axes`] sets are
 ///     only preserved when both inputs already agree on them, or when only one operand carries sharding information.
 ///     Generic [`ArrayType`] broadcasting does not attempt primitive-specific manual-axis merges.
@@ -517,10 +519,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameterized;
 
+    use crate::arrays::DataType::*;
+    use crate::arrays::{
+        Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, StridedLayout, Tile, TileDimension, TiledLayout,
+    };
     use crate::parameters::{Parameter, ParameterError};
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType};
-    use crate::types::data::DataType::*;
-    use crate::types::{Layout, Shape, StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
 

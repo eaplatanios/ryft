@@ -43,6 +43,7 @@ use std::marker::PhantomData;
 
 use thiserror::Error;
 
+use crate::arrays::{ArrayType, Memory};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchedProgram, BatchingContext,
     BatchingDriver, BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
@@ -73,7 +74,6 @@ use crate::programs::regions::{Region, RegionId, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueId};
 use crate::tracing::{DomainTracer, Trace, TracingContext};
-use crate::types::{ArrayType, Memory};
 
 /// Higher-order operation used by checkpointing/rematerialization.
 ///
@@ -2146,16 +2146,18 @@ mod tests {
     use std::fmt::Debug;
     use std::rc::Rc;
 
+    use crate::arrays::{ArrayType, DataType, Dimension, Memory, Shape, ShardingDimension};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::operations::control_flow::ScanOperation;
     use crate::operations::math::{Cos, Dot, DotDimensionNumbers, Sin};
     use crate::operations::tag::Tag;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::regions::RegionRole;
-    use crate::sharding::ShardingDimension;
-    use crate::types::{ArrayType, DataType, Dimension, Memory, Shape};
+
+    use super::*;
 
     /// Shorthand for the policy contract over the `Array` array domain used throughout these tests.
     trait TestPolicy: RematerializationPolicy<ArrayType, ArrayOperation<Array>> + Clone + Debug {}
@@ -2213,8 +2215,6 @@ mod tests {
             .collect::<Vec<_>>();
         StagedRematerialization { regions }
     }
-
-    use super::*;
 
     /// Computes `f(x) = u * sin(u)` with `u = x · x`, whose linearization residuals span all three policy classes:
     /// `u` is produced by a dot, `sin(u)` by a sine, and the sine rule's `cos(u)` factor by a cosine.
@@ -2280,9 +2280,6 @@ mod tests {
     /// still produces the reference gradient (unsaved loop residuals recompute through the replayed known scan).
     #[test]
     fn test_rematerialization_policies_classify_residuals_inside_scan_bodies() {
-        use crate::operations::control_flow::ScanOperation;
-        use crate::types::Shape;
-
         // Loop body `[c, x] -> [c * (x · x)]` over three two-element rows: `f(c0) = c0 * Π |xᵢ|²`.
         let rows = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
         let squared_norms: Vec<f64> = rows.iter().map(|row| row.iter().map(|value| value * value).sum()).collect();

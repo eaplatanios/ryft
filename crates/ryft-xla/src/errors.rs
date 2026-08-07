@@ -1,9 +1,7 @@
 use thiserror::Error;
 
-use ryft_core::{
-    ArrayType, BroadcastingError, DataTypeError, Error as CoreError, LayoutError, ParameterError, Shape, ShardingError,
-    TypeError,
-};
+use ryft_core::arrays::{ArrayType, DataTypeError, LayoutError, Shape, ShardingError};
+use ryft_core::{BroadcastingError, Error as CoreError, ParameterError, TypeError};
 use ryft_pjrt::{DeviceId, Error as PjrtError};
 
 /// Represents errors that can occur in `ryft-xla`.

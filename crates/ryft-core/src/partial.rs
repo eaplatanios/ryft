@@ -1742,6 +1742,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::{Array, ArrayOperation, ArrayTracingContext};
     use crate::contexts::{Context, StagingContext};
     use crate::operations::constants::{ConstantOperation, Zero};
@@ -1752,7 +1753,6 @@ mod tests {
     use crate::programs::atoms::AtomId;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::values::Concretizable;
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

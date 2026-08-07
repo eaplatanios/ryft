@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::{ArrayType, DataType, Dimension, Shape};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
 };
@@ -26,7 +27,6 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::{Value, ValueProjection};
 use crate::tracing::{NestedTracingContext, TracingContext};
-use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 /// Represents axis-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -353,12 +353,12 @@ where
 /// [`NamedAxes`]. `NamedAxes` answers whether a name is in scope, while [`AxisIndex`] reads out the position along it.
 /// Resolution is validated against the active [`NamedAxes`] environment.
 pub trait AxisIndex: Context {
-    /// Returns a [`DataType::U64`](crate::DataType::U64) scalar giving the current element's position along `name`.
-    /// What that position counts follows the kind of binder that introduced the axis (refer to the documentation of
-    /// [`NamedAxis`] for more information): a batching axis of size `N` yields the current element's position in
-    /// `0..N`, and a device mesh axis yields the current shard's coordinate along that mesh axis. `U64` matches the
-    /// `usize` axis sizes the indices are drawn from and cannot be negative. A name that no enclosing binder binds will
-    /// result in [`AxisError::UnboundAxisName`].
+    /// Returns a [`DataType::U64`](DataType::U64) scalar giving the current element's position along `name`. What that
+    /// position counts follows the kind of binder that introduced the axis (refer to the documentation of [`NamedAxis`]
+    /// for more information): a batching axis of size `N` yields the current element's position in `0..N`, and a device
+    /// mesh axis yields the current shard's coordinate along that mesh axis. `U64` matches the `usize` axis sizes the
+    /// indices are drawn from and cannot be negative. A name that no enclosing binder binds will result in
+    /// [`AxisError::UnboundAxisName`].
     fn axis_index(&self, name: &str) -> Result<Self::Value, ProgramError>;
 }
 
@@ -548,12 +548,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType, Dimension, Shape};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{Batch, BatchAxis, BatchAxisSpecification, BatchingError, batch};
     use crate::contexts::EagerContext;
     use crate::programs::types::Typed;
     use crate::tracing::DomainTracingContext;
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 

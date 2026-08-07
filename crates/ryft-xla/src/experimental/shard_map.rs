@@ -11,6 +11,9 @@ use ryft_mlir::dialects::shardy::{
 };
 use thiserror::Error;
 
+use ryft_core::arrays::{
+    ArrayIrType, ArrayType, Dimension, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
+};
 use ryft_core::axes::NamedAxis;
 #[cfg(test)]
 use ryft_core::contexts::StagingContext;
@@ -21,9 +24,7 @@ use ryft_core::programs::operations::Operation;
 #[cfg(test)]
 use ryft_core::programs::types::Typed;
 use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError, ProjectedValue, Value, ValueProjection};
-use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::DomainTracingContext;
-use ryft_core::types::{ArrayIrType, ArrayType, Dimension, Shape};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::operations::ShardMapOperation;
@@ -609,7 +610,7 @@ where
 }
 
 /// Reshards one traced XLA value tree to target shardings, a tracked sharding transition over the mesh's
-/// [`Explicit`](ryft_core::sharding::MeshAxisType::Explicit) and [`Manual`](ryft_core::sharding::MeshAxisType::Manual)
+/// [`Explicit`](ryft_core::arrays::MeshAxisType::Explicit) and [`Manual`](ryft_core::arrays::MeshAxisType::Manual)
 /// axes.
 ///
 /// This stages a [`ReshardOperation`] per leaf, the analogue of JAX's
@@ -638,7 +639,7 @@ where
 }
 
 /// Records sharding-propagation hints on one traced XLA value tree over the mesh's
-/// [`Auto`](ryft_core::sharding::MeshAxisType::Auto) axes.
+/// [`Auto`](ryft_core::arrays::MeshAxisType::Auto) axes.
 ///
 /// This stages a [`ShardingConstraintOperation`] per leaf,
 /// mirroring [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):
@@ -672,7 +673,7 @@ where
 /// function-first shape of JAX's `shard_map` while adapting it to Rust and `tracing_v2` by
 /// requiring explicit `global_input_types`.
 ///
-/// Mesh axes whose type is [`Manual`](ryft_core::sharding::MeshAxisType::Manual) define the default
+/// Mesh axes whose type is [`Manual`](ryft_core::arrays::MeshAxisType::Manual) define the default
 /// manual axes of the computation. Structured `in_specs` and `out_specs` follow the same
 /// `Parameterized` layout as the corresponding input and output types. The body closure receives
 /// only the traced local inputs, which lets common cases compile cleanly as `|x| ...` or
@@ -718,7 +719,7 @@ where
 /// Stages a traced shard-map body with one explicit manual-axis subset and `check_vma` mode.
 ///
 /// `manual_axes` mirrors JAX's `axis_names`: when the list is empty, all mesh axes whose type is
-/// [`Manual`](ryft_core::sharding::MeshAxisType::Manual) are active for this shard-map. `check_vma`
+/// [`Manual`](ryft_core::arrays::MeshAxisType::Manual) are active for this shard-map. `check_vma`
 /// mirrors JAX's default output-validity check for omitted manual axes.
 ///
 /// # Parameters
@@ -854,7 +855,7 @@ impl ShardMap {
     /// Creates a `ShardMap` with one explicit manual-axis selection and `check_vma` mode.
     ///
     /// When `manual_axes` is empty, every mesh axis with type
-    /// [`Manual`](ryft_core::sharding::MeshAxisType::Manual) is treated as manual inside the body.
+    /// [`Manual`](ryft_core::arrays::MeshAxisType::Manual) is treated as manual inside the body.
     /// The constructor returns [`ShardMapError::MeshHasNoManualAxes`] if the resulting active set
     /// is empty.
     ///
@@ -2074,10 +2075,11 @@ mod tests {
     use crate::mlir::ToMlir;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, FromPjrt};
+    use ryft_core::arrays::{
+        DataType, Device, DeviceMesh, DimensionBounds, DimensionVariable, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension,
+    };
     use ryft_core::operations::math::{Dot, DotDimensionNumbers, Sin};
-    use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::types::data::DataType;
-    use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
 
     use super::*;
 

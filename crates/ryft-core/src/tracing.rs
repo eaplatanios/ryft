@@ -875,6 +875,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::axes::NamedAxes;
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::captures::{CaptureReference, CapturingContext};
@@ -888,7 +889,6 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::RegionInterface;
     use crate::programs::types::{TypeError, Typed};
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

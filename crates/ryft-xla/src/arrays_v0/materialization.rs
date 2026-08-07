@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
-use ryft_core::ArrayType;
+use ryft_core::arrays::ArrayType;
 
 use crate::Array;
 

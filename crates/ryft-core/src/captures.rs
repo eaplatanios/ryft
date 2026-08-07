@@ -509,6 +509,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+    };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
@@ -522,9 +525,6 @@ mod tests {
     };
     use crate::tests::TestRegionOperation;
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
-    use crate::types::{
-        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
-    };
 
     use super::*;
 

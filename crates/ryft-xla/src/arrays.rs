@@ -4,12 +4,12 @@ use std::fmt::{Debug, Display};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use ryft_core::arrays::{
+    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Sharding, ShardingDimension, ShardingError, StaticShape,
+};
 use ryft_core::compilation::CompilationContext;
 use ryft_core::programs::Value;
-use ryft_core::{
-    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Parameterized, ProjectedContext, Sharding,
-    ShardingDimension, ShardingError, StaticShape, Typed, check_sharding,
-};
+use ryft_core::{Parameter, Parameterized, ProjectedContext, Typed, check_sharding};
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
 
@@ -114,10 +114,10 @@ impl<'o> Drop for Array<'o> {
 impl<'o> Array<'o> {
     /// Creates an [`Array`] of type `r#type` from the provided _addressable_ [`Buffer`]s using the provided concrete
     /// [`DeviceMesh`] to determine what [`ArrayShard`]s make up the array and which ones correspond to the addressable
-    /// buffers. The provided [`ArrayType`] describes the global logical array. Its [`Shape`](ryft_core::Shape) must be
-    /// static, and it must normally contain [`Sharding`] metadata whose logical mesh matches `mesh`. As a convenience
-    /// for unsharded arrays, callers may omit the sharding information only when exactly one addressable buffer is
-    /// provided; in that case the array is treated as replicated over the provided `mesh`.
+    /// buffers. The provided [`ArrayType`] describes the global logical array. Its [`Shape`](ryft_core::arrays::Shape)
+    /// must be static, and it must normally contain [`Sharding`] metadata whose logical mesh matches `mesh`. As a
+    /// convenience for unsharded arrays, callers may omit the sharding information only when exactly one addressable
+    /// buffer is provided; in that case the array is treated as replicated over the provided `mesh`.
     ///
     /// Each [`Buffer`] is assigned to a global shard based on the [`DeviceId`] of its owning device. This function will
     /// return an [`Error::MultipleBuffersOnDevice`] if there are multiple buffers provided that are owned by the same
@@ -1208,11 +1208,11 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
-    use ryft_core::{
-        ArrayType, DataType, Device, DeviceMesh, Dimension, Error as CoreError, Layout, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StaticShape, TiledLayout, Typed,
+    use ryft_core::arrays::{
+        ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StaticShape, TiledLayout,
     };
+    use ryft_core::{Error as CoreError, Typed};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, load_cpu_plugin};
 
     use crate::tests::{device_mesh_2x2, logical_mesh_2x2, values_from_bytes, values_to_bytes};

@@ -1,7 +1,7 @@
 use crate::experimental::domains::XlaDomain;
 use crate::{Array, FromPjrt};
 
-use ryft_core::{ArrayType, Dimension, Shape};
+use ryft_core::arrays::{ArrayType, Dimension, Shape};
 
 use super::*;
 

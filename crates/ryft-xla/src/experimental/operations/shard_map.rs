@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use ryft_core::arrays::{ArrayIrType, ArrayType, LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationError, TransposableOperation,
@@ -16,12 +17,10 @@ use ryft_core::partial::{
 use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::{RegionInterface, RegionRef, RegionSlot};
 use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramError, ProjectedValue, Value, ValueProjection};
-use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::programs::types::{Type, TypeError, Typed};
-use ryft_core::types::{ArrayIrType, ArrayType};
 
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, materialize_transpose_cotangent};
 use crate::experimental::shard_map::{
@@ -1040,6 +1039,10 @@ where
 mod tests {
     use std::ops::{Deref, DerefMut};
 
+    use ryft_core::arrays::{
+        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
     use ryft_core::contexts::{Context, StagingContext};
     use ryft_core::differentiation::{
         DifferentiableType, DifferentiationError, TransposableOperation, TranspositionDriver,
@@ -1053,11 +1056,7 @@ mod tests {
     use ryft_core::programs::operations::Operation;
     use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionInterface, RegionRef};
     use ryft_core::programs::types::{TypeError, Typed};
-    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::{DomainTracingContext, TracingContext};
-    use ryft_core::types::{
-        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
-    };
 
     use crate::experimental::domains::XlaDomain;
     use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};

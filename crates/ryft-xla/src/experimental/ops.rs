@@ -52,6 +52,7 @@ use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface, RegionSl
 use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, ProgramError, Value, ValueProjection};
 use ryft_core::tracing::{Tracer, TracingContext};
 
+use ryft_core::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
 use ryft_core::axes::AxisIndexOperation;
 use ryft_core::backends::array_programs::ArrayIrOperation;
 use ryft_core::backends::arrays::{Array as ReferenceArray, ArrayOperation};
@@ -65,7 +66,6 @@ use ryft_core::operations::tag::TagOperation;
 use ryft_core::programs::types::{Type, TypeError, Typed};
 use ryft_core::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
-use ryft_core::types::{ArrayIrType, ArrayType, Dimension, DimensionType};
 
 use crate::experimental::operations::ShardMapOperation;
 
@@ -979,6 +979,10 @@ where
 mod tests {
     use std::rc::Rc;
 
+    use ryft_core::arrays::{
+        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
     use ryft_core::backends::array_programs::ArrayIrOperation;
     use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::contexts::StagingContext;
@@ -996,11 +1000,7 @@ mod tests {
     use ryft_core::programs::operations::Operation;
     use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionInterface, RegionRef};
     use ryft_core::programs::types::Typed;
-    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::TracingContext;
-    use ryft_core::types::{
-        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
-    };
 
     use super::{
         JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder,
@@ -1478,11 +1478,11 @@ mod tests {
 
     #[test]
     fn test_rematerialization_policies_are_available_for_the_xla_operation_family() {
+        use ryft_core::arrays::Memory;
         use ryft_core::tracing_v2::{
             DotsSaveable, DotsWithNoBatchDimsSaveable, EverythingSaveable, NothingSaveable, OffloadDotsWithNoBatchDims,
             RematerializationPolicy, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
         };
-        use ryft_core::types::Memory;
 
         // The built-in rematerialization policies — including the projection-bounded dot and tag policies and the
         // transfer-bounded offloading policies — are available for `XlaOperation` through the derive-generated

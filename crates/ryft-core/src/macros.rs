@@ -174,7 +174,7 @@ macro_rules! check_sharding {
         let mesh = &$mesh;
         let sharding = &$sharding;
         if mesh.logical_mesh() != sharding.mesh() {
-            return Err($crate::ShardingError::MeshMismatch {
+            return Err($crate::arrays::ShardingError::MeshMismatch {
                 expected: mesh.logical_mesh().clone(),
                 actual: sharding.mesh().clone(),
             }
@@ -280,9 +280,9 @@ macro_rules! define_arithmetic_dimension_operation {
         impl $operation {
             /// Creates a new operation and derives its fresh bounded result dimension.
             pub fn new(
-                left: &$crate::types::DimensionType,
-                right: &$crate::types::DimensionType,
-            ) -> Result<Self, $crate::types::DimensionError> {
+                left: &$crate::arrays::DimensionType,
+                right: &$crate::arrays::DimensionType,
+            ) -> Result<Self, $crate::arrays::DimensionError> {
                 let result_name = ($result_name)(left, right);
                 let (result_bounds, requires_runtime_assertion) = ($infer_bounds)(left, right)?;
                 Ok(Self {
@@ -296,15 +296,15 @@ macro_rules! define_arithmetic_dimension_operation {
                 })
             }
 
-            /// Returns the expected left operand [`DimensionType`](crate::types::DimensionType).
+            /// Returns the expected left operand [`DimensionType`](crate::DimensionType).
             #[inline]
-            pub fn left_type(&self) -> &$crate::types::DimensionType {
+            pub fn left_type(&self) -> &$crate::arrays::DimensionType {
                 self.metadata.left_type()
             }
 
-            /// Returns the expected right operand [`DimensionType`](crate::types::DimensionType).
+            /// Returns the expected right operand [`DimensionType`](crate::DimensionType).
             #[inline]
-            pub fn right_type(&self) -> &$crate::types::DimensionType {
+            pub fn right_type(&self) -> &$crate::arrays::DimensionType {
                 self.metadata.right_type()
             }
 
@@ -316,7 +316,7 @@ macro_rules! define_arithmetic_dimension_operation {
 
             /// Returns the bounds of a freshly inferred result variable.
             #[inline]
-            pub fn result_bounds(&self) -> $crate::types::DimensionBounds {
+            pub fn result_bounds(&self) -> $crate::arrays::DimensionBounds {
                 self.metadata.result_bounds()
             }
         }
@@ -333,7 +333,7 @@ macro_rules! define_arithmetic_dimension_operation {
         }
 
         impl $crate::programs::operations::Operation for $operation {
-            type Type = $crate::types::DimensionType;
+            type Type = $crate::arrays::DimensionType;
 
             #[inline]
             fn name(&self) -> &'static str {
@@ -343,9 +343,9 @@ macro_rules! define_arithmetic_dimension_operation {
             #[inline]
             fn infer_output_types(
                 &self,
-                input_types: &[$crate::types::DimensionType],
-                _region_interfaces: &[$crate::programs::regions::RegionInterface<$crate::types::DimensionType>],
-            ) -> Result<Vec<$crate::types::DimensionType>, $crate::programs::types::TypeError> {
+                input_types: &[$crate::arrays::DimensionType],
+                _region_interfaces: &[$crate::programs::regions::RegionInterface<$crate::arrays::DimensionType>],
+            ) -> Result<Vec<$crate::arrays::DimensionType>, $crate::programs::types::TypeError> {
                 $crate::operations::dimensions::ArithmeticDimensionOperation::infer_output_types(self, input_types)
             }
 
@@ -361,7 +361,7 @@ macro_rules! define_arithmetic_dimension_operation {
             #[inline]
             fn rename_type_identities(
                 &self,
-                renaming: &$crate::programs::identities::TypeIdentityRenaming<$crate::types::DimensionVariable>,
+                renaming: &$crate::programs::identities::TypeIdentityRenaming<$crate::arrays::DimensionVariable>,
             ) -> Result<Self, $crate::programs::types::TypeError> {
                 Ok(Self { metadata: self.metadata.rename_type_identities(renaming)? })
             }
@@ -369,12 +369,12 @@ macro_rules! define_arithmetic_dimension_operation {
 
         impl $crate::operations::dimensions::ArithmeticDimensionOperation for $operation {
             #[inline]
-            fn left_type(&self) -> &$crate::types::DimensionType {
+            fn left_type(&self) -> &$crate::arrays::DimensionType {
                 $operation::left_type(self)
             }
 
             #[inline]
-            fn right_type(&self) -> &$crate::types::DimensionType {
+            fn right_type(&self) -> &$crate::arrays::DimensionType {
                 $operation::right_type(self)
             }
 
@@ -384,14 +384,14 @@ macro_rules! define_arithmetic_dimension_operation {
             }
 
             #[inline]
-            fn result_bounds(&self) -> $crate::types::DimensionBounds {
+            fn result_bounds(&self) -> $crate::arrays::DimensionBounds {
                 $operation::result_bounds(self)
             }
         }
 
         impl<
             __C: $crate::contexts::Domain<
-                Type = $crate::types::DimensionType,
+                Type = $crate::arrays::DimensionType,
                 Value: $capability,
             >,
         > $crate::interpretation::InterpretableOperation<__C> for $operation
@@ -418,7 +418,7 @@ macro_rules! define_arithmetic_dimension_operation {
 
         impl<
             __C: $crate::contexts::Context<
-                Type = $crate::types::DimensionType,
+                Type = $crate::arrays::DimensionType,
                 Operation: ::std::convert::From<Self>,
             >,
         > $crate::partial::PartiallyEvaluatableOperation<__C> for $operation
@@ -466,14 +466,14 @@ macro_rules! define_arithmetic_dimension_capability {
         $operation:ident $(,)?
     ) => {
         $(#[$capability_documentation])*
-        pub trait $capability: $crate::programs::types::Typed<Type = $crate::types::DimensionType> + Sized {
+        pub trait $capability: $crate::programs::types::Typed<Type = $crate::arrays::DimensionType> + Sized {
             $(#[$method_documentation])*
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::programs::ProgramError>;
         }
 
-        impl<__V: $crate::programs::values::Value<Type = $crate::types::DimensionType>> $capability for __V
+        impl<__V: $crate::programs::values::Value<Type = $crate::arrays::DimensionType>> $capability for __V
         where
-            __V::DispatchDomain: $crate::contexts::Context<Type = $crate::types::DimensionType>,
+            __V::DispatchDomain: $crate::contexts::Context<Type = $crate::arrays::DimensionType>,
             <__V::DispatchDomain as $crate::contexts::Domain>::Operation: ::std::convert::From<$operation>,
         {
             #[inline]
@@ -573,8 +573,8 @@ macro_rules! define_elementwise_operation {
     ) => {
         $crate::define_elementwise_operation!(@marker [$(#[$documentation])*] $operation, $name);
 
-        impl $crate::Operation for $operation<$crate::DataType> {
-            type Type = $crate::DataType;
+        impl $crate::Operation for $operation<$crate::arrays::DataType> {
+            type Type = $crate::arrays::DataType;
 
             #[inline]
             fn name(&self) -> &'static str {
@@ -584,12 +584,12 @@ macro_rules! define_elementwise_operation {
             #[inline]
             fn infer_output_types(
                 &self,
-                input_types: &[$crate::DataType],
-                _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
-            ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
+                input_types: &[$crate::arrays::DataType],
+                _region_interfaces: &[$crate::RegionInterface<$crate::arrays::DataType>],
+            ) -> Result<Vec<$crate::arrays::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
                 $($($crate::check_types!($(@$data_type_check)+, $name, input_types);)*)?
-                let output_types: Result<Vec<$crate::DataType>, $crate::TypeError> =
+                let output_types: Result<Vec<$crate::arrays::DataType>, $crate::TypeError> =
                     $crate::define_elementwise_operation!(@infer_data_types [$($infer_data_types)?] @unary input_types);
                 let output_types = output_types?;
                 $crate::check_count!("output", output_types, 1, TypeError);
@@ -597,8 +597,8 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl $crate::Operation for $operation<$crate::ArrayType> {
-            type Type = $crate::ArrayType;
+        impl $crate::Operation for $operation<$crate::arrays::ArrayType> {
+            type Type = $crate::arrays::ArrayType;
 
             #[inline]
             fn name(&self) -> &'static str {
@@ -608,14 +608,14 @@ macro_rules! define_elementwise_operation {
             #[inline]
             fn infer_output_types(
                 &self,
-                input_types: &[$crate::ArrayType],
-                _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
-            ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
+                input_types: &[$crate::arrays::ArrayType],
+                _region_interfaces: &[$crate::RegionInterface<$crate::arrays::ArrayType>],
+            ) -> Result<Vec<$crate::arrays::ArrayType>, $crate::TypeError> {
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
 
-        impl $crate::ElementwiseOperation for $operation<$crate::ArrayType> {
+        impl $crate::ElementwiseOperation for $operation<$crate::arrays::ArrayType> {
             #[inline]
             fn input_count(&self) -> usize {
                 1
@@ -624,12 +624,12 @@ macro_rules! define_elementwise_operation {
             #[inline]
             fn infer_output_types(
                 &self,
-                input_types: &[$crate::ArrayType],
-            ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
+                input_types: &[$crate::arrays::ArrayType],
+            ) -> Result<Vec<$crate::arrays::ArrayType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
                 $($($crate::check_types!($(@$data_type_check)+, $name, &[input_types[0].data_type()]);)*)?
                 $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
-                let output_types: Result<Vec<$crate::ArrayType>, $crate::TypeError> =
+                let output_types: Result<Vec<$crate::arrays::ArrayType>, $crate::TypeError> =
                     $crate::define_elementwise_operation!(
                         @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @unary self,
                         input_types,
@@ -678,8 +678,8 @@ macro_rules! define_elementwise_operation {
     ) => {
         $crate::define_elementwise_operation!(@marker [$(#[$documentation])*] $operation, $name);
 
-        impl $crate::Operation for $operation<$crate::DataType> {
-            type Type = $crate::DataType;
+        impl $crate::Operation for $operation<$crate::arrays::DataType> {
+            type Type = $crate::arrays::DataType;
 
             #[inline]
             fn name(&self) -> &'static str {
@@ -689,12 +689,12 @@ macro_rules! define_elementwise_operation {
             #[inline]
             fn infer_output_types(
                 &self,
-                input_types: &[$crate::DataType],
-                _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
-            ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
+                input_types: &[$crate::arrays::DataType],
+                _region_interfaces: &[$crate::RegionInterface<$crate::arrays::DataType>],
+            ) -> Result<Vec<$crate::arrays::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
                 $($($crate::check_types!($(@$data_type_selector)+, $name, input_types);)*)?
-                let output_types: Result<Vec<$crate::DataType>, $crate::TypeError> =
+                let output_types: Result<Vec<$crate::arrays::DataType>, $crate::TypeError> =
                     $crate::define_elementwise_operation!(
                         @infer_data_types [$($infer_data_types)?] @binary input_types,
                         $name,
@@ -705,8 +705,8 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl $crate::Operation for $operation<$crate::ArrayType> {
-            type Type = $crate::ArrayType;
+        impl $crate::Operation for $operation<$crate::arrays::ArrayType> {
+            type Type = $crate::arrays::ArrayType;
 
             #[inline]
             fn name(&self) -> &'static str {
@@ -716,14 +716,14 @@ macro_rules! define_elementwise_operation {
             #[inline]
             fn infer_output_types(
                 &self,
-                input_types: &[$crate::ArrayType],
-                _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
-            ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
+                input_types: &[$crate::arrays::ArrayType],
+                _region_interfaces: &[$crate::RegionInterface<$crate::arrays::ArrayType>],
+            ) -> Result<Vec<$crate::arrays::ArrayType>, $crate::TypeError> {
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
 
-        impl $crate::ElementwiseOperation for $operation<$crate::ArrayType> {
+        impl $crate::ElementwiseOperation for $operation<$crate::arrays::ArrayType> {
             #[inline]
             fn input_count(&self) -> usize {
                 2
@@ -732,8 +732,8 @@ macro_rules! define_elementwise_operation {
             #[inline]
             fn infer_output_types(
                 &self,
-                input_types: &[$crate::ArrayType],
-            ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
+                input_types: &[$crate::arrays::ArrayType],
+            ) -> Result<Vec<$crate::arrays::ArrayType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
                 $($($crate::check_types!(
                     $(@$data_type_selector)+,
@@ -741,7 +741,7 @@ macro_rules! define_elementwise_operation {
                     &[input_types[0].data_type(), input_types[1].data_type()],
                 );)*)?
                 $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
-                let output_types: Result<Vec<$crate::ArrayType>, $crate::TypeError> =
+                let output_types: Result<Vec<$crate::arrays::ArrayType>, $crate::TypeError> =
                     $crate::define_elementwise_operation!(
                         @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @binary self,
                         input_types,
@@ -821,7 +821,7 @@ macro_rules! define_elementwise_operation {
 
     // This internal branch supplies the default type-preserving inference for unary operations.
     (@infer_data_types [] @unary $input_types:expr $(,)?) => {
-        Ok::<Vec<$crate::DataType>, $crate::TypeError>(vec![$input_types[0]])
+        Ok::<Vec<$crate::arrays::DataType>, $crate::TypeError>(vec![$input_types[0]])
     };
 
     // This internal branch supplies the default broadcasting inference for binary data types.
@@ -868,7 +868,7 @@ macro_rules! define_elementwise_operation {
         @infer_default_array_types [$($infer_data_types:expr)?] @$arity:ident
         $operation:expr, $input_types:expr, $input_data_types:expr $(, $name:ident)?
     ) => {{
-        let output_data_types: Result<Vec<$crate::DataType>, $crate::TypeError> =
+        let output_data_types: Result<Vec<$crate::arrays::DataType>, $crate::TypeError> =
             $crate::define_elementwise_operation!(
             @infer_data_types [$($infer_data_types)?] @$arity $input_data_types $(, $name)?
         );
@@ -876,7 +876,7 @@ macro_rules! define_elementwise_operation {
         $crate::check_count!("output", output_data_types, 1, TypeError);
         let output_type = $crate::ElementwiseOperation::infer_elementwise_broadcast_type($operation, $input_types)?
             .with_data_type(output_data_types[0]);
-        Ok::<Vec<$crate::ArrayType>, $crate::TypeError>(vec![output_type])
+        Ok::<Vec<$crate::arrays::ArrayType>, $crate::TypeError>(vec![output_type])
     }};
 }
 
@@ -2904,12 +2904,12 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait
+        impl<__C: $crate::Context<Type = $crate::arrays::ArrayType>> $trait
             for $crate::BatchingTracer<__C, $crate::ArrayBatching>
         where
             $crate::BatchingContext<__C, $crate::ArrayBatching>: $crate::Context<
                     Value = $crate::BatchingTracer<__C, $crate::ArrayBatching>,
-                    Operation: ::std::convert::From<$operation<$crate::ArrayType>>,
+                    Operation: ::std::convert::From<$operation<$crate::arrays::ArrayType>>,
                 >,
         {
             type Output = Self;
@@ -2990,7 +2990,7 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context<Type = $crate::ArrayType>> $trait
+        impl<__C: $crate::Context<Type = $crate::arrays::ArrayType>> $trait
             for $crate::BatchingTracer<__C, $crate::ArrayBatching>
         where
             Self: $capability,
@@ -3040,7 +3040,9 @@ macro_rules! define_tracer_operator {
 /// [`AddOperation`](crate::AddOperation):
 ///
 /// ```rust
-/// # use ryft_core::{AddOperation, DataType, check_operation_type_inference};
+/// # use ryft_core::arrays::DataType;
+/// # use ryft_core::{AddOperation, check_operation_type_inference};
+///
 /// check_operation_type_inference!(
 ///     @elementwise @binary,
 ///     operation = AddOperation,
@@ -3061,7 +3063,9 @@ macro_rules! define_tracer_operator {
 /// of [`SinOperation`](crate::SinOperation):
 ///
 /// ```rust
-/// # use ryft_core::{ArrayType, DataType, SinOperation, check_operation_type_inference};
+/// # use ryft_core::arrays::{ArrayType, DataType};
+/// # use ryft_core::{SinOperation, check_operation_type_inference};
+///
 /// check_operation_type_inference!(
 ///     @reject @unreduced,
 ///     operation = SinOperation::<ArrayType>::new(),
@@ -3095,7 +3099,7 @@ macro_rules! check_operation_type_inference {
         operation = $operation:ident,
         cases = [$( { $($case:tt)* } ),+ $(,)?] $(,)?
     ) => {{
-        let data_operation = $operation::<$crate::types::DataType>::new();
+        let data_operation = $operation::<$crate::arrays::DataType>::new();
         $($crate::check_operation_type_inference!(
             @elementwise_unary_case data_operation, $operation, { $($case)* }
         );)+
@@ -3109,7 +3113,7 @@ macro_rules! check_operation_type_inference {
         operation = $operation:ident,
         cases = [$( { $($case:tt)* } ),+ $(,)?] $(,)?
     ) => {{
-        let data_operation = $operation::<$crate::types::DataType>::new();
+        let data_operation = $operation::<$crate::arrays::DataType>::new();
         $($crate::check_operation_type_inference!(
             @elementwise_binary_case data_operation, $operation, { $($case)* }
         );)+
@@ -3134,15 +3138,15 @@ macro_rules! check_operation_type_inference {
     ) => {{
         let operation = $operation;
         let descriptor = $crate::programs::operations::Operation::name(&operation);
-        let mesh = $crate::sharding::LogicalMesh::new(vec![
-            $crate::sharding::MeshAxis::new("x", 2, $crate::sharding::MeshAxisType::Explicit).unwrap(),
+        let mesh = $crate::arrays::sharding::LogicalMesh::new(vec![
+            $crate::arrays::sharding::MeshAxis::new("x", 2, $crate::arrays::sharding::MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
         let input_types = vec![$($input_type),+]
             .into_iter()
             .map(|input_type| {
-                let dimensions = vec![$crate::sharding::ShardingDimension::Replicated; input_type.rank()];
-                let sharding = $crate::sharding::Sharding::new(mesh.clone(), dimensions)
+                let dimensions = vec![$crate::arrays::sharding::ShardingDimension::Replicated; input_type.rank()];
+                let sharding = $crate::arrays::sharding::Sharding::new(mesh.clone(), dimensions)
                     .unwrap()
                     .with_unreduced_axes(["x"])
                     .unwrap();
@@ -3166,14 +3170,14 @@ macro_rules! check_operation_type_inference {
     ) => {{
         let operation = $operation;
         let descriptor = $crate::programs::operations::Operation::name(&operation);
-        let mesh = $crate::sharding::LogicalMesh::new(vec![
-            $crate::sharding::MeshAxis::new("x", 2, $crate::sharding::MeshAxisType::Explicit).unwrap(),
+        let mesh = $crate::arrays::sharding::LogicalMesh::new(vec![
+            $crate::arrays::sharding::MeshAxis::new("x", 2, $crate::arrays::sharding::MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let plain = |input_type: $crate::types::ArrayType| {
-            let dimensions = vec![$crate::sharding::ShardingDimension::Replicated; input_type.rank()];
+        let plain = |input_type: $crate::arrays::ArrayType| {
+            let dimensions = vec![$crate::arrays::sharding::ShardingDimension::Replicated; input_type.rank()];
             input_type
-                .with_sharding($crate::sharding::Sharding::new(mesh.clone(), dimensions).unwrap())
+                .with_sharding($crate::arrays::sharding::Sharding::new(mesh.clone(), dimensions).unwrap())
                 .unwrap()
         };
         let left = plain($left_type);
@@ -3237,9 +3241,9 @@ macro_rules! check_operation_type_inference {
             output_data_types = [$($output_data_type:expr),* $(,)?] $(,)?
         }
     ) => {{
-        let array_operation = $operation::<$crate::types::ArrayType>::new();
+        let array_operation = $operation::<$crate::arrays::ArrayType>::new();
         let input_data_type = $input_data_type;
-        let output_data_types: ::std::vec::Vec<$crate::types::DataType> = ::std::vec![$($output_data_type),*];
+        let output_data_types: ::std::vec::Vec<$crate::arrays::DataType> = ::std::vec![$($output_data_type),*];
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(
                 &$data_operation,
@@ -3248,12 +3252,15 @@ macro_rules! check_operation_type_inference {
             ),
             Ok(output_data_types.clone()),
         );
-        let input_type = $crate::types::ArrayType::new(
+        let input_type = $crate::arrays::ArrayType::new(
             input_data_type,
-            $crate::types::Shape::new(vec![$crate::types::Dimension::Static(2), $crate::types::Dimension::Static(3)]),
+            $crate::arrays::Shape::new(vec![
+                $crate::arrays::Dimension::Static(2),
+                $crate::arrays::Dimension::Static(3),
+            ]),
         )
-        .with_layout($crate::types::Layout::Strided($crate::types::StridedLayout::new(vec![3, 1])))
-        .with_memory($crate::types::Memory::Host { pinned: true });
+        .with_layout($crate::arrays::Layout::Strided($crate::arrays::StridedLayout::new(vec![3, 1])))
+        .with_memory($crate::arrays::Memory::Host { pinned: true });
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(
                 &array_operation,
@@ -3290,10 +3297,10 @@ macro_rules! check_operation_type_inference {
             output_data_types = [$($output_data_type:expr),* $(,)?] $(,)?
         }
     ) => {{
-        let array_operation = $operation::<$crate::types::ArrayType>::new();
+        let array_operation = $operation::<$crate::arrays::ArrayType>::new();
         let left_data_type = $left_data_type;
         let right_data_type = $right_data_type;
-        let output_data_types: ::std::vec::Vec<$crate::types::DataType> = ::std::vec![$($output_data_type),*];
+        let output_data_types: ::std::vec::Vec<$crate::arrays::DataType> = ::std::vec![$($output_data_type),*];
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(
                 &$data_operation,
@@ -3302,12 +3309,15 @@ macro_rules! check_operation_type_inference {
             ),
             Ok(output_data_types.clone()),
         );
-        let left_type = $crate::types::ArrayType::new(
+        let left_type = $crate::arrays::ArrayType::new(
             left_data_type,
-            $crate::types::Shape::new(vec![$crate::types::Dimension::Static(2), $crate::types::Dimension::Static(3)]),
+            $crate::arrays::Shape::new(vec![
+                $crate::arrays::Dimension::Static(2),
+                $crate::arrays::Dimension::Static(3),
+            ]),
         )
-        .with_layout($crate::types::Layout::Strided($crate::types::StridedLayout::new(vec![3, 1])))
-        .with_memory($crate::types::Memory::Host { pinned: true });
+        .with_layout($crate::arrays::Layout::Strided($crate::arrays::StridedLayout::new(vec![3, 1])))
+        .with_memory($crate::arrays::Memory::Host { pinned: true });
         let right_type = left_type.clone().with_data_type(right_data_type);
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(
@@ -3429,7 +3439,8 @@ macro_rules! check_operation_type_inference {
 /// input when interpreting that residual program, and the resulting output is compared with the declared value:
 ///
 /// ```rust
-/// # use ryft_core::{AddOperation, Array, ArrayType, DataType, check_operation_partial_evaluation};
+/// # use ryft_core::arrays::{ArrayType, DataType};
+/// # use ryft_core::{AddOperation, Array, check_operation_partial_evaluation};
 ///
 /// check_operation_partial_evaluation!(
 ///     operation = AddOperation::new(),
@@ -3700,7 +3711,7 @@ macro_rules! check_operation_batching {
             driver = &$crate::programs::regions::EmptyRegionDriver,
             operation = $operation,
             axis_size = $axis_size,
-            axis_sharding = $crate::sharding::ShardingDimension::Replicated,
+            axis_sharding = $crate::arrays::sharding::ShardingDimension::Replicated,
             cases = $cases,
         )
     };
@@ -3721,7 +3732,7 @@ macro_rules! check_operation_batching {
             driver = &$crate::programs::regions::EmptyRegionDriver,
             operation = $operation,
             axis_size = $axis_size,
-            axis_sharding = $crate::sharding::ShardingDimension::Replicated,
+            axis_sharding = $crate::arrays::sharding::ShardingDimension::Replicated,
             cases = $cases,
         )
     };
@@ -4028,7 +4039,9 @@ macro_rules! check_operation_differentiation {
 ///
 /// ```rust
 /// # use indoc::indoc;
-/// # use ryft_core::{Array, ArrayType, DataType, MulOperation, check_operation_transposition};
+/// # use ryft_core::arrays::{ArrayType, DataType};
+/// # use ryft_core::{Array, MulOperation, check_operation_transposition};
+///
 /// check_operation_transposition!(
 ///     @exact,
 ///     operation = MulOperation::new(),
@@ -4357,7 +4370,7 @@ macro_rules! check_gradient {
         let input_type = $crate::programs::types::Typed::r#type(&input).into_owned();
         let element_count = $crate::backends::arrays::Array::materialized_element_count(&input_type).unwrap();
         match input_type.data_type() {
-            $crate::types::DataType::F64 => {
+            $crate::arrays::DataType::F64 => {
                 let perturbed = |index: usize, delta: f64| {
                     let mut values = input.to_f64s();
                     values[index] += delta;
@@ -4369,10 +4382,10 @@ macro_rules! check_gradient {
                 let estimate = $crate::backends::arrays::Array::from_f64s(input_type.clone(), estimates);
                 ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
             }
-            $crate::types::DataType::C128 => {
+            $crate::arrays::DataType::C128 => {
                 // Per input element, the two central differences estimate the real partials that assemble the
                 // conjugate steepest-ascent gradient `complex(∂f/∂re, -∂f/∂im)`.
-                let part_type = input_type.clone().with_data_type($crate::types::DataType::F64);
+                let part_type = input_type.clone().with_data_type($crate::arrays::DataType::F64);
                 let real_values = $crate::operations::complex::Real::real(&input).unwrap().to_f64s();
                 let imaginary_values = $crate::operations::complex::Imaginary::imaginary(&input).unwrap().to_f64s();
                 let perturbed = |index: usize, real_delta: f64, imaginary_delta: f64| {
@@ -4428,6 +4441,10 @@ mod tests {
     use indoc::indoc;
     use num_complex::Complex;
 
+    use crate::arrays::{
+        ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionType,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
+    };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
@@ -4458,11 +4475,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::{Type, TypeError, Typed};
     use crate::programs::values::ValueProjection;
-    use crate::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingError};
     use crate::tracing::{Tracer, TracingContext};
-    use crate::types::{
-        ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable, Shape,
-    };
 
     const TEST_UNARY_OPERATION_NAME: &str = "test_unary";
     const TEST_BINARY_OPERATION_NAME: &str = "test_binary";
@@ -5468,7 +5481,7 @@ mod tests {
             driver = &EmptyRegionDriver,
             operation = TestPairOperation,
             axis_size = 2,
-            axis_sharding = crate::ShardingDimension::Replicated,
+            axis_sharding = ShardingDimension::Replicated,
             cases = [
                 {
                     inputs = [

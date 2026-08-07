@@ -2380,7 +2380,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
           an enum variant; and targeted core/macro/XLA tests plus residual path searches pass.
   - [ ] Move every array-language-specific type out of the top-level `types` hierarchy and give it one canonical home
         under `ryft_core::arrays`:
-    - [ ] Move `DataType`/`DataTypeError` under `arrays::data`; after the scalar backend is deleted, these describe array
+    - [x] Move `DataType`/`DataTypeError` under `arrays::data`; after the scalar backend is deleted, these describe array
           element data rather than an independent scalar execution universe.
     - [ ] Move `ArrayType`/`ArrayTypeRefinements` into the array hierarchy and expose them canonically as
           `ryft_core::arrays::ArrayType` and `ryft_core::arrays::ArrayTypeRefinements`.
@@ -2389,14 +2389,14 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
           `arrays::dimensions`, with the commonly used type vocabulary re-exported from `arrays`.
     - [ ] Move `ArrayIrType`/`ArrayIrTypeRefinements` beside `ArrayIrValue` in `arrays::ir`, move `ArrayIrOperation` to
           `arrays::operations`, and re-export all four canonical IR names from `arrays` for concise public signatures.
-    - [ ] Move `Layout`, `StridedLayout`, `Tile`, `TileDimension`, `TiledLayout`, and `LayoutError` under
+    - [x] Move `Layout`, `StridedLayout`, `Tile`, `TileDimension`, `TiledLayout`, and `LayoutError` under
           `arrays::layouts`, and move `Memory` under `arrays::memories`; both are metadata of `ArrayType`, not generic
           program-type machinery.
     - [ ] Delete the top-level `types` module after its array-specific contents have moved. Do **not** move those
           concrete types into `programs::types`: that module already owns the correct backend-neutral layer
           (`Type`, `Typed`, `TypeError`, `TypeRefinements`, and signature traversal), which must remain independent of
           arrays and of any future value universe.
-  - [ ] Move the current top-level `sharding` hierarchy to `arrays::sharding` (including meshes, shardings,
+  - [x] Move the current top-level `sharding` hierarchy to `arrays::sharding` (including meshes, shardings,
         visualizations, and `ShardingError`) after auditing that no non-array value universe uses it independently.
         Update all paths directly without a `ryft_core::sharding` compatibility module; named-axis transform machinery
         remains outside this hierarchy where it is genuinely universe-neutral.
@@ -5177,3 +5177,21 @@ array-specific capability implementations, mixed interpretation/provider glue, a
 layout recognizable beside `ryft_core::operations` without duplicating the generic payload definitions or the
 operation-owned transform rules established in Phase 8. `Array` remains a value owned by private `arrays::reference`,
 `ArrayIrValue` remains under `arrays::ir`, and both public operation enums are re-exported from `arrays`.
+
+### Phase 9 hierarchy leaf modules (2026-08-06)
+
+The first hierarchy implementation unit moves `DataType` and `DataTypeError` to `arrays::data`; layout descriptors and
+errors to `arrays::layouts`; `Memory` to `arrays::memories`; and the complete mesh, sharding, visualization, and error
+hierarchy to `arrays::sharding`. `arrays` publicly exposes each child module and directly re-exports its common
+vocabulary. The old `types::{data, layouts, memories}` modules and top-level `sharding` module are deleted without
+compatibility paths. The `ryft` facade explicitly retains its intended concise root-level exports while `ryft-core`
+and all in-repository consumers now use canonical `arrays` paths.
+
+The move comparison confirms that the relocated implementations are unchanged apart from their new parent-relative
+imports, canonical rustdoc/doctest paths, and paragraph reflow. Targeted residual searches find no retired `ryft-core`
+module declarations or paths; the remaining `sharding`, `layouts`, and `memories` module names belong to independent
+XLA or PJRT APIs. The complete `ryft-core` gate passes 1,133 unit tests, five allocation tests, six region-prototype
+integration tests, and 53 runnable doctests with 16 intentional ignores. `ryft-macros-tests` passes all 20 operation
+tests, 17 parameter tests, and every compile-fail fixture. The serialized CPU `ryft-xla` library suite passes 438 tests
+with one intentional timing-sensitive ignore. Formatting and diff hygiene pass. Dimension types and values are the
+next buildable hierarchy unit; the broader type, backend, and hierarchy gates remain open.

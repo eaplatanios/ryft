@@ -650,6 +650,7 @@ pub fn interpret_projected_operation<
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionVariable, Shape};
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
@@ -662,7 +663,6 @@ mod tests {
     use crate::programs::types::TypeError;
     use crate::tests::TestRegionOperation;
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionVariable, Shape};
 
     use super::*;
 

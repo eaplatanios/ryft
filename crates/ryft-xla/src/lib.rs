@@ -38,7 +38,7 @@ pub use telemetry::live_array_count;
 pub(crate) mod tests {
     use std::mem::MaybeUninit;
 
-    use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
+    use ryft_core::arrays::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
 
     pub(crate) fn logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![

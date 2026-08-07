@@ -6,10 +6,10 @@ use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precis
 use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
 use ryft_core::Typed;
-use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::types::data::DataType;
-use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
-use ryft_core::types::{ArrayType, Dimension, Layout, Memory, Shape, StaticShape, TiledLayout};
+use ryft_core::arrays::{
+    ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh,
+    Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape, TiledLayout,
+};
 
 use crate::experimental::domains::XlaDomain;
 use crate::tests::{logical_mesh_2x2, values_from_bytes, values_to_bytes};
