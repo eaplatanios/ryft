@@ -2309,13 +2309,14 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [x] Gate the representation/retirement sequence with exact-bit, allocation, core, macro, XLA CPU, available CUDA,
           and before/after size and performance evidence.
   - [x] Define and document the final public hierarchy before moving files. The canonical public layout is
-        `arrays::{data, dimensions, ir, layouts, memories, operations, sharding}` with common array types re-exported
+        `arrays::{batching, broadcasting, data, dimensions, ir, layouts, memories, operations, sharding}` with common array
+        types re-exported
         from `arrays`; remove ambiguous glob exports and duplicate canonical paths rather than preserving the former
         `backends`, `types`, and `sharding` facades.
     - `arrays::addressing` and `arrays::encoding` remain public physical-representation modules, and
       `arrays::macros` remains public because exported declarative macros recurse through its hygienic `$crate` path.
-      The complete public child-module set is therefore `addressing`, `data`, `dimensions`, `encoding`, `ir`,
-      `layouts`, `macros`, `memories`, `operations`, and `sharding`.
+      The complete public child-module set is therefore `addressing`, `batching`, `broadcasting`, `data`,
+      `dimensions`, `encoding`, `ir`, `layouts`, `macros`, `memories`, `operations`, and `sharding`.
     - `arrays` directly re-exports the common reference, type, dimension, IR, layout, memory, encoding, and sharding
       vocabulary. Private `arrays::reference` and `arrays::types` implementation modules own the reference `Array`
       value and `ArrayType`, respectively; users do not acquire redundant
@@ -2400,6 +2401,25 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         visualizations, and `ShardingError`) after auditing that no non-array value universe uses it independently.
         Update all paths directly without a `ryft_core::sharding` compatibility module; named-axis transform machinery
         remains outside this hierarchy where it is genuinely universe-neutral.
+  - [ ] Move the top-level `broadcasting` module to `arrays::broadcasting` (including `Broadcastable` and
+        `BroadcastingError`): its implementations (`DataType`, `Shape`, `ArrayType`, and sharding propagation) and
+        its dependencies (only the array vocabulary plus `parameters`) are array-shape vocabulary, so the move keeps
+        `arrays` upstream of the operation/transform machinery. Re-export `Broadcastable` and `BroadcastingError`
+        from `arrays`, remove the top-level module and its root re-export, and update every in-repo path directly
+        without compatibility re-exports.
+  - [ ] Move the batching array specializations `batching::{array_ir, arrays}` to `arrays::batching` (revised
+        decision 2026-08-05; an earlier in-chat assessment kept them in `batching` on a layering argument that only
+        held for the transitional state — the final hierarchy already makes `arrays` the array-domain home, moving
+        `backends::arrays`, `ArrayTracingContext`, and the array differentiation glue into it, so the array batching
+        instantiations belong there too). The universe-neutral core (`BatchingContext`, the `batch` entry points,
+        `BatchAxis`, and the universal batched-program carriers) stays in `batching`: generic contracts and transform
+        policy live with the transform, universe instantiations live in the domain. Both files move together
+        (`array_ir` consumes `arrays`' axis/sharding helpers), their re-exports move from `batching`'s module root to
+        the `arrays` flat surface (their consumers are a dozen operation modules importing `ArrayIrBatch`/
+        `ArrayIrBatching`-family vocabulary), and every in-repo path updates directly without compatibility
+        re-exports. The prior carrier refactor's gate already certifies the specializations hold no transform policy,
+        so this move has no hard sequencing dependency and may execute independently of the larger
+        `backends::arrays` move.
   - [ ] Gate: the top-level hierarchy has one obvious public path for reference arrays, dimensions, and array IR; no
         scalar backend or per-element `Scalar` payload remains; all reference-backend semantics, transformations,
         exact-literal tests, core/XLA execution suites, and allocation/performance thresholds pass.

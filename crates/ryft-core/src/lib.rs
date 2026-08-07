@@ -46,10 +46,6 @@ pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::*;
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
-// Both `differentiation` and `programs` expose a public `types` module, so these glob exports make the crate-level
-// `types` name ambiguous. P9 replaces these temporary glob exports with an explicit facade; suppress the known
-// ambiguity until that dedicated API increment.
-#[allow(ambiguous_glob_reexports)]
 pub use differentiation::*;
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
