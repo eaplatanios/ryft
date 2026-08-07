@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::{ArrayType, Dimension, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError};
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedProgram, BatchingContext,
@@ -30,9 +31,7 @@ use crate::programs::programs::Program;
 use crate::programs::regions::{RegionRef, RegionReplayMappings, ReplayRegionDriver};
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::sharding::{MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Dimension, Shape};
 
 /// Value with [`ArrayType`] type that represents a _packed_ batch of arrays. [`ArrayBatch`] is the batching
 /// representation for Ryft's batching/vectorization transform over arrays. It pairs a packed array value with a
@@ -1325,6 +1324,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DataType, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{Batch, BatchingTracer, batch};
     use crate::contexts::EagerContext;
@@ -1334,9 +1334,7 @@ mod tests {
     use crate::operations::math::{AddOperation, NegOperation, Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::{LogicalMesh, MeshAxis};
     use crate::tracing::{DomainTracingContext, Trace};
-    use crate::types::{DataType, DimensionBounds, DimensionVariable};
 
     use super::*;
 

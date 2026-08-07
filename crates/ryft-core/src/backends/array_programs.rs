@@ -3,6 +3,9 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::{
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape, Sharding,
+};
 use crate::backends::arrays::{Array, ArrayOperation, BroadcastKernel};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
@@ -48,10 +51,6 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::programs::{AtomId, ProgramBuilder, ProgramError};
-use crate::sharding::Sharding;
-use crate::types::{
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionError, DimensionType, DimensionVariable, Shape,
-};
 
 mod differentiation;
 
@@ -1172,6 +1171,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        Shape, ShardingDimension, StridedLayout,
+    };
     use crate::axes::NamedAxis;
     use crate::backends::arrays::Array;
     use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
@@ -1209,9 +1212,7 @@ mod tests {
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::operations::OperationProjection;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::tracing::{Tracer, TracingContext};
-    use crate::types::{DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Memory, Shape, StridedLayout};
 
     use super::*;
 
@@ -4869,7 +4870,7 @@ in (%4)
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         )
         .with_axis_name("items".to_string())
-        .with_axis_sharding(crate::ShardingDimension::Unconstrained);
+        .with_axis_sharding(ShardingDimension::Unconstrained);
         let batched_outputs = program
             .interpret_in_context(
                 &batching_context,

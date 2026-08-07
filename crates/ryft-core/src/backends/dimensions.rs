@@ -3,6 +3,9 @@ use std::fmt::Display;
 
 use ryft_macros::{Operation, Parameter};
 
+use crate::arrays::{
+    ArrayIrType, DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
+};
 use crate::batching::array_ir::ReplicatedDimensionBatchingPolicy;
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, EagerContext, ProjectedContext};
@@ -21,9 +24,6 @@ use crate::programs::operations::{Operation, OperationProjection};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value, ValueProjection};
 use crate::tracing::TracingContext;
-use crate::types::{
-    ArrayIrType, DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
-};
 
 /// Closed [`Operation`] type for staged [`DimensionValue`] [`Program`](crate::Program)s.
 #[derive(Clone, Debug, Operation)]
@@ -65,7 +65,7 @@ where
 /// [`TracingContext`] over [`DimensionValue`]s and [`DimensionOperation`]s.
 pub type DimensionTracingContext = TracingContext<DimensionValue, DimensionOperation<DimensionValue>>;
 
-/// Checked host representation of a first-class runtime [`Dimension`](crate::Dimension) value. Its eager domain
+/// Checked host representation of a first-class runtime [`Dimension`](crate::arrays::Dimension) value. Its eager domain
 /// performs checked host integer arithmetic without allocating an array or dispatching to a device backend. Fallible
 /// capabilities such as [`Add::add`] form the canonical arithmetic API. [`std::ops::Add`],
 /// [`std::ops::Sub`], [`std::ops::Mul`], [`std::ops::Div`], and [`std::ops::Rem`] implementations provide panicking

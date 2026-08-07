@@ -76,6 +76,7 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::{ArrayType, DimensionType, ShardingDimension};
 use crate::axes::{Axis, AxisError};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
@@ -87,9 +88,7 @@ use crate::programs::programs::Program;
 use crate::programs::regions::{BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueProjection};
-use crate::sharding::ShardingDimension;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DimensionType};
 
 pub mod array_ir;
 pub mod arrays;
@@ -570,7 +569,7 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     ///     is static transform metadata and their batched programs carry exactly the source boundary.
     ///   - [`ArrayIrBatching`] returns its first-class mapped-extent dimension value, because
     ///     every dynamic batch dimension inserted into one of its batched programs references the
-    ///     [`DimensionVariable`](crate::DimensionVariable) defined by that program's leading extent input.
+    ///     [`DimensionVariable`](crate::arrays::DimensionVariable) defined by that program's leading extent input.
     ///
     /// Refer to the documentation of [`Self::adapt_batched_program`] for the output-side counterpart of this contract,
     /// along with a complete boundary example.
@@ -593,16 +592,15 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// ```
     ///
     /// The two extent slots play different roles, which is why adaptation removes one but not the other. The leading
-    /// *input* is load-bearing for the program itself: it defines the
-    /// [`DimensionVariable`](crate::DimensionVariable) that every inserted dynamic batch dimension's type references,
-    /// and a sealed program's types must be grounded by a value in its own scope, so removing it would leave the
-    /// program referencing an undefined identity. The leading *output* carries no information of its own: it merely
-    /// relays the extent so an enclosing extent-threading operation can chain it through its own sealed regions
-    /// (e.g., a batched while body must return the extent it consumed so the next iteration's boundary can be fed).
-    /// A consumer that does not thread extents has no use for the relay, so adapting the program drops the forwarded
-    /// output, producing `[extent, inputs...] ↦ [outputs...]`, while [`Self::boundary_operands`] supplies the value
-    /// for the kept input (e.g., a batched linear call consumes the extent as one more leading residual).
-    /// Homogeneous array policies adapt without any boundary change.
+    /// *input* is load-bearing for the program itself: it defines the [`DimensionVariable`](crate::DimensionVariable)
+    /// that every inserted dynamic batch dimension's type references, and a sealed program's types must be grounded by
+    /// a value in its own scope, so removing it would leave the program referencing an undefined identity. The leading
+    /// *output* carries no information of its own: it merely relays the extent so an enclosing extent-threading
+    /// operation can chain it through its own sealed regions (e.g., a batched while body must return the extent it
+    /// consumed so the next iteration's boundary can be fed). A consumer that does not thread extents has no use for
+    /// the relay, so adapting the program drops the forwarded output, producing `[extent, inputs...] ↦ [outputs...]`,
+    /// while [`Self::boundary_operands`] supplies the value for the kept input (e.g., a batched linear call consumes
+    /// the extent as one more leading residual). Homogeneous array policies adapt without any boundary change.
     ///
     /// When `required_output_axes` is provided, the adaptation additionally reconciles each remaining output with
     /// the batch axis its consumer requires (i.e., an output that is mapped while its required axis is replicated is
@@ -1467,6 +1465,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType, Dimension, Shape, ShardingDimension};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::contexts::tests::{
@@ -1477,9 +1476,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::types::Typed;
-    use crate::sharding::ShardingDimension;
     use crate::tracing::Trace;
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 

@@ -28,13 +28,11 @@ use ryft_macros::{Operation, Parameter};
 
 // TODO(eaplatanios): Review from here onwards.
 
-use crate::arrays::encoding::{
-    decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, validate_storage_bytes,
-};
-use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::{
-    ArrayAddressing, ArrayElement, ArraySliceAxis, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz,
-    f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
+    ArrayAddressing, ArrayElement, ArraySliceAxis, ArrayType, DataType, Dimension, Shape, StaticShape, decode_elements,
+    decode_logical_bytes, dispatch_on_array_element_type, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn,
+    f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2,
+    u4, validate_storage_bytes,
 };
 use crate::axes::{Axis, AxisIndexOperation};
 use crate::broadcasting::Broadcastable;
@@ -99,7 +97,6 @@ use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
 use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 use crate::tracing_v2::rematerialization::RematerializeOperation;
-use crate::types::{ArrayType, DataType, Dimension, Shape, StaticShape};
 
 /// Backend execution contract for broadcasting to an already-concrete [`ArrayType`].
 ///
@@ -4463,12 +4460,12 @@ impl ConvertElementType for Array {
 }
 
 impl TransferToMemory for Array {
-    /// Re-places this [`Array`] in `destination` by updating the [`Memory`](crate::types::Memory) carried by its
+    /// Re-places this [`Array`] in `destination` by updating the [`Memory`](crate::arrays::Memory) carried by its
     /// type. The payload is host-resident either way, but the carried type must reflect the transfer so that staged
     /// programs whose declared types park values in other memories (e.g., offloaded residuals) accept the
     /// interpreted value.
     #[inline]
-    fn transfer_to_memory(&self, destination: crate::types::Memory) -> Self {
+    fn transfer_to_memory(&self, destination: crate::arrays::Memory) -> Self {
         Self { r#type: self.r#type.clone().with_memory(destination), bytes: self.bytes.clone() }
     }
 }
@@ -4479,7 +4476,7 @@ impl TransferToMemory for Array {
 // exactly. The infallible capability signature makes an invalid target sharding a panic rather than an error, which
 // the type-level validation performed before interpretation rules out for staged programs.
 impl crate::operations::sharding::Reshard for Array {
-    fn reshard(&self, sharding: &crate::Sharding) -> Self {
+    fn reshard(&self, sharding: &crate::arrays::Sharding) -> Self {
         let varying_manual_axes =
             self.r#type.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
         let sharding = sharding
@@ -4510,15 +4507,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz,
-        f8e8m0fnu, i1, i2, i4, u1, u2, u4,
+        DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension, StridedLayout, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn,
+        f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
     };
     use crate::operations::complex::Complex;
     use crate::operations::constants::{Fill, Iota};
     use crate::operations::manipulation::{GatherDimensionNumbers, ScatterDimensionNumbers};
     use crate::operations::sharding::{ConstrainSharding, Reshard};
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DimensionBounds, DimensionVariable, Layout, Memory, StridedLayout};
 
     use super::*;
 

@@ -10,6 +10,7 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, Sharding};
 use crate::axes::{Axis, NamedAxes, NamedAxis};
 use crate::backends::dimensions::{DimensionOperation, DimensionValue};
 use crate::batching::arrays::{batch_axis_sharding, normalized_batch_axis_type};
@@ -30,9 +31,7 @@ use crate::programs::regions::{RegionRef, RegionReplayMappings, ReplayRegionDriv
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{ProjectedValue, Value, ValueProjection};
 use crate::programs::{Program, ProgramError};
-use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayIrType, ArrayType, Dimension, DimensionType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -199,7 +198,7 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatching {
         batch.r#type()
     }
 
-    /// The adapted program's leading input still defines the [`DimensionVariable`](crate::DimensionVariable)
+    /// The adapted program's leading input still defines the [`DimensionVariable`](crate::arrays::DimensionVariable)
     /// referenced by every inserted dynamic batch dimension, so the first-class mapped-extent value must become its
     /// matching operand.
     #[inline]
@@ -1012,6 +1011,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{DataType, Dimension, DimensionBounds, DimensionVariable, Shape, ShardingDimension};
     use crate::backends::array_programs::ArrayIrValue;
     use crate::backends::arrays::Array;
     use crate::backends::dimensions::DimensionValue;
@@ -1038,10 +1038,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::ShardingDimension;
     use crate::tracing::TracingContext;
-    use crate::types::dimensions::{DimensionBounds, DimensionVariable};
-    use crate::types::{DataType, Dimension, Shape};
     use crate::{ArrayIrOperation, ArrayOperation};
 
     use super::*;

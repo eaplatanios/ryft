@@ -1540,12 +1540,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayType, DataType};
     use crate::backends::arrays::Array;
     use crate::compilation::{CompilationCacheDomain, CompilationContext};
     use crate::programs::operations::Operation;
     use crate::programs::regions::RegionInterface;
     use crate::programs::types::{Type, TypeError};
-    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

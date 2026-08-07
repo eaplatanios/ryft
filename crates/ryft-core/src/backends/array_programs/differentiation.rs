@@ -194,6 +194,9 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+    };
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
@@ -210,9 +213,6 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::programs::{Program, ProgramBuilder};
     use crate::tracing::TracingContext;
-    use crate::types::{
-        ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
-    };
 
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;

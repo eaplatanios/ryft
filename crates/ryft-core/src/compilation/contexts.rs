@@ -1230,10 +1230,10 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use crate::arrays::ArrayType;
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
-    use crate::types::ArrayType;
 
     use super::*;
 
