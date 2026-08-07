@@ -157,36 +157,32 @@ impl<V: Value<Type = ArrayIrType>> Default for LinearResiduals<V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Exact runtime shape expressed in the coordinate system of a [`LinearResiduals`] list, so it can be reconstructed
-/// inside a linear call's attached regions.
-///
-/// A [`Shape`] describes an array *type*: each axis is either a static extent or a [`DimensionVariable`] identity.
-/// What a staged region needs is one step more concrete—*where the runtime extent of each axis lives*—and the only
-/// values in scope there are the region's residual inputs. [`ExactShape`] is that plan: one [`ExactShapeDimension`]
-/// per axis, referring to static extents directly and to dynamic extents by residual slot index. It is produced next
-/// to the residual list that gives those indices meaning, by [`LinearResiduals::retain_shape`] during rule staging or
-/// by [`Self::for_residual_zero`] when planning disconnected-cotangent zeros, and consumed inside regions after the
-/// primal trace is out of reach.
+/// Exact runtime [`Shape`] expressed in the coordinate system of a [`LinearResiduals`] list, so that it can be
+/// reconstructed inside a [`LinearCallOperation`](crate::LinearCallOperation)'s attached [`Region`](crate::Region)s.
+/// A [`Shape`] describes an array _type_: each axis is either a static extent or a [`DimensionVariable`] identity.
+/// What a staged region needs is one step more concrete (i.e., where the runtime extent of each axis lives) and the
+/// only values in scope there are the region's residual inputs. [`ExactShape`] is that plan, containing one
+/// [`ExactShapeDimension`] per axis, referring to static extents directly and to dynamic extents by residual slot
+/// index. It is produced by [`LinearResiduals::retain_shape`] next to the residual list that gives those indices
+/// meaning during rule staging or by [`Self::for_residual_zero`] when planning disconnected-cotangent zeros, and
+/// consumed inside regions after the primal trace is out of reach.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExactShape(Vec<ExactShapeDimension>);
 
 impl ExactShape {
-    /// Builds the canonical residual plan for constructing a zero of `shape` without any surrounding residual list,
-    /// and returns it together with the source axes a caller must read to populate those residuals.
-    ///
-    /// This is the planning half of the disconnected-cotangent protocol shared by
-    /// [`ResidualZeroProvider`](crate::differentiation::ResidualZeroProvider) and the dynamic-zero constructors: when
-    /// a pullback input receives no cotangent, its zero must still be materialized with the primal input's exact
-    /// runtime extents. Residual slots are assigned by first axis occurrence, and repeated uses of one dimension
-    /// identity reuse the same slot, preserving equality between axes without retaining duplicate scalar values. The
-    /// returned list contains one `(axis, variable)` entry per distinct dynamic identity, in slot order, telling the
-    /// caller which source axis to read (e.g., with [`DimensionSizeOperation`]) to obtain each residual value.
+    /// Builds the canonical [`ExactShape`] plan for constructing a zero of [`Shape`] `shape` without any surrounding
+    /// [`LinearResiduals`] list, and returns it together with the source axes a caller must read to populate those
+    /// residuals. This is the planning half of the disconnected-cotangent protocol shared by
+    /// [`ResidualZeroProvider`](crate::ResidualZeroProvider) and the dynamic-zero constructors: when a pullback input
+    /// receives no cotangent, its zero must still be materialized with the primal input's exact runtime extents.
+    /// Residual slots are assigned by first axis occurrence, and repeated uses of one dimension identity reuse the same
+    /// slot, preserving equality between axes without retaining duplicate scalar values. The returned list contains one
+    /// `(axis, variable)` entry per distinct dynamic identity, in slot order, telling the caller which source axis to
+    /// read (e.g., with [`DimensionSizeOperation`]) to obtain each residual value.
     pub fn for_residual_zero(shape: &Shape) -> (Self, Vec<(usize, DimensionVariable)>) {
+        // Residual slots are assigned by first axis occurrence. Repeated uses of one dimension identity reuse
+        // that slot, preserving equality between axes without retaining duplicate scalar values.
         let mut first_axes = Vec::new();
-        // Residual slots are assigned by first axis occurrence. Repeated uses of one dimension identity reuse that
-        // slot, preserving equality between axes without retaining duplicate scalar values.
         let dimensions = shape
             .dimensions()
             .iter()
@@ -208,7 +204,7 @@ impl ExactShape {
     }
 
     /// Materializes one first-class dimension value per axis of this shape in `context` (typically an attached region
-    /// body): static axes stage a [`DimensionOperation`] constant, while dynamic axes clone the residual value their
+    /// body). Static axes stage a [`DimensionOperation`] constant, while dynamic axes clone the residual value their
     /// slot refers to. The result has exactly one value per axis, in axis order, ready to be consumed by operations
     /// that take one dimension operand per output axis.
     ///
@@ -217,13 +213,16 @@ impl ExactShape {
     ///   - `context`: [`Context`] in which static extents are staged as dimension constants.
     ///   - `residuals`: Residual values owned by `context`, indexed by this plan's residual slots (i.e., the region's
     ///     view of the [`LinearResiduals`] list this shape was built against).
-    pub fn dimensions<C>(&self, context: &C, residuals: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
-    where
+    pub fn dimensions<
         C: Context<
                 Type = ArrayIrType,
                 Operation: OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
             >,
-    {
+    >(
+        &self,
+        context: &C,
+        residuals: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         self.0
             .iter()
             .map(|dimension| match dimension {
@@ -239,12 +238,11 @@ impl ExactShape {
             .collect()
     }
 
-    /// Returns the residual values required by mixed dynamic array constructors, in dynamic-axis order.
-    ///
-    /// Constructors such as the dynamic zero consume one dimension operand per *dynamic* axis, in axis order, while
-    /// this plan stores deduplicated residual slots. This method expands the plan back into that operand convention:
-    /// static axes contribute nothing, and repeated identities intentionally produce repeated operands referring to
-    /// the one shared residual value.
+    /// Returns the residual values required by mixed dynamic array constructors, in dynamic-axis order. Constructors
+    /// such as the dynamic zero consume one dimension operand per _dynamic_ axis, in axis order, while this plan stores
+    /// deduplicated residual slots. This method expands the plan back into that operand convention: static axes
+    /// contribute nothing, and repeated identities intentionally produce repeated operands referring to the one
+    /// shared residual value.
     ///
     /// # Parameters
     ///
@@ -261,10 +259,13 @@ impl ExactShape {
             .collect()
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
     /// Returns this exact shape viewed through an axis selection, so that output axis `i` is copied from source axis
     /// `axes[i]`. Rules whose transpose sees a permuted, repeated, or reduced view of a retained shape (e.g., an axis
-    /// transposition) use this to derive the viewed plan without retaining any additional residuals; residual slot
+    /// transposition) use this to derive the viewed plan without retaining any additional residuals. Residual slot
     /// indices are preserved, so the result addresses the same [`LinearResiduals`] list as `self`.
+    #[inline]
     pub fn reordered(&self, axes: &[usize]) -> Self {
         Self(axes.iter().map(|axis| self.0[*axis]).collect())
     }
