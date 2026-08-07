@@ -1608,8 +1608,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
+    use crate::arrays::{
+        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionVariable, Shape,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::macros::check_count;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};

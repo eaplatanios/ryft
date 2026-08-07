@@ -8,9 +8,10 @@
 
 use std::fmt::{Debug, Display};
 
-use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape};
+use crate::arrays::{
+    ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape,
+};
 use crate::axes::Axis;
-use crate::backends::array_programs::ArrayIrValue;
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
@@ -2722,10 +2723,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        DataType, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        Sharding, ShardingDimension,
+        ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh,
+        Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
-    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::CaptureReference;

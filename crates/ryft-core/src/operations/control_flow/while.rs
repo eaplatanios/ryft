@@ -178,7 +178,7 @@ impl<T: WhileTypeSemantics> Display for WhileOperation<T> {
 /// no shape, and such a dimension carry must additionally be *loop-invariant*: one dimension value cannot represent
 /// independently masked per-item extents, but masking a carry that the body forwards unchanged is the identity. Eager
 /// interpretation enforces that invariance dynamically through
-/// [`ArrayIrValue`](crate::backends::array_programs::ArrayIrValue)'s
+/// [`ArrayIrValue`](crate::arrays::ArrayIrValue)'s
 /// [`mask_select`](WhilePredicate::mask_select), which returns equal dimension carries unchanged and falls back to
 /// scalar-predicate concretization — an error under a batched predicate — for distinct ones. Structural composite
 /// batching relies on this relaxation to thread its loop-invariant mapped extent through batch-varying loops.
@@ -2433,8 +2433,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
     use crate::arrays::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
-    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::batch;
     use crate::contexts::{EagerContext, StagingContext};

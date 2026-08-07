@@ -10,8 +10,8 @@
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
 
 use ryft_core::Typed;
+use ryft_core::arrays::ArrayIrValue;
 use ryft_core::arrays::{ArrayIrType, ArrayType, DeviceMesh};
-use ryft_core::backends::array_programs::ArrayIrValue;
 use ryft_core::captures::{CapturingContext, ClosedProgram};
 use ryft_core::compilation::{
     CompilationDomain, CompilationStagingRequest, CompiledFunction, ExecutableProgram, JitCacheStatistics,
@@ -1264,11 +1264,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use ryft_core::arrays::ArrayIrValue;
     use ryft_core::arrays::{
         ArrayIrType, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape,
         Sharding, ShardingDimension,
     };
-    use ryft_core::backends::array_programs::ArrayIrValue;
     use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
     use ryft_core::contexts::{Context, EagerContext};
     use ryft_core::differentiation::hessian::{Hessian, HessianDifferentiate};

@@ -52,9 +52,9 @@ use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface, RegionSl
 use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, ProgramError, Value, ValueProjection};
 use ryft_core::tracing::{Tracer, TracingContext};
 
+use ryft_core::arrays::ArrayIrOperation;
 use ryft_core::arrays::{ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue};
 use ryft_core::axes::AxisIndexOperation;
-use ryft_core::backends::array_programs::ArrayIrOperation;
 use ryft_core::backends::arrays::{Array as ReferenceArray, ArrayOperation};
 use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation};
@@ -240,8 +240,8 @@ where
                     .iter()
                     .cloned()
                     .map(|capture| match capture {
-                        ryft_core::backends::array_programs::ArrayIrValue::Array(capture) => C::from_projected(capture),
-                        ryft_core::backends::array_programs::ArrayIrValue::Dimension(_) => {
+                        ryft_core::arrays::ArrayIrValue::Array(capture) => C::from_projected(capture),
+                        ryft_core::arrays::ArrayIrValue::Dimension(_) => {
                             unreachable!("validated scan captures are always stacked arrays")
                         }
                     })
@@ -978,11 +978,11 @@ where
 mod tests {
     use std::rc::Rc;
 
+    use ryft_core::arrays::ArrayIrOperation;
     use ryft_core::arrays::{
         ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh,
         MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use ryft_core::backends::array_programs::ArrayIrOperation;
     use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};

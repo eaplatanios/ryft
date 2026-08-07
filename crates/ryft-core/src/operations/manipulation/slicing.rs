@@ -1,11 +1,11 @@
 use std::fmt::Display;
 
+use crate::arrays::LinearResiduals;
 use crate::arrays::{
     ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Memory, MeshAxisType, Shape,
     Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
-use crate::backends::array_programs::LinearResiduals;
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -2489,11 +2489,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
     use crate::arrays::{
         DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
         MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
     use crate::batching::{BatchAxis, BatchingContext, batch};

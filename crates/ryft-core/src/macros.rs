@@ -4442,11 +4442,10 @@ mod tests {
     use num_complex::Complex;
 
     use crate::arrays::{
-        ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionType,
-        DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
-        ShardingError,
+        ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds,
+        DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Sharding, ShardingDimension, ShardingError,
     };
-    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{
         ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, BatchingError, BatchingTracer,

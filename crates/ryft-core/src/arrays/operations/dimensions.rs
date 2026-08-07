@@ -1,19 +1,22 @@
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::operations::DimensionOperation;
-use crate::arrays::types::arrays::ArrayIrType;
 use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType};
+use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionVariable};
+use crate::backends::arrays::Array;
 use crate::batching::array_ir::ReplicatedDimensionBatchingPolicy;
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::operations::dimensions::{
-    DimensionAddOperation, DimensionDivFloorOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
-    DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
-    DimensionRequirement, DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation,
-    DimensionSubOperation, checked_power,
+    DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
+    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
+    DimensionPowOperation, DimensionRemOperation, DimensionRequirement, DimensionRequirementOperation,
+    DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation,
+    DimensionSubOperation, DimensionToScalar, checked_power,
 };
 use crate::operations::math::{Add, Div, Mul, Rem, Sub};
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationProjection};
+use crate::programs::types::Typed;
 use crate::programs::values::{Value, ValueProjection};
 
 // TODO(eaplatanios): Review from here onwards.
@@ -255,6 +258,89 @@ impl DimensionRequirement for DimensionValue {
         DimensionRequirementOperation::bounds(&self.r#type(), bounds)
             .evaluate_extents(self.extent(), None)
             .map_err(Into::into)
+    }
+}
+
+impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayIrValue<A> {
+    fn dimension_size<AxisValue: Into<crate::Axis>>(&self, axis: AxisValue) -> Result<Self, ProgramError> {
+        let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let input_type = array.r#type();
+        let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
+        let extent = <A as DimensionSize<usize>>::dimension_size(array, operation.axis())?;
+        Ok(Self::Dimension(DimensionValue::new(operation.result_type().clone(), extent)?))
+    }
+}
+
+impl DimensionToScalar<Array> for DimensionValue {
+    fn to_scalar(&self) -> Result<Array, ProgramError> {
+        // `DimensionValue::new` enforces the portable extent ceiling, which is no greater than `i64::MAX`.
+        Ok(Array::scalar(i64::try_from(self.extent()).unwrap()))
+    }
+}
+
+impl DimensionFromScalar<DimensionValue> for Array {
+    fn to_dimension(&self, result: DimensionVariable) -> Result<DimensionValue, ProgramError> {
+        let operation = DimensionFromScalarOperation::new(result);
+        DimensionFromScalarOperation::validate_input_type(self.r#type().as_ref())?;
+        let (scalar, extent) = match self.r#type().data_type() {
+            DataType::I8 => {
+                let value = self.elements::<i8>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::I16 => {
+                let value = self.elements::<i16>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::I32 => {
+                let value = self.elements::<i32>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::I64 => {
+                let value = self.elements::<i64>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::U8 => {
+                let value = self.elements::<u8>()?[0];
+                (value.to_string(), Ok(usize::from(value)))
+            }
+            DataType::U16 => {
+                let value = self.elements::<u16>()?[0];
+                (value.to_string(), Ok(usize::from(value)))
+            }
+            DataType::U32 => {
+                let value = self.elements::<u32>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::U64 => {
+                let value = self.elements::<u64>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            _ => unreachable!("dimension_from_scalar input type is validated before reading its payload"),
+        };
+        let extent = extent.map_err(|_| ProgramError::InvalidArgument {
+            message: format!(
+                "'{}' scalar input must be a nonnegative host-representable extent but is {scalar}",
+                operation.name(),
+            ),
+        })?;
+        Ok(DimensionValue::new(operation.result_type().clone(), extent)?)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> DimensionToScalar for ArrayIrValue<A>
+where
+    DimensionValue: DimensionToScalar<A>,
+{
+    fn to_scalar(&self) -> Result<Self, ProgramError> {
+        let dimension = <Self as ValueProjection<DimensionType>>::projected(self)?;
+        Ok(Self::Array(<DimensionValue as DimensionToScalar<A>>::to_scalar(dimension)?))
+    }
+}
+
+impl<A: DimensionFromScalar<DimensionValue> + Value<Type = ArrayType>> DimensionFromScalar for ArrayIrValue<A> {
+    fn to_dimension(&self, result: DimensionVariable) -> Result<Self, ProgramError> {
+        let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        Ok(Self::Dimension(<A as DimensionFromScalar<DimensionValue>>::to_dimension(array, result)?))
     }
 }
 

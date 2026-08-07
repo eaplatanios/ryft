@@ -2,11 +2,11 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::LinearResiduals;
 use crate::arrays::{
     ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape, Sharding,
 };
 use crate::axes::Axis;
-use crate::backends::array_programs::LinearResiduals;
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, align_array_batch};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,

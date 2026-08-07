@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
+use crate::arrays::LinearResiduals;
 use crate::arrays::{
     ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape, Sharding,
     ShardingDimension,
 };
-use crate::backends::array_programs::LinearResiduals;
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -901,7 +901,7 @@ where
                         residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
                     let input_shape = residuals.retain_shape(context, array.primal())?;
                     let permuted_input_shape = match self.dimensions() {
-                        Some(dimensions) => input_shape.reordered(dimensions),
+                        Some(dimensions) => input_shape.transposed(dimensions),
                         None => input_shape,
                     };
 

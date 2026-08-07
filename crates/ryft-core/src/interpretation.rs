@@ -127,7 +127,7 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContex
 // TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
 //  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose context
 //  type is built from `Self` (E0284), and a per-method `where Self: Operation<Type = C::Type>` clause reproduces the
-//  same failure for the composite eager dispatcher in `backends::array_programs`.
+//  same failure for the composite eager dispatcher for `ArrayIrOperation`.
 /// Represents [`Operation`]s that can be interpreted (i.e., executed) over a chosen value semantics. The interpretation
 /// [`Domain`] `C` is the single source of truth for the type, value, and operation families participating in
 /// interpretation. The contract deliberately requires only [`Domain`] and not [`Context`] as [`EagerContext`]'s
@@ -142,7 +142,7 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContex
 /// itself built from `Self`, which is exactly the shape of every eager operation-family dispatcher, and the per-method
 /// `where Self: Operation<Type = C::Type>` clause that [`BatchableOperation`](crate::BatchableOperation) and
 /// [`DifferentiableOperation`](crate::DifferentiableOperation) use instead reproduces the same failure for the
-/// composite eager dispatcher in [`backends::array_programs`](crate::backends::array_programs).
+/// composite eager [`ArrayIrOperation`](crate::ArrayIrOperation) dispatcher.
 ///
 /// Ryft's framework-mediated interpretation paths enforce the missing equality at their surrounding boundaries:
 /// [`Program`]s and [`ProgramBuilder`](crate::ProgramBuilder)s require `O: Operation<Type = V::Type>`,
@@ -650,8 +650,10 @@ pub fn interpret_projected_operation<
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionVariable, Shape};
-    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
+    use crate::arrays::{
+        ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionError,
+        DimensionVariable, Shape,
+    };
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::math::{AddOperation, NegOperation};

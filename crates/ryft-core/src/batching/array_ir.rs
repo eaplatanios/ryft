@@ -1010,10 +1010,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::ArrayIrValue;
     use crate::arrays::{
         DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Shape, ShardingDimension,
     };
-    use crate::backends::array_programs::ArrayIrValue;
     use crate::backends::arrays::Array;
     use crate::batching::{
         Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, InterpretableBatchableOperation,

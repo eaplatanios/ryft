@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use crate::arrays::LinearResiduals;
 use crate::arrays::{ArrayIrType, ArrayType, Dimension, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension};
-use crate::backends::array_programs::LinearResiduals;
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
     BatchingError, InterpretableBatchableOperation,

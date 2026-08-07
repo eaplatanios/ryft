@@ -8,8 +8,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use ryft_core::arrays::ArrayIrValue;
 use ryft_core::arrays::{ArrayIrType, ArrayType};
-use ryft_core::backends::array_programs::ArrayIrValue;
 use ryft_core::compilation::CompilationCacheDomain;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile;

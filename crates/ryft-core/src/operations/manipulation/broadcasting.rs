@@ -1,10 +1,10 @@
 use std::fmt::Display;
 
+use crate::arrays::LinearResiduals;
 use crate::arrays::{
     ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape, Sharding,
     ShardingDimension,
 };
-use crate::backends::array_programs::LinearResiduals;
 use crate::backends::arrays::BroadcastKernel;
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
 use crate::batching::{

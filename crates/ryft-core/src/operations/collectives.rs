@@ -15,10 +15,9 @@ use std::ops::Mul as StdMul;
 
 use crate::arrays::{
     ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable,
-    Shape, Sharding,
+    LinearResiduals, Shape, Sharding,
 };
 use crate::axes::{AxisError, AxisIndexOperation, NamedAxes, NamedAxis};
-use crate::backends::array_programs::LinearResiduals;
 use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching, DynamicArrayBatchingPolicy, broadcast_array};
 use crate::batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
@@ -3726,10 +3725,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding,
+        ArrayIrOperation, ArrayIrType, ArrayIrValue, Dimension, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
-    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::array_ir::{ArrayIrBatch, ArrayIrBatching};
     use crate::batching::{

@@ -1,8 +1,9 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, DimensionVariable};
-use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
+use crate::arrays::{
+    ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionType, DimensionVariable,
+};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};

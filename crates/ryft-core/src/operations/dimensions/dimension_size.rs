@@ -297,8 +297,8 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{ArrayIrOperation, ArrayIrValue};
     use crate::arrays::{DataType, DimensionBounds, Shape};
-    use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::Array;
     use crate::contexts::{Context, EagerContext};
     use crate::parameters::Placeholder;

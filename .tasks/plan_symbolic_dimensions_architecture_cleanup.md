@@ -2309,8 +2309,9 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [x] Gate the representation/retirement sequence with exact-bit, allocation, core, macro, XLA CPU, available CUDA,
           and before/after size and performance evidence.
   - [x] Define and document the final public hierarchy before moving files (revised to a kind-first layout on
-        2026-08-06). The canonical public layout is `arrays::{addressing, batching, broadcasting, dimensions,
-        encoding, ir, macros, operations, sharding, types}` with common array names re-exported flat from `arrays`;
+        2026-08-06). The canonical public layout is `arrays::{addressing, batching, broadcasting, differentiation,
+        dimensions, encoding, ir, macros, operations, sharding, types}` with common array names re-exported flat from
+        `arrays`;
         remove ambiguous glob exports and duplicate canonical paths rather than preserving the former `backends`,
         `types`, and `sharding` facades.
     - The kind-first rule: `arrays::types` owns the complete staged-type vocabulary in kind-internal submodules
@@ -2327,14 +2328,21 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       vocabulary. Modules outside `ryft_core::arrays` import these names flat from `crate::arrays` (or
       `ryft_core::arrays`) without taking a dependency on the internal module structure, so no code acquires
       redundant deep paths such as `arrays::types::arrays::ArrayType`.
-    - `arrays::operations::mod.rs` defines the closed dispatch enums (`DimensionOperation` today; `ArrayOperation`
-      and `ArrayIrOperation` when they move) and their tracing contexts (`DimensionTracingContext` today;
-      `ArrayTracingContext` when the reference backend moves), together with their family-level
-      normalization/conversion contract. Private per-family submodules (`operations::dimensions` today) own concrete
-      capability implementations, mixed array-IR interpretation and provider glue, composite/batching glue, and the
-      tests that exercise those implementations. `arrays` re-exports the operation enums and tracing contexts; users
-      may also name the enums through `arrays::operations`, but family implementation submodules do not create
-      additional public API paths.
+    - `arrays::operations::mod.rs` defines the closed dispatch enums (`DimensionOperation` and `ArrayIrOperation`
+      today; `ArrayOperation` when the reference backend moves) and their tracing contexts, together with their
+      family-level normalization/conversion contract: the trivial member-lift `From` impls and family-spanning
+      boundary adapters such as the composite `MemberDifferentiableOperation` impl live here. Private per-family
+      submodules (`collectives`, `compare`, `constants`, `control_flow`, `dimensions`, and `manipulation` today) own
+      concrete capability implementations, mixed array-IR interpretation and provider glue, composite/batching glue,
+      and the tests that exercise those implementations. `arrays` re-exports the operation enums and tracing
+      contexts; users may also name the enums through `arrays::operations`, but family implementation submodules do
+      not create additional public API paths.
+    - Transform instantiations get their own domain modules beside `operations`: `arrays::differentiation` owns the
+      linearization residual vocabulary (`LinearResiduals`, `ExactShape`) and the array `LinearCallBatchingPolicy`
+      implementations, and the planned `arrays::batching` owns the batching instantiations. The durable rule from the
+      batching decision applies uniformly: generic contracts and protocol machinery live with the transform, universe
+      instantiations live in the domain — which also keeps transform modules such as `differentiation::linear` free
+      of non-test array imports.
     - Mirror the backend-neutral `operations` hierarchy where array-owned implementation code exists, using
       `attention`, `compare`, `complex`, `constants`, `control_flow`, `custom_call`, `debugging`, `differentiation`,
       `dimensions`, `logical`, `manipulation`, `math`, `memory`, `random`, `sharding`, `sort`, and `tag` family
@@ -2372,15 +2380,27 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - [ ] Relocate reference `Array` capability implementations and mixed `ArrayIrValue` interpretation/provider glue
           into the private family submodules specified above. Keep family-local typed traversal helpers in the same
           submodule as their sole consumers; keep only representation-wide construction, addressing, projection, and
-          value contracts with the value types.
-    - [ ] Move the existing `backends/array_programs/differentiation.rs` implementation into
-          `arrays::operations::differentiation`, separating differentiation-specific residual helpers from generic IR
-          value/projection machinery while preserving the operation-owned transform rules already under
-          `ryft_core::operations`.
+          value contracts with the value types. *(The `ArrayIrValue` half is done: the interim `operations::array_ir`
+          catch-all was dissolved on 2026-08-07 into `collectives`, `compare`, `constants`, `control_flow`,
+          `dimensions`, and `manipulation`, with the trivial member-lift `From` impls in `mod.rs` and the value-level
+          `Concretizable<bool>` impl with `ArrayIrValue` in `arrays::ir`. The reference `Array` half waits on the
+          `backends::arrays` move.)*
+    - [x] Dissolve the former `backends/array_programs/differentiation.rs` (executed 2026-08-07; an interim move had
+          kept it whole as `arrays::operations::differentiation`): the linearization residual vocabulary
+          (`LinearResiduals`, `ExactShape`) moved together with the array `LinearCallBatchingPolicy` implementations
+          from `differentiation::linear` into the new `arrays::differentiation` module, the `ArrayIrType`
+          control-flow residual glue (`TemporalResidualType`/`TemporalResidualOperation` and
+          `WhileResidualStackType`/`WhileResidualStackOperation` impls) moved to `operations::control_flow`, and the
+          composite `MemberDifferentiableOperation` boundary adapter moved to `arrays::operations::mod.rs` as
+          family-spanning dispatch glue. The `arrays::operations::differentiation` name stays reserved for array
+          implementations of the custom-derivative operation family.
     - [ ] Split the two backend catch-all test modules beside their new owners: enum normalization and generated
           dispatcher tests in `operations::tests`, reference storage/value tests with `Array`, IR value/projection tests
           with `ArrayIrValue`, and operation behavior tests in the corresponding family submodule. Preserve test names,
           ordering within each owner, comments, and exact fixtures unless ownership makes a focused rename necessary.
+          *(The array-IR catch-all's 49 tests were split on 2026-08-07: value/projection tests with `ArrayIrValue` in
+          `arrays::ir`, dispatcher-level tests in `operations::mod.rs`, and behavior tests in their family
+          submodules. The `backends/arrays.rs` catch-all tests remain.)*
     - [ ] Gate: neither former backend catch-all file remains; every array-owned operation implementation has exactly
           one family home; no generic semantic or transform rule was copied; no family submodule exists solely to hold
           an enum variant; and targeted core/macro/XLA tests plus residual path searches pass.
@@ -2395,7 +2415,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
           `arrays::dimensions` value module; and move `DimensionOperation`/`DimensionTracingContext` into
           `arrays::operations` with the capability implementations in the private `operations::dimensions` family
           submodule (kind-first split executed 2026-08-06); commonly used names re-exported from `arrays`.
-    - [ ] Move `ArrayIrType`/`ArrayIrTypeRefinements` under `arrays::types` (kind-first), move `ArrayIrValue` into
+    - [x] Move `ArrayIrType`/`ArrayIrTypeRefinements` under `arrays::types` (kind-first), move `ArrayIrValue` into
           the `arrays::ir` value module, move `ArrayIrOperation` to `arrays::operations`, and re-export all four
           canonical IR names from `arrays` for concise public signatures.
     - [x] Move `Layout`, `StridedLayout`, `Tile`, `TileDimension`, `TiledLayout`, and `LayoutError` under
@@ -4198,8 +4218,9 @@ live code definitions; they remain plan-history names only.
 
 The eventual top-level `ryft_core::arrays` hierarchy now owns not only the reference `Array`, dimension backend, and
 array IR, but also their complete domain-specific type vocabulary: element data types, array and dimension types,
-shapes, layouts, memories, and sharding. `ArrayIrType` moves beside `ArrayIrValue` in `arrays::ir`; the subsequently
-specified operation-family refinement places `ArrayIrOperation` beside `ArrayOperation` in `arrays::operations`.
+shapes, layouts, memories, and sharding. `ArrayIrType` moves into the kind-first `arrays::types` vocabulary,
+`ArrayIrValue` moves into `arrays::ir`, and the subsequently specified operation-family refinement places
+`ArrayIrOperation` beside `ArrayOperation` in `arrays::operations`.
 Commonly used names are re-exported through `arrays` so public signatures do not require deep module paths. The
 existing top-level `types` and `sharding` facades are deleted without compatibility modules once all consumers have
 moved.
@@ -5262,3 +5283,63 @@ All deep `arrays::dimensions::…` imports across `ryft-core` and `ryft-xla` (38
 library tests, the serialized CPU `ryft-xla` library suite passes 438 tests with one intentional ignore, the full
 workspace check emits zero warnings, formatting passes on every touched file, and `cargo doc` reports no warnings
 under `arrays/`. Residual searches find no `arrays::dimensions::` deep paths and no retired module references.
+
+### Phase 9 hierarchy array IR (2026-08-07)
+
+The third hierarchy implementation unit completes the kind-first Array IR split. `ArrayIrType` and
+`ArrayIrTypeRefinements` now live in `arrays::types::ir`, beside the other staged type descriptors; the type's focused
+test moved with it. `ArrayIrValue` now lives in `arrays::ir` and retains only its representation-wide `Value`,
+projection, identity-renaming, and conversion contracts. `ArrayIrOperation` now lives in `arrays::operations::mod.rs`
+beside `DimensionOperation`, while the private `operations::array_ir` family module owns its conversions, providers,
+mixed interpretation capabilities, and existing behavior tests. The old `backends::array_programs` module and re-export
+were deleted without a compatibility path, and every core and XLA consumer now imports the four canonical IR names
+through `arrays`.
+
+The former differentiation child moved to private `arrays::operations::differentiation`. Its exact-shape and linear
+residual machinery moved with it instead of remaining in the generic IR capability module; `LinearResiduals` is exposed
+only crate-wide through the flat `arrays` boundary for the operation-owned linearization rules that share it. Existing
+`ArrayType` identity/refinement primitives gained `pub(crate)` visibility so the sibling `arrays::types::ir` descriptor
+can reuse the single canonical algorithms rather than duplicate them. The broader operation-family redistribution and
+catch-all test split remain open because `ArrayOperation`, reference `Array`, and their owner-specific tests have not
+yet moved.
+
+Verification passes `cargo check -p ryft-core --tests` without warnings; all 1,133 core unit tests, five projection and
+allocation integration tests, six region-prototype tests, and 53 runnable doctests pass with 16 intentional ignores.
+`ryft-macros-tests` passes all 20 operation tests, 17 parameter tests, and every compile-fail fixture. The serialized
+CPU `ryft-xla` library suite passes 438 tests with one intentional timing-sensitive ignore. Formatting, diff hygiene,
+and source residual searches for `backends::array_programs`, its module declaration, and the former deep Array IR type
+path pass.
+
+### Phase 9 hierarchy operation-family split and arrays::differentiation (2026-08-07)
+
+A design review of the array-IR unit dissolved its two interim catch-all files. The former
+`arrays::operations::array_ir` (the old `backends::array_programs` moved whole) split into private family submodules
+mirroring `ryft_core::operations`: `constants` owns the dynamic-constructor member glue, zero/one/iota lifts, zero
+providers, and residual-aware zero construction; `compare`, `dimensions`, `control_flow`, `manipulation`, and
+`collectives` own their capability and conversion implementations; the trivial member-lift `From` impls live in
+`operations::mod.rs` as the family-conversion contract; and the value-level `Concretizable<bool>` impl moved beside
+`ArrayIrValue` in `arrays::ir`. Its 49 tests split beside their owners with names, order, comments, and fixtures
+preserved.
+
+The former `arrays::operations::differentiation` (the old `backends/array_programs/differentiation.rs` moved whole)
+also dissolved, resolving both a layering leak and a naming collision with the custom-derivative operation family.
+The user-selected design creates `arrays::differentiation` — the domain's differentiation instantiation, sibling of
+the planned `arrays::batching` — owning `LinearResiduals`, `ExactShape`, and the two array `LinearCallBatchingPolicy`
+implementations previously embedded in `differentiation::linear`. This applies the durable rule uniformly (generic
+contracts and protocol machinery live with the transform, universe instantiations live in the domain) and leaves
+`differentiation::linear` with no non-test array imports. The `ArrayIrType` temporal/while residual-stack glue moved
+to `operations::control_flow`, and the composite `MemberDifferentiableOperation` boundary adapter moved to
+`operations::mod.rs`; their eleven composite tests split accordingly. `LinearResiduals` remains exposed crate-wide
+only through the flat `arrays` boundary for the operation-owned linearization rules.
+
+The necessity review confirmed `LinearResiduals`/`ExactShape` are load-bearing rather than incidental: they encode
+the dimensions-as-SSA requirements that exact runtime extents cross the linear-call boundary as ordinary SSA residual
+operands (transpose regions cannot recover operand extents from cotangents, and ambient side channels are banned) and
+that repeated dimension identities share one deduplicated residual before re-expanding into per-axis constructor
+operand order. `ExactShapeDimension` stays a private implementation detail of `ExactShape`.
+
+Gates after both waves: `ryft-core` passes 1,130 library tests; the serialized CPU `ryft-xla` library suite passes
+438 tests with one intentional ignore; the full workspace check emits zero warnings; formatting passes on every
+touched file; and residual searches find no `operations::array_ir`, no `arrays::operations::differentiation`, and no
+non-test `crate::arrays` import in `differentiation/linear.rs`. Session plan:
+`.tasks/plan_array_operations_family_split.md`.

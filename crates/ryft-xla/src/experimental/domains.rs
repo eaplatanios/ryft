@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use ryft_core::InterpretationDriver;
+use ryft_core::arrays::ArrayIrValue;
 use ryft_core::arrays::{
     ArrayIrType, ArrayType, DataType, Device, DeviceId, DeviceMesh, Dimension, DimensionBounds, DimensionOperation,
     DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape,
     Sharding, ShardingDimension, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
 };
-use ryft_core::backends::array_programs::ArrayIrValue;
 #[cfg(test)]
 use ryft_core::backends::arrays::Array as ReferenceArray;
 use ryft_core::batching::BatchingError;
