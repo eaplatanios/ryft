@@ -536,24 +536,24 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::operations::math::Sin;
     use crate::programs::Program;
 
     use super::*;
 
-    /// Summarizes a small scalar program and verifies the structural metrics.
+    /// Summarizes a small rank-zero array program and verifies the structural metrics.
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (_, compiled): (Scalar, Program<Scalar, ScalarOperation<Scalar>, Scalar, Scalar>) = domain
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let (_, compiled): (Array, Program<Array, ArrayOperation<Array>, Array, Array>) = domain
             .interpret_and_trace(
                 |x| {
-                    let with_constant = x.clone() + x.context().constant(Scalar::from(1.0));
+                    let with_constant = x.clone() + x.context().constant(Array::scalar(1.0));
                     with_constant.sin()
                 },
-                Scalar::from(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
 
@@ -593,10 +593,10 @@ mod tests {
         assert_eq!(
             records[0].raw_ir.trim_end(),
             indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = mul %0 %1
-                    %3:f64 = sin %0
-                    %4:f64 = add %2 %3
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %1
+                    %3:f64[] = sin %0
+                    %4:f64[] = add %2 %3
                 in (%4)
             "}
             .trim_end(),

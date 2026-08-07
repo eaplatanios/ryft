@@ -4431,7 +4431,6 @@ mod tests {
     use crate::backends::array_programs::{ArrayIrOperation, ArrayIrValue};
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::dimensions::DimensionValue;
-    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{
         ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, BatchingError, BatchingTracer,
     };
@@ -4582,7 +4581,7 @@ mod tests {
     );
 
     impl_differentiable_operation! {
-        TestDifferentiableOperation<DataType>,
+        TestDifferentiableOperation<ArrayType>,
         jvp<C>
         where
             C::Type: crate::DifferentiableType,
@@ -4638,18 +4637,18 @@ mod tests {
         rule = [@negative, @negative]
     }
 
-    impl_non_differentiable_operation!(TestUnaryOperation<DataType>);
-    impl_non_transposable_operation!(TestUnaryOperation<DataType>);
-    impl_non_differentiable_operation!(TestBinaryOperation<DataType>);
+    impl_non_differentiable_operation!(TestUnaryOperation<ArrayType>);
+    impl_non_transposable_operation!(TestUnaryOperation<ArrayType>);
+    impl_non_differentiable_operation!(TestBinaryOperation<ArrayType>);
 
-    impl From<ZeroOperation<DataType>> for TestUnaryOperation<DataType> {
-        fn from(_operation: ZeroOperation<DataType>) -> Self {
+    impl From<ZeroOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
+        fn from(_operation: ZeroOperation<ArrayType>) -> Self {
             Self::new()
         }
     }
 
-    impl From<ZeroOperation<DataType>> for TestBinaryOperation<DataType> {
-        fn from(_operation: ZeroOperation<DataType>) -> Self {
+    impl From<ZeroOperation<ArrayType>> for TestBinaryOperation<ArrayType> {
+        fn from(_operation: ZeroOperation<ArrayType>) -> Self {
             Self::new()
         }
     }
@@ -5670,29 +5669,29 @@ mod tests {
             Err(TypeError::invalid("'test_unary' does not support unreduced operands".to_string())),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar, TestUnaryOperation<DataType>>>::interpret(
-                &data_operation,
+            InterpretableOperation::<EagerContext<Array, TestUnaryOperation<ArrayType>>>::interpret(
+                &array_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(2.0f32)],
+                &[Array::scalar(2.0f32)],
             ),
-            Ok(vec![Scalar::from(-2.0f32)]),
+            Ok(vec![Array::scalar(-2.0f32)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar, TestUnaryOperation<DataType>>>::interpret(
-                &data_operation,
+            InterpretableOperation::<EagerContext<Array, TestUnaryOperation<ArrayType>>>::interpret(
+                &array_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
-        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestUnaryOperation<DataType>>::new());
-        let outputs = data_operation
-            .partially_evaluate(&context, &EmptyRegionDriver, &[PartialEvaluationValue::known(Scalar::from(2.0f32))])
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new());
+        let outputs = array_operation
+            .partially_evaluate(&context, &EmptyRegionDriver, &[PartialEvaluationValue::known(Array::scalar(2.0f32))])
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].as_known(), Some(&Scalar::from(-2.0f32)));
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(-2.0f32)));
     }
 
     #[test]
@@ -5750,27 +5749,27 @@ mod tests {
             Err(TypeError::invalid("'test_binary' operands must be unreduced over the same axes".to_string())),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar, TestBinaryOperation<DataType>>>::interpret(
-                &data_operation,
+            InterpretableOperation::<EagerContext<Array, TestBinaryOperation<ArrayType>>>::interpret(
+                &array_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(2.0f32), Scalar::from(3.0f32)],
+                &[Array::scalar(2.0f32), Array::scalar(3.0f32)],
             ),
-            Ok(vec![Scalar::from(5.0f32)]),
+            Ok(vec![Array::scalar(5.0f32)]),
         );
-        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestBinaryOperation<DataType>>::new());
-        let outputs = data_operation
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new());
+        let outputs = array_operation
             .partially_evaluate(
                 &context,
                 &EmptyRegionDriver,
                 &[
-                    PartialEvaluationValue::known(Scalar::from(2.0f32)),
-                    PartialEvaluationValue::known(Scalar::from(3.0f32)),
+                    PartialEvaluationValue::known(Array::scalar(2.0f32)),
+                    PartialEvaluationValue::known(Array::scalar(3.0f32)),
                 ],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].as_known(), Some(&Scalar::from(5.0f32)));
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(5.0f32)));
     }
 
     #[test]
@@ -5808,8 +5807,8 @@ mod tests {
 
     #[test]
     fn test_define_elementwise_capability_unary() {
-        let context = TracingContext::<Scalar, TestUnaryOperation<DataType>>::new();
-        let output = context.input(DataType::F32).test_unary().unwrap();
+        let context = TracingContext::<Array, TestUnaryOperation<ArrayType>>::new();
+        let output = context.input(ArrayType::scalar(DataType::F32)).test_unary().unwrap();
         let builder = output.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
         assert_eq!(builder.instructions()[0].operation().name(), TEST_UNARY_OPERATION_NAME);
@@ -5819,9 +5818,9 @@ mod tests {
 
     #[test]
     fn test_define_elementwise_capability_binary() {
-        let context = TracingContext::<Scalar, TestBinaryOperation<DataType>>::new();
-        let left = context.input(DataType::F32);
-        let right = context.input(DataType::F32);
+        let context = TracingContext::<Array, TestBinaryOperation<ArrayType>>::new();
+        let left = context.input(ArrayType::scalar(DataType::F32));
+        let right = context.input(ArrayType::scalar(DataType::F32));
         let output = left.test_binary(&right).unwrap();
         let builder = output.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
@@ -5835,26 +5834,29 @@ mod tests {
         // The generic macro forwards every differentiation dual to the caller-provided JVP body without imposing
         // elementwise alignment or structural-zero handling.
         let inputs = [
-            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
-            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
-        let outputs = TestDifferentiableOperation::<DataType>::new()
-            .jvp(&EagerContext::<Scalar, TestDifferentiableOperation<DataType>>::new(), &EmptyRegionDriver, &inputs)
+        let outputs = TestDifferentiableOperation::<ArrayType>::new()
+            .jvp(&EagerContext::<Array, TestDifferentiableOperation<ArrayType>>::new(), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Scalar::from(2.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(4.0f32)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(2.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(4.0f32)));
 
         // The generic transposition shell likewise forwards the complete partial-input and cotangent slices to the
         // supplied body and preserves the driver's static dispatch.
-        let mut context = TracingContext::<Scalar, TestDifferentiableOperation<DataType>>::new();
-        let output_cotangent = context.input(DataType::F32);
+        let mut context = TracingContext::<Array, TestDifferentiableOperation<ArrayType>>::new();
+        let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
-        let input_cotangents = TestDifferentiableOperation::<DataType>::new()
+        let input_cotangents = TestDifferentiableOperation::<ArrayType>::new()
             .transpose(
                 &mut context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                ],
                 &[MaybeZero::Value(output_cotangent)],
             )
             .unwrap();
@@ -5867,25 +5869,28 @@ mod tests {
     #[test]
     fn test_impl_differentiable_elementwise_operation_linear() {
         let inputs = [
-            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
-            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
         let outputs = AddOperation::new()
-            .jvp(&EagerContext::<Scalar, ScalarOperation<Scalar>>::new(), &EmptyRegionDriver, &inputs)
+            .jvp(&EagerContext::<Array, ArrayOperation<Array>>::new(), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Scalar::from(5.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(9.0f32)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(5.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(9.0f32)));
 
-        let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let output_cotangent = context.input(DataType::F32);
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
         let input_cotangents =
-            <AddOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+            <AddOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &AddOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                ],
                 &[MaybeZero::Value(output_cotangent.clone())],
             )
             .unwrap();
@@ -5904,57 +5909,60 @@ mod tests {
     fn test_impl_differentiable_elementwise_operation_linear_negative_signs() {
         // A `[@negative, @positive]` rule combines both live tangents as `right - left` and negates a left-only
         // tangent. The primal values come from the stand-in `Sub` interpretation and are irrelevant to the rule.
-        let context = EagerContext::<Scalar, TestReversedSubOperation<DataType>>::new();
+        let context = EagerContext::<Array, TestReversedSubOperation<ArrayType>>::new();
         let inputs = [
-            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
-            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
-        let outputs = TestReversedSubOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestReversedSubOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(1.0f32)));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(1.0f32)));
         let inputs = [
-            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
-            DifferentiationDual::new_with_zero_tangent(Scalar::from(3.0f32)),
+            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(3.0f32)),
         ];
-        let outputs = TestReversedSubOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(-4.0f32)));
+        let outputs = TestReversedSubOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-4.0f32)));
         let inputs = [
-            DifferentiationDual::new_with_zero_tangent(Scalar::from(2.0f32)),
-            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32)),
+            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
-        let outputs = TestReversedSubOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(5.0f32)));
+        let outputs = TestReversedSubOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(5.0f32)));
 
         // A `[@negative, @negative]` rule combines both live tangents as `-(left + right)`.
-        let context = EagerContext::<Scalar, TestNegatedAddOperation<DataType>>::new();
+        let context = EagerContext::<Array, TestNegatedAddOperation<ArrayType>>::new();
         let inputs = [
-            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
-            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
-        let outputs = TestNegatedAddOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestNegatedAddOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(-9.0f32)));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-9.0f32)));
         let inputs = [
-            DifferentiationDual::new_with_zero_tangent(Scalar::from(2.0f32)),
-            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32)),
+            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
-        let outputs = TestNegatedAddOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(-5.0f32)));
+        let outputs = TestNegatedAddOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-5.0f32)));
     }
 
     #[test]
     fn test_impl_differentiable_elementwise_operation_linear_negative_transposition() {
         // A negative coefficient stages a negation of the output cotangent while a positive coefficient passes it
         // through unchanged.
-        let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let output_cotangent = context.input(DataType::F32);
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
         let input_cotangents =
-            <TestReversedSubOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
-                &TestReversedSubOperation::<DataType>::new(),
+            <TestReversedSubOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
+                &TestReversedSubOperation::<ArrayType>::new(),
                 &mut context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                ],
                 &[MaybeZero::Value(output_cotangent.clone())],
             )
             .unwrap();
@@ -5974,15 +5982,18 @@ mod tests {
         }
 
         // Both coefficients of a `[@negative, @negative]` rule stage negations.
-        let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let output_cotangent = context.input(DataType::F32);
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
         let input_cotangents =
-            <TestNegatedAddOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
-                &TestNegatedAddOperation::<DataType>::new(),
+            <TestNegatedAddOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
+                &TestNegatedAddOperation::<ArrayType>::new(),
                 &mut context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                ],
                 &[MaybeZero::Value(output_cotangent)],
             )
             .unwrap();
@@ -6003,55 +6014,55 @@ mod tests {
     fn test_impl_differentiable_elementwise_operation_unary_jvp_contributions() {
         let outputs = SinOperation::new()
             .jvp(
-                &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                &EagerContext::<Array, ArrayOperation<Array>>::new(),
                 &EmptyRegionDriver,
-                &[DifferentiationDual::new(Scalar::from(0.0f32), Scalar::from(4.0f32)).unwrap()],
+                &[DifferentiationDual::new(Array::scalar(0.0f32), Array::scalar(4.0f32)).unwrap()],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Scalar::from(0.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(4.0f32)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(0.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(4.0f32)));
 
         let outputs = ExpOperation::new()
             .jvp(
-                &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                &EagerContext::<Array, ArrayOperation<Array>>::new(),
                 &EmptyRegionDriver,
-                &[DifferentiationDual::new(Scalar::from(0.0f32), Scalar::from(3.0f32)).unwrap()],
+                &[DifferentiationDual::new(Array::scalar(0.0f32), Array::scalar(3.0f32)).unwrap()],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Scalar::from(1.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(3.0f32)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(1.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(3.0f32)));
     }
 
     #[test]
     fn test_impl_differentiable_elementwise_operation_binary_jvp_contributions() {
         let outputs = MulOperation::new()
             .jvp(
-                &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                &EagerContext::<Array, ArrayOperation<Array>>::new(),
                 &EmptyRegionDriver,
                 &[
-                    DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
-                    DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+                    DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
+                    DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
                 ],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Scalar::from(6.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(22.0f32)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(6.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(22.0f32)));
     }
 
     #[test]
     fn test_impl_differentiable_elementwise_operation_symmetric_transposition_diagnostics() {
-        let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let output_cotangent = context.input(DataType::F32);
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let outputs = [MaybeZero::Value(output_cotangent)];
         assert!(matches!(
-            <MulOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+            <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &[PartialValue::Unknown(ArrayType::scalar(DataType::F32)), PartialValue::Unknown(ArrayType::scalar(DataType::F32))],
                 &outputs,
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
@@ -6060,10 +6071,10 @@ mod tests {
                         [left = linear, right = linear]",
         ));
 
-        let left = context.input(DataType::F32);
-        let right = context.input(DataType::F32);
+        let left = context.input(ArrayType::scalar(DataType::F32));
+        let right = context.input(ArrayType::scalar(DataType::F32));
         assert!(matches!(
-            <MulOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+            <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
@@ -6076,14 +6087,14 @@ mod tests {
                         [left = known, right = known]",
         ));
 
-        let right = context.input(DataType::I32);
-        let output_cotangent = context.input(DataType::I32);
+        let right = context.input(ArrayType::scalar(DataType::I32));
+        let output_cotangent = context.input(ArrayType::scalar(DataType::I32));
         assert!(matches!(
-            <MulOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+            <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(DataType::I32), PartialValue::Known(right)],
+                &[PartialValue::Unknown(ArrayType::scalar(DataType::I32)), PartialValue::Known(right)],
                 &[MaybeZero::Value(output_cotangent)],
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
@@ -6093,15 +6104,15 @@ mod tests {
 
     #[test]
     fn test_impl_differentiable_elementwise_operation_one_sided_transposition_diagnostics() {
-        let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let output_cotangent = context.input(DataType::F32);
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let outputs = [MaybeZero::Value(output_cotangent)];
         assert!(matches!(
-            <DivOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+            <DivOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &DivOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &[PartialValue::Unknown(ArrayType::scalar(DataType::F32)), PartialValue::Unknown(ArrayType::scalar(DataType::F32))],
                 &outputs,
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
@@ -6110,10 +6121,10 @@ mod tests {
                         [numerator = linear, denominator = linear]",
         ));
 
-        let numerator = context.input(DataType::F32);
-        let denominator = context.input(DataType::F32);
+        let numerator = context.input(ArrayType::scalar(DataType::F32));
+        let denominator = context.input(ArrayType::scalar(DataType::F32));
         assert!(matches!(
-            <DivOperation<DataType> as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+            <DivOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &DivOperation::new(),
                 &mut context,
                 &EmptyRegionDriver,
@@ -6129,13 +6140,16 @@ mod tests {
 
     #[test]
     fn test_impl_differentiable_elementwise_operation_skips_structural_zero_contributions() {
-        let context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = context.input(DataType::F32);
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = context.input(ArrayType::scalar(DataType::F32));
         let outputs = SinOperation::new()
             .jvp(&context, &EmptyRegionDriver, &[DifferentiationDual::new_with_zero_tangent(input)])
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
+        assert!(matches!(
+            outputs[0].tangent(),
+            MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F32),
+        ));
         let builder = context.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
         assert_eq!(builder.instructions()[0].operation().name(), "sin");
@@ -6144,20 +6158,26 @@ mod tests {
     #[test]
     fn test_impl_non_differentiable_operation() {
         // The basic form replays the primal operation and replaces its live tangent with a structural zero.
-        let inputs = [DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(1.0f32)).unwrap()];
-        let outputs = TestUnaryOperation::<DataType>::new()
-            .jvp(&EagerContext::<Scalar, TestUnaryOperation<DataType>>::new(), &EmptyRegionDriver, &inputs)
+        let inputs = [DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(1.0f32)).unwrap()];
+        let outputs = TestUnaryOperation::<ArrayType>::new()
+            .jvp(&EagerContext::<Array, TestUnaryOperation<ArrayType>>::new(), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Scalar::from(-2.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
-        let context = TracingContext::<Scalar, TestUnaryOperation<DataType>>::new();
-        let primal = context.input(DataType::F32);
-        let tangent = context.input(DataType::F32);
+        assert_eq!(outputs[0].primal(), &Array::scalar(-2.0f32));
+        assert!(matches!(
+            outputs[0].tangent(),
+            MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F32),
+        ));
+        let context = TracingContext::<Array, TestUnaryOperation<ArrayType>>::new();
+        let primal = context.input(ArrayType::scalar(DataType::F32));
+        let tangent = context.input(ArrayType::scalar(DataType::F32));
         let inputs = [DifferentiationDual::new(primal, tangent).unwrap()];
-        let outputs = TestUnaryOperation::<DataType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestUnaryOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(context.builder().borrow().instructions().len(), 1);
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
+        assert!(matches!(
+            outputs[0].tangent(),
+            MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F32),
+        ));
 
         // The generic form produces the same implementation shape without constraining its marker parameter.
         let operation = TestGenericNullaryOperation::<ArrayType>(PhantomData);
@@ -6180,12 +6200,12 @@ mod tests {
 
     #[test]
     fn test_impl_non_transposable_operation() {
-        let mut context = TracingContext::<Scalar, TestUnaryOperation<DataType>>::new();
-        let inputs: [PartialValue<Tracer<TracingContext<Scalar, TestUnaryOperation<DataType>>>>; 0] = [];
-        let outputs: [MaybeZero<Tracer<TracingContext<Scalar, TestUnaryOperation<DataType>>>>; 0] = [];
+        let mut context = TracingContext::<Array, TestUnaryOperation<ArrayType>>::new();
+        let inputs: [PartialValue<Tracer<TracingContext<Array, TestUnaryOperation<ArrayType>>>>; 0] = [];
+        let outputs: [MaybeZero<Tracer<TracingContext<Array, TestUnaryOperation<ArrayType>>>>; 0] = [];
         assert!(matches!(
-            <TestUnaryOperation<DataType> as TransposableOperation<Scalar, TestUnaryOperation<DataType>>>::transpose(
-                &TestUnaryOperation::<DataType>::new(),
+            <TestUnaryOperation<ArrayType> as TransposableOperation<Array, TestUnaryOperation<ArrayType>>>::transpose(
+                &TestUnaryOperation::<ArrayType>::new(),
                 &mut context,
                 &EmptyRegionDriver,
                 &inputs,
@@ -6198,19 +6218,20 @@ mod tests {
 
     #[test]
     fn test_impl_nullary_transposable_operation() {
-        let operation = TestNullaryOperation::<DataType>::new();
-        let mut context = TracingContext::<Scalar, TestNullaryOperation<DataType>>::new();
-        let inputs: [PartialValue<Tracer<TracingContext<Scalar, TestNullaryOperation<DataType>>>>; 0] = [];
-        let outputs = [MaybeZero::Zero(DataType::F64), MaybeZero::Zero(DataType::F64)];
-        let result = <TestNullaryOperation<DataType> as TransposableOperation<
-            Scalar,
-            TestNullaryOperation<DataType>,
+        let operation = TestNullaryOperation::<ArrayType>::new();
+        let mut context = TracingContext::<Array, TestNullaryOperation<ArrayType>>::new();
+        let inputs: [PartialValue<Tracer<TracingContext<Array, TestNullaryOperation<ArrayType>>>>; 0] = [];
+        let outputs =
+            [MaybeZero::Zero(ArrayType::scalar(DataType::F64)), MaybeZero::Zero(ArrayType::scalar(DataType::F64))];
+        let result = <TestNullaryOperation<ArrayType> as TransposableOperation<
+            Array,
+            TestNullaryOperation<ArrayType>,
         >>::transpose(&operation, &mut context, &EmptyRegionDriver, &inputs, &outputs)
         .unwrap();
         assert!(result.is_empty());
-        let input = context.input(DataType::F64);
+        let input = context.input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
-            <TestNullaryOperation<DataType> as TransposableOperation<Scalar, TestNullaryOperation<DataType>>>::transpose(
+            <TestNullaryOperation<ArrayType> as TransposableOperation<Array, TestNullaryOperation<ArrayType>>>::transpose(
                 &operation,
                 &mut context,
                 &EmptyRegionDriver,
@@ -6220,7 +6241,7 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
         ));
         assert!(matches!(
-            <TestNullaryOperation<DataType> as TransposableOperation<Scalar, TestNullaryOperation<DataType>>>::transpose(
+            <TestNullaryOperation<ArrayType> as TransposableOperation<Array, TestNullaryOperation<ArrayType>>>::transpose(
                 &operation,
                 &mut context,
                 &EmptyRegionDriver,
@@ -6230,10 +6251,10 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidOutputCount { expected: 2, actual: 0 })),
         ));
 
-        fn assert_transposable<O: Operation<Type = DataType> + TransposableOperation<Scalar, O>>() {}
+        fn assert_transposable<O: Operation<Type = ArrayType> + TransposableOperation<Array, O>>() {}
 
-        assert_transposable::<TestGenericNullaryOperation<DataType>>();
-        assert_transposable::<TestBoundedNullaryOperation<DataType>>();
+        assert_transposable::<TestGenericNullaryOperation<ArrayType>>();
+        assert_transposable::<TestBoundedNullaryOperation<ArrayType>>();
     }
 
     #[test]
@@ -6274,8 +6295,8 @@ mod tests {
 
     #[test]
     fn test_define_tracer_operator_unary() {
-        let context = TracingContext::<Scalar, TestUnaryOperation<DataType>>::new();
-        let input = context.input(DataType::F32);
+        let context = TracingContext::<Array, TestUnaryOperation<ArrayType>>::new();
+        let input = context.input(ArrayType::scalar(DataType::F32));
         let input_id = input.atom_id().unwrap();
         let output = input.apply_unary();
         let builder = output.builder().borrow();
@@ -6293,9 +6314,9 @@ mod tests {
         assert_eq!(output.value().atom_id(), Ok(builder.instructions()[0].outputs()[0]));
         drop(builder);
 
-        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestUnaryOperation<DataType>>::new());
-        let input = PartialTracer::new(context, PartialEvaluationValue::known(Scalar::from(2.0f32)));
-        assert_eq!(input.apply_unary().into_value().unwrap().as_known(), Some(&Scalar::from(-2.0f32)));
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new());
+        let input = PartialTracer::new(context, PartialEvaluationValue::known(Array::scalar(2.0f32)));
+        assert_eq!(input.apply_unary().into_value().unwrap().as_known(), Some(&Array::scalar(-2.0f32)));
 
         let context = BatchingContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new(), 2);
         let input = BatchingTracer::new(context, ArrayBatch::replicated(Array::scalar(2.0f32)));
@@ -6303,21 +6324,24 @@ mod tests {
         assert_eq!(output.value(), &Array::scalar(-2.0f32));
         assert!(output.batch_axis().is_replicated());
 
-        let context = DifferentiationContext::new(EagerContext::<Scalar, TestUnaryOperation<DataType>>::new());
+        let context = DifferentiationContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new());
         let input = DifferentiationTracer::new(
-            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(1.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(1.0f32)).unwrap(),
             context,
         );
         let output = input.apply_unary().into_dual();
-        assert_eq!(output.primal(), &Scalar::from(-2.0f32));
-        assert!(matches!(output.tangent(), MaybeZero::Zero(DataType::F32)));
+        assert_eq!(output.primal(), &Array::scalar(-2.0f32));
+        assert!(matches!(
+            output.tangent(),
+            MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F32),
+        ));
     }
 
     #[test]
     fn test_define_tracer_operator_binary() {
-        let context = TracingContext::<Scalar, TestBinaryOperation<DataType>>::new();
-        let left = context.input(DataType::F32);
-        let right = context.input(DataType::F32);
+        let context = TracingContext::<Array, TestBinaryOperation<ArrayType>>::new();
+        let left = context.input(ArrayType::scalar(DataType::F32));
+        let right = context.input(ArrayType::scalar(DataType::F32));
         let input_ids = [left.atom_id().unwrap(), right.atom_id().unwrap()];
         let output = left.apply_binary(right);
         let builder = output.builder().borrow();
@@ -6337,10 +6361,10 @@ mod tests {
         assert_eq!(output.value().atom_id(), Ok(builder.instructions()[0].outputs()[0]));
         drop(builder);
 
-        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestBinaryOperation<DataType>>::new());
-        let left = PartialTracer::new(context.clone(), PartialEvaluationValue::known(Scalar::from(2.0f32)));
-        let right = PartialTracer::new(context, PartialEvaluationValue::known(Scalar::from(3.0f32)));
-        assert_eq!(left.apply_binary(right).into_value().unwrap().as_known(), Some(&Scalar::from(5.0f32)),);
+        let context = PartialEvaluationContext::new(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new());
+        let left = PartialTracer::new(context.clone(), PartialEvaluationValue::known(Array::scalar(2.0f32)));
+        let right = PartialTracer::new(context, PartialEvaluationValue::known(Array::scalar(3.0f32)));
+        assert_eq!(left.apply_binary(right).into_value().unwrap().as_known(), Some(&Array::scalar(5.0f32)),);
 
         let context = BatchingContext::new(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new(), 2);
         let left = BatchingTracer::new(context.clone(), ArrayBatch::replicated(Array::scalar(2.0f32)));
@@ -6349,26 +6373,29 @@ mod tests {
         assert_eq!(output.value(), &Array::scalar(5.0f32));
         assert!(output.batch_axis().is_replicated());
 
-        let context = DifferentiationContext::new(EagerContext::<Scalar, TestBinaryOperation<DataType>>::new());
+        let context = DifferentiationContext::new(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new());
         let left = DifferentiationTracer::new(
-            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(1.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(1.0f32)).unwrap(),
             context.clone(),
         );
         let right = DifferentiationTracer::new(
-            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(1.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(1.0f32)).unwrap(),
             context,
         );
         let output = left.apply_binary(right).into_dual();
-        assert_eq!(output.primal(), &Scalar::from(5.0f32));
-        assert!(matches!(output.tangent(), MaybeZero::Zero(DataType::F32)));
+        assert_eq!(output.primal(), &Array::scalar(5.0f32));
+        assert!(matches!(
+            output.tangent(),
+            MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F32),
+        ));
     }
 
     #[test]
     fn test_define_tracer_operator_binary_with_provider() {
-        // The scalar universe selects the ordinary elementwise test operation.
-        let context = TracingContext::<Scalar, TestBinaryOperation<DataType>>::new();
-        let left = context.input(DataType::F32);
-        let right = context.input(DataType::F32);
+        // The array universe selects the ordinary elementwise test operation.
+        let context = TracingContext::<Array, TestBinaryOperation<ArrayType>>::new();
+        let left = context.input(ArrayType::scalar(DataType::F32));
+        let right = context.input(ArrayType::scalar(DataType::F32));
         let input_ids = [left.atom_id().unwrap(), right.atom_id().unwrap()];
         let output = left.apply_provided_binary(right);
         let builder = output.builder().borrow();

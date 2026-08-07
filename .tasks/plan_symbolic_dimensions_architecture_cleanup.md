@@ -2578,7 +2578,7 @@ Phase 9a4 — retire the scalar program universe:
       exports, scalar-only doctests, and the obsolete scalar-domain compile-fail fixture.
   - [x] Migrate or delete the final scalar-backed capture and interpretation fixtures.
   - [x] Migrate or delete the final scalar-backed program fixtures.
-  - [ ] Migrate or delete the final scalar-backed macro, compilation, and benchmark fixtures, then remove the obsolete
+  - [x] Migrate or delete the final scalar-backed macro, compilation, and benchmark fixtures, then remove the obsolete
         scalar-domain compile-fail fixture.
   - [ ] Delete the scalar backend module, exports, scalar-only doctests, production specializations, and stale
         documentation references.
@@ -4981,3 +4981,20 @@ references from that module. Re-running the audit against the current committed 
 complete 1,153-test core library suite, all five allocation tests, all seven integration tests, the compile-fail test,
 and all 54 runnable doctests (16 intentional ignores) pass. This closes useful `DataType`-universe fixture migration;
 macro, compilation, and benchmark fixtures are the next dependency-removal unit.
+
+The macro, compilation, and benchmark slice moves the final reusable scalar-backed fixtures to rank-zero arrays.
+Macro tests retain data-type inference coverage directly on `DataType`, while interpretation, partial evaluation,
+tracing, differentiation, transposition, and generated tracer operators now execute through `ArrayType`, `Array`, and
+`ArrayOperation`. Both compilation test domains now use array signatures and values, preserving cache, staging,
+lowering, capture, runtime-validation, concurrency, and JIT-specialization coverage. The stable scalar-semantics
+benchmark identifiers remain unchanged, but their programs now render explicit rank-zero shapes.
+
+The obsolete `DotsSaveable`-versus-`ScalarOperation` compile-fail fixture was the only `ryft-core` trybuild case, so its
+empty harness and now-unused crate-local `trybuild` dependency were deleted with it. This review unit changes 690 lines
+across ten files with four net additions, primarily from explicit `ArrayType::scalar(...)` construction. It removes 41
+retired scalar-backend references and reduces the exact audit from 78 matches across 11 files to 37 matches across four
+files. All 41 focused macro tests, 49 compilation tests, three feature-gated benchmark tests, the complete 1,156-test
+core suite with benchmarking enabled, all five allocation tests, all six region-prototype integration tests, formatting,
+diff hygiene, and all 54 runnable doctests (16 intentional ignores) pass. Deleting the scalar backend, its exports,
+remaining production specializations, scalar-only doctest, and stale documentation is the final dependency-removal
+unit.

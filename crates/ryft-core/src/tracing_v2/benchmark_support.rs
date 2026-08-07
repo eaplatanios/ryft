@@ -1,7 +1,6 @@
 use std::ops::{Add, Mul, Neg};
 
-use crate::backends::scalars::Scalar;
-use crate::backends::scalars::ScalarOperation;
+use crate::backends::arrays::{Array, ArrayOperation};
 use crate::contexts::{Context, EagerContext};
 use crate::differentiation::DifferentiationError;
 use crate::differentiation::ReverseModeDifferentiate;
@@ -80,33 +79,33 @@ fn tracing_category(case_id: &str) -> &'static str {
 ///
 /// # Parameters
 ///
-///   - `x`: Scalar input.
+///   - `x`: Rank-zero array input.
 fn quartic_plus_sin<T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>>(x: T) -> T {
     x.clone() * x.clone() * x.clone() * x.clone() + x.sin().unwrap()
 }
 
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (Scalar, Program<Scalar, ScalarOperation<Scalar>, (Scalar, Scalar), Scalar>) =
-        EagerContext::<Scalar, ScalarOperation<Scalar>>::new().interpret_and_trace(
+    let (_, compiled): (Array, Program<Array, ArrayOperation<Array>, (Array, Array), Array>) =
+        EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
             |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
-            (Scalar::from(2.0), Scalar::from(3.0)),
+            (Array::scalar(2.0), Array::scalar(3.0)),
         )?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", &compiled)?])
 }
 
 /// Emits the staged scalar bilinear pullback benchmark.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pullback): (Scalar, _) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-        .vjp(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?), (Scalar::from(2.0), Scalar::from(3.0)))?;
+    let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
+        .vjp(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?), (Array::scalar(2.0), Array::scalar(3.0)))?;
     let (pullback, _residuals) = pullback.into_parts();
     Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 
 /// Emits the staged scalar reverse-mode gradient benchmark.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (Scalar, Program<Scalar, ScalarOperation<Scalar>, Scalar, Scalar>) =
-        EagerContext::<Scalar, ScalarOperation<Scalar>>::new().interpret_and_trace(
+    let (_, compiled): (Array, Program<Array, ArrayOperation<Array>, Array, Array>) =
+        EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
             |x| {
                 let context = x.context().clone();
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
@@ -118,15 +117,15 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
                 })?;
                 Ok(gradient)
             },
-            Scalar::from(2.0),
+            Array::scalar(2.0),
         )?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_grad", "grad", &compiled)?])
 }
 
 /// Emits the staged scalar value-and-gradient benchmark.
 fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): ((Scalar, Scalar), Program<Scalar, ScalarOperation<Scalar>, Scalar, (Scalar, Scalar)>) =
-        EagerContext::<Scalar, ScalarOperation<Scalar>>::new().interpret_and_trace(
+    let (_, compiled): ((Array, Array), Program<Array, ArrayOperation<Array>, Array, (Array, Array)>) =
+        EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
             |x| {
                 let context = x.context().clone();
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
@@ -139,7 +138,7 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
                     })?;
                 Ok(value_and_gradient)
             },
-            Scalar::from(2.0),
+            Array::scalar(2.0),
         )?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_value_and_grad", "value_and_gradient", &compiled)?])
 }

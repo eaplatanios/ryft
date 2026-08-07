@@ -1535,17 +1535,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::programs::regions::RegionInterface;
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
+    use crate::backends::arrays::Array;
     use crate::compilation::{CompilationCacheDomain, CompilationContext};
     use crate::programs::operations::Operation;
+    use crate::programs::regions::RegionInterface;
     use crate::programs::types::{Type, TypeError};
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
@@ -1553,7 +1553,7 @@ mod tests {
     struct NegateOperation;
 
     impl Operation for NegateOperation {
-        type Type = DataType;
+        type Type = ArrayType;
 
         fn name(&self) -> &'static str {
             "test_negate"
@@ -1561,9 +1561,9 @@ mod tests {
 
         fn infer_output_types(
             &self,
-            input_types: &[DataType],
-            _region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
+            input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
             if input_types.len() != 1 {
                 return Err(TypeError::invalid(format!("test_negate expects 1 input but got {}", input_types.len())));
             }
@@ -1575,20 +1575,20 @@ mod tests {
     struct TestLoweredProgram {
         program: FlatCompilationProgram<TestDomain>,
         capture_count: usize,
-        output_types: Vec<DataType>,
+        output_types: Vec<ArrayType>,
         options: TestOptions,
     }
 
     struct TestCompiledProgram {
         program: FlatCompilationProgram<TestDomain>,
-        output_types: Vec<DataType>,
+        output_types: Vec<ArrayType>,
     }
 
     #[derive(Clone, Debug, Default)]
     struct TestOptions {
-        staged_input_type: Option<DataType>,
-        lowered_output_type: Option<DataType>,
-        compiled_output_type: Option<DataType>,
+        staged_input_type: Option<ArrayType>,
+        lowered_output_type: Option<ArrayType>,
+        compiled_output_type: Option<ArrayType>,
     }
 
     #[derive(Clone)]
@@ -1608,9 +1608,9 @@ mod tests {
     }
 
     impl Domain for TestDomain {
-        type Type = DataType;
-        type Value = Scalar;
-        type Constant = CaptureReference<DataType>;
+        type Type = ArrayType;
+        type Value = Array;
+        type Constant = CaptureReference<ArrayType>;
         type Operation = NegateOperation;
     }
 
@@ -1642,7 +1642,7 @@ mod tests {
             Request: LoweringRequest<Self>,
         {
             let program = staged.lifted_program()?;
-            let mut output_types: Vec<DataType> = program
+            let mut output_types: Vec<ArrayType> = program
                 .output_ids()
                 .iter()
                 .map(|atom_id| program.atoms()[atom_id.index()].r#type().into_owned())
@@ -1730,7 +1730,7 @@ mod tests {
                     if inputs.len() != 1 {
                         return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() });
                     }
-                    Ok(vec![-inputs[0]])
+                    Ok(vec![-inputs[0].clone()])
                 },
             )?;
             Request::reconstruct(&executable, outputs)
@@ -1758,11 +1758,11 @@ mod tests {
     fn compile_from_one_call_site(
         domain: &TestDomain,
         negate: bool,
-    ) -> CompiledFunction<TestDomain, DataType, DataType> {
+    ) -> CompiledFunction<TestDomain, ArrayType, ArrayType> {
         let staged = stage_function(
             domain,
             |input| if negate { input.unary(NegateOperation) } else { input },
-            DataType::F64,
+            ArrayType::scalar(DataType::F64),
             TestOptions::default(),
         )
         .unwrap();
@@ -1777,20 +1777,23 @@ mod tests {
         let negate = compile_from_one_call_site(&domain, true);
 
         assert_eq!(
-            call_function(&domain, identity.executable_program(), Scalar::from(3.0)).unwrap(),
-            Scalar::from(3.0)
+            call_function(&domain, identity.executable_program(), Array::scalar(3.0)).unwrap(),
+            Array::scalar(3.0)
         );
-        assert_eq!(call_function(&domain, negate.executable_program(), Scalar::from(3.0)).unwrap(), Scalar::from(-3.0));
+        assert_eq!(
+            call_function(&domain, negate.executable_program(), Array::scalar(3.0)).unwrap(),
+            Array::scalar(-3.0)
+        );
         assert_eq!(domain.compilation_count(), 2);
     }
 
     #[test]
     fn test_staged_and_lowered_handles_reuse_one_compilation() {
         let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, DataType, DataType> = stage_function(
+        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
             &domain,
             |input: CompilationTracer<TestDomain>| input.unary(NegateOperation),
-            DataType::F64,
+            ArrayType::scalar(DataType::F64),
             TestOptions::default(),
         )
         .unwrap();
@@ -1800,8 +1803,14 @@ mod tests {
         let first = domain.compile(domain.lower(staged_clone).unwrap()).unwrap();
         let second = domain.compile(domain.lower(staged).unwrap()).unwrap();
 
-        assert_eq!(call_function(&domain, first.executable_program(), Scalar::from(2.0)).unwrap(), Scalar::from(-2.0));
-        assert_eq!(call_function(&domain, second.executable_program(), Scalar::from(4.0)).unwrap(), Scalar::from(-4.0));
+        assert_eq!(
+            call_function(&domain, first.executable_program(), Array::scalar(2.0)).unwrap(),
+            Array::scalar(-2.0)
+        );
+        assert_eq!(
+            call_function(&domain, second.executable_program(), Array::scalar(4.0)).unwrap(),
+            Array::scalar(-4.0)
+        );
         assert_eq!(domain.compilation_count(), 1);
         assert_eq!(domain.cache.statistics().memory_hits, 1);
     }
@@ -1809,13 +1818,19 @@ mod tests {
     #[test]
     fn test_staging_options_apply_before_tracing() {
         let domain = TestDomain::new();
-        let options = TestOptions { staged_input_type: Some(DataType::I64), ..TestOptions::default() };
-        let staged: StagedFunction<TestDomain, DataType, DataType> =
-            stage_function(&domain, |input: CompilationTracer<TestDomain>| input, DataType::F64, options).unwrap();
+        let options =
+            TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
+        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
+            &domain,
+            |input: CompilationTracer<TestDomain>| input,
+            ArrayType::scalar(DataType::F64),
+            options,
+        )
+        .unwrap();
 
-        assert_eq!(staged.input_types(), &[DataType::I64]);
-        assert_eq!(staged.output_types(), &[DataType::I64]);
-        assert_eq!(staged.options().staged_input_type, Some(DataType::I64));
+        assert_eq!(staged.input_types(), &[ArrayType::scalar(DataType::I64)]);
+        assert_eq!(staged.output_types(), &[ArrayType::scalar(DataType::I64)]);
+        assert_eq!(staged.options().staged_input_type, Some(ArrayType::scalar(DataType::I64)));
     }
 
     #[test]
@@ -1824,36 +1839,36 @@ mod tests {
         let compiled = compile_from_one_call_site(&domain, false);
 
         assert!(matches!(
-            call_function(&domain, compiled.executable_program(), Scalar::from(3_i64)),
+            call_function(&domain, compiled.executable_program(), Array::scalar(3_i64)),
             Err(ProgramError::InvalidArgument { message })
-                if message == "runtime input type i64 does not refine declared type f64",
+                if message == "runtime input type i64[] does not refine declared type f64[]",
         ));
     }
 
     #[test]
     fn test_compiled_function_executes_explicit_capture() {
         let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, (), DataType> = domain
+        let staged: StagedFunction<TestDomain, (), ArrayType> = domain
             .stage(CompilationStagingRequest::new(
                 |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
-                vec![Scalar::from(7.0)],
+                vec![Array::scalar(7.0)],
                 (),
                 TestOptions::default(),
             ))
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
 
-        assert_eq!(call_function(&domain, compiled.executable_program(), ()).unwrap(), Scalar::from(7.0));
-        assert_eq!(compiled.source_program().captures(), &[Scalar::from(7.0)]);
+        assert_eq!(call_function(&domain, compiled.executable_program(), ()).unwrap(), Array::scalar(7.0));
+        assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0)]);
     }
 
     #[test]
     fn test_executable_program_outlives_transform_metadata_and_executes_captures() {
         let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, (), DataType> = domain
+        let staged: StagedFunction<TestDomain, (), ArrayType> = domain
             .stage(CompilationStagingRequest::new(
                 |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
-                vec![Scalar::from(7.0)],
+                vec![Array::scalar(7.0)],
                 (),
                 TestOptions::default(),
             ))
@@ -1861,17 +1876,17 @@ mod tests {
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let executable = compiled.into_executable_program();
 
-        assert_eq!(executable.captures(), &[Scalar::from(7.0)]);
+        assert_eq!(executable.captures(), &[Array::scalar(7.0)]);
         assert!(executable.input_types().is_empty());
-        assert_eq!(executable.output_types(), &[DataType::F64]);
-        assert_eq!(call_function(&domain, &executable, ()).unwrap(), Scalar::from(7.0));
+        assert_eq!(executable.output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(call_function(&domain, &executable, ()).unwrap(), Array::scalar(7.0));
     }
 
     #[test]
     fn test_executable_program_is_send_and_sync_for_thread_safe_runtime_state() {
         fn assert_send_and_sync<T: Send + Sync>() {}
 
-        assert_send_and_sync::<ExecutableProgram<TestDomain, DataType, DataType>>();
+        assert_send_and_sync::<ExecutableProgram<TestDomain, ArrayType, ArrayType>>();
 
         let domain = TestDomain::new();
         let executable = compile_from_one_call_site(&domain, true).into_executable_program();
@@ -1879,22 +1894,22 @@ mod tests {
         let first_domain = domain.clone();
         let second_domain = domain.clone();
         let first_thread =
-            std::thread::spawn(move || call_function(&first_domain, &executable, Scalar::from(3.0)).unwrap());
+            std::thread::spawn(move || call_function(&first_domain, &executable, Array::scalar(3.0)).unwrap());
         let second_thread =
-            std::thread::spawn(move || call_function(&second_domain, &second, Scalar::from(4.0)).unwrap());
+            std::thread::spawn(move || call_function(&second_domain, &second, Array::scalar(4.0)).unwrap());
 
-        assert_eq!(first_thread.join().unwrap(), Scalar::from(-3.0));
-        assert_eq!(second_thread.join().unwrap(), Scalar::from(-4.0));
+        assert_eq!(first_thread.join().unwrap(), Array::scalar(-3.0));
+        assert_eq!(second_thread.join().unwrap(), Array::scalar(-4.0));
     }
 
     #[test]
     fn test_fallible_staging_propagates_closure_error() {
         let domain = TestDomain::new();
-        let result: Result<StagedFunction<TestDomain, DataType, DataType>, ProgramError> =
+        let result: Result<StagedFunction<TestDomain, ArrayType, ArrayType>, ProgramError> =
             domain.stage(CompilationStagingRequest::new(
                 |_, _, _| Err(ProgramError::InvalidArgument { message: "staging failed".into() }),
                 Vec::new(),
-                DataType::F64,
+                ArrayType::scalar(DataType::F64),
                 TestOptions::default(),
             ));
 
@@ -1904,11 +1919,11 @@ mod tests {
     #[test]
     fn test_staging_prunes_unused_captures() {
         let domain = TestDomain::new();
-        let staged: StagedFunction<TestDomain, DataType, DataType> = domain
+        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = domain
             .stage(CompilationStagingRequest::new(
                 |_, _, input: CompilationTracer<TestDomain>| Ok(input),
-                vec![Scalar::from(7.0)],
-                DataType::F64,
+                vec![Array::scalar(7.0)],
+                ArrayType::scalar(DataType::F64),
                 TestOptions::default(),
             ))
             .unwrap();
@@ -1919,45 +1934,57 @@ mod tests {
     #[test]
     fn test_lower_rejects_incompatible_output_type() {
         let domain = TestDomain::new();
-        let options = TestOptions { lowered_output_type: Some(DataType::I64), ..TestOptions::default() };
+        let options =
+            TestOptions { lowered_output_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
 
-        let staged: StagedFunction<TestDomain, DataType, DataType> =
-            stage_function(&domain, |input: CompilationTracer<TestDomain>| input, DataType::F64, options).unwrap();
+        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
+            &domain,
+            |input: CompilationTracer<TestDomain>| input,
+            ArrayType::scalar(DataType::F64),
+            options,
+        )
+        .unwrap();
         assert!(matches!(
             domain.lower(staged),
             Err(ProgramError::InvalidArgument { message })
-                if message == "output type i64 does not refine declared type f64",
+                if message == "output type i64[] does not refine declared type f64[]",
         ));
     }
 
     #[test]
     fn test_compile_rejects_incompatible_output_type() {
         let domain = TestDomain::new();
-        let options = TestOptions { compiled_output_type: Some(DataType::I64), ..TestOptions::default() };
-        let staged: StagedFunction<TestDomain, DataType, DataType> =
-            stage_function(&domain, |input: CompilationTracer<TestDomain>| input, DataType::F64, options).unwrap();
+        let options =
+            TestOptions { compiled_output_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
+        let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = stage_function(
+            &domain,
+            |input: CompilationTracer<TestDomain>| input,
+            ArrayType::scalar(DataType::F64),
+            options,
+        )
+        .unwrap();
         let lowered = domain.lower(staged).unwrap();
 
         assert!(matches!(
             domain.compile(lowered),
             Err(ProgramError::InvalidArgument { message })
-                if message == "output type i64 does not refine declared type f64",
+                if message == "output type i64[] does not refine declared type f64[]",
         ));
     }
 
     #[test]
     fn test_jitted_function_reuses_warm_specializations() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, DataType, DataType> = jit(
+        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
                 if negate { input.unary(NegateOperation) } else { input }
             },
         );
 
-        assert_eq!(function.call(true, Scalar::from(2.0)).unwrap(), Scalar::from(-2.0));
-        assert_eq!(function.call(true, Scalar::from(3.0)).unwrap(), Scalar::from(-3.0));
-        assert_eq!(function.call(false, Scalar::from(4.0)).unwrap(), Scalar::from(4.0));
+        assert_eq!(function.call(true, Array::scalar(2.0)).unwrap(), Array::scalar(-2.0));
+        assert_eq!(function.call(true, Array::scalar(3.0)).unwrap(), Array::scalar(-3.0));
+        assert_eq!(function.call(false, Array::scalar(4.0)).unwrap(), Array::scalar(4.0));
         assert_eq!(function.specialization_count(), 2);
         let statistics = function.statistics();
         assert_eq!(statistics.dispatch_hits, 1);
@@ -1971,14 +1998,15 @@ mod tests {
     #[test]
     fn test_jitted_function_applies_staging_options_before_tracing() {
         let domain = TestDomain::new();
-        let options = TestOptions { staged_input_type: Some(DataType::I64), ..TestOptions::default() };
-        let function: JittedFunction<TestDomain, _, (), DataType, DataType> =
+        let options =
+            TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
+        let function: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> =
             jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| input, options);
 
         assert!(matches!(
-            function.call((), Scalar::from(2.0)),
+            function.call((), Array::scalar(2.0)),
             Err(ProgramError::InvalidArgument { message })
-                if message == "runtime input type f64 does not refine declared type i64",
+                if message == "runtime input type f64[] does not refine declared type i64[]",
         ));
         assert_eq!(function.statistics().traces, 1);
     }
@@ -1995,15 +2023,15 @@ mod tests {
     #[test]
     fn test_jitted_function_distinguishes_hash_colliding_static_values() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, CollidingStatic, DataType, DataType> = jit(
+        let function: JittedFunction<TestDomain, _, CollidingStatic, ArrayType, ArrayType> = jit(
             &domain,
             |static_parameters: CollidingStatic, input: CompilationTracer<TestDomain>| {
                 if static_parameters.0 { input.unary(NegateOperation) } else { input }
             },
         );
 
-        assert_eq!(function.call(CollidingStatic(false), Scalar::from(2.0)).unwrap(), Scalar::from(2.0));
-        assert_eq!(function.call(CollidingStatic(true), Scalar::from(2.0)).unwrap(), Scalar::from(-2.0));
+        assert_eq!(function.call(CollidingStatic(false), Array::scalar(2.0)).unwrap(), Array::scalar(2.0));
+        assert_eq!(function.call(CollidingStatic(true), Array::scalar(2.0)).unwrap(), Array::scalar(-2.0));
         assert_eq!(function.specialization_count(), 2);
         assert_eq!(domain.compilation_count(), 2);
     }
@@ -2011,32 +2039,32 @@ mod tests {
     #[test]
     fn test_jitted_function_parameter_paths_partition_structures() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, (), Vec<DataType>, DataType> =
+        let function: JittedFunction<TestDomain, _, (), Vec<ArrayType>, ArrayType> =
             try_jit(&domain, |(), mut inputs: Vec<CompilationTracer<TestDomain>>| {
                 inputs.drain(..1).next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
             });
 
-        assert_eq!(function.call((), vec![Scalar::from(2.0)]).unwrap(), Scalar::from(2.0));
-        assert_eq!(function.call((), vec![Scalar::from(2.0), Scalar::from(3.0)]).unwrap(), Scalar::from(2.0),);
+        assert_eq!(function.call((), vec![Array::scalar(2.0)]).unwrap(), Array::scalar(2.0));
+        assert_eq!(function.call((), vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap(), Array::scalar(2.0),);
         assert_eq!(function.specialization_count(), 2);
     }
 
     #[test]
     fn test_jitted_function_invalidates_one_static_specialization() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, DataType, DataType> = jit(
+        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
                 if negate { input.unary(NegateOperation) } else { input }
             },
         );
-        function.call(true, Scalar::from(2.0)).unwrap();
-        function.call(false, Scalar::from(2.0)).unwrap();
+        function.call(true, Array::scalar(2.0)).unwrap();
+        function.call(false, Array::scalar(2.0)).unwrap();
 
         assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
         assert_eq!(function.invalidate_static(&true), 1);
         assert_eq!(function.specialization_count(), 1);
-        function.call(true, Scalar::from(2.0)).unwrap();
+        function.call(true, Array::scalar(2.0)).unwrap();
         assert_eq!(function.statistics().traces, 3);
         assert_eq!(domain.compilation_count(), 2);
     }
@@ -2044,7 +2072,7 @@ mod tests {
     #[test]
     fn test_jitted_function_retries_failed_specialization() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, DataType, DataType> =
+        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> =
             try_jit(&domain, |fail, input: CompilationTracer<TestDomain>| {
                 if fail {
                     Err(ProgramError::InvalidArgument { message: "expected trace failure".into() })
@@ -2055,11 +2083,11 @@ mod tests {
 
         for _ in 0..2 {
             assert!(matches!(
-                function.call(true, Scalar::from(2.0)),
+                function.call(true, Array::scalar(2.0)),
                 Err(ProgramError::InvalidArgument { message }) if message == "expected trace failure",
             ));
         }
-        assert_eq!(function.call(false, Scalar::from(2.0)).unwrap(), Scalar::from(2.0));
+        assert_eq!(function.call(false, Array::scalar(2.0)).unwrap(), Array::scalar(2.0));
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().traces, 3);
     }
@@ -2067,7 +2095,7 @@ mod tests {
     #[test]
     fn test_jitted_function_lru_capacity_retraces_evicted_specialization() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, DataType, DataType> = try_jit_with_options_and_capacity(
+        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = try_jit_with_options_and_capacity(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegateOperation) } else { input })
@@ -2076,9 +2104,9 @@ mod tests {
             1,
         );
 
-        function.call(false, Scalar::from(1.0)).unwrap();
-        function.call(true, Scalar::from(1.0)).unwrap();
-        function.call(false, Scalar::from(1.0)).unwrap();
+        function.call(false, Array::scalar(1.0)).unwrap();
+        function.call(true, Array::scalar(1.0)).unwrap();
+        function.call(false, Array::scalar(1.0)).unwrap();
 
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_misses, 3);
@@ -2089,7 +2117,7 @@ mod tests {
     #[test]
     fn test_jitted_function_independent_caches_reuse_lowering_after_dispatch_eviction() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, DataType, DataType> = try_jit_with_options_and_capacities(
+        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = try_jit_with_options_and_capacities(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegateOperation) } else { input })
@@ -2098,9 +2126,9 @@ mod tests {
             JitCacheCapacities { traces: 2, lowerings: 2, dispatches: 1 },
         );
 
-        function.call(false, Scalar::from(1.0)).unwrap();
-        function.call(true, Scalar::from(1.0)).unwrap();
-        function.call(false, Scalar::from(1.0)).unwrap();
+        function.call(false, Array::scalar(1.0)).unwrap();
+        function.call(true, Array::scalar(1.0)).unwrap();
+        function.call(false, Array::scalar(1.0)).unwrap();
 
         assert_eq!(function.cache_capacities(), JitCacheCapacities { traces: 2, lowerings: 2, dispatches: 1 });
         assert_eq!(function.statistics().dispatch_misses, 3);

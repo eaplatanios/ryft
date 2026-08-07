@@ -1230,11 +1230,10 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
-    use crate::types::DataType;
+    use crate::types::ArrayType;
 
     use super::*;
 
@@ -1253,14 +1252,14 @@ mod tests {
     }
 
     impl Domain for TestDomain {
-        type Type = DataType;
-        type Value = Scalar;
-        type Constant = CaptureReference<DataType>;
-        type Operation = ScalarOperation<Scalar>;
+        type Type = ArrayType;
+        type Value = Array;
+        type Constant = CaptureReference<ArrayType>;
+        type Operation = ArrayOperation<Array>;
     }
 
     impl CompilationDomain for TestDomain {
-        type LoweredProgram = Vec<DataType>;
+        type LoweredProgram = Vec<ArrayType>;
         type CompiledProgram = TestCompiledProgram;
         type Options = ();
         type Error = ProgramError;
@@ -1308,7 +1307,7 @@ mod tests {
     impl CompilationCacheDomain for TestDomain {
         type CacheKey = u8;
 
-        fn compilation_key(&self, _program: &Vec<DataType>) -> Result<u8, ProgramError> {
+        fn compilation_key(&self, _program: &Vec<ArrayType>) -> Result<u8, ProgramError> {
             Ok(0)
         }
 
