@@ -2,16 +2,49 @@
 //!
 //! Shape manipulation is where first-class runtime dimensions do their most visible work: broadcasting an array to a
 //! dynamic output shape consumes one first-class dimension operand per output axis. This module supplies the array
-//! universe's answers to those contracts.
+//! universe's answers to those contracts, together with the reference backend's element conversion contracts, which
+//! pair each source element category with the destination's exact conversion category.
 
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use half::{bf16, f16};
+use num_complex::Complex;
+
+use crate::arrays::addressing::{ArrayAddressing, ArraySliceAxis};
+use crate::arrays::arrays::Array;
+use crate::arrays::encoding::{
+    ArrayElement, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
+    f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
+};
 use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::macros::dispatch_on_array_element_type;
+use crate::arrays::operations::math::{ElementAdd, ElementExtremum, ElementMul};
 use crate::arrays::sharding::shardings::Sharding;
 use crate::arrays::types::arrays::ArrayType;
-use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape};
-use crate::backends::arrays::BroadcastKernel;
+use crate::arrays::types::data::DataType;
+use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape, StaticShape};
+use crate::axes::Axis;
+use crate::contexts::EagerContext;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
-use crate::operations::{Broadcast, BroadcastOperation, DimensionSize};
-use crate::programs::{ProgramError, Value, ValueProjection};
+use crate::operations::{
+    Broadcast, BroadcastOperation, Concatenate, ConcatenateOperation, ConvertElementType, DimensionSize, DynamicSlice,
+    DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, LegacyBroadcast, Pad, Permutation, Reshape,
+    ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice, Zero,
+};
+use crate::programs::{ProgramError, TypeError, Value, ValueProjection};
+
+// TODO(eaplatanios): Review this.
+
+/// Backend execution contract for broadcasting to an already-concrete [`ArrayType`].
+///
+/// This kernel does not stage a program operation or create first-class dimension values. Composite eager
+/// interpretation resolves first-class dimension operands and validates the result type before invoking it. Program
+/// construction uses [`Broadcast`](crate::operations::manipulation::Broadcast) instead.
+pub trait BroadcastKernel: Sized {
+    /// Broadcasts `self` to `output_type` using `output_axes`.
+    fn broadcast_to_type(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError>;
+}
 
 impl<A: BroadcastKernel + DimensionSize<usize> + Value<Type = ArrayType>> Broadcast for ArrayIrValue<A> {
     fn broadcast_with_output_sharding(
@@ -34,13 +67,997 @@ impl<A: BroadcastKernel + DimensionSize<usize> + Value<Type = ArrayType>> Broadc
     }
 }
 
+impl Transpose for Array {
+    fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
+        // Validate the permutation and compute the output type (including sharding) via the type-level rule, so an
+        // out-of-range or duplicated axis is a clean error rather than an out-of-bounds panic.
+        let permutation = permutation.into();
+        let output_type = self.r#type.transpose(permutation.clone())?;
+        if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
+            return Ok(self.clone());
+        }
+        let rank = self.r#type.rank();
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if output_addressing.element_count() == 0 {
+            return Ok(Self { r#type: output_type, bytes: Arc::new(bytes) });
+        }
+        let mut output_index = vec![0usize; rank];
+        let mut input_index = vec![0usize; rank];
+        for output_flat in 0..output_addressing.element_count() {
+            for (position, &input_axis) in permutation.iter().enumerate() {
+                input_index[input_axis] = output_index[position];
+            }
+            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
+                .copy_from_slice(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
+            output_addressing.advance_index(&mut output_index);
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+    }
+}
+
+impl Reshape for Array {
+    fn reshape<P: Into<ReshapeParameters>>(&self, parameters: P) -> Result<Self, ProgramError> {
+        // Resolve runtime dimension expressions from the concrete eager input shape, then delegate to the type-level
+        // reshape so all element-count and sharding validation remains shared with staged execution.
+        let parameters = parameters.into().resolve_target(self.r#type.shape())?;
+        let output_type = self.r#type.reshape(parameters.clone())?;
+        let transposed = parameters.dimensions().map(|dimensions| self.transpose(dimensions)).transpose()?;
+        let input = transposed.as_ref().unwrap_or(self);
+        let input_addressing = ArrayAddressing::new(input.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if input_addressing.is_dense_row_major() && output_addressing.is_dense_row_major() {
+            bytes.copy_from_slice(&input.bytes);
+        } else {
+            for index in 0..input_addressing.element_count() {
+                bytes[output_addressing.byte_range_for_flat_index(index)]
+                    .copy_from_slice(&input.bytes[input_addressing.byte_range_for_flat_index(index)]);
+            }
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+    }
+}
+
+impl BroadcastKernel for Array {
+    fn broadcast_to_type(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let r#type = self.r#type.legacy_broadcast(output_type, output_axes)?;
+        let Some(target_shape) = r#type.static_shape() else {
+            return Err(
+                TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
+            );
+        };
+        if r#type == self.r#type && output_axes.iter().copied().eq(0..r#type.rank()) {
+            return Ok(self.clone());
+        }
+        let input_shape = self.r#type.static_shape().unwrap();
+        let input_rank = input_shape.rank();
+        let target_rank = target_shape.rank();
+        let output_count = Self::materialized_element_count(&r#type)?;
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(r#type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if output_count == 0 {
+            return Ok(Self { r#type, bytes: Arc::new(bytes) });
+        }
+        let mut target_index = vec![0usize; target_rank];
+        let mut input_index = vec![0usize; input_rank];
+        for output_flat in 0..output_count {
+            for input_axis in 0..input_rank {
+                let target_axis = output_axes[input_axis];
+                input_index[input_axis] = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
+            }
+            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
+                .copy_from_slice(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
+            output_addressing.advance_index(&mut target_index);
+        }
+        Ok(Self { r#type, bytes: Arc::new(bytes) })
+    }
+}
+
+impl LegacyBroadcast for Array {
+    #[inline]
+    fn legacy_broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        self.broadcast_to_type(output_type, output_axes)
+    }
+}
+
+impl Array {
+    /// Copies the logical block selected by `axes` into a new array of `output_type`. The caller guarantees that the
+    /// selection lies in bounds and contains exactly the output's logical element count.
+    fn copy_block(&self, output_type: ArrayType, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let ranges = input_addressing.ranges(axes)?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        debug_assert_eq!(ranges.element_count(), output_addressing.element_count());
+        let element_byte_width = input_addressing.element_byte_width();
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        let output_is_dense = output_addressing.is_dense_row_major();
+        let mut output_index = 0usize;
+        for range in ranges {
+            let input_bytes = range.bytes();
+            let element_count = range.elements().len();
+            if output_is_dense {
+                let output_start = output_index * element_byte_width;
+                bytes[output_start..output_start + input_bytes.len()].copy_from_slice(&self.bytes[input_bytes]);
+                output_index += element_count;
+                continue;
+            }
+            for offset in 0..element_count {
+                let input_start = input_bytes.start + offset * element_byte_width;
+                bytes[output_addressing.byte_range_for_flat_index(output_index)]
+                    .copy_from_slice(&self.bytes[input_start..input_start + element_byte_width]);
+                output_index += 1;
+            }
+        }
+        debug_assert_eq!(output_index, output_addressing.element_count());
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+    }
+
+    /// Overwrites the logical block of `update`'s shape starting at `start_indices` in this array with `update`. The
+    /// caller guarantees that the block lies in bounds.
+    fn replace_block(self, update: &Array, start_indices: &[usize]) -> Self {
+        let update_shape = update.r#type.static_shape().unwrap();
+        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
+        let update_addressing = ArrayAddressing::new(update.r#type.clone()).unwrap();
+        let axes = start_indices
+            .iter()
+            .zip(update_shape.dimensions())
+            .map(|(start, size)| ArraySliceAxis::new(*start, *size, 1))
+            .collect::<Vec<_>>();
+        let ranges = addressing.ranges(&axes).unwrap();
+        let element_byte_width = addressing.element_byte_width();
+        let mut output = self;
+        let bytes = Arc::make_mut(&mut output.bytes);
+        let update_is_dense = update_addressing.is_dense_row_major();
+        let mut written = 0usize;
+        for range in ranges {
+            let output_bytes = range.bytes();
+            let element_count = range.elements().len();
+            if update_is_dense {
+                let update_start = written * element_byte_width;
+                bytes[output_bytes]
+                    .copy_from_slice(&update.bytes[update_start..update_start + element_count * element_byte_width]);
+                written += element_count;
+                continue;
+            }
+            for offset in 0..element_count {
+                let output_start = output_bytes.start + offset * element_byte_width;
+                bytes[output_start..output_start + element_byte_width]
+                    .copy_from_slice(&update.bytes[update_addressing.byte_range_for_flat_index(written)]);
+                written += 1;
+            }
+        }
+        debug_assert_eq!(written, update_addressing.element_count());
+        output
+    }
+
+    /// Extracts the in-band scalar start indices of a dynamic slicing operation and clamps them per StableHLO
+    /// semantics: the effective start index along axis `d` is
+    /// `clamp(0, start_indices[d], input_dimension[d] - block_sizes[d])`.
+    fn clamped_start_indices(start_indices: &[Array], input_shape: &StaticShape, block_sizes: &[usize]) -> Vec<usize> {
+        start_indices
+            .iter()
+            .enumerate()
+            .map(|(axis, index)| {
+                let addressing = ArrayAddressing::new(index.r#type.clone()).unwrap();
+                let raw = index.index_value(&addressing, &[]);
+                let maximum = (input_shape[axis] - block_sizes[axis]) as i64;
+                raw.clamp(0, maximum) as usize
+            })
+            .collect()
+    }
+
+    /// Decodes the logical integer element at `index` as the signed representation used by reference indexing
+    /// kernels. Unsigned `u64` values narrow with Rust's two's-complement `as i64` semantics. The type-level validation
+    /// performed by every caller rules out non-integer element types and invalid indices.
+    fn index_value(&self, addressing: &ArrayAddressing, index: &[usize]) -> i64 {
+        let bytes = &self.bytes[addressing.byte_range_unchecked(index)];
+        match self.r#type.data_type() {
+            DataType::I1 => i64::from(i1::decode(bytes).value()),
+            DataType::I2 => i64::from(i2::decode(bytes).value()),
+            DataType::I4 => i64::from(i4::decode(bytes).value()),
+            DataType::I8 => i64::from(i8::decode(bytes)),
+            DataType::I16 => i64::from(i16::decode(bytes)),
+            DataType::I32 => i64::from(i32::decode(bytes)),
+            DataType::I64 => i64::decode(bytes),
+            DataType::U1 => i64::from(u1::decode(bytes).value()),
+            DataType::U2 => i64::from(u2::decode(bytes).value()),
+            DataType::U4 => i64::from(u4::decode(bytes).value()),
+            DataType::U8 => i64::from(u8::decode(bytes)),
+            DataType::U16 => i64::from(u16::decode(bytes)),
+            DataType::U32 => i64::from(u32::decode(bytes)),
+            DataType::U64 => u64::decode(bytes) as i64,
+            data_type => unreachable!("cannot use an array of element data type {data_type} as indices"),
+        }
+    }
+}
+
+impl Pad for Array {
+    fn pad(
+        &self,
+        padding_value: &Self,
+        edge_padding_low: &[i64],
+        edge_padding_high: &[i64],
+        interior_padding: &[usize],
+    ) -> Result<Self, ProgramError> {
+        let output_type =
+            self.r#type.pad(&padding_value.r#type, edge_padding_low, edge_padding_high, interior_padding)?;
+        let input_shape = self.r#type.static_shape().unwrap();
+        if edge_padding_low.iter().all(|padding| *padding == 0)
+            && edge_padding_high.iter().all(|padding| *padding == 0)
+            && input_shape
+                .dimensions()
+                .iter()
+                .zip(interior_padding)
+                .all(|(size, padding)| *padding == 0 || *size <= 1)
+        {
+            return Ok(self.clone());
+        }
+        let output_shape = output_type.static_shape().unwrap();
+        let rank = input_shape.rank();
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let padding_addressing = ArrayAddressing::new(padding_value.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let padding_bytes = &padding_value.bytes[padding_addressing.byte_range_for_flat_index(0)];
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if output_addressing.is_dense_row_major() && output_addressing.element_byte_width() != 0 {
+            for output_bytes in bytes.chunks_exact_mut(output_addressing.element_byte_width()) {
+                output_bytes.copy_from_slice(padding_bytes);
+            }
+        } else {
+            for output_index in 0..output_addressing.element_count() {
+                bytes[output_addressing.byte_range_for_flat_index(output_index)].copy_from_slice(padding_bytes);
+            }
+        }
+        if input_addressing.element_count() == 0 {
+            return Ok(Self { r#type: output_type, bytes: Arc::new(bytes) });
+        }
+        let mut input_index = vec![0usize; rank];
+        let mut output_index = vec![0usize; rank];
+        let mut written = 0usize;
+        'elements: while written < input_addressing.element_count() {
+            for axis in 0..rank {
+                let input_coordinate = i128::try_from(input_index[axis])
+                    .map_err(|_| TypeError::invalid(format!("'pad' input index is too large on axis {axis}")))?;
+                let stride = i128::try_from(interior_padding[axis])
+                    .ok()
+                    .and_then(|padding| padding.checked_add(1))
+                    .ok_or_else(|| TypeError::invalid(format!("'pad' stride is too large on axis {axis}")))?;
+                let output_coordinate =
+                    i128::from(edge_padding_low[axis])
+                        .checked_add(input_coordinate.checked_mul(stride).ok_or_else(|| {
+                            TypeError::invalid(format!("'pad' output index overflows on axis {axis}"))
+                        })?)
+                        .ok_or_else(|| TypeError::invalid(format!("'pad' output index overflows on axis {axis}")))?;
+                let output_extent = i128::try_from(output_shape[axis])
+                    .map_err(|_| TypeError::invalid(format!("'pad' output extent is too large on axis {axis}")))?;
+                if output_coordinate < 0 || output_coordinate >= output_extent {
+                    written += 1;
+                    input_addressing.advance_index(&mut input_index);
+                    continue 'elements;
+                }
+                output_index[axis] = usize::try_from(output_coordinate)
+                    .map_err(|_| TypeError::invalid(format!("'pad' output index is too large on axis {axis}")))?;
+            }
+            bytes[output_addressing.byte_range_unchecked(&output_index)]
+                .copy_from_slice(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
+            written += 1;
+            input_addressing.advance_index(&mut input_index);
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+    }
+}
+
+impl Concatenate for Array {
+    fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+        inputs: I,
+        axis: A,
+    ) -> Result<Self, ProgramError> {
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
+        let Some(first) = inputs.first() else {
+            return Err(
+                TypeError::invalid("'concatenate' expects at least one operand but got none".to_string()).into()
+            );
+        };
+        if inputs.len() == 1 {
+            return Ok((*first).clone());
+        }
+        let operation = ConcatenateOperation::new(axis, first.r#type.rank())?;
+        let axis = operation.axis();
+        let output_type = ArrayType::concatenate(inputs.iter().map(|input| &input.r#type), axis)?;
+        // Each operand owns a contiguous run of `axis` coordinates. Write its logical block at the running offset
+        // along `axis` and offset zero on every other axis.
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        // Zero-initialization establishes every layout hole and tile-padding byte. Every logical element is replaced
+        // below, so this does not require the element data type itself to represent zero.
+        let mut output =
+            Self { r#type: output_type.clone(), bytes: Arc::new(vec![0; output_addressing.storage_byte_len()]) };
+        let mut offset = 0usize;
+        for input in inputs {
+            let input_axis_size = input.r#type.static_shape().unwrap()[axis];
+            let mut start_indices = vec![0usize; output_type.rank()];
+            start_indices[axis] = offset;
+            output = output.replace_block(input, start_indices.as_slice());
+            offset += input_axis_size;
+        }
+        Ok(output)
+    }
+}
+
+impl Gather for Array {
+    fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
+        let output_type = self.r#type.gather(&indices.r#type, operation)?;
+        let dimensions = operation.dimensions();
+        let slice_sizes = operation.slice_sizes();
+        let operand_shape = self.r#type.static_shape().unwrap();
+        let indices_shape = indices.r#type.static_shape().unwrap();
+        let operand_rank = operand_shape.rank();
+        let indices_rank = indices_shape.rank();
+        let output_rank = output_type.rank();
+        let index_vector_dimension = indices_rank - 1;
+        let index_vector_extent = indices_shape[index_vector_dimension];
+
+        // Classify operand axes (window axes carry the slice; collapsed/batching do not) and output axes (offset
+        // positions carry the window, the rest carry the indices' batch coordinates).
+        let collapsed: BTreeSet<usize> = dimensions.collapsed_slice_dimensions().iter().copied().collect();
+        let batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
+        let operand_window_axes: Vec<usize> =
+            (0..operand_rank).filter(|axis| !collapsed.contains(axis) && !batching.contains(axis)).collect();
+        let offset_positions: BTreeSet<usize> = dimensions.offset_dimensions().iter().copied().collect();
+        let batch_output_positions: Vec<usize> =
+            (0..output_rank).filter(|position| !offset_positions.contains(position)).collect();
+        let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
+
+        // Only `FillOrDrop` needs an out-of-bounds fill element. Construct it through the ordinary array capability so
+        // this kernel does not assume an all-zero encoding; the other modes therefore also support element formats
+        // such as F8E8M0FNU that cannot represent zero at all.
+        let dropped_fill = if operation.mode() == GatherScatterMode::FillOrDrop {
+            let value = EagerContext::<Array>::new().zero(&ArrayType::scalar(output_type.data_type()))?;
+            let addressing = ArrayAddressing::new(value.r#type.clone())?;
+            Some((value, addressing))
+        } else {
+            None
+        };
+        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let indices_addressing = ArrayAddressing::new(indices.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        let mut output_index = vec![0usize; output_rank];
+        let mut indices_index = vec![0usize; indices_rank];
+        let mut starts = vec![0i64; index_vector_extent];
+        let mut operand_index = vec![0i64; operand_rank];
+        let mut operand_storage_index = vec![0usize; operand_rank];
+        for output_element in 0..output_addressing.element_count() {
+            // Place the output's batch coordinates into the indices multi-index and read this query's start vector.
+            indices_index.fill(0);
+            for (position, &output_position) in batch_output_positions.iter().enumerate() {
+                indices_index[indices_batch_axes[position]] = output_index[output_position];
+            }
+            for (component, start) in starts.iter_mut().enumerate() {
+                indices_index[index_vector_dimension] = component;
+                *start = indices.index_value(&indices_addressing, &indices_index);
+            }
+            // Assemble the operand multi-index: window offsets, then batching coordinates, then start offsets.
+            operand_index.fill(0);
+            for (window, &operand_axis) in operand_window_axes.iter().enumerate() {
+                operand_index[operand_axis] = output_index[dimensions.offset_dimensions()[window]] as i64;
+            }
+            for (batch, &operand_axis) in dimensions.operand_batching_dimensions().iter().enumerate() {
+                operand_index[operand_axis] =
+                    indices_index[dimensions.start_indices_batching_dimensions()[batch]] as i64;
+            }
+            let mut dropped = false;
+            for (component, &operand_axis) in dimensions.start_index_map().iter().enumerate() {
+                let raw = starts[component];
+                let maximum = (operand_shape[operand_axis] - slice_sizes[operand_axis]) as i64;
+                match operation.mode() {
+                    GatherScatterMode::FillOrDrop => {
+                        if raw < 0 || raw > maximum {
+                            dropped = true;
+                        }
+                        operand_index[operand_axis] += raw;
+                    }
+                    GatherScatterMode::PromiseInBounds | GatherScatterMode::Clip => {
+                        operand_index[operand_axis] += raw.clamp(0, maximum)
+                    }
+                }
+            }
+            let source = if dropped {
+                let (value, addressing) = dropped_fill.as_ref().unwrap();
+                &value.bytes[addressing.byte_range_for_flat_index(0)]
+            } else {
+                for axis in 0..operand_rank {
+                    operand_storage_index[axis] = operand_index[axis] as usize;
+                }
+                &self.bytes[input_addressing.byte_range_unchecked(&operand_storage_index)]
+            };
+            bytes[output_addressing.byte_range_for_flat_index(output_element)].copy_from_slice(source);
+            output_addressing.advance_index(&mut output_index);
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+    }
+}
+
+impl Array {
+    /// Applies one already-validated scatter using a byte-slice combiner, keeping index traversal independent of the
+    /// selected element arithmetic. The combiner receives one mutable operand encoding and one update encoding.
+    fn scatter_with_combiner(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        output_type: ArrayType,
+        operation: &ScatterOperation,
+        combine: impl Fn(&mut [u8], &[u8]) -> Result<(), ProgramError>,
+    ) -> Result<Self, ProgramError> {
+        let dimensions = operation.dimensions();
+        let operand_shape = self.r#type.static_shape().unwrap();
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let indices_shape = indices.r#type.static_shape().unwrap();
+        let indices_addressing = ArrayAddressing::new(indices.r#type.clone())?;
+        let updates_shape = updates.r#type.static_shape().unwrap();
+        let updates_addressing = ArrayAddressing::new(updates.r#type.clone())?;
+        let operand_rank = operand_shape.rank();
+        let indices_rank = indices_shape.rank();
+        let updates_rank = updates_shape.rank();
+        let index_vector_dimension = indices_rank - 1;
+        let index_vector_extent = indices_shape[index_vector_dimension];
+
+        let inserted: BTreeSet<usize> = dimensions.inserted_window_dimensions().iter().copied().collect();
+        let batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
+        let operand_window_axes: Vec<usize> =
+            (0..operand_rank).filter(|axis| !inserted.contains(axis) && !batching.contains(axis)).collect();
+        let update_window: BTreeSet<usize> = dimensions.update_window_dimensions().iter().copied().collect();
+        let update_scatter_axes: Vec<usize> = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect();
+        let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
+        // Window size per operand axis (the update extent on window axes, 1 elsewhere), used to clamp the start so the
+        // whole window stays in bounds.
+        let mut operand_window_size = vec![1usize; operand_rank];
+        for (window, &operand_axis) in operand_window_axes.iter().enumerate() {
+            operand_window_size[operand_axis] = updates_shape[dimensions.update_window_dimensions()[window]];
+        }
+
+        let mut output = Self { r#type: output_type, bytes: self.bytes.clone() };
+        let output_bytes = Arc::make_mut(&mut output.bytes);
+        let mut update_index = vec![0usize; updates_rank];
+        let mut indices_index = vec![0usize; indices_rank];
+        let mut starts = vec![0i64; index_vector_extent];
+        let mut operand_index = vec![0i64; operand_rank];
+        let mut operand_storage_index = vec![0usize; operand_rank];
+        for written in 0..updates_addressing.element_count() {
+            indices_index.fill(0);
+            for (position, &update_axis) in update_scatter_axes.iter().enumerate() {
+                indices_index[indices_batch_axes[position]] = update_index[update_axis];
+            }
+            for (component, start) in starts.iter_mut().enumerate() {
+                indices_index[index_vector_dimension] = component;
+                *start = indices.index_value(&indices_addressing, &indices_index);
+            }
+            operand_index.fill(0);
+            for (window, &operand_axis) in operand_window_axes.iter().enumerate() {
+                operand_index[operand_axis] = update_index[dimensions.update_window_dimensions()[window]] as i64;
+            }
+            for (batch, &operand_axis) in dimensions.operand_batching_dimensions().iter().enumerate() {
+                operand_index[operand_axis] =
+                    indices_index[dimensions.scatter_indices_batching_dimensions()[batch]] as i64;
+            }
+            let mut dropped = false;
+            for (component, &operand_axis) in dimensions.scatter_dimensions_to_operand_dimensions().iter().enumerate() {
+                let raw = starts[component];
+                let maximum = (operand_shape[operand_axis] - operand_window_size[operand_axis]) as i64;
+                match operation.mode() {
+                    GatherScatterMode::FillOrDrop => {
+                        if raw < 0 || raw > maximum {
+                            dropped = true;
+                        }
+                        operand_index[operand_axis] += raw;
+                    }
+                    GatherScatterMode::PromiseInBounds | GatherScatterMode::Clip => {
+                        operand_index[operand_axis] += raw.clamp(0, maximum)
+                    }
+                }
+            }
+            if !dropped {
+                for axis in 0..operand_rank {
+                    operand_storage_index[axis] = operand_index[axis] as usize;
+                }
+                combine(
+                    &mut output_bytes[output_addressing.byte_range_unchecked(&operand_storage_index)],
+                    &updates.bytes[updates_addressing.byte_range_for_flat_index(written)],
+                )?;
+            }
+            updates_addressing.advance_index(&mut update_index);
+        }
+        Ok(output)
+    }
+}
+
+impl Scatter for Array {
+    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
+        let output_type = self.r#type.scatter(&indices.r#type, &updates.r#type, operation)?;
+        let data_type = output_type.data_type();
+        if operation.kind() == ScatterReductionKind::Overwrite || data_type == DataType::Zero {
+            return self.scatter_with_combiner(indices, updates, output_type, operation, |current, update| {
+                current.copy_from_slice(update);
+                Ok(())
+            });
+        }
+        match operation.kind() {
+            ScatterReductionKind::Add | ScatterReductionKind::Mul => {
+                dispatch_on_array_element_type!(@numeric data_type, |Element| {
+                    self.scatter_with_combiner(indices, updates, output_type, operation, |current, update| {
+                        let current_value = Element::decode(current);
+                        let update_value = Element::decode(update);
+                        let result = if operation.kind() == ScatterReductionKind::Add {
+                            <Element as ElementAdd>::add(current_value, update_value)?
+                        } else {
+                            <Element as ElementMul>::mul(current_value, update_value)?
+                        };
+                        result.encode(current);
+                        Ok(())
+                    })
+                })
+            }
+            ScatterReductionKind::Min | ScatterReductionKind::Max => {
+                dispatch_on_array_element_type!(data_type, |Element| {
+                    self.scatter_with_combiner(indices, updates, output_type, operation, |current, update| {
+                        let current_value = Element::decode(current);
+                        let update_value = Element::decode(update);
+                        let result = if operation.kind() == ScatterReductionKind::Min {
+                            <Element as ElementExtremum>::minimum(current_value, update_value)
+                        } else {
+                            <Element as ElementExtremum>::maximum(current_value, update_value)
+                        };
+                        result.encode(current);
+                        Ok(())
+                    })
+                })
+            }
+            ScatterReductionKind::Overwrite => unreachable!("overwrite scatter returns before typed dispatch"),
+        }
+    }
+}
+
+impl Slice for Array {
+    fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
+        let output_type = self.r#type.slice(start_indices, limit_indices, strides)?;
+        let axes = start_indices
+            .iter()
+            .zip(limit_indices.iter())
+            .zip(strides.iter())
+            .map(|((start, limit), stride)| ArraySliceAxis::new(*start, (limit - start).div_ceil(*stride), *stride))
+            .collect::<Vec<_>>();
+        self.copy_block(output_type, &axes)
+    }
+}
+
+impl UpdateSlice for Array {
+    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
+        self.r#type.update_slice(&update.r#type, start_indices)?;
+        Ok(self.clone().replace_block(update, start_indices))
+    }
+}
+
+impl DynamicSlice for Array {
+    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
+        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type.clone()).collect();
+        let output_type = self.r#type.dynamic_slice(&index_types, sizes)?;
+        let input_shape = self.r#type.static_shape().unwrap();
+        let starts = Self::clamped_start_indices(start_indices, &input_shape, sizes);
+        let axes = starts
+            .iter()
+            .zip(sizes)
+            .map(|(start, size)| ArraySliceAxis::new(*start, *size, 1))
+            .collect::<Vec<_>>();
+        self.copy_block(output_type, &axes)
+    }
+}
+
+impl DynamicUpdateSlice for Array {
+    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
+        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type.clone()).collect();
+        self.r#type.dynamic_update_slice(&update.r#type, &index_types)?;
+        let input_shape = self.r#type.static_shape().unwrap();
+        let update_shape = update.r#type.static_shape().unwrap();
+        let starts = Self::clamped_start_indices(start_indices, &input_shape, update_shape.dimensions());
+        Ok(self.clone().replace_block(update, starts.as_slice()))
+    }
+}
+
+/// Destination-side element conversion contract. The source category remains explicit so integer-to-floating-point
+/// conversion does not first lose precision through `f64`, while complex sources can preserve both components when
+/// the destination is also complex.
+pub(crate) trait ElementConversionTarget: ArrayElement {
+    /// Converts one signed integer source element.
+    fn from_signed(value: i64) -> Result<Self, ProgramError>;
+
+    /// Converts one unsigned integer or Boolean source element.
+    fn from_unsigned(value: u64) -> Result<Self, ProgramError>;
+
+    /// Converts one real floating-point source element.
+    fn from_real(value: f64) -> Result<Self, ProgramError>;
+
+    /// Converts one complex floating-point source element.
+    fn from_complex(value: Complex<f64>) -> Result<Self, ProgramError> {
+        Self::from_real(value.re)
+    }
+}
+
+/// Source-side element conversion contract that selects the destination's exact conversion category.
+trait ElementConversionSource: ArrayElement {
+    /// Converts this element to `Output`.
+    fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError>;
+}
+
+impl ElementConversionSource for bool {
+    #[inline]
+    fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+        Output::from_unsigned(u64::from(self))
+    }
+}
+
+// Implements conversion from native signed integer sources without an intervening floating-point representation.
+macro_rules! impl_element_conversion_source_for_signed_integer {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementConversionSource for $type {
+            #[inline]
+            fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+                Output::from_signed(self as i64)
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_source_for_signed_integer!(i8, i16, i32, i64);
+
+// Implements conversion from checked signed sub-byte sources through their exact native values.
+macro_rules! impl_element_conversion_source_for_signed_sub_byte_integer {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementConversionSource for $type {
+            #[inline]
+            fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+                Output::from_signed(i64::from(self.value()))
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_source_for_signed_sub_byte_integer!(i1, i2, i4);
+
+// Implements conversion from native unsigned integer sources without an intervening floating-point representation.
+macro_rules! impl_element_conversion_source_for_unsigned_integer {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementConversionSource for $type {
+            #[inline]
+            fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+                Output::from_unsigned(self as u64)
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_source_for_unsigned_integer!(u8, u16, u32, u64);
+
+// Implements conversion from checked unsigned sub-byte sources through their exact native values.
+macro_rules! impl_element_conversion_source_for_unsigned_sub_byte_integer {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementConversionSource for $type {
+            #[inline]
+            fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+                Output::from_unsigned(u64::from(self.value()))
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_source_for_unsigned_sub_byte_integer!(u1, u2, u4);
+
+// Implements conversion from low-precision floating-point sources through their exact `f64` values.
+macro_rules! impl_element_conversion_source_for_low_precision_float {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementConversionSource for $type {
+            #[inline]
+            fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+                Output::from_real(self.to_f64())
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_source_for_low_precision_float!(
+    f4e2m1fn,
+    f6e2m3fn,
+    f6e3m2fn,
+    f8e3m4,
+    f8e4m3,
+    f8e4m3fn,
+    f8e4m3fnuz,
+    f8e4m3b11fnuz,
+    f8e5m2,
+    f8e5m2fnuz,
+    f8e8m0fnu,
+);
+
+impl ElementConversionSource for bf16 {
+    #[inline]
+    fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+        Output::from_real(self.to_f64())
+    }
+}
+
+impl ElementConversionSource for f16 {
+    #[inline]
+    fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+        Output::from_real(self.to_f64())
+    }
+}
+
+impl ElementConversionSource for f32 {
+    #[inline]
+    fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+        Output::from_real(f64::from(self))
+    }
+}
+
+impl ElementConversionSource for f64 {
+    #[inline]
+    fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+        Output::from_real(self)
+    }
+}
+
+// Implements conversion from complex sources while retaining both components for complex destinations.
+macro_rules! impl_element_conversion_source_for_complex {
+    ($($component:ty),+ $(,)?) => {$(
+        impl ElementConversionSource for Complex<$component> {
+            #[inline]
+            fn convert_to<Output: ElementConversionTarget>(self) -> Result<Output, ProgramError> {
+                Output::from_complex(Complex::new(self.re as f64, self.im as f64))
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_source_for_complex!(f32, f64);
+
+impl ElementConversionTarget for bool {
+    #[inline]
+    fn from_signed(value: i64) -> Result<Self, ProgramError> {
+        Ok(value != 0)
+    }
+
+    #[inline]
+    fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+        Ok(value != 0)
+    }
+
+    #[inline]
+    fn from_real(value: f64) -> Result<Self, ProgramError> {
+        Ok(value != 0.0)
+    }
+
+    #[inline]
+    fn from_complex(value: Complex<f64>) -> Result<Self, ProgramError> {
+        Ok(value.re != 0.0 || value.im != 0.0)
+    }
+}
+
+// Implements conversions to native signed and unsigned integer destinations using Rust's `as` semantics, which are
+// also the reference backend's existing C-style narrowing and truncation contract.
+macro_rules! impl_element_conversion_target_for_integer {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementConversionTarget for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(value as Self)
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(value as Self)
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(value as Self)
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_target_for_integer!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+// Implements modular narrowing into checked signed sub-byte destinations.
+macro_rules! impl_element_conversion_target_for_signed_sub_byte_integer {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementConversionTarget for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(value as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(value as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(value as i8 as u8 & bit_mask).unwrap())
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_target_for_signed_sub_byte_integer!(i1, i2, i4);
+
+// Implements modular narrowing into checked unsigned sub-byte destinations.
+macro_rules! impl_element_conversion_target_for_unsigned_sub_byte_integer {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementConversionTarget for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_target_for_unsigned_sub_byte_integer!(u1, u2, u4);
+
+// Implements conversions to low-precision floating-point destinations through their checked rounding contract.
+macro_rules! impl_element_conversion_target_for_low_precision_float {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ElementConversionTarget for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(value as f64)?)
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(value as f64)?)
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(value)?)
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_target_for_low_precision_float!(
+    f4e2m1fn,
+    f6e2m3fn,
+    f6e3m2fn,
+    f8e3m4,
+    f8e4m3,
+    f8e4m3fn,
+    f8e4m3fnuz,
+    f8e4m3b11fnuz,
+    f8e5m2,
+    f8e5m2fnuz,
+    f8e8m0fnu,
+);
+
+// Implements conversions to native and half-precision real floating-point destinations.
+macro_rules! impl_element_conversion_target_for_float {
+    ($type:ty, $from_signed:expr, $from_unsigned:expr, $from_real:expr $(,)?) => {
+        impl ElementConversionTarget for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok($from_signed(value))
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok($from_unsigned(value))
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok($from_real(value))
+            }
+        }
+    };
+}
+
+impl_element_conversion_target_for_float!(
+    bf16,
+    |value: i64| bf16::from_f64(value as f64),
+    |value: u64| bf16::from_f64(value as f64),
+    bf16::from_f64,
+);
+impl_element_conversion_target_for_float!(
+    f16,
+    |value: i64| f16::from_f64(value as f64),
+    |value: u64| f16::from_f64(value as f64),
+    f16::from_f64,
+);
+impl_element_conversion_target_for_float!(
+    f32,
+    |value: i64| value as f32,
+    |value: u64| value as f32,
+    |value: f64| value as f32,
+);
+impl_element_conversion_target_for_float!(f64, |value: i64| value as f64, |value: u64| value as f64, |value| value,);
+
+// Implements conversions to complex destinations, placing real sources in the real component and preserving both
+// components of complex sources.
+macro_rules! impl_element_conversion_target_for_complex {
+    ($($component:ty),+ $(,)?) => {$(
+        impl ElementConversionTarget for Complex<$component> {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(Self::new(value as $component, 0.0))
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(Self::new(value as $component, 0.0))
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(Self::new(value as $component, 0.0))
+            }
+
+            #[inline]
+            fn from_complex(value: Complex<f64>) -> Result<Self, ProgramError> {
+                Ok(Self::new(value.re as $component, value.im as $component))
+            }
+        }
+    )+};
+}
+
+impl_element_conversion_target_for_complex!(f32, f64);
+
+impl ConvertElementType for Array {
+    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
+        let source_data_type = self.r#type.data_type();
+        if source_data_type.is_token() || data_type.is_token() {
+            return Err(TypeError::invalid("cannot convert values to or from the token data type".to_string()).into());
+        }
+        if source_data_type == data_type {
+            return Ok(self.clone());
+        }
+        if source_data_type.is_zero() || data_type.is_zero() {
+            return Err(TypeError::invalid("cannot convert values to or from the zero data type".to_string()).into());
+        }
+        let output_type = self.r#type.clone().with_data_type(data_type);
+        dispatch_on_array_element_type!(source_data_type, |Input| {
+            dispatch_on_array_element_type!(data_type, |Output| {
+                self.map_elements::<Input, Output>(output_type, Input::convert_to::<Output>)
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
+    use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::arrays::{Array, array_type};
     use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::arrays::dimensions::DimensionValue;
+    use crate::arrays::encoding::{f8e4m3fn, f8e5m2, i4, u2, u4};
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
@@ -49,7 +1066,7 @@ mod tests {
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::arrays::types::ir::ArrayIrType;
-    use crate::backends::Array;
+    use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableType, DifferentiationError};
@@ -1728,6 +2745,427 @@ in (%4)
         assert_eq!(
             destination.atoms()[imported_outputs[0].index()].r#type().as_ref(),
             &ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target_result)]),)),
+        );
+    }
+
+    #[test]
+    fn test_array_convert_element_type() {
+        // Every materialized element data type converts to every other one without falling back to a dynamic scalar
+        // representation. The common value one is exactly representable in every supported format.
+        let data_types = [
+            DataType::Boolean,
+            DataType::I1,
+            DataType::I2,
+            DataType::I4,
+            DataType::I8,
+            DataType::I16,
+            DataType::I32,
+            DataType::I64,
+            DataType::U1,
+            DataType::U2,
+            DataType::U4,
+            DataType::U8,
+            DataType::U16,
+            DataType::U32,
+            DataType::U64,
+            DataType::F4E2M1FN,
+            DataType::F6E2M3FN,
+            DataType::F6E3M2FN,
+            DataType::F8E3M4,
+            DataType::F8E4M3,
+            DataType::F8E4M3FN,
+            DataType::F8E4M3FNUZ,
+            DataType::F8E4M3B11FNUZ,
+            DataType::F8E5M2,
+            DataType::F8E5M2FNUZ,
+            DataType::F8E8M0FNU,
+            DataType::BF16,
+            DataType::F16,
+            DataType::F32,
+            DataType::F64,
+            DataType::C64,
+            DataType::C128,
+        ];
+        for source_data_type in data_types {
+            let source = Array::from_f64s(array_type(source_data_type, &[1]), vec![1.0]);
+            for target_data_type in data_types {
+                let converted = source.convert_element_type(target_data_type).unwrap();
+                assert_eq!(converted.r#type().into_owned(), array_type(target_data_type, &[1]));
+            }
+        }
+
+        // Representative values pin Boolean truth, integer truncation and sub-byte modular narrowing.
+        let vector = Array::vector(vec![0.0, 1.5]);
+        assert_eq!(vector.convert_element_type(DataType::Boolean).unwrap(), Array::vector(vec![false, true]));
+        assert_eq!(vector.convert_element_type(DataType::I32).unwrap(), Array::vector(vec![0i32, 1]));
+        let signed = Array::from_elements(
+            array_type(DataType::I4, &[3]),
+            &[i4::new(-8).unwrap(), i4::new(-1).unwrap(), i4::new(7).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            signed.convert_element_type(DataType::U2).unwrap().elements::<u2>(),
+            Ok(vec![u2::new(0).unwrap(), u2::new(3).unwrap(), u2::new(3).unwrap()]),
+        );
+        assert_eq!(
+            Array::from_elements(array_type(DataType::U4, &[1]), &[u4::new(15).unwrap()])
+                .unwrap()
+                .convert_element_type(DataType::I4)
+                .unwrap()
+                .elements::<i4>(),
+            Ok(vec![i4::new(-1).unwrap()]),
+        );
+
+        // Complex conversion preserves both components only for complex destinations and otherwise converts the real
+        // component, except that Boolean conversion observes whether either component is nonzero.
+        let complex = Array::vector(vec![ComplexNumber::new(0.0f32, 2.0), ComplexNumber::new(-1.5, 0.0)]);
+        assert_eq!(complex.convert_element_type(DataType::Boolean).unwrap().elements::<bool>(), Ok(vec![true, true]),);
+        assert_eq!(complex.convert_element_type(DataType::I32).unwrap().elements::<i32>(), Ok(vec![0, -1]),);
+        assert_eq!(
+            complex.convert_element_type(DataType::C128).unwrap().elements::<ComplexNumber<f64>>(),
+            Ok(vec![ComplexNumber::new(0.0, 2.0), ComplexNumber::new(-1.5, 0.0)]),
+        );
+
+        // Conversions into low-precision floating-point element types produce exact encodings, including their
+        // format-specific fallible cases.
+        let low_precision = vector.convert_element_type(DataType::F8E5M2).unwrap();
+        assert_eq!(low_precision.elements::<f8e5m2>().unwrap()[1].to_bits(), 0x3e);
+        assert_eq!(
+            Array::scalar(1e9f64)
+                .convert_element_type(DataType::F8E4M3FN)
+                .unwrap()
+                .elements::<f8e4m3fn>()
+                .unwrap()[0]
+                .to_bits(),
+            0x7f,
+        );
+        assert!(matches!(
+            Array::scalar(0.0f64).convert_element_type(DataType::F8E8M0FNU),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type f8e8m0fnu cannot represent zero",
+        ));
+
+        // Cross-type conversion traverses the logical order selected by the input layout and preserves the same
+        // physical-layout descriptor on its output type.
+        let input_type = array_type(DataType::F64, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16])));
+        let converted = Array::from_elements(input_type, &[1.9f64, -2.9])
+            .unwrap()
+            .convert_element_type(DataType::I32)
+            .unwrap();
+        assert_eq!(
+            converted.r#type().into_owned(),
+            array_type(DataType::I32, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16]))),
+        );
+        assert_eq!(converted.elements::<i32>(), Ok(vec![1, -2]));
+        assert_eq!(converted.storage_bytes().len(), 20);
+
+        // Same-type conversion shares the original bytes, preserving NaN payloads and every unoccupied layout byte.
+        let nan = Array::vector(vec![f32::from_bits(0x7fc0_1234)]);
+        let unchanged = nan.convert_element_type(DataType::F32).unwrap();
+        assert!(Arc::ptr_eq(&nan.bytes, &unchanged.bytes));
+        assert_eq!(unchanged.storage_bytes(), nan.storage_bytes());
+
+        // Token conversion is always rejected. Structural-zero conversion is valid only when it is a same-type no-op.
+        assert!(matches!(
+            vector.convert_element_type(DataType::Token),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot convert values to or from the token data type",
+        ));
+        let token = Array::from_logical_bytes(array_type(DataType::Token, &[1]), &[]).unwrap();
+        assert!(matches!(
+            token.convert_element_type(DataType::Token),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot convert values to or from the token data type",
+        ));
+        let zero = Array::from_logical_bytes(array_type(DataType::Zero, &[2]), &[]).unwrap();
+        assert_eq!(zero.convert_element_type(DataType::Zero), Ok(zero.clone()));
+        assert!(matches!(
+            vector.convert_element_type(DataType::Zero),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot convert values to or from the zero data type",
+        ));
+        assert!(matches!(
+            zero.convert_element_type(DataType::F32),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot convert values to or from the zero data type",
+        ));
+    }
+
+    #[test]
+    fn test_array_broadcast() {
+        let vector = Array::vector(vec![1.0, 2.0]);
+        let output_type = array_type(DataType::F64, &[3, 2]);
+        let broadcast = LegacyBroadcast::legacy_broadcast(&vector, output_type.clone(), &[1]).unwrap();
+        assert_eq!(broadcast.r#type().into_owned(), output_type);
+        assert_eq!(broadcast.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+
+        // Broadcasting reads a reversed input layout and writes the output's requested physical layout, retaining
+        // zero in its holes.
+        let input_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let input = Array::from_elements(input_type, &[0x1122u16, 0x3344]).unwrap();
+        let output_type =
+            array_type(DataType::U16, &[2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![6, 2])));
+        let broadcast = input.broadcast_to_type(output_type.clone(), &[1]).unwrap();
+        assert_eq!(broadcast.r#type().as_ref(), &output_type);
+        assert_eq!(broadcast.elements::<u16>(), Ok(vec![0x1122, 0x3344, 0x1122, 0x3344]));
+        assert_eq!(broadcast.storage_bytes(), [0x22, 0x11, 0x44, 0x33, 0, 0, 0x22, 0x11, 0x44, 0x33]);
+
+        // Deliberately malformed concrete values with dynamic types fail through the structured materialization
+        // diagnostic before either the identity fast path or static-shape payload logic can accept or panic on them.
+        let dynamic = DimensionVariable::new("dynamic", DimensionBounds::unbounded());
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(dynamic.clone()), Dimension::Dynamic(dynamic)]),
+        );
+        let dynamic = Array::with_unchecked_type(
+            dynamic_type.clone(),
+            [1.0f64, 2.0, 3.0, 4.0].into_iter().flat_map(f64::to_le_bytes).collect(),
+        );
+        for output_axes in [vec![0, 1], vec![1, 0]] {
+            assert!(matches!(
+                dynamic.broadcast_to_type(dynamic_type.clone(), output_axes.as_slice()),
+                Err(ProgramError::Type(TypeError::Invalid { message }))
+                    if message == "cannot materialize a value of dynamically sized type f64[dynamic, dynamic]",
+            ));
+        }
+    }
+
+    #[test]
+    fn test_array_transpose() {
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let transposed = matrix.transpose([1, 0]).unwrap();
+        assert_eq!(transposed.r#type().into_owned(), array_type(DataType::F64, &[3, 2]));
+        assert_eq!(transposed.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert!(matrix.transpose([0, 0]).is_err());
+
+        // Transposition traverses the input's physical layout while producing the canonical layout-free output type.
+        let input_type =
+            array_type(DataType::U16, &[2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
+        let matrix = Array::from_elements(input_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
+        let transposed = matrix.transpose([1, 0]).unwrap();
+        assert_eq!(transposed.r#type().into_owned(), array_type(DataType::U16, &[3, 2]));
+        assert_eq!(transposed.elements::<u16>(), Ok(vec![1, 4, 2, 5, 3, 6]));
+        assert_eq!(transposed.storage_bytes(), [1, 0, 4, 0, 2, 0, 5, 0, 3, 0, 6, 0]);
+
+        // Empty arrays transpose without calculating strides that may overflow for otherwise irrelevant dimensions.
+        let empty = Array::new(array_type(DataType::F64, &[0, usize::MAX, usize::MAX]), Vec::new()).unwrap();
+        assert_eq!(
+            empty.transpose([1, 2, 0]).unwrap(),
+            Array::new(array_type(DataType::F64, &[usize::MAX, usize::MAX, 0]), Vec::new()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_array_reshape() {
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
+        assert_eq!(reshaped.r#type().into_owned(), array_type(DataType::F64, &[3, 2]));
+        assert_eq!(reshaped.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(matrix.reshape(Shape::new(vec![Dimension::Static(4)])).is_err());
+
+        // Reshaping preserves logical order independently of the input's physical placement.
+        let input_type =
+            array_type(DataType::U16, &[2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
+        let matrix = Array::from_elements(input_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
+        let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
+        assert_eq!(reshaped.elements::<u16>(), Ok(vec![1, 2, 3, 4, 5, 6]));
+        assert_eq!(reshaped.storage_bytes(), [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
+    }
+
+    #[test]
+    fn test_array_slicing() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(vector.slice(&[1], &[5], &[2]).unwrap(), Array::vector(vec![2.0, 4.0]));
+        assert_eq!(
+            vector.update_slice(&Array::vector(vec![10.0, 20.0]), &[1]).unwrap(),
+            Array::vector(vec![1.0, 10.0, 20.0, 4.0, 5.0]),
+        );
+        // Dynamic start indices clamp so the block stays in bounds.
+        let start = [Array::scalar(4i64)];
+        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![4.0, 5.0]));
+        assert_eq!(
+            vector.dynamic_update_slice(&Array::vector(vec![10.0, 20.0]), &start).unwrap(),
+            Array::vector(vec![1.0, 2.0, 3.0, 10.0, 20.0]),
+        );
+        // Index decoding is typed and supports sub-byte integers directly; a negative start still clamps to zero.
+        let start = [Array::scalar(i4::new(-1).unwrap())];
+        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![1.0, 2.0]));
+
+        // Static slicing and updating traverse arbitrary source and update layouts while preserving the destination
+        // layout for updates.
+        let input_type = array_type(DataType::U16, &[5]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let vector = Array::from_elements(input_type.clone(), &[1u16, 2, 3, 4, 5]).unwrap();
+        assert_eq!(vector.slice(&[1], &[5], &[2]).unwrap().elements::<u16>(), Ok(vec![2, 4]));
+        let update_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let update = Array::from_elements(update_type, &[10u16, 20]).unwrap();
+        let updated = vector.update_slice(&update, &[1]).unwrap();
+        assert_eq!(updated.r#type().as_ref(), &input_type);
+        assert_eq!(updated.elements::<u16>(), Ok(vec![1, 10, 20, 4, 5]));
+        assert_eq!(updated.storage_bytes(), [5, 0, 4, 0, 20, 0, 10, 0, 1, 0]);
+    }
+
+    #[test]
+    fn test_array_pad() {
+        let vector = Array::vector(vec![1.0, 2.0]);
+        let padded = vector.pad(&Array::scalar(0.5), &[1], &[2], &[1]).unwrap();
+        assert_eq!(padded, Array::vector(vec![0.5, 1.0, 0.5, 2.0, 0.5, 0.5]));
+
+        // Padding copies both the reversed input layout and the rank-zero padding element by their exact bytes.
+        let input_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let vector = Array::from_elements(input_type, &[1u16, 2]).unwrap();
+        let padded = vector.pad(&Array::scalar(9u16), &[1], &[1], &[1]).unwrap();
+        assert_eq!(padded.r#type().into_owned(), array_type(DataType::U16, &[5]));
+        assert_eq!(padded.elements::<u16>(), Ok(vec![9, 1, 9, 2, 9]));
+        assert_eq!(padded.storage_bytes(), [9, 0, 1, 0, 9, 0, 2, 0, 9, 0]);
+    }
+
+    #[test]
+    fn test_array_concatenate() {
+        // Three operands joined along axis 0 preserve their order.
+        let concatenated = Array::concatenate(
+            [&Array::vector(vec![1.0]), &Array::vector(vec![2.0, 3.0]), &Array::vector(vec![4.0])],
+            0,
+        )
+        .unwrap();
+        assert_eq!(concatenated, Array::vector(vec![1.0, 2.0, 3.0, 4.0]));
+
+        // A rank-3 middle-axis concatenation exercises the row-major block odometer.
+        let first = Array::from_f64s(array_type(DataType::F64, &[2, 1, 2]), vec![1.0, 2.0, 3.0, 4.0]);
+        let second =
+            Array::from_f64s(array_type(DataType::F64, &[2, 2, 2]), vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let concatenated = Array::concatenate([&first, &second], 1).unwrap();
+        assert_eq!(concatenated.r#type().into_owned(), array_type(DataType::F64, &[2, 3, 2]));
+        assert_eq!(concatenated.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0],);
+
+        // Concatenation traverses each input's physical layout and emits the canonical layout-free result.
+        let first_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let second_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let first = Array::from_elements(first_type, &[1u16, 2]).unwrap();
+        let second = Array::from_elements(second_type, &[3u16, 4]).unwrap();
+        let concatenated = Array::concatenate([&first, &second], 0).unwrap();
+        assert_eq!(concatenated.r#type().into_owned(), array_type(DataType::U16, &[4]));
+        assert_eq!(concatenated.elements::<u16>(), Ok(vec![1, 2, 3, 4]));
+        assert_eq!(concatenated.storage_bytes(), [1, 0, 2, 0, 3, 0, 4, 0]);
+
+        // Concatenation does not require an artificial additive zero, including when the output itself is empty.
+        let element_type = array_type(DataType::F8E8M0FNU, &[1]);
+        let first = Array::new(element_type.clone(), vec![1]).unwrap();
+        let second = Array::new(element_type, vec![2]).unwrap();
+        assert_eq!(
+            Array::concatenate([&first, &second], 0),
+            Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![1, 2]),
+        );
+        let empty_type = array_type(DataType::F8E8M0FNU, &[0]);
+        let empty = Array::new(empty_type.clone(), Vec::new()).unwrap();
+        assert_eq!(Array::concatenate([&empty, &empty], 0), Array::new(empty_type, Vec::new()));
+    }
+
+    #[test]
+    fn test_array_gather() {
+        // Gather rows 2 and 0 of a 3x2 matrix.
+        let operand = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let indices = Array::matrix(2, 1, vec![2i64, 0]);
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+        let gathered = operand.gather(&indices, &operation).unwrap();
+        assert_eq!(gathered.r#type().into_owned(), array_type(DataType::F64, &[2, 2]));
+        assert_eq!(gathered.to_f64s(), vec![5.0, 6.0, 1.0, 2.0]);
+
+        // In-bounds and clipping modes do not materialize an unused zero fill, so they work for formats that cannot
+        // represent zero.
+        let operand = Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![0x7f, 0x80]).unwrap();
+        let indices = Array::matrix(1, 1, vec![1i64]);
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
+        assert_eq!(operand.gather(&indices, &operation), Array::new(array_type(DataType::F8E8M0FNU, &[1]), vec![0x80]));
+
+        // Gather reads both a reversed operand and reversed sub-byte indices through their physical addressing. An
+        // out-of-bounds query in fill-or-drop mode writes the element type's zero encoding into the dense result.
+        let operand_type = array_type(DataType::U16, &[3]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let operand = Array::from_elements(operand_type, &[10u16, 20, 30]).unwrap();
+        let indices_type =
+            array_type(DataType::I4, &[3, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
+        let indices =
+            Array::from_elements(indices_type, &[i4::new(2).unwrap(), i4::new(-1).unwrap(), i4::new(1).unwrap()])
+                .unwrap();
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
+            .with_mode(GatherScatterMode::FillOrDrop);
+        let gathered = operand.gather(&indices, &operation).unwrap();
+        assert_eq!(gathered.elements::<u16>(), Ok(vec![30, 0, 20]));
+        assert_eq!(gathered.storage_bytes(), [30, 0, 0, 0, 20, 0]);
+    }
+
+    #[test]
+    fn test_array_scatter() {
+        // Scatter-add updates 10 and 20 into elements 3 and 0 of a vector.
+        let operand = Array::vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let indices = Array::from_f64s(array_type(DataType::I64, &[2, 1]), vec![3.0, 0.0]);
+        let updates = Array::vector(vec![10.0, 20.0]);
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Add);
+        let scattered = operand.scatter(&indices, &updates, &operation).unwrap();
+        assert_eq!(scattered, Array::vector(vec![21.0, 2.0, 3.0, 14.0]));
+
+        // Scatter decodes sub-byte indices through their physical layout without materializing a scalar index vector.
+        let indices_type =
+            array_type(DataType::I4, &[2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
+        let indices = Array::from_elements(indices_type, &[i4::new(3).unwrap(), i4::new(0).unwrap()]).unwrap();
+        assert_eq!(operand.scatter(&indices, &updates, &operation).unwrap(), Array::vector(vec![21.0, 2.0, 3.0, 14.0]),);
+
+        // Operand and update payloads are decoded and written through their independent physical layouts.
+        let operand_type = array_type(DataType::U16, &[4]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let operand = Array::from_elements(operand_type.clone(), &[1u16, 2, 3, 4]).unwrap();
+        let updates_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let updates = Array::from_elements(updates_type, &[10u16, 20]).unwrap();
+        assert_eq!(
+            operand.scatter(&indices, &updates, &operation),
+            Array::from_elements(operand_type, &[21u16, 2, 3, 14]),
+        );
+
+        // Sub-byte arithmetic wraps in the declared bit width, including repeated modular addition.
+        let operand = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]);
+        let indices = Array::matrix(2, 1, vec![0i32, 1]);
+        let updates = Array::vector(vec![i4::new(2).unwrap(), i4::new(-3).unwrap()]);
+        assert_eq!(
+            operand.scatter(&indices, &updates, &operation).unwrap().elements::<i4>(),
+            Ok(vec![i4::new(-7).unwrap(), i4::new(5).unwrap()]),
+        );
+
+        // Overwrite moves encodings without requiring arithmetic identities, including for formats without zero.
+        let operand = Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![0x7f, 0x80]).unwrap();
+        let updates = Array::new(array_type(DataType::F8E8M0FNU, &[1]), vec![0x81]).unwrap();
+        let indices = Array::matrix(1, 1, vec![0i32]);
+        let operation = ScatterOperation::new(
+            ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+            ScatterReductionKind::Overwrite,
+        );
+        assert_eq!(
+            operand.scatter(&indices, &updates, &operation),
+            Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![0x81, 0x80]),
+        );
+
+        // Extrema follow JAX for floating-point NaNs and signed zero and for lexicographically ordered complex values.
+        let indices = Array::matrix(2, 1, vec![0i32, 1]);
+        let operand = Array::vector(vec![f32::NAN, -0.0]);
+        let updates = Array::vector(vec![1.0f32, 0.0]);
+        let maximum =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Max);
+        let minimum =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Min);
+        let maximum_values = operand.scatter(&indices, &updates, &maximum).unwrap().elements::<f32>().unwrap();
+        assert!(maximum_values[0].is_nan());
+        assert_eq!(maximum_values[1].to_bits(), 0.0f32.to_bits());
+        let minimum_values = operand.scatter(&indices, &updates, &minimum).unwrap().elements::<f32>().unwrap();
+        assert!(minimum_values[0].is_nan());
+        assert_eq!(minimum_values[1].to_bits(), (-0.0f32).to_bits());
+
+        let operand = Array::vector(vec![ComplexNumber::new(1.0f32, 9.0), ComplexNumber::new(2.0, -1.0)]);
+        let updates = Array::vector(vec![ComplexNumber::new(1.0f32, 10.0), ComplexNumber::new(1.0, 100.0)]);
+        assert_eq!(
+            operand.scatter(&indices, &updates, &maximum).unwrap().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(1.0, 10.0), ComplexNumber::new(2.0, -1.0)]),
+        );
+        assert_eq!(
+            operand.scatter(&indices, &updates, &minimum).unwrap().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(1.0, 9.0), ComplexNumber::new(1.0, 100.0)]),
         );
     }
 }

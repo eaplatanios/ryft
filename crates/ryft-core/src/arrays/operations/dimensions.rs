@@ -1,3 +1,4 @@
+use crate::arrays::arrays::Array;
 use crate::arrays::batching::ReplicatedDimensionBatchingPolicy;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
@@ -6,18 +7,18 @@ use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::arrays::types::ir::ArrayIrType;
-use crate::backends::Array;
+use crate::axes::Axis;
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::operations::dimensions::checked_power;
 use crate::operations::{
-    Add, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalar, DimensionFromScalarOperation,
-    DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
-    DimensionPowOperation, DimensionRemOperation, DimensionRequirement, DimensionRequirementOperation,
-    DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation,
-    DimensionSubOperation, DimensionToScalar, Div, Mul, Rem, Sub,
+    Add, DIMENSION_SIZE_OPERATION_NAME, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalar,
+    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
+    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
+    DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, Div, Mul, Rem, Sub,
 };
-use crate::programs::{Operation, OperationProjection, ProgramError, Typed, Value, ValueProjection};
+use crate::programs::{Operation, OperationProjection, ProgramError, TypeError, Typed, Value, ValueProjection};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -341,6 +342,23 @@ impl<A: DimensionFromScalar<DimensionValue> + Value<Type = ArrayType>> Dimension
     fn to_dimension(&self, result: DimensionVariable) -> Result<Self, ProgramError> {
         let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
         Ok(Self::Dimension(<A as DimensionFromScalar<DimensionValue>>::to_dimension(array, result)?))
+    }
+}
+
+impl DimensionSize<usize> for Array {
+    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<usize, ProgramError> {
+        let axis = axis.into();
+        let position = axis.normalize(self.r#type.rank()).map_err(|_| {
+            TypeError::invalid(format!(
+                "'{DIMENSION_SIZE_OPERATION_NAME}' axis {axis} is out of bounds for rank {}",
+                self.r#type.rank(),
+            ))
+        })?;
+        let dimension = &self.r#type.shape().dimensions()[position];
+        dimension.value().ok_or_else(|| {
+            TypeError::invalid(format!("materialized reference array has a dynamic dimension at axis {position}",))
+                .into()
+        })
     }
 }
 

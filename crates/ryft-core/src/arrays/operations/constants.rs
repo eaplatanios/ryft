@@ -6,24 +6,31 @@
 //! operand per dynamic axis, the canonical lifts that route each constructor to its static or dynamic encoding, and
 //! the residual-aware zero construction that differentiation uses to rebuild a disconnected cotangent.
 
+use crate::arrays::arrays::Array;
 use crate::arrays::differentiation::ExactShape;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::macros::dispatch_on_array_element_type;
+use crate::arrays::operations::manipulation::ElementConversionTarget;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::differentiation::ResidualZeroProvider;
 use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::operations::{
-    DimensionSizeOperation, Iota, IotaOperation, One, OneOperation, ZERO_OPERATION_NAME, Zero, ZeroOperation,
-    ZeroOperationProvider, check_constructor_type_has_no_identity_references, infer_dynamic_constructor_output_types,
+    DimensionSizeOperation, IOTA_OPERATION_NAME, Iota, IotaOperation, One, OneLike, OneOperation, ZERO_OPERATION_NAME,
+    Zero, ZeroLike, ZeroOperation, ZeroOperationProvider, check_constructor_type_has_no_identity_references,
+    infer_dynamic_constructor_output_types,
 };
 use crate::programs::{
     AtomId, MemberOperation, Operation, ProgramBuilder, ProgramError, RegionInterface, TypeError, TypeIdentityRenaming,
     Typed, Value, ValueProjection,
 };
+
+// TODO(eaplatanios): Review this.
 
 macro_rules! impl_dynamic_constructor_member_operation {
     // Implements the shared mixed array IR boundary for one canonical homogeneous constructor payload.
@@ -388,18 +395,111 @@ where
     }
 }
 
+impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
+    fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+        match r#type.data_type() {
+            DataType::Token => Err(TypeError::invalid("data type token cannot represent zero".to_string()).into()),
+            DataType::Zero => Array::new(r#type.clone(), Vec::new()),
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = <Element as ElementConversionTarget>::from_unsigned(0)?;
+                Array::from_fn_elements(r#type.clone(), |_| Ok(element))
+            }),
+        }
+    }
+}
+
+impl ZeroLike for Array {
+    fn zero_like(&self) -> Self {
+        match self.r#type.data_type() {
+            DataType::Token | DataType::Zero | DataType::F8E8M0FNU => self.clone(),
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = <Element as ElementConversionTarget>::from_unsigned(0).unwrap();
+                Self::from_fn_elements(self.r#type.clone(), |_| Ok(element)).unwrap()
+            }),
+        }
+    }
+}
+
+impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
+    fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+        match r#type.data_type() {
+            DataType::Token | DataType::Zero => {
+                Err(TypeError::invalid(format!("data type {} cannot represent one", r#type.data_type())).into())
+            }
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = <Element as ElementConversionTarget>::from_unsigned(1)?;
+                Array::from_fn_elements(r#type.clone(), |_| Ok(element))
+            }),
+        }
+    }
+}
+
+impl OneLike for Array {
+    fn one_like(&self) -> Self {
+        match self.r#type.data_type() {
+            DataType::Token | DataType::Zero => self.clone(),
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = <Element as ElementConversionTarget>::from_unsigned(1).unwrap();
+                Self::from_fn_elements(self.r#type.clone(), |_| Ok(element)).unwrap()
+            }),
+        }
+    }
+}
+
+impl<O: Operation<Type = ArrayType>> crate::operations::constants::Iota<Array> for EagerContext<Array, O> {
+    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
+        if !r#type.data_type().is_numeric() {
+            return Err(TypeError::invalid(format!(
+                "'{}' requires a numeric element type but has {}",
+                IOTA_OPERATION_NAME,
+                r#type.data_type(),
+            ))
+            .into());
+        }
+        let sizes = r#type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| {
+                dimension.value().ok_or_else(|| {
+                    TypeError::invalid(format!("cannot materialize an iota of dynamically sized type {type}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if dimension >= sizes.len() {
+            return Err(TypeError::invalid(format!(
+                "iota dimension {dimension} is out of bounds for array type {type}",
+            ))
+            .into());
+        }
+        // In row-major order, the index along `dimension` at flat position `flat` is `(flat / stride) % size`, where
+        // `stride` is the product of the sizes of the dimensions after `dimension`.
+        let size = sizes[dimension];
+        let stride: usize = sizes[dimension + 1..].iter().product();
+        let data_type = r#type.data_type();
+        dispatch_on_array_element_type!(data_type, |Element| {
+            Array::from_fn_elements(r#type.clone(), |flat| {
+                <Element as ElementConversionTarget>::from_unsigned(((flat / stride) % size) as u64)
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::arrays::{Array, array_type};
     use crate::arrays::dimensions::DimensionValue;
+    use crate::arrays::encoding::{f6e2m3fn, f8e8m0fnu, i4, u4};
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::arrays::types::ir::ArrayIrType;
-    use crate::backends::Array;
+    use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::compilation::{
         CallRequest, CompilationDomain, CompilationTracer, CompileRequest, CompiledFunction, FlatCompilationProgram,
         JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, try_jit,
@@ -410,7 +510,7 @@ mod tests {
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
-    use crate::operations::{BroadcastOperation, StopGradientOperation, ZeroOperation};
+    use crate::operations::{BroadcastOperation, Fill, StopGradientOperation, ZeroOperation};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{AtomId, EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, Typed};
@@ -1112,5 +1212,114 @@ mod tests {
         let cotangents = pullback.apply(vec![cotangent]).unwrap();
         assert_eq!(cotangents[0].r#type().as_ref(), &ArrayIrType::Array(dynamic_type.cotangent()));
         assert_eq!(cotangents[1].r#type().as_ref(), &ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+    }
+
+    #[test]
+    fn test_array_constants() {
+        let context = EagerContext::<Array>::new();
+        let r#type = array_type(DataType::F32, &[2, 2]);
+        assert_eq!(
+            context.zero(&r#type),
+            Array::from_elements(r#type.clone(), &[0.0f32; 4]).map_err(|_| unreachable!())
+        );
+        assert_eq!(
+            context.one(&r#type),
+            Array::from_elements(r#type.clone(), &[1.0f32; 4]).map_err(|_| unreachable!())
+        );
+        assert_eq!(
+            context.fill(&r#type, 2.5f32),
+            Array::from_elements(r#type.clone(), &[2.5f32; 4]).map_err(|_| unreachable!()),
+        );
+        // Explicit output types use ordinary element conversion, including narrowing.
+        assert_eq!(
+            context.fill(&r#type, 2.5f64),
+            Array::from_elements(r#type.clone(), &[2.5f32; 4]).map_err(|_| unreachable!()),
+        );
+        assert_eq!(
+            context.fill(&r#type, ComplexNumber::new(1.0f32, 2.0)),
+            Array::from_elements(r#type.clone(), &[1.0f32; 4]).map_err(|_| unreachable!()),
+        );
+        let integer_type = array_type(DataType::I32, &[2]);
+        assert_eq!(
+            context.fill(&integer_type, 2.5f64),
+            Array::from_elements(integer_type, &[2i32; 2]).map_err(|_| unreachable!()),
+        );
+        let boolean_type = array_type(DataType::Boolean, &[2]);
+        assert_eq!(
+            context.fill(&boolean_type, ComplexNumber::new(0.0f32, 2.0)),
+            Array::from_elements(boolean_type, &[true; 2]).map_err(|_| unreachable!()),
+        );
+        // Iota materializes coordinates along the requested dimension in the declared element data type.
+        assert_eq!(
+            context.iota(&array_type(DataType::I32, &[2, 3]), 1).unwrap().elements::<i32>(),
+            Ok(vec![0, 1, 2, 0, 1, 2]),
+        );
+        assert_eq!(context.iota(&array_type(DataType::F64, &[3]), 0).unwrap().to_f64s(), vec![0.0, 1.0, 2.0]);
+        assert_eq!(
+            context.iota(&array_type(DataType::C64, &[3]), 0).unwrap().elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(0.0, 0.0), ComplexNumber::new(1.0, 0.0), ComplexNumber::new(2.0, 0.0),]),
+        );
+        // Constructors dispatch over element codecs that have no scalar representation and honor physical layout.
+        let strided_type = array_type(DataType::I4, &[3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+        let zero = context.zero(&strided_type).unwrap();
+        assert_eq!(zero.elements::<i4>(), Ok(vec![i4::new(0).unwrap(); 3]));
+        assert_eq!(zero.storage_bytes(), [0, 0, 0]);
+        let one = context.one(&strided_type).unwrap();
+        assert_eq!(one.elements::<i4>(), Ok(vec![i4::new(1).unwrap(); 3]));
+        assert_eq!(one.storage_bytes(), [1, 1, 1]);
+        assert_eq!(
+            context.iota(&array_type(DataType::U4, &[2, 3]), 1).unwrap().elements::<u4>(),
+            Ok(vec![
+                u4::new(0).unwrap(),
+                u4::new(1).unwrap(),
+                u4::new(2).unwrap(),
+                u4::new(0).unwrap(),
+                u4::new(1).unwrap(),
+                u4::new(2).unwrap(),
+            ]),
+        );
+        assert_eq!(
+            context.fill(&array_type(DataType::F6E2M3FN, &[2]), f6e2m3fn::from_bits(0x08).unwrap()),
+            Array::from_elements(array_type(DataType::F6E2M3FN, &[2]), &[f6e2m3fn::from_bits(0x08).unwrap(); 2],),
+        );
+        assert_eq!(
+            context.fill(&array_type(DataType::U4, &[2]), 2.5f64).unwrap().elements::<u4>(),
+            Ok(vec![u4::new(2).unwrap(); 2]),
+        );
+        // Kernels that materialize a payload from a type reject dynamically sized types.
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+                Dimension::Static(3),
+            ]),
+        );
+        let expected_message = "cannot materialize a value of dynamically sized type f64[dynamic, 3]";
+        assert!(matches!(
+            context.zero(&dynamic_type),
+            Err(ProgramError::Type(TypeError::Invalid { message })) if message == expected_message,
+        ));
+        assert!(matches!(
+            context.one(&dynamic_type),
+            Err(ProgramError::Type(TypeError::Invalid { message })) if message == expected_message,
+        ));
+        assert_eq!(context.fill(&dynamic_type, 42.0f64).unwrap_err().to_string(), expected_message);
+    }
+
+    #[test]
+    fn test_array_zero_like_and_one_like() {
+        let array = Array::vector(vec![1.5f32, -2.5]);
+        assert_eq!(array.zero_like().elements::<f32>(), Ok(vec![0.0, 0.0]));
+        assert_eq!(array.one_like().elements::<f32>(), Ok(vec![1.0, 1.0]));
+        assert_eq!(array.zero_like().r#type().into_owned(), array_type(DataType::F32, &[2]));
+
+        // `f8e8m0fnu` cannot represent zero, so zero-like retains each value while one-like produces exact ones.
+        let array = Array::from_elements(
+            array_type(DataType::F8E8M0FNU, &[2]),
+            &[f8e8m0fnu::from_bits(0x7e), f8e8m0fnu::from_bits(0x80)],
+        )
+        .unwrap();
+        assert_eq!(array.zero_like(), array);
+        assert_eq!(array.one_like().elements::<f8e8m0fnu>(), Ok(vec![f8e8m0fnu::from_bits(0x7f); 2]));
     }
 }

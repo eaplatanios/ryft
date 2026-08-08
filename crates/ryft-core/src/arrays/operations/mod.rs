@@ -1,12 +1,12 @@
 use ryft_macros::Operation;
 
+use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::DimensionType;
 use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::AxisIndexOperation;
-use crate::backends::Array;
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
@@ -43,12 +43,26 @@ use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperati
 
 // TODO(eaplatanios): Review this module.
 
+// TODO(eaplatanios): All these should be `pub mod` and we should have appropriate `pub use` statements right after.
+mod attention;
 mod collectives;
 mod compare;
+mod complex;
 mod constants;
 mod control_flow;
+mod custom_call;
+mod differentiation;
 mod dimensions;
-mod manipulation;
+mod logical;
+pub mod manipulation;
+mod math;
+mod memory;
+mod random;
+mod sharding;
+mod sort;
+mod tag;
+
+pub use manipulation::BroadcastKernel;
 
 /// Reusable [`Operation`] enum for ordinary staged programs over arrays.
 ///
@@ -400,6 +414,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::arrays::Array;
     use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
@@ -412,7 +427,6 @@ mod tests {
     use crate::arrays::types::ir::ArrayIrType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::arrays::types::memories::Memory;
-    use crate::backends::Array;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};

@@ -1,4 +1,5 @@
 pub mod addressing;
+mod arrays;
 pub mod batching;
 pub mod broadcasting;
 pub mod differentiation;
@@ -11,6 +12,7 @@ pub mod sharding;
 pub mod types;
 
 pub use addressing::{ArrayAddressing, ArrayIndexRange, ArrayIndexRanges, ArraySliceAxis};
+pub use arrays::Array;
 pub use batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, DimensionSource,
     ReplicatedDimensionBatchingPolicy, StaticArrayBatchingPolicy,
@@ -26,7 +28,7 @@ pub use encoding::{
 pub use ir::ArrayIrValue;
 pub use macros::dispatch_on_array_element_type;
 pub use operations::{
-    ArrayIrOperation, ArrayOperation, ArrayTracingContext, DimensionOperation, DimensionTracingContext,
+    ArrayIrOperation, ArrayOperation, ArrayTracingContext, BroadcastKernel, DimensionOperation, DimensionTracingContext,
 };
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,

@@ -171,9 +171,9 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::arrays::Array;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{DimensionBounds, DimensionVariable};
-    use crate::backends::Array;
     use crate::contexts::StagingContext;
     use crate::differentiation::DifferentiationTracer;
     use crate::operations::ConstantOperation;

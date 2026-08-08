@@ -325,11 +325,11 @@ impl<
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::arrays::Array;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::DimensionBounds;
-    use crate::backends::Array;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::programs::TypeError;
 

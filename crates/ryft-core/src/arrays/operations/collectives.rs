@@ -9,6 +9,8 @@ use crate::arrays::types::arrays::ArrayType;
 use crate::operations::collectives::PpermuteOperation;
 use crate::programs::Value;
 
+// TODO(eaplatanios): Review this.
+
 impl<A: Value<Type = ArrayType>> From<PpermuteOperation> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: PpermuteOperation) -> Self {
@@ -18,9 +20,9 @@ impl<A: Value<Type = ArrayType>> From<PpermuteOperation> for ArrayIrOperation<A>
 
 #[cfg(test)]
 mod tests {
-
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::arrays::Array;
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, DimensionOperation};
@@ -29,7 +31,6 @@ mod tests {
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::arrays::types::ir::ArrayIrType;
     use crate::axes::NamedAxis;
-    use crate::backends::Array;
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::DifferentiationError;
     use crate::macros::check_operation_partial_evaluation;
