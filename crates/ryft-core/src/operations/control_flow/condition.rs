@@ -19,7 +19,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+    ResidualZeroProvider, TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -1139,7 +1139,7 @@ where
 impl<C: Context<Type: ConditionTypeSemantics + DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
     for ConditionOperation<C::Constant>
 where
-    C::Operation: ZeroOperationProvider<C::Type> + From<ConditionOperation<C::Constant>>,
+    C::Operation: ResidualZeroProvider<C::Type> + From<ConditionOperation<C::Constant>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -1167,7 +1167,13 @@ where
         condition_operands.extend(operands.iter().map(|operand| operand.primal().clone()));
         for operand in operands {
             if !operand.tangent().r#type().is_zero_space() {
-                condition_operands.push(operand.tangent().clone().materialize(context)?);
+                // The operand primal names every runtime quantity a reference-bearing tangent type omits, because
+                // the tangent type derivation preserves geometry exactly.
+                condition_operands.push(C::Operation::materialize_zero_with_geometry(
+                    context,
+                    operand.tangent().clone(),
+                    std::iter::once(operand.primal()),
+                )?);
             }
         }
         let outputs = context.bind(fused_condition, vec![fused_true, fused_false], &condition_operands)?;
@@ -1199,7 +1205,7 @@ where
 impl<V, O> TransposableOperation<V, O> for ConditionOperation<V>
 where
     V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
-    O: Operation<Type = V::Type> + ZeroOperationProvider<V::Type> + From<ConditionOperation<V>>,
+    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type> + From<ConditionOperation<V>>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1252,7 +1258,7 @@ pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
     V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
-    O: Operation<Type = V::Type> + ZeroOperationProvider<V::Type> + From<ConditionOperation<V>>,
+    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type> + From<ConditionOperation<V>>,
 {
     // A condition with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -1310,7 +1316,15 @@ where
     let mut operands = Vec::with_capacity(1 + output_types.len() + residuals.len());
     operands.push(predicate);
     for cotangent in outputs {
-        operands.push(cotangent.clone().materialize(context)?);
+        // A dead output's structural-zero cotangent still becomes a real operand of the transposed condition. Its
+        // type alone cannot construct it when it references runtime identities, but the boundary already carries that
+        // geometry: at least one peer cotangent is live here (the all-zero case returned above), and the known
+        // residuals are live too.
+        operands.push(O::materialize_zero_with_geometry(
+            context,
+            cotangent.clone(),
+            outputs.iter().filter_map(MaybeZero::as_value).chain(&residuals),
+        )?);
     }
     operands.extend(residuals);
     let branch_cotangents =

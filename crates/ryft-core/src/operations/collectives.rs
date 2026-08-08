@@ -829,10 +829,7 @@ fn infer_explicit_shape_changing_collective_output_type(
     if operation_name != PSUM_SCATTER_OPERATION_NAME && !input_type.unreduced_axes().is_empty() {
         return Err(TypeError::invalid(format!("'{operation_name}' does not support unreduced operands")));
     }
-    let output_extents = input_types[1..]
-        .iter()
-        .map(|r#type| <&DimensionType>::try_from(r#type).map(DimensionType::to_dimension))
-        .collect::<Result<Vec<_>, _>>()?;
+    let output_extents = ArrayIrType::extents(&input_types[1..])?;
     if unchanged_input_axes.len() != output_extents.len() {
         return Err(TypeError::invalid(format!(
             "'{operation_name}' internal output-axis mapping has length {} but the result rank is {}",

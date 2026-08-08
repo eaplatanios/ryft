@@ -21,7 +21,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+    ResidualZeroProvider, TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -2098,7 +2098,7 @@ where
 impl<C: Context<Type: DifferentiableType + ScanTypeSemantics> + Zero<C::Value>> DifferentiableOperation<C>
     for ScanOperation<C::Constant>
 where
-    C::Operation: ZeroOperationProvider<C::Type> + From<ScanOperation<C::Constant>>,
+    C::Operation: ResidualZeroProvider<C::Type> + From<ScanOperation<C::Constant>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -2148,18 +2148,27 @@ where
             .with_reverse(reverse)
             .with_unroll(unroll)?;
         // The fused scan takes each live carry and scanned tangent as a real program input, so materialize their
-        // structural zeros at this sub-program boundary.
+        // structural zeros at this sub-program boundary. Each operand's own primal names every runtime quantity a
+        // reference-bearing tangent type omits, because the tangent type derivation preserves geometry exactly.
         let mut operands = Vec::with_capacity(fused_body.input_types().len());
         operands.extend(body_inputs[..carry_count].iter().map(|input| input.primal().clone()));
         for (input, &live) in body_inputs[..carry_count].iter().zip(&input_has_tangent[..carry_count]) {
             if live {
-                operands.push(input.tangent().clone().materialize(context)?);
+                operands.push(C::Operation::materialize_zero_with_geometry(
+                    context,
+                    input.tangent().clone(),
+                    std::iter::once(input.primal()),
+                )?);
             }
         }
         operands.extend(body_inputs[carry_count..].iter().map(|input| input.primal().clone()));
         for (input, &live) in body_inputs[carry_count..].iter().zip(&input_has_tangent[carry_count..]) {
             if live {
-                operands.push(input.tangent().clone().materialize(context)?);
+                operands.push(C::Operation::materialize_zero_with_geometry(
+                    context,
+                    input.tangent().clone(),
+                    std::iter::once(input.primal()),
+                )?);
             }
         }
         operands.extend(runtime_length_inputs.iter().map(|input| input.primal().clone()));
@@ -2361,7 +2370,7 @@ impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayType
 where
     V: Value<Type = ArrayType>,
     F: Value<Type = ArrayType>,
-    Target: Operation<Type = ArrayType> + ZeroOperationProvider<ArrayType> + From<ScanOperation<F>>,
+    Target: Operation<Type = ArrayType> + ResidualZeroProvider<ArrayType> + From<ScanOperation<F>>,
 {
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
@@ -2378,7 +2387,7 @@ impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayIrType
 where
     V: Value<Type = ArrayIrType>,
     F: Value<Type = ArrayIrType>,
-    Target: Operation<Type = ArrayIrType> + ZeroOperationProvider<ArrayIrType> + From<ScanOperation<F>>,
+    Target: Operation<Type = ArrayIrType> + ResidualZeroProvider<ArrayIrType> + From<ScanOperation<F>>,
 {
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
@@ -2402,7 +2411,7 @@ fn transpose_array_scan<V, F, Target, D>(
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
     F: Value<Type = V::Type>,
-    Target: Operation<Type = V::Type> + ZeroOperationProvider<V::Type> + From<ScanOperation<F>>,
+    Target: Operation<Type = V::Type> + ResidualZeroProvider<V::Type> + From<ScanOperation<F>>,
     D: TranspositionDriver<V, Target>,
 {
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -2421,9 +2430,21 @@ where
         .with_unroll(operation.unroll())?
         .with_captures(operation.captures().to_vec());
     check_count!("output", outputs, body.output_types().len(), ProgramError);
+    // A dead output's structural-zero cotangent still becomes a real operand of the reversed scan. Its type alone
+    // cannot construct it when it references runtime identities, but the boundary already carries that geometry: at
+    // least one peer cotangent is live here (the all-zero case returned above) and every known operand is live too.
     let mut materialized = outputs
         .iter()
-        .map(|cotangent| cotangent.clone().materialize(context))
+        .map(|cotangent| {
+            Target::materialize_zero_with_geometry(
+                context,
+                cotangent.clone(),
+                outputs
+                    .iter()
+                    .filter_map(MaybeZero::as_value)
+                    .chain(inputs.iter().filter_map(PartialValue::as_known)),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     for (index, input) in runtime_length_inputs.iter().enumerate() {
         materialized.push(input.as_known().cloned().ok_or_else(|| {
@@ -2490,7 +2511,7 @@ pub fn transpose_primal_scan<V, O, F, D: TranspositionDriver<V, O>>(
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
     F: Value<Type = V::Type>,
-    O: Operation<Type = V::Type> + ZeroOperationProvider<V::Type> + From<ScanOperation<F>>,
+    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type> + From<ScanOperation<F>>,
 {
     // A scan with only zero output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -2557,10 +2578,24 @@ where
     // stacked along the scan length. Using the body's per-iteration y-slice types here would materialize a zero
     // cotangent for a dead y-output with the un-stacked slice type, desyncing the reversed scan's operand signature.
     check_count!("output", outputs, body.output_types().len(), ProgramError);
+    // A dead output's structural-zero cotangent still becomes a real operand of the reversed scan. Its type alone
+    // cannot construct it when it references runtime identities, but the boundary collectively names every such
+    // quantity, so the zero is assembled from the peers one identity at a time. Carry cotangents keep the
+    // per-iteration geometry that live peer carries and known carries also carry, while a dead *stacked* cotangent's
+    // scan-length-prefixed geometry is split across the boundary: the length identity rides the runtime length
+    // operand (a first-class dimension) and any known residual stack, while its inner extents ride the carries and
+    // per-iteration peers. No peer has the stacked type as a whole, which is exactly why exemplar matching cannot
+    // close this case and identity-directed capture can.
+    let geometry_sources = || {
+        outputs
+            .iter()
+            .filter_map(MaybeZero::as_value)
+            .chain(inputs.iter().filter_map(PartialValue::as_known))
+    };
     let mut operands = Vec::with_capacity(outputs.len() + operand_linear.len());
     for index in 0..carry_count {
         if operand_linear[index] {
-            operands.push(outputs[index].clone().materialize(context)?);
+            operands.push(O::materialize_zero_with_geometry(context, outputs[index].clone(), geometry_sources())?);
         } else {
             operands.push(scan_inputs[index].as_known().cloned().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
@@ -2571,7 +2606,7 @@ where
     }
     for (cotangent, output_type) in outputs[carry_count..].iter().zip(&body.output_types()[carry_count..]) {
         if !output_type.cotangent().is_zero_space() {
-            operands.push(cotangent.clone().materialize(context)?);
+            operands.push(O::materialize_zero_with_geometry(context, cotangent.clone(), geometry_sources())?);
         }
     }
 

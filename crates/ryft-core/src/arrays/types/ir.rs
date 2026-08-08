@@ -4,7 +4,7 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::arrays::types::arrays::{ArrayType, ArrayTypeRefinements};
-use crate::arrays::types::dimensions::{DimensionType, DimensionVariable};
+use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable};
 use crate::parameters::Parameter;
 use crate::programs::types::visit_type_signature_pairs;
 use crate::programs::{Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements};
@@ -31,6 +31,26 @@ use crate::programs::{Type, TypeError, TypeIdentityPosition, TypeIdentityRenamin
 pub enum ArrayIrType {
     Array(ArrayType),
     Dimension(DimensionType),
+}
+
+impl ArrayIrType {
+    /// Projects a run of explicit extent operand types into the [`Dimension`]s they define, in operand order.
+    ///
+    /// Mixed shape-carrying operations derive their result shape from exactly this projection, so every mixed
+    /// inference rule that consumes a trailing extent-operand run shares one member-kind diagnostic for an operand
+    /// that is not a dimension.
+    ///
+    /// # Parameters
+    ///
+    ///   - `types`: Extent operand types, in operand order. The [`Borrow`] item bound lets type slices, owned type
+    ///     iterators, and borrowed [`Typed::r#type`](crate::Typed::type) results all be projected in place, so
+    ///     value-level callers need no intermediate type collection.
+    pub(crate) fn extents(types: impl IntoIterator<Item: Borrow<Self>>) -> Result<Vec<Dimension>, TypeError> {
+        types
+            .into_iter()
+            .map(|r#type| <&DimensionType>::try_from(r#type.borrow()).map(DimensionType::to_dimension))
+            .collect()
+    }
 }
 
 impl Display for ArrayIrType {

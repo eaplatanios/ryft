@@ -26,7 +26,7 @@ use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationTracer, TransposableOperation, TranspositionDriver,
+    DifferentiationTracer, ResidualZeroProvider, TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -1512,7 +1512,7 @@ fn jvp_array_backed_while<C, D: DifferentiationDriver<C>, A>(
 where
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
     C::Value: Concretizable<bool>,
-    C::Operation: ZeroOperationProvider<C::Type>
+    C::Operation: ResidualZeroProvider<C::Type>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<C::Type>>
         + From<ScanOperation<C::Constant>>
@@ -1562,7 +1562,7 @@ where
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> WhileJvp<C> for ArrayType
 where
     C::Value: Concretizable<bool>,
-    C::Operation: ZeroOperationProvider<ArrayType>
+    C::Operation: ResidualZeroProvider<ArrayType>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<ArrayType>>
         + From<ScanOperation<C::Constant>>
@@ -1590,7 +1590,8 @@ fn jvp_while_bounded<C, D: DifferentiationDriver<C>, A>(
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
-    C::Operation: WhileResidualStackOperation<C::Type, A>
+    C::Operation: ResidualZeroProvider<C::Type>
+        + WhileResidualStackOperation<C::Type, A>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<C::Type>>
         + From<ScanOperation<C::Constant>>,
@@ -1829,11 +1830,21 @@ where
         .flatten()
         .map(|&state_index| inputs[state_index].primal().clone())
         .collect::<Vec<_>>();
+    // Each state element's own primal names every runtime quantity a reference-bearing tangent type omits, because
+    // the tangent type derivation preserves geometry exactly.
     tangent_operands.extend(
         inputs
             .iter()
             .zip(&element_has_tangent)
-            .filter_map(|(input, &has_tangent)| has_tangent.then(|| input.tangent().clone().materialize(context)))
+            .filter_map(|(input, &has_tangent)| {
+                has_tangent.then(|| {
+                    C::Operation::materialize_zero_with_geometry(
+                        context,
+                        input.tangent().clone(),
+                        std::iter::once(input.primal()),
+                    )
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?,
     );
     tangent_operands.extend(residual_stacks);
@@ -1862,7 +1873,7 @@ impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> WhileJvp<C> for ArrayIrTyp
 where
     C::Constant: ValueProjection<ArrayType>,
     C::Value: Concretizable<bool>,
-    C::Operation: ZeroOperationProvider<ArrayIrType>
+    C::Operation: ResidualZeroProvider<ArrayIrType>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<ArrayIrType>>
         + From<ScanOperation<C::Constant>>
@@ -1910,7 +1921,7 @@ fn jvp_while_fused<C, D: DifferentiationDriver<C>>(
 where
     C: Context + Zero<C::Value>,
     C::Type: DifferentiableType + WhileTypeSemantics,
-    C::Operation: ZeroOperationProvider<C::Type> + From<WhileOperation<C::Type>>,
+    C::Operation: ResidualZeroProvider<C::Type> + From<WhileOperation<C::Type>>,
 {
     let state_count = inputs.len();
 
@@ -1946,14 +1957,19 @@ where
 
     // Stage the fused loop over the operand primals followed by the materialized tangents of the live differential
     // state elements — the fused body takes each of those tangents as a real program input, so their structural
-    // zeros are materialized — and zip the output halves back into `DifferentiationDual`s in the original state
-    // order, restoring structural zeros for the omitted zero-space state elements.
+    // zeros are materialized against their own primal, which supplies the runtime geometry a reference-bearing
+    // tangent type omits — and zip the output halves back into `DifferentiationDual`s in the original state order,
+    // restoring structural zeros for the omitted zero-space state elements.
     let fused_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
     let mut operands = Vec::with_capacity(fused_state_count);
     operands.extend(inputs.iter().map(|input| input.primal().clone()));
     for (input, &has_tangent) in inputs.iter().zip(&element_has_tangent) {
         if has_tangent {
-            operands.push(input.tangent().clone().materialize(context)?);
+            operands.push(C::Operation::materialize_zero_with_geometry(
+                context,
+                input.tangent().clone(),
+                std::iter::once(input.primal()),
+            )?);
         }
     }
     let outputs = context.bind(C::Operation::from(fused_while), vec![fused_condition, fused_body], &operands)?;

@@ -2162,7 +2162,13 @@ where
                     dropout,
                 )?;
             // The sequence lengths are non-differentiated `i32` inputs, so their cotangents are structural zeros of
-            // the first-class zero-space cotangent type that non-differentiable types carry.
+            // the first-class zero-space cotangent type that non-differentiable types carry. The nullary zero is the
+            // only available construction and is sufficient here because a dynamically shaped lengths vector cannot
+            // reach this point: `DotProductAttentionOperation::infer_output_types` rejects every non-static operand
+            // shape (refer to `validated_sequence_length_operands` and `static_attention_dimensions`), so the
+            // static-shape requirement is part of the attention operations' own public contract rather than an
+            // assumption of this rule. A future dynamically shaped attention would have to read those extents
+            // explicitly through a mixed entry point.
             let zero_cotangent = |lengths: &DomainTracer<D>| lengths.context().zero(&lengths.r#type().cotangent());
             let query_lengths_cotangent = zero_cotangent(&query_lengths)?;
             let key_value_lengths_cotangent = zero_cotangent(&key_value_lengths)?;
