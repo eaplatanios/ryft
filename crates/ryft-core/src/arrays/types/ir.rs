@@ -302,6 +302,9 @@ mod tests {
     fn test_array_ir_type() {
         let declared_variable = DimensionVariable::new("declared", DimensionBounds::non_negative(Some(8)).unwrap());
         let actual_variable = DimensionVariable::new("actual", DimensionBounds::non_negative(Some(4)).unwrap());
+
+        // Extent projection accepts an empty run, preserves operand order, recognizes singleton-bounded dimensions as
+        // static, retains wider-bounded dimensions as dynamic, and rejects non-dimension members.
         let exact_variable = DimensionVariable::new("exact", DimensionBounds::new(4, Some(5)).unwrap());
         let extent_types = [
             ArrayIrType::Dimension(DimensionType::new(exact_variable)),
@@ -317,6 +320,8 @@ mod tests {
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
 
+        // One identity may be defined by a dimension member and referenced by an array member. Signature matching
+        // must preserve that relationship under one consistent renaming and reject arity or member-kind mismatches.
         let declared = [
             ArrayIrType::Dimension(DimensionType::new(declared_variable.clone())),
             ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(declared_variable.clone())]))),
@@ -348,6 +353,8 @@ mod tests {
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
 
+        // Repeated observations of one dynamic array identity establish one concrete refinement and reject a later
+        // conflicting extent.
         let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap());
         let declared_array =
             ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(batch.clone())])));
@@ -431,6 +438,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_type_projection() {
+        // An array member projects back to its exact borrowed array type and rejects projection as a dimension.
         let array = ArrayType::new(F32, Shape::scalar());
         let stored = ArrayIrType::from(array.clone());
         assert_eq!(<&ArrayType>::try_from(&stored), Ok(&array));
@@ -438,6 +446,8 @@ mod tests {
             <&DimensionType>::try_from(&stored),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
+
+        // A dimension member provides the symmetric successful dimension projection and array-kind diagnostic.
         let dimension =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap()));
         let stored = ArrayIrType::from(dimension.clone());

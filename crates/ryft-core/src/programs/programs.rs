@@ -1184,7 +1184,76 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// times renders its body exactly once (at its first reference, labeled with its [`RegionId`]), and every later
     /// reference renders as that identifier alone. [`RegionId`]s are arena indices and therefore deterministic
     /// [`Program`]-local names.
+    ///
+    /// A [`Region`] body renders as a sequence of statements between its `lambda` header and its `in (...)` result
+    /// list, where the first statement carries the `let` keyword and every later one is aligned beneath it. A statement
+    /// is either a binding of the form `%0:f64 = operation ...operands` or, for an [`Instruction`] that binds no output
+    /// atom (e.g., an effectful assertion), the resultless form `operation ...operands` without the `%0:f64 =` binder.
+    /// Resultless instructions render in [`Instruction`] order relative to the instructions that do bind atoms, so
+    /// programs whose only difference is the presence or ordering of such instructions render differently.
     pub fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        /// Renders one [`Instruction`] as a single statement of the enclosing region's `let` block, recursively
+        /// rendering its attached regions according to `reference_counts` and `rendered`. An instruction that binds
+        /// no output atom renders without the leading binder. `statement_count` is the number of statements already
+        /// rendered in this block and selects the `let` keyword for the first one.
+        #[allow(clippy::too_many_arguments)]
+        fn render_instruction<V: Value, O: Operation<Type = V::Type>>(
+            regions: &RegionArena<V, O>,
+            atoms: &[Atom<V>],
+            instruction: &Instruction<O>,
+            formatter: &mut std::fmt::Formatter<'_>,
+            indentation: usize,
+            statement_count: usize,
+            reference_counts: &[usize],
+            rendered: &mut [bool],
+        ) -> std::fmt::Result {
+            let line_indentation = if statement_count == 0 { indentation } else { indentation + 4 };
+            write!(formatter, "{:indentation$}", "")?;
+            write!(formatter, "{} ", if statement_count == 0 { "let" } else { "   " })?;
+            if !instruction.outputs.is_empty() {
+                instruction.outputs.iter().enumerate().try_for_each(|(index, output)| {
+                    if index > 0 {
+                        write!(formatter, ", {output}:{}", atoms[output.index()].r#type())
+                    } else {
+                        write!(formatter, "{output}:{}", atoms[output.index()].r#type())
+                    }
+                })?;
+                write!(formatter, " = ")?;
+            }
+            instruction.operation.render(formatter, line_indentation)?;
+            instruction.inputs.iter().try_for_each(|input| write!(formatter, " {input}"))?;
+            if !instruction.regions.is_empty() {
+                let slots = instruction.operation.region_slots();
+                write!(formatter, " [")?;
+                for (slot, attached) in instruction.regions.iter().copied().enumerate() {
+                    writeln!(formatter)?;
+                    write!(formatter, "{:width$}", "", width = line_indentation + 4)?;
+                    match slots.get(slot) {
+                        Some(slot) => write!(formatter, "{}=", slot.name)?,
+                        None => write!(formatter, "{slot}=")?,
+                    }
+                    let is_shared = reference_counts[attached.index()] > 1;
+                    if is_shared && rendered[attached.index()] {
+                        write!(formatter, "{attached},")?;
+                        continue;
+                    }
+                    rendered[attached.index()] = true;
+                    if is_shared {
+                        write!(formatter, "{attached}=")?;
+                    }
+                    writeln!(formatter, "{{")?;
+                    render_region(regions, attached, formatter, line_indentation + 8, reference_counts, rendered)?;
+                    writeln!(formatter)?;
+                    write!(formatter, "{:width$}", "", width = line_indentation + 4)?;
+                    write!(formatter, "}},")?;
+                }
+                writeln!(formatter)?;
+                write!(formatter, "{:width$}", "", width = line_indentation)?;
+                write!(formatter, "]")?;
+            }
+            writeln!(formatter)
+        }
+
         /// Renders one [`Region`] as a `lambda ... in (...)` block, recursively rendering the regions attached to its
         /// instructions according to `reference_counts` and `rendered`.
         fn render_region<V: Value, O: Operation<Type = V::Type>>(
@@ -1212,11 +1281,17 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                     instructions_by_first_output[output_id.index()] = Some(index);
                 }
             }
-            let mut binding_count = 0usize;
+            let mut statement_count = 0usize;
             let mut is_input = vec![false; region.atoms.len()];
             for input_id in region.input_ids.iter().copied() {
                 is_input[input_id.index()] = true;
             }
+
+            // The atom walk drives rendering because bindings are named by their atoms, but an instruction that binds
+            // no output atom is invisible to it. Such instructions are flushed in instruction order just before the
+            // next instruction the walk reaches, and the remainder is flushed after the walk, so the rendered statement
+            // sequence always reflects the region's instruction order.
+            let mut next_instruction_index = 0usize;
             for (atom_id, atom) in region.atoms.iter().enumerate() {
                 match atom {
                     Atom::Constant(_) => {
@@ -1224,69 +1299,60 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                         writeln!(
                             formatter,
                             "{} {}:{} = const",
-                            if binding_count == 0 { "let" } else { "   " },
+                            if statement_count == 0 { "let" } else { "   " },
                             AtomId::new(atom_id),
                             region.atoms[atom_id].r#type()
                         )?;
-                        binding_count += 1;
+                        statement_count += 1;
                     }
                     Atom::Variable(_) if is_input[atom_id] => {}
                     Atom::Variable(_) => {
                         if let Some(instruction_index) = instructions_by_first_output[atom_id] {
-                            let instruction = &region.instructions[instruction_index];
-                            let line_indentation = if binding_count == 0 { indentation } else { indentation + 4 };
-                            write!(formatter, "{:indentation$}", "")?;
-                            write!(formatter, "{} ", if binding_count == 0 { "let" } else { "   " })?;
-                            instruction.outputs.iter().enumerate().try_for_each(|(index, output)| {
-                                if index > 0 {
-                                    write!(formatter, ", {output}:{}", region.atoms[output.index()].r#type())
-                                } else {
-                                    write!(formatter, "{output}:{}", region.atoms[output.index()].r#type())
-                                }
-                            })?;
-                            write!(formatter, " = ")?;
-                            instruction.operation.render(formatter, line_indentation)?;
-                            instruction.inputs.iter().try_for_each(|input| write!(formatter, " {input}"))?;
-                            if !instruction.regions.is_empty() {
-                                let slots = instruction.operation.region_slots();
-                                write!(formatter, " [")?;
-                                for (slot, attached) in instruction.regions.iter().copied().enumerate() {
-                                    writeln!(formatter)?;
-                                    write!(formatter, "{:width$}", "", width = line_indentation + 4)?;
-                                    match slots.get(slot) {
-                                        Some(slot) => write!(formatter, "{}=", slot.name)?,
-                                        None => write!(formatter, "{slot}=")?,
-                                    }
-                                    let is_shared = reference_counts[attached.index()] > 1;
-                                    if is_shared && rendered[attached.index()] {
-                                        write!(formatter, "{attached},")?;
-                                        continue;
-                                    }
-                                    rendered[attached.index()] = true;
-                                    if is_shared {
-                                        write!(formatter, "{attached}=")?;
-                                    }
-                                    writeln!(formatter, "{{")?;
-                                    render_region(
+                            for pending_index in next_instruction_index..instruction_index {
+                                let pending = &region.instructions[pending_index];
+                                if pending.outputs.is_empty() {
+                                    render_instruction(
                                         regions,
-                                        attached,
+                                        &region.atoms,
+                                        pending,
                                         formatter,
-                                        line_indentation + 8,
+                                        indentation,
+                                        statement_count,
                                         reference_counts,
                                         rendered,
                                     )?;
-                                    writeln!(formatter)?;
-                                    write!(formatter, "{:width$}", "", width = line_indentation + 4)?;
-                                    write!(formatter, "}},")?;
+                                    statement_count += 1;
                                 }
-                                writeln!(formatter)?;
-                                write!(formatter, "{:width$}", "", width = line_indentation)?;
-                                write!(formatter, "]")?;
                             }
-                            writeln!(formatter)?;
-                            binding_count += 1;
+                            next_instruction_index = next_instruction_index.max(instruction_index + 1);
+                            render_instruction(
+                                regions,
+                                &region.atoms,
+                                &region.instructions[instruction_index],
+                                formatter,
+                                indentation,
+                                statement_count,
+                                reference_counts,
+                                rendered,
+                            )?;
+                            statement_count += 1;
                         };
                     }
+                }
+            }
+            for pending in &region.instructions[next_instruction_index..] {
+                if pending.outputs.is_empty() {
+                    render_instruction(
+                        regions,
+                        &region.atoms,
+                        pending,
+                        formatter,
+                        indentation,
+                        statement_count,
+                        reference_counts,
+                        rendered,
+                    )?;
+                    statement_count += 1;
                 }
             }
             write!(formatter, "{:indentation$}", "")?;
@@ -2342,8 +2408,8 @@ mod tests {
         assert_eq!(effectful.simplified().unwrap().to_string(), expected);
         assert_eq!(build().into_simplified().unwrap().to_string(), expected);
 
-        // An effectful instruction with no outputs must itself be rooted: there is no result atom from which either
-        // simplification implementation could otherwise discover it.
+        // An effectful instruction with no outputs must still render as a resultless statement and remain rooted as
+        // there is no result atom from which rendering or either simplification implementation could discover it.
         let build_zero_output_effect = || {
             let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -2351,6 +2417,15 @@ mod tests {
             builder.build::<Array, Vec<Array>>(Vec::new(), Placeholder, Vec::new()).unwrap()
         };
         let zero_output_effect = build_zero_output_effect();
+        assert_eq!(
+            zero_output_effect.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let zero_output_effect %0
+                in ()
+            "}
+            .trim_end(),
+        );
         assert_eq!(zero_output_effect.simplified().unwrap().instructions().len(), 1);
         assert_eq!(build_zero_output_effect().into_simplified().unwrap().instructions().len(), 1);
     }
