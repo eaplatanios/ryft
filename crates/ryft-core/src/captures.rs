@@ -135,6 +135,40 @@ where
     }
 }
 
+/// Constant payload that a [`ClosedProgram`] can store in its [`Atom`] table. A payload is either a _capture reference_
+/// that names a runtime value in the surrounding capture table (the canonical [`CaptureReference`] case, which keeps
+/// concrete data out of reusable staged intermediate representation) or an _immediate_ that carries its own host-sized
+/// data and therefore never participates in capture bookkeeping. Backends that stage host-sized payloads directly
+/// (e.g., a first-class dimension extent staged inside a manual `shard_map` region, where no capture table is
+/// reachable) model their constant family as a sum of the two and report [`None`] from
+/// [`capture_index`](Self::capture_index) for the immediate variants.
+///
+/// Capture validation, dead-capture elimination, and capture lifting are all expressed through this trait, and so
+/// extending a constant family with immediates preserves the capture-table invariant that [`ClosedProgram`] upholds.
+/// Every such family must be able to represent a plain capture reference, which is what
+/// [`CapturingContext::capture`] hands back when a trace registers a runtime value.
+pub trait CaptureConstant: Value + From<CaptureReference<Self::Type>> {
+    /// Returns the capture-table index that this constant references, or [`None`] when it is an immediate payload
+    /// that carries its own data.
+    fn capture_index(&self) -> Option<usize>;
+
+    /// Returns this constant with its capture-table index replaced by the result of applying `map` to it. Immediate
+    /// payloads carry no index and are returned unchanged.
+    fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self;
+}
+
+impl<T: Type> CaptureConstant for CaptureReference<T> {
+    #[inline]
+    fn capture_index(&self) -> Option<usize> {
+        Some(self.index)
+    }
+
+    #[inline]
+    fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
+        Self::new(map(self.index), self.r#type.clone())
+    }
+}
+
 /// [`Context`] that can register runtime values as captures (e.g., for a [`Program`] that is being built). The returned
 /// value is the context's staged constant payload. For captured-program backends this is usually a lifetime-free
 /// [`CaptureReference`] into a side table owned by the surrounding compiled function. Stackable transform contexts
@@ -171,8 +205,11 @@ where
     }
 }
 
-impl<T: Type, O: Operation<Type = T>, C: Value<Type = T>> CapturingContext
-    for TracingContext<CaptureReference<T>, O, C>
+// Any traced constant family that can embed a `CaptureReference` registers captures the same way: the runtime value
+// is appended to the trace's capture table and the staged payload is the reference to its slot. Constant families that
+// also carry immediate payloads therefore inherit capture registration unchanged.
+impl<T: Type, V: Value<Type = T> + From<CaptureReference<T>>, O: Operation<Type = T>, C: Value<Type = T>>
+    CapturingContext for TracingContext<V, O, C>
 {
     type Capture = C;
 
@@ -181,7 +218,7 @@ impl<T: Type, O: Operation<Type = T>, C: Value<Type = T>> CapturingContext
         let mut captures = self.captures().borrow_mut();
         let constant = CaptureReference::new(captures.len(), value.r#type().into_owned());
         captures.push(value);
-        Ok(constant)
+        Ok(constant.into())
     }
 }
 
@@ -237,59 +274,58 @@ where
 
 /// A [`Program`] paired with the concrete runtime values referenced by its captured constants. The [`Program`] remains
 /// independent of the concrete capture data: values of type `V` live only in [`captures`](Self::captures), while its
-/// constant atoms carry lifetime-free [`CaptureReference`]s into that table. [`new`](Self::new), the sole construction
-/// path, validates that every reference names an existing capture with the same type, and so every [`ClosedProgram`]
-/// upholds the capture-table invariant before it can be interpreted or transformed.
+/// constant atoms carry lifetime-free [`CaptureConstant`] payloads — [`CaptureReference`]s into that table, plus any
+/// immediate payloads the backend's constant family also admits. [`new`](Self::new), the sole construction path,
+/// validates that every reference names an existing capture with the same type, and so every [`ClosedProgram`] upholds
+/// the capture-table invariant before it can be interpreted or transformed.
 pub struct ClosedProgram<
-    V: Value,
+    C: Value,
+    V: CaptureConstant<Type = C::Type>,
     O,
-    Input: Parameterized<CaptureReference<V::Type>>,
-    Output: Parameterized<CaptureReference<V::Type>>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
 > {
-    /// [`Program`] whose constants are [`CaptureReference`]s.
-    program: Program<CaptureReference<V::Type>, O, Input, Output>,
+    /// [`Program`] whose constants are [`CaptureConstant`] payloads.
+    program: Program<V, O, Input, Output>,
 
-    /// Captured values referenced by [`CaptureReference`] indices in [`Self::program`].
-    captures: Vec<V>,
+    /// Captured values referenced by [`CaptureConstant::capture_index`] indices in [`Self::program`].
+    captures: Vec<C>,
 }
 
 impl<
-    V: Value,
-    O: Operation<Type = V::Type>,
-    Input: Parameterized<CaptureReference<V::Type>>,
-    Output: Parameterized<CaptureReference<V::Type>>,
-> ClosedProgram<V, O, Input, Output>
+    C: Value,
+    V: CaptureConstant<Type = C::Type>,
+    O: Operation<Type = C::Type>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+> ClosedProgram<C, V, O, Input, Output>
 {
     /// Creates a [`ClosedProgram`] from a capture-referenced `program` and its concrete `captures`, validating that
-    /// every [`CaptureReference`] in the program references an existing capture whose type matches the type stored
-    /// in the reference. This is the sole construction path and both the program and its capture table are immutable
-    /// after construction, and so every [`ClosedProgram`] upholds this capture-table invariant for its entire lifetime
-    /// and no separate re-validation is ever needed.
-    pub fn new(
-        program: Program<CaptureReference<V::Type>, O, Input, Output>,
-        captures: Vec<V>,
-    ) -> Result<Self, ProgramError> {
+    /// every capture-referencing constant in the program references an existing capture whose type matches the type
+    /// stored in the reference. Immediate constants carry their own data and are skipped. This is the sole construction
+    /// path and both the program and its capture table are immutable after construction, and so every [`ClosedProgram`]
+    /// upholds this capture-table invariant for its entire lifetime and no separate re-validation is ever needed.
+    pub fn new(program: Program<V, O, Input, Output>, captures: Vec<C>) -> Result<Self, ProgramError> {
         // Every region in the arena participates in the single capture scope, so validation walks all of them.
         for region in program.regions().iter() {
             for (atom_index, atom) in region.atoms().iter().enumerate() {
                 let Atom::Constant(value) = atom else {
                     continue;
                 };
-                let capture = captures.get(value.index()).ok_or_else(|| {
+                let Some(index) = value.capture_index() else {
+                    continue;
+                };
+                let capture = captures.get(index).ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
-                        "captured constant atom %{atom_index} references missing capture #{}",
-                        value.index(),
+                        "captured constant atom %{atom_index} references missing capture #{index}",
                     ))
                 })?;
                 let expected_type = value.r#type();
                 let actual_type = capture.r#type();
                 if expected_type.as_ref() != actual_type.as_ref() {
                     return Err(ProgramError::MalformedProgram(format!(
-                        "captured constant atom %{atom_index} references capture #{} with type {}, \
-                         but the atom has type {}",
-                        value.index(),
-                        actual_type,
-                        expected_type,
+                        "captured constant atom %{} references capture #{} with type {}, but the atom has type {}",
+                        atom_index, index, actual_type, expected_type,
                     )));
                 }
             }
@@ -299,13 +335,13 @@ impl<
 
     /// Returns the underlying [`Program`].
     #[inline]
-    pub fn program(&self) -> &Program<CaptureReference<V::Type>, O, Input, Output> {
+    pub fn program(&self) -> &Program<V, O, Input, Output> {
         &self.program
     }
 
     /// Returns the underlying captures table.
     #[inline]
-    pub fn captures(&self) -> &[V] {
+    pub fn captures(&self) -> &[C] {
         self.captures.as_slice()
     }
 
@@ -313,9 +349,10 @@ impl<
     /// a contiguous capture table. This is _dead-capture elimination_: any capture whose index never appears in an
     /// [`Atom::Constant`] is dropped, and the remaining captures are renumbered to occupy `0..captures().len()` in
     /// their original relative order. The program structure (i.e., inputs, instructions, and outputs) is preserved
-    /// and only constant atoms are rewritten to carry their new indices. This function consumes `self` so that the
-    /// surviving captures, the instruction operations, and the input/output structures can all be moved into the
-    /// rebuilt program instead of being cloned.
+    /// and only capture-referencing constant atoms are rewritten to carry their new indices; immediate constants are
+    /// index-free and pass through untouched. This function consumes `self` so that the surviving captures, the
+    /// instruction operations, and the input/output structures can all be moved into the rebuilt program instead of
+    /// being cloned.
     pub fn without_unused_captures(self) -> Result<Self, ProgramError> {
         let Self { program, captures } = self;
 
@@ -325,8 +362,10 @@ impl<
         let mut is_referenced = vec![false; captures.len()];
         for region in program.regions().iter() {
             for atom in region.atoms() {
-                if let Atom::Constant(capture_reference) = atom {
-                    is_referenced[capture_reference.index()] = true;
+                if let Atom::Constant(constant) = atom
+                    && let Some(index) = constant.capture_index()
+                {
+                    is_referenced[index] = true;
                 }
             }
         }
@@ -342,17 +381,16 @@ impl<
             }
         }
 
-        // Rewrite every constant atom in place, across every region, to carry its capture's new index. The program
-        // structure (i.e., atoms, identifiers, instructions, regions, and boundaries) is preserved exactly. The
-        // `capture_index_map` lookups cannot fail because the marking pass above assigns a slot to every capture
-        // referenced by any constant atom.
+        // Rewrite every capture-referencing constant atom in place, across every region, to carry its capture's new
+        // index. The program structure (i.e., atoms, identifiers, instructions, regions, and boundaries) is preserved
+        // exactly. The `capture_index_map` lookups cannot fail because the marking pass above assigns a slot to every
+        // capture referenced by any constant atom.
         let Program { input_structure, output_structure, regions, entry, .. } = program;
         let mut regions = regions.into_regions();
         for region in &mut regions {
             for atom in &mut region.atoms {
-                if let Atom::Constant(capture_reference) = atom {
-                    let index = capture_index_map[capture_reference.index()].unwrap();
-                    *capture_reference = CaptureReference::new(index, capture_reference.r#type().into_owned());
+                if let Atom::Constant(constant) = atom {
+                    *constant = constant.map_capture_index(|index| capture_index_map[index].unwrap());
                 }
             }
         }
@@ -365,19 +403,15 @@ impl<
     /// Returns a [`Program`] where the captures have been lifted into explicit leading inputs that are followed by
     /// the original program inputs. The [`ClosedProgram`] itself is unchanged. The returned program is a derived
     /// view used by compilation, which supplies arguments in `[captures..., public inputs...]` order.
-    pub fn to_program_with_lifted_captures(
-        &self,
-    ) -> Result<
-        Program<CaptureReference<V::Type>, O, Vec<CaptureReference<V::Type>>, Vec<CaptureReference<V::Type>>>,
-        ProgramError,
-    > {
+    pub fn to_program_with_lifted_captures(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
         /// Materializes the rebuilt atom identifiers for `atom_ids`, resolving each atom either through `mapped_atoms`
-        /// (which memoizes the rebuilt identifiers of program inputs and instruction outputs) or, for a captured
-        /// constant, to the leading capture input that `capture_inputs` records for the capture the constant
-        /// references. The `capture_inputs` lookup cannot fail because [`ClosedProgram::new`] validated that
-        /// every [`CaptureReference`] names an existing capture, and one leading input exists per capture.
-        fn map_atoms<T: Type>(
-            atoms: &[Atom<CaptureReference<T>>],
+        /// (which memoizes the rebuilt identifiers of program inputs, instruction outputs, and re-added immediate
+        /// constants) or, for a capture-referencing constant, to the leading capture input that `capture_inputs`
+        /// records for the capture the constant references. The `capture_inputs` lookup cannot fail because
+        /// [`ClosedProgram::new`] validated that every capture reference names an existing capture, and one leading
+        /// input exists per capture.
+        fn map_atoms<Constant: CaptureConstant>(
+            atoms: &[Atom<Constant>],
             mapped_atoms: &[Option<AtomId>],
             capture_inputs: &[AtomId],
             atom_ids: &[AtomId],
@@ -390,24 +424,27 @@ impl<
                         return Ok(mapped);
                     }
                     match atoms.get(atom_id.index()) {
-                        Some(Atom::Constant(capture_reference)) => Ok(capture_inputs[capture_reference.index()]),
-                        Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
-                            "variable atom {atom_id} has no mapped input or instruction output",
-                        ))),
-                        None => Err(ProgramError::UnboundAtomId { id: atom_id }),
+                        Some(Atom::Constant(constant)) => constant.capture_index().map(|index| capture_inputs[index]),
+                        Some(Atom::Variable(_)) => None,
+                        None => return Err(ProgramError::UnboundAtomId { id: atom_id }),
                     }
+                    .ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "atom {atom_id} has no mapped input, instruction output, or capture argument",
+                        ))
+                    })
                 })
                 .collect()
         }
 
         // Add one leading input per capture, in capture-table order and unconditionally (a capture that no atom
         // references still occupies its input slot), because execution supplies arguments positionally in
-        // `[captures..., public inputs...]` order. Entry-region constant atoms referencing capture `k` resolve
-        // to `capture_inputs[k]` during the replay below. Constants inside attached regions are preserved as
-        // `CaptureReference`s (backend-specific lowering like XLA lowering will resolve them against the same
-        // hidden capture argument prefix while lowering those regions). Nested regions are imported verbatim ahead
-        // of the replay. Their identifiers are arena indices assigned in order, so copying them in order preserves
-        // every entry-instruction region reference.
+        // `[captures..., public inputs...]` order. Entry-region constant atoms referencing capture `k` resolve to
+        // `capture_inputs[k]` during the replay below. Constants inside attached regions are preserved verbatim
+        // (backend-specific lowering like XLA lowering will resolve capture references against the same hidden capture
+        // argument prefix while lowering those regions, and materialize immediate constants in place). Nested regions
+        // are imported verbatim ahead of the replay. Their identifiers are arena indices assigned in order, so copying
+        // them in order preserves every entry-instruction region reference.
         let mut builder = ProgramBuilder::new();
         builder.regions = RegionArena::from_regions(
             self.program.regions().iter().take(self.program.entry().index()).cloned().collect(),
@@ -430,6 +467,16 @@ impl<
                 return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
             };
             mapped_atoms[input_id.index()] = Some(builder.add_input(input_type.clone()));
+        }
+
+        // Immediate constants carry their own data instead of naming a capture slot, and so they are re-added to the
+        // rebuilt entry region as constant atoms rather than resolving to a leading capture argument.
+        for (atom_index, atom) in self.program.atoms().iter().enumerate() {
+            if let Atom::Constant(constant) = atom
+                && constant.capture_index().is_none()
+            {
+                mapped_atoms[atom_index] = Some(builder.add_constant(constant.clone()));
+            }
         }
 
         // Replay the instructions in order, mapping their operands and recording their rebuilt outputs so that later
@@ -466,7 +513,7 @@ impl<
 
         // The lifted program is flat. Its input and output boundaries are placeholder vectors sized to the
         // `[captures..., public inputs...]` argument convention and the original outputs, respectively.
-        builder.build::<Vec<CaptureReference<V::Type>>, Vec<CaptureReference<V::Type>>>(
+        builder.build::<Vec<V>, Vec<V>>(
             output_ids,
             vec![Placeholder; self.captures.len() + self.program.input_ids().len()],
             vec![Placeholder; self.program.output_ids().len()],
@@ -474,12 +521,8 @@ impl<
     }
 }
 
-impl<
-    V: Value,
-    O: Clone,
-    Input: Parameterized<CaptureReference<V::Type>>,
-    Output: Parameterized<CaptureReference<V::Type>>,
-> Clone for ClosedProgram<V, O, Input, Output>
+impl<C: Value, V: CaptureConstant<Type = C::Type>, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clone
+    for ClosedProgram<C, V, O, Input, Output>
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -487,8 +530,8 @@ impl<
     }
 }
 
-impl<V: Value, O, Input: Parameterized<CaptureReference<V::Type>>, Output: Parameterized<CaptureReference<V::Type>>>
-    Debug for ClosedProgram<V, O, Input, Output>
+impl<C: Value, V: CaptureConstant<Type = C::Type>, O, Input: Parameterized<V>, Output: Parameterized<V>> Debug
+    for ClosedProgram<C, V, O, Input, Output>
 {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
