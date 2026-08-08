@@ -1039,7 +1039,7 @@ macro_rules! define_elementwise_capability {
 /// ```rust,ignore
 /// impl_differentiable_operation! {
 ///     BroadcastOperation,
-///     jvp<C> where C: Context<Type = ArrayType, Value: BroadcastTo> {
+///     jvp<C> where C: Context<Type = ArrayType, Value: Broadcast> {
 ///         |operation, _context, _driver, inputs| {
 ///             broadcast_jvp(operation, inputs)
 ///         }

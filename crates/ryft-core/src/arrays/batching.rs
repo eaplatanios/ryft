@@ -31,7 +31,7 @@ use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext, V
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::{
-    BroadcastOperation, BroadcastTo, ConstantOperation, DimensionRequirementOperation, DimensionSizeOperation,
+    Broadcast, BroadcastOperation, ConstantOperation, DimensionRequirementOperation, DimensionSizeOperation,
     DynamicBroadcastOperation, ElementwiseOperation, Transpose, TransposeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
@@ -155,7 +155,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
     where
-        V: BroadcastTo,
+        V: Broadcast,
     {
         if !self.batch_axis().is_replicated() {
             return Err(BatchingError::MisalignedBatchAxes {
@@ -186,7 +186,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
             .map(|dimension| if dimension < position { dimension } else { dimension + 1 })
             .collect::<Vec<_>>();
 
-        let broadcasted = self.value().clone().broadcast_to(batched_type.clone(), output_axes.as_slice())?;
+        let broadcasted = self.value().clone().broadcast(batched_type.clone(), output_axes.as_slice())?;
         ArrayBatch::new(batched_type, broadcasted, axis)
     }
 
@@ -241,7 +241,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
     where
-        V: BroadcastTo + Transpose,
+        V: Broadcast + Transpose,
     {
         let axis = axis.into();
         if self.batch_axis().is_replicated() {
@@ -272,7 +272,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
     where
-        V: BroadcastTo + Transpose,
+        V: Broadcast + Transpose,
     {
         // Signed declaration normalization is owned by the delegates: `move_axis` normalizes against the (unchanged)
         // packed rank and `broadcast` against the batched output rank gaining the batch dimension.
@@ -695,9 +695,7 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPoli
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: BroadcastTo + Transpose>> ArrayBatchingPolicy<C>
-    for StaticArrayBatchingPolicy
-{
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> ArrayBatchingPolicy<C> for StaticArrayBatchingPolicy {
     #[inline]
     fn axis_dimension(context: &BatchingContext<C, ArrayBatching<Self>>) -> Result<Dimension, BatchingError> {
         Ok(Dimension::Static(*context.axis_extent()))
@@ -721,7 +719,7 @@ impl<C: Context<Type = ArrayType, Value: BroadcastTo + Transpose>> ArrayBatching
         batch_axis: Axis,
         _dimension_sources: Vec<DimensionSource<C::Value>>,
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
-        let broadcasted = input.value().clone().broadcast_to(r#type.clone(), output_axes.as_slice())?;
+        let broadcasted = input.value().clone().broadcast(r#type.clone(), output_axes.as_slice())?;
         ArrayBatch::new(r#type, broadcasted, batch_axis)
     }
 }
@@ -810,7 +808,7 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: BroadcastTo + Transpose>> BatchingEntrypointPolicy<C> for ArrayBatching {
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchingEntrypointPolicy<C> for ArrayBatching {
     fn prepare_inputs(
         context: &C,
         inputs: Vec<C::Value>,
@@ -876,7 +874,7 @@ impl<C: Context<Type = ArrayType, Value: BroadcastTo + Transpose>> BatchingEntry
                     // A rank-preserving broadcast with identity output axes changes only the requested packed
                     // sharding placement. Rewrapping the result retains the original batch-axis declaration.
                     let output_axes = (0..batch.r#type().rank()).collect::<Vec<_>>();
-                    let value = batch.value().clone().broadcast_to(r#type.clone(), output_axes.as_slice())?;
+                    let value = batch.value().clone().broadcast(r#type.clone(), output_axes.as_slice())?;
                     ArrayBatch::new(r#type, value, batch.batch_axis())?
                 } else {
                     batch

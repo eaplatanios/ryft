@@ -27,7 +27,7 @@ use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::dimensions::dimension_requirement::DimensionRequirementOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, BroadcastTo, DynamicBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -846,7 +846,7 @@ fn reconcile_branch<C: Context>(
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ConditionOperation<C::Constant>
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: Concretizable<bool> + BroadcastTo + Transpose + Select,
+    <C as Domain>::Value: Concretizable<bool> + Broadcast + Transpose + Select,
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<BroadcastOperation>
@@ -964,7 +964,7 @@ pub(crate) fn batch_condition_with_interpreter<C, P: ArrayBatchingPolicy<C>, F>(
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
-    C::Value: BroadcastTo + Transpose + Select,
+    C::Value: Broadcast + Transpose + Select,
     C::Operation: From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
     F: FnMut(usize, Vec<ArrayBatch<C::Value>>) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>,
 {
@@ -1006,7 +1006,7 @@ where
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Value: ValueProjection<ArrayType, Projected: BroadcastTo + Select + Transpose + Value<Type = ArrayType>>
+    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Select + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,

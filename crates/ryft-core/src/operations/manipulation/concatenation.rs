@@ -23,7 +23,7 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::broadcasting::{BroadcastTo, DynamicBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -578,7 +578,7 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: BroadcastTo + Transpose>, P: ArrayBatchingPolicy<C>>
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, P: ArrayBatchingPolicy<C>>
     BatchableOperation<C, ArrayBatching<P>> for ConcatenateOperation<ArrayType>
 where
     ConcatenateOperation<ArrayType>: InterpretableOperation<C>,
@@ -620,7 +620,7 @@ where
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for ConcatenateOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: BroadcastTo + Transpose + Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<ConcatenateOperation<ArrayIrType>>
         + From<DynamicBroadcastOperation>
         + From<DimensionOperation<DimensionValue>>

@@ -1261,7 +1261,7 @@ mod tests {
     use ryft_core::operations::random::Random;
     use ryft_core::operations::sort::{ArgMax, TopK};
     use ryft_core::{
-        Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Atan2, BroadcastTo,
+        Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Atan2, Broadcast,
         CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos, DataType, Device, DeviceMesh,
         DifferentiableType, Dimension, Div, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
         DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, HessianDifferentiate, Iota,
@@ -3253,7 +3253,7 @@ mod tests {
             + DynamicSlice
             + DynamicUpdateSlice
             + Reshape
-            + BroadcastTo
+            + Broadcast
             + Random
             + CustomCall
             + OneLike
@@ -3300,13 +3300,13 @@ mod tests {
                 let positions_type = tokens.r#type().into_owned();
                 let positions = context.iota(&positions_type, 0)?;
                 let visible = positions
-                    .compare(&position.broadcast_to(positions_type, &[])?, ComparisonDirection::LessThanOrEqual)?;
+                    .compare(&position.broadcast(positions_type, &[])?, ComparisonDirection::LessThanOrEqual)?;
                 let masked = V::select(&visible, &scores, &context.fill(&scores_type, -1.0e30f32)?)?;
                 let stabilized =
-                    masked.sub(&masked.reduce(&[0], ReductionKind::Max).broadcast_to(scores_type.clone(), &[])?)?;
+                    masked.sub(&masked.reduce(&[0], ReductionKind::Max).broadcast(scores_type.clone(), &[])?)?;
                 let exponentials = stabilized.exp()?;
                 let weights =
-                    exponentials.div(&exponentials.reduce(&[0], ReductionKind::Sum).broadcast_to(scores_type, &[])?)?;
+                    exponentials.div(&exponentials.reduce(&[0], ReductionKind::Sum).broadcast(scores_type, &[])?)?;
                 weights.dot(&cache_values, &DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new()))
             }
             DecodeAttention::CustomCall => {

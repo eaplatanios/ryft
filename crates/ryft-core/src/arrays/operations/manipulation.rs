@@ -24,15 +24,15 @@ use crate::axes::Axis;
 use crate::contexts::EagerContext;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::{
-    Broadcast, BroadcastTo, Concatenate, ConcatenateOperation, ConvertElementType, DimensionSize,
+    Broadcast, Concatenate, ConcatenateOperation, ConvertElementType, DimensionSize, DynamicBroadcast,
     DynamicBroadcastOperation, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad,
     Permutation, Reshape, ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, Transpose,
     UpdateSlice, Zero,
 };
 use crate::programs::{ProgramError, TypeError, Typed, Value, ValueProjection};
 
-impl<A: Value<Type = ArrayType> + DimensionSize<usize> + BroadcastTo> Broadcast for ArrayIrValue<A> {
-    fn broadcast_with_output_sharding(
+impl<A: Value<Type = ArrayType> + DimensionSize<usize> + Broadcast> DynamicBroadcast for ArrayIrValue<A> {
+    fn dynamic_broadcast_with_output_sharding(
         &self,
         output_dimensions: &[Self],
         output_axes: &[usize],
@@ -48,7 +48,7 @@ impl<A: Value<Type = ArrayType> + DimensionSize<usize> + BroadcastTo> Broadcast 
         );
         let operation = DynamicBroadcastOperation::new(output_axes.to_vec()).with_output_sharding(output_sharding);
         let output_type = infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, &operation)?;
-        Ok(Self::Array(input.broadcast_to(output_type, output_axes)?))
+        Ok(Self::Array(input.broadcast(output_type, output_axes)?))
     }
 }
 
@@ -105,9 +105,9 @@ impl Reshape for Array {
     }
 }
 
-impl BroadcastTo for Array {
-    fn broadcast_to(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        let r#type = self.r#type().broadcast_to(output_type, output_axes)?;
+impl Broadcast for Array {
+    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let r#type = self.r#type().broadcast(output_type, output_axes)?;
         let Some(target_shape) = r#type.static_shape() else {
             return Err(
                 TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
@@ -683,10 +683,11 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::{
-        Broadcast, CONCATENATE_OPERATION_NAME, ConcatenateOperation, DimensionAddOperation, DimensionMulOperation,
-        DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation,
-        DynamicSliceOperation, DynamicUpdateSliceOperation, GatherDimensionNumbers, GatherOperation, PadOperation,
-        ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, SliceOperation, UpdateSliceOperation,
+        CONCATENATE_OPERATION_NAME, ConcatenateOperation, DimensionAddOperation, DimensionMulOperation,
+        DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshapeOperation,
+        DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherDimensionNumbers,
+        GatherOperation, PadOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, SliceOperation,
+        UpdateSliceOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
@@ -1887,14 +1888,14 @@ in (%4)
 
         let eager = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));
         assert_eq!(
-            eager.broadcast_leading_sizes(&[2]),
+            eager.dynamic_broadcast_leading_sizes(&[2]),
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0],))),
         );
 
         let context = TestContext::new();
         let value = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).into());
         let extent = context.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
-        assert_eq!(value.broadcast(&[extent], &[0]).unwrap().atom_id(), value.atom_id());
+        assert_eq!(value.dynamic_broadcast(&[extent], &[0]).unwrap().atom_id(), value.atom_id());
         assert!(context.builder().borrow().instructions().is_empty());
 
         // A shape-preserving axis permutation is still a real broadcast. Eager execution transposes the payload and
@@ -1903,12 +1904,12 @@ in (%4)
         let square = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]));
         let two = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         let expected = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 3.0, 2.0, 4.0]));
-        assert_eq!(square.broadcast(&[two.clone(), two.clone()], &[1, 0]), Ok(expected.clone()));
+        assert_eq!(square.dynamic_broadcast(&[two.clone(), two.clone()], &[1, 0]), Ok(expected.clone()));
 
         let context = TestContext::new();
         let value = context.input(square_type.into());
         let extent = context.constant(two);
-        let output = value.broadcast(&[extent.clone(), extent], &[1, 0]).unwrap();
+        let output = value.dynamic_broadcast(&[extent.clone(), extent], &[1, 0]).unwrap();
         {
             let builder = context.builder().borrow();
             let [instruction] = builder.instructions() else {
@@ -1936,7 +1937,7 @@ in (%4)
         let context = TestContext::new();
         let scalar = context.input(ArrayType::scalar(DataType::F64).into());
         let extent = context.input(extent_type.clone().into());
-        let output = scalar.broadcast_to(std::slice::from_ref(&extent)).unwrap();
+        let output = scalar.dynamic_broadcast_to(std::slice::from_ref(&extent)).unwrap();
         let program = context
             .builder()
             .borrow()
@@ -1976,7 +1977,7 @@ in (%4)
         let value = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
         let rows = context.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
         let columns = context.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
-        let output = value.broadcast_to(&[rows, columns]).unwrap();
+        let output = value.dynamic_broadcast_to(&[rows, columns]).unwrap();
         let program = context
             .builder()
             .borrow()
@@ -1998,7 +1999,7 @@ in (%4)
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]))
                 .into(),
         );
-        let output = value.broadcast_leading_sizes(&[2]).unwrap();
+        let output = value.dynamic_broadcast_leading_sizes(&[2]).unwrap();
         assert_eq!(
             output.r#type().as_ref(),
             &ArrayIrType::Array(ArrayType::new(
@@ -2372,7 +2373,7 @@ in (%4)
     fn test_array_broadcast() {
         let vector = Array::vector(vec![1.0, 2.0]);
         let output_type = array_type(DataType::F64, &[3, 2]);
-        let broadcast = BroadcastTo::broadcast_to(&vector, output_type.clone(), &[1]).unwrap();
+        let broadcast = Broadcast::broadcast(&vector, output_type.clone(), &[1]).unwrap();
         assert_eq!(broadcast.r#type().into_owned(), output_type);
         assert_eq!(broadcast.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
 
@@ -2382,7 +2383,7 @@ in (%4)
         let input = Array::from_elements(input_type, &[0x1122u16, 0x3344]).unwrap();
         let output_type =
             array_type(DataType::U16, &[2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![6, 2])));
-        let broadcast = input.broadcast_to(output_type.clone(), &[1]).unwrap();
+        let broadcast = input.broadcast(output_type.clone(), &[1]).unwrap();
         assert_eq!(broadcast.r#type().as_ref(), &output_type);
         assert_eq!(broadcast.elements::<u16>(), Ok(vec![0x1122, 0x3344, 0x1122, 0x3344]));
         assert_eq!(broadcast.storage_bytes(), [0x22, 0x11, 0x44, 0x33, 0, 0, 0x22, 0x11, 0x44, 0x33]);
@@ -2400,7 +2401,7 @@ in (%4)
         );
         for output_axes in [vec![0, 1], vec![1, 0]] {
             assert!(matches!(
-                dynamic.broadcast_to(dynamic_type.clone(), output_axes.as_slice()),
+                dynamic.broadcast(dynamic_type.clone(), output_axes.as_slice()),
                 Err(ProgramError::Type(TypeError::Invalid { message }))
                     if message == "cannot materialize a value of dynamically sized type f64[dynamic, dynamic]",
             ));

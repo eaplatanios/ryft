@@ -38,7 +38,7 @@ use crate::operations::control_flow::select::SelectOperation;
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::logical::and::AndOperation;
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, BroadcastTo, DynamicBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::DynamicUpdateSliceOperation;
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::math::add::AddOperation;
@@ -930,7 +930,7 @@ where
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for WhileOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: BroadcastTo + Transpose,
+    <C as Domain>::Value: Broadcast + Transpose,
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<BroadcastOperation>

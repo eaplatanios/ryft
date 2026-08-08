@@ -37,7 +37,7 @@ use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOpe
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::broadcasting::{BroadcastTo, DynamicBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::reshaping::{
     DynamicReshapeOperation, Reshape, ReshapeParameters, lift_output_sharding_for_leading_batch_axis,
@@ -1258,7 +1258,7 @@ pub(crate) trait CollectiveBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBa
 
 impl<C> CollectiveBatchingPolicy<C> for StaticArrayBatchingPolicy
 where
-    C: Context<Type = ArrayType, Value: BroadcastTo + Reshape + Transpose>,
+    C: Context<Type = ArrayType, Value: Broadcast + Reshape + Transpose>,
 {
     type ShapeExtent = usize;
 

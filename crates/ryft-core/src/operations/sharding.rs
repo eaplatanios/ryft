@@ -40,7 +40,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, BroadcastTo};
+use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
@@ -244,7 +244,7 @@ impl_differentiable_operation! {
                 MaybeZero::Value(cotangent) => {
                     let contribution = match input_cotangent_type.sharding() {
                         Some(input_cotangent_sharding) => cotangent.reshard(input_cotangent_sharding),
-                        None => cotangent.broadcast_to(
+                        None => cotangent.broadcast(
                             input_cotangent_type.clone(),
                             &(0..input_cotangent_type.shape().rank()).collect::<Vec<_>>(),
                         )?,

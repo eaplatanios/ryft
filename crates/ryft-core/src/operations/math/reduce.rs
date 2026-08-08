@@ -22,7 +22,7 @@ use crate::operations::constants::fill::Fill;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, BroadcastTo, DynamicBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
 use crate::operations::math::div::DivOperation;
 use crate::operations::math::mul::MulOperation;
@@ -467,7 +467,7 @@ where
         + From<DivOperation<ArrayType>>
         + From<MulOperation<ArrayType>>,
     C::Value: Reduce
-        + BroadcastTo
+        + Broadcast
         + Compare<C::Value>
         + Div<Output = C::Value>
         + ElementwiseDerivativeAlignment<ArrayType>
@@ -503,7 +503,7 @@ where
                 let primal = primal_input.reduce(self.axes(), kind);
                 let input_type = primal_input.r#type().into_owned();
                 let output_axes = output_to_input_axis_map(input_type.rank(), self.axes());
-                let broadcast_primal = primal.broadcast_to(input_type, output_axes.as_slice())?;
+                let broadcast_primal = primal.broadcast(input_type, output_axes.as_slice())?;
                 let mask = primal_input.compare(&broadcast_primal, ComparisonDirection::Equal)?;
                 let tangent = match inputs[0].tangent() {
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
@@ -809,7 +809,7 @@ where
                 ReductionKind::Sum | ReductionKind::Mean => {
                     let output_type = input_type.cotangent();
                     let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
-                    let broadcasted = cotangent.broadcast_to(output_type, output_axes.as_slice())?;
+                    let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
                     let cotangent_input = match self.kind {
                         ReductionKind::Sum => broadcasted,
                         ReductionKind::Mean => {
