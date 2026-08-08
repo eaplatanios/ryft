@@ -8667,6 +8667,54 @@ mod tests {
     }
 
     #[test]
+    fn test_plain_broadcast_with_dynamic_result_type_lowers_to_bounded_broadcast_in_dim() {
+        // Homogeneous broadcast admits a dynamic output extent that is identity-equal to the mapped input extent,
+        // which is exactly the payload that program batching stages for a dynamic per-item dimension. Lowering keeps
+        // that extent dynamic in the result tensor type and supplies no extent operand, so `stablehlo.broadcast_in_dim`
+        // verifies only when the dynamic axis carries an upper bound that lowers to a `#stablehlo.bounds` encoding.
+        let bounded = dynamic_dimension("n", Some(5));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![bounded.clone()]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), bounded]));
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<2x?xf32, #stablehlo.bounds<?, 4>> {
+                    %0 = stablehlo.broadcast_in_dim %arg0, dims = [1] : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<2x?xf32, #stablehlo.bounds<?, 4>>
+                    return %0 : tensor<2x?xf32, #stablehlo.bounds<?, 4>>
+                  }
+                }
+            "#},
+        );
+
+        // An unbounded dynamic result has no bounded form to lower into, so the module fails StableHLO verification
+        // rather than producing an unverified graph.
+        let unbounded = dynamic_dimension("n", None);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![unbounded.clone()]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), unbounded]));
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(to_mlir_module_for_plain_program(&program, "main"), Err(LoweringError::MlirVerificationFailure));
+    }
+
+    #[test]
     fn test_plain_reshape_dimensions_lower_transpose_before_reshape() {
         let input_type = test_matrix_type(2, 3);
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();

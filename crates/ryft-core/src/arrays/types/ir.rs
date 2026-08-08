@@ -302,6 +302,21 @@ mod tests {
     fn test_array_ir_type() {
         let declared_variable = DimensionVariable::new("declared", DimensionBounds::non_negative(Some(8)).unwrap());
         let actual_variable = DimensionVariable::new("actual", DimensionBounds::non_negative(Some(4)).unwrap());
+        let exact_variable = DimensionVariable::new("exact", DimensionBounds::new(4, Some(5)).unwrap());
+        let extent_types = [
+            ArrayIrType::Dimension(DimensionType::new(exact_variable)),
+            ArrayIrType::Dimension(DimensionType::new(declared_variable.clone())),
+        ];
+        assert_eq!(ArrayIrType::extents(std::iter::empty::<ArrayIrType>()), Ok(Vec::new()));
+        assert_eq!(
+            ArrayIrType::extents(&extent_types),
+            Ok(vec![Dimension::Static(4), Dimension::Dynamic(declared_variable.clone())]),
+        );
+        assert_eq!(
+            ArrayIrType::extents([ArrayIrType::Array(ArrayType::scalar(F32))]),
+            Err(TypeError::invalid("expected dimension type but got array type")),
+        );
+
         let declared = [
             ArrayIrType::Dimension(DimensionType::new(declared_variable.clone())),
             ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(declared_variable.clone())]))),

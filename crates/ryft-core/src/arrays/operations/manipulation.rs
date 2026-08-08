@@ -690,7 +690,7 @@ mod tests {
         ScatterOperation, ScatterReductionKind, SliceOperation, UpdateSliceOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
+    use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -813,6 +813,25 @@ mod tests {
             .unwrap();
         let jvp = program.jvp().unwrap();
         assert_eq!(jvp.input_types().len(), 2);
+
+        // The dual program derives the forward geometry once. The staged linear call receives the primal reshape's own
+        // dimension operands as its leading residuals instead of restaging extent arithmetic for the tangent, so no
+        // dimension acquires a second forward definition just because the program was differentiated. The additional
+        // geometry read is the transpose residual that the inverse reshape needs, not a duplicated derivation.
+        let staged = |name: &str| {
+            jvp.instructions()
+                .iter()
+                .filter(|instruction| instruction.operation().name() == name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(staged("dimension_mul").len(), 1);
+        assert_eq!(staged("dimension_size").len(), 2);
+        let (reshapes, linear_calls) = (staged("reshape"), staged("linear_call"));
+        let ([reshape], [linear_call]) = (reshapes.as_slice(), linear_calls.as_slice()) else {
+            panic!("expected one staged primal reshape and one staged linear call");
+        };
+        assert_eq!(linear_call.inputs()[..2], reshape.inputs()[1..]);
+
         for size in [0, 1, 3, 8] {
             let element_count = size * 4;
             let primal_values = (0..element_count).map(|value| value as f64).collect::<Vec<_>>();
@@ -1541,10 +1560,10 @@ in (%4)
     #[test]
     fn test_array_ir_gather_differentiation() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(6)).unwrap());
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3), Dimension::Static(1)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(input_type.into());
+        let input = builder.add_input(input_type.clone().into());
         let indices = builder.add_input(indices_type.clone().into());
         let operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1]);
         let output = builder
@@ -1563,7 +1582,21 @@ in (%4)
             .unwrap();
         let linearization = program.linearize().unwrap();
 
+        // A dynamically shaped operand reaches the mixed member rule, never the homogeneous array rule: the composite
+        // rule intercepts it and delegates only fully static operands downward. That routing is what keeps the
+        // homogeneous `gather` and `slice` transpose rules static-only, and it is observable in the residual
+        // signature, because retaining a runtime extent as a first-class dimension is something the homogeneous rule
+        // cannot express. The tangent boundary is therefore the operand tangent followed by the indices and that
+        // extent.
         assert_eq!(linearization.residual_count(), 2);
+        assert_eq!(
+            linearization.tangent().input_types(),
+            &[
+                input_type.tangent().into(),
+                indices_type.clone().into(),
+                ArrayIrType::Dimension(DimensionType::new(extent)),
+            ],
+        );
         assert!(linearization.tangent().to_string().contains("linear_call [residual_count=2]"));
         let indices = ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 1.0, 3.0]));
         let mut primal_outputs = linearization
@@ -2590,6 +2623,115 @@ in (%4)
                 ArrayIrValue::Array(Array::vector(vec![9.0_f64])),
             ]),
         );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_transpose_slices_a_dynamic_non_concatenated_extent() {
+        // Concatenation along a static axis of operands whose other axis is dynamic. Transposition slices the
+        // cotangent back into per-operand pieces, which needs the runtime extent of the non-concatenated axis. That
+        // extent is already live at the transpose boundary: concatenation preserves every non-concatenated axis, so
+        // the output cotangent repeats the operands' `columns` identity, and one `dimension_size` read of the
+        // cotangent recovers it. The composite rule therefore stages the slicing itself rather than delegating to the
+        // homogeneous array-only rule, whose static `slice` bounds cannot express a runtime extent, and no residual
+        // is retained.
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(9)).unwrap());
+        let left_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns.clone())]));
+        let right_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(columns)]));
+        let extent_value = DimensionValue::constant(3).unwrap();
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[left_type.clone().into(), right_type.clone().into(), extent_value.r#type().into_owned().into()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left = builder.add_input(left_type.into());
+        let right = builder.add_input(right_type.into());
+        let extent = builder.add_constant(ArrayIrValue::Dimension(extent_value));
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent]).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // Forward mode is unaffected: only the cotangent slicing needs the non-concatenated extent.
+        assert!(program.jvp().is_ok());
+
+        let pullback = program.transpose_with_respect_to(&[0, 1]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[3, columns] .
+                let %1:dimension<3> = const
+                    %2:dimension<0> = constant [value=0]
+                    %3:dimension<columns ∈ [1, 9)> = dimension_size [axis=1] %0
+                    %4:dimension<2> = constant [value=2]
+                    %5:f64[2, columns] = dynamic_shape_slice [strides=[1, 1]] %0 %2 %2 %4 %3
+                    %6:dimension<2> = constant [value=2]
+                    %7:dimension<1> = constant [value=1]
+                    %8:f64[1, columns] = dynamic_shape_slice [strides=[1, 1]] %0 %6 %2 %7 %3
+                in (%5, %8)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback.interpret(vec![ArrayIrValue::Array(Array::from_f64s(
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ))]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::from_f64s(
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+                    vec![1.0, 2.0, 3.0, 4.0],
+                )),
+                ArrayIrValue::Array(Array::from_f64s(
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
+                    vec![5.0, 6.0],
+                )),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_transpose_rejects_a_dynamic_concatenated_extent() {
+        // A dynamic extent on the *concatenated* axis is the one geometry this boundary does not already hold: the
+        // per-operand slice offsets are runtime sums that the output cotangent alone cannot recover. Direct
+        // transposition therefore rejects the case by name instead of guessing, and linearization is the supported
+        // route, because it retains those input extents as explicit residuals.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let total = DimensionVariable::new("total", DimensionBounds::new(2, Some(10)).unwrap());
+        let left_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows)]));
+        let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
+        let result_extent_type = DimensionType::new(total);
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[left_type.clone().into(), right_type.clone().into(), result_extent_type.clone().into()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left = builder.add_input(left_type.into());
+        let right = builder.add_input(right_type.into());
+        let extent = builder.add_input(result_extent_type.into());
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent]).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0, 1]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "direct transposition of a dynamic 'concatenate' requires linearization so its input \
+                               extents can be retained as residuals",
+        ));
+        assert!(program.linearize().unwrap().pullback().is_ok());
     }
 
     #[test]

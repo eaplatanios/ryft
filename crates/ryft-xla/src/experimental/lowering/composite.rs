@@ -985,7 +985,10 @@ where
         ArrayIrOperation::Condition(_)
         | ArrayIrOperation::While(_)
         | ArrayIrOperation::Scan(_)
-        | ArrayIrOperation::LinearCall(_) => Err(LoweringError::UnsupportedOp {
+        | ArrayIrOperation::CustomJvp(_)
+        | ArrayIrOperation::CustomVjp(_)
+        | ArrayIrOperation::LinearCall(_)
+        | ArrayIrOperation::Rematerialize(_) => Err(LoweringError::UnsupportedOp {
             op: format!(
                 "core composite higher-order operation `{}` must be promoted to the XLA operation family before \
                      lowering",

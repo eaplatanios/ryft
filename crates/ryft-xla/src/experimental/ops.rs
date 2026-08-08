@@ -393,7 +393,10 @@ where
                         .with_captures(captures),
                 )
             }
+            ArrayIrOperation::CustomJvp(operation) => Self::CustomJvp(operation),
+            ArrayIrOperation::CustomVjp(operation) => Self::CustomVjp(operation),
             ArrayIrOperation::LinearCall(operation) => Self::LinearCall(operation),
+            ArrayIrOperation::Rematerialize(operation) => Self::Rematerialize(operation),
         }
     }
 }
@@ -1121,12 +1124,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, CaptureReference, ConditionOperation,
-        DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
-        DimensionType, DimensionValue, DimensionVariable, DynamicBroadcastOperation, Effects, EmptyRegionDriver,
-        LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation, PartialValue, Placeholder,
-        ProgramBuilder, RegionDriver, RegionInterface, RegionRef, ScanOperation, Shape, Sharding, ShardingDimension,
-        StagingContext, TracingContext, TranspositionDriver, TypeError, Typed, ValueProjection, WhileOperation,
-        ZeroOperation,
+        CustomJvpOperation, CustomVjpOperation, DataType, DifferentiableType, DifferentiationError, Dimension,
+        DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
+        DynamicBroadcastOperation, Effects, EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
+        MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder, RegionDriver, RegionInterface, RegionRef,
+        RematerializeOperation, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, TracingContext,
+        TranspositionDriver, TypeError, Typed, ValueProjection, WhileOperation, ZeroOperation,
     };
 
     use super::{
@@ -1264,6 +1267,33 @@ mod tests {
                     && operation.length() == &Dimension::Static(5)
                     && operation.reverse()
         ));
+    }
+
+    #[test]
+    fn test_core_custom_derivative_and_rematerialization_promotions_preserve_metadata() {
+        // These three payloads are promoted by move rather than reconstructed, so their complete stored surface must
+        // survive: the nondifferentiated operand split of all three, and additionally the rematerialization
+        // optimization-barrier hint. The promoted carrier must also keep contributing the payload's own operation
+        // name and region slots, because the attached regions are matched against those slots by name.
+        let custom_jvp = CustomJvpOperation::<ArrayIrType>::new().with_nondifferentiated_count(2);
+        let promoted: XlaOperation<XlaConstant> = ArrayIrOperation::<XlaArrayConstant>::CustomJvp(custom_jvp).into();
+        assert!(matches!(&promoted, XlaOperation::CustomJvp(operation) if operation == &custom_jvp));
+        assert_eq!(promoted.name(), custom_jvp.name());
+        assert_eq!(promoted.region_slots(), custom_jvp.region_slots());
+
+        let custom_vjp = CustomVjpOperation::<ArrayIrType>::new().with_nondifferentiated_count(3);
+        let promoted: XlaOperation<XlaConstant> = ArrayIrOperation::<XlaArrayConstant>::CustomVjp(custom_vjp).into();
+        assert!(matches!(&promoted, XlaOperation::CustomVjp(operation) if operation == &custom_vjp));
+        assert_eq!(promoted.name(), custom_vjp.name());
+        assert_eq!(promoted.region_slots(), custom_vjp.region_slots());
+
+        let rematerialize =
+            RematerializeOperation::<ArrayIrType>::new().with_nondifferentiated_count(1).with_prevent_cse(true);
+        let promoted: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::Rematerialize(rematerialize).into();
+        assert!(matches!(&promoted, XlaOperation::Rematerialize(operation) if operation == &rematerialize));
+        assert_eq!(promoted.name(), rematerialize.name());
+        assert_eq!(promoted.region_slots(), rematerialize.region_slots());
     }
 
     #[test]

@@ -4907,7 +4907,7 @@ mod tests {
         assert_eq!(body.output_count(), 1);
         assert_eq!(body.instruction_count(), 1);
         assert_eq!(body.constant_count(), 0);
-        assert_eq!(body.operation_counts(), &BTreeMap::from([("sin".to_string(), 1usize)]));
+        assert_eq!(body.operation_counts(), &BTreeMap::from([("sin", 1usize)]));
         assert_eq!(body.maximum_output_dependency_depth(), 1);
         assert_eq!(body.attached_regions(), &[]);
 
@@ -4915,7 +4915,7 @@ mod tests {
         assert_eq!(entry.input_count(), 1);
         assert_eq!(entry.output_count(), 1);
         assert_eq!(entry.instruction_count(), 1);
-        assert_eq!(entry.operation_counts(), &BTreeMap::from([("shard_map".to_string(), 1usize)]));
+        assert_eq!(entry.operation_counts(), &BTreeMap::from([("shard_map", 1usize)]));
         assert_eq!(entry.maximum_output_dependency_depth(), 1);
         assert_eq!(entry.attached_regions().len(), 1);
         let edge = &entry.attached_regions()[0];

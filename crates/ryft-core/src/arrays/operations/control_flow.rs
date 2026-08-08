@@ -431,6 +431,81 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_condition_tracing_rendering_and_eager_execution() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let operand = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let regions = vec![
+            builder.import_region(scale_branch(extent_type.clone(), 2.0).entry_region_ref()),
+            builder.import_region(scale_branch(extent_type.clone(), 3.0).entry_region_ref()),
+        ];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                regions,
+                vec![predicate, extent, operand],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder.build(outputs, vec![Placeholder; 3], vec![Placeholder; 2]).unwrap();
+
+        // A dimension carried through a condition is an ordinary structural value: it appears in both branch
+        // interfaces and in the composite output signature exactly like the array beside it.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:dimension<extent ∈ [1, 8)>, %2:f64[] .
+                let %3:dimension<extent ∈ [1, 8)>, %4:f64[] = condition %0 %1 %2 [
+                    true={
+                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[] .
+                        let %2:f64[] = const
+                            %3:f64[] = mul %1 %2
+                        in (%0, %3)
+                    },
+                    false={
+                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[] .
+                        let %2:f64[] = const
+                            %3:f64[] = mul %1 %2
+                        in (%0, %3)
+                    },
+                ]
+                in (%3, %4)"},
+        );
+
+        // Eager interpretation selects one branch per predicate value and forwards the same dimension either way.
+        let boolean = |value: f64| array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![value]));
+        assert_eq!(
+            program.interpret(vec![boolean(1.0), dimension(&extent_type, 4), array(Array::scalar(5.0))]),
+            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(10.0))]),
+        );
+        assert_eq!(
+            program.interpret(vec![boolean(0.0), dimension(&extent_type, 4), array(Array::scalar(5.0))]),
+            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(15.0))]),
+        );
+
+        // Relocating the composite program imports both branch regions unchanged, so it renders and executes exactly
+        // like its source.
+        let mut relocated_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let relocated_inputs = vec![
+            relocated_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))),
+            relocated_builder.add_input(ArrayIrType::Dimension(extent_type.clone())),
+            relocated_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64))),
+        ];
+        let relocated_outputs = relocated_builder.splice_program(&program, &relocated_inputs).unwrap();
+        let relocated = relocated_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(relocated_outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(relocated.to_string(), program.to_string());
+        assert_eq!(
+            relocated.interpret(vec![boolean(1.0), dimension(&extent_type, 4), array(Array::scalar(5.0))]),
+            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(10.0))]),
+        );
+    }
+
+    #[test]
     fn test_composite_condition_jvp_preserves_dimension_outputs_without_tangent_slots() {
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
