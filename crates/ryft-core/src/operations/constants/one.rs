@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
-use crate::arrays::{ArrayIrType, ArrayType};
-use crate::batching::{ArrayBatch, ArrayBatching, ArrayIrBatching, BatchAxis, BatchingContext, BatchingTracer};
+use crate::arrays::{ArrayBatch, ArrayBatching, ArrayIrBatching, ArrayIrType, ArrayType};
+use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -172,9 +172,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DataType, Dimension, DimensionBounds, DimensionType, Shape};
+    use crate::arrays::{ArrayBatch, DataType, Dimension, DimensionBounds, DimensionType, Shape};
     use crate::backends::Array;
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
+    use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::constants::constant::ConstantOperation;

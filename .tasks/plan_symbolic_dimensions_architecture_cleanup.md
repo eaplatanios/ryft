@@ -2435,7 +2435,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         `arrays` upstream of the operation/transform machinery. Re-export `Broadcastable` and `BroadcastingError`
         from `arrays`, remove the top-level module and its root re-export, and update every in-repo path directly
         without compatibility re-exports.
-  - [ ] Move the batching array specializations `batching::{array_ir, arrays}` to `arrays::batching` (revised
+  - [x] Move the batching array specializations `batching::{array_ir, arrays}` to `arrays::batching` (revised
         decision 2026-08-05; an earlier in-chat assessment kept them in `batching` on a layering argument that only
         held for the transitional state — the final hierarchy already makes `arrays` the array-domain home, moving
         `backends::arrays`, `ArrayTracingContext`, and the array differentiation glue into it, so the array batching
@@ -2447,7 +2447,15 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         `ArrayIrBatching`-family vocabulary), and every in-repo path updates directly without compatibility
         re-exports. The prior carrier refactor's gate already certifies the specializations hold no transform policy,
         so this move has no hard sequencing dependency and may execute independently of the larger
-        `backends::arrays` move.
+        `backends::arrays` move. *(Executed; then consolidated on 2026-08-07: the two moved files collapsed into the
+        single flat `arrays/batching.rs` — core-array content first, array-IR content second, one merged tests
+        module — matching the sibling flat transform-instantiation module `arrays::differentiation`, and the
+        universe-neutral remainder flattened from `batching/mod.rs` to the root `batching.rs` since it is now a
+        single file. A staleness audit found no dead code: all public items have live consumers,
+        `ThreadedExtentBatchedProgram` is `ArrayIrBatching`'s associated batched-program carrier, and
+        `DimensionSource` is part of the `ArrayBatchingPolicy::broadcast_input` contract. Known residual coupling:
+        the neutral `batching.rs` still names `ArrayType`/`DimensionType` in its error variants and
+        `ShardingDimension` in `BatchingContext`; generifying those is optional follow-up polish.)*
   - [ ] Gate: the top-level hierarchy has one obvious public path for reference arrays, dimensions, and array IR; no
         scalar backend or per-element `Scalar` payload remains; all reference-backend semantics, transformations,
         exact-literal tests, core/XLA execution suites, and allocation/performance thresholds pass.
@@ -5361,3 +5369,22 @@ crate passes all 20 operation tests, 17 parameter tests, and every compile-fail 
 compiles and links. A direct comparison of the former module with the moved file confirms that only the imports and
 canonical rustdoc paths changed. Residual searches find no retired `crate::broadcasting`, `ryft_core::broadcasting`,
 top-level module declaration, explicit root re-export, or old macro hygiene path.
+
+### Phase 9 hierarchy batching specializations (2026-08-07)
+
+Moved the `ArrayType` and `ArrayIrType` batching instantiations together from `batching::{arrays, array_ir}` to
+`arrays::batching`. The generic `batching` module now owns only universe-neutral transform contracts, contexts,
+drivers, carriers, and entry points; the array domain owns `ArrayBatch`, `ArrayBatching`, its static and dynamic
+policies, the mixed `ArrayIrBatching` representation, first-class-extent threading, and the replicated-dimension
+policy. `arrays` flat-re-exports the public specialization vocabulary, while mixed operation rules reach the few
+crate-private alignment and dimension helpers through the `arrays::batching` facade. The old modules and re-exports
+were deleted without compatibility paths, and macro-generated batching fixtures now use the public root facade for
+array-domain types while retaining generic batching paths for transform machinery.
+
+Verification passes both core and XLA all-target checks. The complete `ryft-core` suite passes 1,139 unit tests, five
+allocation tests, six region-prototype integration tests, and 53 runnable doctests with 16 intentional ignores.
+`ryft-macros-tests` passes all 20 operation tests, 17 parameter tests, and every compile-fail fixture, and the XLA
+unit-test target compiles and links. Nightly formatting of the touched core crate, diff hygiene, and targeted residual
+searches for all retired specialization paths pass. The larger reference-array backend move remains the next
+hierarchy unit because extracting its value before its operation implementations would require temporary field
+visibility or adapters.

@@ -1,14 +1,11 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape,
-    Sharding, ShardingDimension,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
+    DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::backends::arrays::BroadcastKernel;
-use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
-    BatchingContext, BatchingDriver, BatchingError,
-};
+use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,

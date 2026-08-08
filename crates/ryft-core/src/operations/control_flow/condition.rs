@@ -7,12 +7,14 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DimensionOperation, DimensionType, DimensionValue};
-use crate::batching::array_ir::require_equal_dimensions;
+use crate::arrays::batching::require_equal_dimensions;
+use crate::arrays::{
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayIrValue,
+    ArrayType, DimensionOperation, DimensionType, DimensionValue,
+};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
-    BatchedProgram, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
-    batch_projected_operation,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    ProgramBatchingOutputAxesPolicy, batch_projected_operation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -1341,11 +1343,11 @@ mod tests {
     use std::borrow::Cow;
 
     use crate::arrays::{
-        DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType,
-        Shape, Sharding, ShardingDimension,
+        ArrayBatch, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::backends::{Array, ArrayOperation};
-    use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer, batch};
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{

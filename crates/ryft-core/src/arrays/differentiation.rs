@@ -1,10 +1,11 @@
+use crate::arrays::batching::{ArrayBatching, ArrayBatchingPolicy, ArrayIrBatching};
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::operations::DimensionOperation;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable, Shape};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::Axis;
-use crate::batching::{ArrayBatching, ArrayBatchingPolicy, ArrayIrBatching, BatchingError};
+use crate::batching::BatchingError;
 use crate::contexts::Context;
 use crate::differentiation::LinearCallBatchingPolicy;
 use crate::operations::{

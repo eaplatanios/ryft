@@ -1,16 +1,14 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
-    ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionOperation, DimensionType,
-    DimensionValue, DimensionVariable, Shape, ShardingDimension,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType,
+    ArrayIrValue, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable,
+    Shape, ShardingDimension,
 };
 use crate::axes::Axis;
-use crate::batching::array_ir::align_array_batch;
-use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
-    BatchingContext, BatchingDriver, BatchingError,
-};
+use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};

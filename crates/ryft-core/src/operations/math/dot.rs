@@ -1,10 +1,12 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
-use crate::arrays::{ArrayType, DataType, Dimension, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension};
+use crate::arrays::{
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, MeshAxisType, Shape,
+    Sharding, ShardingDimension,
+};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
@@ -1851,11 +1853,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension,
+        ArrayBatch, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::backends::{Array, ArrayOperation};
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
+    use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{JacobianDifferentiate, jacobian_reverse};
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
@@ -3141,7 +3143,8 @@ mod tests {
     fn test_dot_batching_stages_the_lifted_output_sharding() {
         use std::rc::Rc;
 
-        use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
+        use crate::arrays::ArrayBatch;
+        use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
         use crate::parameters::Placeholder;
         use crate::tracing::TracingContext;
 
@@ -3187,8 +3190,9 @@ mod tests {
     fn test_dot_batching_preserves_materialized_batch_placement() {
         use std::rc::Rc;
 
+        use crate::arrays::ArrayBatch;
         use crate::backends::{Array, ArrayOperation};
-        use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
+        use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
         use crate::parameters::Placeholder;
         use crate::tracing::TracingContext;
 

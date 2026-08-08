@@ -638,11 +638,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
+        ArrayIrBatching, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
         ShardingDimension,
     };
     use crate::backends::{Array, ArrayOperation};
-    use crate::batching::{ArrayIrBatching, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy};
+    use crate::batching::{BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationError, TransposableOperation};
     use crate::interpretation::InterpretableOperation;

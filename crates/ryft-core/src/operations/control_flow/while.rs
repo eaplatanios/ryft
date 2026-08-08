@@ -12,12 +12,15 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrType, ArrayType, DataType, DimensionOperation, DimensionType, DimensionValue};
+use crate::arrays::batching::align_array_batch;
+use crate::arrays::{
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
+    DimensionOperation, DimensionType, DimensionValue,
+};
 use crate::axes::Axis;
-use crate::batching::array_ir::align_array_batch;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
-    BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingTracer, ProgramBatchingOutputAxesPolicy,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain};

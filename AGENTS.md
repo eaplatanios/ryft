@@ -153,6 +153,15 @@ update this file so that they do not need to remind you again in the future.
     `Complex as ComplexNumber` participate in the group). Keep imports that descend into nested module paths in
     separate `use` statements, and never merge imports across different `#[cfg]`, visibility, or other attribute
     boundaries.
+  - Apply the same shortest-path rule to imports from other workspace crates, including their crate roots: when the
+    foreign crate re-exports an item at its root (by name or by glob), import it directly from the root (e.g.,
+    `ryft_core::Typed`, `ryft_core::ArrayType`, `ryft_pjrt::Event`); otherwise import through the shortest module
+    facade that re-exports it. The prohibition on `crate::<Item>` root imports applies only inside the defining
+    crate itself, never to downstream consumers.
+  - When two facades expose an item at the same shortest length, import from the module that owns the item (e.g.,
+    `Tag` from `crate::operations`, not through another module's incidental re-export of it).
+  - Enum-variant imports such as `use crate::arrays::DataType::{F32, F64};` keep their own statement beside the
+    owning type's group, because merging them would require nested brace groups, which are never used.
   - Facade `pub use` statements refer to their own child modules by relative path (e.g., `pub use types::{...}`
     inside `arrays/mod.rs`), matching the existing facade files; the rules above govern item *imports*, not the
     re-export statements that define the facades.

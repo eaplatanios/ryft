@@ -288,6 +288,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, DimensionOperation};
@@ -300,7 +301,7 @@ mod tests {
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::arrays::types::memories::Memory;
     use crate::backends::{Array, ArrayOperation};
-    use crate::batching::{ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchingContext, BatchingTracer};
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::interpretation::InterpretableOperation;

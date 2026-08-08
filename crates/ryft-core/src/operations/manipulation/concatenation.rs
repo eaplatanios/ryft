@@ -2,15 +2,14 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
-    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape,
-    Sharding,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
+    DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
 };
 use crate::axes::Axis;
-use crate::batching::array_ir::align_array_batch;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
-    BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{

@@ -1,13 +1,13 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Memory,
-    MeshAxisType, Shape, Sharding, ShardingDimension,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
+    DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Memory, MeshAxisType, Shape, Sharding,
+    ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
-    BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -2490,11 +2490,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+        ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionValue,
+        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        StridedLayout,
     };
     use crate::backends::{Array, ArrayOperation};
-    use crate::batching::{ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchingContext, batch};
+    use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{LinearizationTracer, jacobian_forward, value_and_gradient};
     use crate::macros::{

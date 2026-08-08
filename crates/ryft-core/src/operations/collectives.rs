@@ -13,15 +13,15 @@
 use std::fmt::{Debug, Display};
 use std::ops::Mul as StdMul;
 
+use crate::arrays::batching::{DynamicArrayBatchingPolicy, broadcast_array};
 use crate::arrays::{
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable,
-    LinearResiduals, Shape, Sharding,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
+    Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LinearResiduals, Shape, Sharding,
+    StaticArrayBatchingPolicy,
 };
 use crate::axes::{AxisError, AxisIndexOperation, NamedAxes, NamedAxis};
-use crate::batching::array_ir::{DynamicArrayBatchingPolicy, broadcast_array};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
-    BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation, StaticArrayBatchingPolicy,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
@@ -3729,13 +3729,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrType, ArrayIrValue, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        ArrayBatch, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, Dimension,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Sharding,
     };
     use crate::backends::{Array, ArrayOperation};
     use crate::batching::{
-        ArrayBatch, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchAxisSpecification, BatchableOperation,
-        BatchingContext, BatchingError, BatchingTracer, batch,
+        BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, batch,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{transpose_mixed_operation, value_and_gradient};

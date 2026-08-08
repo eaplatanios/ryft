@@ -1,10 +1,10 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::arrays::ArrayType;
+use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchedProgram, BatchingContext,
-    BatchingDriver, BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
+    BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -955,12 +955,11 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DataType, Dimension, Shape, ShardingDimension};
+    use crate::arrays::{ArrayBatch, ArrayBatching, DataType, Dimension, Shape, ShardingDimension};
     use crate::axes::AxisIndexOperation;
     use crate::backends::{Array, ArrayOperation};
     use crate::batching::{
-        ArrayBatch, ArrayBatching, Batch, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy,
-        RecursiveBatchingDriver,
+        Batch, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver,
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{

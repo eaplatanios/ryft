@@ -10,10 +10,8 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
-use crate::arrays::{ArrayType, Memory};
-use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-};
+use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Memory};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -230,9 +228,9 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
-    use crate::arrays::{DataType, Dimension, Shape};
+    use crate::arrays::{ArrayBatch, DataType, Dimension, Shape};
     use crate::backends::{Array, ArrayOperation};
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, batch};
+    use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{jvp, value_and_gradient, vjp};
     use crate::operations::math::dot::{Dot, DotDimensionNumbers};

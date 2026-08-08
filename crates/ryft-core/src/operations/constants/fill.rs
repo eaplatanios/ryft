@@ -1,6 +1,6 @@
-use crate::arrays::{ArrayElement, ArrayType};
+use crate::arrays::{ArrayBatch, ArrayBatching, ArrayElement, ArrayType};
 use crate::backends::Array;
-use crate::batching::{ArrayBatch, ArrayBatching, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::operations::constants::constant::ConstantOperation;

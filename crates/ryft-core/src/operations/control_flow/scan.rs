@@ -8,14 +8,15 @@
 
 use std::fmt::{Debug, Display};
 
+use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
-    ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayIrValue,
+    ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape,
 };
 use crate::axes::Axis;
-use crate::batching::array_ir::align_array_batch;
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, BatchAxis, BatchableOperation,
-    BatchedProgram, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{

@@ -1,3 +1,4 @@
+use crate::arrays::batching::ReplicatedDimensionBatchingPolicy;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::operations::DimensionOperation;
@@ -6,9 +7,7 @@ use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::backends::Array;
-use crate::batching::{
-    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, ReplicatedDimensionBatchingPolicy,
-};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::operations::dimensions::checked_power;
 use crate::operations::{

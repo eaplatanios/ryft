@@ -1,5 +1,7 @@
-use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, Shape, Sharding, ShardingDimension};
-use crate::batching::{ArrayBatch, ArrayBatching, BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
+use crate::arrays::{
+    ArrayBatch, ArrayBatching, ArrayIrType, ArrayType, DataType, Dimension, Shape, Sharding, ShardingDimension,
+};
+use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::Context;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
@@ -649,11 +651,11 @@ mod tests {
 
     use crate::arrays::DataType::*;
     use crate::arrays::{
-        ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        Shape, Sharding, ShardingDimension, StridedLayout,
+        ArrayBatch, ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::backends::{Array, ArrayOperation};
-    use crate::batching::{ArrayBatch, BatchAxis};
+    use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
 
     use super::*;

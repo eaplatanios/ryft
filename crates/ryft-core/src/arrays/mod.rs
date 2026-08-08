@@ -1,4 +1,5 @@
 pub mod addressing;
+pub mod batching;
 pub mod broadcasting;
 pub mod differentiation;
 pub mod dimensions;
@@ -10,6 +11,10 @@ pub mod sharding;
 pub mod types;
 
 pub use addressing::{ArrayAddressing, ArrayIndexRange, ArrayIndexRanges, ArraySliceAxis};
+pub use batching::{
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, DimensionSource,
+    ReplicatedDimensionBatchingPolicy, StaticArrayBatchingPolicy,
+};
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use differentiation::{ExactShape, ExactShapeDimension, LinearResiduals};
 pub use dimensions::DimensionValue;

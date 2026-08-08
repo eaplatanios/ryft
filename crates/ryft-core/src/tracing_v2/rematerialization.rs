@@ -43,10 +43,10 @@ use std::marker::PhantomData;
 
 use thiserror::Error;
 
-use crate::arrays::{ArrayType, Memory};
+use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Memory};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchableOperation, BatchedProgram, BatchingContext,
-    BatchingDriver, BatchingError, BatchingPolicy, ProgramBatchingOutputAxesPolicy,
+    BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{

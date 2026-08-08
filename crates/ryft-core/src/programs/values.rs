@@ -3,8 +3,8 @@ use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
 
-use crate::arrays::ArrayType;
-use crate::batching::{ArrayBatch, BatchingPolicy, BatchingTracer};
+use crate::arrays::{ArrayBatch, ArrayType};
+use crate::batching::{BatchingPolicy, BatchingTracer};
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::DifferentiationTracer;

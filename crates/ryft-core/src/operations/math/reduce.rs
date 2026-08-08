@@ -2,12 +2,11 @@ use std::fmt::Display;
 use std::ops::{Div, Mul};
 
 use crate::arrays::{
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals,
-    Shape, Sharding, StaticShape,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation,
+    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, StaticShape,
 };
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{

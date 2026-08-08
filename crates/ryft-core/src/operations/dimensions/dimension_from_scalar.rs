@@ -7,10 +7,8 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{ArrayIrType, ArrayType, DimensionType, DimensionVariable};
-use crate::batching::{
-    ArrayIrBatch, ArrayIrBatching, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
-};
+use crate::arrays::{ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DimensionType, DimensionVariable};
+use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};

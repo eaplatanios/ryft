@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
-use crate::arrays::{ArrayType, DataType, Dimension, LogicalMesh, Sharding};
+use crate::arrays::{
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, Sharding,
+};
 use crate::batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver,
-    BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
