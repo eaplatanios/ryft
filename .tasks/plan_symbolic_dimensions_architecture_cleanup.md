@@ -1251,14 +1251,15 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
 - [x] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
       first-class result-dimension operands. After this point, a fresh output reference without an available operand or
       a definition-position occurrence is a closure error.
-- [ ] Phase 4–9 deletion gate: delete each frozen homogeneous reshape/broadcast implementation and transform rule as
-      its owning consumer migrates. Do not attempt the final zero-residual deletion before the composite public
-      capability and transform domains replace the current homogeneous `Reshape`/`Broadcast` implementations. The
-      2026-08-07 current-tree audit in the Phase 9 review below confirms production XLA already uses the composite
-      family, but the homogeneous `ArrayOperation` reference/transform universe still stores both legacy variants.
-      Complete the Phase 5/6 reference-consumer migration, remove that homogeneous variant storage and its projected
-      lowering arms, and then delete both payloads plus `ReshapeDimensionExpression` as one zero-residual gate before
-      Phase 10 measurements. Retain the narrowed array-only member family for ordinary primitive projection.
+- [x] Phase 4–9 deletion gate: delete each frozen homogeneous reshape/broadcast implementation and transform rule as
+      its owning consumer migrates. *(Closed by decision on 2026-08-07: the removability audit proved the mixed
+      operations' own transposition rules stage the homogeneous payloads through member-typed traces, that
+      expressiveness is incomparable rather than nested (layout retype and sharding strip exist only on the
+      homogeneous side), and that the remaining consumers are structurally operand-less — so the homogeneous
+      implementations are the permanent baseline, not deletion candidates. The transitional parts that WERE deletable
+      are gone: `ReshapeDimensionExpression`/`ReshapeTarget` deleted with ~780 lines, `LegacyAllGather` deleted, and
+      the `Legacy*` names retired via the executed rename program (`Dynamic*` mixed operations, plain-named
+      homogeneous operations, `Broadcast`/`DynamicBroadcast` capabilities).)*
 - [x] Complete and remove the remaining-operation inventory through P3i's explicit mixed migration or array-only
       classification proof: custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and the
       archived slice-scatter proposal.
@@ -1459,7 +1460,31 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       Retain the homogeneous reference backend and focused transform fixtures until their composite replacements land;
       they are comparison baselines, not unfinished production-XLA migration. *(Scope narrowed 2026-08-07 by the
       removability audit: the homogeneous surface is the permanent baseline vocabulary, so this item covers only the
-      per-consumer dynamic-shape checks — no blanket migration remains; see the Phase 9 exit criterion.)*
+      per-consumer dynamic-shape checks — no blanket migration remains; see the Phase 9 exit criterion. The
+      2026-08-07 consumer sweep then audited every production consumer and found the scope is structurally small for
+      two recorded reasons: (i) a production `Array` can never carry a dynamic `ArrayType` — every constructor
+      funnels through `ArrayAddressing::new`, which rejects dynamic shapes, and the only bypass is the
+      `#[cfg(test)]`-gated `with_unchecked_type` — so all ~45 reference kernels are static-by-construction; and
+      (ii) `ArrayType::identities()` emits only reference positions and region closure requires boundary
+      establishment, so homogeneous programs carry dynamic extents only at their input boundary (tier-2 by
+      structure). Fourteen consumer groups already reject dynamics with typed diagnostics; no consumer panics or
+      silently mis-executes. Closure requires exactly four small fixes: (1) add the missing dynamic-output guard to
+      `CustomCallOperation<ArrayType>::infer_output_types` mirroring `RngBitGeneratorOperation` plus a rejection
+      test; (2) add the untested `iota` case to the constructor rejection test and append the canonical-route hint
+      (mixed `Zero`/`DynamicOne`/`DynamicIota`, or rank-0 fill + `dynamic_broadcast`) to the four constructor
+      diagnostics; (3) document `Array`'s always-static invariant on the struct doc with its enforcement point;
+      (4) document `RegionRef::batched`'s contract (mapped axis always inserted static; per-item dynamic dimensions
+      pass through to `DimensionSource` resolution) plus one test batching a program with a dynamic per-item input
+      type. Deferred pending the concurrent zero/one hygiene agent's completion in the same files.)*
+- [ ] Homogeneous-baseline replay refinement (opened 2026-08-07 by the consumer sweep): `Program::interpret_in_context`
+      refines only the input/output boundary, not instruction operation payloads, so a homogeneous
+      `BroadcastOperation` with a dynamic stored `output_type` (admitted by broadcast inference for identity-equal
+      dynamic dimensions, and required by `StaticArrayBatchingPolicy::broadcast_input`) fails eager replay with an
+      inference-level message instead of using the boundary-refined extent. Decide between an exact replay-time
+      rejection naming the operation, the identity, and the refined extent, or accepting the limitation with a
+      documented diagnostic. Also add an XLA lowering test pinning `lower_broadcast_to_mlir` behavior for a dynamic
+      result type. Do NOT add a dynamic-routing `From<BroadcastOperation> for ArrayIrOperation`: the conversion site
+      has no context from which to synthesize extent operands, which would reintroduce ambient recovery.
 - [x] Replace production tests that rely on the complete homogeneous backend with canonical array-program tests;
       retain small local homogeneous enums only for focused generic tests.
 - [x] Migrate XLA operation conversion and compilation entry points to the sole stored array-program operation family.
@@ -1469,11 +1494,12 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       erase proven requirements, reject disproven requirements with exact diagnostics, and retain inconclusive ordered
       assertions.
 - [x] Verify conditional and loop-carried extents, gateway compaction, region forwarding, and alpha-equivalent imports.
-- [ ] Phase 8/9 owner: rename the narrowed primitive family only after the old full family is deleted and all residual
+- [x] Phase 8/9 owner: rename the narrowed primitive family only after the old full family is deleted and all residual
       references are classified. *(Superseded in direction on 2026-08-07: the removability audit concluded the
       homogeneous family is the permanent baseline, so the endgame is the rename program recorded in the Phase 9
       exit criterion — `Legacy*` names are retired by renaming the mixed operations to `Dynamic*` and giving the
-      static operations the freed plain names, not by deleting the family.)*
+      static operations the freed plain names, not by deleting the family. Executed the same day: the rename program
+      completed with zero rendering changes and all residual searches clean.)*
 - [x] Gate: targeted searches find no `with_dimensions`, `with_source_array`, `bind_replayed`, ambient replay
       environment, or full homogeneous implicit-shape graph.
 
@@ -1544,11 +1570,34 @@ rename only part of the problem while introducing another carrier.
       boundary helper. Keep this item open until the generic array-primitive dispatcher and all internal elementwise
       alignment stop using the localized static bridge.
 - [x] Remove repeated outer-enum matches that only project/lift batches.
-- [ ] Delete dimension/source-array reconstruction in dynamic slice, concatenate, reduce, collectives, RNG, and
-      constructors. P5c/P5d close control flow, RNG, constructors, and collectives. The remaining production reads
-      are the dynamic broadcast/alignment paths (`array_dimensions` and `DimensionSource::Value`), transform-boundary
-      normalization/extent inference, and pad-mask construction in `backends/array_programs/batching.rs`; these still
-      serve concatenate/reduce/slice-style projected rules and keep this checkbox open.
+- [x] Delete dimension/source-array reconstruction in dynamic slice, concatenate, reduce, collectives, RNG, and
+      constructors. *(Closed by the 2026-08-07 reconstruction-residue audit: all six named operations are verified
+      clean, and every remaining read is compliant under this plan's own definition — "every shape dependency in
+      rendered IR is an operand edge or an explicit `dimension_size` instruction". The audit fixed two stale
+      identifiers (the code lives in `crates/ryft-core/src/arrays/batching.rs`; the helper is the singular
+      `array_dimension` — the plural was deleted in the 2026-08-04 minimality pass) and classified the residue:
+      the five production `array_dimension` call sites (replicated-broadcast alignment, `DimensionSource::Value`
+      spending, mapped-extent inference, composite sharding normalization, and pad-mask construction) all bind real
+      `DimensionSizeOperation` graph edges and are PERMANENT BY DESIGN — batching-policy and projected-rule contracts
+      whose job is deriving per-item geometry from the carrier, with no operand they could structurally consume
+      instead. `batch_axis_sharding`/`normalized_batch_axis_type` were mis-scoped into this item entirely: they
+      reconstruct sharding placement, which has no value-level representation by design, never dimensions.
+      Sanctioned-reads ledger (drift gate — `array_dimension` shall have exactly these five production call sites):
+      `arrays/batching.rs` replicated `match_axis`, `broadcast_input` `DimensionSource::Value`, `prepare_inputs`
+      mapped-extent inference, `prepare_inputs` sharding normalization, and `manipulation/padding.rs` pad-mask
+      construction. Two follow-ups recorded below as separate items.)*
+- [ ] Constant-fold static axes in `DynamicArrayBatchingPolicy::match_axis` and the composite `prepare_inputs`
+      sharding normalization, matching the existing `DimensionSource::Static` arm and `collective_input_extents`:
+      today those two paths read every axis `0..rank` through `dimension_size`, allocating fresh exact-bounded
+      `size(axis=N)` identities for statically known axes — IR noise and identity churn, not a correctness bug
+      (recorded 2026-08-07; small, behaviorally inert, some golden-IR test churn).
+- [ ] Optional, risk-gated: replace the composite sharding-normalization broadcast in `prepare_inputs` with a
+      projected `ReshardOperation` bind, deleting the rank-many `array_dimension` sweep staged purely to relabel one
+      axis's placement and making the composite entrypoint symmetric with the homogeneous one. Gate: `Reshard` is a
+      tracked transition dualized under transposition while the current broadcast has a different transpose rule —
+      verify no AD/PE behavior change at the transform boundary first, and keep the broadcast if the adjoint differs.
+      Also resolve the unused `From<ReshardOperation>` bound in `operations/manipulation/broadcasting.rs` in the
+      same pass (recorded 2026-08-07).
 - [x] Verify nested `vmap`, mapped arrays with dynamic logical extents, replicated dimension residuals, control flow,
       and all mapped-authority rejection paths.
 - [x] P5d — immediately after P5c3: enforce one canonical batching algorithm per semantic contract. Member rules
@@ -2502,13 +2551,54 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       public value.)*
 - [x] Update every in-repo use site directly without compatibility re-exports.
 - [x] Update rustdoc, examples, error links, and behavioral JAX fixtures.
-- [ ] Close the foreign-call batching gap as an isolated transform/API review after the operation contracts settle.
-      Follow JAX's current direction rather than copying the deprecated `ffi_call(vmap_method = ...)` parameter:
-      prototype a general user-defined custom batching rule that can wrap foreign calls, and retain it only if one
-      implementation composes through homogeneous and mixed programs, nested batching, JIT, AD, partial evaluation,
-      ordered effects, and first-class dynamic output extents. Add small convenience rules only where they reproduce
-      the useful `sequential`, `sequential_unrolled`, `expand_dims`, `broadcast_all`, and `legacy_vectorized`
-      behaviors without introducing a second batching path.
+- [x] Close the foreign-call batching gap as an isolated transform/API review after the operation contracts settle.
+      *(Review completed 2026-08-07; the general user-defined custom batching rule is REJECTED with a
+      representability proof: the custom-derivative precedent works because every rule-region interface
+      (`custom_jvp`, `custom_vjp`, `linear_call`) is a total function of the primal interface computable at trace
+      time, while a batching rule's interface is a function of the primal interface PLUS transform state (the batch
+      extent and the per-operand mapped/replicated pattern), neither of which exists when the operation is staged.
+      A rule region is representable in the mixed universe (symbolic extent) but unrepresentable in the homogeneous
+      universe whose extent is a static host `usize` — so "one implementation composes through homogeneous and mixed
+      programs" is unsatisfiable and the item's own retention criterion resolves to do-not-build. The two escape
+      hatches are rejected: a closure-in-payload breaks faithful rendering and the graph-as-complete-source
+      invariant; a homogeneous payload carrying a mixed rule region breaks the one-contract-per-instantiation rule.
+      Revisit only if the homogeneous universe ever gains a first-class extent. AD stance mirrors JAX's documented
+      guidance: `custom_vjp` on the OUTSIDE of a custom-batched call; the wrapper itself rejects differentiation.
+      Two premise corrections recorded: JAX 0.6.1's `vmap_method` is live and non-deprecated (only its implicit
+      `sequential` default is deprecated toward `NotImplementedError`), and JAX's own `sequential_vmap` is a canned
+      rule atop `custom_vmap`, not a separate mechanism. The actionable residue is the two items below.)*
+  - [ ] Foreign-call batching D0 — all-replicated pass-through and diagnostic audit: the current blanket
+        `BatchableOperation` rejection for `CustomCallOperation` errors even when every operand is replicated, a
+        JAX-parity defect (JAX only invokes a batching rule when an operand is mapped). The shortcut is sound for
+        custom call specifically because it is region-free by construction (a foreign kernel cannot observe the
+        transform's named axis) — cite the region-carrying counterexample fixture in
+        `plan_custom_derivative_batching_axis_parity.md` so the shortcut is never generalized. Also: name the mapped
+        operand index/axis and the remedies in the rejection message; fix the rustdoc that implies wrapping in
+        `custom_jvp`/`custom_vjp` provides a batching rule (it does not — both structurally batch their primal
+        region and hit the same rejection); remove the module-review TODOs.
+  - [ ] Foreign-call batching D1 — enumerated `CustomCallBatching` payload field (`Rejected` default \|
+        `Sequential { unroll: Option<usize> }` \| `BroadcastAll`), read inside the operation's own
+        `BatchableOperation` impls (no new policy trait, no second batching path): a policy-generic homogeneous rule
+        mirroring `RngBitGeneratorOperation`'s scan-based sequential shape (which also serves the composite
+        `Array(..)` path through projection at dynamic extents), and a mixed rule that validates trailing extent
+        operands replicated, delegates to the projected rule when extent-free, and threads extents as invariant scan
+        carries. `expand_dims` is REJECTED (contradicts input/output aliasing: a replicated operand gains a size-1
+        axis while its aliased output gains size b) and `legacy_vectorized` is REJECTED (an XLA-legacy mode JAX
+        already removed). Required test coverage includes alias-under-batching rejection, layout shifting on batched
+        types, side-effect count semantics (batched-once vs sequential-N — both conventions already exist in-repo:
+        `Print` vs `RngBitGenerator`), nested vmap, and one CPU execution fixture.
+  - Note (2026-08-07, corrected by the owner): `tracing_v2` is NOT being deleted — its functionality
+        (`custom_derivatives.rs`, `rematerialization.rs`, feature-gated benchmarking) stays, and the owner plans to
+        refactor the module later on their own schedule. This is deliberately NOT a Phase 9 exit-criterion item and
+        gates nothing; recorded only so the module's transitional name is not mistaken for unrecorded residue again.
+        Until that owner-driven refactor, `crate::tracing_v2::*` rustdoc links (e.g., in `custom_call.rs`) remain
+        valid and should not be "cleaned up".
+  - [ ] Five-minute audits flagged by the review (adjacent, possibly separate defects): (i) whether
+        `ArrayIrOperation::Array(ArrayOperation::CustomJvp(..))` — a region-carrying payload reached through a
+        variant documented region-free — can actually reach `batch_projected_operation`, which requires region-free
+        operations; (ii) whether `LinearCallOperation`'s all-replicated batching fast path is sound against the
+        all-replicated-shortcut-invalid fixture (likely yes because differentiation-generated linear regions cannot
+        contain named-axis collectives, but unverified).
 - [x] Run targeted searches for every old canonical path and classify all remaining matches.
 - [ ] Gate: core language semantics no longer appear to be backend implementation details.
 - [ ] Phase 9 exit criterion (added 2026-08-07, owner decision): Phase 9 concludes only after every unchecked residual

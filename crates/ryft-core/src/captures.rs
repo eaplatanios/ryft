@@ -823,6 +823,148 @@ mod tests {
     }
 
     #[test]
+    fn test_closed_program_immediate_constants_bypass_the_capture_table() {
+        /// Constant family that mixes capture references with immediate literals, mirroring how a backend extends
+        /// its constant universe with payloads that carry their own host-sized data.
+        #[derive(Clone, Debug, PartialEq)]
+        enum TestConstant {
+            /// Reference into the surrounding capture table.
+            Captured(CaptureReference<ArrayType>),
+
+            /// Immediate literal that carries its own data.
+            Immediate(Array),
+        }
+
+        impl Parameter for TestConstant {}
+
+        impl Display for TestConstant {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Self::Captured(value) => Display::fmt(value, formatter),
+                    Self::Immediate(value) => Display::fmt(value, formatter),
+                }
+            }
+        }
+
+        impl Typed for TestConstant {
+            type Type = ArrayType;
+
+            fn r#type(&self) -> Cow<'_, ArrayType> {
+                match self {
+                    Self::Captured(value) => value.r#type(),
+                    Self::Immediate(value) => value.r#type(),
+                }
+            }
+        }
+
+        impl Value for TestConstant {
+            type DispatchDomain = EagerContext<Self>;
+            type ExecutionDomain = EagerContext<Self>;
+
+            fn dispatch_domain(&self) -> EagerContext<Self> {
+                EagerContext::new()
+            }
+
+            fn execution_domain(&self) -> EagerContext<Self> {
+                EagerContext::new()
+            }
+
+            fn rename_type_identities(
+                &self,
+                renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+            ) -> Result<Self, TypeError> {
+                match self {
+                    Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
+                    Self::Immediate(value) => Ok(Self::Immediate(value.rename_type_identities(renaming)?)),
+                }
+            }
+        }
+
+        impl From<CaptureReference<ArrayType>> for TestConstant {
+            fn from(value: CaptureReference<ArrayType>) -> Self {
+                Self::Captured(value)
+            }
+        }
+
+        impl CaptureConstant for TestConstant {
+            fn capture_index(&self) -> Option<usize> {
+                match self {
+                    Self::Captured(value) => Some(value.index()),
+                    Self::Immediate(_) => None,
+                }
+            }
+
+            fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
+                match self {
+                    Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
+                    Self::Immediate(value) => Self::Immediate(value.clone()),
+                }
+            }
+        }
+
+        // The program computes `(input + capture#1) + immediate`, capture #0 is dead, and the immediate constant
+        // carries its own literal instead of naming a capture slot.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<TestConstant, ArrayOperation<Array>>::new();
+        let input = builder.add_input(scalar_type.clone());
+        let capture = builder.add_constant(TestConstant::Captured(CaptureReference::new(1, scalar_type.clone())));
+        let immediate = builder.add_constant(TestConstant::Immediate(Array::scalar(5.0)));
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, immediate]).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestConstant>, Vec<TestConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Construction validates only the capture-referencing constant, so an immediate never has to name a slot.
+        let closed = ClosedProgram::new(program, vec![Array::scalar(3.0), Array::scalar(7.0)]).unwrap();
+
+        // Dead-capture elimination renumbers the surviving reference and leaves the immediate untouched.
+        let closed = closed.without_unused_captures().unwrap();
+        assert_eq!(closed.captures(), &[Array::scalar(7.0)]);
+        let constants =
+            closed.program().atoms().iter().filter_map(|atom| atom.as_constant()).cloned().collect::<Vec<_>>();
+        assert_eq!(
+            constants,
+            vec![
+                TestConstant::Captured(CaptureReference::new(0, scalar_type)),
+                TestConstant::Immediate(Array::scalar(5.0)),
+            ],
+        );
+
+        // Lifting turns the capture reference into a leading argument while the immediate stays a constant atom, and
+        // so the lifted program takes `[capture, input]` and still folds its own literal in.
+        let lifted = closed.to_program_with_lifted_captures().unwrap();
+        assert_eq!(lifted.input_ids().len(), 2);
+        assert_eq!(
+            lifted.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %3:f64[] = add %1 %0
+                    %4:f64[] = add %3 %2
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        let output = lifted
+            .interpret_with::<Array, ProgramError, _, _>(
+                vec![Array::scalar(7.0), Array::scalar(2.0)],
+                |_, constant| match constant {
+                    TestConstant::Captured(_) => unreachable!("capture references are lifted into inputs"),
+                    TestConstant::Immediate(value) => Ok(value.clone()),
+                },
+                |instruction, inputs| {
+                    instruction.operation().interpret(
+                        &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                        &EmptyRegionDriver,
+                        inputs,
+                    )
+                },
+            )
+            .unwrap();
+        assert_eq!(output, vec![Array::scalar(14.0)]);
+    }
+
+    #[test]
     fn test_closed_program_to_program_with_lifted_captures_with_attached_regions() {
         // Lifting supports capture-free attached regions (imported verbatim ahead of the entry replay) and rejects
         // nested-region capture references until region boundaries can thread them.
