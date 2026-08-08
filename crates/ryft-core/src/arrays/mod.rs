@@ -1,5 +1,5 @@
 pub mod addressing;
-mod arrays;
+pub mod arrays;
 pub mod batching;
 pub mod broadcasting;
 pub mod differentiation;
@@ -18,6 +18,7 @@ pub use batching::{
     ReplicatedDimensionBatchingPolicy, StaticArrayBatchingPolicy,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
+pub use differentiation::materialize_array_tangent;
 pub use differentiation::{ExactShape, ExactShapeDimension, LinearResiduals};
 pub use dimensions::DimensionValue;
 pub use encoding::{

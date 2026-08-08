@@ -6,12 +6,14 @@ use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariab
 use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::Axis;
 use crate::batching::BatchingError;
-use crate::contexts::Context;
-use crate::differentiation::LinearCallBatchingPolicy;
+use crate::contexts::{Context, ProjectedContext};
+use crate::differentiation::{DifferentiationDual, DifferentiationError, LinearCallBatchingPolicy};
+use crate::macros::check_count;
 use crate::operations::{
-    ConstantOperation, DimensionSizeOperation, Permutation, Reduce, ReduceOperation, ReductionKind,
+    ConstantOperation, DimensionSizeOperation, Permutation, Reduce, ReduceOperation, ReductionKind, Zero,
+    ZeroLikeOperation, ZeroOperation,
 };
-use crate::programs::{OperationProjection, ProgramError, Typed, Value, ValueProjection};
+use crate::programs::{MaybeZero, OperationProjection, ProgramError, Type, Typed, Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Ordered residual list accumulated by an extent-sensitive linearization rule (e.g., for slice, reshape, pad, reduce
@@ -319,6 +321,53 @@ impl<
         })?;
         Ok(ValueProjection::from_projected(cotangent.reduce(&[axis], ReductionKind::Sum)))
     }
+}
+
+/// Materializes one array operand's forward-mode tangent as a concrete projected array value, using the operand's
+/// primal as the runtime-geometry exemplar whenever the tangent type cannot supply that geometry itself. A mixed array
+/// rule that has to hand a concrete tangent to a staged operation cannot always materialize a [`MaybeZero::Zero`] from
+/// its type: an identity-bearing [`ArrayType`] names its dynamic extents by [`DimensionVariable`] rather than pinning
+/// them, so the type-only nullary [`ZeroOperation`] is unconstructible. The primal is a live value of exactly the
+/// operand's shape, so [`ZeroLikeOperation`] over it produces the same zero with runtime geometry and no extra
+/// residual. Identity-free tangent types keep the canonical nullary zero, whose zero-producing marker keeps
+/// higher-order partial evaluation structural.
+///
+/// The exemplar is used only when the primal's type already equals the tangent type. Array families whose tangent
+/// representation widens the element type (e.g., `f8e8m0fnu`) keep the nullary path, which their identity-free types
+/// support; the widening exemplar path belongs to the generic projected-member dispatch rather than to an individual
+/// mixed rule.
+///
+/// # Parameters
+///
+///   - `context`: Projected array view of the active mixed [`Context`] in which the zero is staged.
+///   - `input`: Forward-mode dual whose tangent is materialized and whose primal is the geometry exemplar.
+pub fn materialize_array_tangent<
+    C: Context<
+            Type = ArrayIrType,
+            Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+            Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+            Operation: OperationProjection<
+                ArrayType,
+                Projected: From<ZeroOperation<ArrayType>> + From<ZeroLikeOperation<ArrayType>>,
+            >,
+        >,
+>(
+    context: &ProjectedContext<C, ArrayType>,
+    input: &DifferentiationDual<C::Value>,
+) -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, DifferentiationError> {
+    let tangent_type = match input.tangent() {
+        MaybeZero::Value(value) => {
+            return Ok(<C::Value as ValueProjection<ArrayType>>::into_projected(value.clone())?);
+        }
+        MaybeZero::Zero(r#type) => <&ArrayType>::try_from(r#type)?.clone(),
+    };
+    let primal = <C::Value as ValueProjection<ArrayType>>::into_projected(input.primal().clone())?;
+    if tangent_type.identities().next().is_some() && primal.r#type().as_ref() == &tangent_type {
+        let mut zero = context.bind(ZeroLikeOperation::new(), Vec::new(), std::slice::from_ref(&primal))?;
+        check_count!("output", zero, 1, ProgramError);
+        return Ok(zero.remove(0));
+    }
+    Ok(context.zero(&tangent_type)?)
 }
 
 #[cfg(test)]
