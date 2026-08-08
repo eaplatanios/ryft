@@ -17,7 +17,7 @@ use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::broadcasting::BroadcastOperation;
+use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::conversion::ConvertElementType;
 use crate::operations::manipulation::slicing::Slice;
@@ -431,7 +431,7 @@ impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for 
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    C::Operation: From<BroadcastOperation>
+    C::Operation: From<DynamicBroadcastOperation>
         + From<DimensionOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<RngBitGeneratorOperation<ArrayIrType>>

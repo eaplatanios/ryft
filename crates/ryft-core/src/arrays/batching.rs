@@ -31,8 +31,8 @@ use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext, V
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::{
-    BroadcastOperation, ConstantOperation, DimensionRequirementOperation, DimensionSizeOperation, ElementwiseOperation,
-    LegacyBroadcast, LegacyBroadcastOperation, Transpose, TransposeOperation,
+    BroadcastOperation, BroadcastTo, ConstantOperation, DimensionRequirementOperation, DimensionSizeOperation,
+    DynamicBroadcastOperation, ElementwiseOperation, Transpose, TransposeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -155,7 +155,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
     where
-        V: LegacyBroadcast,
+        V: BroadcastTo,
     {
         if !self.batch_axis().is_replicated() {
             return Err(BatchingError::MisalignedBatchAxes {
@@ -186,7 +186,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
             .map(|dimension| if dimension < position { dimension } else { dimension + 1 })
             .collect::<Vec<_>>();
 
-        let broadcasted = self.value().clone().legacy_broadcast(batched_type.clone(), output_axes.as_slice())?;
+        let broadcasted = self.value().clone().broadcast_to(batched_type.clone(), output_axes.as_slice())?;
         ArrayBatch::new(batched_type, broadcasted, axis)
     }
 
@@ -241,7 +241,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
     where
-        V: LegacyBroadcast + Transpose,
+        V: BroadcastTo + Transpose,
     {
         let axis = axis.into();
         if self.batch_axis().is_replicated() {
@@ -272,7 +272,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
     where
-        V: LegacyBroadcast + Transpose,
+        V: BroadcastTo + Transpose,
     {
         // Signed declaration normalization is owned by the delegates: `move_axis` normalizes against the (unchanged)
         // packed rank and `broadcast` against the batched output rank gaining the batch dimension.
@@ -695,7 +695,7 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPoli
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> ArrayBatchingPolicy<C>
+impl<C: Context<Type = ArrayType, Value: BroadcastTo + Transpose>> ArrayBatchingPolicy<C>
     for StaticArrayBatchingPolicy
 {
     #[inline]
@@ -721,7 +721,7 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> ArrayBatc
         batch_axis: Axis,
         _dimension_sources: Vec<DimensionSource<C::Value>>,
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
-        let broadcasted = input.value().clone().legacy_broadcast(r#type.clone(), output_axes.as_slice())?;
+        let broadcasted = input.value().clone().broadcast_to(r#type.clone(), output_axes.as_slice())?;
         ArrayBatch::new(r#type, broadcasted, batch_axis)
     }
 }
@@ -810,7 +810,7 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchingEntrypointPolicy<C> for ArrayBatching {
+impl<C: Context<Type = ArrayType, Value: BroadcastTo + Transpose>> BatchingEntrypointPolicy<C> for ArrayBatching {
     fn prepare_inputs(
         context: &C,
         inputs: Vec<C::Value>,
@@ -876,7 +876,7 @@ impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Transpose>> BatchingE
                     // A rank-preserving broadcast with identity output axes changes only the requested packed
                     // sharding placement. Rewrapping the result retains the original batch-axis declaration.
                     let output_axes = (0..batch.r#type().rank()).collect::<Vec<_>>();
-                    let value = batch.value().clone().legacy_broadcast(r#type.clone(), output_axes.as_slice())?;
+                    let value = batch.value().clone().broadcast_to(r#type.clone(), output_axes.as_slice())?;
                     ArrayBatch::new(r#type, value, batch.batch_axis())?
                 } else {
                     batch
@@ -906,7 +906,7 @@ where
     C::Operation: BatchableOperation<C, ArrayBatching>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatching>
         + From<TransposeOperation>
-        + From<LegacyBroadcastOperation>,
+        + From<BroadcastOperation>,
 {
     #[inline]
     fn batch_region(
@@ -1120,7 +1120,7 @@ impl<
     O: Operation<Type = ArrayType>
         + BatchableOperation<TracingContext<V, O>, ArrayBatching>
         + From<TransposeOperation>
-        + From<LegacyBroadcastOperation>,
+        + From<BroadcastOperation>,
 > RegionRef<'_, V, O>
 {
     /// Structurally batches this borrowed homogeneous-array [`Region`](crate::Region) so that the resulting program
@@ -1298,7 +1298,7 @@ impl<
     O: Operation<Type = ArrayType>
         + BatchableOperation<TracingContext<V, O>, ArrayBatching>
         + From<TransposeOperation>
-        + From<LegacyBroadcastOperation>,
+        + From<BroadcastOperation>,
 > Program<V, O, Vec<V>, Vec<V>>
 {
     /// Structurally batches this homogeneous-array [`Program`] over the provided input axes. Refer to
@@ -1799,7 +1799,7 @@ where
     C: Context<Type = ArrayIrType, Operation: BatchableOperation<C, ArrayIrBatching>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatching>
-        + From<BroadcastOperation>
+        + From<DynamicBroadcastOperation>
         + From<DimensionOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
@@ -1871,9 +1871,9 @@ pub(crate) fn broadcast_array<C>(
     output_sharding: Option<Sharding>,
 ) -> Result<C::Value, BatchingError>
 where
-    C: Context<Type = ArrayIrType, Operation: From<BroadcastOperation>>,
+    C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
 {
-    let operation = BroadcastOperation::new(output_axes).with_output_sharding(output_sharding);
+    let operation = DynamicBroadcastOperation::new(output_axes).with_output_sharding(output_sharding);
     let mut inputs = Vec::with_capacity(output_dimensions.len() + 1);
     inputs.push(value);
     inputs.extend(output_dimensions);
@@ -1884,7 +1884,7 @@ impl<C> ArrayBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayBatc
 where
     C: Context<
             Type = ArrayIrType,
-            Operation: From<BroadcastOperation>
+            Operation: From<DynamicBroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>,
@@ -1988,7 +1988,7 @@ pub(crate) fn align_array_batch<C>(
 where
     C: Context<
             Type = ArrayIrType,
-            Operation: From<BroadcastOperation>
+            Operation: From<DynamicBroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>,
@@ -2026,7 +2026,7 @@ impl<C> BatchingEntrypointPolicy<C> for ArrayIrBatching
 where
     C: Context<
             Type = ArrayIrType,
-            Operation: From<BroadcastOperation>
+            Operation: From<DynamicBroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>
@@ -2138,7 +2138,7 @@ where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: BatchableOperation<C, ArrayIrBatching>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatching>
-        + From<BroadcastOperation>
+        + From<DynamicBroadcastOperation>
         + From<DimensionOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
@@ -2273,7 +2273,7 @@ where
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatching>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatching>
-        + From<BroadcastOperation>
+        + From<DynamicBroadcastOperation>
         + From<DimensionOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
@@ -2327,8 +2327,8 @@ mod tests {
     use crate::operations::{
         AddOperation, CollectiveKind, CollectiveOperation, CompareOperation, ComparisonDirection, ConcatenateOperation,
         ConditionOperation, DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
-        DimensionToScalar, DimensionToScalarOperation, IotaOperation, NegOperation, OneLike, OneOperation,
-        PadOperation, Reduce, ReductionKind, ReshapeOperation, ScanOperation, SelectOperation, WhileOperation,
+        DimensionToScalar, DimensionToScalarOperation, DynamicReshapeOperation, IotaOperation, NegOperation, OneLike,
+        OneOperation, PadOperation, Reduce, ReductionKind, ScanOperation, SelectOperation, WhileOperation,
         ZeroOperation,
     };
     use crate::parameters::Placeholder;
@@ -3695,7 +3695,7 @@ mod tests {
             BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(output_extent)),
         ];
         let [output] = context
-            .bind(ArrayIrOperation::<Array>::from(ReshapeOperation::new()), Vec::new(), &inputs)?
+            .bind(ArrayIrOperation::<Array>::from(DynamicReshapeOperation::new()), Vec::new(), &inputs)?
             .try_into()
             .unwrap();
         let output_id = output.into_batch().into_value().atom_id().unwrap();
@@ -5114,7 +5114,7 @@ mod tests {
             Err(BatchingError::from(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
         );
 
-        let reshape = ArrayIrOperation::<Array>::from(ReshapeOperation::new());
+        let reshape = ArrayIrOperation::<Array>::from(DynamicReshapeOperation::new());
         let reshape_input = ArrayIrBatch::new(
             ArrayIrValue::Array(Array::matrix(2, 6, (0..12).map(|value| value as f32).collect())),
             BatchAxis::new(0),
@@ -5168,7 +5168,7 @@ mod tests {
             }),
         );
 
-        let broadcast = ArrayIrOperation::<Array>::from(BroadcastOperation::new(vec![1]));
+        let broadcast = ArrayIrOperation::<Array>::from(DynamicBroadcastOperation::new(vec![1]));
         let broadcast_input =
             ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 1, vec![1.0_f32, 2.0])), BatchAxis::new(0)).unwrap();
         let broadcast_output = broadcast

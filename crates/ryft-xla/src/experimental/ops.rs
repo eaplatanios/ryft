@@ -21,11 +21,11 @@ use ryft_core::{
     CoordinateBasisOperation, CosOperation, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, Dimension, DimensionFromScalarOperation, DimensionOperation,
     DimensionRequirementOperation, DimensionSizeOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
-    DivOperation, DotOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    ErfOperation, ExpOperation, FloorOperation, GatherOperation, IotaOperation, LegacyBroadcastOperation,
-    LegacyReshapeOperation, LinearCallOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero,
-    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation,
-    PadOperation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, ErfOperation, ExpOperation, FloorOperation, GatherOperation,
+    IotaOperation, LinearCallOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation,
+    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation, PadOperation,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
     ProgramBuilder, ProgramError, ReduceOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
     ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
@@ -101,10 +101,10 @@ where
     DimensionToScalar(DimensionToScalarOperation),
 
     /// Reshapes an array using explicit dimension operands.
-    Reshape(ReshapeOperation),
+    Reshape(DynamicReshapeOperation),
 
     /// Broadcasts an array using explicit dimension operands.
-    Broadcast(BroadcastOperation),
+    Broadcast(DynamicBroadcastOperation),
 
     /// Concatenates arrays with an explicit result extent.
     Concatenate(ConcatenateOperation<ArrayIrType>),
@@ -330,8 +330,8 @@ impl_array_operation_conversion!(
     PpermuteOperation,
     AxisIndexOperation,
     TransposeOperation,
-    LegacyReshapeOperation,
-    LegacyBroadcastOperation,
+    ReshapeOperation,
+    BroadcastOperation,
     GatherOperation,
     ScatterOperation,
     SliceOperation,
@@ -949,12 +949,12 @@ mod tests {
     use std::rc::Rc;
 
     use ryft_core::{
-        AddOperation, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, BroadcastOperation, ConditionOperation,
-        DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
-        DimensionType, DimensionVariable, Effects, EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
-        MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder, RegionDriver, RegionInterface, RegionRef,
-        ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, TracingContext, TranspositionDriver, Typed,
-        WhileOperation, ZeroOperation,
+        AddOperation, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, ConditionOperation, DataType,
+        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
+        DimensionType, DimensionVariable, DynamicBroadcastOperation, Effects, EmptyRegionDriver, LogicalMesh,
+        MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder,
+        RegionDriver, RegionInterface, RegionRef, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext,
+        TracingContext, TranspositionDriver, Typed, WhileOperation, ZeroOperation,
     };
 
     use super::{
@@ -1144,7 +1144,7 @@ mod tests {
             let extent = builder.add_input(extent_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let output = builder
-                .add_instruction(BroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])
+                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(

@@ -56,8 +56,8 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::{
-    AddOperation, DotOperation, LegacyBroadcast, LegacyBroadcastOperation, TagOperation, TransferToMemoryOperation,
-    Transpose, TransposeOperation, Zero,
+    AddOperation, BroadcastOperation, BroadcastTo, DotOperation, TagOperation, TransferToMemoryOperation, Transpose,
+    TransposeOperation, Zero,
 };
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
@@ -356,11 +356,11 @@ crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: T
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for RematerializeOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: LegacyBroadcast + Transpose,
+    <C as Domain>::Value: BroadcastTo + Transpose,
     ArrayBatching<P>: LinearCallBatchingPolicy<C> + BatchingPolicy<C, Batch = ArrayBatch<C::Value>>,
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
-        + From<LegacyBroadcastOperation>
+        + From<BroadcastOperation>
         + From<RematerializeOperation<ArrayType>>,
 {
     #[inline]

@@ -3502,12 +3502,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        AddOperation, AndOperation, ArrayOperation, Atan2Operation, BroadcastOperation, CalleeRegionDriver,
-        CompareOperation, ComparisonDirection, ConditionOperation, ConstantOperation, Dimension, DimensionAddOperation,
+        AddOperation, AndOperation, ArrayOperation, Atan2Operation, CalleeRegionDriver, CompareOperation,
+        ComparisonDirection, ConditionOperation, ConstantOperation, Dimension, DimensionAddOperation,
         DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
         DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
-        DynamicShapeSliceOperation, Fill, MulOperation, NegOperation, OneOperation, PrintOperation, ReshapeOperation,
-        SelectOperation, Sharding, ShardingDimension, StaticShape, WhileOperation,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, MulOperation,
+        NegOperation, OneOperation, PrintOperation, SelectOperation, Sharding, ShardingDimension, StaticShape,
+        WhileOperation,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -4232,21 +4233,25 @@ mod tests {
 
         let reshape_inputs =
             [ArrayIrValue::Array(input), ArrayIrValue::Dimension(two.clone()), ArrayIrValue::Dimension(three.clone())];
-        let reshaped = domain.bind(ReshapeOperation::new(), Vec::new(), &reshape_inputs).unwrap().remove(0);
+        let reshaped = domain.bind(DynamicReshapeOperation::new(), Vec::new(), &reshape_inputs).unwrap().remove(0);
         assert_eq!(program_array(&reshaped).shape().as_slice(), &[2, 3]);
         assert_eq!(domain.cache_size(), 1);
 
         let four = DimensionValue::constant(4).unwrap();
         let broadcast_inputs =
             [reshaped, ArrayIrValue::Dimension(four), ArrayIrValue::Dimension(two), ArrayIrValue::Dimension(three)];
-        let broadcast =
-            domain.bind(BroadcastOperation::new(vec![1, 2]), Vec::new(), &broadcast_inputs).unwrap().remove(0);
+        let broadcast = domain
+            .bind(DynamicBroadcastOperation::new(vec![1, 2]), Vec::new(), &broadcast_inputs)
+            .unwrap()
+            .remove(0);
         assert_eq!(program_array(&broadcast).shape().as_slice(), &[4, 2, 3]);
         assert_eq!(read_f32s(&client, program_array(&broadcast)), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0].repeat(4));
         assert_eq!(domain.cache_size(), 2);
 
-        let repeated =
-            domain.bind(BroadcastOperation::new(vec![1, 2]), Vec::new(), &broadcast_inputs).unwrap().remove(0);
+        let repeated = domain
+            .bind(DynamicBroadcastOperation::new(vec![1, 2]), Vec::new(), &broadcast_inputs)
+            .unwrap()
+            .remove(0);
         assert_eq!(program_array(&repeated).shape().as_slice(), &[4, 2, 3]);
         assert_eq!(domain.cache_size(), 2);
     }
@@ -4281,10 +4286,10 @@ mod tests {
                 .add_instruction(XlaOperation::Dimension(DimensionOperation::Add(add)), Vec::new(), vec![size, one])
                 .unwrap()[0];
             let broadcast = builder
-                .add_instruction(BroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, output_extent])
+                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, output_extent])
                 .unwrap()[0];
             let reshaped = builder
-                .add_instruction(ReshapeOperation::new(), Vec::new(), vec![broadcast, output_extent])
+                .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![broadcast, output_extent])
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -5547,7 +5552,7 @@ mod tests {
                 scalar
             };
             let output = builder
-                .add_instruction(BroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])
+                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(

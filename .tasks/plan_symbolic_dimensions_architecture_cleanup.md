@@ -2531,16 +2531,21 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
           −549 lines in reshaping.rs and −229 in XLA lowering, four symbolic-only tests deleted, two rewritten;
           the `reshape_dimension_i32` bounds validator was found to also serve the mixed `dynamic_reshape` path
           and was retained; new suite baselines 1,139 core / 435 XLA).
-    - [ ] Rename `LegacyBroadcast` to `BroadcastTo` (the resolved-geometry contract the mixed broadcast delegates
+    - [x] Rename `LegacyBroadcast` to `BroadcastTo` (the resolved-geometry contract the mixed broadcast delegates
           to, mirroring the plain `Reshape` capability); drop its `#[doc(hidden)]` and document it as the
-          homogeneous-baseline layer.
-    - [ ] Rename the mixed `BroadcastOperation` to `DynamicBroadcastOperation` and the mixed `ReshapeOperation` to
+          homogeneous-baseline layer. *(Executed 2026-08-07 as phase C of the rename program: 156 sites across 27
+          files, `#[doc(hidden)]` removed, docs rewritten as the resolved-geometry contract.)*
+    - [x] Rename the mixed `BroadcastOperation` to `DynamicBroadcastOperation` and the mixed `ReshapeOperation` to
           `DynamicReshapeOperation`, matching the StableHLO `broadcast_in_dim`/`dynamic_broadcast_in_dim` and
           `reshape`/`dynamic_reshape` convention and Ryft's existing `DynamicShapeSlice`/`DynamicZero`/`DynamicOne`/
-          `DynamicIota` vocabulary. The `Broadcast` capability keeps its name as the user-facing verb.
-    - [ ] Rename `LegacyBroadcastOperation` to the freed `BroadcastOperation` name and `LegacyReshapeOperation` to
+          `DynamicIota` vocabulary. The `Broadcast` capability keeps its name as the user-facing verb. *(Executed
+          2026-08-07 as phase A of the rename program: 145 sites across 19 files; composite variant names
+          `Broadcast`/`Reshape` and both operation-name constants unchanged.)*
+    - [x] Rename `LegacyBroadcastOperation` to the freed `BroadcastOperation` name and `LegacyReshapeOperation` to
           `ReshapeOperation`; drop `#[doc(hidden)]` where present and document both as the homogeneous-baseline
-          operations (two-commit swap: mixed renames land first to free the plain names).
+          operations (two-commit swap: mixed renames land first to free the plain names). *(Executed 2026-08-07 as
+          phase B of the rename program: 139 sites across 20 files plus the inlined `HomogeneousBroadcastOperation`
+          test alias.)*
   - [ ] Manual-region first-class extents (closes the homogeneous body-replay half of the Phase 4 gate; evidence
         recorded 2026-08-07: `CaptureReference<T>` is index-plus-type only, so the shard-map body context's
         `Constant = CaptureReference<ArrayIrType>` cannot satisfy `From<DimensionValue>` and no extent operand can
@@ -5630,3 +5635,45 @@ Verification: workspace `cargo check --all-targets` is clean, `ryft-core --lib` 
 `test_plain_symbolic_reshape_rejects_derived_dynamic_bounds_without_result_operands`), the macro integration crate
 passes 20 + 17 tests, `cargo doc` adds no new warnings, and residual searches for the deleted identifiers find
 nothing under `crates/`.
+
+### Legacy broadcast/reshape rename program (2026-08-07)
+
+Executed the homogeneous/mixed naming endgame recorded under the Phase 9 exit criterion as three compile-green
+phases. These were Rust-identifier renames only: no operation-name string literal, `Display`/`render` output, staged
+program text, or error message changed anywhere.
+
+Phase A freed the plain names. The mixed `BroadcastOperation` (`Operation::Type = ArrayIrType`, payload `output_axes`
+plus `output_sharding`) became `DynamicBroadcastOperation` and the mixed `ReshapeOperation` (payload
+`dimensions: Option<Permutation>` plus `output_sharding`) became `DynamicReshapeOperation`: 145 sites across 19 files
+in `ryft-core` and `ryft-xla`. The composite `ArrayIrOperation::Broadcast`/`ArrayIrOperation::Reshape` variant names,
+the `Broadcast` capability trait, `infer_explicit_broadcast_output_type`, and both operation-name constants
+(`BROADCAST_OPERATION_NAME = "broadcast"`, `RESHAPE_OPERATION_NAME = "reshape"`, each still owned by its own module
+and still shared by both members of its family) were left untouched.
+
+Phase B gave the homogeneous operations the freed names. `LegacyBroadcastOperation` became `BroadcastOperation` (79
+sites) and `LegacyReshapeOperation` became `ReshapeOperation` (60 sites), 139 sites across 20 files, plus the
+now-unnecessary `HomogeneousBroadcastOperation` test alias in `broadcasting.rs`, which was inlined to a plain
+`use super::*`. `BroadcastOperation` lost its `#[doc(hidden)]` and both operations were re-documented as the
+member-family primitives of the homogeneous array language, whose complete output geometry is carried by `ArrayType`
+metadata and which `ProjectedContext` serves, cross-linking `DynamicBroadcastOperation`/`DynamicReshapeOperation` for
+first-class dynamic extents.
+
+Phase C renamed the capability. `LegacyBroadcast` became `BroadcastTo` and `legacy_broadcast` became `broadcast_to`:
+156 sites across 27 files, covering the `ArrayType` type rule, the eager `Array` kernel, and the staging blanket.
+The `#[doc(hidden)]` was removed and the trait is now documented as the resolved-geometry contract that both
+interpretation and the composite eager path delegate to once operand extents are concrete, mirroring the plain
+`Reshape` capability, while keeping the guidance that new composite-program construction uses `Broadcast`. The
+new `broadcast_to` name coexists with `Broadcast::broadcast_to` without ambiguity because the two traits are
+implemented over disjoint `Value::Type` families (`ArrayType` versus `ArrayIrType`).
+
+One incidental cleanup: the `FillContext` impl header in `operations/constants/fill.rs` was already over the
+120-column limit before this change and stayed over it after the (shorter) rename, so its inline bounds moved into a
+`where` clause.
+
+Verification: workspace `cargo check --all-targets` is clean with zero warnings after each phase; `ryft-core --lib`
+is 1,139 tests, `ryft-xla --lib` is 435 tests plus one ignored, the macro integration crate passes 20 + 17 tests, and
+`ryft-core --doc` passes 53 tests. `cargo doc -p ryft-core -p ryft-xla --no-deps` reports 92 warnings, all
+pre-existing and none in `broadcasting.rs` or `reshaping.rs`. A scan of every `indoc!` fixture body in `crates/`
+found zero occurrences of any renamed identifier, confirming that no rendered-IR fixture could have been rewritten.
+Targeted searches for `LegacyBroadcast`, `LegacyBroadcastOperation`, `LegacyReshapeOperation`, `legacy_broadcast`,
+and `HomogeneousBroadcastOperation` find nothing under `crates/`.

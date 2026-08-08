@@ -38,7 +38,7 @@ use crate::operations::control_flow::select::SelectOperation;
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::logical::and::AndOperation;
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, BroadcastTo, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::DynamicUpdateSliceOperation;
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::math::add::AddOperation;
@@ -930,10 +930,10 @@ where
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for WhileOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: LegacyBroadcast + Transpose,
+    <C as Domain>::Value: BroadcastTo + Transpose,
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
-        + From<LegacyBroadcastOperation>
+        + From<BroadcastOperation>
         + From<ReduceOperation>
         + From<SelectOperation<ArrayType>>
         + From<AndOperation<ArrayType>>
@@ -1094,7 +1094,7 @@ impl<C> BatchableOperation<C, ArrayIrBatching> for WhileOperation<ArrayIrType>
 where
     C: Context<
             Type = ArrayIrType,
-            Operation: From<BroadcastOperation>
+            Operation: From<DynamicBroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + From<WhileOperation<ArrayIrType>>
@@ -1414,7 +1414,7 @@ where
         + From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
         + From<AddOperation<ArrayType>>
-        + From<LegacyBroadcastOperation>
+        + From<BroadcastOperation>
         + From<DynamicUpdateSliceOperation>
         + From<SelectOperation<ArrayType>>
         + From<ReduceOperation>
@@ -1432,7 +1432,7 @@ where
 
     #[inline]
     fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
-        Self::from(LegacyBroadcastOperation::new(output_type, output_axes))
+        Self::from(BroadcastOperation::new(output_type, output_axes))
     }
 
     #[inline]
@@ -4282,7 +4282,7 @@ mod tests {
                     >,
                     ArrayBatching,
                 > + From<crate::operations::manipulation::TransposeOperation>
-                + From<crate::operations::manipulation::LegacyBroadcastOperation>,
+                + From<crate::operations::manipulation::BroadcastOperation>,
         {
             let context = x.dispatch_domain();
             let mapped = Batch::batch(

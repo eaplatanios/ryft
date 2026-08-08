@@ -508,7 +508,7 @@ mod tests {
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
-    use crate::operations::{BroadcastOperation, Fill, StopGradientOperation, ZeroOperation};
+    use crate::operations::{DynamicBroadcastOperation, Fill, StopGradientOperation, ZeroOperation};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{AtomId, EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, Typed};
@@ -1063,7 +1063,7 @@ mod tests {
             )
             .unwrap()[0];
         let output = builder
-            .add_instruction(BroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(

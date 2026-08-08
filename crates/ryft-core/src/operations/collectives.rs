@@ -37,10 +37,10 @@ use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOpe
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast};
+use crate::operations::manipulation::broadcasting::{BroadcastTo, DynamicBroadcastOperation};
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::reshaping::{
-    Reshape, ReshapeOperation, ReshapeParameters, lift_output_sharding_for_leading_batch_axis,
+    DynamicReshapeOperation, Reshape, ReshapeParameters, lift_output_sharding_for_leading_batch_axis,
 };
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, Slice, resized_output_sharding};
 use crate::operations::manipulation::transposition::Transpose;
@@ -1258,7 +1258,7 @@ pub(crate) trait CollectiveBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBa
 
 impl<C> CollectiveBatchingPolicy<C> for StaticArrayBatchingPolicy
 where
-    C: Context<Type = ArrayType, Value: LegacyBroadcast + Reshape + Transpose>,
+    C: Context<Type = ArrayType, Value: BroadcastTo + Reshape + Transpose>,
 {
     type ShapeExtent = usize;
 
@@ -1325,10 +1325,10 @@ impl<C> CollectiveBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArra
 where
     C: Context<
             Type = ArrayIrType,
-            Operation: From<BroadcastOperation>
+            Operation: From<DynamicBroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + From<ReshapeOperation>
+                           + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1423,7 +1423,7 @@ where
         output_extents: &[Self::ShapeExtent],
         output_sharding: Option<Sharding>,
     ) -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, BatchingError> {
-        let operation = ReshapeOperation::new().with_output_sharding(output_sharding);
+        let operation = DynamicReshapeOperation::new().with_output_sharding(output_sharding);
         let inputs = std::iter::once(<C::Value as ValueProjection<ArrayType>>::from_projected(value))
             .chain(output_extents.iter().cloned().map(<C::Value as ValueProjection<DimensionType>>::from_projected))
             .collect::<Vec<_>>();
@@ -2863,7 +2863,7 @@ where
         + From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>
         + From<LinearCallOperation<ArrayIrType>>
-        + From<ReshapeOperation>
+        + From<DynamicReshapeOperation>
         + OperationProjection<ArrayType>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
@@ -2969,7 +2969,7 @@ where
                     reshape_inputs.push(selected);
                     reshape_inputs.extend(input_dimensions);
                     transpose_context.bind(
-                        ReshapeOperation::new().with_output_sharding(transpose_target_type.sharding().cloned()),
+                        DynamicReshapeOperation::new().with_output_sharding(transpose_target_type.sharding().cloned()),
                         Vec::new(),
                         reshape_inputs.as_slice(),
                     )
@@ -2993,7 +2993,7 @@ where
         + From<DynamicShapeSliceOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + From<PSumScatterOperation>
-        + From<ReshapeOperation>
+        + From<DynamicReshapeOperation>
         + OperationProjection<ArrayType>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
@@ -3394,10 +3394,10 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<AllGatherOperation>
-                           + From<BroadcastOperation>
+                           + From<DynamicBroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + From<ReshapeOperation>
+                           + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -3471,10 +3471,10 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<PSumScatterOperation>
-                           + From<BroadcastOperation>
+                           + From<DynamicBroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + From<ReshapeOperation>
+                           + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -3547,10 +3547,10 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<AllToAllOperation>
-                           + From<BroadcastOperation>
+                           + From<DynamicBroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + From<ReshapeOperation>
+                           + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,

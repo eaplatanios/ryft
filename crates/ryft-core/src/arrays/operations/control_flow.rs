@@ -23,8 +23,8 @@ use crate::operations::control_flow::scan::{
     ScanInterpretation, read_scan_iteration, stacked_scan_type, write_scan_iteration,
 };
 use crate::operations::{
-    AddOperation, AndOperation, DimensionFromScalarOperation, DimensionToScalarOperation, DynamicUpdateSliceOperation,
-    LegacyBroadcastOperation, OneOperation, RUNTIME_DIMENSION_DATA_TYPE, ReduceOperation, ReductionKind, Reshape,
+    AddOperation, AndOperation, BroadcastOperation, DimensionFromScalarOperation, DimensionToScalarOperation,
+    DynamicUpdateSliceOperation, OneOperation, RUNTIME_DIMENSION_DATA_TYPE, ReduceOperation, ReductionKind, Reshape,
     Select, SelectOperation, Slice, TemporalResidualOperation, TemporalResidualType, UpdateSlice, WhilePredicate,
     WhileResidualStackOperation, WhileResidualStackType, Zero, ZeroOperation,
 };
@@ -103,7 +103,7 @@ where
 
     #[inline]
     fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
-        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::Broadcast(LegacyBroadcastOperation::new(
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::Broadcast(BroadcastOperation::new(
             output_type,
             output_axes,
         ))))
@@ -391,9 +391,9 @@ mod tests {
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::ForwardModeDifferentiate;
     use crate::operations::{
-        AddOperation, BroadcastOperation, CompareOperation, ComparisonDirection, ConditionOperation,
-        DimensionFromScalarOperation, MulOperation, ReduceOperation, ReductionKind, ReshapeOperation, ScanOperation,
-        Select, WhileOperation, ZeroOperation,
+        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
+        DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
+        ScanOperation, Select, WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
@@ -709,7 +709,7 @@ mod tests {
             .unwrap()[0];
         let repeated = body_builder
             .add_instruction(
-                TestOperation::from(BroadcastOperation::new(Vec::new())),
+                TestOperation::from(DynamicBroadcastOperation::new(Vec::new())),
                 Vec::new(),
                 vec![state, iteration],
             )
@@ -1009,7 +1009,7 @@ mod tests {
         let vector = body_builder.add_input(ArrayIrType::Array(vector_type.clone()));
         let counter = body_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
         let reshaped = body_builder
-            .add_instruction(TestOperation::from(ReshapeOperation::new()), Vec::new(), vec![vector, extent])
+            .add_instruction(TestOperation::from(DynamicReshapeOperation::new()), Vec::new(), vec![vector, extent])
             .unwrap()[0];
         let one = body_builder.add_constant(array(Array::scalar(1_i64)));
         let next_counter = body_builder
@@ -1101,7 +1101,7 @@ mod tests {
             .unwrap()[0];
         let repeated = body_builder
             .add_instruction(
-                TestOperation::from(BroadcastOperation::new(Vec::new())),
+                TestOperation::from(DynamicBroadcastOperation::new(Vec::new())),
                 Vec::new(),
                 vec![state, iteration],
             )

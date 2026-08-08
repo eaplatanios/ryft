@@ -27,7 +27,7 @@ use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_saturating_sub::DimensionSaturatingSubOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast};
+use crate::operations::manipulation::broadcasting::{BroadcastTo, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::reduce::{ReduceOperation, ReductionKind};
@@ -946,7 +946,7 @@ where
 impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for PadOperation<ArrayType>
 where
     C: Context<Type = ArrayType> + One<C::Value> + Zero<C::Value>,
-    C::Value: LegacyBroadcast + Pad + Select + Transpose,
+    C::Value: BroadcastTo + Pad + Select + Transpose,
     PadOperation<ArrayType>: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
@@ -996,7 +996,7 @@ where
             edge_padding_high.as_slice(),
             interior_padding.as_slice(),
         )?;
-        let broadcasted_padding = inputs[1].value().legacy_broadcast(padded.r#type().into_owned(), &[batch_axis])?;
+        let broadcasted_padding = inputs[1].value().broadcast_to(padded.r#type().into_owned(), &[batch_axis])?;
         let output = C::Value::select(&mask, &padded, &broadcasted_padding)?;
         let output_type = output.r#type().into_owned();
         Ok(vec![ArrayBatch::new(output_type, output, BatchAxis::from_position(batch_axis))?])
@@ -1010,8 +1010,8 @@ impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for 
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Transpose + Value<Type = ArrayType>>,
-    C::Operation: From<BroadcastOperation>
+    C::Value: ValueProjection<ArrayType, Projected: BroadcastTo + Transpose + Value<Type = ArrayType>>,
+    C::Operation: From<DynamicBroadcastOperation>
         + From<DimensionOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<OneOperation<ArrayType>>
@@ -1153,7 +1153,7 @@ where
         ));
         broadcast_inputs.extend(lifted_output_extents);
         let mut broadcasted_padding = context.parent().bind(
-            BroadcastOperation::new(vec![batch_axis]),
+            DynamicBroadcastOperation::new(vec![batch_axis]),
             Vec::new(),
             broadcast_inputs.as_slice(),
         )?;

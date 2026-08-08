@@ -22,7 +22,7 @@ use crate::operations::constants::fill::Fill;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, BroadcastTo, DynamicBroadcastOperation};
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
 use crate::operations::math::div::DivOperation;
 use crate::operations::math::mul::MulOperation;
@@ -462,12 +462,12 @@ pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> (Vec<usize>, usize
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReduceOperation
 where
     C::Operation: From<ReduceOperation>
-        + From<LegacyBroadcastOperation>
+        + From<BroadcastOperation>
         + From<CompareOperation<ArrayType>>
         + From<DivOperation<ArrayType>>
         + From<MulOperation<ArrayType>>,
     C::Value: Reduce
-        + LegacyBroadcast
+        + BroadcastTo
         + Compare<C::Value>
         + Div<Output = C::Value>
         + ElementwiseDerivativeAlignment<ArrayType>
@@ -503,7 +503,7 @@ where
                 let primal = primal_input.reduce(self.axes(), kind);
                 let input_type = primal_input.r#type().into_owned();
                 let output_axes = output_to_input_axis_map(input_type.rank(), self.axes());
-                let broadcast_primal = primal.legacy_broadcast(input_type, output_axes.as_slice())?;
+                let broadcast_primal = primal.broadcast_to(input_type, output_axes.as_slice())?;
                 let mask = primal_input.compare(&broadcast_primal, ComparisonDirection::Equal)?;
                 let tangent = match inputs[0].tangent() {
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
@@ -536,7 +536,7 @@ where
     C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: From<BroadcastOperation>
+    C::Operation: From<DynamicBroadcastOperation>
         + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>
         + From<LinearCallOperation<ArrayIrType>>
@@ -582,7 +582,7 @@ where
                         broadcast_inputs.extend(input_extents.iter().cloned());
                         let broadcast_primal = context
                             .bind(
-                                BroadcastOperation::new(output_axes.clone()),
+                                DynamicBroadcastOperation::new(output_axes.clone()),
                                 Vec::new(),
                                 broadcast_inputs.as_slice(),
                             )?
@@ -619,7 +619,7 @@ where
                         tie_broadcast_inputs.extend(input_extents);
                         let broadcast_tie_count = context
                             .bind(
-                                BroadcastOperation::new(output_axes.clone()),
+                                DynamicBroadcastOperation::new(output_axes.clone()),
                                 Vec::new(),
                                 tie_broadcast_inputs.as_slice(),
                             )?
@@ -667,7 +667,7 @@ where
                                 broadcast_inputs.extend(input_extents);
                                 let broadcasted = transpose_context
                                     .bind(
-                                        BroadcastOperation::new(transpose_output_axes.clone())
+                                        DynamicBroadcastOperation::new(transpose_output_axes.clone())
                                             .with_output_sharding(transpose_target_type.sharding().cloned()),
                                         Vec::new(),
                                         broadcast_inputs.as_slice(),
@@ -712,7 +712,7 @@ where
                                 broadcast_inputs.extend(input_extents.iter().cloned());
                                 let broadcasted = transpose_context
                                     .bind(
-                                        BroadcastOperation::new(transpose_output_axes.clone())
+                                        DynamicBroadcastOperation::new(transpose_output_axes.clone())
                                             .with_output_sharding(transpose_operand_type.sharding().cloned()),
                                         Vec::new(),
                                         broadcast_inputs.as_slice(),
@@ -788,7 +788,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperation
 where
     O: Operation<Type = ArrayType>
-        + From<LegacyBroadcastOperation>
+        + From<BroadcastOperation>
         + From<ConstantOperation<crate::arrays::Array>>
         + From<MulOperation<ArrayType>>,
 {
@@ -809,7 +809,7 @@ where
                 ReductionKind::Sum | ReductionKind::Mean => {
                     let output_type = input_type.cotangent();
                     let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
-                    let broadcasted = cotangent.legacy_broadcast(output_type, output_axes.as_slice())?;
+                    let broadcasted = cotangent.broadcast_to(output_type, output_axes.as_slice())?;
                     let cotangent_input = match self.kind {
                         ReductionKind::Sum => broadcasted,
                         ReductionKind::Mean => {

@@ -1,9 +1,9 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Add, AndOperation, ArrayIrType, ArrayOperation, Concretizable, Context, DataType, DimensionFromScalar,
+    Add, AndOperation, ArrayIrType, ArrayOperation, BroadcastTo, Concretizable, Context, DataType, DimensionFromScalar,
     DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType, DimensionValue,
-    DimensionVariable, Div, ElementType, LegacyBroadcast, Mul, Neg, NotOperation, Operation, OrOperation, ProgramError,
-    Select, Sub, Typed, Value, WhilePredicate, XorOperation,
+    DimensionVariable, Div, ElementType, Mul, Neg, NotOperation, Operation, OrOperation, ProgramError, Select, Sub,
+    Typed, Value, WhilePredicate, XorOperation,
 };
 
 use crate::experimental::ops::XlaArrayConstant;
@@ -193,7 +193,7 @@ impl WhilePredicate for Array<'_> {
         } else {
             let output_type = on_true.r#type().with_element_type(DataType::Boolean);
             let output_axes = (0..self.r#type().rank()).collect::<Vec<_>>();
-            self.legacy_broadcast(output_type, output_axes.as_slice())?
+            self.broadcast_to(output_type, output_axes.as_slice())?
         };
         Select::select(&condition, on_true, on_false)
     }
@@ -1697,7 +1697,7 @@ mod tests {
 
         // Broadcasting maps the input axis onto the trailing output axis.
         let broadcast_type = replicated_type(&mesh, DataType::F32, &[2, 6]);
-        let broadcast = concatenated.legacy_broadcast(broadcast_type, &[1]).unwrap();
+        let broadcast = concatenated.broadcast_to(broadcast_type, &[1]).unwrap();
         assert_eq!(broadcast.shape(), StaticShape::new(vec![2, 6]));
         assert_eq!(read_f32s(&broadcast), vec![1.0, 2.0, 3.0, 4.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 2.0, 3.0],);
 

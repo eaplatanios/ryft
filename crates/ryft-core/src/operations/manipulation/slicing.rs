@@ -21,7 +21,7 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::broadcasting::LegacyBroadcast;
+use crate::operations::manipulation::broadcasting::BroadcastTo;
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::transposition::Transpose;
@@ -1145,7 +1145,7 @@ where
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for UpdateSliceOperation
 where
-    C::Value: LegacyBroadcast + Transpose,
+    C::Value: BroadcastTo + Transpose,
     UpdateSliceOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
@@ -1520,7 +1520,7 @@ where
 impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for DynamicSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: ZeroLike + LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
+    C::Value: ZeroLike + BroadcastTo + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     DynamicSliceOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
@@ -1990,7 +1990,7 @@ where
 impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for DynamicUpdateSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: ZeroLike + LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
+    C::Value: ZeroLike + BroadcastTo + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     DynamicUpdateSliceOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
@@ -2378,7 +2378,7 @@ fn stack_expansion_items<V, InterpretItemFn>(
     mut interpret_item: InterpretItemFn,
 ) -> Result<ArrayBatch<V>, BatchingError>
 where
-    V: Value<Type = ArrayType> + LegacyBroadcast + UpdateSlice + Reshape + Reshard,
+    V: Value<Type = ArrayType> + BroadcastTo + UpdateSlice + Reshape + Reshard,
     InterpretItemFn: FnMut(usize) -> Result<V, ProgramError>,
 {
     let mut accumulator: Option<V> = None;
@@ -2438,7 +2438,7 @@ pub(crate) fn batch_by_item_expansion<C, O, P: ArrayBatchingPolicy<C>>(
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
+    C::Value: BroadcastTo + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     O: Operation<Type = ArrayType> + InterpretableOperation<C>,
 {
     if inputs.is_empty() {

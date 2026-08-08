@@ -1038,8 +1038,8 @@ macro_rules! define_elementwise_capability {
 ///
 /// ```rust,ignore
 /// impl_differentiable_operation! {
-///     LegacyBroadcastOperation,
-///     jvp<C> where C: Context<Type = ArrayType, Value: LegacyBroadcast> {
+///     BroadcastOperation,
+///     jvp<C> where C: Context<Type = ArrayType, Value: BroadcastTo> {
 ///         |operation, _context, _driver, inputs| {
 ///             broadcast_jvp(operation, inputs)
 ///         }
@@ -1047,7 +1047,7 @@ macro_rules! define_elementwise_capability {
 ///     transpose<V, O>
 ///     where
 ///         V: Value<Type = ArrayType>,
-///         O: Operation<Type = ArrayType> + From<LegacyBroadcastOperation>,
+///         O: Operation<Type = ArrayType> + From<BroadcastOperation>,
 ///     {
 ///         |operation, context, driver, inputs, outputs| {
 ///             broadcast_transpose(operation, context, driver, inputs, outputs)
@@ -4451,9 +4451,9 @@ mod tests {
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, DivOperation, ElementwiseOperation,
-        ExpOperation, LegacyBroadcastOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation,
-        Sub, SubOperation, TransposeOperation, ZeroOperation,
+        Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, BroadcastOperation, DivOperation,
+        ElementwiseOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation, Sub,
+        SubOperation, TransposeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{
@@ -4660,8 +4660,8 @@ mod tests {
         }
     }
 
-    impl From<LegacyBroadcastOperation> for TestUnaryOperation<ArrayType> {
-        fn from(_operation: LegacyBroadcastOperation) -> Self {
+    impl From<BroadcastOperation> for TestUnaryOperation<ArrayType> {
+        fn from(_operation: BroadcastOperation) -> Self {
             Self::new()
         }
     }
@@ -4684,8 +4684,8 @@ mod tests {
         }
     }
 
-    impl From<LegacyBroadcastOperation> for TestBinaryOperation<ArrayType> {
-        fn from(_operation: LegacyBroadcastOperation) -> Self {
+    impl From<BroadcastOperation> for TestBinaryOperation<ArrayType> {
+        fn from(_operation: BroadcastOperation) -> Self {
             Self::new()
         }
     }

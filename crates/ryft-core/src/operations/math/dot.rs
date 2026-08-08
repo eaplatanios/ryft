@@ -16,9 +16,9 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::fill::Fill;
-use crate::operations::manipulation::broadcasting::{LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, BroadcastTo};
 use crate::operations::manipulation::conversion::{ConvertElementType, ConvertElementTypeOperation};
-use crate::operations::manipulation::reshaping::{LegacyReshapeOperation, Reshape};
+use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::abs::Abs;
 use crate::operations::math::clamp::Clamp;
@@ -638,7 +638,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast>, P: ArrayBatchingPolicy<C>>
+impl<C: Context<Type = ArrayType, Value: BroadcastTo>, P: ArrayBatchingPolicy<C>>
     BatchableOperation<C, ArrayBatching<P>> for DotOperation
 where
     DotOperation: InterpretableOperation<C>,
@@ -1257,11 +1257,11 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ScaledDotOperation
 where
     O: Operation<Type = ArrayType>
-        + From<LegacyBroadcastOperation>
+        + From<BroadcastOperation>
         + From<ConvertElementTypeOperation<ArrayType>>
         + From<DotOperation>
         + From<MulOperation<ArrayType>>
-        + From<LegacyReshapeOperation>,
+        + From<ReshapeOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1316,7 +1316,7 @@ where
                 let cotangent = match inputs.get(4) {
                     Some(_) => {
                         let cotangent_type = output_cotangent.r#type().into_owned();
-                        output_cotangent.mul(&known_value(4).legacy_broadcast(cotangent_type, &[])?)?
+                        output_cotangent.mul(&known_value(4).broadcast_to(cotangent_type, &[])?)?
                     }
                     None => output_cotangent.clone(),
                 };
@@ -1360,7 +1360,7 @@ where
 /// from the lifted operation and multiplied into the `[b, m, n]` result per batch item instead. The rank-3 form has
 /// no rank-4 analogue, so batching an already-batched `scaled_dot` reports an error directing users to batch an
 /// explicit dequantization composition instead.
-impl<C: Context<Type = ArrayType, Value: LegacyBroadcast + Mul + Transpose>, P: ArrayBatchingPolicy<C>>
+impl<C: Context<Type = ArrayType, Value: BroadcastTo + Mul + Transpose>, P: ArrayBatchingPolicy<C>>
     BatchableOperation<C, ArrayBatching<P>> for ScaledDotOperation
 where
     ScaledDotOperation: InterpretableOperation<C>,
@@ -1408,7 +1408,7 @@ where
         // axis and multiply it into the lifted output.
         let output = outputs.remove(0);
         let output_type = output.r#type().into_owned();
-        let broadcast_global_scale = global_scale.value().legacy_broadcast(output_type.clone(), &[0])?;
+        let broadcast_global_scale = global_scale.value().broadcast_to(output_type.clone(), &[0])?;
         let scaled_value = output.value().mul(&broadcast_global_scale)?;
         Ok(vec![ArrayBatch::new(output_type, scaled_value, BatchAxis::new(0))?])
     }
@@ -1506,7 +1506,7 @@ pub(crate) fn scaled_dot_composition<V>(
     accumulation_type: DataType,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + LegacyBroadcast + ConvertElementType + Dot + Mul + Reshape,
+    V: Value<Type = ArrayType> + BroadcastTo + ConvertElementType + Dot + Mul + Reshape,
 {
     let rank = lhs.r#type().rank();
     let lhs = dequantize_block_scaled(lhs, lhs_scales, block_size, accumulation_type)?;
@@ -1519,7 +1519,7 @@ where
     match global_scale {
         Some(global_scale) => {
             let product_type = product.r#type().into_owned();
-            product.mul(&global_scale.legacy_broadcast(product_type, &[])?)
+            product.mul(&global_scale.broadcast_to(product_type, &[])?)
         }
         None => Ok(product),
     }
@@ -1536,7 +1536,7 @@ fn dequantize_block_scaled<V>(
     accumulation_type: DataType,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + LegacyBroadcast + ConvertElementType + Mul + Reshape,
+    V: Value<Type = ArrayType> + BroadcastTo + ConvertElementType + Mul + Reshape,
 {
     let element_type = elements.r#type().into_owned();
     let Some(element_shape) = element_type.static_shape() else {
@@ -1579,7 +1579,7 @@ where
     let element_sizes = element_dimensions.iter().map(|&size| Dimension::Static(size)).collect::<Vec<_>>();
     let expanded_scales = scales
         .convert_element_type(accumulation_type)?
-        .legacy_broadcast(expanded_type, scale_axes.as_slice())?
+        .broadcast_to(expanded_type, scale_axes.as_slice())?
         .reshape(Shape::new(element_sizes))?;
     elements.convert_element_type(accumulation_type)?.mul(&expanded_scales)
 }
@@ -1645,7 +1645,7 @@ where
     V: Value<Type = ArrayType>
         + Abs
         + Clamp
-        + LegacyBroadcast
+        + BroadcastTo
         + ConvertElementType
         + Div
         + Exp
@@ -1748,7 +1748,7 @@ where
         let expanded_type = ArrayType::new(compute_type, block_shape);
         let scale_axes = (0..scale_dimensions.len()).collect::<Vec<_>>();
         let expanded_scales = stored_scales
-            .legacy_broadcast(expanded_type, scale_axes.as_slice())?
+            .broadcast_to(expanded_type, scale_axes.as_slice())?
             .reshape(input_type.shape().clone())?;
         let fill_scalar = |value: f64| domain.fill(&ArrayType::scalar(compute_type), value);
         let elements = self

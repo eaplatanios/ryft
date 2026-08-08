@@ -30,7 +30,7 @@ use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
 
-/// Canonical operation name for [`ReshapeOperation`].
+/// Canonical operation name for [`DynamicReshapeOperation`].
 pub const RESHAPE_OPERATION_NAME: &str = "reshape";
 
 /// Mixed [`Operation`] that reshapes one array using one explicit first-class dimension operand per output axis.
@@ -40,7 +40,7 @@ pub const RESHAPE_OPERATION_NAME: &str = "reshape";
 /// The operation therefore carries only reshape attributes; it does not duplicate its output shape or encode shape
 /// arithmetic in its payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ReshapeOperation {
+pub struct DynamicReshapeOperation {
     /// Optional permutation of the input dimensions applied before reshaping.
     dimensions: Option<Permutation>,
 
@@ -48,7 +48,7 @@ pub struct ReshapeOperation {
     output_sharding: Option<Sharding>,
 }
 
-impl ReshapeOperation {
+impl DynamicReshapeOperation {
     /// Creates a reshape with no input permutation or requested output sharding.
     #[inline]
     pub fn new() -> Self {
@@ -90,14 +90,14 @@ impl ReshapeOperation {
     }
 }
 
-impl Display for ReshapeOperation {
+impl Display for DynamicReshapeOperation {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl Operation for ReshapeOperation {
+impl Operation for DynamicReshapeOperation {
     type Type = ArrayIrType;
 
     #[inline]
@@ -141,7 +141,7 @@ impl Operation for ReshapeOperation {
     }
 }
 
-impl<C> InterpretableOperation<C> for ReshapeOperation
+impl<C> InterpretableOperation<C> for DynamicReshapeOperation
 where
     C: Domain<Type = ArrayIrType>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Reshape>
@@ -179,8 +179,8 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayIrType, Operation: From<ReshapeOperation>>> PartiallyEvaluatableOperation<C>
-    for ReshapeOperation
+impl<C: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>> PartiallyEvaluatableOperation<C>
+    for DynamicReshapeOperation
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -206,12 +206,12 @@ impl<C: Context<Type = ArrayIrType, Operation: From<ReshapeOperation>>> Partiall
     }
 }
 
-/// Batching rule for [`ReshapeOperation`]. Explicit output extents remain replicated shape values. A mapped input is
-/// canonicalized to a leading batch axis, and that axis is inserted into both the reshape geometry and output
-/// sharding before the mixed operation is replayed.
-impl<C> BatchableOperation<C, ArrayIrBatching> for ReshapeOperation
+/// Batching rule for [`DynamicReshapeOperation`]. Explicit output extents remain replicated shape values. A mapped
+/// input is canonicalized to a leading batch axis, and that axis is inserted into both the reshape geometry and the
+/// output sharding before the mixed operation is replayed.
+impl<C> BatchableOperation<C, ArrayIrBatching> for DynamicReshapeOperation
 where
-    C: Context<Type = ArrayIrType, Operation: From<ReshapeOperation>>,
+    C: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
@@ -277,8 +277,8 @@ where
 ///
 /// A [`Shape`] converts directly into `ReshapeParameters`, preserving the ordinary `value.reshape(shape)` spelling.
 /// Callers that need an input permutation or an explicit output [`Sharding`] can construct these parameters and apply
-/// the corresponding builder methods. Unlike [`LegacyReshapeOperation`], this type contains no Intermediate
-/// Representation (IR) behavior and can be consumed directly by eager backends and type inference.
+/// the corresponding builder methods. Unlike [`ReshapeOperation`], this type contains no Intermediate Representation
+/// (IR) behavior and can be consumed directly by eager backends and type inference.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReshapeParameters {
     /// Output shape of this reshape.
@@ -346,17 +346,26 @@ impl From<Shape> for ReshapeParameters {
     }
 }
 
-/// [`Operation`] that reshapes its input array according to semantic [`ReshapeParameters`]. The input shape is
-/// recoverable from staged input types and is therefore not duplicated in the operation payload. Refer to the
-/// documentation of [`Reshape`] for more information.
+/// [`Operation`] that reshapes its input array according to semantic [`ReshapeParameters`].
+///
+/// This is the member-family reshape primitive of the homogeneous array language: complete output geometry is carried
+/// by the [`ArrayType`] metadata that [`ReshapeParameters`] describes, so the operation has exactly one operand and no
+/// explicit extent edges. The input shape is recoverable from the staged input types and is therefore not duplicated
+/// in the payload. It and [`BroadcastOperation`](crate::operations::manipulation::BroadcastOperation) form the
+/// homogeneous baseline that [`ProjectedContext`](crate::contexts::ProjectedContext) serves, which is why transform
+/// rules for mixed operations can delegate to them once operand geometry is resolved. Refer to the documentation of
+/// [`Reshape`] for the underlying resolved-geometry contract.
+///
+/// Programs that need first-class dynamic extents stage [`DynamicReshapeOperation`] instead, which takes one explicit
+/// first-class dimension operand per output axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LegacyReshapeOperation {
+pub struct ReshapeOperation {
     /// Semantic parameters carried by this operation.
     parameters: ReshapeParameters,
 }
 
-impl LegacyReshapeOperation {
-    /// Creates a new [`LegacyReshapeOperation`] from semantic reshape `parameters`.
+impl ReshapeOperation {
+    /// Creates a new [`ReshapeOperation`] from semantic reshape `parameters`.
     #[inline]
     pub fn new(parameters: impl Into<ReshapeParameters>) -> Self {
         Self { parameters: parameters.into() }
@@ -369,13 +378,13 @@ impl LegacyReshapeOperation {
     }
 }
 
-impl Display for LegacyReshapeOperation {
+impl Display for ReshapeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl Operation for LegacyReshapeOperation {
+impl Operation for ReshapeOperation {
     type Type = ArrayType;
 
     #[inline]
@@ -421,7 +430,7 @@ impl Operation for LegacyReshapeOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for LegacyReshapeOperation {
+impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for ReshapeOperation {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -436,21 +445,21 @@ impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for 
 
 /// Partial evaluation defers to the default fold-or-residualize behavior of
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for LegacyReshapeOperation where
-    C::Operation: From<LegacyReshapeOperation>
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReshapeOperation where
+    C::Operation: From<ReshapeOperation>
 {
 }
 
 impl_differentiable_operation! {
-    LegacyReshapeOperation,
+    ReshapeOperation,
     jvp<C>
     where
         C: Context<Type = ArrayType>,
-        C::Operation: From<LegacyReshapeOperation>,
+        C::Operation: From<ReshapeOperation>,
         C::Value: Reshape,
     {
         |operation, _context, _driver, inputs| {
-            // Forward-mode differentiation rule for `LegacyReshapeOperation`. `reshape` is structural-linear, and so the
+            // Forward-mode differentiation rule for `ReshapeOperation`. `reshape` is structural-linear, and so the
             // tangent is the same reshape applied to the operand tangent. The shared all-zero fast path handles a zero
             // operand tangent before this rule is consulted, so the operand tangent reaching here is always live.
             check_count!("input", inputs, 1, ProgramError);
@@ -465,7 +474,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: Operation<Type = ArrayType> + From<LegacyReshapeOperation> + From<TransposeOperation>,
+        O: Operation<Type = ArrayType> + From<ReshapeOperation> + From<TransposeOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Reshape + Transpose,
     {
         |operation, _context, _driver, inputs, outputs| {
@@ -510,12 +519,12 @@ impl_differentiable_operation! {
 /// Forward-mode rule for mixed reshape. The explicit output extents are ordinary non-differentiated shape values.
 /// Static input cotangent geometry replays the mixed reshape directly; dynamic geometry retains the exact input shape
 /// so the linear transpose can reconstruct the inverse reshape from first-class dimension residuals.
-impl<C> DifferentiableOperation<C> for ReshapeOperation
+impl<C> DifferentiableOperation<C> for DynamicReshapeOperation
 where
     C: Context<Type = ArrayIrType>,
     C::Operation: From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
-        + From<ReshapeOperation>
+        + From<DynamicReshapeOperation>
         + OperationProjection<ArrayType, Projected: From<TransposeOperation>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
@@ -594,7 +603,7 @@ where
                                 }
                                 (None, None) => None,
                             };
-                            let mut inverse_operation = ReshapeOperation::new();
+                            let mut inverse_operation = DynamicReshapeOperation::new();
                             if let Some(bridge_sharding) = bridge_sharding {
                                 inverse_operation = inverse_operation.with_output_sharding(bridge_sharding);
                             }
@@ -641,11 +650,11 @@ where
 /// Direct transposition rule for mixed reshape. Static input geometry delegates to the homogeneous array pullback,
 /// while every explicit output extent receives a structural-zero cotangent. Dynamic input geometry requires
 /// linearization so [`DifferentiableOperation::jvp`] can retain its exact extents as residuals.
-impl<V, O> TransposableOperation<V, O> for ReshapeOperation
+impl<V, O> TransposableOperation<V, O> for DynamicReshapeOperation
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
-    <O as OperationProjection<ArrayType>>::Projected: From<LegacyReshapeOperation>
+    <O as OperationProjection<ArrayType>>::Projected: From<ReshapeOperation>
         + From<TransposeOperation>
         + TransposableOperation<
             <V as ValueProjection<ArrayType>>::Projected,
@@ -694,7 +703,7 @@ where
         if let Some(output_sharding) = self.output_sharding() {
             parameters = parameters.with_output_sharding(output_sharding.clone());
         }
-        let operation = <O as OperationProjection<ArrayType>>::Projected::from(LegacyReshapeOperation::new(parameters));
+        let operation = <O as OperationProjection<ArrayType>>::Projected::from(ReshapeOperation::new(parameters));
         let mut cotangents = transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs)?;
         cotangents.extend(output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())));
         Ok(cotangents)
@@ -702,10 +711,10 @@ where
 }
 
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for LegacyReshapeOperation
+    for ReshapeOperation
 where
     C::Value: Transpose,
-    LegacyReshapeOperation: InterpretableOperation<C>,
+    ReshapeOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,
@@ -738,7 +747,7 @@ where
                 ArrayBatch::sharding_for_inputs(inputs)?,
             )?);
         }
-        LegacyReshapeOperation::new(lifted_parameters).interpret_with_batch_axes(
+        ReshapeOperation::new(lifted_parameters).interpret_with_batch_axes(
             context,
             &[moved_input],
             &[BatchAxis::from_position(0)],
@@ -771,8 +780,8 @@ pub(crate) fn lift_output_sharding_for_leading_batch_axis(
 /// `t.reshape(target_shape)` reinterprets `t`'s payload under the specified target [`Shape`]. The input and target
 /// shapes must have equal element counts, which the type system must be able to establish from the two shapes alone.
 /// Shape-polymorphic programs whose output extents are not recoverable from anonymous dynamic [`Dimension`] values
-/// stage [`ReshapeOperation`] instead, which takes one explicit first-class dimension operand per output axis and so
-/// expresses runtime shape arithmetic as ordinary graph values. When the input carries a [`Sharding`], singleton
+/// stage [`DynamicReshapeOperation`] instead, which takes one explicit first-class dimension operand per output axis
+/// and so expresses runtime shape arithmetic as ordinary graph values. When the input carries a [`Sharding`], singleton
 /// dimensions are ignored and contiguous split/merge groups redistribute compatible mesh axes over their output
 /// factors. Ambiguous dynamic, zero-sized, unconstrained, or non-contiguous placement changes require an explicit
 /// output sharding. A non-identity reshape preserves the input memory space and clears explicit physical layout
@@ -860,7 +869,7 @@ impl Reshape for ArrayType {
 fn infer_explicit_reshape_output_type(
     input: &ArrayType,
     output_shape: Shape,
-    operation: &ReshapeOperation,
+    operation: &DynamicReshapeOperation,
 ) -> Result<ArrayType, TypeError> {
     let permuted_input = match operation.dimensions() {
         Some(dimensions) => input.transpose(dimensions).map_err(|error| TypeError::invalid(error.to_string()))?,
@@ -1149,17 +1158,17 @@ fn rebuild_reshape_sharding(input: &Sharding, dimensions: Vec<ShardingDimension>
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
-/// Any context-carrying value reshapes by binding a [`LegacyReshapeOperation`] through its own context. The
-/// `From<LegacyReshapeOperation>` bound makes this disjoint from the eager value types (whose context operation is
+/// Any context-carrying value reshapes by binding a [`ReshapeOperation`] through its own context. The
+/// `From<ReshapeOperation>` bound makes this disjoint from the eager value types (whose context operation is
 /// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> Reshape for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<LegacyReshapeOperation>,
+    <V::DispatchDomain as Domain>::Operation: From<ReshapeOperation>,
 {
     #[inline]
     fn reshape<P: Into<ReshapeParameters>>(&self, parameters: P) -> Result<Self, ProgramError> {
-        let operation = LegacyReshapeOperation::new(parameters);
+        let operation = ReshapeOperation::new(parameters);
         let input_type = self.r#type().into_owned();
         let output_type = input_type.reshape(operation.parameters().clone())?;
         if operation.parameters().has_identity_dimensions(input_type.rank()) && input_type == output_type {
@@ -1192,7 +1201,7 @@ mod tests {
     #[test]
     fn test_reshape() {
         let shape = Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]);
-        let operation = LegacyReshapeOperation::new(shape.clone());
+        let operation = ReshapeOperation::new(shape.clone());
 
         // Operation identity and accessors.
         assert_eq!(operation.name(), RESHAPE_OPERATION_NAME);
@@ -1258,7 +1267,7 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the captured output shape.
-        let mut builder = ProgramBuilder::<Array, LegacyReshapeOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ReshapeOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, Vec::new(), vec![program_input]).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![program_output], Placeholder, Placeholder).unwrap();
@@ -1277,7 +1286,7 @@ mod tests {
         let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
-            operation = LegacyReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
             cases = [
                 {
                     inputs = [(@known, input.clone())],
@@ -1300,7 +1309,7 @@ mod tests {
         );
         check_operation_batching!(
             @exact,
-            operation = LegacyReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), batched_input)],
@@ -1309,7 +1318,7 @@ mod tests {
         );
         check_operation_batching!(
             @exact,
-            operation = LegacyReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 1), Array::matrix(
@@ -1325,7 +1334,7 @@ mod tests {
         );
         check_operation_batching!(
             @exact,
-            operation = LegacyReshapeOperation::new(
+            operation = ReshapeOperation::new(
                 ReshapeParameters::new(Shape::new(vec![6.into()])).with_dimensions([1, 0]),
             ),
             axis_size = 2,
@@ -1343,7 +1352,7 @@ mod tests {
         );
         check_operation_differentiation!(
             @approx(step = 0.125, epsilon = 1e-9),
-            operation = LegacyReshapeOperation::new(Shape::new(vec![2.into(), 2.into()])),
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 2.into()])),
             cases = [{
                 primals = [Array::vector(vec![1.0, 2.0, 3.0, 4.0])],
                 tangents = [Array::vector(vec![5.0, 6.0, 7.0, 8.0])],
@@ -1353,7 +1362,7 @@ mod tests {
         );
         check_operation_transposition!(
             @exact,
-            operation = LegacyReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
             cases = [{
                 inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))))],
                 output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
@@ -1362,7 +1371,7 @@ mod tests {
         );
         check_operation_transposition!(
             @exact,
-            operation = LegacyReshapeOperation::new(
+            operation = ReshapeOperation::new(
                 ReshapeParameters::new(Shape::new(vec![6.into()])).with_dimensions([1, 0]),
             ),
             cases = [{
@@ -1385,7 +1394,7 @@ mod tests {
             .with_memory(Memory::Host { pinned: true });
         check_operation_transposition!(
             @exact,
-            operation = LegacyReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
             cases = [{
                 inputs = [(@linear(type = placed_input_type.clone()))],
                 output_cotangents = [Array::from_f64s(
@@ -1424,8 +1433,7 @@ mod tests {
             ))),
         );
         assert_eq!(
-            LegacyReshapeOperation::new(dynamic_shape.clone())
-                .infer_output_types(std::slice::from_ref(&static_type), &[]),
+            ReshapeOperation::new(dynamic_shape.clone()).infer_output_types(std::slice::from_ref(&static_type), &[]),
             Err(TypeError::invalid(
                 "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string(),
             )),

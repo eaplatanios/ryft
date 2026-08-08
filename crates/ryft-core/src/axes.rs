@@ -13,7 +13,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::{IotaOperation, LegacyBroadcastOperation, TransposeOperation};
+use crate::operations::{BroadcastOperation, IotaOperation, TransposeOperation};
 use crate::parameters::Parameter;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -311,7 +311,7 @@ where
     C::Operation: BatchableOperation<C, ArrayBatching>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatching>
         + From<TransposeOperation>
-        + From<LegacyBroadcastOperation>,
+        + From<BroadcastOperation>,
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {

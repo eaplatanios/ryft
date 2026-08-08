@@ -17,17 +17,17 @@ use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
 use ryft_core::operations::sort::{SortDirection, SortOperation};
 use ryft_core::{
     AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType, Atan2Operation, AtomId,
-    AxisIndexOperation, CaptureReference, CeilOperation, CollectiveKind, CollectiveOperation, ComparisonDirection,
-    ConstantOperation, ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation, DataType, Dimension,
-    DimensionOperation, DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue,
-    DivOperation, DotOperation, Effect, Effects, ErfOperation, ExpOperation, FloorOperation, GatherOperation,
-    GatherScatterMode, Instruction, IotaOperation, Layout, LegacyBroadcastOperation, LegacyReshapeOperation,
-    LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType,
-    MinOperation, MulOperation, NegOperation, Operation, PadOperation, Parameterized, PowOperation, Program,
-    ProgramError, ReductionKind, RegionId, RegionRef, RemOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError,
-    SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation,
-    Type as RyftType, Typed, Value, WhileOperation,
+    AxisIndexOperation, BroadcastOperation, CaptureReference, CeilOperation, CollectiveKind, CollectiveOperation,
+    ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation,
+    DataType, Dimension, DimensionOperation, DimensionRequirementOperation, DimensionRequirementPredicate,
+    DimensionType, DimensionValue, DivOperation, DotOperation, Effect, Effects, ErfOperation, ExpOperation,
+    FloorOperation, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout, LogOperation, LogicalMesh,
+    LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation,
+    NegOperation, Operation, PadOperation, Parameterized, PowOperation, Program, ProgramError, ReductionKind, RegionId,
+    RegionRef, RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation,
+    SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType,
+    Typed, Value, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, ReshapeParameters};
@@ -1374,7 +1374,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<CpuAr
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LegacyReshapeOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1386,9 +1386,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LegacyReshapeOperation 
     }
 }
 
-/// Lowers a [`LegacyReshapeOperation`] after validating its unary input and single output contract.
+/// Lowers a [`ReshapeOperation`] after validating its unary input and single output contract.
 fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &LegacyReshapeOperation,
+    operation: &ReshapeOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -1497,7 +1497,7 @@ fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType, B: Block<'b, 'c, 't>, L: C
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LegacyBroadcastOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1566,7 +1566,7 @@ fn broadcast_changes_explicit_sharding(input_type: &ArrayType, output_type: &Arr
 /// Lowers a broadcast and explicitly constrains any placement transition over an explicit mesh axis.
 #[allow(clippy::too_many_arguments)]
 fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &LegacyBroadcastOperation,
+    operation: &BroadcastOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
@@ -3868,7 +3868,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Reshape(operation) => <LegacyReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
@@ -3881,15 +3881,13 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::ShardingConstraint(operation) => {
                 lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
             }
-            ArrayOperation::Broadcast(operation) => {
-                <LegacyBroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    operation,
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
+            ArrayOperation::Broadcast(operation) => <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             ArrayOperation::Reduce(operation) => {
                 check_count!("output", output_types, 1, ProgramError);
                 let value = lower_reduce_to_mlir(
@@ -8405,12 +8403,11 @@ mod tests {
         AndOperation, Array as CpuArray, ArrayOperation, Atan2Operation, BroadcastOperation, CompareOperation,
         ConcatenateOperation, ConditionOperation, ConstantOperation, Context, Cos, Dimension, DimensionAddOperation,
         DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation,
-        Dot, DotDimensionNumbers, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, Fill,
-        LegacyBroadcastOperation, LegacyReshapeOperation, LogicalMesh, MeshAxis, MeshAxisType, OneLike,
-        OneLikeOperation, OneOperation, OrOperation, PadOperation, Placeholder, ProgramBuilder, ReduceOperation,
-        ReverseModeDifferentiate, ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension, Sin,
-        SliceOperation, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike,
-        ZeroOperation, i1, i2, i4, u1, u2, u4,
+        Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+        EagerContext, Fill, LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation,
+        PadOperation, Placeholder, ProgramBuilder, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate,
+        ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension, Sin, SliceOperation, Transpose, TypeError,
+        UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -8613,10 +8610,10 @@ mod tests {
         let output_type = test_vector_type(4)
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyBroadcastOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
-            .add_instruction(LegacyBroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input])
+            .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
             .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -8642,11 +8639,11 @@ mod tests {
     #[test]
     fn test_plain_reshape_dimensions_lower_transpose_before_reshape() {
         let input_type = test_matrix_type(2, 3);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                LegacyReshapeOperation::new(
+                ReshapeOperation::new(
                     ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
                 ),
                 Vec::new(),
@@ -8676,9 +8673,9 @@ mod tests {
     #[test]
     fn test_plain_fixed_dynamic_identity_reshape_lowers_without_an_operation() {
         let shape = Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(3)]);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, shape.clone()));
-        let output = builder.add_instruction(LegacyReshapeOperation::new(shape), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(ReshapeOperation::new(shape), Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -8703,11 +8700,11 @@ mod tests {
         let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(5)).unwrap());
         let input_shape = Shape::new(vec![rows.clone().into(), Dimension::Static(3), columns.clone().into()]);
         let output_shape = Shape::new(vec![columns.into(), rows.into(), Dimension::Static(3)]);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, input_shape));
         let output = builder
             .add_instruction(
-                LegacyReshapeOperation::new(ReshapeParameters::new(output_shape).with_dimensions([2, 0, 1])),
+                ReshapeOperation::new(ReshapeParameters::new(output_shape).with_dimensions([2, 0, 1])),
                 Vec::new(),
                 vec![input],
             )
@@ -8814,7 +8811,7 @@ mod tests {
         let module = context.module(location).unwrap();
         let mut block = module.body().unwrap();
         let error = lower_reshape_to_mlir(
-            &LegacyReshapeOperation::new(Shape::new(vec![Dimension::Static(4)])),
+            &ReshapeOperation::new(Shape::new(vec![Dimension::Static(4)])),
             &[],
             &[test_vector_type(4)],
             &mut block,
@@ -8832,7 +8829,7 @@ mod tests {
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                LegacyReshapeOperation::new(
+                ReshapeOperation::new(
                     ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
                 ),
                 Vec::new(),
@@ -8864,11 +8861,11 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_sharding =
             Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(test_vector_type(4));
         let output = builder
             .add_instruction(
-                LegacyReshapeOperation::new(
+                ReshapeOperation::new(
                     ReshapeParameters::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
                         .with_output_sharding(output_sharding),
                 ),
@@ -8904,10 +8901,10 @@ mod tests {
         let output_type = test_vector_type(4)
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, LegacyBroadcastOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
-            .add_instruction(LegacyBroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input])
+            .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
             .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -8942,7 +8939,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let output = builder
-            .add_instruction(LegacyBroadcastOperation::new(output_type.clone(), vec![0]), Vec::new(), vec![input])
+            .add_instruction(BroadcastOperation::new(output_type.clone(), vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -9005,7 +9002,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let output = builder
-            .add_instruction(LegacyBroadcastOperation::new(output_type.clone(), vec![0]), Vec::new(), vec![input])
+            .add_instruction(BroadcastOperation::new(output_type.clone(), vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -10680,7 +10677,7 @@ mod tests {
                 scalar
             };
             let output = builder
-                .add_instruction(BroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, branch_extent])
+                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, branch_extent])
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -10845,7 +10842,7 @@ mod tests {
             )
             .unwrap()[0];
         let output = builder
-            .add_instruction(BroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, carried_extent])
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, carried_extent])
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(

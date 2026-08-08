@@ -28,8 +28,8 @@ use crate::macros::{check_count, check_types};
 use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation};
-use crate::operations::manipulation::reshaping::{LegacyReshapeOperation, Reshape};
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, BroadcastTo, DynamicBroadcastOperation};
+use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::slicing::{Slice, SliceOperation, UpdateSlice, UpdateSliceOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
@@ -1581,13 +1581,13 @@ where
 impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ScanOperation<C::Constant>
 where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
-    <C as Domain>::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape,
+    <C as Domain>::Value: BroadcastTo + Transpose + Slice + UpdateSlice + Reshape,
     C::Operation: ZeroOperationProvider<ArrayType>
-        + From<LegacyBroadcastOperation>
+        + From<BroadcastOperation>
         + From<TransposeOperation>
         + From<SliceOperation>
         + From<UpdateSliceOperation>
-        + From<LegacyReshapeOperation>
+        + From<ReshapeOperation>
         + From<ScanOperation<C::Constant>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
@@ -1938,7 +1938,7 @@ where
     A: Value<Type = ArrayType>,
     C: Context<
             Type = ArrayIrType,
-            Operation: From<BroadcastOperation>
+            Operation: From<DynamicBroadcastOperation>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + From<ScanOperation<ArrayIrValue<A>>>

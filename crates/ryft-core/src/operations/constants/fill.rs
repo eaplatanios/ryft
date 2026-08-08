@@ -3,7 +3,7 @@ use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::operations::constants::constant::ConstantOperation;
-use crate::operations::manipulation::broadcasting::{LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, BroadcastTo};
 use crate::operations::manipulation::conversion::ConvertElementType;
 use crate::operations::memory::TransferToMemory;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
@@ -32,7 +32,7 @@ impl<S: ArrayElement, O: Operation<Type = ArrayType>> Fill<S, Array> for EagerCo
         Array::scalar(value)
             .convert_element_type(r#type.data_type())?
             .transfer_to_memory(r#type.memory())
-            .legacy_broadcast(r#type.clone(), &[])
+            .broadcast_to(r#type.clone(), &[])
     }
 }
 
@@ -42,20 +42,16 @@ pub(crate) trait FillContext<S, T: Type>: Context<Type = T> {
     fn fill_literal(&self, r#type: &T, value: S) -> Result<Self::Value, ProgramError>;
 }
 
-impl<
-    S: ArrayElement,
-    C: Context<
-            Type = ArrayType,
-            Value: LegacyBroadcast,
-            Operation: From<ConstantOperation<Array>> + From<LegacyBroadcastOperation>,
-        >,
-> FillContext<S, ArrayType> for C
+impl<S: ArrayElement, C: Context<Type = ArrayType>> FillContext<S, ArrayType> for C
+where
+    C::Value: BroadcastTo,
+    C::Operation: From<ConstantOperation<Array>> + From<BroadcastOperation>,
 {
     fn fill_literal(&self, r#type: &ArrayType, value: S) -> Result<Self::Value, ProgramError> {
         let literal =
             Array::scalar(value).convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
         let scalar = self.bind(ConstantOperation::new(literal), Vec::new(), &[])?.remove(0);
-        scalar.legacy_broadcast(r#type.clone(), &[])
+        scalar.broadcast_to(r#type.clone(), &[])
     }
 }
 

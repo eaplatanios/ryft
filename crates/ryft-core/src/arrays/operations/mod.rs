@@ -34,14 +34,15 @@ use crate::operations::{
     DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation,
     DimensionPowOperation, DimensionRemOperation, DimensionRequirementOperation, DimensionSaturatingSubOperation,
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotOperation,
-    DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, ErfOperation, ExpOperation,
-    FloorOperation, GatherOperation, IotaOperation, LegacyBroadcastOperation, LegacyReshapeOperation, LogOperation,
-    LogisticOperation, MaxOperation, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation,
-    OneOperation, OrOperation, PadOperation, PowOperation, PrintOperation, ReduceOperation, RemOperation,
-    ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
-    ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation,
-    SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanhOperation, TransferToMemoryOperation,
-    TransposeOperation, UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation,
+    DynamicUpdateSliceOperation, ErfOperation, ExpOperation, FloorOperation, GatherOperation, IotaOperation,
+    LogOperation, LogisticOperation, MaxOperation, MinOperation, MulOperation, NegOperation, NotOperation,
+    OneLikeOperation, OneOperation, OrOperation, PadOperation, PowOperation, PrintOperation, ReduceOperation,
+    RemOperation, ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation,
+    SliceOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
+    TransferToMemoryOperation, TransposeOperation, UpdateSliceOperation, WhileOperation, XorOperation, Zero,
+    ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, Type, TypeIdentityPosition, Typed, Value, ValueProjection,
@@ -133,8 +134,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     AllToAll(AllToAllOperation),
     AxisIndex(AxisIndexOperation),
     Transpose(TransposeOperation),
-    Reshape(LegacyReshapeOperation),
-    Broadcast(LegacyBroadcastOperation),
+    Reshape(ReshapeOperation),
+    Broadcast(BroadcastOperation),
     Pad(PadOperation<ArrayType>),
     Concatenate(ConcatenateOperation<ArrayType>),
     Gather(GatherOperation),
@@ -241,10 +242,10 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     DimensionToScalar(DimensionToScalarOperation),
 
     /// Mixed operation that reshapes an array using one first-class dimension operand per output axis.
-    Reshape(ReshapeOperation),
+    Reshape(DynamicReshapeOperation),
 
     /// Mixed operation that broadcasts an array using one first-class dimension operand per output axis.
-    Broadcast(BroadcastOperation),
+    Broadcast(DynamicBroadcastOperation),
 
     /// Mixed operation that concatenates array operands using one trailing result-extent operand.
     Concatenate(ConcatenateOperation<ArrayIrType>),
@@ -346,7 +347,7 @@ where
             Type = ArrayIrType,
             Constant: ValueProjection<ArrayType, Projected = A>,
             Operation: From<ArrayIrOperation<A>>
-                           + From<BroadcastOperation>
+                           + From<DynamicBroadcastOperation>
                            + From<DimensionSizeOperation>
                            + From<DimensionToScalarOperation>
                            + From<LinearCallOperation<ArrayIrType>>
@@ -437,9 +438,10 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::{
-        AddOperation, BroadcastOperation, ConcatenateOperation, ConditionOperation, DimensionAddOperation,
-        DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation, MulOperation, ReduceOperation,
-        ReductionKind, ReshapeOperation, ScanOperation, WhileOperation, ZeroOperation, ZeroOperationProvider,
+        AddOperation, ConcatenateOperation, ConditionOperation, DimensionAddOperation, DimensionMulOperation,
+        DimensionRequirementOperation, DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
+        MulOperation, ReduceOperation, ReductionKind, ScanOperation, WhileOperation, ZeroOperation,
+        ZeroOperationProvider,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -690,7 +692,7 @@ mod tests {
         );
 
         // Canonical reshape derives its entire result shape from its ordered first-class dimension operand types.
-        let reshape = ArrayIrOperation::<Array>::from(ReshapeOperation::new());
+        let reshape = ArrayIrOperation::<Array>::from(DynamicReshapeOperation::new());
         assert!(matches!(reshape, ArrayIrOperation::Reshape(_)));
         let two = DimensionValue::constant(2).unwrap();
         let three = DimensionValue::constant(3).unwrap();
@@ -735,7 +737,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
                 .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))
                 .with_memory(Memory::Host { pinned: true });
-        let permuted = ArrayIrOperation::<Array>::from(ReshapeOperation::new().with_dimensions([1, 0]));
+        let permuted = ArrayIrOperation::<Array>::from(DynamicReshapeOperation::new().with_dimensions([1, 0]));
         assert_eq!(permuted.to_string(), "reshape [dimensions=[1, 0]]");
         assert_eq!(
             permuted.infer_output_types(
@@ -839,7 +841,7 @@ mod tests {
         let reshape_input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
         let reshape = context
             .bind(
-                ReshapeOperation::new(),
+                DynamicReshapeOperation::new(),
                 Vec::new(),
                 &[
                     reshape_input,
@@ -1056,7 +1058,7 @@ mod tests {
             .unwrap()
             .into_value();
         let reshape_output = reshape_context
-            .bind(ReshapeOperation::new(), Vec::new(), &[reshape_input, first_extent, second_extent])
+            .bind(DynamicReshapeOperation::new(), Vec::new(), &[reshape_input, first_extent, second_extent])
             .unwrap()
             .remove(0);
         let reshape_builder = reshape_context.builder().borrow();
@@ -1499,10 +1501,14 @@ mod tests {
             )
             .unwrap()[0];
         let reshaped = builder
-            .add_instruction(ReshapeOperation::new(), Vec::new(), vec![input, one, repeated_extent])
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, one, repeated_extent])
             .unwrap()[0];
         let output = builder
-            .add_instruction(BroadcastOperation::new(vec![0, 1]), Vec::new(), vec![reshaped, two, repeated_extent])
+            .add_instruction(
+                DynamicBroadcastOperation::new(vec![0, 1]),
+                Vec::new(),
+                vec![reshaped, two, repeated_extent],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(

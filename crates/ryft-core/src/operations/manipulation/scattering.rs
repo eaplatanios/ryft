@@ -15,7 +15,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
-use crate::operations::manipulation::broadcasting::LegacyBroadcast;
+use crate::operations::manipulation::broadcasting::BroadcastTo;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
 use crate::operations::manipulation::transposition::Transpose;
@@ -528,7 +528,7 @@ where
 impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ScatterOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: LegacyBroadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
+    C::Value: BroadcastTo + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     ScatterOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(

@@ -27,7 +27,7 @@ use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::dimensions::dimension_requirement::DimensionRequirementOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
-use crate::operations::manipulation::broadcasting::{BroadcastOperation, LegacyBroadcast, LegacyBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, BroadcastTo, DynamicBroadcastOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -846,10 +846,10 @@ fn reconcile_branch<C: Context>(
 impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ConditionOperation<C::Constant>
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: Concretizable<bool> + LegacyBroadcast + Transpose + Select,
+    <C as Domain>::Value: Concretizable<bool> + BroadcastTo + Transpose + Select,
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
-        + From<LegacyBroadcastOperation>
+        + From<BroadcastOperation>
         + From<SelectOperation<ArrayType>>
         + From<ConditionOperation<C::Constant>>,
 {
@@ -964,8 +964,8 @@ pub(crate) fn batch_condition_with_interpreter<C, P: ArrayBatchingPolicy<C>, F>(
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
-    C::Value: LegacyBroadcast + Transpose + Select,
-    C::Operation: From<LegacyBroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
+    C::Value: BroadcastTo + Transpose + Select,
+    C::Operation: From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
     F: FnMut(usize, Vec<ArrayBatch<C::Value>>) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>,
 {
     let true_outputs = batch_branch(0, operand_inputs.to_vec())?;
@@ -997,7 +997,7 @@ where
     A: Value<Type = ArrayType>,
     C: Context<
             Type = ArrayIrType,
-            Operation: From<BroadcastOperation>
+            Operation: From<DynamicBroadcastOperation>
                            + From<ConditionOperation<ArrayIrValue<A>>>
                            + From<DimensionOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
@@ -1006,10 +1006,10 @@ where
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Value: ValueProjection<ArrayType, Projected: LegacyBroadcast + Select + Transpose + Value<Type = ArrayType>>
+    C::Value: ValueProjection<ArrayType, Projected: BroadcastTo + Select + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
-        From<LegacyBroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
+        From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
     <C::Operation as OperationProjection<DimensionType>>::Projected: From<DimensionRequirementOperation>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
