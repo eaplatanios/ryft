@@ -1253,7 +1253,12 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
       a definition-position occurrence is a closure error.
 - [ ] Phase 4–9 deletion gate: delete each frozen homogeneous reshape/broadcast implementation and transform rule as
       its owning consumer migrates. Do not attempt the final zero-residual deletion before the composite public
-      capability and transform domains replace the current homogeneous `Reshape`/`Broadcast` implementations.
+      capability and transform domains replace the current homogeneous `Reshape`/`Broadcast` implementations. The
+      2026-08-07 current-tree audit in the Phase 9 review below confirms production XLA already uses the composite
+      family, but the homogeneous `ArrayOperation` reference/transform universe still stores both legacy variants.
+      Complete the Phase 5/6 reference-consumer migration, remove that homogeneous variant storage and its projected
+      lowering arms, and then delete both payloads plus `ReshapeDimensionExpression` as one zero-residual gate before
+      Phase 10 measurements. Retain the narrowed array-only member family for ordinary primitive projection.
 - [x] Complete and remove the remaining-operation inventory through P3i's explicit mixed migration or array-only
       classification proof: custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and the
       archived slice-scatter proposal.
@@ -2394,10 +2399,11 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
           `compare_elements`, `copy_block`, `scatter_with_combiner`, …) moved with their families. `Array`'s fields
           remain private: moved kernels use `new_unchecked`, `shared_storage`, and `storage_bytes_mut` to preserve the
           storage invariants without redundant validation or copying, and use the existing `Typed::r#type` rather than
-          a duplicate inherent accessor. Four element contracts cross family boundaries: `ElementAdd`, `ElementMul`,
-          `ElementExtremum`, and `ElementConversionTarget`. A subsequent Phase 9 audit deleted the temporary public
-          `BroadcastKernel` bridge and reused the existing `LegacyBroadcast` capability for resolved eager
-          materialization.)*
+          a duplicate inherent accessor. Three element contracts cross operation-family boundaries: `ElementAdd`,
+          `ElementMul`, and `ElementExtremum`. Subsequent Phase 9 audits deleted the temporary public
+          `BroadcastKernel` bridge by reusing the existing `LegacyBroadcast` capability for resolved eager
+          materialization, and folded the source/target conversion pair into the sealed `ArrayElement` interchange
+          contract.)*
     - [x] Dissolve the former `backends/array_programs/differentiation.rs` (executed 2026-08-07; an interim move had
           kept it whole as `arrays::operations::differentiation`): the linearization residual vocabulary
           (`LinearResiduals`, `ExactShape`) moved together with the array `LinearCallBatchingPolicy` implementations
@@ -2478,10 +2484,17 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
   - [x] Gate: the top-level hierarchy has one obvious public path for reference arrays, dimensions, and array IR; no
         scalar backend or per-element `Scalar` payload remains; all reference-backend semantics, transformations,
         exact-literal tests, core/XLA execution suites, and allocation/performance thresholds pass.
-- [ ] Audit names after responsibilities settle; rename only where the final name is materially clearer.
-- [ ] Known residual from the P4b audit: `ryft-xla/src/profile_guided.rs` names `ArrayIrValue<Array>` in the
+- [x] Audit names after responsibilities settle; rename only where the final name is materially clearer. *(Completed
+      2026-08-07: the settled array/type/IR/transform names accurately describe distinct durable roles. The only
+      temporary names are the homogeneous `ArrayOperation`/`Legacy*` compatibility vocabulary, whose deletion is
+      explicitly gated above; renaming it before deletion would add churn.)*
+- [x] Known residual from the P4b audit: `ryft-xla/src/profile_guided.rs` names `ArrayIrValue<Array>` in the
       `where` clauses of two public functions (`interpret` and `profile_baseline`). Bounds only — no public value
       positions — but it is public-signature/rustdoc surface; tighten or accept explicitly during this cleanup.
+      *(Accepted 2026-08-07: the public `interpret` method delegates to `XlaDomain::{interpret, interpret_async}` and
+      needs the same parameter-family projection contract. A new public marker trait would only conceal these exact
+      blanket bounds while increasing API surface; no `ArrayIrValue` appears in an input, output, field, or associated
+      public value.)*
 - [x] Update every in-repo use site directly without compatibility re-exports.
 - [x] Update rustdoc, examples, error links, and behavioral JAX fixtures.
 - [ ] Close the foreign-call batching gap as an isolated transform/API review after the operation contracts settle.
@@ -5454,12 +5467,12 @@ combinators, and value contracts. Its fields remain private; family kernels use 
 kernel traits, and their tests live in the corresponding semantic family beneath `arrays::operations`.
 
 The hierarchy closure keeps all 17 operation-family implementation modules private in their existing semantic order
-and documents the operation-family root and the dimension family. The sole outside-root dependency,
-`ElementConversionTarget`, crosses through a narrow `pub(crate)` re-export for the reference `Array` constructor
-instead of exposing the entire manipulation module. Targeted searches find no retired core `backends`, top-level
-array `types`, top-level array `sharding`, top-level `broadcasting`, `arrays::reference`, scalar backend, per-element
-`Vec<Scalar>` storage, or compatibility facade. The remaining `crate::sharding` import belongs to `ryft-xla`'s
-independent Shardy lowering module and is not a retired `ryft-core` path.
+and documents the operation-family root and the dimension family. A subsequent conversion cleanup removed the sole
+outside-root family dependency by folding exact element interchange into the sealed `ArrayElement` contract, so no
+operation-family module or family-local trait is re-exported. Targeted searches find no retired core `backends`,
+top-level array `types`, top-level array `sharding`, top-level `broadcasting`, `arrays::reference`, scalar backend,
+per-element `Vec<Scalar>` storage, or compatibility facade. The remaining `crate::sharding` import belongs to
+`ryft-xla`'s independent Shardy lowering module and is not a retired `ryft-core` path.
 
 Verification passes nightly formatting and diff hygiene; core and XLA all-target checks; all 1,139 core unit tests,
 five allocation tests, six region-prototype tests, and 53 runnable doctests with 16 intentional ignores; all 20
@@ -5485,12 +5498,44 @@ shape/data-type algebra rather than value execution. `ArrayElement` is the seale
 decisions. The family-local element arithmetic traits deliberately implement device-compatible wrapping,
 low-precision re-encoding, unsupported-data-type errors, and reduction-count conversion; the similarly named
 program-level capabilities dispatch operations and, for host integers, use checked rather than wrapping arithmetic.
-The source/target element conversion traits preserve exact integer and complex conversion categories, whereas
+The sealed `ArrayElement` contract preserves exact integer, real, and complex interchange categories, whereas
 `ConvertElementType` is the array-level operation capability. None of those contracts is semantically substitutable,
-and only `ElementAdd`, `ElementMul`, `ElementExtremum`, and `ElementConversionTarget`, which are shared across family
-files, remain `pub(crate)`.
+and only `ElementAdd`, `ElementMul`, and `ElementExtremum`, which are shared across operation-family files, remain
+`pub(crate)`.
 
 Verification passes nightly formatting and diff hygiene, the core and XLA all-target checks, all 1,139 core unit
 tests, five allocation tests, six region-prototype tests, 53 runnable doctests with 16 intentional ignores, and all 20
 operation and 17 parameter macro tests plus their compile-fail fixtures. Residual searches find no `BroadcastKernel`
 or `broadcast_to_type` reference.
+
+### Phase 9 naming, public-bound, and legacy-deletion audit (2026-08-07)
+
+The audit started from clean revision `ac4040dc8`. The settled public names accurately distinguish the reference array
+value/type (`Array`/`ArrayType`), the heterogeneous program IR (`ArrayIr*`), and the array-specific batching and
+differentiation instantiations. Renaming any of these now would be churn. The only intentionally temporary names are
+`ArrayOperation`, `LegacyBroadcastOperation`, `LegacyReshapeOperation`, and `ReshapeDimensionExpression`; their names
+describe the still-live homogeneous compatibility universe and must not be normalized before that universe is
+deleted.
+
+The two `profile_guided.rs` bounds are accepted. `AdaptiveProfileGuidedXlaFunction::interpret` delegates directly to
+the same public `XlaDomain::{interpret, interpret_async}` boundary, whose parameter-family contract must support both
+public arrays and the internal heterogeneous execution value. The mixed value occurs only as a trait bound, never as
+an input, output, field, or associated public value. Hiding it would require a new public marker trait whose sole
+purpose was to conceal the exact blanket bounds, increasing public API and indirection without changing what callers
+can express or what the implementation requires.
+
+Current source counts are 79 `LegacyBroadcastOperation`, 68 `LegacyReshapeOperation`, and 80
+`ReshapeDimensionExpression` occurrences. Production XLA already stores the canonical composite family, but the
+homogeneous `ArrayOperation` reference/transform universe still stores both legacy variants. Its remaining owners
+include reference eager/tracing fixtures, generic batching/differentiation/rematerialization fixtures, operation rules
+whose homogeneous contracts are still used by those fixtures, and the projected `XlaOperation::Array` member/lowering
+path. Deleting either payload before migrating that universe would remove valid array-only test and projection
+coverage or force a second temporary adapter.
+
+The deletion sequence is therefore: migrate the remaining Phase 5/6 reference consumers to `ArrayIrOperation` where
+composite behavior is required; replace generic transform coverage with local operation families or projected
+composite fixtures where appropriate; remove the two legacy variants and their projected XLA lowering arms from the
+otherwise-retained array-only `ArrayOperation` member family; then delete both legacy payloads, their
+capability/transform implementations, `ReshapeDimensionExpression`, exports, and tests in one zero-residual gate. This
+work begins immediately after this audit and before Phase 10 measurement; it is not deferred to the final Phase 11
+dead-code sweep.
